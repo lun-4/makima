@@ -1,350 +1,96 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::Duration;
 
 use async_lock::Mutex;
+use event_listener::Event;
 use flume::Receiver;
 use futures_lite::future;
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_providers::Message;
 use maki_providers::model::Model;
-use maki_providers::provider::{self, Provider};
-use maki_providers::{Timeouts, TokenUsage};
+use maki_providers::provider::{self, BoxFuture, Provider};
+use maki_providers::{RequestOptions, Timeouts};
 use maki_storage::id::{MakiId, SessionRef};
 use serde_json::Value;
-use tracing::error;
+use tracing::warn;
 
-use crate::agent::{self, History};
-use crate::cancel::{CancelMap, CancelToken};
+use crate::actor::{
+    ActorError, AdmissionPreparation, AgentActorHandle, AgentContextSnapshot, CompactionStatus,
+    PreparedModel, PreparedReadiness, TurnAdmissionOptions, TurnOrigin, TurnProvenance,
+};
+use crate::agent::isolated_turn::IsolatedTurnEvent;
+use crate::agent::{self, History, PromptSlotSource, TurnSetup};
+use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
-use crate::session_coordinator::SessionOptionCatalog;
-use crate::session_coordinator::{
-    SessionCoordinatorHandle, SessionCoordinatorParams, builtin_option_definitions,
-};
+use crate::session_coordinator::{ModelPreparer, SessionCoordinatorHandle};
 use crate::template;
 use crate::tools::offload::{OffloadCleanup, OffloadStore};
-use crate::tools::{FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolRegistry};
+use crate::tools::{
+    Deadline, FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolContext, ToolRegistry,
+    TurnToolBindings,
+};
 use crate::{
-    Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentMode, AgentParams, AgentRunParams,
-    Envelope, EventSender, McpHandle, McpSession, PermissionsConfig, RunLedger, SessionMailbox,
-    ToolOutputLines, TurnFailure, TurnId, TurnOutcome,
+    ActorBackend, Agent, AgentConfig, AgentEvent, AgentInput, AgentLimits, AgentManagerHandle,
+    AgentMode, AgentParams, AgentRef, AgentRunParams, BackendResult, ControlWork,
+    EffectiveAgentConfig, Envelope, EventSender, McpHandle, McpSession, PermissionsConfig,
+    RunLedger, RunSettings, SessionMailbox, ToolOutputLines, TurnContext, TurnFailure,
+    TurnFailureKind, TurnId, TurnTicket, WorkKind,
 };
 
-pub struct HeadlessParams {
-    pub model: Model,
-    pub config: AgentConfig,
-    pub permissions_config: PermissionsConfig,
-    pub timeouts: Timeouts,
-    pub input: AgentInput,
-    pub prompt_slots: ResolvedSlots,
-    pub excluded_tools: Vec<&'static str>,
-    pub mcp_handle: Option<McpHandle>,
-    pub initial_wd: PathBuf,
-    pub system_prompt_override: Option<String>,
-    pub append_system_prompt: Option<String>,
-    pub model_policy: Arc<ModelPolicy>,
-    pub plugin_rules: Arc<PluginRuleStore>,
-    pub project_config: ProjectConfig,
-    pub modes: Arc<crate::ModeRegistry>,
-    /// Plugin-registered session options. A print-mode run still needs a
-    /// coordinator: tools read their options through one, and
-    /// `SessionMailbox::notify` resolves through one.
-    pub session_options: SessionOptionCatalog,
-    /// Root for the run's offload store. `None` cuts oversized tool output
-    /// instead of saving it.
-    pub state_dir: Option<PathBuf>,
+const GRAPH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const INITIALIZATION_CLOSED: &str = "session ended before initialization";
+const TERMINAL_CHECKPOINT_TIMEOUT: &str = "checkpoint timed out";
+const OPERATION_CANCELLED: &str = "operation cancelled";
+const ROOT_NOT_READY: &str = "session root is not initialized yet";
+const HEADLESS_CONFIG_UNAVAILABLE: &str = "managed headless configuration unavailable";
+const COMPACTION_CANCELLED: &str = "compaction cancelled";
+
+#[derive(Clone, Default)]
+pub struct RootReadiness(Arc<RootInitialization>);
+
+#[derive(Default)]
+struct RootInitialization {
+    result: OnceLock<Result<AgentRef, String>>,
+    changed: Event,
 }
 
-pub struct HeadlessHandle {
-    pub event_rx: Receiver<Envelope>,
-    pub tool_names: Vec<String>,
-    pub session_id: SessionRef,
-    pub cwd: String,
-    pub task: smol::Task<()>,
-    pub offload_cleanup: Option<OffloadCleanup>,
-}
-
-struct AgentSetup {
-    vars: template::Vars,
-    instructions: agent::Instructions,
-    tools: RequestTools,
-}
-
-/// Takes the handle rather than a second `bool`: two adjacent flags is one
-/// too many to read call sites of.
-fn setup(
-    model: &Model,
-    config: &AgentConfig,
-    excluded_tools: &[&'static str],
-    workflow: bool,
-    mcp: Option<&McpHandle>,
-) -> AgentSetup {
-    let vars = template::env_vars();
-    let instructions = agent::load_instructions(&vars.apply("{cwd}"));
-    let tools = RequestTools::build(
-        ToolRegistry::global(),
-        &vars,
-        model,
-        config,
-        excluded_tools,
-        workflow,
-        mcp.is_some(),
-    );
-
-    AgentSetup {
-        vars,
-        instructions,
-        tools,
-    }
-}
-
-fn session_offload(state_dir: Option<&Path>, session: &SessionRef) -> Option<Arc<OffloadStore>> {
-    Some(Arc::new(OffloadStore::for_session(state_dir?, session)))
-}
-
-/// Cancellation and unwinding cannot await removal. The handle retains the
-/// same controller so callers can drain the request made by this guard.
-struct RemoveOffloadOnDrop(OffloadCleanup);
-
-impl Drop for RemoveOffloadOnDrop {
-    fn drop(&mut self) {
-        self.0.request();
-    }
-}
-
-async fn drain_offload(cleanup: Option<&OffloadCleanup>) {
-    if let Some(cleanup) = cleanup {
-        cleanup.request();
-        let _ = cleanup.wait().await;
-    }
-}
-
-/// Names advertised to SDK clients: base tools plus what the first request
-/// would carry from MCP (always-load definitions and `tool_search`).
-fn advertised_tool_names(tools: &Value, mcp: Option<&McpSession>) -> Vec<String> {
-    let mut probe = tools.clone();
-    if let Some(mcp) = mcp {
-        mcp.extend_tools(&mut probe);
-    }
-    extract_tool_names(&probe)
-}
-
-pub fn spawn(
-    params: HeadlessParams,
-) -> Result<HeadlessHandle, crate::session_coordinator::SessionCoordinatorError> {
-    spawn_with_session_id(params, MakiId::generate())
-}
-
-fn spawn_with_session_id(
-    params: HeadlessParams,
-    session_id: MakiId,
-) -> Result<HeadlessHandle, crate::session_coordinator::SessionCoordinatorError> {
-    spawn_initialized(params, session_id, None)
-}
-
-pub fn spawn_with_provider(
-    params: HeadlessParams,
-    provider: Arc<dyn Provider>,
-) -> Result<HeadlessHandle, crate::session_coordinator::SessionCoordinatorError> {
-    spawn_initialized(params, MakiId::generate(), Some(Ok(provider)))
-}
-
-fn spawn_initialized(
-    params: HeadlessParams,
-    session_id: MakiId,
-    initialized_provider: Option<Result<Arc<dyn Provider>, crate::AgentError>>,
-) -> Result<HeadlessHandle, crate::session_coordinator::SessionCoordinatorError> {
-    let working_dir = params.initial_wd.to_string_lossy().into_owned();
-    let mode = params.input.mode.clone();
-    let workflow = params.input.workflow;
-    let AgentSetup {
-        vars,
-        instructions,
-        tools,
-    } = setup(
-        &params.model,
-        &params.config,
-        &params.excluded_tools,
-        workflow,
-        params.mcp_handle.as_ref(),
-    );
-
-    let mut system = params.system_prompt_override.clone().unwrap_or_else(|| {
-        agent::build_system_prompt(
-            &vars,
-            &params.modes,
-            &mode,
-            &instructions.text,
-            &params.prompt_slots,
-        )
-    });
-    if let Some(append) = &params.append_system_prompt {
-        system.push('\n');
-        system.push_str(append);
-    }
-
-    let mcp = params.mcp_handle.clone().map(|h| McpSession::new(h, &[]));
-    let tool_names = advertised_tool_names(tools.definitions(), mcp.as_ref());
-
-    let (guard, events) = crate::types::event_stream();
-    let raw_tx = guard.tx().clone();
-    let event_rx = events.into_receiver();
-
-    let session_ref = SessionRef::from(session_id);
-    let session_ref_clone = session_ref.clone();
-    let mailbox = SessionMailbox::new(session_id);
-    // A print-mode session is one turn and is never restored, so the
-    // checkpoint is a no-op and no options are persisted -- but the
-    // coordinator must exist, or every option read and every mailbox
-    // notification in this run fails with `session not live`.
-    let coordinator = SessionCoordinatorHandle::register(SessionCoordinatorParams {
-        session_id,
-        catalog: params.session_options.clone(),
-        definitions: builtin_option_definitions(
-            Arc::from(params.model.spec().as_str()),
-            [Arc::from(params.model.spec().as_str())],
-            params.permissions_config.yolo,
-            false,
-            workflow,
-            params.input.thinking,
-        ),
-        persisted_options: Default::default(),
-        history: Vec::new(),
-        model: Arc::from(params.model.spec().as_str()),
-        cwd: params.initial_wd.clone(),
-        model_policy: Arc::clone(&params.model_policy),
-        // A print run resolves its provider once, up front: there is no
-        // mechanism to swap either mid-run, so both adoptions are refused
-        // rather than silently accepted and ignored.
-        model_adopter: Arc::new(|_: Model| {
-            Box::pin(async { Err(Arc::from("model cannot be changed in print mode")) })
-                as crate::session_coordinator::ModelAdoptionFuture
-        }),
-        directory_adopter: Arc::new(|_: PathBuf| {
-            Box::pin(async { Err(Arc::from("directory cannot be changed in print mode")) })
-                as crate::session_coordinator::DirectoryAdoptionFuture
-        }),
-        checkpoint: Arc::new(
-            |request: maki_storage::checkpoint::CheckpointRequest<
-                crate::session_coordinator::SessionCheckpoint,
-            >| {
-                Box::pin(async move {
-                    Ok(maki_storage::checkpoint::CheckpointAck {
-                        session_id: request.session_id,
-                        version: request.version,
-                    })
-                }) as maki_storage::checkpoint::CheckpointFuture
-            },
-        ),
-        mailbox: mailbox.clone(),
-    })?;
-    let file_write_locks = Arc::new(crate::tools::FileWriteLocks::new());
-    let offload = session_offload(params.state_dir.as_deref(), &session_ref);
-    let offload_cleanup = offload
-        .as_ref()
-        .map(|store| OffloadCleanup::new(Arc::clone(store)));
-    let future = {
-        let file_write_locks = Arc::clone(&file_write_locks);
-        let mcp_shutdown = params.mcp_handle.clone();
-        let working_dir_path = params.initial_wd.clone();
-        let _stream_guard = guard;
-        let cleanup = offload_cleanup.clone();
-        let remove_offload = cleanup.clone().map(RemoveOffloadOnDrop);
-        async move {
-            let remove_offload = remove_offload;
-            let event_tx = EventSender::new(raw_tx, 0);
-            let mut model = params.model;
-            let provider: Arc<dyn Provider> = match async {
-                match initialized_provider {
-                    Some(provider) => provider,
-                    None => provider::from_model_async(&mut model, params.timeouts)
-                        .await
-                        .map(Arc::from),
-                }
+impl RootReadiness {
+    pub async fn get(&self) -> Result<AgentRef, String> {
+        loop {
+            let listener = self.0.changed.listen();
+            if let Some(result) = self.0.result.get() {
+                return result.clone();
             }
-            .await
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    error!(error = %e, "provider error");
-                    let _ = event_tx.send(AgentEvent::ControlError {
-                        message: e.user_message(),
-                    });
-                    let _ = coordinator.close().await;
-                    drain_offload(cleanup.as_ref()).await;
-                    return;
-                }
-            };
-            let mut history = History::new(Vec::new());
-            let mut agent = Agent::new(
-                AgentParams {
-                    agent_id: AgentId::generate(),
-                    provider,
-                    model,
-                    config: params.config,
-                    tool_output_lines: ToolOutputLines::default(),
-                    permissions: Arc::new(PermissionManager::new(
-                        params.permissions_config,
-                        working_dir_path,
-                        params.project_config,
-                        params.plugin_rules,
-                    )),
-                    session_id: Some(session_ref_clone.clone()),
-                    mailbox: Some(mailbox.clone()),
-                    timeouts: params.timeouts,
-                    file_tracker: FileReadTracker::fresh(),
-                    prompt_slots: Arc::new(params.prompt_slots),
-                    modes: Arc::clone(&params.modes),
-                    subagent_cancels: Arc::new(CancelMap::new()),
-                    ledger: Arc::new(RunLedger::default()),
-                    registry: Arc::clone(ToolRegistry::global_arc()),
-                    audience: ToolAudience::MAIN,
-                    question_mode: crate::tools::QuestionMode::Headless,
-                    model_policy: Arc::clone(&params.model_policy),
-                    file_write_locks: Arc::clone(&file_write_locks),
-                    offload: offload.clone(),
-                    managed_turn: None,
-                },
-                AgentRunParams {
-                    history: &mut history,
-                    system,
-                    event_tx,
-                    tools,
-                },
-            )
-            .with_loaded_instructions(instructions.loaded)
-            .with_mcp(mcp);
-
-            agent.run(TurnId::generate(), params.input).await;
-            drop(agent);
-            drain_offload(cleanup.as_ref()).await;
-            drop(remove_offload);
-
-            if let Some(handle) = mcp_shutdown {
-                handle.shutdown().await;
-            }
-            let _ = coordinator.close().await;
-            drop(_stream_guard);
+            listener.await;
         }
-    };
+    }
 
-    Ok(HeadlessHandle {
-        event_rx,
-        tool_names,
-        session_id: session_ref,
-        cwd: working_dir,
-        task: smol::spawn(future),
-        offload_cleanup,
-    })
+    fn current(&self) -> Option<Result<AgentRef, String>> {
+        self.0.result.get().cloned()
+    }
+
+    fn finish(&self, result: Result<AgentRef, String>) {
+        let _ = self.0.result.set(result);
+        self.0.changed.notify(usize::MAX);
+    }
 }
+
+/// Called after provider preparation and root creation, before admissions can run.
+pub type RootBinding = Box<
+    dyn FnOnce(AgentManagerHandle, AgentRef, ToolContext) -> BoxFuture<'static, Result<(), String>>
+        + Send,
+>;
 
 pub struct InteractiveParams {
     pub model: Model,
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
-    pub prompt_slots: Arc<ResolvedSlots>,
+    pub prompt_slots: PromptSlotSource,
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
@@ -359,12 +105,11 @@ pub struct InteractiveParams {
     pub question_mode: crate::tools::QuestionMode,
     pub plugin_rules: Arc<PluginRuleStore>,
     pub project_config: ProjectConfig,
-    /// Host-side overrides that shadow a registered tool's execution while
-    /// keeping its advertised schema (e.g. ACP answers `question` via elicitation).
     pub local_tools: LocalTools,
-    /// Root for the session's offload store. `None` cuts oversized tool
-    /// output instead of saving it.
     pub state_dir: Option<PathBuf>,
+    /// Whether the frontend answers permission asks over `answer_tx`. Without
+    /// it every ask is denied at once instead of waiting on nobody.
+    pub answers: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -381,17 +126,8 @@ pub enum InteractiveControl {
         instructions: Option<String>,
         output: flume::Sender<ManualCompactionEvent>,
         cancel: CancelToken,
-        lease_committer: Option<crate::session_coordinator::SessionLeaseCommitter>,
     },
     Reset(flume::Sender<Result<(), String>>),
-    ChangeDirectory {
-        path: PathBuf,
-        reply: flume::Sender<Result<PathBuf, String>>,
-    },
-    SettleDirectory {
-        path: PathBuf,
-        reply: flume::Sender<Result<PathBuf, String>>,
-    },
     IsolatedTurn {
         question: String,
         images: Vec<maki_providers::ImageSource>,
@@ -400,25 +136,717 @@ pub enum InteractiveControl {
     },
 }
 
-struct InteractiveControlContext<'a> {
-    session_id: MakiId,
-    history: &'a mut History,
-    model: &'a Model,
-    provider: &'a dyn Provider,
-    raw_tx: &'a flume::Sender<Envelope>,
-    run_id: u64,
-    config: &'a AgentConfig,
+#[derive(Clone)]
+pub struct InteractiveControlSender {
+    root: RootReadiness,
+    next: Arc<AtomicU64>,
 }
 
-/// Finish a manual compaction: persist the compacted history, and only then
-/// report success. A compaction that reported `Completed` before the write
-/// landed would promise durability it does not have, so persistence failure --
-/// like compaction failure -- rolls the in-memory history back to `previous`
-/// and reports the error instead. A failed compaction is never persisted.
+/// A control the actor owns until it runs. Dropping it unrun, because it was
+/// cancelled or the actor closed, reports the cancellation to its caller; once
+/// the actor drops its work, the task forwarding the caller's cancel ends.
+struct PendingControl {
+    control: Option<InteractiveControl>,
+    _done: flume::Sender<()>,
+}
+
+impl PendingControl {
+    fn cancel(&mut self) {
+        match self.control.take() {
+            Some(InteractiveControl::Compact(reply) | InteractiveControl::Reset(reply)) => {
+                let _ = reply.send(Err(OPERATION_CANCELLED.into()));
+            }
+            Some(InteractiveControl::ManualCompaction { output, .. }) => {
+                let _ = output.send(ManualCompactionEvent::Cancelled);
+            }
+            Some(InteractiveControl::IsolatedTurn { output, .. }) => {
+                let _ = output.send(agent::isolated_turn::IsolatedTurnEvent::Cancelled);
+            }
+            None => {}
+        }
+    }
+}
+
+impl Drop for PendingControl {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+impl InteractiveControlSender {
+    pub async fn send(&self, control: InteractiveControl) -> Result<(), String> {
+        let actor = self
+            .root
+            .get()
+            .await?
+            .actor()
+            .map_err(|error| error.to_string())?;
+        let key = format!(
+            "headless-control:{}",
+            self.next.fetch_add(1, Ordering::Relaxed)
+        );
+        let cancel = match &control {
+            InteractiveControl::ManualCompaction { cancel, .. }
+            | InteractiveControl::IsolatedTurn { cancel, .. } => Some(cancel.clone()),
+            _ => None,
+        };
+        let (done, finished) = flume::bounded(0);
+        let pending = Arc::new(StdMutex::new(PendingControl {
+            control: Some(control),
+            _done: done,
+        }));
+        let queued = Arc::downgrade(&pending);
+        actor
+            .push_control(key.clone(), key.clone(), Some(pending))
+            .map_err(|error| error.to_string())?;
+        if let Some(cancel) = cancel {
+            smol::spawn(async move {
+                future::or(
+                    async {
+                        cancel.cancelled().await;
+                        actor.cancel_correlation(&key, crate::TurnCancellationReason::User);
+                        if let Some(pending) = queued.upgrade() {
+                            pending
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .cancel();
+                        }
+                    },
+                    async {
+                        let _ = finished.recv_async().await;
+                    },
+                )
+                .await;
+            })
+            .detach();
+        }
+        Ok(())
+    }
+
+    /// Compacts the root's history and waits for it to settle.
+    pub async fn compact(
+        &self,
+        instructions: Option<String>,
+        cancel: CancelToken,
+    ) -> Result<(), String> {
+        let (output, events) = flume::unbounded();
+        self.send(InteractiveControl::ManualCompaction {
+            instructions,
+            output,
+            cancel,
+        })
+        .await?;
+        loop {
+            match events.recv_async().await {
+                Ok(ManualCompactionEvent::Started) => {}
+                Ok(event) => return compaction_result(event),
+                Err(_) => return Err(OPERATION_CANCELLED.into()),
+            }
+        }
+    }
+
+    /// Asks {question} beside the root's history, leaving it unchanged, and
+    /// returns the answer.
+    pub async fn ask_isolated(
+        &self,
+        question: String,
+        images: Vec<maki_providers::ImageSource>,
+        cancel: CancelToken,
+    ) -> Result<String, String> {
+        let (output, events) = flume::unbounded();
+        self.send(InteractiveControl::IsolatedTurn {
+            question,
+            images,
+            output,
+            cancel,
+        })
+        .await?;
+        let mut answer = String::new();
+        loop {
+            match events.recv_async().await {
+                Ok(IsolatedTurnEvent::TextDelta(text)) => answer.push_str(&text),
+                Ok(IsolatedTurnEvent::ThinkingDelta(_)) => {}
+                Ok(IsolatedTurnEvent::Done) => return Ok(answer),
+                Ok(IsolatedTurnEvent::Error(error)) => return Err(error),
+                Ok(IsolatedTurnEvent::Cancelled) | Err(_) => {
+                    return Err(OPERATION_CANCELLED.into());
+                }
+            }
+        }
+    }
+}
+
+/// Admits turns on the root like the frontend's input does, without keeping
+/// the session alive: plugin-run commands hold one past the frontend's input.
+#[derive(Clone)]
+pub struct TurnAdmitter {
+    root: RootReadiness,
+    events: flume::Sender<Envelope>,
+    next: Arc<AtomicU64>,
+}
+
+impl TurnAdmitter {
+    pub async fn admit(&self, input: AgentInput) -> Result<TurnTicket, String> {
+        self.ready()
+            .await?
+            .submit(input)
+            .map(|(ticket, _)| ticket)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Waits for the root, so a frontend can then submit synchronously and
+    /// record the turn under its own lock before the turn's events reach it.
+    pub async fn ready(&self) -> Result<RootSubmission, String> {
+        let root = self.root.get().await?;
+        Ok(RootSubmission {
+            actor: root.actor().map_err(|error| error.to_string())?,
+            events: self.events.clone(),
+            run: self.next.fetch_add(1, Ordering::Relaxed),
+        })
+    }
+}
+
+/// One submission to a ready root, made the way the TUI's input makes it.
+pub struct RootSubmission {
+    actor: AgentActorHandle,
+    events: flume::Sender<Envelope>,
+    run: u64,
+}
+
+impl RootSubmission {
+    /// Joins the root's compatible turn in flight, or starts one, and returns
+    /// the ticket and presentation of the turn that carries {input}.
+    pub fn submit(self, input: AgentInput) -> Result<(TurnTicket, u64), ActorError> {
+        self.actor.submit_presented(
+            input,
+            Some(EventSender::new(self.events)),
+            format!("run:{}", self.run),
+            TurnAdmissionOptions {
+                provenance: TurnProvenance {
+                    origin: TurnOrigin::User,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+    }
+}
+
+#[derive(Clone)]
+pub struct InteractiveInputSender {
+    admitter: TurnAdmitter,
+    _lifetime: flume::Sender<()>,
+}
+
+impl InteractiveInputSender {
+    pub async fn admit(&self, input: AgentInput) -> Result<TurnTicket, String> {
+        self.admitter.admit(input).await
+    }
+
+    pub fn admitter(&self) -> TurnAdmitter {
+        self.admitter.clone()
+    }
+
+    /// Cancels {ticket}'s turn alone; the rest of the session keeps running.
+    /// Holds no part of the sender, so it never keeps the session alive.
+    pub fn turn_cancel(&self, ticket: TurnTicket) -> WorkCancel {
+        WorkCancel::Turn {
+            ticket,
+            root: self.admitter.root.clone(),
+        }
+    }
+}
+
+/// What a frontend cancels when its user interrupts the work in flight: a
+/// local operation's trigger, or an admitted turn on the actor.
+pub enum WorkCancel {
+    Control(CancelTrigger),
+    Turn {
+        ticket: TurnTicket,
+        root: RootReadiness,
+    },
+}
+
+impl WorkCancel {
+    pub fn turn_id(&self) -> Option<TurnId> {
+        match self {
+            Self::Control(_) => None,
+            Self::Turn { ticket, .. } => Some(ticket.turn_id()),
+        }
+    }
+
+    pub fn cancel(self) {
+        match self {
+            Self::Control(trigger) => trigger.cancel(),
+            Self::Turn { ticket, root } => {
+                let cancelled = root
+                    .current()
+                    .ok_or_else(|| ROOT_NOT_READY.to_owned())
+                    .flatten()
+                    .and_then(|root| root.actor().map_err(|error| error.to_string()))
+                    .and_then(|actor| {
+                        actor
+                            .cancel_turn(ticket.turn_id())
+                            .map_err(|error| error.to_string())
+                    });
+                if let Err(error) = cancelled {
+                    warn!(%error, turn_id = %ticket.turn_id(), "turn cancel failed");
+                }
+            }
+        }
+    }
+}
+
+pub struct InteractiveHandle {
+    pub manager: AgentManagerHandle,
+    pub root: RootReadiness,
+    pub event_rx: Receiver<Envelope>,
+    pub tool_names: Vec<String>,
+    pub input_tx: InteractiveInputSender,
+    pub answer_tx: flume::Sender<String>,
+    pub control_tx: InteractiveControlSender,
+    pub model: crate::SharedModel,
+    pub session_id: SessionRef,
+    pub mailbox: SessionMailbox,
+    pub permissions: Arc<PermissionManager>,
+    pub offload_cleanup: Option<OffloadCleanup>,
+    pub task: smol::Task<()>,
+}
+
+impl InteractiveHandle {
+    pub async fn initialized_root(&self) -> Result<AgentRef, String> {
+        self.root.get().await
+    }
+}
+
+pub type ProviderPreparation = Box<
+    dyn FnOnce(
+            Model,
+            Timeouts,
+        ) -> BoxFuture<'static, Result<(Model, Arc<dyn Provider>), crate::AgentError>>
+        + Send,
+>;
+
+pub fn default_preparation() -> ProviderPreparation {
+    Box::new(|mut model, timeouts| {
+        Box::pin(async move {
+            let provider = provider::from_model_async(&mut model, timeouts).await?;
+            Ok((model, Arc::from(provider)))
+        })
+    })
+}
+
+/// Prepares the provider for a model a session coordinator commits.
+pub fn default_model_preparer(timeouts: Timeouts) -> ModelPreparer {
+    Arc::new(move |mut model| {
+        Box::pin(async move {
+            let provider = provider::from_model_async(&mut model, timeouts)
+                .await
+                .map_err(|error| Arc::from(error.user_message()))?;
+            Ok(PreparedModel {
+                model,
+                provider: Arc::from(provider),
+            })
+        })
+    })
+}
+
+struct HeadlessBackend {
+    params: AgentParams,
+    excluded_tools: Vec<&'static str>,
+    system_override: Option<String>,
+    append_system: Option<String>,
+    setup: TurnSetup,
+    local_tools: LocalTools,
+    mcp: Option<McpSession>,
+    answer_rx: Option<Arc<Mutex<Receiver<String>>>>,
+    raw_tx: flume::Sender<Envelope>,
+    root: RootReadiness,
+}
+
+impl HeadlessBackend {
+    fn event_sender(&self, context: &TurnContext) -> EventSender {
+        EventSender::with_identity(self.raw_tx.clone(), Some(context.work))
+    }
+
+    async fn config(&self, context: &TurnContext) -> Result<Arc<EffectiveAgentConfig>, String> {
+        if let Some(config) = &context.policy {
+            return Ok(Arc::clone(config));
+        }
+        self.root
+            .get()
+            .await?
+            .effective_config()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| HEADLESS_CONFIG_UNAVAILABLE.to_owned())
+    }
+
+    fn system(
+        &self,
+        config: &EffectiveAgentConfig,
+        instructions: &agent::Instructions,
+        slots: &ResolvedSlots,
+    ) -> String {
+        let vars = template::env_vars_for(config.context.cwd());
+        let definition = config
+            .mode_def
+            .clone()
+            .unwrap_or_else(|| self.params.modes.current(&config.mode));
+        let mut system = self.system_override.clone().unwrap_or_else(|| {
+            agent::build_system_prompt_with_def(
+                &vars,
+                &definition,
+                &config.mode,
+                &instructions.text,
+                slots,
+            )
+        });
+        if let Some(append) = &self.append_system {
+            system.push('\n');
+            system.push_str(append);
+        }
+        system
+    }
+
+    fn tools(&self, config: &EffectiveAgentConfig) -> RequestTools {
+        RequestTools::build(
+            &self.params.registry,
+            &template::env_vars_for(config.context.cwd()),
+            &config.model,
+            &self.params.config,
+            &self.excluded_tools,
+            config.workflow,
+            self.mcp.is_some(),
+        )
+    }
+
+    fn template(&self, config: &EffectiveAgentConfig) -> ToolContext {
+        let tools = self.tools(config);
+        ToolContext {
+            execution_agent_id: Some(self.params.agent_id),
+            provider: Arc::clone(&config.provider),
+            model: Arc::new(config.model.clone()),
+            event_tx: EventSender::new(self.raw_tx.clone()),
+            mode: config.mode.clone(),
+            mode_def: config.mode_def.clone().map(Arc::new),
+            question_mode: self.params.question_mode,
+            session_id: self.params.session_id.clone(),
+            cwd: config.context.cwd().to_path_buf(),
+            tool_use_id: None,
+            user_response_rx: self.answer_rx.clone(),
+            loaded_instructions: Default::default(),
+            cancel: CancelToken::none(),
+            mcp: self.mcp.clone(),
+            deadline: Deadline::None,
+            config: self.params.config.clone(),
+            tool_filter: Arc::clone(tools.filter()),
+            request_tools: Some(tools),
+            tool_output_lines: self.params.tool_output_lines,
+            permissions: Arc::clone(&self.params.permissions),
+            timeouts: self.params.timeouts,
+            file_tracker: Arc::clone(&self.params.file_tracker),
+            prompt_slots: Arc::clone(&self.params.prompt_slots),
+            modes: Arc::clone(&self.params.modes),
+            opts: RequestOptions {
+                thinking: config.thinking,
+                fast: config.fast,
+            },
+            subagent_cancels: Arc::clone(&self.params.subagent_cancels),
+            ledger: Arc::new(RunLedger::default()),
+            registry: Arc::clone(&self.params.registry),
+            workflow: config.workflow,
+            audience: self.params.audience,
+            local_tools: Arc::clone(&self.local_tools),
+            local_tool_capture: None,
+            turn_bindings: Arc::new(TurnToolBindings::capture(
+                &self.params.registry,
+                &self.local_tools,
+                self.mcp.as_ref(),
+            )),
+            live_sink: None,
+            model_policy: Arc::clone(&self.params.model_policy),
+            file_write_locks: Arc::clone(&self.params.file_write_locks),
+            offload: self.params.offload.clone(),
+            pending_output_limits: None,
+            write_lock_chain: Arc::new(Vec::new()),
+            managed_turn: None,
+        }
+    }
+
+    async fn compact(
+        &self,
+        history: &mut History,
+        context: &TurnContext,
+        instructions: Option<&str>,
+        cancel: &CancelToken,
+    ) -> ManualCompactionEvent {
+        let config = match self.config(context).await {
+            Ok(config) => config,
+            Err(error) => return ManualCompactionEvent::Failed(error),
+        };
+        let previous = history.snapshot().clone();
+        let result = agent::compact(
+            &*config.provider,
+            &config.model,
+            history,
+            &self.event_sender(context),
+            cancel,
+            &self.params.config,
+            instructions,
+            self.params.session_id.as_ref(),
+        )
+        .await
+        .map_err(|error| error.to_string());
+        let snapshot = history.snapshot().clone();
+        settle_manual_compaction(result, history, previous, cancel, |_| {
+            persist_history(self.params.session_id.as_ref().unwrap().id(), snapshot)
+        })
+        .await
+    }
+}
+
+impl ActorBackend for HeadlessBackend {
+    fn offload_store(&self) -> Option<Arc<OffloadStore>> {
+        self.params.offload.clone()
+    }
+
+    fn admission_preparation(&self) -> Option<AdmissionPreparation> {
+        Some(self.setup.clone().preparation())
+    }
+
+    fn prepared_readiness(&self) -> Option<PreparedReadiness> {
+        Some(TurnSetup::readiness())
+    }
+
+    fn run_turn<'a>(
+        &'a mut self,
+        history: &'a mut History,
+        context: TurnContext,
+        mut input: AgentInput,
+        _work: WorkKind,
+    ) -> BoxFuture<'a, BackendResult> {
+        Box::pin(async move {
+            let turn_id = context.turn_id.unwrap_or_else(TurnId::generate);
+            let config = match self.config(&context).await {
+                Ok(config) => config,
+                Err(error) => {
+                    warn!(%turn_id, %error, "headless turn setup failed");
+                    return BackendResult::SetupFailed(Some(TurnFailure {
+                        kind: TurnFailureKind::Internal,
+                        diagnostic: error.clone(),
+                        user_message: error,
+                        retryable: true,
+                    }));
+                }
+            };
+            let prompt_inputs = context
+                .admission
+                .as_ref()
+                .and_then(|admission| admission.prompt_inputs.clone());
+            let slots = match &prompt_inputs {
+                Some(inputs) => match inputs.resolve(&mut input, self.mcp.as_ref()).await {
+                    Ok(slots) => slots,
+                    Err(error) => {
+                        warn!(%turn_id, %error, "headless turn inputs failed");
+                        return BackendResult::SetupFailed(Some(TurnFailure {
+                            kind: TurnFailureKind::Internal,
+                            diagnostic: error.to_string(),
+                            user_message: error.user_message(),
+                            retryable: false,
+                        }));
+                    }
+                },
+                None => Arc::default(),
+            };
+            let instructions = prompt_inputs
+                .map(|inputs| inputs.instructions.clone())
+                .unwrap_or_default();
+            let event_tx = self.event_sender(&context);
+            context.output.set_terminal_sender(event_tx.clone());
+            if let Some(answer_rx) = &self.answer_rx {
+                while answer_rx.lock().await.try_recv().is_ok() {}
+            }
+            let mut params = self.params.clone();
+            params.prompt_slots = Arc::clone(&slots);
+            let mut agent = Agent::for_actor_turn(
+                params,
+                AgentRunParams {
+                    history,
+                    system: self.system(&config, &instructions, &slots),
+                    event_tx: event_tx.clone(),
+                    tools: self.tools(&config),
+                },
+                &context,
+                instructions.loaded,
+            )
+            .with_user_response_rx(self.answer_rx.clone())
+            .with_local_tools(Arc::clone(&self.local_tools))
+            .with_mcp(self.mcp.clone());
+            let outcome = agent.run(turn_id, input).await;
+            drop(agent);
+            let persisted = future::or(
+                persist_history(
+                    self.params.session_id.as_ref().unwrap().id(),
+                    history.snapshot().clone(),
+                ),
+                async {
+                    smol::Timer::after(self.params.timeouts.low_speed).await;
+                    Err(TERMINAL_CHECKPOINT_TIMEOUT.to_owned())
+                },
+            )
+            .await;
+            BackendResult::EnteredRun(match persisted {
+                Ok(()) => outcome,
+                Err(error) => outcome.checkpoint_failed(error),
+            })
+        })
+    }
+
+    fn run_control<'a>(
+        &'a mut self,
+        history: &'a mut History,
+        context: TurnContext,
+        control: &'a ControlWork,
+    ) -> BoxFuture<'a, BackendResult> {
+        Box::pin(async move {
+            let pending = control
+                .payload
+                .clone()
+                .and_then(|payload| payload.downcast::<StdMutex<PendingControl>>().ok());
+            let control = pending.as_ref().and_then(|pending| {
+                pending
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .control
+                    .take()
+            });
+            match control {
+                Some(InteractiveControl::Compact(reply)) => {
+                    let result = self.compact(history, &context, None, &context.cancel).await;
+                    let _ = reply.send(compaction_result(result));
+                }
+                Some(InteractiveControl::ManualCompaction {
+                    instructions,
+                    output,
+                    cancel,
+                }) => {
+                    let _ = output.send(ManualCompactionEvent::Started);
+                    let (trigger, combined) = CancelToken::new();
+                    let cancellation = smol::spawn({
+                        let actor_cancel = context.cancel.clone();
+                        async move {
+                            future::or(cancel.cancelled(), actor_cancel.cancelled()).await;
+                            trigger.cancel();
+                        }
+                    });
+                    let result = self
+                        .compact(history, &context, instructions.as_deref(), &combined)
+                        .await;
+                    cancellation.cancel().await;
+                    let status = match result {
+                        ManualCompactionEvent::Completed => CompactionStatus::Completed,
+                        ManualCompactionEvent::Cancelled => CompactionStatus::Cancelled,
+                        _ => CompactionStatus::Failed,
+                    };
+                    let _ = output.send(result);
+                    return BackendResult::ControlCompacted(status);
+                }
+                Some(InteractiveControl::Reset(reply)) => {
+                    let previous = history.snapshot().clone();
+                    history.replace(Vec::new());
+                    let result = persist_history(
+                        self.params.session_id.as_ref().unwrap().id(),
+                        history.snapshot().clone(),
+                    )
+                    .await;
+                    if result.is_err() {
+                        history.replace_snapshot(previous);
+                    }
+                    let _ = reply.send(result);
+                }
+                Some(InteractiveControl::IsolatedTurn {
+                    question,
+                    images,
+                    output,
+                    cancel,
+                }) => {
+                    let config = match self.config(&context).await {
+                        Ok(config) => config,
+                        Err(error) => {
+                            let _ =
+                                output.send(agent::isolated_turn::IsolatedTurnEvent::Error(error));
+                            return BackendResult::ControlFailed;
+                        }
+                    };
+                    let instructions =
+                        agent::load_instructions(&config.context.cwd().to_string_lossy());
+                    let slots = self.setup.slots.current().await;
+                    let (trigger, combined) = CancelToken::new();
+                    let cancellation = smol::spawn({
+                        let actor_cancel = context.cancel.clone();
+                        async move {
+                            future::or(cancel.cancelled(), actor_cancel.cancelled()).await;
+                            trigger.cancel();
+                        }
+                    });
+                    agent::isolated_turn::run_isolated_turn(
+                        agent::isolated_turn::IsolatedTurnRequest {
+                            provider: Arc::clone(&config.provider),
+                            model: config.model.clone(),
+                            history: history.as_slice().to_vec(),
+                            system: self.system(&config, &instructions, &slots),
+                            question,
+                            images,
+                            session_id: self.params.session_id.clone(),
+                            cancel: combined,
+                        },
+                        output,
+                    )
+                    .await;
+                    cancellation.cancel().await;
+                }
+                None => return BackendResult::ControlFailed,
+            }
+            BackendResult::ControlDone
+        })
+    }
+
+    fn run_compact<'a>(
+        &'a mut self,
+        history: &'a mut History,
+        context: TurnContext,
+        instructions: Option<&'a str>,
+    ) -> BoxFuture<'a, BackendResult> {
+        Box::pin(async move {
+            let result = self
+                .compact(history, &context, instructions, &context.cancel)
+                .await;
+            match compaction_result(result) {
+                Ok(()) => BackendResult::CompactDone,
+                Err(message) => {
+                    let _ = self
+                        .event_sender(&context)
+                        .send(AgentEvent::ControlError { message });
+                    BackendResult::ControlFailed
+                }
+            }
+        })
+    }
+}
+
+fn compaction_result(event: ManualCompactionEvent) -> Result<(), String> {
+    match event {
+        ManualCompactionEvent::Completed => Ok(()),
+        ManualCompactionEvent::Failed(error) => Err(error),
+        ManualCompactionEvent::Cancelled => Err(COMPACTION_CANCELLED.into()),
+        ManualCompactionEvent::Started => unreachable!(),
+    }
+}
+
 async fn settle_manual_compaction<P, F>(
     compacted: Result<(), String>,
     history: &mut History,
-    previous: Vec<Message>,
+    previous: crate::agent::HistorySnapshot,
     cancel: &CancelToken,
     persist: P,
 ) -> ManualCompactionEvent
@@ -432,910 +860,317 @@ where
     };
     match result {
         Ok(()) => ManualCompactionEvent::Completed,
-        Err(_) if cancel.is_cancelled() => {
-            history.replace(previous);
-            ManualCompactionEvent::Cancelled
-        }
         Err(error) => {
-            history.replace(previous);
-            ManualCompactionEvent::Failed(error)
+            history.replace_snapshot(previous);
+            if cancel.is_cancelled() {
+                ManualCompactionEvent::Cancelled
+            } else {
+                ManualCompactionEvent::Failed(error)
+            }
         }
     }
 }
 
-async fn persist_history(session_id: MakiId, history: &[Message]) -> Result<(), String> {
-    crate::session_coordinator::SessionCoordinatorHandle::resolve(session_id)
+async fn persist_history(
+    session_id: MakiId,
+    history: crate::agent::HistorySnapshot,
+) -> Result<(), String> {
+    SessionCoordinatorHandle::resolve(session_id)
         .map_err(|error| error.to_string())?
-        .replace_history(history.to_vec())
+        .persist_history(history)
         .await
         .map_err(|error| error.to_string())
 }
 
-async fn checkpoint_and_forward_terminal(
-    committer: Option<crate::session_coordinator::SessionLeaseCommitter>,
-    session_id: MakiId,
-    history: &[Message],
-    timeout: std::time::Duration,
-    terminal: Option<Envelope>,
-    raw_tx: &flume::Sender<Envelope>,
-    run_id: u64,
-) -> Result<(), String> {
-    let commit = match committer {
-        Some(committer) => Some(
-            committer
-                .begin_history_commit(history.to_vec(), Some(timeout))
-                .await,
-        ),
-        None => None,
-    };
-    let result = match commit {
-        Some(Ok(commit)) => commit.wait().await.map_err(|error| error.to_string()),
-        Some(Err(error)) => Err(error.to_string()),
-        None => persist_history(session_id, history).await,
-    };
-    match &result {
-        Ok(()) => {
-            if let Some(terminal) = terminal {
-                let _ = raw_tx.send(terminal);
-            }
-        }
-        Err(error) => {
-            let _ = EventSender::new(raw_tx.clone(), run_id).send(AgentEvent::ControlError {
-                message: format!("failed to checkpoint completed turn: {error}"),
-            });
-        }
-    }
-    result
+struct ManagedLifetime {
+    manager: AgentManagerHandle,
+    root: RootReadiness,
+    cleanup: Option<OffloadCleanup>,
+    children: Arc<CancelMap<String>>,
 }
 
-fn current_interactive_settings(
-    model_source: &impl crate::ModelSource,
-    session_id: MakiId,
-) -> Option<crate::RunSettings> {
-    use crate::session_options::{
-        ENABLED_VALUE, FAST_OPTION_ID, THINKING_OPTION_ID, WORKFLOW_OPTION_ID,
-    };
-
-    let (provider, model) = model_source.current()?;
-    let options = SessionCoordinatorHandle::resolve(session_id)
-        .ok()?
-        .read()
-        .options();
-    let enabled = |id: &str| {
-        options
-            .options
-            .iter()
-            .find(|option| option.definition.id.as_ref() == id)
-            .is_some_and(|option| option.current_value.as_ref() == ENABLED_VALUE)
-    };
-    let thinking = options
-        .options
-        .iter()
-        .find(|option| option.definition.id.as_ref() == THINKING_OPTION_ID)
-        .and_then(|option| option.current_value.parse().ok())
-        .unwrap_or_default();
-    Some(crate::RunSettings {
-        provider,
-        model,
-        fast: enabled(FAST_OPTION_ID),
-        workflow: enabled(WORKFLOW_OPTION_ID),
-        thinking,
-    })
-}
-
-enum InteractiveWake {
-    Input(Box<QueuedInput>),
-    Control(InteractiveControl),
-}
-
-async fn collect_turn_events(
-    turn_event_rx: Receiver<Envelope>,
-    raw_tx: flume::Sender<Envelope>,
-) -> Option<Envelope> {
-    while let Ok(envelope) = turn_event_rx.recv_async().await {
-        if envelope.subagent.is_none() && matches!(envelope.event, AgentEvent::TurnOutcome(_)) {
-            return Some(envelope);
+impl Drop for ManagedLifetime {
+    fn drop(&mut self) {
+        self.root.finish(Err(INITIALIZATION_CLOSED.into()));
+        self.children.cancel_all();
+        if let Some(cleanup) = &self.cleanup {
+            cleanup.request();
         }
-        let _ = raw_tx.send(envelope);
-    }
-    None
-}
-
-fn admit_pending_inputs(
-    pending_rx: &Receiver<AgentInput>,
-    admission_sender: &InteractiveInputSender,
-    settings: &crate::RunSettings,
-    ready: &std::sync::Mutex<bool>,
-) {
-    let mut ready = ready.lock().unwrap_or_else(|error| error.into_inner());
-    *admission_sender
-        .fallback_settings
-        .lock()
-        .unwrap_or_else(|error| error.into_inner()) = Some(settings.clone());
-    while let Ok(input) = pending_rx.try_recv() {
-        let _ = admission_sender.send_with_settings(input, settings.clone());
-    }
-    *ready = true;
-}
-
-async fn receive_wake_and_refresh(
-    input_rx: &Receiver<QueuedInput>,
-    control_rx: &Receiver<InteractiveControl>,
-    shared_model: &crate::SharedModel,
-    provider: &mut Arc<dyn Provider>,
-    model: &mut Model,
-) -> Option<InteractiveWake> {
-    let wake = if let Ok(control) = control_rx.try_recv() {
-        Some(InteractiveWake::Control(control))
-    } else {
-        future::or(
-            async {
-                input_rx
-                    .recv_async()
-                    .await
-                    .map(|input| InteractiveWake::Input(Box::new(input)))
-            },
-            async { control_rx.recv_async().await.map(InteractiveWake::Control) },
-        )
-        .await
-        .ok()
-    };
-    use crate::ModelSource;
-    if let Some((current_provider, current_model)) = shared_model.current()
-        && (current_model.spec() != model.spec() || !Arc::ptr_eq(&current_provider, provider))
-    {
-        *provider = current_provider;
-        *model = current_model;
-    }
-    wake
-}
-
-async fn apply_interactive_control(
-    control: InteractiveControl,
-    context: InteractiveControlContext<'_>,
-) {
-    let InteractiveControlContext {
-        session_id,
-        history,
-        model,
-        provider,
-        raw_tx,
-        run_id,
-        config,
-    } = context;
-    let result = match &control {
-        InteractiveControl::Compact(_) => {
-            let previous = history.as_slice().to_vec();
-            match agent::compact(
-                provider,
-                model,
-                history,
-                &EventSender::new(raw_tx.clone(), run_id),
-                &CancelToken::none(),
-                config,
-                None,
-                Some(&SessionRef::from(session_id)),
-            )
-            .await
-            {
-                Ok(()) => persist_history(session_id, history.as_slice())
-                    .await
-                    .inspect_err(|_| history.replace(previous)),
-                Err(error) => Err(error.to_string()),
-            }
-        }
-        InteractiveControl::ManualCompaction { .. } => {
-            Err("manual compaction was not intercepted by the session loop".into())
-        }
-        InteractiveControl::Reset(_) => {
-            let previous = history.as_slice().to_vec();
-            history.replace(Vec::new());
-            persist_history(session_id, history.as_slice())
-                .await
-                .inspect_err(|_| history.replace(previous))
-        }
-        InteractiveControl::ChangeDirectory { .. } | InteractiveControl::SettleDirectory { .. } => {
-            Err("directory adoption was not intercepted by the session loop".into())
-        }
-        InteractiveControl::IsolatedTurn { .. } => {
-            Err("isolated turn was not intercepted by the session loop".into())
-        }
-    };
-    match control {
-        InteractiveControl::Compact(reply) | InteractiveControl::Reset(reply) => {
-            let _ = reply.send(result);
-        }
-        InteractiveControl::ChangeDirectory { reply, .. }
-        | InteractiveControl::SettleDirectory { reply, .. } => {
-            let _ = reply.send(Err(
-                "directory adoption was not intercepted by the session loop".into(),
-            ));
-        }
-        InteractiveControl::ManualCompaction { .. } | InteractiveControl::IsolatedTurn { .. } => {}
+        let manager = self.manager.clone();
+        smol::spawn(async move {
+            manager.shutdown(GRAPH_SHUTDOWN_TIMEOUT).await;
+        })
+        .detach();
     }
 }
 
-pub fn interactive_directory_adopter(
-    control_tx: flume::Sender<InteractiveControl>,
-) -> Arc<dyn crate::session_coordinator::DirectoryAdopter> {
-    struct Adopter {
-        control_tx: flume::Sender<InteractiveControl>,
-    }
+#[cfg(test)]
+struct RemoveOffloadOnDrop(OffloadCleanup);
 
-    impl crate::session_coordinator::DirectoryAdopter for Adopter {
-        fn adopt(&self, path: PathBuf) -> crate::session_coordinator::DirectoryAdoptionFuture {
-            let control_tx = self.control_tx.clone();
-            Box::pin(async move {
-                let (reply, response) = flume::bounded(1);
-                control_tx
-                    .send_async(InteractiveControl::ChangeDirectory { path, reply })
-                    .await
-                    .map_err(|_| Arc::from("session ended before directory adoption"))?;
-                response
-                    .recv_async()
-                    .await
-                    .map_err(|_| Arc::from("session ended during directory adoption"))?
-                    .map_err(Arc::from)
-            })
-        }
-
-        fn settle(
-            &self,
-            path: PathBuf,
-            _committed: bool,
-        ) -> crate::session_coordinator::DirectoryAdoptionFuture {
-            let control_tx = self.control_tx.clone();
-            Box::pin(async move {
-                let (reply, response) = flume::bounded(1);
-                control_tx
-                    .send_async(InteractiveControl::SettleDirectory { path, reply })
-                    .await
-                    .map_err(|_| Arc::from("session ended before directory settlement"))?;
-                response
-                    .recv_async()
-                    .await
-                    .map_err(|_| Arc::from("session ended during directory settlement"))?
-                    .map_err(Arc::from)
-            })
-        }
-    }
-
-    Arc::new(Adopter { control_tx })
-}
-
-struct QueuedInput {
-    input: AgentInput,
-    settings: crate::RunSettings,
-    prepared: (String, RequestTools, agent::Instructions),
-    admission: agent::TurnAdmissionSnapshot,
-}
-
-#[derive(Clone)]
-pub struct InteractiveInputSender {
-    tx: flume::Sender<QueuedInput>,
-    pending_tx: flume::Sender<AgentInput>,
-    ready: Arc<std::sync::Mutex<bool>>,
-    fallback_settings: Arc<std::sync::Mutex<Option<crate::RunSettings>>>,
-    mirror: Option<flume::Sender<AgentInput>>,
-    model: crate::SharedModel,
-    session_id: MakiId,
-    cwd: Arc<std::sync::Mutex<PathBuf>>,
-    config: AgentConfig,
-    excluded_tools: Vec<&'static str>,
-    modes: Arc<crate::ModeRegistry>,
-    prompt_slots: Arc<ResolvedSlots>,
-    system_prompt_override: Option<String>,
-    append_system_prompt: Option<String>,
-    mcp_handle: Option<McpHandle>,
-    local_tools: LocalTools,
-}
-
-impl InteractiveInputSender {
-    pub fn with_input_mirror(mut self, mirror: flume::Sender<AgentInput>) -> Self {
-        self.mirror = Some(mirror);
-        self
-    }
-
-    pub fn send(&self, input: AgentInput) -> Result<(), flume::SendError<Box<AgentInput>>> {
-        if let Some(mirror) = &self.mirror {
-            return mirror
-                .send(input)
-                .map_err(|error| flume::SendError(Box::new(error.0)));
-        }
-        let ready = self.ready.lock().unwrap_or_else(|error| error.into_inner());
-        if !*ready {
-            return self
-                .pending_tx
-                .send(input)
-                .map_err(|error| flume::SendError(Box::new(error.0)));
-        }
-        let Some(settings) =
-            current_interactive_settings(&self.model, self.session_id).or_else(|| {
-                self.fallback_settings
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .clone()
-            })
-        else {
-            return Err(flume::SendError(Box::new(input)));
-        };
-        self.send_with_settings(input, settings)
-    }
-
-    fn send_with_settings(
-        &self,
-        mut input: AgentInput,
-        settings: crate::RunSettings,
-    ) -> Result<(), flume::SendError<Box<AgentInput>>> {
-        input.fast = settings.fast;
-        input.workflow = settings.workflow;
-        input.thinking = settings.thinking;
-        let cwd = self
-            .cwd
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone();
-        let vars = template::env_vars_for(&cwd);
-        let instructions = agent::load_instructions(&cwd.to_string_lossy());
-        let tools = RequestTools::build(
-            ToolRegistry::global(),
-            &vars,
-            &settings.model,
-            &self.config,
-            &self.excluded_tools,
-            input.workflow,
-            self.mcp_handle.is_some(),
-        );
-        let mode_def = match &input.mode {
-            AgentMode::Custom(id) => self.modes.get(id).map(Arc::new),
-            _ => Some(Arc::new(self.modes.current(&input.mode))),
-        };
-        let mut system = self.system_prompt_override.clone().unwrap_or_else(|| {
-            mode_def.as_ref().map_or_else(
-                || {
-                    agent::build_system_prompt(
-                        &vars,
-                        &self.modes,
-                        &input.mode,
-                        &instructions.text,
-                        &self.prompt_slots,
-                    )
-                },
-                |definition| {
-                    agent::build_system_prompt_with_def(
-                        &vars,
-                        definition,
-                        &input.mode,
-                        &instructions.text,
-                        &self.prompt_slots,
-                    )
-                },
-            )
-        });
-        if let Some(append) = &self.append_system_prompt {
-            system.push('\n');
-            system.push_str(append);
-        }
-        let prepared = (system, tools, instructions);
-        let mcp = self
-            .mcp_handle
-            .clone()
-            .map(|handle| McpSession::new(handle, &[]));
-        let admission = agent::TurnAdmissionSnapshot {
-            mode_def,
-            prompt_inputs: None,
-            bindings: Arc::new(crate::tools::TurnToolBindings::capture(
-                ToolRegistry::global(),
-                &self.local_tools,
-                mcp.as_ref(),
-            )),
-            mcp_startup_notice: mcp.as_ref().and_then(|mcp| {
-                let count = mcp.connecting_count();
-                (count > 0).then_some(count)
-            }),
-        };
-        self.tx
-            .send(QueuedInput {
-                input,
-                settings,
-                prepared,
-                admission,
-            })
-            .map_err(|error| flume::SendError(Box::new(error.0.input)))
+#[cfg(test)]
+impl Drop for RemoveOffloadOnDrop {
+    fn drop(&mut self) {
+        self.0.request();
     }
 }
 
-pub struct InteractiveHandle {
-    pub event_rx: Receiver<Envelope>,
-    pub tool_names: Vec<String>,
-    pub input_tx: InteractiveInputSender,
-    pub answer_tx: flume::Sender<String>,
-    pub cancel_tx: flume::Sender<()>,
-    pub model_tx: flume::Sender<Model>,
-    pub control_tx: flume::Sender<InteractiveControl>,
-    /// Install a model here to change it. A running turn keeps its admitted
-    /// model. The new model applies when the next turn wakes.
-    pub model: crate::SharedModel,
-    pub session_id: SessionRef,
-    pub mailbox: SessionMailbox,
-    pub permissions: Arc<PermissionManager>,
-    pub task: smol::Task<()>,
+async fn drain_offload(cleanup: Option<&OffloadCleanup>) {
+    if let Some(cleanup) = cleanup {
+        cleanup.request();
+        let _ = cleanup.wait().await;
+    }
 }
 
-pub type ProviderPreparation = Box<
-    dyn FnOnce(
-            Model,
-            Timeouts,
-        ) -> provider::BoxFuture<
-            'static,
-            Result<(Model, Arc<dyn Provider>), crate::AgentError>,
-        > + Send,
->;
-
-pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
-    spawn_interactive_with_preparation(
-        params,
-        Box::new(|mut model, timeouts| {
-            Box::pin(async move {
-                let provider = provider::from_model_async(&mut model, timeouts).await?;
-                Ok((model, Arc::from(provider)))
-            })
-        }),
-    )
+fn session_offload(state_dir: Option<&Path>, session: &SessionRef) -> Option<Arc<OffloadStore>> {
+    state_dir.map(|root| Arc::new(OffloadStore::for_session(root, session)))
 }
 
-pub fn spawn_interactive_with_preparation(
+pub fn spawn_interactive_with_binding(
     params: InteractiveParams,
     prepare: ProviderPreparation,
+    history: Option<crate::agent::HistorySnapshot>,
+    binding: Option<RootBinding>,
 ) -> InteractiveHandle {
-    let initial_tools = RequestTools::build(
+    let session_ref = params
+        .session_id
+        .clone()
+        .unwrap_or_else(|| SessionRef::from(MakiId::generate()));
+    let mailbox = SessionMailbox::new(session_ref.id());
+    let manager = AgentManagerHandle::new(AgentLimits {
+        max_concurrent_agent_turns: params.config.max_concurrent_agent_turns.max(1),
+        ..AgentLimits::default()
+    })
+    .expect("headless agent limits are valid");
+    let root = RootReadiness::default();
+    let model = crate::SharedModel::default();
+    let (guard, events) = crate::types::event_stream();
+    let raw_tx = guard.tx().clone();
+    let (lifetime_tx, lifetime_rx) = flume::unbounded();
+    let input_tx = InteractiveInputSender {
+        admitter: TurnAdmitter {
+            root: root.clone(),
+            events: raw_tx.clone(),
+            next: Arc::new(AtomicU64::new(0)),
+        },
+        _lifetime: lifetime_tx,
+    };
+    let control_tx = InteractiveControlSender {
+        root: root.clone(),
+        next: Arc::new(AtomicU64::new(0)),
+    };
+    let (answer_tx, answer_rx) = flume::unbounded();
+    let mut permission_config = params.permissions_config.clone();
+    permission_config.yolo |= params.yolo;
+    let permissions = Arc::new(PermissionManager::new(
+        permission_config,
+        params.initial_wd.clone(),
+        params.project_config.clone(),
+        Arc::clone(&params.plugin_rules),
+    ));
+    let offload = session_offload(params.state_dir.as_deref(), &session_ref);
+    let cleanup = offload
+        .as_ref()
+        .map(|store| OffloadCleanup::new(Arc::clone(store)));
+    let children = Arc::new(CancelMap::new());
+    let lifetime = ManagedLifetime {
+        manager: manager.clone(),
+        root: root.clone(),
+        cleanup: cleanup.clone(),
+        children: Arc::clone(&children),
+    };
+    let tools = RequestTools::build(
         ToolRegistry::global(),
-        &template::env_vars(),
+        &template::env_vars_for(&params.initial_wd),
         &params.model,
         &params.config,
         &params.excluded_tools,
         params.defaults.workflow,
         params.mcp_handle.is_some(),
     );
-
     let mcp = params
         .mcp_handle
         .clone()
-        .map(|h| McpSession::new(h, &params.initial_history));
-    let tool_names = advertised_tool_names(initial_tools.definitions(), mcp.as_ref());
-
-    let (guard, events) = crate::types::event_stream();
-    let raw_tx = guard.tx().clone();
-    let event_rx = events.into_receiver();
-    let (input_tx, input_rx) = flume::unbounded::<QueuedInput>();
-    let (pending_tx, pending_rx) = flume::unbounded::<AgentInput>();
-    let input_ready = Arc::new(std::sync::Mutex::new(false));
-    let (answer_tx, answer_rx) = flume::unbounded::<String>();
-    let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
-    let (model_tx, model_rx) = flume::unbounded::<Model>();
-    let (control_tx, control_rx) = flume::unbounded::<InteractiveControl>();
-
-    let (session_id, session_ref) = match params.session_id.clone() {
-        Some(w) => (w.id(), w),
-        None => {
-            let id = MakiId::generate();
-            (id, SessionRef::from(id))
-        }
-    };
-    let mailbox = SessionMailbox::new(session_id);
-    let handle_mailbox = mailbox.clone();
-    // Seeded by the task once its provider exists; until then it reports no
-    // change, which is what an unstarted session should say.
-    let shared_model = crate::SharedModel::default();
-    let handle_model = shared_model.clone();
-
-    let working_dir = params.initial_wd.to_string_lossy().into_owned();
-    let admission_cwd = Arc::new(std::sync::Mutex::new(PathBuf::from(&working_dir)));
-    let input_tx = InteractiveInputSender {
-        tx: input_tx.clone(),
-        pending_tx,
-        ready: Arc::clone(&input_ready),
-        fallback_settings: Arc::new(std::sync::Mutex::new(None)),
-        mirror: None,
-        model: shared_model.clone(),
-        session_id,
-        cwd: Arc::clone(&admission_cwd),
-        config: params.config.clone(),
-        excluded_tools: params.excluded_tools.clone(),
-        modes: Arc::clone(&params.modes),
-        prompt_slots: Arc::clone(&params.prompt_slots),
-        system_prompt_override: params.system_prompt_override.clone(),
-        append_system_prompt: params.append_system_prompt.clone(),
-        mcp_handle: params.mcp_handle.clone(),
-        local_tools: Arc::clone(&params.local_tools),
-    };
-    let admission_sender = input_tx.clone();
-    let mut permissions_config = params.permissions_config.clone();
-    permissions_config.yolo |= params.yolo;
-    let permissions = Arc::new(PermissionManager::new(
-        permissions_config,
-        params.initial_wd,
-        params.project_config,
-        Arc::clone(&params.plugin_rules),
-    ));
-    let modes = Arc::clone(&params.modes);
-
-    let answer_rx = Arc::new(Mutex::new(answer_rx));
-    let file_tracker = FileReadTracker::fresh();
-    let file_write_locks = Arc::new(crate::tools::FileWriteLocks::new());
-    let offload = session_offload(params.state_dir.as_deref(), &session_ref);
-
-    let session_ref_clone = session_ref.clone();
+        .map(|handle| McpSession::new(handle, &params.initial_history));
+    let tool_names = advertised_tool_names(tools.definitions(), mcp.as_ref());
+    let offload_cleanup = cleanup.clone();
     let task = smol::spawn({
+        let manager = manager.clone();
+        let root = root.clone();
+        let model_source = model.clone();
         let permissions = Arc::clone(&permissions);
-        let file_write_locks = Arc::clone(&file_write_locks);
-        let _stream_guard = guard;
+        let mailbox = mailbox.clone();
+        let session_ref = session_ref.clone();
         async move {
-            let (mut model, mut provider) = match prepare(params.model, params.timeouts).await {
-                Ok(prepared) => prepared,
-                Err(e) => {
-                    error!(error = %e, "provider error");
-                    let _ = EventSender::new(raw_tx, 0).send(AgentEvent::ControlError {
-                        message: e.user_message(),
-                    });
-                    return;
-                }
-            };
-            shared_model.install(Arc::clone(&provider), model.clone());
-            let settings = loop {
-                if let Some(settings) = current_interactive_settings(&shared_model, session_id) {
-                    break settings;
-                }
-                smol::future::yield_now().await;
-            };
-            admit_pending_inputs(&pending_rx, &admission_sender, &settings, &input_ready);
-
-            let mut history = History::restored(params.initial_history);
-            let mut working_dir = PathBuf::from(working_dir);
-            let permissions = permissions;
-            let agent_id = AgentId::generate();
-            let mut run_id: u64 = 0;
-            let mut directory_pending = false;
-
-            loop {
-                let wake = if directory_pending {
-                    control_rx
-                        .recv_async()
-                        .await
-                        .ok()
-                        .map(InteractiveWake::Control)
-                } else {
-                    receive_wake_and_refresh(
-                        &input_rx,
-                        &control_rx,
-                        &shared_model,
-                        &mut provider,
-                        &mut model,
-                    )
+            let _lifetime = lifetime;
+            let initialized = async {
+                let (model, provider) = prepare(params.model.clone(), params.timeouts)
                     .await
-                };
-                let queued = match wake {
-                    Some(InteractiveWake::Input(input)) => *input,
-                    Some(InteractiveWake::Control(InteractiveControl::ChangeDirectory {
-                        path,
-                        reply,
-                    })) => {
-                        let result = path
-                            .canonicalize()
-                            .and_then(|canonical| {
-                                if canonical.is_dir() {
-                                    Ok(canonical)
-                                } else {
-                                    Err(std::io::Error::new(
-                                        std::io::ErrorKind::NotADirectory,
-                                        "path is not a directory",
-                                    ))
-                                }
-                            })
-                            .map_err(|error| error.to_string());
-                        directory_pending = result.is_ok();
-                        let _ = reply.send(result);
-                        continue;
-                    }
-                    Some(InteractiveWake::Control(InteractiveControl::SettleDirectory {
-                        path,
-                        reply,
-                    })) => {
-                        working_dir = path.clone();
-                        *admission_cwd
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner()) = path.clone();
-                        permissions.set_cwd(path.clone());
-                        directory_pending = false;
-                        let _ = reply.send(Ok(path));
-                        continue;
-                    }
-                    Some(InteractiveWake::Control(InteractiveControl::ManualCompaction {
-                        instructions,
-                        output,
-                        cancel,
-                        lease_committer,
-                    })) => {
-                        let _ = output.send(ManualCompactionEvent::Started);
-                        let previous = history.as_slice().to_vec();
-                        let (private_tx, _private_rx) = flume::unbounded();
-                        let result = agent::compact(
-                            &*provider,
-                            &model,
-                            &mut history,
-                            &EventSender::new(private_tx, run_id),
-                            &cancel,
-                            &params.config,
-                            instructions.as_deref(),
-                            Some(&session_ref_clone),
-                        )
-                        .await
-                        .map_err(|error| error.to_string());
-                        let terminal = settle_manual_compaction(
-                            result,
-                            &mut history,
-                            previous,
-                            &cancel,
-                            |compacted| async move {
-                                match lease_committer {
-                                    Some(committer) => committer
-                                        .commit_history(compacted)
-                                        .await
-                                        .map_err(|error| error.to_string()),
-                                    None => persist_history(session_id, &compacted).await,
-                                }
-                            },
-                        )
-                        .await;
-                        let _ = output.send(terminal);
-                        continue;
-                    }
-                    Some(InteractiveWake::Control(InteractiveControl::IsolatedTurn {
-                        question,
-                        images,
-                        output,
-                        cancel,
-                    })) => {
-                        let vars = template::env_vars_for(&working_dir);
-                        let instructions = agent::load_instructions(&working_dir.to_string_lossy());
-                        let mut system =
-                            params.system_prompt_override.clone().unwrap_or_else(|| {
-                                agent::build_system_prompt(
-                                    &vars,
-                                    &modes,
-                                    &AgentMode::Build,
-                                    &instructions.text,
-                                    &params.prompt_slots,
-                                )
-                            });
-                        if let Some(append) = &params.append_system_prompt {
-                            system.push('\n');
-                            system.push_str(append);
-                        }
-                        agent::isolated_turn::run_isolated_turn(
-                            agent::isolated_turn::IsolatedTurnRequest {
-                                provider: Arc::clone(&provider),
-                                model: model.clone(),
-                                history: history.as_slice().to_vec(),
-                                system,
-                                question,
-                                images,
-                                session_id: Some(SessionRef::from(session_id)),
-                                cancel,
-                            },
-                            output,
-                        )
-                        .await;
-                        continue;
-                    }
-                    Some(InteractiveWake::Control(control)) => {
-                        apply_interactive_control(
-                            control,
-                            InteractiveControlContext {
-                                session_id,
-                                history: &mut history,
-                                model: &model,
-                                provider: &*provider,
-                                raw_tx: &raw_tx,
-                                run_id,
-                                config: &params.config,
-                            },
-                        )
-                        .await;
-                        continue;
-                    }
-                    None => break,
-                };
-                let QueuedInput {
-                    mut input,
-                    settings,
-                    prepared,
-                    admission,
-                } = queued;
-                let turn_id = TurnId::generate();
-                let lease_committer = input.lease_committer.clone();
-                let operation_cancel = input.cancel.clone();
-                let (cancel_task, cancel) = match operation_cancel {
-                    Some(cancel) => (None, cancel),
-                    None => {
-                        let (trigger, cancel) = CancelToken::new();
-                        let cancel_rx = cancel_rx.clone();
-                        let task = smol::spawn(async move {
-                            if cancel_rx.recv_async().await.is_ok() {
-                                trigger.cancel();
-                            }
-                        });
-                        (Some(task), cancel)
-                    }
-                };
-
-                let (turn_event_tx, turn_event_rx) = flume::unbounded::<Envelope>();
-                let terminal_task = smol::spawn(collect_turn_events(turn_event_rx, raw_tx.clone()));
-                let event_tx = EventSender::new(turn_event_tx.clone(), run_id);
-                let error_tx = EventSender::new(raw_tx.clone(), run_id);
-
-                if let Some(mut new_model) = model_rx
-                    .try_iter()
-                    .last()
-                    .filter(|candidate| params.model_policy.allows(&candidate.spec()))
-                    && new_model.spec() != model.spec()
-                {
-                    match provider::from_model_async(&mut new_model, params.timeouts).await {
-                        Ok(p) => {
-                            provider = Arc::from(p);
-                            model = new_model;
-                            // The run reads the shared source, so an adoption
-                            // that stops here is discarded.
-                            shared_model.install(Arc::clone(&provider), model.clone());
-                        }
-                        Err(e) => {
-                            error!(error = %e, agent_id = %agent_id, %turn_id, "provider error");
-                            let outcome = TurnOutcome::failed(
-                                agent_id,
-                                turn_id,
-                                TokenUsage::default(),
-                                0,
-                                TurnFailure::from_agent_error(&e),
-                            );
-                            if let Err(send_error) = error_tx.send(AgentEvent::TurnOutcome(outcome))
-                            {
-                                error!(
-                                    %send_error,
-                                    agent_id = %agent_id,
-                                    %turn_id,
-                                    "terminal outcome delivery failed"
-                                );
-                            }
-                            if let Some(cancel_task) = cancel_task {
-                                cancel_task.cancel().await;
-                            }
-                            run_id += 1;
-                            continue;
-                        }
-                    }
-                }
-
-                provider = settings.provider;
-                model = settings.model;
-                input.fast = settings.fast;
-                input.workflow = settings.workflow;
-                input.thinking = settings.thinking;
-
-                let (system, tools, turn_instructions) = prepared;
-
-                while answer_rx.lock().await.try_recv().is_ok() {}
-
-                let mut agent = Agent::new(
-                    AgentParams {
-                        agent_id,
+                    .map_err(|error| error.user_message())?;
+                model_source.install(Arc::clone(&provider), model.clone());
+                let config = EffectiveAgentConfig::new(
+                    RunSettings {
                         provider: Arc::clone(&provider),
                         model: model.clone(),
-                        config: params.config.clone(),
+                        fast: params.defaults.fast,
+                        workflow: params.defaults.workflow,
+                        thinking: params.defaults.thinking.into(),
+                    },
+                    AgentMode::Build,
+                )
+                .with_context(AgentContextSnapshot::new(params.initial_wd.clone()))
+                .with_mode_def(Some(params.modes.current(&AgentMode::Build)));
+                let backend = HeadlessBackend {
+                    params: AgentParams {
+                        agent_id: crate::AgentId::generate(),
+                        provider,
+                        model,
+                        config: params.config,
                         tool_output_lines: ToolOutputLines::default(),
-                        permissions: Arc::clone(&permissions),
-                        session_id: Some(session_ref_clone.clone()),
-                        mailbox: Some(mailbox.clone()),
+                        permissions,
+                        session_id: Some(session_ref.clone()),
+                        mailbox: Some(mailbox),
                         timeouts: params.timeouts,
-                        file_tracker: Arc::clone(&file_tracker),
-                        prompt_slots: Arc::clone(&params.prompt_slots),
-                        modes: Arc::clone(&modes),
-                        subagent_cancels: Arc::new(CancelMap::new()),
-                        ledger: Arc::new(RunLedger::default()),
+                        file_tracker: FileReadTracker::fresh(),
+                        prompt_slots: Arc::default(),
+                        modes: Arc::clone(&params.modes),
+                        subagent_cancels: children,
                         registry: Arc::clone(ToolRegistry::global_arc()),
                         audience: ToolAudience::MAIN,
                         question_mode: params.question_mode,
-                        model_policy: Arc::clone(&params.model_policy),
-                        file_write_locks: Arc::clone(&file_write_locks),
-                        offload: offload.clone(),
+                        model_policy: params.model_policy,
+                        file_write_locks: Arc::new(crate::tools::FileWriteLocks::new()),
+                        offload,
                         managed_turn: None,
                     },
-                    AgentRunParams {
-                        history: &mut history,
-                        system,
-                        event_tx,
-                        tools: tools.clone(),
+                    excluded_tools: params.excluded_tools,
+                    system_override: params.system_prompt_override,
+                    append_system: params.append_system_prompt,
+                    setup: TurnSetup {
+                        registry: Arc::clone(ToolRegistry::global_arc()),
+                        local_tools: Arc::clone(&params.local_tools),
+                        mcp: mcp.clone(),
+                        slots: params.prompt_slots,
+                        modes: Arc::clone(&params.modes),
+                        instructions: true,
                     },
-                )
-                .with_loaded_instructions(turn_instructions.loaded)
-                .with_user_response_rx(Arc::clone(&answer_rx))
-                .with_cancel(cancel)
-                .with_local_tools(Arc::clone(&params.local_tools))
-                .with_mcp(mcp.clone())
-                .with_admission(Some(admission));
-
-                let outcome = agent.run(turn_id, input).await;
-                drop(agent);
-                drop(turn_event_tx);
-                if let Some(cancel_task) = cancel_task {
-                    cancel_task.cancel().await;
+                    local_tools: params.local_tools,
+                    mcp,
+                    answer_rx: params.answers.then(|| Arc::new(Mutex::new(answer_rx))),
+                    raw_tx: raw_tx.clone(),
+                    root: root.clone(),
+                };
+                let mut template = backend.template(&config);
+                let mirror =
+                    history.map(|snapshot| Arc::new(arc_swap::ArcSwap::from_pointee(snapshot)));
+                let initial_history = mirror
+                    .as_ref()
+                    .map(|mirror| mirror.load().messages.as_ref().clone())
+                    .unwrap_or(params.initial_history);
+                let (start, started) = flume::bounded(1);
+                let reference = manager
+                    .create_root_deferred_with_config(
+                        Some(config),
+                        initial_history,
+                        mirror,
+                        |agent_id| {
+                            let mut backend = backend;
+                            backend.params.agent_id = agent_id;
+                            Ok::<Box<dyn ActorBackend>, String>(Box::new(backend))
+                        },
+                        started,
+                    )
+                    .map_err(|error| error.to_string())?;
+                template.execution_agent_id = Some(reference.id());
+                if let Some(binding) = binding {
+                    binding(manager.clone(), reference.clone(), template).await?;
                 }
-                let terminal = terminal_task.await;
-
-                if let TurnOutcome::Failed { failure, .. } = &outcome {
-                    error!(error = %failure.user_message, "agent error");
-                }
-                if let Err(error) = checkpoint_and_forward_terminal(
-                    lease_committer,
-                    session_id,
-                    history.as_slice(),
-                    params.timeouts.low_speed,
-                    terminal,
-                    &raw_tx,
-                    run_id,
-                )
-                .await
-                {
-                    error!(%error, %session_id, "failed to checkpoint completed turn");
-                }
-                run_id += 1;
+                root.finish(Ok(reference.clone()));
+                start
+                    .send(())
+                    .map_err(|_| INITIALIZATION_CLOSED.to_owned())?;
+                Ok::<_, String>(reference)
             }
-
+            .await;
+            match initialized {
+                Ok(_) => {
+                    let _ = lifetime_rx.recv_async().await;
+                }
+                Err(message) => {
+                    root.finish(Err(message.clone()));
+                    let _ = EventSender::new(raw_tx).send(AgentEvent::ControlError { message });
+                }
+            }
+            manager.shutdown(GRAPH_SHUTDOWN_TIMEOUT).await;
             if let Some(handle) = params.mcp_handle {
                 handle.shutdown().await;
             }
-            drop(_stream_guard);
+            drain_offload(cleanup.as_ref()).await;
+            drop(guard);
         }
     });
-
     InteractiveHandle {
-        event_rx,
+        manager,
+        root,
+        event_rx: events.into_receiver(),
         tool_names,
         input_tx,
         answer_tx,
-        cancel_tx,
-        model_tx,
         control_tx,
-        model: handle_model,
+        model,
         session_id: session_ref,
-        mailbox: handle_mailbox,
+        mailbox,
         permissions,
+        offload_cleanup,
         task,
     }
+}
+
+fn advertised_tool_names(tools: &Value, mcp: Option<&McpSession>) -> Vec<String> {
+    let mut probe = tools.clone();
+    if let Some(mcp) = mcp {
+        mcp.extend_tools(&mut probe);
+    }
+    extract_tool_names(&probe)
 }
 
 fn extract_tool_names(tools: &Value) -> Vec<String> {
     tools
         .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|t| t["name"].as_str().map(String::from))
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(String::from))
                 .collect()
         })
         .unwrap_or_default()
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::actor::{ActorEvent, ConfigChange, ConfigPatch, PreparedModel};
+    use crate::session_coordinator::{SessionCoordinatorParams, builtin_option_definitions};
     use crate::tools::offload::{OffloadBackend, OffloadError};
+    use crate::{ModeRegistry, TurnOutcome};
+    use maki_providers::{ContentBlock, Role, StopReason, StreamResponse, TokenUsage};
+    use maki_storage::checkpoint::{
+        CheckpointAck, CheckpointError, CheckpointFuture, CheckpointRequest, CheckpointWriter,
+        accept_all,
+    };
     use maki_storage::sessions::{SESSIONS_DIR, offload_dir};
     use std::io;
-    use std::time::Duration;
     use test_case::test_case;
 
     const GATE_TIMEOUT: Duration = Duration::from_secs(10);
     const HEADLESS_PROVIDER_ERROR: &str = "headless provider failed";
     const SAVED_OUTPUT: &str = "saved output";
+    const SAVE_ERROR: &str = "save failed";
+    const FIRST: &str = "first provider";
+    const SECOND: &str = "second provider";
+    const TEST_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+    const TEST_CWD: &str = "/tmp";
+    type Checkpoint = Arc<dyn CheckpointWriter<crate::session_coordinator::SessionCheckpoint>>;
+    type RecordedRequest = (&'static str, String, String, bool);
 
     #[derive(Clone, Copy)]
     enum ProviderExit {
@@ -1345,8 +1180,20 @@ mod tests {
 
     struct GatedHeadlessProvider {
         entered: flume::Sender<()>,
-        release: flume::Receiver<()>,
+        release: Receiver<()>,
         exit: ProviderExit,
+    }
+
+    fn response(text: &str) -> StreamResponse {
+        StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text { text: text.into() }],
+                ..Default::default()
+            },
+            usage: TokenUsage::default(),
+            stop_reason: Some(StopReason::EndTurn),
+        }
     }
 
     impl Provider for GatedHeadlessProvider {
@@ -1357,27 +1204,14 @@ mod tests {
             _: &'a str,
             _: &'a Value,
             _: &'a flume::Sender<maki_providers::ProviderEvent>,
-            _: maki_providers::RequestOptions,
+            _: RequestOptions,
             _: Option<&'a SessionRef>,
-        ) -> maki_providers::provider::BoxFuture<
-            'a,
-            Result<maki_providers::StreamResponse, crate::AgentError>,
-        > {
+        ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
             Box::pin(async move {
                 self.entered.send_async(()).await.unwrap();
                 self.release.recv_async().await.unwrap();
                 match self.exit {
-                    ProviderExit::Success => Ok(maki_providers::StreamResponse {
-                        message: Message {
-                            role: maki_providers::Role::Assistant,
-                            content: vec![maki_providers::ContentBlock::Text {
-                                text: SAVED_OUTPUT.into(),
-                            }],
-                            ..Default::default()
-                        },
-                        usage: TokenUsage::default(),
-                        stop_reason: Some(maki_providers::StopReason::EndTurn),
-                    }),
+                    ProviderExit::Success => Ok(response(SAVED_OUTPUT)),
                     ProviderExit::Pending => std::future::pending().await,
                 }
             })
@@ -1385,49 +1219,711 @@ mod tests {
 
         fn list_models(
             &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, crate::AgentError>,
-        > {
+        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, crate::AgentError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }
 
-    #[test_case(ProviderExit::Success ; "successful completion")]
-    #[test_case(ProviderExit::Pending ; "cancelled task")]
+    struct RecordingProvider {
+        name: &'static str,
+        requests: flume::Sender<(&'static str, String, String, bool)>,
+    }
+
+    impl Provider for RecordingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            model: &'a Model,
+            _: &'a [Message],
+            system: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<maki_providers::ProviderEvent>,
+            options: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
+            Box::pin(async move {
+                let _ = self
+                    .requests
+                    .send((self.name, model.spec(), system.into(), options.fast));
+                Ok(response(self.name))
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, crate::AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    fn first_input() -> AgentInput {
+        AgentInput::new("hello".into(), Vec::new())
+    }
+
+    /// Spawns a headless session on {provider} and admits its first turn.
+    fn spawn_started(
+        params: InteractiveParams,
+        provider: Result<Arc<dyn Provider>, crate::AgentError>,
+    ) -> InteractiveHandle {
+        let handle = spawn_interactive_with_binding(
+            params,
+            Box::new(move |model, _| {
+                Box::pin(async move { provider.map(|provider| (model, provider)) })
+            }),
+            None,
+            None,
+        );
+        let _ = smol::block_on(handle.input_tx.admit(first_input()));
+        handle
+    }
+
+    fn interactive_params(session_id: MakiId, history: Vec<Message>) -> InteractiveParams {
+        InteractiveParams {
+            model: Model::from_spec(TEST_MODEL).unwrap(),
+            config: AgentConfig::default(),
+            permissions_config: PermissionsConfig::default(),
+            timeouts: Timeouts::default(),
+            prompt_slots: PromptSlotSource::default(),
+            excluded_tools: Vec::new(),
+            mcp_handle: None,
+            initial_wd: PathBuf::from(TEST_CWD),
+            session_id: Some(SessionRef::from(session_id)),
+            initial_history: history,
+            yolo: false,
+            system_prompt_override: Some("admitted system".into()),
+            append_system_prompt: None,
+            defaults: Default::default(),
+            model_policy: Arc::default(),
+            modes: Arc::new(ModeRegistry::builtin()),
+            question_mode: crate::tools::QuestionMode::Headless,
+            plugin_rules: Arc::default(),
+            project_config: ProjectConfig::for_project(Path::new(TEST_CWD)),
+            local_tools: Arc::default(),
+            state_dir: None,
+            answers: true,
+        }
+    }
+
+    pub(crate) fn command_fixture(
+        model: Model,
+        coordinator: SessionCoordinatorHandle,
+    ) -> InteractiveHandle {
+        let (provider, _) = recording();
+        let mut params = interactive_params(coordinator.read().session_id(), Vec::new());
+        params.model = model;
+        let binding = coordinator_binding(coordinator, Arc::clone(&provider));
+        spawn_interactive_with_binding(
+            params,
+            Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) })),
+            None,
+            Some(binding),
+        )
+    }
+
+    fn coordinator_binding(
+        coordinator: SessionCoordinatorHandle,
+        provider: Arc<dyn Provider>,
+    ) -> RootBinding {
+        Box::new(move |_, root, _| {
+            Box::pin(async move {
+                coordinator
+                    .bind_actor(
+                        root,
+                        Arc::new(move |model| {
+                            let provider = Arc::clone(&provider);
+                            Box::pin(async move { Ok(PreparedModel { provider, model }) })
+                        }),
+                        Arc::new(|_| {}),
+                    )
+                    .map_err(|error| error.to_string())
+            })
+        })
+    }
+
+    fn checkpoint() -> Checkpoint {
+        accept_all()
+    }
+
+    fn coordinator(session_id: MakiId, checkpoint: Checkpoint) -> SessionCoordinatorHandle {
+        SessionCoordinatorHandle::register(SessionCoordinatorParams {
+            session_id,
+            catalog: Default::default(),
+            definitions: builtin_option_definitions(
+                Arc::from(TEST_MODEL),
+                [Arc::from(TEST_MODEL)],
+                false,
+                false,
+                false,
+                Default::default(),
+            ),
+            persisted_options: Default::default(),
+            model_policy: Arc::default(),
+            checkpoint,
+            mailbox: SessionMailbox::new(session_id),
+        })
+        .unwrap()
+    }
+
+    fn fixture(
+        history: Vec<Message>,
+        checkpoint: Checkpoint,
+        provider: Arc<dyn Provider>,
+    ) -> (InteractiveHandle, SessionCoordinatorHandle) {
+        let session_id = MakiId::generate();
+        let coordinator = coordinator(session_id, checkpoint);
+        let binding = coordinator_binding(coordinator.clone(), Arc::clone(&provider));
+        let handle = spawn_interactive_with_binding(
+            interactive_params(session_id, history),
+            Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) })),
+            None,
+            Some(binding),
+        );
+        (handle, coordinator)
+    }
+
+    async fn bounded<F: Future>(future: F) -> F::Output {
+        future::or(future, async {
+            smol::Timer::after(GATE_TIMEOUT).await;
+            panic!("headless operation did not settle");
+        })
+        .await
+    }
+
+    fn recording() -> (Arc<dyn Provider>, Receiver<RecordedRequest>) {
+        let (requests, received) = flume::unbounded();
+        (
+            Arc::new(RecordingProvider {
+                name: FIRST,
+                requests,
+            }),
+            received,
+        )
+    }
+
+    #[test]
+    fn terminal_waits_for_checkpoint_then_forwards() {
+        smol::block_on(async {
+            let (seen, received) = flume::bounded(1);
+            let (release, released) = flume::bounded(1);
+            let checkpoint: Checkpoint = Arc::new(
+                move |request: CheckpointRequest<crate::session_coordinator::SessionCheckpoint>| {
+                    let seen = seen.clone();
+                    let released = released.clone();
+                    Box::pin(async move {
+                        seen.send_async(request.snapshot.history.clone().unwrap())
+                            .await
+                            .unwrap();
+                        released.recv_async().await.unwrap();
+                        Ok(CheckpointAck::for_request(&request))
+                    }) as CheckpointFuture
+                },
+            );
+            let (provider, _) = recording();
+            let (handle, coordinator) = fixture(Vec::new(), checkpoint, provider);
+            let root = handle.initialized_root().await.unwrap();
+            let ticket = handle.input_tx.admit(first_input()).await.unwrap();
+            let saved = bounded(received.recv_async()).await.unwrap();
+            assert!(saved.messages.len() >= 2);
+            assert!(ticket.peek_result().is_none());
+            assert!(
+                !handle
+                    .event_rx
+                    .try_iter()
+                    .any(|event| matches!(event.event, AgentEvent::TurnOutcome(_)))
+            );
+            release.send_async(()).await.unwrap();
+            assert!(matches!(
+                bounded(ticket.wait()).await,
+                TurnOutcome::Completed { .. }
+            ));
+            let mut terminals = 0;
+            while let Ok(event) = handle.event_rx.try_recv() {
+                if let AgentEvent::TurnOutcome(outcome) = event.event {
+                    assert_eq!(outcome.agent_id(), root.id());
+                    terminals += 1;
+                }
+            }
+            assert_eq!(terminals, 1);
+            assert!(ticket.peek_result().is_some());
+            handle.task.cancel().await;
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test_case(false, SAVE_ERROR ; "checkpoint_failure_fails_the_turn_once")]
+    #[test_case(true, TERMINAL_CHECKPOINT_TIMEOUT ; "hung_checkpoint_times_out_into_one_failure")]
+    fn checkpoint_failure_fails_the_turn_with_its_usage(hang: bool, expected: &str) {
+        smol::block_on(async {
+            let checkpoint: Checkpoint = Arc::new(
+                move |request: CheckpointRequest<crate::session_coordinator::SessionCheckpoint>| {
+                    Box::pin(async move {
+                        if hang {
+                            future::pending::<()>().await;
+                        }
+                        Err(CheckpointError::Save {
+                            session_id: request.session_id,
+                            message: Arc::from(SAVE_ERROR),
+                        })
+                    }) as CheckpointFuture
+                },
+            );
+            let session_id = MakiId::generate();
+            let coordinator = coordinator(session_id, checkpoint);
+            let (provider, _) = recording();
+            let binding = coordinator_binding(coordinator.clone(), Arc::clone(&provider));
+            let mut params = interactive_params(session_id, Vec::new());
+            if hang {
+                params.timeouts.low_speed = Duration::ZERO;
+            }
+            let handle = spawn_interactive_with_binding(
+                params,
+                Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) })),
+                None,
+                Some(binding),
+            );
+            let ticket = handle.input_tx.admit(first_input()).await.unwrap();
+            let settled = bounded(ticket.wait()).await;
+            assert!(
+                matches!(&settled, TurnOutcome::Failed { failure, num_turns, .. }
+                    if failure.user_message.contains(expected) && *num_turns > 0),
+                "{settled:?}"
+            );
+            let terminals: Vec<_> = handle
+                .event_rx
+                .try_iter()
+                .filter(|envelope| {
+                    matches!(
+                        envelope.event,
+                        AgentEvent::TurnOutcome(_) | AgentEvent::ControlError { .. }
+                    )
+                })
+                .collect();
+            assert!(
+                matches!(
+                    terminals.as_slice(),
+                    [Envelope { event: AgentEvent::TurnOutcome(outcome), .. }] if *outcome == settled
+                ),
+                "{terminals:?}"
+            );
+            handle.task.cancel().await;
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test_case(false ; "manual_compaction_persists_before_reporting_success")]
+    #[test_case(true ; "failed_persistence_reports_failure_and_rolls_history_back")]
+    fn managed_manual_compaction(fail: bool) {
+        smol::block_on(async {
+            let original = vec![Message::user("original".into())];
+            let (seen, received) = flume::bounded(1);
+            let (release, released) = flume::bounded(1);
+            let checkpoint: Checkpoint = Arc::new(
+                move |request: CheckpointRequest<crate::session_coordinator::SessionCheckpoint>| {
+                    let seen = seen.clone();
+                    let released = released.clone();
+                    Box::pin(async move {
+                        seen.send_async(()).await.unwrap();
+                        released.recv_async().await.unwrap();
+                        if fail {
+                            Err(CheckpointError::Save {
+                                session_id: request.session_id,
+                                message: Arc::from(SAVE_ERROR),
+                            })
+                        } else {
+                            Ok(CheckpointAck::for_request(&request))
+                        }
+                    }) as CheckpointFuture
+                },
+            );
+            let (provider, _) = recording();
+            let (handle, coordinator) = fixture(original.clone(), checkpoint, provider);
+            let root = handle.initialized_root().await.unwrap();
+            let actor = root.actor().unwrap();
+            let events = actor.subscribe_events();
+            let (output, results) = flume::unbounded();
+            handle
+                .control_tx
+                .send(InteractiveControl::ManualCompaction {
+                    instructions: None,
+                    output,
+                    cancel: CancelToken::none(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                bounded(results.recv_async()).await.unwrap(),
+                ManualCompactionEvent::Started
+            );
+            bounded(received.recv_async()).await.unwrap();
+            assert!(results.is_empty());
+            release.send_async(()).await.unwrap();
+            let terminal = bounded(results.recv_async()).await.unwrap();
+            if fail {
+                assert!(
+                    matches!(terminal, ManualCompactionEvent::Failed(error) if error.contains(SAVE_ERROR))
+                );
+            } else {
+                assert_eq!(terminal, ManualCompactionEvent::Completed);
+            }
+            let ended = bounded(async {
+                loop {
+                    if let ActorEvent::CompactionEnd(status) = events.recv_async().await.unwrap() {
+                        return status;
+                    }
+                }
+            })
+            .await;
+            assert_eq!(
+                ended,
+                if fail {
+                    CompactionStatus::Failed
+                } else {
+                    CompactionStatus::Completed
+                }
+            );
+            bounded(actor.runtime_barrier()).await.unwrap();
+            let transcript = actor
+                .transcript(crate::actor::TranscriptRequest {
+                    through_turn: None,
+                    last_messages: original.len() + 4,
+                    max_bytes: 4096,
+                })
+                .unwrap();
+            assert_eq!(transcript.compacted, !fail);
+            if fail {
+                assert_eq!(actor.committed_message_count(), original.len());
+            }
+            let ticket = handle.input_tx.admit(first_input()).await.unwrap();
+            bounded(received.recv_async()).await.unwrap();
+            release.send_async(()).await.unwrap();
+            bounded(ticket.wait()).await;
+            handle.task.cancel().await;
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test_case(InteractiveControl::Compact ; "compact")]
+    #[test_case(InteractiveControl::Reset ; "reset")]
+    fn control_dropped_on_close_replies_cancelled(
+        control: fn(flume::Sender<Result<(), String>>) -> InteractiveControl,
+    ) {
+        smol::block_on(async {
+            let (seen, received) = flume::bounded(1);
+            let (release, released) = flume::bounded::<()>(1);
+            let checkpoint: Checkpoint = Arc::new(
+                move |request: CheckpointRequest<crate::session_coordinator::SessionCheckpoint>| {
+                    let seen = seen.clone();
+                    let released = released.clone();
+                    Box::pin(async move {
+                        let _ = seen.send_async(()).await;
+                        let _ = released.recv_async().await;
+                        Ok(CheckpointAck::for_request(&request))
+                    }) as CheckpointFuture
+                },
+            );
+            let (provider, _) = recording();
+            let (handle, coordinator) = fixture(Vec::new(), checkpoint, provider);
+            let root = handle.initialized_root().await.unwrap();
+            let _turn = handle.input_tx.admit(first_input()).await.unwrap();
+            bounded(received.recv_async()).await.unwrap();
+            let (reply, replies) = flume::bounded(1);
+            handle.control_tx.send(control(reply)).await.unwrap();
+            root.actor().unwrap().close();
+            assert_eq!(
+                bounded(replies.recv_async()).await.unwrap(),
+                Err(OPERATION_CANCELLED.to_owned())
+            );
+            drop(release);
+            handle.task.cancel().await;
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test_case(false ; "a_failed_compaction_is_never_persisted")]
+    #[test_case(true ; "cancelled_persistence_reports_cancellation_not_failure")]
+    fn unsuccessful_compaction_rolls_back(cancelled: bool) {
+        smol::block_on(async {
+            let previous =
+                crate::agent::HistorySnapshot::new(vec![Message::user("original".into())]);
+            let mut history = History::new(vec![Message::user("compacted".into())]);
+            let (trigger, cancel) = CancelToken::new();
+            if cancelled {
+                trigger.cancel();
+            }
+            let compacted = if cancelled {
+                Ok(())
+            } else {
+                Err(SAVE_ERROR.into())
+            };
+            let event = settle_manual_compaction(
+                compacted,
+                &mut history,
+                previous.clone(),
+                &cancel,
+                |_| async move {
+                    assert!(cancelled, "failed compaction must not persist");
+                    Err(SAVE_ERROR.into())
+                },
+            )
+            .await;
+            assert_eq!(
+                serde_json::to_value(history.as_slice()).unwrap(),
+                serde_json::to_value(previous.messages.as_ref()).unwrap()
+            );
+            assert_eq!(history.snapshot().epoch, previous.epoch);
+            assert_eq!(
+                event,
+                if cancelled {
+                    ManualCompactionEvent::Cancelled
+                } else {
+                    ManualCompactionEvent::Failed(SAVE_ERROR.into())
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn headless_queued_settings_survive_config_change() {
+        smol::block_on(async {
+            let (requests, received) = flume::unbounded();
+            let first: Arc<dyn Provider> = Arc::new(RecordingProvider {
+                name: FIRST,
+                requests: requests.clone(),
+            });
+            let (handle, coordinator) = fixture(Vec::new(), checkpoint(), first);
+            let root = handle.initialized_root().await.unwrap();
+            let actor = root.actor().unwrap();
+            let first = handle.input_tx.admit(first_input()).await.unwrap();
+            let update = actor.reserve_prepared_operation(None).unwrap();
+            update
+                .commit_when_ready(Some(ConfigChange::Patch(ConfigPatch {
+                    model: Some(PreparedModel {
+                        provider: Arc::new(RecordingProvider {
+                            name: SECOND,
+                            requests,
+                        }),
+                        model: Model::from_spec("anthropic/claude-opus-4-8").unwrap(),
+                    }),
+                    fast: Some(true),
+                    workflow: Some(true),
+                    ..Default::default()
+                })))
+                .await
+                .unwrap();
+            let second = handle.input_tx.admit(first_input()).await.unwrap();
+            bounded(first.wait()).await;
+            bounded(second.wait()).await;
+            let before = bounded(received.recv_async()).await.unwrap();
+            let after = bounded(received.recv_async()).await.unwrap();
+            assert_eq!(
+                before,
+                (
+                    FIRST,
+                    TEST_MODEL.to_owned(),
+                    "admitted system".into(),
+                    false
+                )
+            );
+            assert_eq!(
+                after,
+                (
+                    SECOND,
+                    "anthropic/claude-opus-4-8".into(),
+                    "admitted system".into(),
+                    true
+                )
+            );
+            assert!(received.is_empty());
+            handle.task.cancel().await;
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn reset_is_ordered_after_active_turn() {
+        smol::block_on(async {
+            let (entered, received) = flume::bounded(1);
+            let (release, released) = flume::bounded(1);
+            let provider = Arc::new(GatedHeadlessProvider {
+                entered,
+                release: released,
+                exit: ProviderExit::Success,
+            });
+            let (handle, coordinator) = fixture(Vec::new(), checkpoint(), provider);
+            let primary = handle.input_tx.admit(first_input()).await.unwrap();
+            bounded(received.recv_async()).await.unwrap();
+            let (reply, response) = flume::bounded(1);
+            handle
+                .control_tx
+                .send(InteractiveControl::Reset(reply))
+                .await
+                .unwrap();
+            assert!(response.is_empty());
+            release.send_async(()).await.unwrap();
+            bounded(primary.wait()).await;
+            bounded(response.recv_async()).await.unwrap().unwrap();
+            let root = handle.initialized_root().await.unwrap();
+            assert_eq!(root.actor().unwrap().committed_message_count(), 0);
+            handle.task.cancel().await;
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn queued_compaction_cancellation_does_not_wait_for_active_turn() {
+        smol::block_on(async {
+            let (entered, received) = flume::bounded(1);
+            let (_release, released) = flume::bounded(1);
+            let provider = Arc::new(GatedHeadlessProvider {
+                entered,
+                release: released,
+                exit: ProviderExit::Pending,
+            });
+            let (handle, coordinator) = fixture(Vec::new(), checkpoint(), provider);
+            let primary = handle.input_tx.admit(first_input()).await.unwrap();
+            bounded(received.recv_async()).await.unwrap();
+            let (trigger, cancel) = CancelToken::new();
+            let (output, events) = flume::unbounded();
+            handle
+                .control_tx
+                .send(InteractiveControl::ManualCompaction {
+                    instructions: None,
+                    output,
+                    cancel,
+                })
+                .await
+                .unwrap();
+            trigger.cancel();
+            assert_eq!(
+                bounded(events.recv_async()).await.unwrap(),
+                ManualCompactionEvent::Cancelled
+            );
+            assert!(primary.peek().is_none());
+            let root = handle.initialized_root().await.unwrap();
+            root.cancel().unwrap();
+            assert!(matches!(
+                bounded(primary.wait()).await,
+                TurnOutcome::Cancelled { .. }
+            ));
+            assert!(received.is_empty());
+            handle.task.cancel().await;
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn binding_precedes_first_admission() {
+        const DISPATCHED_INPUT: &str = "expanded command prompt";
+        smol::block_on(async {
+            let (provider, received) = recording();
+            let (bound, binding_seen) = flume::bounded(1);
+            let session_id = MakiId::generate();
+            let coordinator = coordinator(session_id, checkpoint());
+            let bind_actor = coordinator_binding(coordinator.clone(), Arc::clone(&provider));
+            let mut params = interactive_params(session_id, Vec::new());
+            params.config.max_concurrent_agent_turns = 1;
+            let handle = spawn_interactive_with_binding(
+                params,
+                Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) })),
+                None,
+                Some(Box::new(move |manager, root, template| {
+                    Box::pin(async move {
+                        assert_eq!(manager.root_id().unwrap(), root.id());
+                        assert_eq!(manager.limits().max_concurrent_agent_turns, 1);
+                        assert_eq!(template.mode, AgentMode::Build);
+                        assert_eq!(template.execution_agent_id, Some(root.id()));
+                        assert_eq!(template.cwd, PathBuf::from(TEST_CWD));
+                        assert!(template.managed_turn.is_none());
+                        bound.send_async(root.id()).await.unwrap();
+                        bind_actor(manager, root, template).await
+                    })
+                })),
+            );
+            let root = handle.initialized_root().await.unwrap();
+            assert_eq!(binding_seen.recv_async().await.unwrap(), root.id());
+            assert!(received.is_empty());
+            let InteractiveHandle {
+                input_tx,
+                event_rx,
+                manager,
+                task,
+                ..
+            } = handle;
+            let ticket = input_tx
+                .admit(AgentInput::new(DISPATCHED_INPUT.into(), Vec::new()))
+                .await
+                .unwrap();
+            assert!(matches!(
+                bounded(ticket.wait()).await,
+                TurnOutcome::Completed { .. }
+            ));
+            assert_eq!(received.len(), 1);
+            drop(input_tx);
+            bounded(task).await;
+            let inputs = event_rx
+                .try_iter()
+                .filter_map(|envelope| match envelope.event {
+                    AgentEvent::QueueItemConsumed { text, .. } => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(inputs, [DISPATCHED_INPUT]);
+            assert!(
+                !manager
+                    .snapshot()
+                    .iter()
+                    .any(|node| node.graph_lifecycle == crate::GraphLifecycle::Live)
+            );
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test_case(ProviderExit::Success ; "successful_completion")]
+    #[test_case(ProviderExit::Pending ; "cancelled_task")]
     fn headless_offload_cleanup_covers_task_exit(exit: ProviderExit) {
         let state = tempfile::tempdir().unwrap();
-        let mut params = test_params();
+        let session_id = MakiId::generate();
+        let mut params = interactive_params(session_id, Vec::new());
         params.state_dir = Some(state.path().to_path_buf());
         let (entered, received) = flume::bounded(1);
         let (release, released) = flume::bounded(1);
-        let handle = spawn_with_provider(
+        let handle = spawn_started(
             params,
-            Arc::new(GatedHeadlessProvider {
+            Ok(Arc::new(GatedHeadlessProvider {
                 entered,
                 release: released,
                 exit,
-            }),
-        )
-        .unwrap();
+            })),
+        );
+        let InteractiveHandle {
+            input_tx,
+            event_rx,
+            task,
+            offload_cleanup,
+            ..
+        } = handle;
         received.recv_timeout(GATE_TIMEOUT).unwrap();
-        let dir = offload_dir(&state.path().join(SESSIONS_DIR), handle.session_id.id());
+        let dir = offload_dir(&state.path().join(SESSIONS_DIR), session_id);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("saved.txt"), SAVED_OUTPUT).unwrap();
-        let cleanup = handle.offload_cleanup.unwrap();
+        let cleanup = offload_cleanup.unwrap();
         match exit {
             ProviderExit::Pending => {
-                smol::block_on(handle.task.cancel());
+                smol::block_on(task.cancel());
             }
             ProviderExit::Success => {
                 release.send(()).unwrap();
-                while let Ok(envelope) = handle.event_rx.recv() {
-                    if matches!(envelope.event, AgentEvent::StreamClosed) {
-                        assert!(!dir.exists(), "stream close must follow cleanup");
-                        break;
+                let mut input_tx = Some(input_tx);
+                while let Ok(event) = event_rx.recv() {
+                    match event.event {
+                        AgentEvent::TurnOutcome(_) => drop(input_tx.take()),
+                        AgentEvent::StreamClosed => {
+                            assert!(!dir.exists());
+                            break;
+                        }
+                        _ => {}
                     }
                 }
-                smol::block_on(handle.task);
+                smol::block_on(task);
             }
         }
         smol::block_on(cleanup.wait()).unwrap();
@@ -1436,7 +1932,7 @@ mod tests {
 
     struct GatedGuardRemoval {
         entered: flume::Sender<()>,
-        release: flume::Receiver<()>,
+        release: Receiver<()>,
     }
 
     impl OffloadBackend for GatedGuardRemoval {
@@ -1486,20 +1982,18 @@ mod tests {
         let dir = offload_dir(&state.path().join(SESSIONS_DIR), session_id);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("saved.txt"), SAVED_OUTPUT).unwrap();
-        let mut params = test_params();
+        let mut params = interactive_params(session_id, Vec::new());
         params.state_dir = Some(state.path().to_path_buf());
-        let handle = spawn_initialized(
+        let handle = spawn_started(
             params,
-            session_id,
-            Some(Err(crate::AgentError::Config {
+            Err(crate::AgentError::Config {
                 message: HEADLESS_PROVIDER_ERROR.into(),
-            })),
-        )
-        .unwrap();
+            }),
+        );
         let mut saw_error = false;
         let mut saw_close = false;
-        while let Ok(envelope) = handle.event_rx.recv() {
-            match envelope.event {
+        while let Ok(event) = handle.event_rx.recv() {
+            match event.event {
                 AgentEvent::ControlError { message } => {
                     assert!(message.contains(HEADLESS_PROVIDER_ERROR));
                     saw_error = true;
@@ -1509,923 +2003,22 @@ mod tests {
                     saw_close = true;
                     break;
                 }
-                _ => (),
+                _ => {}
             }
         }
-        assert!(saw_error);
-        assert!(saw_close);
+        assert!(saw_error && saw_close);
         smol::block_on(handle.task);
         smol::block_on(handle.offload_cleanup.unwrap().wait()).unwrap();
-        assert!(!dir.exists());
-    }
-
-    fn test_params() -> HeadlessParams {
-        HeadlessParams {
-            model: Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
-            config: AgentConfig::default(),
-            permissions_config: PermissionsConfig::default(),
-            timeouts: Timeouts::default(),
-            input: AgentInput {
-                message: "hello".into(),
-                mode: AgentMode::Build,
-                images: Vec::new(),
-                preamble: Vec::new(),
-                thinking: Default::default(),
-                fast: false,
-                workflow: false,
-                prompt: None,
-                cancel: None,
-                lease_committer: None,
-            },
-            prompt_slots: ResolvedSlots::default(),
-            excluded_tools: Vec::new(),
-            mcp_handle: None,
-            initial_wd: PathBuf::from("/tmp"),
-            system_prompt_override: None,
-            append_system_prompt: None,
-            model_policy: Arc::default(),
-            plugin_rules: Arc::default(),
-            project_config: ProjectConfig::for_project(Path::new("/tmp")),
-            modes: Arc::default(),
-            session_options: Default::default(),
-            state_dir: None,
-        }
-    }
-
-    /// A print-mode run needs a coordinator like any other session: tools read
-    /// their options through one, and `SessionMailbox::notify` resolves through
-    /// one. Without it every option read fails with `session not live` and
-    /// `bash` cannot run at all.
-    #[test]
-    fn spawn_registers_a_resolvable_coordinator() {
-        let handle = spawn(test_params()).unwrap();
-
-        let session_id = handle.session_id.id();
-        let coordinator = SessionCoordinatorHandle::resolve(session_id)
-            .expect("print mode must register a coordinator for its session");
-        assert_eq!(coordinator.read().session_id(), session_id);
-        // The mailbox the coordinator hands out must be the one the run polls,
-        // or notifications land nowhere.
-        SessionMailbox::notify(session_id, "ping".into(), true)
-            .expect("notify resolves through the registered coordinator");
-
-        smol::block_on(handle.task.cancel());
-        let _ = futures_lite::future::block_on(coordinator.close());
-    }
-
-    #[test]
-    fn spawn_stops_when_coordinator_registration_fails() {
-        let session_id = MakiId::generate();
-        let existing = SessionCoordinatorHandle::register(SessionCoordinatorParams {
-            session_id,
-            catalog: Default::default(),
-            definitions: Vec::new(),
-            persisted_options: Default::default(),
-            history: Vec::new(),
-            model: Arc::from("test"),
-            cwd: PathBuf::from("/tmp"),
-            model_policy: Arc::default(),
-            model_adopter: Arc::new(|_| {
-                Box::pin(async { Ok(()) }) as crate::session_coordinator::ModelAdoptionFuture
-            }),
-            directory_adopter: Arc::new(|path| {
-                Box::pin(async move { Ok(path) })
-                    as crate::session_coordinator::DirectoryAdoptionFuture
-            }),
-            checkpoint: Arc::new(
-                |request: maki_storage::checkpoint::CheckpointRequest<
-                    crate::session_coordinator::SessionCheckpoint,
-                >| {
-                    Box::pin(async move {
-                        Ok(maki_storage::checkpoint::CheckpointAck {
-                            session_id: request.session_id,
-                            version: request.version,
-                        })
-                    }) as maki_storage::checkpoint::CheckpointFuture
-                },
-            ),
-            mailbox: SessionMailbox::new(session_id),
-        })
-        .unwrap();
-
-        let error = match spawn_with_session_id(test_params(), session_id) {
-            Ok(_) => panic!("duplicate coordinator registration succeeded"),
-            Err(error) => error,
-        };
-        assert_eq!(
-            error,
-            crate::session_coordinator::SessionCoordinatorError::DuplicateSession(session_id)
-        );
-        futures_lite::future::block_on(existing.close()).unwrap();
-    }
-
-    /// `/compact` reports success only when the compacted history is durable.
-    /// These pin the order: nothing reports `Completed` unless the persist step
-    /// ran first and returned `Ok`, and every other path rolls the in-memory
-    /// history back to what it was before the compaction.
-    fn as_json(messages: &[Message]) -> Value {
-        serde_json::to_value(messages).unwrap()
-    }
-
-    type PersistLog = Arc<std::sync::Mutex<Vec<Vec<Message>>>>;
-
-    struct CompactionFixture {
-        history: History,
-        previous: Vec<Message>,
-        persisted: PersistLog,
-    }
-
-    fn compaction_fixture() -> CompactionFixture {
-        CompactionFixture {
-            history: History::new(vec![Message::user("compacted".into())]),
-            previous: vec![Message::user("original".into())],
-            persisted: Arc::new(std::sync::Mutex::new(Vec::new())),
-        }
-    }
-
-    #[test]
-    fn manual_compaction_persists_before_reporting_success() {
-        smol::block_on(async {
-            let CompactionFixture {
-                mut history,
-                previous,
-                persisted,
-            } = compaction_fixture();
-            let terminal = settle_manual_compaction(
-                Ok(()),
-                &mut history,
-                previous,
-                &CancelToken::none(),
-                |compacted| {
-                    let persisted = Arc::clone(&persisted);
-                    async move {
-                        persisted.lock().unwrap().push(compacted);
-                        Ok(())
-                    }
-                },
-            )
-            .await;
-
-            assert_eq!(terminal, ManualCompactionEvent::Completed);
-            let persisted = persisted.lock().unwrap();
-            assert_eq!(persisted.len(), 1, "persistence must run exactly once");
-            assert_eq!(
-                as_json(&persisted[0]),
-                as_json(&[Message::user("compacted".into())]),
-                "the compacted history is what must reach persistence"
-            );
-            assert_eq!(
-                as_json(history.as_slice()),
-                as_json(&[Message::user("compacted".into())])
-            );
-        });
-    }
-
-    #[test]
-    fn failed_persistence_reports_failure_and_rolls_history_back() {
-        smol::block_on(async {
-            let CompactionFixture {
-                mut history,
-                previous,
-                ..
-            } = compaction_fixture();
-            let terminal = settle_manual_compaction(
-                Ok(()),
-                &mut history,
-                previous.clone(),
-                &CancelToken::none(),
-                |_| async { Err("save failed".to_owned()) },
-            )
-            .await;
-
-            assert_eq!(
-                terminal,
-                ManualCompactionEvent::Failed("save failed".to_owned()),
-                "a compaction nobody saved must not report success"
-            );
-            assert_eq!(as_json(history.as_slice()), as_json(&previous));
-        });
-    }
-
-    #[test]
-    fn a_failed_compaction_is_never_persisted() {
-        smol::block_on(async {
-            let CompactionFixture {
-                mut history,
-                previous,
-                persisted,
-            } = compaction_fixture();
-            let terminal = settle_manual_compaction(
-                Err("provider failed".to_owned()),
-                &mut history,
-                previous.clone(),
-                &CancelToken::none(),
-                |compacted| {
-                    let persisted = Arc::clone(&persisted);
-                    async move {
-                        persisted.lock().unwrap().push(compacted);
-                        Ok(())
-                    }
-                },
-            )
-            .await;
-
-            assert_eq!(
-                terminal,
-                ManualCompactionEvent::Failed("provider failed".to_owned())
-            );
-            assert!(
-                persisted.lock().unwrap().is_empty(),
-                "a compaction that failed must not overwrite the saved history"
-            );
-            assert_eq!(as_json(history.as_slice()), as_json(&previous));
-        });
-    }
-
-    #[test]
-    fn cancelled_persistence_reports_cancellation_not_failure() {
-        smol::block_on(async {
-            let CompactionFixture {
-                mut history,
-                previous,
-                ..
-            } = compaction_fixture();
-            let (trigger, cancel) = CancelToken::new();
-            trigger.cancel();
-            let terminal = settle_manual_compaction(
-                Ok(()),
-                &mut history,
-                previous.clone(),
-                &cancel,
-                |_| async { Err("interrupted".to_owned()) },
-            )
-            .await;
-
-            assert_eq!(terminal, ManualCompactionEvent::Cancelled);
-            assert_eq!(as_json(history.as_slice()), as_json(&previous));
-        });
-    }
-
-    struct RecordingProvider {
-        name: &'static str,
-        requests: flume::Sender<(&'static str, String, String, bool)>,
-    }
-
-    impl Provider for RecordingProvider {
-        fn stream_message<'a>(
-            &'a self,
-            model: &'a Model,
-            _: &'a [Message],
-            system: &'a str,
-            _: &'a Value,
-            _: &'a flume::Sender<maki_providers::ProviderEvent>,
-            options: maki_providers::RequestOptions,
-            _: Option<&'a SessionRef>,
-        ) -> maki_providers::provider::BoxFuture<
-            'a,
-            Result<maki_providers::StreamResponse, crate::AgentError>,
-        > {
-            Box::pin(async move {
-                self.requests
-                    .send((self.name, model.spec(), system.into(), options.fast))
-                    .unwrap();
-                Ok(maki_providers::StreamResponse {
-                    message: Message {
-                        role: maki_providers::Role::Assistant,
-                        content: vec![maki_providers::ContentBlock::Text {
-                            text: self.name.into(),
-                        }],
-                        ..Default::default()
-                    },
-                    usage: TokenUsage::default(),
-                    stop_reason: Some(maki_providers::StopReason::EndTurn),
-                })
-            })
-        }
-
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, crate::AgentError>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
-        }
-    }
-
-    struct TestProvider;
-
-    impl maki_providers::provider::Provider for TestProvider {
-        fn stream_message<'a>(
-            &'a self,
-            _: &'a Model,
-            _: &'a [Message],
-            _: &'a str,
-            _: &'a Value,
-            _: &'a flume::Sender<maki_providers::ProviderEvent>,
-            _: maki_providers::RequestOptions,
-            _: Option<&'a SessionRef>,
-        ) -> maki_providers::provider::BoxFuture<
-            'a,
-            Result<maki_providers::StreamResponse, crate::AgentError>,
-        > {
-            Box::pin(std::future::pending())
-        }
-
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, crate::AgentError>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
-        }
-    }
-
-    #[test]
-    fn turn_event_collection_finishes_with_retained_sender() {
-        smol::block_on(async {
-            let (turn_tx, turn_rx) = flume::unbounded();
-            let retained_tx = turn_tx.clone();
-            let (raw_tx, raw_rx) = flume::unbounded();
-            let run_id = 17;
-            let outcome = TurnOutcome::completed(
-                AgentId::generate(),
-                TurnId::generate(),
-                TokenUsage::default(),
-                1,
-                crate::DoneReason::EndTurn,
-            );
-            let collector = smol::spawn(collect_turn_events(turn_rx, raw_tx));
-
-            turn_tx
-                .send(Envelope {
-                    event: AgentEvent::TextDelta {
-                        text: "before terminal".into(),
-                    },
-                    subagent: None,
-                    run_id,
-                })
-                .unwrap();
-            turn_tx
-                .send(Envelope {
-                    event: AgentEvent::TurnOutcome(outcome.clone()),
-                    subagent: None,
-                    run_id,
-                })
-                .unwrap();
-            drop(turn_tx);
-
-            let terminal = collector
-                .await
-                .expect("root outcome must finish collection");
-            assert_eq!(terminal.run_id, run_id);
-            assert!(terminal.subagent.is_none());
-            assert!(matches!(terminal.event, AgentEvent::TurnOutcome(got) if got == outcome));
-            assert!(matches!(
-                raw_rx.recv_async().await.unwrap(),
-                Envelope {
-                    event: AgentEvent::TextDelta { text },
-                    subagent: None,
-                    run_id: got_run_id,
-                } if text == "before terminal" && got_run_id == run_id
-            ));
-            assert!(
-                retained_tx
-                    .send(Envelope {
-                        event: AgentEvent::TextDelta {
-                            text: "retained".into(),
-                        },
-                        subagent: None,
-                        run_id,
-                    })
-                    .is_err()
-            );
-        });
-    }
-
-    #[test]
-    fn terminal_waits_for_checkpoint_then_forwards() {
-        smol::block_on(async {
-            let session_id = MakiId::generate();
-            let (checkpoint_seen_tx, checkpoint_seen_rx) = flume::bounded(1);
-            let (release_tx, release_rx) = flume::bounded(1);
-            let checkpoint: Arc<
-                dyn maki_storage::checkpoint::CheckpointWriter<
-                        crate::session_coordinator::SessionCheckpoint,
-                    >,
-            > = Arc::new(
-                move |request: maki_storage::checkpoint::CheckpointRequest<
-                    crate::session_coordinator::SessionCheckpoint,
-                >| {
-                    let checkpoint_seen_tx = checkpoint_seen_tx.clone();
-                    let release_rx = release_rx.clone();
-                    Box::pin(async move {
-                        let history = request
-                            .snapshot
-                            .history
-                            .as_ref()
-                            .expect("history commits include history")
-                            .as_ref()
-                            .clone();
-                        checkpoint_seen_tx.send_async(history).await.unwrap();
-                        release_rx.recv_async().await.unwrap();
-                        Ok(maki_storage::checkpoint::CheckpointAck {
-                            session_id: request.session_id,
-                            version: request.version,
-                        })
-                    }) as maki_storage::checkpoint::CheckpointFuture
-                },
-            );
-            let coordinator = SessionCoordinatorHandle::register(SessionCoordinatorParams {
-                session_id,
-                catalog: Default::default(),
-                definitions: builtin_option_definitions(
-                    "test/model",
-                    [Arc::from("test/model")],
-                    false,
-                    false,
-                    false,
-                    Default::default(),
-                ),
-                persisted_options: Default::default(),
-                history: Vec::new(),
-                model: Arc::from("test/model"),
-                cwd: PathBuf::from("/project"),
-                model_policy: Arc::default(),
-                model_adopter: Arc::new(|_| {
-                    Box::pin(async { Ok(()) }) as crate::session_coordinator::ModelAdoptionFuture
-                }),
-                directory_adopter: Arc::new(|path| {
-                    Box::pin(async move { Ok(path) })
-                        as crate::session_coordinator::DirectoryAdoptionFuture
-                }),
-                checkpoint,
-                mailbox: SessionMailbox::new(session_id),
-            })
-            .unwrap();
-            let lease = coordinator.acquire_lease().await.unwrap();
-            let committer = lease.committer().unwrap();
-            let outcome = TurnOutcome::completed(
-                AgentId::generate(),
-                TurnId::generate(),
-                TokenUsage::default(),
-                1,
-                crate::DoneReason::EndTurn,
-            );
-            let terminal = Envelope {
-                event: AgentEvent::TurnOutcome(outcome.clone()),
-                subagent: None,
-                run_id: 0,
-            };
-            let (raw_tx, raw_rx) = flume::unbounded();
-            let history = vec![Message::user("first".into())];
-            let checkpoint_task = smol::spawn({
-                let history = history.clone();
-                async move {
-                    checkpoint_and_forward_terminal(
-                        Some(committer),
-                        session_id,
-                        &history,
-                        std::time::Duration::from_secs(1),
-                        Some(terminal),
-                        &raw_tx,
-                        0,
-                    )
-                    .await
-                }
-            });
-
-            let checkpoint_history = checkpoint_seen_rx.recv_async().await.unwrap();
-            assert_eq!(as_json(&checkpoint_history), as_json(&history));
-            assert!(raw_rx.is_empty());
-
-            release_tx.send_async(()).await.unwrap();
-            assert!(checkpoint_task.await.is_ok());
-            let forwarded = raw_rx.recv_async().await.unwrap();
-            assert!(
-                matches!(forwarded.event, AgentEvent::TurnOutcome(got) if got == outcome)
-                    && forwarded.subagent.is_none()
-                    && forwarded.run_id == 0
-            );
-            assert_eq!(
-                as_json(coordinator.read().history().as_ref()),
-                as_json(&history)
-            );
-            drop(lease);
-
-            let next = coordinator.acquire_lease().await.unwrap();
-            assert_eq!(as_json(next.read().history().as_ref()), as_json(&history));
-            drop(next);
-            coordinator.close().await.unwrap();
-        });
-    }
-
-    #[test]
-    fn checkpoint_failure_after_terminal_is_forwarded_to_frontend() {
-        smol::block_on(async {
-            const SAVE_ERROR: &str = "save failed";
-
-            let session_id = MakiId::generate();
-            let checkpoint: Arc<
-                dyn maki_storage::checkpoint::CheckpointWriter<
-                        crate::session_coordinator::SessionCheckpoint,
-                    >,
-            > = Arc::new(
-                |request: maki_storage::checkpoint::CheckpointRequest<
-                    crate::session_coordinator::SessionCheckpoint,
-                >| {
-                    Box::pin(async move {
-                        Err(maki_storage::checkpoint::CheckpointError::Save {
-                            session_id: request.session_id,
-                            message: Arc::from(SAVE_ERROR),
-                        })
-                    }) as maki_storage::checkpoint::CheckpointFuture
-                },
-            );
-            let coordinator = SessionCoordinatorHandle::register(SessionCoordinatorParams {
-                session_id,
-                catalog: Default::default(),
-                definitions: builtin_option_definitions(
-                    "test/model",
-                    [Arc::from("test/model")],
-                    false,
-                    false,
-                    false,
-                    Default::default(),
-                ),
-                persisted_options: Default::default(),
-                history: Vec::new(),
-                model: Arc::from("test/model"),
-                cwd: PathBuf::from("/project"),
-                model_policy: Arc::default(),
-                model_adopter: Arc::new(|_| {
-                    Box::pin(async { Ok(()) }) as crate::session_coordinator::ModelAdoptionFuture
-                }),
-                directory_adopter: Arc::new(|path| {
-                    Box::pin(async move { Ok(path) })
-                        as crate::session_coordinator::DirectoryAdoptionFuture
-                }),
-                checkpoint,
-                mailbox: SessionMailbox::new(session_id),
-            })
-            .unwrap();
-            let outcome = TurnOutcome::completed(
-                AgentId::generate(),
-                TurnId::generate(),
-                TokenUsage::default(),
-                1,
-                crate::DoneReason::EndTurn,
-            );
-            let terminal = Envelope {
-                event: AgentEvent::TurnOutcome(outcome.clone()),
-                subagent: None,
-                run_id: 7,
-            };
-            let (raw_tx, raw_rx) = flume::unbounded();
-
-            let result = checkpoint_and_forward_terminal(
-                None,
-                session_id,
-                &[Message::user("first".into())],
-                std::time::Duration::from_secs(1),
-                Some(terminal),
-                &raw_tx,
-                7,
-            )
-            .await;
-
-            assert!(result.is_err());
-            assert!(matches!(
-                raw_rx.recv_async().await.unwrap(),
-                Envelope {
-                    event: AgentEvent::ControlError { message },
-                    run_id: 7,
-                    ..
-                } if message.contains(SAVE_ERROR)
-            ));
-            assert!(raw_rx.is_empty());
-            coordinator.close().await.unwrap();
-        });
-    }
-
-    #[test]
-    fn headless_queued_settings_survive_config_change() {
-        const FIRST: &str = "first provider";
-        const SECOND: &str = "second provider";
-        let (requests, received) = flume::unbounded();
-        let params = test_params();
-        let (tx, rx) = flume::unbounded();
-        let (pending_tx, pending_rx) = flume::unbounded();
-        let cwd = Arc::new(std::sync::Mutex::new(params.initial_wd));
-        let sender = InteractiveInputSender {
-            tx,
-            pending_tx: pending_tx.clone(),
-            ready: Arc::new(std::sync::Mutex::new(false)),
-            fallback_settings: Arc::new(std::sync::Mutex::new(None)),
-            mirror: None,
-            model: crate::SharedModel::default(),
-            session_id: MakiId::generate(),
-            cwd: Arc::clone(&cwd),
-            config: params.config,
-            excluded_tools: params.excluded_tools,
-            modes: params.modes,
-            prompt_slots: Arc::new(params.prompt_slots),
-            system_prompt_override: Some("admitted system".into()),
-            append_system_prompt: None,
-            mcp_handle: None,
-            local_tools: Arc::new(Default::default()),
-        };
-        sender.send(test_params().input).unwrap();
-        assert!(rx.is_empty());
-        let pending_input = pending_rx.try_recv().unwrap();
-        assert_eq!(pending_input.message, "hello");
-        let initialized_provider: Arc<dyn Provider> = Arc::new(TestProvider);
-        let initialized_settings = crate::RunSettings {
-            provider: Arc::clone(&initialized_provider),
-            model: Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
-            fast: true,
-            workflow: true,
-            thinking: Default::default(),
-        };
-        sender
-            .fallback_settings
-            .lock()
-            .unwrap()
-            .replace(initialized_settings.clone());
-        pending_tx.send(pending_input).unwrap();
-        admit_pending_inputs(&pending_rx, &sender, &initialized_settings, &sender.ready);
-        sender.send(test_params().input).unwrap();
-        let admitted = rx.recv().unwrap();
-        let ready_admitted = rx.recv().unwrap();
-        assert_eq!(ready_admitted.input.message, "hello");
-        assert!(Arc::ptr_eq(
-            &admitted.settings.provider,
-            &initialized_provider
-        ));
-        assert!(admitted.input.fast && admitted.input.workflow);
-        assert_eq!(admitted.prepared.0, "admitted system");
-        sender
-            .modes
-            .define(crate::ModeDefSpec {
-                name: "build".into(),
-                system_prompt: Some("before".into()),
-                ..Default::default()
-            })
-            .unwrap();
-        let first_provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
-            name: FIRST,
-            requests: requests.clone(),
-        });
-        let first_model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
-        let later_model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
-        sender
-            .send_with_settings(
-                test_params().input,
-                crate::RunSettings {
-                    provider: Arc::clone(&first_provider),
-                    model: first_model,
-                    fast: true,
-                    workflow: true,
-                    thinking: Default::default(),
-                },
-            )
-            .unwrap();
-        *cwd.lock().unwrap() = PathBuf::from("/other");
-        sender
-            .modes
-            .define(crate::ModeDefSpec {
-                name: "build".into(),
-                system_prompt: Some("after".into()),
-                ..Default::default()
-            })
-            .unwrap();
-        sender
-            .send_with_settings(
-                test_params().input,
-                crate::RunSettings {
-                    provider: Arc::new(RecordingProvider {
-                        name: SECOND,
-                        requests,
-                    }),
-                    model: later_model,
-                    fast: false,
-                    workflow: false,
-                    thinking: Default::default(),
-                },
-            )
-            .unwrap();
-
-        let first = rx.recv().unwrap();
-        let second = rx.recv().unwrap();
-        assert!(Arc::ptr_eq(&first.settings.provider, &first_provider));
-        assert!(first.input.fast && first.input.workflow);
-        assert!(!second.input.fast && !second.input.workflow);
-        assert_ne!(first.settings.model.spec(), second.settings.model.spec());
-        assert_eq!(
-            first
-                .admission
-                .mode_def
-                .as_ref()
-                .unwrap()
-                .system_prompt
-                .as_deref(),
-            Some("before")
-        );
-        assert_eq!(
-            second
-                .admission
-                .mode_def
-                .as_ref()
-                .unwrap()
-                .system_prompt
-                .as_deref(),
-            Some("after")
-        );
-        assert_eq!(first.prepared.0, "admitted system");
-        assert_eq!(second.prepared.0, "admitted system");
-        let expected = [
-            (FIRST, first.settings.model.spec(), first.input.fast),
-            (SECOND, second.settings.model.spec(), second.input.fast),
-        ];
-        smol::block_on(async {
-            let params = test_params();
-            let session_id = MakiId::generate();
-            let spec = params.model.spec();
-            let coordinator = SessionCoordinatorHandle::register(SessionCoordinatorParams {
-                session_id,
-                catalog: Default::default(),
-                definitions: builtin_option_definitions(
-                    Arc::from(spec.as_str()),
-                    [Arc::from(spec.as_str())],
-                    false,
-                    false,
-                    false,
-                    Default::default(),
-                ),
-                persisted_options: Default::default(),
-                history: Vec::new(),
-                model: Arc::from(spec.as_str()),
-                cwd: params.initial_wd.clone(),
-                model_policy: Arc::default(),
-                model_adopter: Arc::new(|_| {
-                    Box::pin(async { Ok(()) }) as crate::session_coordinator::ModelAdoptionFuture
-                }),
-                directory_adopter: Arc::new(|path| {
-                    Box::pin(async move { Ok(path) })
-                        as crate::session_coordinator::DirectoryAdoptionFuture
-                }),
-                checkpoint: Arc::new(
-                    |request: maki_storage::checkpoint::CheckpointRequest<
-                        crate::session_coordinator::SessionCheckpoint,
-                    >| {
-                        Box::pin(async move {
-                            Ok(maki_storage::checkpoint::CheckpointAck {
-                                session_id: request.session_id,
-                                version: request.version,
-                            })
-                        }) as maki_storage::checkpoint::CheckpointFuture
-                    },
-                ),
-                mailbox: SessionMailbox::new(session_id),
-            })
-            .unwrap();
-            let handle = spawn_interactive_with_preparation(
-                InteractiveParams {
-                    model: params.model,
-                    config: params.config,
-                    permissions_config: params.permissions_config,
-                    timeouts: params.timeouts,
-                    prompt_slots: Arc::new(params.prompt_slots),
-                    excluded_tools: params.excluded_tools,
-                    mcp_handle: None,
-                    initial_wd: params.initial_wd,
-                    session_id: Some(SessionRef::from(session_id)),
-                    initial_history: Vec::new(),
-                    yolo: false,
-                    system_prompt_override: None,
-                    append_system_prompt: None,
-                    defaults: Default::default(),
-                    model_policy: params.model_policy,
-                    modes: params.modes,
-                    question_mode: crate::tools::QuestionMode::Headless,
-                    plugin_rules: params.plugin_rules,
-                    project_config: params.project_config,
-                    local_tools: Default::default(),
-                    state_dir: None,
-                },
-                Box::new(|model, _| {
-                    Box::pin(
-                        async move { Ok((model, Arc::new(TestProvider) as Arc<dyn Provider>)) },
-                    )
-                }),
-            );
-            handle.input_tx.tx.send(first).unwrap();
-            handle.input_tx.tx.send(second).unwrap();
-            for _ in 0..2 {
-                loop {
-                    let event = smol::future::or(
-                        async { handle.event_rx.recv_async().await.ok() },
-                        async {
-                            smol::Timer::after(std::time::Duration::from_secs(5)).await;
-                            None
-                        },
-                    )
-                    .await
-                    .expect("interactive queued turn did not complete");
-                    match event.event {
-                        AgentEvent::TurnOutcome(outcome) => {
-                            assert!(matches!(outcome, TurnOutcome::Completed { .. }));
-                            break;
-                        }
-                        AgentEvent::ControlError { message } => panic!("{message}"),
-                        _ => {}
-                    }
-                }
-            }
-            handle.task.cancel().await;
-            coordinator.close().await.unwrap();
-        });
-        for (name, model, fast) in expected {
-            assert_eq!(
-                received.try_recv().unwrap(),
-                (name, model, "admitted system".into(), fast)
-            );
-        }
-        assert!(received.try_recv().is_err());
-    }
-
-    #[test]
-    fn wake_refreshes_model_after_idle_wait() {
-        smol::block_on(async {
-            let (_input_tx, input_rx) = flume::unbounded();
-            let (control_tx, control_rx) = flume::unbounded();
-            let initial_model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
-            let adopted_model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
-            let adopted_provider: Arc<dyn Provider> = Arc::new(TestProvider);
-            let mut provider: Arc<dyn Provider> = Arc::new(TestProvider);
-            let mut model = initial_model;
-            let shared_model = crate::SharedModel::default();
-            let mut wake = Box::pin(receive_wake_and_refresh(
-                &input_rx,
-                &control_rx,
-                &shared_model,
-                &mut provider,
-                &mut model,
-            ));
-            assert!(futures_lite::future::poll_once(&mut wake).await.is_none());
-            shared_model.install(Arc::clone(&adopted_provider), adopted_model.clone());
-            control_tx
-                .send(InteractiveControl::Reset(flume::bounded(1).0))
-                .unwrap();
-            let got_control = matches!(
-                wake.as_mut().await,
-                Some(InteractiveWake::Control(InteractiveControl::Reset(_)))
-            );
-            drop(wake);
-
-            assert!(got_control);
-            assert_eq!(model.spec(), adopted_model.spec());
-            assert!(Arc::ptr_eq(&provider, &adopted_provider));
-        });
-    }
-
-    #[test]
-    fn wake_refreshes_provider_for_same_model() {
-        smol::block_on(async {
-            let (_input_tx, input_rx) = flume::unbounded();
-            let (control_tx, control_rx) = flume::unbounded();
-            let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
-            let adopted_provider: Arc<dyn Provider> = Arc::new(TestProvider);
-            let mut provider: Arc<dyn Provider> = Arc::new(TestProvider);
-            let mut current_model = model.clone();
-            let shared_model = crate::SharedModel::default();
-            shared_model.install(Arc::clone(&adopted_provider), model);
-            control_tx
-                .send(InteractiveControl::Reset(flume::bounded(1).0))
-                .unwrap();
-
-            let wake = receive_wake_and_refresh(
-                &input_rx,
-                &control_rx,
-                &shared_model,
-                &mut provider,
-                &mut current_model,
-            )
-            .await;
-
-            assert!(matches!(
-                wake,
-                Some(InteractiveWake::Control(InteractiveControl::Reset(_)))
-            ));
-            assert!(Arc::ptr_eq(&provider, &adopted_provider));
-        });
     }
 
     #[test]
     fn extract_tool_names_filters_valid_entries() {
-        let tools = serde_json::json!([{"name": "read"}, {"type": "function"}, {"name": "bash"}]);
-        assert_eq!(extract_tool_names(&tools), vec!["read", "bash"]);
+        assert_eq!(
+            extract_tool_names(
+                &serde_json::json!([{"name": "read"}, {"type": "function"}, {"name": "bash"}])
+            ),
+            vec!["read", "bash"]
+        );
     }
 
     #[test]
@@ -2433,16 +2026,9 @@ mod tests {
         let base = serde_json::json!([{"name": "read"}]);
         let mcp =
             crate::mcp::test_support::stub_session(&[("srv.fetch_issue", "Fetch a GitHub issue")]);
-        let names = advertised_tool_names(&base, Some(&mcp));
         assert_eq!(
-            names,
-            vec!["read", crate::mcp::TOOL_SEARCH_TOOL_NAME],
-            "clients must see the search tool, not deferred definitions"
-        );
-        assert_eq!(
-            base,
-            serde_json::json!([{"name": "read"}]),
-            "probing must not bake MCP entries into the base tools"
+            advertised_tool_names(&base, Some(&mcp)),
+            vec!["read", crate::mcp::TOOL_SEARCH_TOOL_NAME]
         );
         assert_eq!(advertised_tool_names(&base, None), vec!["read"]);
     }

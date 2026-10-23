@@ -44,6 +44,7 @@ The `model` value is a `provider/model-id` spec, same format as `makima --model`
 - Tool progress streams during execution, including sub-agents and batched calls.
 - Prompts can include images and editor-attached files.
 - The editor receives the target-scoped command list. The list updates when plugin or MCP registrations change. An available leading slash command runs before model input. Unknown and unavailable slash-prefixed text is rejected with an error. Prefix a literal message that starts with `/` with another slash to send it as text: `//lmao` sends `/lmao`. Agent-turn commands preserve images and text resources. Local commands reject non-text content.
+- A `session/prompt` sent while a turn runs joins that turn, as typing does in the TUI (see [messages and turns](/docs/agent-work/#messages-and-turns)). Both prompts resolve when the turn ends, with the same stop reason. A prompt that cannot join, for example after a model switch, runs as the next turn and resolves with it. While `/compact` or `/btw` runs, a new prompt is rejected.
 - `/compact` reports a `Compact context` tool call and saves the compacted model history before it reports success.
 - `/btw` runs one isolated model request with copied history and no tools. Its question and response do not change the primary model history.
 - `/cd` reports the canonical working directory as an agent message. Later relative tool locations use that directory.
@@ -63,6 +64,6 @@ makima --no-jit acp
 
 `makima acp` only takes `-m` / `--model` and `--yolo` as subcommand flags. Global flags like `--no-jit` must come before the subcommand (`makima --no-jit acp`, not `makima acp --no-jit`).
 
-Plan mode in ACP uses the same state-directory plan files as the TUI (`…/plans/<slug>.md`), not the SDK's `./plan.md`.
+When the client closes stdin, the prompt still running finishes and gets its response, and subagents still working in the background finish too, along with the turns their results start, then the server exits. Permission requests and questions that come after that are refused, since the client can no longer answer them. Send `session/cancel` first to stop the prompt instead.
 
 A session open in another terminal is locked by it: loading fails until that instance exits, which releases the lock automatically (or a few seconds after it crashes).

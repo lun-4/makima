@@ -511,9 +511,8 @@ local function open(query)
 end
 
 -- A background agent flipping state deserves a heads-up even with the picker
--- closed, so the flash names the session and where to find it. Autocmds run
--- synchronously while refresh needs an async roundtrip, so the dirty flag
--- defers it to the next tick of the recv loop.
+-- closed, so the flash names the session and where to find it. The open
+-- board refreshes on the next tick of its recv loop.
 local last_status = {}
 maki.api.create_autocmd("SessionStatusChanged", {
   callback = function(ev)
@@ -545,19 +544,9 @@ maki.api.register_command({
   end,
 })
 
--- Autocmd callbacks run synchronously on the Lua thread; open() suspends
--- (ui roundtrips, win:recv), so it must run as a coroutine. Hop through the
--- /sessions command, which the host runs as a deadline-free async task. The
--- maki.async.run wrapper lives only as long as the run_command roundtrip,
--- so its abandon deadline never touches the open picker.
 maki.api.create_autocmd("SessionPickerRequested", {
   callback = function()
-    maki.async.run(function()
-      local _, err = maki.api.run_command("/sessions")
-      if err then
-        maki.ui.flash(err)
-      end
-    end)
+    open()
   end,
 })
 maki.keymap.set("n", "<C-p>", open, { desc = "Browse sessions" })
@@ -567,15 +556,15 @@ maki.api.register_command({
   description = "Rename the current session",
   arguments = { raw = true, required = true },
   tui_only = true,
-  handler = function(opts)
+  handler = function(opts, ctx)
     local title = opts.args:match("^%s*(.-)%s*$")
     if title == "" then
       maki.ui.flash(RENAME_USAGE)
       return
     end
-    local id, err = maki.session.current()
-    if err then
-      maki.ui.flash(err)
+    local id, err = ctx and ctx:session_id()
+    if not id then
+      maki.ui.flash(err or "no session")
       return
     end
     local _, set_err = maki.session.set_title({ id = id, title = title })

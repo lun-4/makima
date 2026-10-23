@@ -1544,9 +1544,11 @@ pub mod test_support {
     use super::error::McpError;
     use super::transport::{self, McpTransport};
     use super::{
-        McpHandle, McpManagerInner, McpPublishedState, McpSession, McpToolDef, SEPARATOR,
-        ServerEntry, publish,
+        McpHandle, McpManagerInner, McpPromptDef, McpPublishedState, McpSession, McpToolDef,
+        SEPARATOR, ServerEntry, publish,
     };
+
+    const PROMPTS_GET: &str = "prompts/get";
 
     /// Goes through the real `publish` path, so it cannot drift from how the
     /// index is built in production. Tools are named `server.tool`.
@@ -1560,7 +1562,21 @@ pub mod test_support {
         stub_session_answering(tools, Some(Arc::from(text)))
     }
 
+    /// Serves one prompt, `server.prompt`, whose `prompts/get` answers one
+    /// user message with `text`.
+    pub fn stub_prompt_session(qualified: &str, text: &str) -> McpSession {
+        stub_session_serving(&[], Some(Arc::from(text)), Some(qualified))
+    }
+
     fn stub_session_answering(tools: &[(&str, &str)], result: Option<Arc<str>>) -> McpSession {
+        stub_session_serving(tools, result, None)
+    }
+
+    fn stub_session_serving(
+        tools: &[(&str, &str)],
+        result: Option<Arc<str>>,
+        prompt: Option<&str>,
+    ) -> McpSession {
         let entry = ServerEntry {
             name: "stub".into(),
             config: None,
@@ -1583,7 +1599,19 @@ pub mod test_support {
                     input_schema: json!({}),
                 })
                 .collect(),
-            prompts: Vec::new(),
+            prompts: prompt
+                .into_iter()
+                .map(|qualified| McpPromptDef {
+                    qualified_name: qualified.into(),
+                    raw_name: qualified
+                        .split_once(SEPARATOR)
+                        .map_or(qualified, |(_, raw)| raw)
+                        .into(),
+                    description: String::new(),
+                    arguments: Vec::new(),
+                    identity: Arc::new(()),
+                })
+                .collect(),
         };
         let inner = McpManagerInner {
             entries: vec![entry],
@@ -1619,6 +1647,9 @@ pub mod test_support {
         ) -> transport::BoxFuture<'a, Result<Value, McpError>> {
             Box::pin(async move {
                 match &self.result {
+                    Some(text) if method == PROMPTS_GET => Ok(json!({
+                        "messages": [{ "role": "user", "content": { "type": "text", "text": &**text } }]
+                    })),
                     Some(text) => Ok(json!({ "content": [{ "type": "text", "text": &**text }] })),
                     None => Err(McpError::UnknownTool {
                         name: method.into(),

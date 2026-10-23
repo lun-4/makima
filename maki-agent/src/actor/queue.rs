@@ -1,17 +1,17 @@
 //! The actor's sole FIFO deque.
 //!
 //! Every push, pop, interrupt extraction, removal, clear, snapshot, and drain
-//! goes through this one lock-backed deque. `publish_if_empty` runs its
-//! closure under the queue lock, so a drain publication can never interleave
-//! with a concurrent push, matching the TUI's expectation.
+//! goes through this one lock-backed deque.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use super::types::EarlierRoot;
-use super::{ActorInner, ActorWork, RootWork, TurnAdmission};
+use super::{ActorInner, ActorWork, PendingQueueEntry, TurnAdmission};
 use crate::types::TurnId;
-use crate::{BatchKey, ExtractedCommand};
+use crate::{AgentInput, ExtractedCommand};
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -21,32 +21,17 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// queue panel without importing UI types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueueProjection {
-    Message {
-        text: String,
-        image_count: usize,
-        displayed: bool,
-    },
     Compact(Option<String>),
     Control(String),
     Turn(String),
 }
 
-impl From<&RootWork> for QueueProjection {
-    fn from(root: &RootWork) -> Self {
-        Self::Message {
-            text: root.text.clone(),
-            image_count: root.images.len(),
-            displayed: root.displayed,
-        }
-    }
-}
-
 impl From<&ActorWork> for QueueProjection {
     fn from(work: &ActorWork) -> Self {
         match work {
-            ActorWork::Root(root) => Self::from(root),
             ActorWork::Compact { instructions, .. } => Self::Compact(instructions.clone()),
             ActorWork::Control(control) => Self::Control(control.name.clone()),
+            ActorWork::HistoryEdit(_) => Self::Control("rewind".into()),
             ActorWork::Turn(admission) => Self::Turn(admission.correlation.clone()),
         }
     }
@@ -76,63 +61,8 @@ impl ActorQueue {
     }
 
     /// Pops the front item, or `None` when the queue is empty.
-    /// Consecutive plain root inputs that share a batch key are condensed into a single turn.
     pub fn pop(&self) -> Option<ActorWork> {
-        let mut items = lock(&self.items);
-        let first = items.pop_front()?;
-        match first {
-            ActorWork::Root(root) => {
-                let key = crate::batch_key(&root.input);
-                if key.is_none() {
-                    return Some(ActorWork::Root(root));
-                }
-                let mut roots = vec![root];
-                while items.front().is_some_and(|work| {
-                    matches!(work,
-                        ActorWork::Root(next) if next.generation == roots[0].generation
-                            && crate::batch_key(&next.input) == key
-                    )
-                }) {
-                    let Some(ActorWork::Root(next)) = items.pop_front() else {
-                        break;
-                    };
-                    roots.push(next);
-                }
-                if roots.len() == 1 {
-                    return Some(ActorWork::Root(roots.pop().unwrap()));
-                }
-                let mut last = roots.pop().unwrap();
-                let mut inputs = Vec::with_capacity(roots.len() + 1);
-                let mut earlier = Vec::with_capacity(roots.len());
-                for r in roots {
-                    inputs.push(r.input);
-                    earlier.push(EarlierRoot {
-                        run_id: r.run_id,
-                        displayed: r.displayed,
-                        text: r.text,
-                        images: r.images,
-                        correlation: r.correlation,
-                        mcp_startup_notice: r
-                            .admission
-                            .as_ref()
-                            .and_then(|admission| admission.mcp_startup_notice),
-                        already_displayed: r.displayed,
-                    });
-                }
-                let notice = last
-                    .admission
-                    .as_ref()
-                    .and_then(|admission| admission.mcp_startup_notice);
-                inputs.push(last.input);
-                last.input = crate::merge_inputs(inputs).expect("at least two inputs");
-                if let Some(admission) = &mut last.admission {
-                    admission.mcp_startup_notice = notice;
-                }
-                last.earlier = earlier;
-                Some(ActorWork::Root(last))
-            }
-            other => Some(other),
-        }
+        lock(&self.items).pop_front()
     }
 
     /// Extracts the given admitted turn from anywhere in the queue without
@@ -144,29 +74,60 @@ impl ActorQueue {
             .iter()
             .position(|w| matches!(w, ActorWork::Turn(a) if a.turn_id == turn_id))?;
         match items.remove(index) {
-            Some(ActorWork::Turn(admission)) => Some(admission),
+            Some(ActorWork::Turn(admission)) => Some(*admission),
             _ => unreachable!("remove_turn position matched a Turn"),
         }
     }
 
-    /// Removes the item at raw `index` (the same index [`snapshot`](Self::snapshot)
-    /// uses) and returns it. `None` is returned for out-of-bounds indices.
-    pub fn remove_at(&self, index: usize) -> Option<ActorWork> {
+    pub(super) fn remove_compact(&self, operation_id: u64) -> Option<PendingQueueEntry> {
         let mut items = lock(&self.items);
-        items.remove(index)
+        let index = items.iter().position(
+            |work| matches!(work, ActorWork::Compact { operation_id: id, .. } if *id == operation_id),
+        )?;
+        match items.remove(index)? {
+            ActorWork::Compact {
+                run_id,
+                instructions,
+                ..
+            } => Some(PendingQueueEntry::Compact {
+                operation_id,
+                run_id,
+                instructions,
+            }),
+            _ => None,
+        }
     }
 
-    /// Correlation of one queued item. Roots and turns carry a host correlation;
-    /// compacts are matched by their canonical `r{run_id}` encoding so a
-    /// targeted cancel can drop them the way it drops a deferred root.
-    fn correlation_of(work: &ActorWork) -> Option<std::borrow::Cow<'_, str>> {
-        match work {
-            ActorWork::Turn(a) => Some(std::borrow::Cow::Borrowed(a.correlation.as_str())),
-            ActorWork::Root(r) => Some(std::borrow::Cow::Borrowed(r.correlation.as_str())),
-            ActorWork::Compact { run_id, .. } => {
-                Some(std::borrow::Cow::Owned(super::run_correlation(*run_id)))
+    pub(super) fn has_prepared_turn(&self, turn_id: TurnId) -> bool {
+        lock(&self.items).iter().any(|work| {
+            matches!(work, ActorWork::Turn(admission)
+                if admission.turn_id == turn_id && admission.admission.is_some())
+        })
+    }
+
+    pub fn replace_turn_input(
+        &self,
+        turn_id: TurnId,
+        input: AgentInput,
+    ) -> Result<(), Box<AgentInput>> {
+        let mut items = lock(&self.items);
+        for work in items.iter_mut() {
+            if let ActorWork::Turn(admission) = work
+                && admission.turn_id == turn_id
+            {
+                admission.input = Some(input);
+                return Ok(());
             }
-            ActorWork::Control(_) => None,
+        }
+        Err(Box::new(input))
+    }
+
+    /// Turns carry a host correlation; compacts use their canonical `r{run_id}` encoding.
+    fn correlation_of(work: &ActorWork) -> Option<Cow<'_, str>> {
+        match work {
+            ActorWork::Turn(a) => Some(Cow::Borrowed(a.correlation.as_str())),
+            ActorWork::Compact { run_id, .. } => Some(Cow::Owned(super::run_correlation(*run_id))),
+            ActorWork::Control(_) | ActorWork::HistoryEdit(_) => None,
         }
     }
 
@@ -190,52 +151,8 @@ impl ActorQueue {
         removed
     }
 
-    /// Whether the item is shown in the TUI queue panel. Deferred roots
-    /// (`displayed == false`) and compacts are visible; admitted turns,
-    /// controls, and already-displayed roots are hidden rows.
-    pub fn is_visible(work: &ActorWork) -> bool {
-        match work {
-            ActorWork::Root(root) => !root.displayed,
-            ActorWork::Compact { .. } => true,
-            ActorWork::Turn(_) | ActorWork::Control(_) => false,
-        }
-    }
-
-    /// Removes the `visible_index`-th item in panel order and returns its
-    /// projection plus the work. `None` when the panel has fewer rows.
-    pub fn remove_visible_at(&self, visible_index: usize) -> Option<(ActorWork, QueueProjection)> {
-        let mut items = lock(&self.items);
-        let mut seen = 0usize;
-        let mut target = None;
-        for (i, w) in items.iter().enumerate() {
-            if Self::is_visible(w) {
-                if seen == visible_index {
-                    target = Some(i);
-                    break;
-                }
-                seen += 1;
-            }
-        }
-        let index = target?;
-        let work = items.remove(index)?;
-        let projection = (&work).into();
-        Some((work, projection))
-    }
-
     pub fn len(&self) -> usize {
         lock(&self.items).len()
-    }
-
-    pub fn has_work_after_generation(&self, generation: u64) -> bool {
-        lock(&self.items).iter().any(|work| match work {
-            ActorWork::Root(root) => root.generation > generation,
-            ActorWork::Turn(turn) => turn.generation > generation,
-            ActorWork::Compact {
-                generation: queued_generation,
-                ..
-            } => *queued_generation > generation,
-            ActorWork::Control(_) => false,
-        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -248,18 +165,48 @@ impl ActorQueue {
         std::mem::take(&mut *items).into()
     }
 
-    /// A neutral snapshot of the queue for the TUI projection.
-    pub fn snapshot(&self) -> Vec<QueueProjection> {
-        lock(&self.items).iter().map(Into::into).collect()
+    /// Drains every item `keep` does not select; kept items stay in order.
+    pub fn drain_except(&self, keep: impl Fn(&ActorWork) -> bool) -> Vec<ActorWork> {
+        let mut items = lock(&self.items);
+        let mut drained = Vec::new();
+        let mut kept = VecDeque::with_capacity(items.len());
+        for work in std::mem::take(&mut *items) {
+            if keep(&work) {
+                kept.push_back(work);
+            } else {
+                drained.push(work);
+            }
+        }
+        *items = kept;
+        drained
     }
 
-    /// Runs `publish` under the queue lock, and only when the queue is empty,
-    /// so a drain publication can never interleave with a concurrent push.
-    pub fn publish_if_empty(&self, publish: impl FnOnce()) {
-        let items = lock(&self.items);
-        if items.is_empty() {
-            publish();
-        }
+    /// A neutral snapshot of the queue for the TUI projection.
+    pub(super) fn project_pending(
+        &self,
+        messages: &impl Fn(TurnId) -> Vec<PendingQueueEntry>,
+    ) -> Vec<PendingQueueEntry> {
+        lock(&self.items)
+            .iter()
+            .flat_map(|work| match work {
+                ActorWork::Turn(turn) => messages(turn.turn_id),
+                ActorWork::Compact {
+                    operation_id,
+                    run_id,
+                    instructions,
+                    ..
+                } => vec![PendingQueueEntry::Compact {
+                    operation_id: *operation_id,
+                    run_id: *run_id,
+                    instructions: instructions.clone(),
+                }],
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    pub fn snapshot(&self) -> Vec<QueueProjection> {
+        lock(&self.items).iter().map(Into::into).collect()
     }
 
     /// Wakes the runner. Debounced by the bounded channel: at most one token
@@ -277,22 +224,10 @@ impl ActorQueue {
             .expect("actor queue notify receiver taken once")
     }
 
-    /// Extracts the front item only when it is interrupt-compatible. Roots
-    /// fold into the active turn as `Interrupt`; compacts become `Compact`.
-    /// Turns and controls are never popped here, so interrupt polling cannot
-    /// discard incompatible FIFO entries.
-    pub(crate) fn pop_interrupt(
-        &self,
-        generation: u64,
-        batch_key: &Option<BatchKey>,
-    ) -> Option<ExtractedCommand> {
+    /// Extracts a same-policy compaction without crossing ordered work.
+    pub(crate) fn pop_interrupt(&self, generation: u64) -> Option<ExtractedCommand> {
         let mut items = lock(&self.items);
-
         match items.front() {
-            Some(ActorWork::Root(root))
-                if batch_key.is_some()
-                    && root.generation == generation
-                    && crate::batch_key(&root.input).as_ref() == batch_key.as_ref() => {}
             Some(ActorWork::Compact {
                 generation: compact_generation,
                 ..
@@ -300,28 +235,10 @@ impl ActorQueue {
             _ => return None,
         }
         match items.pop_front()? {
-            ActorWork::Root(first) => {
-                let key = crate::batch_key(&first.input);
-                let mut inputs = vec![first.input];
-                while key.is_some()
-                    && items.front().is_some_and(|work| {
-                        matches!(work,
-                            ActorWork::Root(next) if next.generation == generation
-                                && crate::batch_key(&next.input) == key
-                        )
-                    })
-                {
-                    let Some(ActorWork::Root(next)) = items.pop_front() else {
-                        break;
-                    };
-                    inputs.push(next.input);
-                }
-                Some(ExtractedCommand::Interrupt(inputs))
-            }
             ActorWork::Compact { instructions, .. } => {
                 Some(ExtractedCommand::Compact(instructions))
             }
-            _ => unreachable!("front was matched as root or compact"),
+            _ => unreachable!("front was matched as compact"),
         }
     }
 }
@@ -332,15 +249,13 @@ impl Default for ActorQueue {
     }
 }
 
-/// A scheduler-side view of the queue, usable as the running agent's
-/// [`InterruptSource`](crate::InterruptSource) so roots fold into the active
-/// turn and compacts are handled between model turns.
+/// A scheduler-side [`InterruptSource`](crate::InterruptSource) for compaction
+/// commands handled between model requests.
 #[derive(Clone)]
 pub struct InterruptQueue {
     inner: Arc<ActorInner>,
     cancellation_generation: u64,
     policy_generation: u64,
-    batch_key: Option<BatchKey>,
 }
 
 impl InterruptQueue {
@@ -348,243 +263,109 @@ impl InterruptQueue {
         inner: Arc<ActorInner>,
         cancellation_generation: u64,
         policy_generation: u64,
-        batch_key: Option<BatchKey>,
     ) -> Self {
         Self {
             inner,
             cancellation_generation,
             policy_generation,
-            batch_key,
         }
     }
 }
 
 impl crate::InterruptSource for InterruptQueue {
+    fn poll_ready(&self) -> Pin<Box<dyn Future<Output = Option<ExtractedCommand>> + Send + '_>> {
+        Box::pin(async { self.poll() })
+    }
+
     fn poll(&self) -> Option<ExtractedCommand> {
         let state = lock(&self.inner.state);
         (state.cancellation_generation == self.cancellation_generation)
-            .then(|| {
-                self.inner
-                    .queue
-                    .pop_interrupt(self.policy_generation, &self.batch_key)
-            })
+            .then(|| self.inner.queue.pop_interrupt(self.policy_generation))
             .flatten()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{AgentInput, AgentMode, SessionDefaults};
-    use maki_providers::{ContentBlock, ImageMediaType, ImageSource};
+    use super::ActorQueue;
+    use crate::ExtractedCommand;
+    use crate::actor::{ActorWork, ControlWork};
+    use crate::types::{ActorWorkIdentity, ActorWorkKind, AgentId};
 
-    fn test_image() -> ImageSource {
-        ImageSource::new(ImageMediaType::Png, Arc::from("dGVzdA=="))
-    }
+    const INSTRUCTIONS: &str = "retain decisions";
+    const CONTROL: &str = "boundary";
 
-    fn test_input(message: &str) -> AgentInput {
-        AgentInput::from_defaults(
-            message.into(),
-            AgentMode::Build,
-            Vec::new(),
-            SessionDefaults::default(),
-        )
-    }
-
-    fn test_root(message: &str, run_id: u64, images: Vec<ImageSource>) -> RootWork {
-        let mut input = test_input(message);
-        input.images = images.clone();
-        RootWork::new(
-            input,
-            run_id,
-            true,
-            message.into(),
-            images,
-            format!("r{run_id}"),
-        )
-    }
-
-    #[test]
-    fn test_actor_condenses_consecutive_plain_user_messages() {
-        let queue = ActorQueue::new();
-        queue.push(ActorWork::Root(test_root("first", 1, Vec::new())));
-        queue.push(ActorWork::Root(test_root("second", 2, Vec::new())));
-        queue.push(ActorWork::Root(test_root("third", 3, Vec::new())));
-
-        let popped = queue.pop().expect("must pop work");
-        let ActorWork::Root(merged) = popped else {
-            panic!("expected Root work");
-        };
-
-        assert_eq!(merged.input.message, "third");
-        assert_eq!(merged.run_id, 3);
-        assert_eq!(merged.earlier.len(), 2);
-        assert_eq!(merged.earlier[0].text, "first");
-        assert_eq!(merged.earlier[0].run_id, 1);
-        assert_eq!(merged.earlier[1].text, "second");
-        assert_eq!(merged.earlier[1].run_id, 2);
-
-        assert_eq!(merged.input.preamble.len(), 2);
-        assert_eq!(merged.input.preamble[0].user_text(), Some("first"));
-        assert_eq!(merged.input.preamble[1].user_text(), Some("second"));
-
-        assert!(queue.pop().is_none());
-    }
-
-    #[test]
-    fn root_batch_stops_at_generation_boundary() {
-        let queue = ActorQueue::new();
-        let mut old = test_root("old", 1, Vec::new());
-        old.generation = 1;
-        let mut new = test_root("new", 2, Vec::new());
-        new.generation = 2;
-        queue.push(ActorWork::Root(old));
-        queue.push(ActorWork::Root(new));
-
-        let Some(ActorWork::Root(first)) = queue.pop() else {
-            panic!("expected first root");
-        };
-        assert_eq!(first.input.message, "old");
-        assert!(first.earlier.is_empty());
-        let Some(ActorWork::Root(second)) = queue.pop() else {
-            panic!("expected second root");
-        };
-        assert_eq!(second.input.message, "new");
-        assert!(second.earlier.is_empty());
-    }
-
-    #[test]
-    fn interrupt_batch_stops_at_generation_boundary() {
-        let queue = ActorQueue::new();
-        let mut old = test_root("old", 1, Vec::new());
-        old.generation = 1;
-        let mut new = test_root("new", 2, Vec::new());
-        new.generation = 2;
-        queue.push(ActorWork::Root(old));
-        queue.push(ActorWork::Root(new));
-
-        assert!(
-            queue
-                .pop_interrupt(2, &crate::batch_key(&test_input("old")))
-                .is_none()
-        );
-        assert_eq!(queue.len(), 2);
-        let Some(ExtractedCommand::Interrupt(inputs)) =
-            queue.pop_interrupt(1, &crate::batch_key(&test_input("old")))
-        else {
-            panic!("expected interrupt");
-        };
-        assert_eq!(inputs.len(), 1);
-        assert_eq!(inputs[0].message, "old");
-        let Some(ExtractedCommand::Interrupt(inputs)) =
-            queue.pop_interrupt(2, &crate::batch_key(&test_input("old")))
-        else {
-            panic!("expected next interrupt");
-        };
-        assert_eq!(inputs.len(), 1);
-        assert_eq!(inputs[0].message, "new");
-    }
-
-    #[test]
-    fn interrupt_does_not_fold_roots_without_batch_keys() {
-        let queue = ActorQueue::new();
-        let mut active = test_input("active");
-        active.prompt = Some(Box::new(crate::McpPromptRef {
-            qualified_name: "server.prompt".into(),
-            arguments: Default::default(),
-        }));
-        let mut root = test_root("queued", 1, Vec::new());
-        root.input.cancel = Some(crate::CancelToken::new().1);
-        queue.push(ActorWork::Root(root));
-
-        assert!(queue.pop_interrupt(0, &crate::batch_key(&active)).is_none());
-        assert_eq!(queue.len(), 1);
-    }
-
-    #[test]
-    fn interrupt_does_not_fold_roots_when_active_batch_key_is_none() {
-        let queue = ActorQueue::new();
-        let mut active = test_input("active");
-        active.prompt = Some(Box::new(crate::McpPromptRef {
-            qualified_name: "server.prompt".into(),
-            arguments: Default::default(),
-        }));
-        queue.push(ActorWork::Root(test_root("plain", 1, Vec::new())));
-
-        assert!(queue.pop_interrupt(0, &crate::batch_key(&active)).is_none());
-        assert_eq!(queue.len(), 1);
-    }
-
-    #[test]
-    fn interrupt_rejects_same_generation_different_mode() {
-        let queue = ActorQueue::new();
-        let mut plan = test_root("plan", 1, Vec::new());
-        plan.input.mode = AgentMode::Plan("plan.md".into());
-        queue.push(ActorWork::Root(plan));
-
-        assert!(
-            queue
-                .pop_interrupt(0, &crate::batch_key(&test_input("build")))
-                .is_none()
-        );
-        assert_eq!(queue.len(), 1);
-    }
-
-    #[test]
-    fn test_actor_preserves_images_in_condensed_burst() {
-        let queue = ActorQueue::new();
-        let img1 = test_image();
-        let img2 = test_image();
-        queue.push(ActorWork::Root(test_root("first", 1, vec![img1.clone()])));
-        queue.push(ActorWork::Root(test_root("second", 2, vec![img2.clone()])));
-        queue.push(ActorWork::Root(test_root("third", 3, Vec::new())));
-
-        let popped = queue.pop().expect("must pop work");
-        let ActorWork::Root(merged) = popped else {
-            panic!("expected Root work");
-        };
-
-        assert_eq!(merged.earlier[0].images.len(), 1);
-        assert_eq!(merged.earlier[1].images.len(), 1);
-        assert_eq!(merged.input.preamble.len(), 2);
-
-        let img_count = |msg: &maki_providers::Message| {
-            msg.content
-                .iter()
-                .filter(|b| matches!(b, ContentBlock::Image { .. }))
-                .count()
-        };
-        assert_eq!(img_count(&merged.input.preamble[0]), 1);
-        assert_eq!(img_count(&merged.input.preamble[1]), 1);
-    }
-
-    #[test]
-    fn test_actor_does_not_condense_tool_results_or_slash_commands() {
-        let queue = ActorQueue::new();
-        queue.push(ActorWork::Root(test_root("first", 1, Vec::new())));
-        queue.push(ActorWork::Compact {
-            run_id: 2,
-            instructions: None,
-            generation: 0,
+    fn compact(generation: u64) -> ActorWork {
+        ActorWork::Compact {
+            operation_id: generation,
+            run_id: generation,
+            instructions: Some(INSTRUCTIONS.into()),
+            generation,
             policy: None,
-        });
-        queue.push(ActorWork::Root(test_root("second", 3, Vec::new())));
+            work: ActorWorkIdentity::new(
+                AgentId::generate(),
+                ActorWorkKind::Compact {
+                    operation_id: generation,
+                },
+                generation,
+            ),
+        }
+    }
 
-        let first_pop = queue.pop().expect("first item");
-        let ActorWork::Root(r1) = first_pop else {
-            panic!("expected Root");
-        };
-        assert_eq!(r1.input.message, "first");
-        assert_eq!(r1.earlier.len(), 0);
+    #[test_case::test_case(1, true; "same_generation")]
+    #[test_case::test_case(2, false; "different_generation")]
+    fn compaction_interrupt_respects_policy_generation(generation: u64, compatible: bool) {
+        let queue = ActorQueue::new();
+        queue.push(compact(1));
+        let extracted = queue.pop_interrupt(generation);
+        assert_eq!(extracted.is_some(), compatible);
+        assert_eq!(queue.len(), usize::from(!compatible));
+        if let Some(ExtractedCommand::Compact(instructions)) = extracted {
+            assert_eq!(instructions.as_deref(), Some(INSTRUCTIONS));
+        } else {
+            assert!(!compatible);
+        }
+    }
 
-        let second_pop = queue.pop().expect("second item");
-        assert!(matches!(second_pop, ActorWork::Compact { run_id: 2, .. }));
+    #[test]
+    fn compaction_interrupt_does_not_cross_control_boundary() {
+        let queue = ActorQueue::new();
+        queue.push(ActorWork::Control(ControlWork {
+            name: CONTROL.into(),
+            correlation: CONTROL.into(),
+            work: ActorWorkIdentity::new(
+                AgentId::generate(),
+                ActorWorkKind::Control { operation_id: 0 },
+                0,
+            ),
+            payload: None,
+        }));
+        queue.push(compact(1));
+        assert!(queue.pop_interrupt(1).is_none());
+        assert_eq!(queue.len(), 2);
+        assert!(matches!(queue.pop(), Some(ActorWork::Control(_))));
+        assert!(matches!(
+            queue.pop_interrupt(1),
+            Some(ExtractedCommand::Compact(_))
+        ));
+        assert!(queue.is_empty());
+    }
 
-        let third_pop = queue.pop().expect("third item");
-        let ActorWork::Root(r2) = third_pop else {
-            panic!("expected Root");
-        };
-        assert_eq!(r2.input.message, "second");
-        assert_eq!(r2.earlier.len(), 0);
+    #[test]
+    fn compaction_interrupt_preserves_fifo_across_policy_boundary() {
+        let queue = ActorQueue::new();
+        queue.push(compact(1));
+        queue.push(compact(2));
+        assert!(queue.pop_interrupt(2).is_none());
+        assert!(matches!(
+            queue.pop_interrupt(1),
+            Some(ExtractedCommand::Compact(_))
+        ));
+        assert!(queue.pop_interrupt(1).is_none());
+        assert!(matches!(
+            queue.pop_interrupt(2),
+            Some(ExtractedCommand::Compact(_))
+        ));
+        assert!(queue.is_empty());
     }
 }

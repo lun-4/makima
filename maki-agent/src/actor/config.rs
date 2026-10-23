@@ -1,11 +1,57 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use maki_providers::provider::Provider;
-use maki_providers::{Model, RequestOptions, ThinkingConfig, ThinkingConfigExt};
+use maki_providers::{Model, RequestOptions, ThinkingConfig, ThinkingConfigExt, model_registry};
 
 use crate::{AgentMode, ModeDef};
 
 use super::{ActorError, EffectiveAgentConfig};
+
+#[derive(Clone, Default)]
+pub struct ModeCeiling {
+    restrict_write_to: Option<PathBuf>,
+    tools: Option<Vec<String>>,
+}
+
+impl ModeCeiling {
+    pub(super) fn new(config: &EffectiveAgentConfig) -> Self {
+        config
+            .mode_authority
+            .clone()
+            .unwrap_or_else(|| Self::from_mode(&config.mode, config.mode_def.as_ref()))
+    }
+
+    pub fn from_mode(mode: &AgentMode, mode_def: Option<&ModeDef>) -> Self {
+        Self {
+            restrict_write_to: mode_def
+                .and_then(|definition| definition.restrict_write_to.clone())
+                .or_else(|| mode.plan_path().map(PathBuf::from)),
+            tools: mode_def.and_then(|definition| definition.tools.clone()),
+        }
+    }
+
+    pub fn validate(&self, mode: &AgentMode, mode_def: Option<&ModeDef>) -> Result<(), ActorError> {
+        let path = mode_def
+            .and_then(|definition| definition.restrict_write_to.as_deref())
+            .or_else(|| mode.plan_path());
+        if self.restrict_write_to.is_some() && self.restrict_write_to.as_deref() != path {
+            return Err(ActorError::InvalidConfig(
+                "mode exceeds the child's initial write restriction".into(),
+            ));
+        }
+        if let Some(allowed) = &self.tools
+            && !mode_def
+                .and_then(|definition| definition.tools.as_ref())
+                .is_some_and(|tools| tools.iter().all(|tool| allowed.contains(tool)))
+        {
+            return Err(ActorError::InvalidConfig(
+                "mode exceeds the child's initial tool permissions".into(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone)]
 pub struct PreparedModel {
@@ -34,6 +80,7 @@ pub enum ConfigChange {
         mode: AgentMode,
         mode_def: Option<ModeDef>,
     },
+    WorkingDirectory(PathBuf),
     ToggleFast,
     ToggleWorkflow,
     ToggleThinking,
@@ -50,13 +97,69 @@ pub struct ConfigCommit {
     pub config: Arc<EffectiveAgentConfig>,
 }
 
+/// Re-resolves `model` against what discovery knows now. `None` when that
+/// changes nothing, so an already-correct agent is left alone.
+pub fn rediscovered_model(provider: &dyn Provider, model: &Model) -> Option<Model> {
+    let mut refined = Model::from_spec(&model.spec()).ok()?;
+    provider.adjust_model(&mut refined);
+    (!same_model(&refined, model)).then_some(refined)
+}
+
+/// {candidate} as it commits over {current}: a model it switched to takes
+/// what discovery knows by now, so discovery that lands after the change
+/// materialized is not lost.
+pub(super) fn with_discovery(
+    current: Option<&EffectiveAgentConfig>,
+    candidate: &Arc<EffectiveAgentConfig>,
+) -> Arc<EffectiveAgentConfig> {
+    let switched = current.is_none_or(|current| {
+        !Arc::ptr_eq(&current.provider, &candidate.provider)
+            || current.model.spec() != candidate.model.spec()
+    });
+    let Some(model) = switched
+        .then(|| model_registry::discovered(&candidate.model.provider, &candidate.model.id))
+        .flatten()
+        .and_then(|_| rediscovered_model(&*candidate.provider, &candidate.model))
+    else {
+        return Arc::clone(candidate);
+    };
+    let mut config = (**candidate).clone();
+    config.settings.model = model;
+    Arc::new(config)
+}
+
 impl ConfigChange {
+    /// A metadata-only refresh: the provider stays, so a concurrent model
+    /// switch makes the compare-and-swap a no-op.
+    pub fn rediscovered(config: &EffectiveAgentConfig) -> Option<Self> {
+        let model = rediscovered_model(&*config.provider, &config.model)?;
+        Some(Self::Refresh {
+            expected: PreparedModel {
+                provider: Arc::clone(&config.provider),
+                model: config.model.clone(),
+            },
+            replacement: PreparedModel {
+                provider: Arc::clone(&config.provider),
+                model,
+            },
+        })
+    }
+
     pub(super) fn apply(
         self,
         current: &EffectiveAgentConfig,
     ) -> Result<EffectiveAgentConfig, ActorError> {
         let mut config = current.clone();
         let mut patch = match self {
+            Self::WorkingDirectory(cwd) => {
+                if !cwd.is_absolute() {
+                    return Err(ActorError::InvalidConfig(
+                        "working directory must be absolute".into(),
+                    ));
+                }
+                config.context = current.context.change_directory(cwd);
+                return Ok(config);
+            }
             Self::Patch(patch) => patch,
             Self::PatchAndMode {
                 patch,
@@ -181,4 +284,34 @@ pub(super) fn equivalent(left: &EffectiveAgentConfig, right: &EffectiveAgentConf
         && left.thinking == right.thinking
         && left.mode == right.mode
         && left.mode_def == right.mode_def
+        && left.context == right.context
+}
+
+#[cfg(test)]
+mod context_tests {
+    use std::path::PathBuf;
+
+    use super::ConfigChange;
+    use crate::AgentMode;
+    use crate::actor::{AgentContextSnapshot, EffectiveAgentConfig};
+
+    #[test]
+    fn cwd_config_captures_context_generation_and_rejects_relative_paths() {
+        let original =
+            EffectiveAgentConfig::new(crate::actor::tests::policy(false), AgentMode::Build)
+                .with_context(AgentContextSnapshot::new(PathBuf::from("/original")));
+        let changed = ConfigChange::WorkingDirectory(PathBuf::from("/changed"))
+            .apply(&original)
+            .unwrap();
+        assert_eq!(original.context.cwd(), PathBuf::from("/original"));
+        assert_eq!(original.context.generation(), 0);
+        assert_eq!(changed.context.cwd(), PathBuf::from("/changed"));
+        assert_eq!(changed.context.generation(), 1);
+        assert!(!super::equivalent(&original, &changed));
+        assert!(
+            ConfigChange::WorkingDirectory(PathBuf::from("relative"))
+                .apply(&original)
+                .is_err()
+        );
+    }
 }

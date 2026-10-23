@@ -168,7 +168,7 @@ impl App {
                         let focused = !self.any_overlay_open();
                         self.input_box
                             .handle_click(zone.area, event.row, event.column, focused);
-                        if focused && self.is_main_chat() {
+                        if focused {
                             let input = self.input_box.buffer.value();
                             self.sync_command_arguments(
                                 &input,

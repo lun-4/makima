@@ -3,37 +3,41 @@
 //! directly to the agent mailbox so synchronous callbacks can use it.
 
 use maki_agent::SessionMailbox;
-use maki_agent::session_coordinator::SessionCoordinatorHandle;
-use maki_agent::session_options::{
-    SessionOptionCategory, SessionOptionOwner, SessionOptionsSnapshot,
-};
-use maki_commands::{HostContextRequest, HostContextResponse, HostRequest, HostResponse};
 use maki_lua_macro::{lua_fn, lua_table};
+use maki_providers::parse_thinking;
 use maki_storage::id::MakiId;
+use maki_storage::sessions::{Prefs, write_prefs};
 use mlua::{Lua, Result as LuaResult, Table, Value};
 
-use crate::api::session_option::{ensure_validation_not_in_progress, validate_option_value};
+use crate::agent_errors::{
+    DELEGATED_FOREIGN_SESSION, DELEGATED_HOST_MUTATION, DELEGATED_SESSION_LIFECYCLE,
+    SESSION_REQUIRED_ERR,
+};
+use crate::api::env::host_state_dir;
 use crate::api::util::command::{SessionRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::convert::json_to_lua;
-use crate::api::util::pair::{Pair, err_pair};
-use crate::runtime::command_invocation;
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 
 /// Answers `maki.session.read` for a driver that has no UI to ask. Takes the
-/// optional session id from Lua and returns a serialized
+/// session id from Lua and returns a serialized
 /// [`crate::session_snapshot::SessionSnapshot`].
 pub type SessionSnapshotFn =
-    Box<dyn Fn(Option<&str>) -> Result<serde_json::Value, String> + Send + Sync + 'static>;
+    Box<dyn Fn(MakiId) -> Result<serde_json::Value, String> + Send + Sync + 'static>;
 
 pub struct SessionSnapshotSlot(pub SessionSnapshotFn);
 
+/// Present in print, which saves nothing.
+pub(crate) struct NoPreferences;
+
 const BLANK_NOTIFY_ERR: &str = "text must not be blank";
-const SESSION_REQUIRED_ERR: &str = "session is required";
+const NO_PREFERENCES_ERR: &str = "print saves no preferences";
 
 async fn roundtrip(
     lua: Lua,
     tx: Option<flume::Sender<UiAction>>,
     req: SessionRequest,
 ) -> LuaResult<Pair<Value>> {
+    try_pair!(crate::runtime::validate_plugin_effect(&lua));
     ui_json_roundtrip(&lua, tx.as_ref(), |reply_tx| UiAction::Session {
         req,
         reply_tx,
@@ -41,92 +45,17 @@ async fn roundtrip(
     .await
 }
 
-pub(crate) async fn resolve_coordinator(
-    lua: &Lua,
-    tx: Option<&flume::Sender<UiAction>>,
-    opts: Option<&Table>,
-) -> Result<SessionCoordinatorHandle, String> {
-    let raw_id = match opts {
-        Some(opts) => opts
-            .get::<Option<String>>("session")
-            .map_err(|e| e.to_string())?,
-        None => None,
+/// The `session` id {opts} must name; the inner error is a missing or
+/// malformed id.
+fn required_session(opts: Option<&Table>) -> LuaResult<Result<MakiId, String>> {
+    let Some(raw) = opts
+        .map(|opts| opts.get::<Option<String>>("session"))
+        .transpose()?
+        .flatten()
+    else {
+        return Ok(Err(SESSION_REQUIRED_ERR.to_owned()));
     };
-    let raw_id = match raw_id {
-        Some(id) => id,
-        None => {
-            if let Some(invocation) = command_invocation(lua) {
-                match invocation
-                    .invocation
-                    .host_request(HostRequest::Context(HostContextRequest::SessionId))
-                    .await
-                    .map_err(|error| error.to_string())?
-                {
-                    HostResponse::Context(HostContextResponse::SessionId(id)) => id.to_string(),
-                    _ => return Err(SESSION_REQUIRED_ERR.to_string()),
-                }
-            } else {
-                let (value, error) = ui_json_roundtrip(lua, tx, |reply_tx| UiAction::Session {
-                    req: SessionRequest::Current,
-                    reply_tx,
-                })
-                .await
-                .map_err(|e| e.to_string())?;
-                if let Some(error) = error {
-                    return Err(error);
-                }
-                value
-                    .and_then(|value| {
-                        value
-                            .as_string()
-                            .and_then(|value| value.to_str().ok().map(|value| value.to_string()))
-                    })
-                    .ok_or_else(|| SESSION_REQUIRED_ERR.to_string())?
-            }
-        }
-    };
-    let id = raw_id.parse::<MakiId>().map_err(|e| e.to_string())?;
-    SessionCoordinatorHandle::resolve(id).map_err(|e| e.to_string())
-}
-
-fn snapshot_table(lua: &Lua, snapshot: &SessionOptionsSnapshot) -> LuaResult<Table> {
-    let result = lua.create_table()?;
-    result.set("version", snapshot.version)?;
-    let options = lua.create_table_with_capacity(snapshot.options.len(), 0)?;
-    for (index, state) in snapshot.options.iter().enumerate() {
-        let option = lua.create_table()?;
-        let definition = &state.definition;
-        option.set("id", definition.id.as_ref())?;
-        option.set("name", definition.name.as_ref())?;
-        option.set("description", definition.description.as_ref())?;
-        option.set(
-            "category",
-            match definition.category {
-                SessionOptionCategory::Model => "model",
-                SessionOptionCategory::Mode => "mode",
-            },
-        )?;
-        option.set("current_value", state.current_value.as_ref())?;
-        option.set("persistent", definition.persistent)?;
-        option.set(
-            "owner",
-            match &definition.owner {
-                SessionOptionOwner::Builtin => "builtin",
-                SessionOptionOwner::Plugin { plugin, .. } => plugin.as_ref(),
-            },
-        )?;
-        let values = lua.create_table_with_capacity(definition.values.len(), 0)?;
-        for (value_index, value) in definition.values.iter().enumerate() {
-            let item = lua.create_table()?;
-            item.set("value", value.value.as_ref())?;
-            item.set("name", value.name.as_ref())?;
-            values.set(value_index + 1, item)?;
-        }
-        option.set("values", values)?;
-        options.set(index + 1, option)?;
-    }
-    result.set("options", options)?;
-    Ok(result)
+    Ok(raw.parse::<MakiId>().map_err(|error| error.to_string()))
 }
 
 /// Lists sessions stored for the current project. Answered from a
@@ -170,31 +99,6 @@ async fn live(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
     roundtrip(lua, tx, SessionRequest::Live).await
 }
 
-/// Returns the id of the currently focused session.
-///
-/// @return (string|nil, string|nil) Session id, or nil and an error.
-/// @example
-/// local id = maki.session.current()
-#[lua_fn]
-async fn current(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
-    roundtrip(lua, tx, SessionRequest::Current).await
-}
-
-/// Returns the focused session's token usage without making a network request.
-/// Costs are the values recorded when each turn was billed and remain nil when
-/// no turn for that total or model was priced. Models are sorted by total tokens
-/// descending, then model spec ascending.
-///
-/// @return (table|nil, string|nil) `{total={input, output, cache_creation,
-///   cache_read, cost}, models}`, where each model has `{model, input, output,
-///   cache_creation, cache_read, cost}`, or nil and an error.
-/// @example
-/// local usage, err = maki.session.usage()
-#[lua_fn]
-async fn usage(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
-    roundtrip(lua, tx, SessionRequest::Usage).await
-}
-
 /// Switches the UI to the session with {id}. The session must belong to
 /// the current directory and must not be open in another terminal.
 ///
@@ -208,6 +112,9 @@ async fn focus(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     id: String,
 ) -> LuaResult<Pair<Value>> {
+    if crate::runtime::in_delegated_tool(&lua) {
+        return Ok(err_pair(DELEGATED_SESSION_LIFECYCLE));
+    }
     roundtrip(lua, tx, SessionRequest::Focus { id }).await
 }
 
@@ -224,52 +131,49 @@ async fn delete(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     id: String,
 ) -> LuaResult<Pair<Value>> {
+    if crate::runtime::in_delegated_tool(&lua) {
+        return Ok(err_pair(DELEGATED_SESSION_LIFECYCLE));
+    }
     roundtrip(lua, tx, SessionRequest::Delete { id }).await
 }
 
-/// One-call snapshot of a session: queue, usage, context, cost, mode, and
-/// status. Reads the focused session, or the one you name in `session` when
-/// you act on a background tab.
+/// Snapshot of the session you name in `session`.
 ///
 /// The returned table:
 /// ```lua
 /// {
-///   id, cwd, model, mode = "build" | "plan",
-///   status = "idle" | "working" | "needs_input",
-///   focused, updated_at,
-///   usage = { input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens },
-///   context_size, context_window,
-///   cost,
-///   queue = { count }, -- nil under headless drivers
+///   id,
 ///   title,             -- nil under headless drivers
+///   status = "idle" | "working" | "needs_input",
+///   updated_at,        -- unix seconds
+///   usage = {
+///     total = { input, output, cache_creation, cache_read, cost },
+///     models = { { model, input, output, cache_creation, cache_read, cost }, ... },
+///   },
 /// }
 /// ```
 ///
-/// `usage` and `cost` include subagent spend. `context_size` is the main
-/// session's own, since a subagent runs its own window. There is no
-/// `list_cost` here because `cost` is re-settled from stored usage when a
-/// session resumes and list price is not stored, so per-turn list price
-/// lives on the `TurnEnd` autocmd instead.
+/// `usage` includes subagent spend. Costs are the values recorded when each
+/// turn was billed and stay nil when unpriced. `models` is sorted by total
+/// tokens, descending, then spec; headless drivers do not split usage by
+/// model and leave it empty. Model, mode and options are on the agent:
+/// `Agent:config(ctx)`; per-turn context size and list price are on the
+/// `TurnEnd` autocmd.
 ///
-/// @param opts table? `session` (string?) Session id; defaults to focused.
+/// @param opts table Required `session` (string) id.
 /// @return (table|nil, string|nil) Snapshot table, or nil and an error.
 /// @example
-/// local s = maki.session.read()
-/// if s.context_size > s.context_window * 0.8 then
-///   maki.ui.notify("context is nearly full")
-/// end
+/// local s = maki.session.read({ session = ctx:session_id() })
+/// maki.ui.notify("spent " .. tostring(s.usage.total.cost))
 #[lua_fn]
 async fn read(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
-    opts: Option<Table>,
+    opts: Table,
 ) -> LuaResult<Pair<Value>> {
-    let id = match opts {
-        Some(t) => t.get::<Option<String>>("session")?,
-        None => None,
-    };
+    let id = try_pair!(required_session(Some(&opts))?);
     if let Some(slot) = lua.app_data_ref::<SessionSnapshotSlot>() {
-        return match (slot.0)(id.as_deref()) {
+        return match (slot.0)(id) {
             Ok(value) => Ok((Some(json_to_lua(&lua, &value)?), None)),
             Err(msg) => Ok(err_pair(msg)),
         };
@@ -294,36 +198,14 @@ async fn new(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
+    if crate::runtime::in_delegated_tool(&lua) {
+        return Ok(err_pair(DELEGATED_SESSION_LIFECYCLE));
+    }
     let (prompt, focus) = match opts {
         Some(opts) => (opts.get("prompt")?, opts.get("focus").unwrap_or(false)),
         None => (None, false),
     };
     roundtrip(lua, tx, SessionRequest::New { prompt, focus }).await
-}
-
-/// Sends {text} as a regular user prompt to a live session. The text is
-/// never interpreted: slash commands, `exit`, and `!` shell prefixes are
-/// all sent to the model verbatim. If the session is currently streaming,
-/// the prompt is queued and picked up when the agent reaches it.
-///
-/// @param text string The prompt to send. Must not be blank.
-/// @param opts table? Optional fields: session (string) id of a live
-///   session; defaults to the focused one.
-/// @return (string|nil, string|nil) "started" or "queued", or nil and an error.
-/// @example
-/// local state, err = maki.session.prompt("run the tests", { session = id })
-#[lua_fn]
-async fn prompt(
-    lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
-    text: String,
-    opts: Option<Table>,
-) -> LuaResult<Pair<Value>> {
-    let id = match opts {
-        Some(opts) => opts.get("session")?,
-        None => None,
-    };
-    roundtrip(lua, tx, SessionRequest::Prompt { id, text }).await
 }
 
 /// Reports {text} to a live session without creating a user turn. The
@@ -337,13 +219,10 @@ async fn prompt(
 /// @example
 /// maki.session.notify("[monitor] deploy failed", { session = id, wake = true })
 #[lua_fn]
-fn notify(_lua: &Lua, text: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
+fn notify(_lua: &Lua, text: String, opts: Table) -> LuaResult<Pair<bool>> {
     if text.trim().is_empty() {
         return Ok(err_pair(BLANK_NOTIFY_ERR));
     }
-    let Some(opts) = opts else {
-        return Ok(err_pair(SESSION_REQUIRED_ERR));
-    };
     let Some(raw_id) = opts.get::<Option<String>>("session")? else {
         return Ok(err_pair(SESSION_REQUIRED_ERR));
     };
@@ -356,113 +235,6 @@ fn notify(_lua: &Lua, text: String, opts: Option<Table>) -> LuaResult<Pair<bool>
         return Ok(err_pair(error));
     }
     Ok((Some(true), None))
-}
-
-/// Returns the complete ordered option snapshot for a live session.
-///
-/// @param opts table? Optional `session` id; defaults to the focused session.
-/// @return (table|nil, string|nil) `{version, options}`, or nil and an error.
-/// @example
-/// local snapshot, err = maki.session.options({ session = id })
-#[lua_fn]
-async fn options(
-    lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
-    opts: Option<Table>,
-) -> LuaResult<Pair<Table>> {
-    let coordinator = match resolve_coordinator(&lua, tx.as_ref(), opts.as_ref()).await {
-        Ok(coordinator) => coordinator,
-        Err(error) => return Ok(err_pair(error)),
-    };
-    let snapshot = snapshot_table(&lua, &coordinator.read().options())?;
-    if let Some(tx) = tx {
-        let (reply_tx, reply_rx) = flume::bounded(1);
-        if let Err(error) = tx.send(UiAction::Session {
-            req: SessionRequest::Options {
-                session: coordinator.session_id().to_string(),
-            },
-            reply_tx,
-        }) {
-            return Ok(err_pair(error));
-        }
-        let values = match reply_rx.recv_async().await {
-            Ok(Ok(values)) => values,
-            Ok(Err(error)) => return Ok(err_pair(error)),
-            Err(error) => return Ok(err_pair(error)),
-        };
-        let options: Table = snapshot.get("options")?;
-        for option in options.sequence_values::<Table>() {
-            let option = option?;
-            let id: String = option.get("id")?;
-            if let Some(value) = values.get(&id).and_then(serde_json::Value::as_str) {
-                option.set("current_value", value)?;
-            }
-        }
-    }
-    Ok((Some(snapshot), None))
-}
-
-/// Sets one option explicitly for a live session. Managed model, thinking,
-/// fast, and workflow changes succeed at actor commit; saving is asynchronous.
-/// Other options retain their existing owner and persistence behavior.
-/// See [Configuration changes](/docs/modes/#configuration-changes).
-///
-/// @param id string Stable option id.
-/// @param value string Selectable value id.
-/// @param opts table? Optional `session` id; defaults to the focused session.
-/// @return (boolean|nil, string|nil) true, or nil and an error.
-/// @example
-/// local ok, err = maki.session.set_option("fast", "enabled", { session = id })
-#[lua_fn]
-async fn set_option(
-    lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
-    id: String,
-    value: String,
-    opts: Option<Table>,
-) -> LuaResult<Pair<bool>> {
-    if let Err(error) = ensure_validation_not_in_progress(&lua) {
-        return Ok(err_pair(error));
-    }
-    let coordinator = match resolve_coordinator(&lua, tx.as_ref(), opts.as_ref()).await {
-        Ok(coordinator) => coordinator,
-        Err(error) => return Ok(err_pair(error)),
-    };
-    let snapshot = coordinator.read().options();
-    if let Some(option) = snapshot
-        .options
-        .iter()
-        .find(|option| option.definition.id.as_ref() == id)
-        && let Err(error) = validate_option_value(&lua, option, &value)
-    {
-        return Ok(err_pair(error));
-    }
-    if let Some(tx) = tx {
-        let (reply_tx, reply_rx) = flume::bounded(1);
-        if let Err(error) = tx.send(UiAction::Session {
-            req: SessionRequest::SetOption {
-                session: coordinator.session_id().to_string(),
-                id,
-                value,
-                version: snapshot.version,
-            },
-            reply_tx,
-        }) {
-            return Ok(err_pair(error));
-        }
-        return match reply_rx.recv_async().await {
-            Ok(Ok(_)) => Ok((Some(true), None)),
-            Ok(Err(error)) => Ok(err_pair(error)),
-            Err(_) => Ok(err_pair("ui dropped the option update")),
-        };
-    }
-    match coordinator
-        .set_option_if_version(id, value, Some(snapshot.version))
-        .await
-    {
-        Ok(_) => Ok((Some(true), None)),
-        Err(error) => Ok(err_pair(error)),
-    }
 }
 
 /// Renames a session, live or stored.
@@ -478,47 +250,54 @@ async fn set_title(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     opts: Table,
 ) -> LuaResult<Pair<Value>> {
+    let id: String = opts.get("id")?;
+    let parsed = try_pair!(id.parse::<MakiId>());
+    if let Some(denial) = delegated_tool_denial(&lua, parsed) {
+        return Ok(err_pair(denial));
+    }
     let req = SessionRequest::SetTitle {
-        id: opts.get("id")?,
+        id,
         title: opts.get("title")?,
     };
     roundtrip(lua, tx, req).await
 }
 
-/// Returns the current thinking mode of the focused session and whether its
-/// model supports thinking at all (for hiding/graving the selector).
+/// Persists the default thinking setting for new sessions without changing
+/// any live session. Every frontend starts a blank session on it, ahead of
+/// `always_thinking`. `mode` is a thinking setting as `Agent:set_model`
+/// accepts it. Print saves nothing, so there it returns an error and leaves
+/// the saved default alone.
 ///
-/// @return (table|nil, string|nil) `{mode, supports_thinking, options}`, or nil and an error.
+/// @param mode string The thinking setting.
+/// @return (table|nil, string|nil) `{mode}` with the normalized setting, or nil and an error.
 /// @example
-/// local info = maki.session.thinking()
+/// maki.session.set_default_thinking("medium")
 #[lua_fn]
-async fn thinking(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
-    roundtrip(lua, tx, SessionRequest::GetThinking).await
+fn set_default_thinking(lua: &Lua, mode: String) -> LuaResult<Pair<Table>> {
+    if crate::runtime::in_delegated_tool(lua) {
+        return Ok(err_pair(DELEGATED_HOST_MUTATION));
+    }
+    try_pair!(crate::runtime::validate_plugin_effect(lua));
+    if lua.app_data_ref::<NoPreferences>().is_some() {
+        return Ok(err_pair(NO_PREFERENCES_ERR));
+    }
+    let thinking = try_pair!(parse_thinking(mode.trim()));
+    let state_dir = try_pair!(host_state_dir(lua));
+    try_pair!(write_prefs(
+        &state_dir,
+        &Prefs {
+            default_thinking: Some(thinking.into()),
+        },
+    ));
+    let reply = lua.create_table()?;
+    reply.set("mode", thinking.to_string())?;
+    Ok((Some(reply), None))
 }
 
-/// Sets the focused session's thinking mode. `mode` accepts any value
-/// `ThinkingConfig::parse_setting` understands: `off`, `adaptive`, an effort
-/// level (`minimal` .. `max`), or a token budget. When `set_default` is true,
-/// the choice is also persisted as the global default for new sessions.
-/// The active session changes at actor commit and is saved asynchronously.
-/// See [Configuration changes](/docs/modes/#configuration-changes).
-///
-/// @param opts table Required fields: mode (string) the thinking setting;
-///   set_default (boolean) also persist as the default for new sessions.
-/// @return (table|nil, string|nil) `{mode}`, or nil and an error.
-/// @example
-/// maki.session.set_thinking({ mode = "medium", set_default = true })
-#[lua_fn]
-async fn set_thinking(
-    lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
-    opts: Table,
-) -> LuaResult<Pair<Value>> {
-    let req = SessionRequest::SetThinking {
-        set_default: opts.get("set_default").unwrap_or(false),
-        thinking: opts.get("mode")?,
-    };
-    roundtrip(lua, tx, req).await
+/// Delegated tools may change only the session their turn belongs to.
+fn delegated_tool_denial(lua: &Lua, session: MakiId) -> Option<&'static str> {
+    let tool = crate::runtime::delegated_tool(lua)?;
+    (tool.session != Some(session)).then_some(DELEGATED_FOREIGN_SESSION)
 }
 
 lua_table! {
@@ -526,26 +305,27 @@ lua_table! {
     /// at once; these functions let plugins list, create, focus, rename, and
     /// delete them. Session management returns `nil, "no interactive UI
     /// attached"` without a UI. `notify` instead targets a live agent mailbox
-    /// directly, so it also works under ACP and SDK frontends.
+    /// directly, so it also works under ACP and SDK frontends. A tool handler
+    /// cannot create, focus or delete sessions, and the functions that change
+    /// a session (`set_title`) accept
+    /// only the session its own turn belongs to. Every function that reads or
+    /// changes one session takes it explicitly; `ctx:session_id()` names the
+    /// invocation's session.
     "maki.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), list_all(tx), live(tx), current(tx), usage(tx), read(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), options(tx), set_option(tx), set_title(tx), thinking(tx), set_thinking(tx)]
+    DOCS [list(tx), list_all(tx), live(tx), read(tx), focus(tx), delete(tx), new(tx), notify(), set_title(tx), set_default_thinking]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::util::command::NO_UI_ERR;
-    use std::path::PathBuf;
     use std::sync::Arc;
 
     use maki_agent::session_coordinator::{
-        DirectoryAdoptionFuture, ModelAdoptionFuture, SessionCheckpoint, SessionCoordinatorHandle,
-        SessionCoordinatorParams, builtin_option_definitions,
+        SessionCheckpoint, SessionCoordinatorHandle, SessionCoordinatorParams,
+        builtin_option_definitions,
     };
-    use maki_providers::Model;
-    use maki_storage::checkpoint::{
-        CheckpointAck, CheckpointFuture, CheckpointRequest, CheckpointWriter,
-    };
+    use maki_storage::checkpoint::{CheckpointWriter, accept_all};
     use mlua::Value;
     use serde_json::json;
     use test_case::test_case;
@@ -559,15 +339,7 @@ mod tests {
 
     fn live_mailbox(id: MakiId) -> (SessionMailbox, SessionCoordinatorHandle) {
         let mailbox = SessionMailbox::new(id);
-        let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> =
-            Arc::new(|request: CheckpointRequest<SessionCheckpoint>| {
-                Box::pin(async move {
-                    Ok(CheckpointAck {
-                        session_id: request.session_id,
-                        version: request.version,
-                    })
-                }) as CheckpointFuture
-            });
+        let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = accept_all();
         let coordinator = SessionCoordinatorHandle::register(SessionCoordinatorParams {
             session_id: id,
             catalog: Default::default(),
@@ -580,14 +352,7 @@ mod tests {
                 maki_agent::ThinkingConfig::Off,
             ),
             persisted_options: Default::default(),
-            history: Vec::new(),
-            model: Arc::from("test/model"),
-            cwd: PathBuf::from("/project"),
             model_policy: Arc::default(),
-            model_adopter: Arc::new(|_: Model| Box::pin(async { Ok(()) }) as ModelAdoptionFuture),
-            directory_adopter: Arc::new(|path: PathBuf| {
-                Box::pin(async move { Ok(path) }) as DirectoryAdoptionFuture
-            }),
             checkpoint,
             mailbox: mailbox.clone(),
         })
@@ -602,41 +367,6 @@ mod tests {
             smol::block_on(lua.load("return session.live()").eval_async()).unwrap();
         assert!(val.is_nil());
         assert_eq!(err.as_deref(), Some(NO_UI_ERR));
-    }
-
-    #[test]
-    fn usage_roundtrips_through_ui_channel() {
-        let (tx, rx) = flume::unbounded::<UiAction>();
-        let lua = lua_with_session(Some(tx));
-        let checker = std::thread::spawn(move || {
-            let Ok(UiAction::Session {
-                req: SessionRequest::Usage,
-                reply_tx,
-            }) = rx.recv()
-            else {
-                panic!("expected usage request");
-            };
-            reply_tx
-                .send(Ok(json!({
-                    "total": {
-                        "input": 1,
-                        "output": 2,
-                        "cache_creation": 3,
-                        "cache_read": 4,
-                        "cost": null,
-                    },
-                    "models": [],
-                })))
-                .unwrap();
-        });
-        let (val, err): (Table, Option<String>) =
-            smol::block_on(lua.load("return session.usage()").eval_async()).unwrap();
-        checker.join().unwrap();
-        assert_eq!(err, None);
-        let total: Table = val.get("total").unwrap();
-        assert_eq!(total.get::<u32>("input").unwrap(), 1);
-        assert!(total.get::<Value>("cost").unwrap().is_nil());
-        assert_eq!(val.get::<Table>("models").unwrap().raw_len(), 0);
     }
 
     #[test]
@@ -659,137 +389,15 @@ mod tests {
         assert_eq!(val.get::<String>("focused").unwrap(), "abc");
     }
 
-    #[test_case("return session.prompt('hi', { session = 'abc' })", Some("abc") ; "explicit_session_id")]
-    #[test_case("return session.prompt('hi')", None ; "defaults_to_focused")]
-    fn prompt_forwards_text_and_session_id(code: &str, expected_id: Option<&str>) {
+    #[test_case("return session.read({})" ; "read")]
+    fn session_target_is_required(code: &str) {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = lua_with_session(Some(tx));
-        let expected_id = expected_id.map(str::to_owned);
-        let checker = std::thread::spawn(move || {
-            let Ok(UiAction::Session {
-                req: SessionRequest::Prompt { id, text },
-                reply_tx,
-            }) = rx.recv()
-            else {
-                panic!("expected prompt request");
-            };
-            assert_eq!(id, expected_id);
-            assert_eq!(text, "hi");
-            reply_tx.send(Ok(json!("queued"))).unwrap();
-        });
-        let (val, err): (String, Option<String>) =
+        let (value, error): (Value, Option<String>) =
             smol::block_on(lua.load(code).eval_async()).unwrap();
-        checker.join().unwrap();
-        assert_eq!(err, None);
-        assert_eq!(val, "queued");
-    }
-
-    #[test]
-    fn options_explicit_session_returns_complete_ordered_snapshot() {
-        let id = MakiId::generate();
-        let (_, coordinator) = live_mailbox(id);
-        let lua = lua_with_session(None);
-        lua.globals().set("session_id", id.to_string()).unwrap();
-
-        let (snapshot, error): (Table, Option<String>) = smol::block_on(
-            lua.load("return session.options({ session = session_id })")
-                .eval_async(),
-        )
-        .unwrap();
-
-        assert_eq!(error, None);
-        assert_eq!(snapshot.get::<u64>("version").unwrap(), 1);
-        let options = snapshot.get::<Table>("options").unwrap();
-        let ids = options
-            .sequence_values::<Table>()
-            .map(|option| option.unwrap().get::<String>("id").unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(ids, ["model", "yolo", "fast", "workflow", "thinking"]);
-        let model = options.get::<Table>(1).unwrap();
-        assert_eq!(model.get::<String>("category").unwrap(), "model");
-        assert_eq!(model.get::<String>("current_value").unwrap(), "test/model");
-        assert_eq!(model.get::<Table>("values").unwrap().raw_len(), 1);
-        smol::block_on(coordinator.close()).unwrap();
-    }
-
-    #[test]
-    fn focused_session_options_and_setter_use_coordinator() {
-        let id = MakiId::generate();
-        let (_, coordinator) = live_mailbox(id);
-        let (tx, rx) = flume::unbounded::<UiAction>();
-        let lua = lua_with_session(Some(tx));
-        let session_id = id.to_string();
-        let responder_coordinator = coordinator.clone();
-        let responder = std::thread::spawn(move || {
-            let Ok(UiAction::Session {
-                req: SessionRequest::Current,
-                reply_tx,
-            }) = rx.recv()
-            else {
-                panic!("expected current-session request");
-            };
-            reply_tx.send(Ok(json!(session_id))).unwrap();
-            let Ok(UiAction::Session {
-                req:
-                    SessionRequest::SetOption {
-                        session: target,
-                        id,
-                        value,
-                        version,
-                    },
-                reply_tx,
-            }) = rx.recv()
-            else {
-                panic!("expected option update request");
-            };
-            assert_eq!(target, session_id);
-            let result = smol::block_on(responder_coordinator.set_option_if_version(
-                id,
-                value,
-                Some(version),
-            ))
-            .map(|_| json!(true))
-            .map_err(|error| error.to_string());
-            reply_tx.send(result).unwrap();
-        });
-
-        let (ok, error): (bool, Option<String>) = smol::block_on(
-            lua.load("return session.set_option('yolo', 'enabled')")
-                .eval_async(),
-        )
-        .unwrap();
-        assert!(ok);
-        assert_eq!(error, None);
-
-        assert!(
-            coordinator
-                .read()
-                .options()
-                .options
-                .iter()
-                .any(|option| option.definition.id.as_ref() == "yolo"
-                    && option.current_value.as_ref() == "enabled")
-        );
-        responder.join().unwrap();
-        smol::block_on(coordinator.close()).unwrap();
-    }
-
-    #[test]
-    fn options_rejects_closed_explicit_session() {
-        let id = MakiId::generate();
-        let (_, coordinator) = live_mailbox(id);
-        smol::block_on(coordinator.close()).unwrap();
-        let lua = lua_with_session(None);
-        lua.globals().set("session_id", id.to_string()).unwrap();
-
-        let (value, error): (Value, Option<String>) = smol::block_on(
-            lua.load("return session.options({ session = session_id })")
-                .eval_async(),
-        )
-        .unwrap();
-
         assert!(value.is_nil());
-        assert_eq!(error, Some(format!("session not live: {id}")));
+        assert_eq!(error.as_deref(), Some(SESSION_REQUIRED_ERR));
+        assert!(rx.is_empty());
     }
 
     #[test]
@@ -836,8 +444,10 @@ mod tests {
     #[test]
     fn notify_rejects_missing_and_non_live_sessions() {
         let lua = lua_with_session(None);
-        let (_, missing): (Value, Option<String>) =
-            lua.load("return session.notify('built')").eval().unwrap();
+        let (_, missing): (Value, Option<String>) = lua
+            .load("return session.notify('built', {})")
+            .eval()
+            .unwrap();
         assert_eq!(missing.as_deref(), Some(SESSION_REQUIRED_ERR));
 
         let id = MakiId::generate();
@@ -871,65 +481,5 @@ mod tests {
         let result: LuaResult<Value> =
             smol::block_on(lua.load("return session.set_title('oops')").eval_async());
         assert!(result.unwrap_err().to_string().contains("table"));
-    }
-
-    #[test]
-    fn set_thinking_forwards_mode_and_set_default_flag() {
-        let (tx, rx) = flume::unbounded::<UiAction>();
-        let lua = lua_with_session(Some(tx));
-        let checker = std::thread::spawn(move || {
-            let Ok(UiAction::Session {
-                req:
-                    SessionRequest::SetThinking {
-                        set_default,
-                        thinking,
-                    },
-                reply_tx,
-            }) = rx.recv()
-            else {
-                panic!("expected set_thinking request");
-            };
-            assert!(set_default);
-            assert_eq!(thinking, "medium");
-            reply_tx.send(Ok(json!({ "mode": "medium" }))).unwrap();
-        });
-        let (val, err): (Table, Option<String>) = smol::block_on(
-            lua.load("return session.set_thinking({ mode = 'medium', set_default = true })")
-                .eval_async(),
-        )
-        .unwrap();
-        assert_eq!(err, None);
-        assert_eq!(val.get::<String>("mode").unwrap(), "medium");
-        checker.join().unwrap();
-    }
-
-    #[test]
-    fn thinking_roundtrips_mode_support_flag_and_options() {
-        let (tx, rx) = flume::unbounded::<UiAction>();
-        let lua = lua_with_session(Some(tx));
-        let checker = std::thread::spawn(move || {
-            let Ok(UiAction::Session {
-                req: SessionRequest::GetThinking,
-                reply_tx,
-            }) = rx.recv()
-            else {
-                panic!("expected get_thinking request");
-            };
-            reply_tx
-                .send(Ok(json!({
-                    "mode": "high",
-                    "supports_thinking": true,
-                    "options": ["off", "adaptive", "low", "high"],
-                })))
-                .unwrap();
-        });
-        let (val, err): (Table, Option<String>) =
-            smol::block_on(lua.load("return session.thinking()").eval_async()).unwrap();
-        assert_eq!(err, None);
-        assert_eq!(val.get::<String>("mode").unwrap(), "high");
-        assert!(val.get::<bool>("supports_thinking").unwrap());
-        let options: Vec<String> = val.get("options").unwrap();
-        assert_eq!(options, ["off", "adaptive", "low", "high"]);
-        checker.join().unwrap();
     }
 }

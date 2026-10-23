@@ -7,7 +7,9 @@ use maki_agent::cancel::CancelToken;
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult};
 
-use crate::runtime::{ASYNC_RUN_DEFAULT_DEADLINE, MAX_LUA_SECONDS, PendingAsyncTask};
+use crate::agent_errors::TRUSTED_TIMER_REQUIRED;
+use crate::api::util::pair::{Pair, try_pair};
+use crate::runtime::{ASYNC_RUN_DEFAULT_DEADLINE, MAX_LUA_SECONDS, PendingAsyncTask, TaskCall};
 
 const ERR_SECONDS_RANGE: &str = "seconds must be a finite number > 0 and < 1e9";
 
@@ -171,10 +173,25 @@ pub(crate) fn due_tasks(lua: &Lua) -> Vec<PendingAsyncTask> {
                     deadline: Some(now + ASYNC_RUN_DEFAULT_DEADLINE),
                     live_ctx: None,
                     owner: None,
+                    plugin_grant: lua
+                        .app_data_ref::<TimerStore>()
+                        .and_then(|store| {
+                            store
+                                .entries
+                                .get(&timer_id)
+                                .map(|entry| entry.plugin.clone())
+                        })
+                        .map(|plugin| {
+                            let owner = crate::orchestration::plugin_authority(lua, plugin.clone());
+                            (plugin, owner)
+                        }),
                     managed_turn: None,
+                    ancestors: Arc::default(),
+                    delegated_tool: None,
                     command_depth: 0,
                     command_invocation: None,
-                    timer_id: Some(timer_id),
+                    pinned_target: None,
+                    call: TaskCall::Timer(timer_id),
                 }),
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to pin timer callback");
@@ -183,6 +200,13 @@ pub(crate) fn due_tasks(lua: &Lua) -> Vec<PendingAsyncTask> {
             },
         )
         .collect()
+}
+
+pub(crate) fn require_trusted_authority(lua: &Lua) -> Result<(), String> {
+    if crate::runtime::in_delegated_tool(lua) {
+        return Err(TRUSTED_TIMER_REQUIRED.into());
+    }
+    crate::runtime::validate_plugin_effect(lua)
 }
 
 /// Schedule {callback} to run every {seconds} on the runtime's timer pump.
@@ -200,11 +224,13 @@ pub(crate) fn due_tasks(lua: &Lua) -> Vec<PendingAsyncTask> {
 /// coalesce into a single fire.
 ///
 /// Registration is synchronous - nothing runs until the first deadline - so
-/// calling this from `init.lua` or a command is safe.
+/// calling this from `init.lua` or a command is safe. Delegated tool tasks,
+/// including their async children, cannot register timers.
 ///
 /// @param seconds number Interval between fires, in seconds. Must be a finite number > 0 and < 1e9.
 /// @param callback function Called on each fire with the timer id. May be async.
-/// @return integer Id. Pass to `maki.timer.del` to stop the timer.
+/// @return integer|nil Id. Pass to `maki.timer.del` to stop the timer.
+/// @return string|nil Error on failure.
 /// @example
 /// local runs = 0
 /// maki.timer.set(1, function(id)
@@ -220,26 +246,29 @@ fn set(
     #[ctx] plugin: Arc<str>,
     seconds: f64,
     callback: Function,
-) -> LuaResult<u64> {
+) -> LuaResult<Pair<u64>> {
+    try_pair!(require_trusted_authority(lua));
     if !seconds.is_finite() || seconds <= 0.0 || seconds >= MAX_LUA_SECONDS {
         return Err(mlua::Error::runtime(ERR_SECONDS_RANGE));
     }
-    let key = lua.create_registry_value(callback.clone())?;
+    let key = try_pair!(lua.create_registry_value(callback.clone()));
     let interval = Duration::from_secs_f64(seconds);
     if crate::runtime::loading_plugin_is(lua, &plugin) {
-        Ok(pending
+        let id = pending
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .add(plugin, key, callback, interval))
+            .add(plugin, key, callback, interval);
+        Ok((Some(id), None))
     } else {
-        let mut store = lua
-            .app_data_mut::<TimerStore>()
-            .ok_or_else(|| mlua::Error::runtime("timer store not initialized"))?;
+        let mut store = try_pair!(
+            lua.app_data_mut::<TimerStore>()
+                .ok_or("timer store not initialized")
+        );
         let id = store.add(plugin, key, callback, interval);
         // One pending wake is enough: the pump re-picks the earliest deadline
         // on its next pass.
         let _ = store.wake_tx.try_send(());
-        Ok(id)
+        Ok((Some(id), None))
     }
 }
 

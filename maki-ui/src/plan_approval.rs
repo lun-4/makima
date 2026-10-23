@@ -2,10 +2,8 @@ use std::fmt::Display;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use maki_agent::actor::{ConfigChange, ConfigPatch, PreparedModel};
+use maki_agent::actor::PreparedModel;
 use maki_agent::manager::ManagerError;
-use maki_agent::{AgentMode, ModeDef};
-use maki_config::ModelPolicy;
 use maki_providers::{Model, Timeouts};
 
 pub(crate) type PrepareProvider =
@@ -54,32 +52,6 @@ pub(crate) fn read_plan(path: PathBuf, parallel: bool) -> Result<ApprovedPlan, S
         path,
         content,
         message,
-    })
-}
-
-pub(crate) fn prepare_change(
-    spec: Option<String>,
-    policy: &ModelPolicy,
-    timeouts: Timeouts,
-    prepare: &PrepareProvider,
-    mode_def: ModeDef,
-) -> Result<ConfigChange, String> {
-    let model = spec
-        .map(|spec| {
-            if !policy.allows(&spec) {
-                return Err(format!("model is not allowed: {spec}"));
-            }
-            let model = Model::from_spec(&spec).map_err(|error| error.to_string())?;
-            prepare(model, timeouts).map_err(|error| error.to_string())
-        })
-        .transpose()?;
-    Ok(ConfigChange::PatchAndMode {
-        patch: ConfigPatch {
-            model,
-            ..Default::default()
-        },
-        mode: AgentMode::Build,
-        mode_def,
     })
 }
 

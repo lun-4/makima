@@ -365,7 +365,7 @@ All fields are optional. Typos in field names cause an error right away.
          `enabled = false` to turn one off.\n\n\
          A plugin that is off never loads, so its tool name is free for one \
          of your own plugins to take. Permission rules are keyed by the tool \
-         name alone, and names such as `bash`, `write`, and `task` already \
+         name alone, and names such as `bash`, `write`, and `task_spawn` already \
          have rules in maki. A plugin that takes one of them inherits those \
          rules, together with any \"always allow\" you saved. Maki warns you \
          at load when this happens.\n\n\
@@ -420,18 +420,6 @@ Makima follows platform directory conventions. On Linux and macOS that is XDG. O
 | Cache | `~/.cache/makima/` | `%LOCALAPPDATA%\\makima\\` |
 
 Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\\makima` on Windows; that is separate from these runtime dirs.
-
-`~/.makima/` (or `%USERPROFILE%\\.makima\\`) is checked as a legacy fallback. If that directory still exists, maki uses it for everything until you migrate.
-
-### Migrating from ~/.makima/
-
-```
-makima migrate xdg
-```
-
-This safely moves sessions, auth, plans, memories, logs, and preferences to the platform locations above. Where both old and new files exist, they are merged (input history, model tiers, etc.). Nothing is deleted until it has been copied. At the end you get a summary of where everything lives now.
-
-Safe to run more than once.
 
 ## Personal Instructions
 

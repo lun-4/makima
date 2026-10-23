@@ -31,6 +31,8 @@ pub enum ManagerError {
         expected_id: AgentId,
         actual_id: AgentId,
     },
+    #[error("turn_result_unavailable: {turn_id} for agent {agent_id}")]
+    TurnResultUnavailable { agent_id: AgentId, turn_id: TurnId },
     #[error("turn {turn_id} does not belong to agent {agent_id}")]
     TicketActorMismatch { agent_id: AgentId, turn_id: TurnId },
     #[error("agent {child_id} is not a descendant of agent {parent_id}")]

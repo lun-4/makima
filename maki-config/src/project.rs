@@ -6,7 +6,7 @@ use maki_storage::StateDir;
 use maki_storage::paths::{canonicalize_clean, home};
 use maki_storage::trusted_folders::{CanonicalFolder, TrustDecision, TrustedFolders};
 use strum::VariantArray;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::{PROJECT_DIR, TrustConfig};
 
@@ -84,10 +84,10 @@ impl std::fmt::Display for GatedFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectConfig {
     config_root: PathBuf,
-    /// The home directory is the one folder that is never a project of its own,
-    /// see [`ProjectConfig::rooted`].
-    at_home: bool,
     trusted: bool,
+    /// `--no-project`: nothing under the project's `.makima` directory loads,
+    /// whatever the folder's trust.
+    ignored: bool,
     /// The store the trust answer came from, so a gated file Maki writes later
     /// can be added to that same answer. A config nobody resolved against a
     /// store has no answer to widen, so it records nothing, which also keeps
@@ -101,17 +101,13 @@ impl ProjectConfig {
         Self::rooted(cwd, home.as_deref())
     }
 
-    /// The walk stops below `home`, and a start in `home` itself is the same
-    /// rule seen from the other side: `PROJECT_DIR` there is the user's own
-    /// global config, not something a repository shipped, so there is no
-    /// project to load and nothing to ask about.
+    /// The walk stops below `home`, see [`git_checkout_boundary`].
     pub(crate) fn rooted(cwd: &Path, home: Option<&Path>) -> Self {
         let cwd = canonicalize_clean(cwd);
-        let at_home = home == Some(cwd.as_path());
         Self {
             config_root: git_checkout_boundary(&cwd, home).unwrap_or(cwd),
-            at_home,
             trusted: false,
+            ignored: false,
             trust_store: None,
         }
     }
@@ -130,6 +126,10 @@ impl ProjectConfig {
 
     pub fn is_trusted(&self) -> bool {
         self.trusted
+    }
+
+    pub fn is_ignored(&self) -> bool {
+        self.ignored
     }
 
     /// The only route to a gated project file. `None` unless the folder is
@@ -194,11 +194,10 @@ impl TrustQuestion {
 /// "trusted" and "why" cannot drift apart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrustState {
-    /// Project config loads: a recorded yes, a grandfathered or v1 folder just
-    /// written down, or `--trust`.
+    /// Project config loads: a recorded yes or `--trust`.
     Trusted,
-    /// Nothing loads and nothing to ask: the home directory, a folder shipping
-    /// no gated file, or a store this run could not read.
+    /// Nothing loads and nothing to ask: a folder shipping no gated file, or a
+    /// store this run could not read.
     Inert,
     /// Gated files present, no answer recorded. This is what the card asks.
     Unanswered(TrustQuestion),
@@ -309,21 +308,34 @@ pub enum TrustMode {
     Consult,
     /// Trust for this process only. `--trust`.
     Session,
+    /// Load nothing from the project, trusted or not. `--no-project`.
+    Ignore,
 }
 
 pub fn resolve(storage: &StateDir, cwd: &Path, mode: TrustMode) -> ProjectDecision {
     match mode {
         TrustMode::Session => session_grant(ProjectConfig::discover(cwd)),
         TrustMode::Consult => resolve_recorded(storage, ProjectConfig::discover(cwd)),
+        TrustMode::Ignore => ignored(cwd),
     }
+}
+
+/// Nothing is read or recorded, so a folder that was never asked about stays
+/// unasked.
+fn ignored(cwd: &Path) -> ProjectDecision {
+    let mut project_config = ProjectConfig::discover(cwd);
+    project_config.ignored = true;
+    ProjectDecision::new(project_config, TrustState::Inert, None)
 }
 
 /// For commands that never open the state directory for anything else: a state
 /// directory they cannot resolve costs them the shared project config, not the
 /// whole command.
 pub fn resolve_noninteractive(cwd: &Path, mode: TrustMode) -> ProjectDecision {
-    if mode == TrustMode::Session {
-        return session_grant(ProjectConfig::discover(cwd));
+    match mode {
+        TrustMode::Session => return session_grant(ProjectConfig::discover(cwd)),
+        TrustMode::Ignore => return ignored(cwd),
+        TrustMode::Consult => {}
     }
     match StateDir::resolve() {
         Ok(storage) => resolve(&storage, cwd, mode),
@@ -342,44 +354,29 @@ pub fn resolve_noninteractive(cwd: &Path, mode: TrustMode) -> ProjectDecision {
 /// The config carries no store, so a gated file Maki writes during the run
 /// records nothing either, and the next start without the flag asks about it.
 fn session_grant(project_config: ProjectConfig) -> ProjectDecision {
-    // `~/.maki` is the user's own global config, already loaded as global. No
-    // flag turns that into a project, or it would load twice.
-    let state = if project_config.at_home {
-        TrustState::Inert
-    } else {
-        TrustState::Trusted
-    };
-    ProjectDecision::new(project_config, state, None)
+    ProjectDecision::new(project_config, TrustState::Trusted, None)
 }
 
 fn resolve_recorded(storage: &StateDir, project_config: ProjectConfig) -> ProjectDecision {
     // Every config that leaves here carries the store its answer came from,
     // trusted or not, so a later write can find the same answer again.
     let project_config = project_config.with_trust_store(storage);
-    // Maki loads the home directory's own `.maki` as global config already, so
-    // a start there has nothing a project shipped. Asking would be a question
-    // about the user's own files, and a yes would load that config twice.
-    if project_config.at_home {
-        return ProjectDecision::new(project_config, TrustState::Inert, None);
-    }
     let folder = match CanonicalFolder::resolve(project_config.config_root()) {
         Ok(folder) => folder,
         Err(error) => return ProjectDecision::inert(project_config, format!("{error}; {SKIPPED}")),
     };
     let trusted_folders = TrustedFolders::new(storage);
     let present = gated_files(project_config.config_root());
-    let decision = match trusted_folders.decide(&folder, &store_names(&present), &project_root) {
+    let decision = match trusted_folders.decide(&folder, &store_names(&present)) {
         Ok(decision) => decision,
         Err(error) => return ProjectDecision::inert(project_config, format!("{error}; {SKIPPED}")),
     };
 
     // Nothing to load means nothing to ask about, so report whatever the store
-    // already says and stay quiet. A folder that predates folder trust is the
-    // exception: writing its record down even with nothing to load is what
-    // bounds the grant to today's files.
-    if present.is_empty() && decision != TrustDecision::Grandfathered {
+    // already says and stay quiet.
+    if present.is_empty() {
         let state = match decision {
-            TrustDecision::Trusted | TrustDecision::Unrecorded => TrustState::Trusted,
+            TrustDecision::Trusted => TrustState::Trusted,
             _ => TrustState::Inert,
         };
         return ProjectDecision::new(project_config, state, None);
@@ -392,24 +389,6 @@ fn resolve_recorded(storage: &StateDir, project_config: ProjectConfig) -> Projec
     };
     match decision {
         TrustDecision::Trusted => ProjectDecision::new(project_config, TrustState::Trusted, None),
-        // An answer given before Maki recorded file sets stays good, and
-        // writing down what the folder ships today bounds it from here on.
-        TrustDecision::Unrecorded => {
-            info!(folder = %folder.path().display(), "recording what an older trust decision covers");
-            record_trust(storage, &question(Vec::new()), project_config)
-        }
-        // A folder the user was already working in before folder trust existed
-        // loaded its shared config without a question, and re-asking there only
-        // teaches people to answer without reading. The set behind this is
-        // frozen at the first start of this version, so nothing a later run
-        // does can put a folder into it, and that is what makes it safe on a
-        // path that cannot ask anybody. What the folder shipped back then is
-        // unknowable, so the record covers what it ships today and nothing
-        // more, and a file added after this asks like any other.
-        TrustDecision::Grandfathered => {
-            info!(folder = %folder.path().display(), "trusting folder that was in use before folder trust existed");
-            record_trust(storage, &question(Vec::new()), project_config)
-        }
         TrustDecision::Rejected => ProjectDecision::new(
             project_config,
             TrustState::Declined(question(Vec::new())),
@@ -496,15 +475,6 @@ pub fn apply_answer(
         }
         TrustAnswer::NotNow => decision,
     }
-}
-
-fn record_trust(
-    storage: &StateDir,
-    question: &TrustQuestion,
-    project_config: ProjectConfig,
-) -> ProjectDecision {
-    let warning = grant(storage, question).err();
-    ProjectDecision::new(project_config, TrustState::Trusted, warning)
 }
 
 /// Maki writing a gated file into a trusted project is not the project
@@ -610,20 +580,8 @@ fn name_list<'a>(files: impl IntoIterator<Item = &'a str>) -> Option<String> {
     }
 }
 
-/// The folder a start in `cwd` would decide trust about. The grandfather
-/// snapshot resolves every working directory it remembers through this, so a
-/// grant covers the checkout that held the session and nothing above it.
-///
-/// A directory that is gone by then has no `.git` anywhere it could still be
-/// found, so it resolves to itself. That grants nothing until somebody recreates
-/// exactly the directory that had the history.
-pub fn project_root(cwd: &Path) -> PathBuf {
-    ProjectConfig::discover(cwd).config_root
-}
-
 /// The walk stops below `home`: a dotfiles repository at `$HOME` would otherwise
-/// make every folder under home share one project root, and `PROJECT_DIR` there
-/// is the user's own global config, not something a repository shipped.
+/// make every folder under home share one project root.
 fn git_checkout_boundary(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
     cwd.ancestors()
         .take_while(|path| Some(*path) != home)
@@ -633,9 +591,7 @@ fn git_checkout_boundary(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use maki_storage::sessions::{SESSIONS_DIR, Session, TitleSource};
     use maki_storage::trusted_folders::TrustStatus;
-    use serde::{Deserialize, Serialize};
 
     use crate::TrustFileConfig;
     use test_case::test_case;
@@ -656,12 +612,9 @@ mod tests {
     const ANSWER_UNUSED: Option<TrustAnswer> = None;
     /// A run that cannot ask at all: headless, ACP, a utility subcommand.
     const CANNOT_ASK: Option<TrustAnswer> = None;
-    const MODEL: &str = "test-model";
     const PROJECTS_DIR: &str = "projects";
     const PROJECT_STATE_DIR: &str = "project-cbf29ce484222325";
     const TRUST_FILE: &str = "trusted-folders.json";
-    const PRE_TRUST_FILE: &str = "pre-trust-roots.json";
-    const EMPTY_SNAPSHOT: &str = "[]";
     const TRUST_LOCK: &str = "trusted-folders.lock";
     const UNREADABLE_STORE: &str = "broken";
     const GIT_DIR: &str = ".git";
@@ -669,8 +622,6 @@ mod tests {
     const HOME_ITSELF: &str = "";
     const NESTED_REPO: &str = "work";
     const NESTED_CWD: &str = "work/src";
-    const SOURCE_DIR: &str = "src";
-    const NO_FILES: &[&str] = &[];
     /// The documented blanket form: every folder trusted, spelled out.
     const BLANKET_GLOB: &str = "**";
     const UNRELATED_GLOB: &str = "/nowhere/*";
@@ -717,24 +668,7 @@ mod tests {
         Nothing,
         Trusted,
         Rejected,
-        RejectedAfterUse,
-        Session,
         ProjectState,
-    }
-
-    #[derive(Clone, Serialize, Deserialize)]
-    struct StoredMessage;
-
-    impl TitleSource for StoredMessage {
-        fn first_user_text(&self) -> Option<&str> {
-            None
-        }
-    }
-
-    fn record_session(storage: &StateDir, cwd: &Path) {
-        let mut session: Session<StoredMessage, u32, ()> =
-            Session::new(MODEL, cwd.to_str().unwrap());
-        session.save(storage).unwrap();
     }
 
     fn setup() -> (tempfile::TempDir, tempfile::TempDir, StateDir) {
@@ -759,11 +693,6 @@ mod tests {
             Prior::Rejected => {
                 store.reject(folder).unwrap();
             }
-            Prior::RejectedAfterUse => {
-                store.reject(folder).unwrap();
-                record_session(storage, folder.path());
-            }
-            Prior::Session => record_session(storage, &folder.path().join("src")),
             Prior::ProjectState => {
                 fs::create_dir_all(state.join(PROJECTS_DIR).join(PROJECT_STATE_DIR)).unwrap();
             }
@@ -966,38 +895,6 @@ mod tests {
         );
     }
 
-    /// The other end of the same boundary: starting Maki in the home directory
-    /// itself. On the legacy layout `~/.maki` holds init.lua and friends, so
-    /// without this the gated file scan would ask the user to trust their own
-    /// home, a no would store a rejection for it forever, and a yes would run
-    /// the global config a second time as project config.
-    #[test]
-    fn a_start_in_the_home_directory_asks_nothing() {
-        let state = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let home = home.path().canonicalize().unwrap();
-        fs::create_dir(home.join(PROJECT_DIR)).unwrap();
-        fs::write(home.join(INIT_FILE), INIT_SOURCE).unwrap();
-        let storage = StateDir::from_path(state.path().to_path_buf());
-
-        let answered = answer_question(
-            &storage,
-            ProjectConfig::rooted(&home, Some(&home)),
-            Some(TrustAnswer::Trust),
-        );
-
-        assert!(!answered.config.is_trusted());
-        assert!(answered.asked.is_none());
-        assert!(answered.warning.is_empty(), "{:?}", answered.warning);
-        assert_eq!(
-            TrustedFolders::new(&storage)
-                .status(&CanonicalFolder::resolve(&home).unwrap())
-                .unwrap(),
-            TrustStatus::Unknown,
-            "the home directory must not collect a stored decision either"
-        );
-    }
-
     /// `--trust` is the answer for a container that throws its state directory
     /// away, so it cannot depend on one. It also has to beat a stored no, or a
     /// mounted state directory would keep overriding the flag the user typed.
@@ -1032,18 +929,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_session_grant_still_loads_no_project_in_the_home_directory() {
-        let home = tempfile::tempdir().unwrap();
-        let home = home.path().canonicalize().unwrap();
-
-        let decision = session_grant(ProjectConfig::rooted(&home, Some(&home)));
-
-        assert!(!decision.project_config.is_trusted());
-    }
-
     #[test_case(Prior::Trusted, ANSWER_UNUSED, true, false, false ; "stored_trust_needs_no_question")]
-    #[test_case(Prior::Session, ANSWER_UNUSED, true, false, false ; "a_session_in_the_folder_grandfathers_it")]
     #[test_case(Prior::ProjectState, Some(TrustAnswer::Trust), true, true, false ; "project_state_alone_still_asks")]
     #[test_case(Prior::ProjectState, CANNOT_ASK, false, false, true ; "project_state_alone_grants_nothing_headless")]
     #[test_case(Prior::Nothing, Some(TrustAnswer::Trust), true, true, false ; "trust_records_the_folder")]
@@ -1051,7 +937,6 @@ mod tests {
     #[test_case(Prior::Nothing, Some(TrustAnswer::NotNow), false, true, false ; "not_now_records_nothing")]
     #[test_case(Prior::Nothing, CANNOT_ASK, false, false, true ; "headless_skips_and_warns")]
     #[test_case(Prior::Rejected, Some(TrustAnswer::Trust), false, false, true ; "a_rejection_is_not_asked_again")]
-    #[test_case(Prior::RejectedAfterUse, Some(TrustAnswer::Trust), false, false, true ; "a_rejection_beats_prior_use")]
     fn resolve_answers_from_what_the_state_dir_knows(
         prior: Prior,
         answer: Option<TrustAnswer>,
@@ -1164,121 +1049,6 @@ mod tests {
         }
     }
 
-    /// The bypass the frozen snapshot closes. An ACP or headless run skips the
-    /// shared config of an untrusted folder and still records a session in it,
-    /// so a live session index would read that back as prior use and grant the
-    /// folder trust on the next start with nobody ever asked.
-    #[test_case(Some(TrustAnswer::Never), true ; "the_next_interactive_run_still_asks")]
-    #[test_case(CANNOT_ASK, false ; "the_next_headless_run_gains_nothing")]
-    fn a_session_recorded_after_the_snapshot_never_grandfathers(
-        answer: Option<TrustAnswer>,
-        asked: bool,
-    ) {
-        let (_state, project, storage) = setup();
-        let folder = CanonicalFolder::resolve(project.path()).unwrap();
-        let first = answer_question(&storage, project_at(project.path()), CANNOT_ASK);
-        assert!(!first.config.is_trusted());
-
-        record_session(&storage, project.path());
-        let answered = answer_question(&storage, project_at(project.path()), answer);
-
-        assert!(!answered.config.is_trusted());
-        assert_eq!(answered.asked.is_some(), asked);
-        assert!(
-            !TrustedFolders::new(&storage).contains(&folder).unwrap(),
-            "a folder that entered the session index after the snapshot must not be trusted"
-        );
-    }
-
-    /// Somebody installing Maki for the first time has no history to
-    /// grandfather, so the snapshot their first start takes is empty and stays
-    /// empty.
-    #[test]
-    fn a_fresh_install_grandfathers_nothing() {
-        let (state, project, storage) = setup();
-
-        let answered = answer_question(
-            &storage,
-            project_at(project.path()),
-            Some(TrustAnswer::Never),
-        );
-
-        assert!(!answered.config.is_trusted());
-        assert!(answered.asked.is_some());
-        let snapshot =
-            fs::read_to_string(state.path().join(SESSIONS_DIR).join(PRE_TRUST_FILE)).unwrap();
-        assert_eq!(snapshot, EMPTY_SNAPSHOT);
-    }
-
-    /// The escalation an ancestor match would open. Running Maki once in a
-    /// checkout must not hand the directory that holds it a grant, or a
-    /// `.maki/init.lua` dropped in there runs the first time somebody starts
-    /// Maki one level up, with no question asked.
-    #[test]
-    fn a_session_in_a_nested_checkout_never_grandfathers_the_directory_above_it() {
-        let state = tempfile::tempdir().unwrap();
-        let parent = tempfile::tempdir().unwrap();
-        let nested = parent.path().join(NESTED_REPO);
-        fs::create_dir_all(nested.join(GIT_DIR)).unwrap();
-        for root in [parent.path(), nested.as_path()] {
-            fs::create_dir(root.join(PROJECT_DIR)).unwrap();
-            fs::write(root.join(INIT_FILE), INIT_SOURCE).unwrap();
-        }
-        let storage = StateDir::from_path(state.path().to_path_buf());
-        record_session(&storage, &nested.join(SOURCE_DIR));
-
-        let checkout = answer_question(&storage, project_at(&nested), CANNOT_ASK);
-        assert!(
-            checkout.config.is_trusted(),
-            "the checkout the session ran in keeps what it always loaded"
-        );
-
-        let above = answer_question(&storage, project_at(parent.path()), CANNOT_ASK);
-        assert!(
-            !above.config.is_trusted(),
-            "a directory that only holds a checkout was never in use itself"
-        );
-        assert!(!above.warning.is_empty(), "{:?}", above.warning);
-    }
-
-    /// The home directory is nobody's project root, so a session in a project
-    /// below it must not grandfather everything the user owns.
-    #[test]
-    fn home_is_never_grandfathered_from_a_project_below_it() {
-        let state = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let home = home.path().canonicalize().unwrap();
-        let repo = home.join(NESTED_REPO);
-        fs::create_dir_all(repo.join(GIT_DIR)).unwrap();
-        fs::create_dir(repo.join(SOURCE_DIR)).unwrap();
-        let storage = StateDir::from_path(state.path().to_path_buf());
-        record_session(&storage, &repo.join(SOURCE_DIR));
-
-        let root_of = |cwd: &Path| ProjectConfig::rooted(cwd, Some(&home)).config_root;
-        let store = TrustedFolders::new(&storage);
-
-        assert_eq!(
-            store
-                .decide(
-                    &CanonicalFolder::resolve(&repo).unwrap(),
-                    NO_FILES,
-                    &root_of
-                )
-                .unwrap(),
-            TrustDecision::Grandfathered
-        );
-        assert_eq!(
-            store
-                .decide(
-                    &CanonicalFolder::resolve(&home).unwrap(),
-                    NO_FILES,
-                    &root_of
-                )
-                .unwrap(),
-            TrustDecision::Unknown
-        );
-    }
-
     /// The escalation this closes: `<state>/projects/<id>/` is a directory the
     /// agent can create through the write tool, and the memory plugin writes
     /// there with no prompt. A repository must not be able to manufacture its
@@ -1385,34 +1155,6 @@ mod tests {
         assert!(answered.config.is_trusted());
         assert!(answered.asked.is_none());
         assert!(answered.warning.is_empty(), "{:?}", answered.warning);
-    }
-
-    /// A store written before file sets existed keeps its answers, and the
-    /// first start after the upgrade writes down what the folder ships that
-    /// day, which bounds it from then on.
-    #[test]
-    fn a_decision_from_before_file_sets_survives_and_is_bounded() {
-        let (state, project, storage) = setup();
-        let folder = CanonicalFolder::resolve(project.path()).unwrap();
-        fs::write(
-            state.path().join(TRUST_FILE),
-            serde_json::json!({"version": 1, "folders": [folder.path()]}).to_string(),
-        )
-        .unwrap();
-
-        let answered = answer_question(&storage, project_at(project.path()), ANSWER_UNUSED);
-        assert!(answered.config.is_trusted());
-        assert!(answered.asked.is_none());
-        assert!(answered.warning.is_empty(), "{:?}", answered.warning);
-
-        fs::write(project.path().join(MCP_FILE), MCP_SOURCE).unwrap();
-        let answered = answer_question(
-            &storage,
-            project_at(project.path()),
-            Some(TrustAnswer::Never),
-        );
-        assert!(!answered.config.is_trusted());
-        assert!(answered.asked_about(GatedFile::Mcp));
     }
 
     #[test_case(false, false ; "an_unreadable_store_warns_and_stays_untrusted")]

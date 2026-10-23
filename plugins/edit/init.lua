@@ -201,11 +201,6 @@ local function apply_edit(path, ctx, transform)
   end
   path = resolved
 
-  local ok, err = ctx:check_before_edit(path)
-  if not ok then
-    return nil, err
-  end
-
   local before, read_err = maki.fs.read(path)
   if read_err then
     return nil, "read error: " .. tostring(read_err)

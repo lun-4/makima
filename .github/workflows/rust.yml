@@ -27,6 +27,7 @@ jobs:
               - "Cargo.toml"
               - "Cargo.lock"
               - "src/**"
+              - "tests/**"
               - "maki-*/src/**"
               - "maki-*/benches/**"
               - "maki-*/tests/**"

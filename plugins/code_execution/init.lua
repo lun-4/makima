@@ -49,7 +49,7 @@ async def gather(*calls):
 ]]):format(ERROR_PREFIX)
 local TOOLS_HEADER = "\n\nAvailable tools (async Python functions, keyword args only):\n"
 local WORKFLOW_TOOLS_NOTE =
-  "\nWorkflow mode: orchestrate subagents from this script. Await every `task(...)` call and use `gather(task(...), task(...))` for parallel fan-out. Pass `output_schema` to task for machine-readable results (a JSON string, parse with `json.loads`).\n"
+  "\nWorkflow mode: orchestrate subagents from this script. `task_spawn(...)` returns a JSON string with `task_id`; `task_wait(task_id=...)` returns the result as JSON (parse with `json.loads`). Spawn several, then `gather(task_wait(...), task_wait(...))` to wait on them together. Pass `output_schema` to task_spawn for a machine-readable `result.captured`.\n"
 -- MCP names and schemas already sit in the tool array (or the tool_search
 -- catalog), so point at those instead of repeating them here.
 local MCP_NOTE =

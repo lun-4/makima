@@ -42,6 +42,7 @@ The docs are sorted by what you came here to do:
     <a class="card" href="/docs/token-economy/"><span class="card-title">Token Economy</span><span class="card-desc">Where tokens go in an agent loop, and every trick Makima uses to spend fewer of them.</span></a>
     <a class="card" href="/docs/modes/"><span class="card-title">Modes</span><span class="card-desc">Build, plan, and plugin-defined modes you can switch between or override.</span></a>
     <a class="card" href="/docs/context/"><span class="card-title">Context</span><span class="card-desc">What enters the model's context and when, and where to put project knowledge.</span></a>
+    <a class="card" href="/docs/agent-work/"><span class="card-title">Agent work</span><span class="card-desc">Message queues, focused controls, cancellation, and child reports.</span></a>
     <a class="card" href="/docs/splash/"><span class="card-title">Home-screen splash</span><span class="card-desc">The default screen is a Lua plugin; override it with matrix rain and more.</span></a>
   </div>
 </div>

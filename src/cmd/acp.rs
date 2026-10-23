@@ -1,4 +1,4 @@
-use std::env;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use color_eyre::Result;
@@ -8,12 +8,14 @@ use maki_agent::{command, tools::ToolRegistry};
 use maki_config::project::{self, TrustMode};
 use maki_config::{load_env_files, load_permissions};
 use maki_lua::PluginHost;
+use maki_lua::ui_sink::{HeadlessUi, HostUi};
 use maki_storage::StateDir;
 
 use crate::setup;
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
+    cwd: PathBuf,
     model_arg: Option<String>,
     yolo: bool,
     automode: bool,
@@ -26,14 +28,13 @@ pub fn run(
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
 
-    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     let trust = project::resolve(&storage, &cwd, trust_mode);
     load_env_files(&trust.project_config);
 
     let command_registry = maki_commands::CommandRegistry::new();
     let standard_commands = command::StandardCommands::register(
         &command_registry,
-        &command::discover_commands(&cwd),
+        &command::discover_commands(&cwd, &trust.project_config),
         command::StandardCompletions::default(),
     )
     .context("register standard commands")?;
@@ -41,6 +42,7 @@ pub fn run(
         Arc::clone(ToolRegistry::global_arc()),
         command_registry.clone(),
         !no_jit,
+        HostUi::Sink(Box::new(HeadlessUi)),
     )
     .context("initialize lua plugin host")?;
 
@@ -48,13 +50,16 @@ pub fn run(
     let raw_config = plugin_host
         .load_init_files_or_skip(no_plugins, &trust.project_config, &mut warnings)
         .context("load init.lua files")?;
+    for warning in &warnings {
+        eprintln!("warning: {warning}");
+    }
 
     let mut config = raw_config
         .unwrap_or_default()
         .into_config()
         .context("invalid config")?;
     maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
-    config.permissions = load_permissions(&trust.project_config);
+    config.permissions = load_permissions(&trust.project_config)?;
 
     if yolo || config.always_yolo {
         config.permissions.yolo = true;
@@ -74,10 +79,11 @@ pub fn run(
     setup::init_logging(&config.storage);
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
+    for warning in super::unmatched_permission_rules(&config.permissions) {
+        eprintln!("warning: {warning}");
+    }
 
     let lua_event_handle = plugin_host.event_handle();
-    let prompt_slots = lua_event_handle.collect_prompt_slots();
-    let modes = lua_event_handle.mode_registry();
     let yolo = config.permissions.yolo;
 
     let result = maki_acp::run(maki_acp::AcpParams {
@@ -87,8 +93,7 @@ pub fn run(
         timeouts,
         initial_wd: cwd,
         storage,
-        prompt_slots: Arc::new(prompt_slots),
-        modes,
+        prompt_slots: lua_event_handle.prompt_slot_source(),
         yolo,
         defaults: config.session_defaults,
         system_prompt_override,

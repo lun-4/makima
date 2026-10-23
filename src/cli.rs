@@ -5,6 +5,7 @@ use color_eyre::Result;
 use color_eyre::eyre::bail;
 
 use maki_agent::tools::{all_builtin_tool_names, is_builtin_tool};
+use maki_config::project::TrustMode;
 
 use crate::print::OutputFormat;
 
@@ -92,8 +93,15 @@ pub struct Cli {
     /// Load shared project `.makima` config for this run without asking and
     /// without recording an answer. For containers and CI, where the state
     /// directory is thrown away anyway. Only use it on a project you trust.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "no_project")]
     pub trust: bool,
+
+    /// Load nothing from the project's `.makima` directory: no init.lua,
+    /// permissions.toml, mcp.toml, .env, commands or skills, whatever the
+    /// folder's trust. Use it to work in a repository whose `.makima` files
+    /// are broken or that you do not want to run.
+    #[arg(long)]
+    pub no_project: bool,
 
     /// Exit after the agent completes (for automation workflows)
     #[arg(long)]
@@ -173,6 +181,17 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// How this run reaches the project's shared config.
+    pub fn trust_mode(&self) -> TrustMode {
+        if self.no_project {
+            TrustMode::Ignore
+        } else if self.trust {
+            TrustMode::Session
+        } else {
+            TrustMode::Consult
+        }
+    }
+
     pub fn warn_ignored_flags(&self) {
         let ignored = [
             ("fallback-model", self.fallback_model.is_some()),
@@ -266,11 +285,6 @@ pub enum Command {
         #[arg(long, requires = "tools")]
         names: bool,
     },
-    /// Data migration utilities
-    Migrate {
-        #[command(subcommand)]
-        action: MigrateAction,
-    },
     /// Manage projects that may load automatic shared project configuration
     Trust {
         #[command(subcommand)]
@@ -295,12 +309,6 @@ pub enum TrustAction {
     },
     /// List stored project trust decisions
     List,
-}
-
-#[derive(Subcommand)]
-pub enum MigrateAction {
-    /// Migrate files from ~/.makima/ to XDG directories
-    Xdg,
 }
 
 #[derive(Subcommand)]

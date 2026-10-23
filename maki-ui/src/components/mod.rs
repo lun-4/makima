@@ -30,12 +30,15 @@ pub(crate) mod streaming_content;
 pub(crate) mod theme_picker;
 pub(crate) mod tool_display;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use maki_agent::AgentInput;
-use maki_agent::{BufferSnapshot, ToolInput, ToolOutput};
+use maki_agent::actor::HistoryBoundary;
+use maki_agent::{
+    AgentId, AgentInput, AgentRef, BufferSnapshot, PostLevel, ToolInput, ToolOutput, TurnId,
+};
 use maki_providers::{ImageSource, ModelTier};
 use ratatui::text::{Line, Span};
 
@@ -196,7 +199,6 @@ pub enum SessionReplacementKind {
     },
     #[cfg(test)]
     Load,
-    Rewind,
 }
 
 #[derive(Debug, Clone)]
@@ -205,24 +207,35 @@ pub struct SessionReplacementRequest {
     pub(crate) kind: SessionReplacementKind,
 }
 
-use std::path::PathBuf;
-
 pub enum Action {
     SendMessage(Box<AgentInput>),
+    RunKeybind(u64),
     ManualExit,
     ShellCommand {
+        target: Option<AgentId>,
+        cwd: PathBuf,
         id: String,
         command: String,
         visible: bool,
     },
     CancelAgent {
+        turn_id: Option<TurnId>,
         run_id: u64,
     },
     CancelSubagent {
         tool_use_id: String,
     },
     ReplaceSession(Box<SessionReplacementRequest>),
+    RewindAgent {
+        target: AgentRef,
+        boundary: HistoryBoundary,
+    },
     ChangeModel(String),
+    ChangePinnedModel {
+        target: AgentRef,
+        spec: String,
+    },
+    SelectModel(maki_commands::ModelSelection),
     ChangeMode(String),
     ApprovePlan {
         clear_context: bool,
@@ -237,7 +250,7 @@ pub enum Action {
         id: &'static str,
     },
     /// `/cd`, adopted through the coordinator off the event-loop thread.
-    ChangeDirectory(std::path::PathBuf),
+    ChangeDirectory(PathBuf),
     RefreshProvider {
         slug: String,
     },
@@ -413,6 +426,8 @@ pub enum DisplayRole {
     Tool(Box<ToolRole>),
     Error,
     Done,
+    /// A plugin's display-only row; see `maki.ui.post`.
+    Post(PostLevel),
 }
 
 impl DisplayRole {

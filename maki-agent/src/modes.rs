@@ -3,9 +3,14 @@
 //! ACP all share one `Arc<ModeRegistry>`.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+use maki_storage::StateDir;
+use maki_storage::plans::new_plan_path;
+use maki_storage::sessions::{SessionMeta, StoredMode};
+
+use crate::AgentMode;
 use crate::prompt::PLAN_PROMPT;
 
 /// Identity of an agent mode. Custom modes are keyed by a snake_case name.
@@ -113,10 +118,67 @@ pub enum ModeError {
     EmptyName,
     #[error("unknown mode '{0}'")]
     Unknown(String),
+    #[error("cannot allocate a plan file: {0}")]
+    PlanPath(Arc<str>),
+}
+
+/// The one step from a mode name to its definition, for every frontend and
+/// Lua. `plan` keeps {current}'s plan file or allocates a fresh one under
+/// {state_dir}. Guest modes (#24) replace the registry lookup here, and the
+/// native build and plan arms are the only ones that move to plugins.
+pub fn resolve(
+    registry: &ModeRegistry,
+    key: &str,
+    current: &AgentMode,
+    state_dir: &StateDir,
+) -> Result<(AgentMode, ModeDef), ModeError> {
+    let def = registry
+        .get(&ModeId::parse(key))
+        .ok_or_else(|| ModeError::Unknown(key.to_owned()))?;
+    let mode = match &def.id {
+        ModeId::Build => AgentMode::Build,
+        ModeId::Plan => AgentMode::Plan(match current.plan_path() {
+            Some(path) => path.to_path_buf(),
+            None => new_plan_path(state_dir)
+                .map_err(|error| ModeError::PlanPath(error.to_string().into()))?,
+        }),
+        ModeId::Custom(_) => AgentMode::Custom(def.id.clone()),
+    };
+    Ok((mode, def))
+}
+
+/// The mode key a session was saved in and its plan file while that still
+/// exists; `None` for build.
+pub fn saved(meta: &SessionMeta) -> Option<(&str, Option<&Path>)> {
+    let key = match &meta.mode {
+        Some(StoredMode::Plan) => ModeId::Plan.key(),
+        Some(StoredMode::Custom(name)) => name.as_str(),
+        Some(StoredMode::Build) | None => return None,
+    };
+    let plan = meta
+        .plan_path
+        .as_deref()
+        .map(Path::new)
+        .filter(|path| path.exists());
+    Some((key, plan))
+}
+
+/// The mode a saved session resumes in, through [`resolve`]: a missing custom
+/// mode is an error the caller answers by starting in build mode.
+pub fn restored(
+    registry: &ModeRegistry,
+    meta: &SessionMeta,
+    state_dir: &StateDir,
+) -> Result<(AgentMode, ModeDef), ModeError> {
+    let Some((key, plan)) = saved(meta) else {
+        return Ok((AgentMode::Build, registry.current(&AgentMode::Build)));
+    };
+    let current = plan.map_or(AgentMode::Build, |plan| AgentMode::Plan(plan.to_path_buf()));
+    resolve(registry, key, &current, state_dir)
 }
 
 /// Shared, thread-safe store of mode definitions.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ModeRegistry {
     modes: RwLock<HashMap<String, ModeDef>>,
 }
@@ -137,31 +199,24 @@ impl ModeRegistry {
     /// Insert or replace a mode (override). `build`/`plan` are replaced; a new
     /// name defines a custom mode.
     pub fn define(&self, spec: ModeDefSpec) -> Result<(), ModeError> {
-        let def = spec.build()?;
-        self.modes
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(def.id.key().to_owned(), def);
+        self.insert(spec.build()?);
         Ok(())
     }
 
     /// Restore a built-in's default def, dropping any plugin override.
     pub fn reset(&self, id: &ModeId) -> Result<(), ModeError> {
-        let key = match id {
-            ModeId::Build => "build".to_owned(),
-            ModeId::Plan => "plan".to_owned(),
-            ModeId::Custom(name) => name.to_string(),
-        };
-        let def = match id {
-            ModeId::Build => ModeDef::default_for(ModeId::Build),
-            ModeId::Plan => ModeDef::default_for(ModeId::Plan),
-            ModeId::Custom(_) => return Err(ModeError::Unknown(key)),
-        };
+        if let ModeId::Custom(name) = id {
+            return Err(ModeError::Unknown(name.to_string()));
+        }
+        self.insert(ModeDef::default_for(id.clone()));
+        Ok(())
+    }
+
+    fn insert(&self, def: ModeDef) {
         self.modes
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(key, def);
-        Ok(())
+            .insert(def.id.key().to_owned(), def);
     }
 
     pub fn get(&self, id: &ModeId) -> Option<ModeDef> {
@@ -169,15 +224,6 @@ impl ModeRegistry {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .get(id.key())
-            .cloned()
-    }
-
-    /// Get by string key (used by SDK/ACP parsers).
-    pub fn get_by_key(&self, key: &str) -> Option<ModeDef> {
-        self.modes
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(key)
             .cloned()
     }
 
@@ -195,35 +241,14 @@ impl ModeRegistry {
 
     /// Resolve the active mode's full def; falls back to `build` when a custom
     /// mode is not (re)defined.
-    pub fn current(&self, active: &crate::AgentMode) -> ModeDef {
-        match active {
-            crate::AgentMode::Build => self
-                .get(&ModeId::Build)
-                .unwrap_or_else(|| ModeDef::default_for(ModeId::Build)),
-            crate::AgentMode::Plan(_) => self
-                .get(&ModeId::Plan)
-                .unwrap_or_else(|| ModeDef::default_for(ModeId::Plan)),
-            crate::AgentMode::Custom(id) => self
-                .get(id)
-                .unwrap_or_else(|| ModeDef::default_for(ModeId::Build)),
-        }
-    }
-
-    /// Write-restriction for the active mode: the dynamic plan path wins for
-    /// `Plan`; otherwise the def's `restrict_write_to`.
-    pub fn restrict_write_to(&self, active: &crate::AgentMode) -> Option<PathBuf> {
-        match active {
-            crate::AgentMode::Build => None,
-            crate::AgentMode::Plan(p) => Some(p.clone()),
-            crate::AgentMode::Custom(id) => self.get(id).and_then(|d| d.restrict_write_to),
-        }
-    }
-
-    pub fn contains(&self, key: &str) -> bool {
-        self.modes
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(key)
+    pub fn current(&self, active: &AgentMode) -> ModeDef {
+        let id = active.id();
+        self.get(&id).unwrap_or_else(|| {
+            ModeDef::default_for(match id {
+                ModeId::Custom(_) => ModeId::Build,
+                builtin => builtin,
+            })
+        })
     }
 }
 
@@ -232,7 +257,6 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::AgentMode;
 
     fn reg() -> ModeRegistry {
         ModeRegistry::builtin()
@@ -242,8 +266,8 @@ mod tests {
     fn builtin_registers_build_and_plan() {
         let r = reg();
         assert_eq!(r.list().len(), 2);
-        assert!(r.contains("build"));
-        assert!(r.contains("plan"));
+        assert!(r.get(&ModeId::Build).is_some());
+        assert!(r.get(&ModeId::Plan).is_some());
     }
 
     #[test]
@@ -310,40 +334,63 @@ mod tests {
         );
     }
 
-    #[test_case(&AgentMode::Build, None ; "build_no_restrict")]
-    #[test_case(&AgentMode::Plan(PathBuf::from("plan.md")), Some("plan.md") ; "plan_restricts_to_path")]
-    fn restrict_write_to_resolves(active: &AgentMode, expected: Option<&str>) {
-        let r = reg();
-        assert_eq!(
-            r.restrict_write_to(active)
-                .as_deref()
-                .map(|p| p.to_string_lossy().into_owned()),
-            expected.map(str::to_owned)
-        );
-    }
-
-    #[test]
-    fn custom_restrict_uses_def() {
-        let r = reg();
-        r.define(ModeDefSpec {
-            name: "audit".into(),
-            restrict_write_to: Some("audit.md".into()),
-            ..Default::default()
-        })
-        .unwrap();
-        assert_eq!(
-            r.restrict_write_to(&AgentMode::Custom(ModeId::Custom("audit".into())))
-                .as_deref()
-                .map(|p| p.to_string_lossy().into_owned()),
-            Some("audit.md".to_owned())
-        );
-    }
-
     #[test]
     fn current_falls_back_to_build_when_custom_missing() {
         let r = reg();
         let def = r.current(&AgentMode::Custom(ModeId::Custom("ghost".into())));
         assert_eq!(def.id, ModeId::Build);
+    }
+
+    const AUDIT_MODE: &str = "audit";
+    const GHOST_MODE: &str = "ghost";
+    const KEPT_PLAN: &str = "/kept/plan.md";
+
+    #[test_case("build", AgentMode::Build, ModeId::Build ; "build")]
+    #[test_case(AUDIT_MODE, AgentMode::Build, ModeId::Custom(AUDIT_MODE.into()) ; "custom")]
+    #[test_case("plan", AgentMode::Plan(KEPT_PLAN.into()), ModeId::Plan ; "plan_keeps_current_file")]
+    fn resolve_maps_name_to_mode(key: &str, current: AgentMode, id: ModeId) {
+        let r = reg();
+        r.define(ModeDefSpec {
+            name: AUDIT_MODE.into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let (mode, def) =
+            resolve(&r, key, &current, &StateDir::from_path(state.path().into())).unwrap();
+        assert_eq!(def.id, id);
+        assert_eq!(mode.id(), id);
+        if let Some(path) = current.plan_path() {
+            assert_eq!(mode.plan_path(), Some(path));
+        }
+    }
+
+    #[test]
+    fn resolve_allocates_plan_in_state_dir() {
+        let state = tempfile::tempdir().unwrap();
+        let (mode, _) = resolve(
+            &reg(),
+            "plan",
+            &AgentMode::Build,
+            &StateDir::from_path(state.path().into()),
+        )
+        .unwrap();
+        let path = mode.plan_path().unwrap();
+        assert!(path.starts_with(state.path().join(maki_storage::plans::PLANS_DIR)));
+    }
+
+    #[test]
+    fn resolve_rejects_unknown_mode() {
+        let state = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve(
+                &reg(),
+                GHOST_MODE,
+                &AgentMode::Build,
+                &StateDir::from_path(state.path().into())
+            ),
+            Err(ModeError::Unknown(GHOST_MODE.into()))
+        );
     }
 
     #[test]

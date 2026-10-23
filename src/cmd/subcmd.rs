@@ -16,6 +16,7 @@ use maki_config::providers::{
 };
 use maki_config::{Config, load_env_files, load_permissions};
 use maki_lua::PluginHost;
+use maki_lua::ui_sink::{HeadlessUi, HostUi};
 use maki_providers::provider::fetch_all_models;
 use maki_providers::{ProviderData, catalog_providers};
 use maki_providers::{copilot_auth, dynamic, openai_auth};
@@ -29,6 +30,11 @@ use maki_ui::AppSession;
 
 const SESSIONS_JSON_ONLY_ERR: &str =
     "the sessions command only supports --json; use `makima sessions --json`";
+
+/// Subcommands have no UI, so their hosts print notifications to stderr.
+fn headless() -> HostUi {
+    HostUi::Sink(Box::new(HeadlessUi))
+}
 
 pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
     let provider = provider.map(slugify);
@@ -542,12 +548,17 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
-pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMode) -> Result<()> {
-    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    let trust = project::resolve_noninteractive(&cwd, trust_mode);
+pub fn models(
+    cwd: &Path,
+    no_plugins: bool,
+    no_jit: bool,
+    refresh: bool,
+    trust_mode: TrustMode,
+) -> Result<()> {
+    let trust = project::resolve_noninteractive(cwd, trust_mode);
     load_env_files(&trust.project_config);
 
-    let host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
+    let host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit, headless())
         .context("initialize lua plugin host")?;
     let mut warnings: Vec<String> = trust.warning.clone().into_iter().collect();
     let config = load_effective_config(&host, no_plugins, &trust.project_config, &mut warnings)?;
@@ -560,18 +571,14 @@ pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMo
         }
     }
 
-    smol::block_on(fetch_all_models(
-        &config.provider.model_policy,
-        |batch| {
-            for model in batch.models {
-                println!("{model}");
-            }
-            for warning in batch.warnings {
-                eprintln!("warning: {warning}");
-            }
-        },
-        None,
-    ));
+    smol::block_on(fetch_all_models(&config.provider.model_policy, |batch| {
+        for model in batch.models {
+            println!("{model}");
+        }
+        for warning in batch.warnings {
+            eprintln!("warning: {warning}");
+        }
+    }));
 
     if let Some(e) = refresh_failure {
         bail!("catalog refresh failed, keeping existing cache: {e}");
@@ -604,13 +611,19 @@ pub fn sessions(storage: &StateDir, json: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) -> Result<()> {
-    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    let trust = project::resolve_noninteractive(&cwd, trust_mode);
+pub fn index(
+    cwd: &Path,
+    path: &str,
+    no_plugins: bool,
+    no_jit: bool,
+    trust_mode: TrustMode,
+) -> Result<()> {
+    let trust = project::resolve_noninteractive(cwd, trust_mode);
     load_env_files(&trust.project_config);
 
-    let mut host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
-        .context("initialize lua plugin host")?;
+    let mut host =
+        PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit, headless())
+            .context("initialize lua plugin host")?;
 
     let mut warnings: Vec<String> = trust.warning.clone().into_iter().collect();
     let raw_config = host
@@ -622,7 +635,7 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) 
         .into_config()
         .context("invalid config")?;
     maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
-    config.permissions = load_permissions(&trust.project_config);
+    config.permissions = load_permissions(&trust.project_config)?;
 
     host.load_builtins(&config.plugins)
         .context("load builtin plugins")?;
@@ -639,7 +652,7 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) 
         .tool
         .parse(&input)
         .map_err(|e| color_eyre::eyre::eyre!("parse index input: {e}"))?;
-    let ctx = maki_agent::tools::cli_tool_ctx();
+    let ctx = maki_agent::tools::cli_tool_ctx(cwd.to_path_buf());
     let result = smol::block_on(async { inv.execute(&ctx).await });
     match result.output {
         Ok(output) => print!("{}", output.as_text()),
@@ -648,11 +661,10 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) 
     Ok(())
 }
 
-pub fn mcp_auth(server: &str, storage: &StateDir, trust_mode: TrustMode) -> Result<()> {
+pub fn mcp_auth(cwd: &Path, server: &str, storage: &StateDir, trust_mode: TrustMode) -> Result<()> {
     smol::block_on(async {
-        let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-        let trust = project::resolve(storage, &cwd, trust_mode);
-        let (config, _) = mcp_config::load_config(&cwd, trust.project_config);
+        let trust = project::resolve(storage, cwd, trust_mode);
+        let (config, _) = mcp_config::load_config(cwd, trust.project_config);
         let raw = config
             .mcp
             .get(server)
@@ -686,7 +698,9 @@ pub fn mcp_logout(server: &str, storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn prompt(
+    cwd: &Path,
     variant: &crate::cli::PromptVariant,
     plan: bool,
     tools: bool,
@@ -705,14 +719,13 @@ pub fn prompt(
         bail!("--plan can only be used with the 'system' prompt variant");
     }
 
-    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    let trust = project::resolve_noninteractive(&cwd, trust_mode);
+    let trust = project::resolve_noninteractive(cwd, trust_mode);
     load_env_files(&trust.project_config);
 
-    let vars = template::env_vars();
+    let vars = template::env_vars_for(cwd);
     let reg = ToolRegistry::global_arc();
-    let mut host =
-        PluginHost::with_jit(Arc::clone(reg), !no_jit).context("initialize lua plugin host")?;
+    let mut host = PluginHost::with_jit(Arc::clone(reg), !no_jit, headless())
+        .context("initialize lua plugin host")?;
     let mut warnings: Vec<String> = trust.warning.clone().into_iter().collect();
     let raw_config = host
         .load_init_files_or_skip(no_plugins, &trust.project_config, &mut warnings)
@@ -776,8 +789,8 @@ mod tests {
     use maki_storage::sessions::SessionSummary;
     use std::collections::BTreeSet;
 
-    const SESSION_ID_A: &str = "550e8400-e29b-41d4-a716-446655440000";
-    const SESSION_ID_B: &str = "550e8400-e29b-41d4-a716-446655440001";
+    const SESSION_ID_A: &str = "BWBeN28Vb7cMEx7Ym8AUzs";
+    const SESSION_ID_B: &str = "BWBeN28Vb7cMEx7Ym8AUzt";
 
     fn summary(id: &str, title: &str, updated_at: u64, cwd: &str) -> SessionSummary {
         SessionSummary {

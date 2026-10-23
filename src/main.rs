@@ -14,9 +14,9 @@ mod command_attachments {
 
     use color_eyre::Result;
     use color_eyre::eyre::eyre;
-    use maki_agent::{AgentInput, AgentMode, McpPromptRef};
+    use maki_agent::AgentInput;
     use maki_commands::{AgentTurn, CommandAttachment};
-    use maki_providers::{ImageMediaType, ImageSource};
+    use maki_providers::ImageSource;
 
     pub(crate) fn from_images(images: &[ImageSource]) -> Arc<[CommandAttachment]> {
         images
@@ -30,43 +30,11 @@ mod command_attachments {
     }
 
     pub(crate) fn into_images(attachments: &[CommandAttachment]) -> Result<Vec<ImageSource>> {
-        attachments
-            .iter()
-            .map(|attachment| {
-                let media_type =
-                    ImageMediaType::from_mime(&attachment.media_type).ok_or_else(|| {
-                        eyre!(
-                            "unsupported command attachment media type: {}",
-                            attachment.media_type
-                        )
-                    })?;
-                Ok(ImageSource::new(media_type, Arc::clone(&attachment.data)))
-            })
-            .collect()
+        maki_agent::command::command_images(attachments).map_err(|error| eyre!(error))
     }
 
-    pub(crate) fn agent_input(
-        turn: AgentTurn,
-        mode: AgentMode,
-        defaults: maki_config::SessionDefaults,
-    ) -> Result<AgentInput> {
-        let mut input = AgentInput::from_defaults(
-            turn.content.text.to_string(),
-            mode,
-            into_images(&turn.content.attachments)?,
-            defaults,
-        );
-        input.prompt = turn.prompt.map(|prompt| {
-            Box::new(McpPromptRef {
-                qualified_name: prompt.qualified_name.to_string(),
-                arguments: prompt
-                    .arguments
-                    .iter()
-                    .map(|(key, value)| (key.to_string(), value.to_string()))
-                    .collect(),
-            })
-        });
-        Ok(input)
+    pub(crate) fn agent_input(turn: AgentTurn) -> Result<AgentInput> {
+        maki_agent::command::command_input(turn).map_err(|error| eyre!(error))
     }
 }
 

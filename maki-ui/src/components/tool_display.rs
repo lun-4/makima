@@ -19,7 +19,7 @@ use jiff::tz::TimeZone;
 
 use crate::markdown::{should_truncate, text_to_lines, truncate_output, truncation_notice};
 use maki_agent::{
-    BufferSnapshot, InstructionBlock, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
+    BufferSnapshot, InstructionBlock, PostLevel, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
 };
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -107,6 +107,22 @@ pub fn error_style() -> RoleStyle {
     }
 }
 
+pub fn post_style(level: PostLevel) -> RoleStyle {
+    let theme = theme::current();
+    let (text_style, prefix_style) = match level {
+        PostLevel::Info => (theme.tool, theme.tool_dim),
+        PostLevel::Warn => (theme.status_notice, theme.status_notice),
+        PostLevel::Error => (theme.error, theme.tool_error),
+    };
+    RoleStyle {
+        prefix: TOOL_INDICATOR,
+        text_style,
+        prefix_style,
+        use_markdown: false,
+        max_line_bytes: None,
+    }
+}
+
 pub fn done_style() -> RoleStyle {
     RoleStyle {
         prefix: "",
@@ -149,7 +165,6 @@ impl HighlightRequest {
         }
         let output = output.and_then(|o| match *o {
             ToolOutput::ReadCode { .. }
-            | ToolOutput::WriteCode { .. }
             | ToolOutput::Diff { .. }
             | ToolOutput::GrepResult { .. }
             | ToolOutput::Instructions { .. } => Some(o),
@@ -157,7 +172,6 @@ impl HighlightRequest {
             | ToolOutput::Markdown(_)
             | ToolOutput::ReadDir(_)
             | ToolOutput::TodoList(_)
-            | ToolOutput::Batch { .. }
             | ToolOutput::Image { .. } => None,
         });
         if input.is_none() && output.is_none() {
@@ -693,9 +707,7 @@ pub fn search_text_for(msg: &DisplayMessage) -> String {
     );
 
     let output = msg.tool_output.as_deref();
-    if let Some(ToolInput::Code { code, .. } | ToolInput::Script { code, .. }) =
-        msg.tool_input.as_deref()
-    {
+    if let Some(ToolInput::Code { code, .. }) = msg.tool_input.as_deref() {
         push_section(&mut out, code.trim_end());
     }
     if let Some(text) = output.and_then(ToolOutput::structured_display_text) {
@@ -743,7 +755,6 @@ fn plain_output_text(output: &ToolOutput) -> Option<&str> {
         ToolOutput::Plain(t) | ToolOutput::Markdown(t) | ToolOutput::ReadDir(t) => {
             Some(t.text.as_str())
         }
-        ToolOutput::Batch { text } => Some(text.as_str()),
         _ => None,
     }
 }
@@ -809,7 +820,7 @@ mod tests {
     const TOL: ToolOutputLines = ToolOutputLines::DEFAULT;
     use crate::components::{DisplayRole, ToolRole};
     use crate::markdown::TRUNCATION_PREFIX;
-    use maki_agent::tools::{BASH_TOOL_NAME, READ_TOOL_NAME, TASK_TOOL_NAME};
+    use maki_agent::tools::{BASH_TOOL_NAME, READ_TOOL_NAME, TASK_SPAWN_TOOL_NAME};
     use maki_agent::{SnapshotLine, SnapshotSpan, TextOutput, ToolInput, ToolOutput};
     use test_case::test_case;
 
@@ -998,7 +1009,7 @@ mod tests {
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 status: ToolStatus::Success,
-                name: TASK_TOOL_NAME.into(),
+                name: TASK_SPAWN_TOOL_NAME.into(),
             })),
             text: "Find auth".into(),
             images: Vec::new(),
@@ -1047,7 +1058,7 @@ mod tests {
 
     #[test]
     fn task_output_truncated_and_styled() {
-        let task_max = TOL.task;
+        let task_max = TOL.task_spawn;
         let tl = task_truncation_tl(n_lines(200));
         let body_lines = tl.lines.len() - 1;
         assert!(
@@ -1379,11 +1390,6 @@ mod tests {
     #[test_case(
         Some(ToolOutput::Plain(String::new().into())), None, "bash", false
         ; "empty_plain_resolves_to_none"
-    )]
-    #[test_case(
-        Some(ToolOutput::Batch { text: "legacy batch text".into() }),
-        None, "batch", true
-        ; "legacy_batch_falls_back_to_text"
     )]
     #[test_case(
         Some(ToolOutput::ReadDir(TextOutput { text: "dir listing".into(), instructions: None, state: None })),

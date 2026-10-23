@@ -3,11 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::agent::QueuedMessage;
-use crate::components::Status;
 use crate::theme;
 use maki_agent::{AgentInput, AgentMode, ModeDef, ModeId, ModeRegistry};
-use maki_storage::StateDir;
-use maki_storage::plans;
 use ratatui::style::{Color, Modifier, Style};
 
 use super::{App, ModelPickerPurpose};
@@ -19,12 +16,31 @@ pub(crate) enum Mode {
     Custom(Arc<str>),
 }
 
+impl From<&AgentMode> for Mode {
+    fn from(mode: &AgentMode) -> Self {
+        match mode.id() {
+            ModeId::Build => Self::Build,
+            ModeId::Plan => Self::Plan,
+            ModeId::Custom(name) => Self::Custom(name),
+        }
+    }
+}
+
 pub(crate) enum PlanTrigger {
     WriteDone,
     InteractivePrompt,
 }
 
 impl Mode {
+    #[cfg(test)]
+    pub(crate) fn from_id(id: &str) -> Self {
+        match id {
+            "build" => Self::Build,
+            "plan" => Self::Plan,
+            name => Self::Custom(Arc::from(name)),
+        }
+    }
+
     pub(crate) fn def(&self, registry: &ModeRegistry) -> ModeDef {
         match self {
             Self::Build => registry
@@ -102,19 +118,11 @@ impl PlanState {
     pub(crate) fn is_ready(&self) -> bool {
         matches!(self, Self::Ready(_))
     }
-
-    pub(crate) fn allocate_path(&mut self, storage: &StateDir) {
-        if matches!(self, Self::None) {
-            *self = Self::Drafting(
-                plans::new_plan_path(storage).unwrap_or_else(|_| PathBuf::from("plans/plan.md")),
-            );
-        }
-    }
 }
 
 impl App {
     pub(crate) fn transition_plan(&mut self, trigger: PlanTrigger) {
-        if self.state.mode != Mode::Plan {
+        if self.root_mode() != Mode::Plan {
             return;
         }
         match trigger {
@@ -145,7 +153,7 @@ impl App {
         if modes.is_empty() {
             return vec![];
         }
-        let current = self.state.mode.id_key();
+        let current = self.focused_mode().id_key();
         let idx = modes.iter().position(|d| d.id.key() == current);
         let next = match idx {
             Some(i) => &modes[(i + 1) % modes.len()],
@@ -154,76 +162,50 @@ impl App {
         vec![super::Action::ChangeMode(next.id.key().to_owned())]
     }
 
-    /// Applies a mode switch, guarding plan-mode invariants (plan path).
-    pub(crate) fn set_mode_id(&mut self, id: String) {
-        let changed = self.state.mode.id_key() != id;
-        if self.state.mode == Mode::Plan && id != "plan" {
-            self.plan_form.reset();
-            self.plan_approval_pending = false;
-            if self.model_picker_purpose == ModelPickerPurpose::PlanImplementation {
-                self.close_model_picker();
+    /// Follows a committed root mode change: leaving plan mode retires the
+    /// plan form, entering it adopts the plan path the agent writes to.
+    pub(crate) fn project_root_mode(&mut self, previous: &AgentMode, mode: &AgentMode) {
+        if previous.id() == mode.id() && previous.plan_path() == mode.plan_path() {
+            return;
+        }
+        match mode.plan_path() {
+            Some(path) if self.state.plan.path() != Some(path) => {
+                self.state.plan = PlanState::Drafting(path.to_path_buf());
             }
+            Some(_) => {}
+            None if matches!(previous, AgentMode::Plan(_)) => {
+                self.state.plan = PlanState::None;
+                self.plan_form.reset();
+                self.plan_approval_pending = false;
+                if self.model_picker_purpose == ModelPickerPurpose::PlanImplementation {
+                    self.close_model_picker();
+                }
+            }
+            None => {}
         }
         self.file_completion.close();
-        match id.as_str() {
-            "build" => {
-                self.state.mode = Mode::Build;
-            }
-            "plan" => {
-                self.state.plan.allocate_path(&self.storage);
-                self.state.mode = Mode::Plan;
-            }
-            name => {
-                self.state.mode = Mode::Custom(Arc::from(name));
-            }
-        }
-        if changed {
-            self.emit_mode_changed(&id);
-        }
-    }
-
-    fn emit_mode_changed(&self, id: &str) {
-        let data = serde_json::json!({ "mode": id });
-        self.lua_event_handle.fire_autocmd("ModeChanged", data);
-    }
-
-    pub(super) fn agent_mode(&self) -> AgentMode {
-        match &self.state.mode {
-            Mode::Plan => match self.state.plan.path() {
-                Some(p) => AgentMode::Plan(p.to_path_buf()),
-                None => {
-                    debug_assert!(false, "Plan mode without path - invariant violated");
-                    AgentMode::Build
-                }
-            },
-            Mode::Build => AgentMode::Build,
-            Mode::Custom(name) => AgentMode::Custom(ModeId::Custom(Arc::clone(name))),
-        }
     }
 
     pub(crate) fn build_agent_input(&self, msg: &QueuedMessage) -> AgentInput {
         // `msg.text` is already `@`-expanded at submit time (`submit_prompt`);
         // no second expansion here.
-        AgentInput {
-            message: msg.text.clone(),
-            mode: self.agent_mode(),
-            images: msg.images.clone(),
-            preamble: Vec::new(),
-            thinking: self.state.thinking,
-            fast: self.state.fast,
-            workflow: self.state.workflow,
-            prompt: None,
-            cancel: None,
-            lease_committer: None,
-        }
+        AgentInput::new(msg.text.clone(), msg.images.clone())
     }
 
     pub(super) fn mode_label(&self) -> (Cow<'static, str>, Style) {
         let label: Cow<'static, str> = if self.is_bash_input() {
             "[BASH]".into()
+        } else if let Some(config) = self.focused_config() {
+            config
+                .mode_def
+                .as_ref()
+                .map_or_else(
+                    || config.mode.id().key().to_owned(),
+                    |mode| mode.label.to_string(),
+                )
+                .into()
         } else {
-            self.state
-                .mode
+            self.focused_mode()
                 .label(&self.lua_event_handle.mode_registry())
         };
         let style = Style::new()
@@ -244,12 +226,12 @@ impl App {
         if self.is_bash_input() {
             theme::current().mode_bash
         } else {
-            self.state.mode.color()
+            self.focused_mode().color()
         }
     }
 
     pub(super) fn separator_style(&self) -> Style {
-        if self.status == Status::Streaming {
+        if self.focused_streaming() {
             theme::current().input_border
         } else {
             Style::new().fg(self.effective_mode_color())

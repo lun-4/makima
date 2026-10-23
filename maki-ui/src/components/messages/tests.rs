@@ -4,7 +4,7 @@ use crate::components::scrollbar::SCROLLBAR_THUMB;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{Selection, SelectionZone};
 use crate::theme::InMemoryThemesProvider;
-use maki_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, WRITE_TOOL_NAME};
+use maki_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, TASK_SPAWN_TOOL_NAME};
 use maki_agent::{
     GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
 };
@@ -100,12 +100,6 @@ fn tool_done_updates_start_status(is_error: bool, expected: ToolStatus) {
     assert!(panel.messages[0].text.contains("output"));
 }
 
-#[test_case(
-    WRITE_TOOL_NAME,
-    ToolOutput::WriteCode { path: "src/main.rs".into(), byte_count: 42, lines: vec!["fn main() {}".into()] },
-    Some("42 bytes")
-    ; "write_bytes"
-)]
 #[test_case(
     "grep",
     grep_output(2),
@@ -325,7 +319,7 @@ fn unknown_tool_id_is_noop() {
 
 #[test]
 fn fail_in_progress_except_preserves_excluded_tool() {
-    let mut panel = panel_with_tools(&[("agent", "task"), ("shell", "bash")]);
+    let mut panel = panel_with_tools(&[("agent", TASK_SPAWN_TOOL_NAME), ("shell", "bash")]);
     let excluded = HashSet::from(["shell".to_string()]);
 
     panel.fail_in_progress_except("missing completion".into(), &excluded);
@@ -845,7 +839,7 @@ fn wrapped_line_count_cases(input: &[&str], width: u16, expected: u16) {
 
 #[test]
 fn update_tool_model_sets_annotation() {
-    let mut panel = panel_with_tools(&[("t1", "task"), ("t2", "bash")]);
+    let mut panel = panel_with_tools(&[("t1", TASK_SPAWN_TOOL_NAME), ("t2", "bash")]);
     rebuild(&mut panel);
 
     panel.update_tool_model("t1", "anthropic/claude-sonnet-4-20250514");
@@ -862,7 +856,7 @@ fn set_tool_turn_usage_updates_exact_tool_and_keeps_annotation() {
     const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
     const USAGE: &str = "1.2k↑ 345↓ $0.010";
 
-    let mut panel = panel_with_tools(&[("t1", "task"), ("t2", "task")]);
+    let mut panel = panel_with_tools(&[("t1", TASK_SPAWN_TOOL_NAME), ("t2", TASK_SPAWN_TOOL_NAME)]);
     panel.update_tool_model("t1", MODEL);
 
     panel.set_tool_turn_usage("t1", USAGE.into());
@@ -1576,7 +1570,7 @@ fn handle_click_on_watched_tool_sends_click_with_fallback(is_error: bool) {
         eh,
         Arc::new(InMemoryThemesProvider::bundled()),
     );
-    panel.set_restore_channel(Some(EventSender::new(tx, 0)));
+    panel.set_restore_channel(Some(EventSender::new(tx)));
     finish_with_live_buf(&mut panel, "t1", "body", is_error);
     assert!(panel.watching("t1"));
 
@@ -1622,7 +1616,7 @@ fn watched_fifo_evicts_oldest_which_stops_polling_and_restores_with_recorded_cli
         eh,
         Arc::new(InMemoryThemesProvider::bundled()),
     );
-    panel.set_restore_channel(Some(EventSender::new(tx, 0)));
+    panel.set_restore_channel(Some(EventSender::new(tx)));
     let buf = finish_with_live_buf(&mut panel, "t0", "before", false);
 
     render(&mut panel, 80, 24);
@@ -1668,7 +1662,7 @@ fn tool_done_without_live_buf_is_not_watched_and_click_restores() {
         eh,
         Arc::new(InMemoryThemesProvider::bundled()),
     );
-    panel.set_restore_channel(Some(EventSender::new(tx, 0)));
+    panel.set_restore_channel(Some(EventSender::new(tx)));
     let mut ev = start("t1", BASH_TOOL_NAME);
     ev.raw_input = Some(serde_json::json!({ "command": "true" }));
     panel.tool_start(ev);
@@ -1702,7 +1696,7 @@ fn cancel_in_progress_retires_live_buf_to_watched() {
         eh,
         Arc::new(InMemoryThemesProvider::bundled()),
     );
-    panel.set_restore_channel(Some(EventSender::new(tx, 0)));
+    panel.set_restore_channel(Some(EventSender::new(tx)));
     let buf = Arc::new(maki_agent::SharedBuf::new());
     buf.set_lines(vec![snap_line("body")]);
     let mut ev = start("t1", BASH_TOOL_NAME);
@@ -1749,7 +1743,7 @@ fn restore_reply_stops_watching_buf() {
         eh,
         Arc::new(InMemoryThemesProvider::bundled()),
     );
-    panel.set_restore_channel(Some(EventSender::new(tx, 0)));
+    panel.set_restore_channel(Some(EventSender::new(tx)));
     let buf = finish_with_live_buf(&mut panel, "t1", "old-theme", false);
     assert!(panel.watching("t1"));
 
@@ -1796,7 +1790,7 @@ fn rebake_request_stops_watching_buf() {
         eh,
         Arc::new(InMemoryThemesProvider::bundled()),
     );
-    panel.set_restore_channel(Some(EventSender::new(tx, 0)));
+    panel.set_restore_channel(Some(EventSender::new(tx)));
     finish_with_live_buf(&mut panel, "t1", "old-theme", false);
     assert!(panel.watching("t1"));
 
@@ -1961,7 +1955,7 @@ fn superseded_rebake_reply_is_dropped() {
 
 fn test_event_sender() -> maki_agent::EventSender {
     let (tx, _rx) = flume::unbounded();
-    maki_agent::EventSender::new(tx, 0)
+    maki_agent::EventSender::new(tx)
 }
 
 const RAW_INPUT_SET_MSG: &str = "tool_raw_input must be set from event payload";

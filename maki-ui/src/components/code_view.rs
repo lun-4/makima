@@ -452,9 +452,7 @@ pub fn render_tool_content(
     let mut lines = Vec::new();
     let mut truncation = SectionFlags::default();
     if let Some((language, code)) = input.map(|i| match i {
-        ToolInput::Script { language, code } | ToolInput::Code { language, code } => {
-            (language, code)
-        }
+        ToolInput::Code { language, code } => (language, code),
     }) {
         let code_lines: Vec<String> = code
             .trim_end_matches('\n')
@@ -476,17 +474,6 @@ pub fn render_tool_content(
         }) => render_code(
             highlight.then(|| maki_highlight::Highlighter::for_path(path)),
             *start_line,
-            code_lines,
-            code_lines.len(),
-            limits.output,
-        ),
-        Some(ToolOutput::WriteCode {
-            path,
-            lines: code_lines,
-            ..
-        }) => render_code(
-            highlight.then(|| maki_highlight::Highlighter::for_path(path)),
-            1,
             code_lines,
             code_lines.len(),
             limits.output,

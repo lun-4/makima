@@ -3,7 +3,11 @@ name = "maki-agent"
 version.workspace = true
 edition.workspace = true
 
+[features]
+test-util = []
+
 [dependencies]
+maki-domain = { workspace = true }
 maki-providers = { workspace = true }
 maki-config = { workspace = true }
 maki-commands = { workspace = true }
@@ -48,6 +52,7 @@ rustix = { workspace = true, features = ["fs", "std"] }
 windows-sys = { workspace = true, features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 
 [dev-dependencies]
+maki-storage = { workspace = true, features = ["test-util"] }
 maki-config = { workspace = true, features = ["test-util"] }
 test-case = { workspace = true }
 tempfile = { workspace = true }

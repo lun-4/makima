@@ -36,16 +36,25 @@ impl PluginPermissions {
         self.allowed.iter().all(|&allowed| allowed)
     }
 
-    pub fn from_manifest(manifest: &toml::Value) -> Self {
-        let perms = manifest.get("permissions");
-        let mut allowed = [true; Permission::COUNT];
-        for &perm in Permission::ALL {
-            allowed[perm as usize] = perms
-                .and_then(|p| p.get(perm.manifest_key()))
-                .and_then(toml::Value::as_bool)
-                .unwrap_or(true);
+    /// Fails on a `[permissions]` key that names no permission or a value
+    /// that is not a boolean, so a typo never leaves a permission granted.
+    pub fn from_manifest(manifest: &toml::Value) -> Result<Self, String> {
+        let mut permissions = Self::trusted();
+        let Some(section) = manifest.get("permissions") else {
+            return Ok(permissions);
+        };
+        let section = section.as_table().ok_or("[permissions] is not a table")?;
+        for (key, value) in section {
+            let perm = Permission::ALL
+                .iter()
+                .find(|perm| perm.manifest_key() == key)
+                .ok_or_else(|| format!("[permissions] {key}: unknown permission"))?;
+            let allowed = value
+                .as_bool()
+                .ok_or_else(|| format!("[permissions] {key}: expected a boolean"))?;
+            permissions.set(*perm, allowed);
         }
-        Self { allowed }
+        Ok(permissions)
     }
 
     pub fn set(&mut self, perm: Permission, value: bool) {
@@ -103,8 +112,11 @@ pub(crate) fn load_plugin_permissions(plugin_dir: Option<&Path>) -> PluginPermis
     };
     let manifest_path = dir.join(MANIFEST_FILE);
     match std::fs::read_to_string(&manifest_path) {
-        Ok(content) => match toml::from_str::<toml::Value>(&content) {
-            Ok(val) => PluginPermissions::from_manifest(&val),
+        Ok(content) => match toml::from_str::<toml::Value>(&content)
+            .map_err(|e| e.to_string())
+            .and_then(|val| PluginPermissions::from_manifest(&val))
+        {
+            Ok(permissions) => permissions,
             Err(e) => {
                 warn!(
                     path = %manifest_path.display(),
@@ -135,6 +147,8 @@ pub(crate) fn load_plugin_permissions(plugin_dir: Option<&Path>) -> PluginPermis
 
 #[cfg(test)]
 mod tests {
+    use test_case::test_case;
+
     use super::*;
 
     #[test]
@@ -163,7 +177,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let p = PluginPermissions::from_manifest(&val);
+        let p = PluginPermissions::from_manifest(&val).unwrap();
         assert!(!p.is_allowed(Permission::FsRead));
         assert!(p.is_allowed(Permission::FsWrite));
         assert!(!p.is_allowed(Permission::Net));
@@ -174,10 +188,18 @@ mod tests {
     #[test]
     fn from_manifest_missing_section() {
         let val: toml::Value = toml::from_str("[package]\nname = \"test\"").unwrap();
-        let p = PluginPermissions::from_manifest(&val);
+        let p = PluginPermissions::from_manifest(&val).unwrap();
         for &perm in Permission::ALL {
             assert!(p.is_allowed(perm), "{perm} should default to allowed");
         }
+    }
+
+    #[test_case("permissions = 1" ; "section_not_a_table")]
+    #[test_case("[permissions]\nnet = \"false\"" ; "string_value")]
+    #[test_case("[permissions]\nnett = false" ; "unknown_permission")]
+    fn from_manifest_rejects_invalid_permissions(manifest: &str) {
+        let val: toml::Value = toml::from_str(manifest).unwrap();
+        assert!(PluginPermissions::from_manifest(&val).is_err());
     }
 
     #[test]

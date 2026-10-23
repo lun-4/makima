@@ -103,7 +103,6 @@ impl Drop for ChildGuard {
 #[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::process::CommandExt;
-    use std::time::{Duration, Instant};
 
     use async_process::Child;
 
@@ -126,15 +125,27 @@ mod tests {
         unsafe { libc::kill(pid as i32, 0) == 0 }
     }
 
-    fn wait_for_death(pid: u32) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            if !is_alive(pid) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
+    /// Asserts the process was killed by attempting to reap it. The guard's own
+    /// `Drop` may have won the race and reaped already, which reads as `ECHILD`.
+    /// Otherwise the status must show `SIGKILL`: a `sleep` that outlived a guard
+    /// which failed to kill it would reap here with a normal exit.
+    fn assert_reaped(pid: u32) {
+        let mut status = 0;
+        let reaped = unsafe { libc::waitpid(pid as i32, &mut status, 0) };
+        if reaped == -1 {
+            let error = std::io::Error::last_os_error();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::ECHILD),
+                "process {pid} was neither reaped here nor already reaped by the guard"
+            );
+            return;
         }
-        panic!("process {pid} still alive after 2s");
+        assert_eq!(reaped, pid as i32);
+        assert!(
+            libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
+            "process {pid} exited with status {status} instead of being killed"
+        );
     }
 
     #[test]
@@ -143,7 +154,7 @@ mod tests {
         let pid = child.id();
         assert!(is_alive(pid));
         drop(ChildGuard::new(child));
-        wait_for_death(pid);
+        assert_reaped(pid);
     }
 
     #[test]
@@ -154,7 +165,7 @@ mod tests {
             assert!(is_alive(pid));
             let mut guard = ChildGuard::new(child);
             guard.kill_and_reap().await;
-            wait_for_death(pid);
+            assert_reaped(pid);
         });
     }
 

@@ -1,4 +1,4 @@
-use maki_agent::session_coordinator::SessionCoordinatorError;
+use maki_agent::config_change::ConfigChangeError;
 use std::io;
 use std::path::PathBuf;
 
@@ -30,10 +30,10 @@ pub enum PluginError {
     HostDead,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum SessionOptionMutationError {
     #[error("plugin host is not running")]
     HostDead,
     #[error(transparent)]
-    Coordinator(#[from] SessionCoordinatorError),
+    Config(#[from] ConfigChangeError),
 }

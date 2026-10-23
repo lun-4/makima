@@ -1,7 +1,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use serde::de::{self, Deserializer};
+use serde::de::Deserializer;
 use serde::{Deserialize, Serialize, Serializer};
 use thiserror::Error;
 
@@ -320,97 +320,21 @@ impl Default for ThinkingOptions {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase", tag = "kind")]
-enum StoredThinkingConfig {
-    Off,
-    Adaptive,
-    Effort { level: Effort },
-    Budget { tokens: u32 },
-}
-
 impl Serialize for ThinkingConfig {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let stored = match self {
-            Self::Off => StoredThinkingConfig::Off,
-            Self::Adaptive => StoredThinkingConfig::Adaptive,
-            Self::Effort(level) => StoredThinkingConfig::Effort { level: *level },
-            Self::Budget(tokens) => StoredThinkingConfig::Budget { tokens: *tokens },
-        };
-        stored.serialize(serializer)
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        StoredThinking::from(*self).serialize(serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for ThinkingConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let stored = StoredThinkingRepr::deserialize(deserializer)?;
-        match stored {
-            StoredThinkingRepr::Tagged {
-                kind,
-                level,
-                tokens,
-            } => match kind.as_str() {
-                "off" if level.is_none() && tokens.is_none() => Ok(Self::Off),
-                "adaptive" if level.is_none() && tokens.is_none() => Ok(Self::Adaptive),
-                "effort" => level
-                    .map(Self::Effort)
-                    .ok_or_else(|| de::Error::custom("effort thinking requires level")),
-                "budget" => tokens
-                    .map(Self::Budget)
-                    .ok_or_else(|| de::Error::custom("budget thinking requires tokens")),
-                _ => Err(de::Error::custom("invalid thinking configuration")),
-            },
-            StoredThinkingRepr::Legacy(value) => {
-                Self::parse_setting(&value).map_err(de::Error::custom)
-            }
-            StoredThinkingRepr::LegacyObject { mode } => {
-                Self::parse_setting(&mode).map_err(de::Error::custom)
-            }
-        }
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        StoredThinking::deserialize(deserializer).map(Self::from)
     }
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum StoredThinkingRepr {
-    Tagged {
-        kind: String,
-        level: Option<Effort>,
-        tokens: Option<u32>,
-    },
-    LegacyObject {
-        mode: String,
-    },
-    Legacy(String),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn thinking_config_round_trips_legacy_tagged_schema() {
-        let json = serde_json::to_string(&ThinkingConfig::Effort(Effort::High)).unwrap();
-        assert_eq!(json, r#"{"kind":"effort","level":"high"}"#);
-        assert_eq!(
-            serde_json::from_str::<ThinkingConfig>(&json).unwrap(),
-            ThinkingConfig::Effort(Effort::High)
-        );
-        assert_eq!(
-            serde_json::from_str::<ThinkingConfig>(r#""high""#).unwrap(),
-            ThinkingConfig::Effort(Effort::High)
-        );
-        assert_eq!(
-            serde_json::from_str::<ThinkingConfig>(r#"{"mode":"high"}"#).unwrap(),
-            ThinkingConfig::Effort(Effort::High)
-        );
-    }
 
     #[test]
     fn thinking_config_parses_aliases_and_budgets() {

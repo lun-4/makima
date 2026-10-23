@@ -16,7 +16,7 @@
 //! The counters are process-wide, so overlapping runs share one budget:
 //! only the outermost rebases the baseline, and the tightest `max_memory`
 //! wins. Serializing instead would deadlock, because a script suspended in
-//! a `task` call holds its scope while the subagent it waits on starts a
+//! a `task_wait` call holds its scope while the subagent it waits on starts a
 //! run of its own.
 //!
 //! The accounting is approximate: tool results are allocated on other

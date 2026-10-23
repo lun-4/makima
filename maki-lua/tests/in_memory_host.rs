@@ -10,7 +10,7 @@ use maki_agent::AgentMode;
 use maki_agent::cancel::CancelToken;
 use maki_agent::tools::ToolRegistry;
 use maki_agent::tools::test_support::stub_ctx;
-use maki_lua::test_support::InMemoryFs;
+use maki_lua::test_support::{InMemoryFs, run_command};
 use maki_lua::{CommandArgumentContext, CommandArgumentItem, CommandArgumentLifecycle};
 
 const NOTE_PATH: &str = "note.md";
@@ -330,14 +330,10 @@ fn splash_picker_command_persists_selection() {
         None,
     );
 
-    handle.run_command(
-        Arc::from("splashes"),
-        Arc::from("/splash"),
-        "matrix".into(),
-        0,
-    );
+    let switched = run_command(&guard.host().command_registry(), "/splash matrix", 0, None);
     let content = wait_for_selection(&guard, SELECTION_MATRIX);
     assert!(content.contains("name"), "persisted file: {content}");
+    assert_eq!(switched.recv_timeout(SPLASH_DEADLINE).unwrap(), Ok(()));
 
     let frame = pull_frame(&handle, None);
     assert!(!frame.rows.is_empty(), "committed splash serves frames");
@@ -413,12 +409,7 @@ fn splash_picker_command_switches_to_default() {
         "the committed matrix splash serves frames before the switch"
     );
 
-    handle.run_command(
-        Arc::from("splashes"),
-        Arc::from("/splash"),
-        "default".into(),
-        0,
-    );
+    let switched = run_command(&guard.host().command_registry(), "/splash default", 0, None);
 
     // The fallback path must serve the starfield through the chain below the
     // picker; a failing delegation rolls the selection back to matrix.
@@ -429,6 +420,7 @@ fn splash_picker_command_switches_to_default() {
         !content.contains(SELECTION_MATRIX),
         "the switch must not roll the file back to matrix: {content}"
     );
+    assert_eq!(switched.recv_timeout(SPLASH_DEADLINE).unwrap(), Ok(()));
 }
 
 const SECOND_SOURCE: &str = r##"
@@ -484,14 +476,10 @@ fn splash_picker_rollback_serves_reloaded_contribution() {
         !frame.rows.is_empty(),
         "the committed vortex splash serves before the switch"
     );
-    handle.run_command(
-        Arc::from("splashes"),
-        Arc::from("/splash"),
-        "other".into(),
-        0,
-    );
+    let switched = run_command(&guard.host().command_registry(), "/splash other", 0, None);
     let content = wait_for_selection(&guard, "other");
     assert!(content.contains("name"), "persisted file: {content}");
+    assert_eq!(switched.recv_timeout(SPLASH_DEADLINE).unwrap(), Ok(()));
 
     // Reload vortex with a fresh closure ("n") and drop the committed
     // splash: the rollback must re-resolve the previous selection, not serve
@@ -539,14 +527,10 @@ fn splash_picker_sees_contribution_loaded_after_picker() {
     // StoreChanged event, not from polling.
     guard.host().load_source("late", LATE_SOURCE).unwrap();
 
-    handle.run_command(
-        Arc::from("splashes"),
-        Arc::from("/splash"),
-        "late".into(),
-        0,
-    );
+    let switched = run_command(&guard.host().command_registry(), "/splash late", 0, None);
     let content = wait_for_selection(&guard, "late");
     assert!(content.contains("name"), "persisted file: {content}");
+    assert_eq!(switched.recv_timeout(SPLASH_DEADLINE).unwrap(), Ok(()));
     let frame = pull_frame(&handle, Some("lll"));
     assert!(
         !frame.rows.is_empty(),
@@ -877,12 +861,8 @@ fn splash_fps_overlay_toggles_through_store_and_readout() {
         .expect("timings reflect real renders");
 
     let toggle = || {
-        handle.run_command(
-            Arc::from("perf"),
-            Arc::from("/splash-fps"),
-            String::new(),
-            0,
-        );
+        let toggled = run_command(&guard.host().command_registry(), "/splash-fps", 0, None);
+        assert_eq!(toggled.recv_timeout(SPLASH_DEADLINE).unwrap(), Ok(()));
     };
 
     toggle();

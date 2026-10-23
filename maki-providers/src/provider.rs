@@ -423,6 +423,8 @@ pub async fn from_model_async(
 }
 
 pub struct ModelBatch {
+    /// The one builtin or dynamic provider this batch lists, if it lists one.
+    pub provider: Option<&'static str>,
     pub models: Vec<String>,
     pub warnings: Vec<String>,
 }
@@ -470,15 +472,16 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
             }
         }
     }
-    specs.retain(|spec| policy.allows(spec));
+    specs.retain(|spec| {
+        policy.allows(spec)
+            && spec
+                .split_once('/')
+                .is_some_and(|(slug, _)| provider_available_offline(slug))
+    });
     specs
 }
 
-pub async fn fetch_all_models(
-    policy: &ModelPolicy,
-    mut on_ready: impl FnMut(ModelBatch),
-    on_done: Option<Box<dyn FnOnce() + Send>>,
-) {
+pub async fn fetch_all_models(policy: &ModelPolicy, mut on_ready: impl FnMut(ModelBatch)) {
     let (tx, rx) = flume::unbounded();
     let timeouts = Timeouts::default();
 
@@ -505,6 +508,7 @@ pub async fn fetch_all_models(
                         }
                     }
                     ModelBatch {
+                        provider: Some(slug),
                         models: specs,
                         warnings: Vec::new(),
                     }
@@ -518,6 +522,7 @@ pub async fn fetch_all_models(
                         .map(|p| format!("{slug}/{p}"))
                         .collect();
                     ModelBatch {
+                        provider: Some(slug),
                         models: fallback,
                         warnings: vec![format!(
                             "{display_name}: {e} (using static fallback)"
@@ -530,9 +535,9 @@ pub async fn fetch_all_models(
         .detach();
     }
 
-    for slug in dynamic::discovered_slugs() {
+    for listed in dynamic::discovered_slugs() {
         let tx = tx.clone();
-        let slug = slug.to_string();
+        let slug = listed.to_string();
         smol::spawn(async move {
             let static_fallback = |reason: String| {
                 warn!(
@@ -541,6 +546,7 @@ pub async fn fetch_all_models(
                     "dynamic model listing failed, using static fallback"
                 );
                 ModelBatch {
+                    provider: Some(listed),
                     models: dynamic::dynamic_model_specs_for(&slug),
                     warnings: vec![format!("{slug}: {reason} (using static fallback)")],
                 }
@@ -548,6 +554,7 @@ pub async fn fetch_all_models(
             let batch = match dynamic::create(&slug, timeouts) {
                 Ok(provider) => match provider.list_models().await {
                     Ok(models) => ModelBatch {
+                        provider: Some(listed),
                         models: models.iter().map(|m| format!("{slug}/{}", m.id)).collect(),
                         warnings: Vec::new(),
                     },
@@ -577,6 +584,7 @@ pub async fn fetch_all_models(
             let models: Vec<String> = cat.models.keys().map(|id| format!("{slug}/{id}")).collect();
             let _ = tx_catalog
                 .send_async(ModelBatch {
+                    provider: None,
                     models,
                     warnings: Vec::new(),
                 })
@@ -592,6 +600,7 @@ pub async fn fetch_all_models(
         if !declared.is_empty() {
             let _ = tx_custom
                 .send_async(ModelBatch {
+                    provider: None,
                     models: declared,
                     warnings: Vec::new(),
                 })
@@ -602,6 +611,7 @@ pub async fn fetch_all_models(
         if !custom_specs.is_empty() {
             let _ = tx_custom
                 .send_async(ModelBatch {
+                    provider: None,
                     models: custom_specs,
                     warnings: Vec::new(),
                 })
@@ -615,9 +625,6 @@ pub async fn fetch_all_models(
     while let Ok(mut batch) = rx.recv_async().await {
         batch.models.retain(|spec| policy.allows(spec));
         on_ready(batch);
-    }
-    if let Some(done) = on_done {
-        done();
     }
 }
 

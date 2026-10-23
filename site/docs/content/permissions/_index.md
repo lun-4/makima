@@ -43,7 +43,7 @@ default: prompt / allow / deny
 
 Deny rules are checked across all layers before anything else, so a deny cannot be bypassed by YOLO. Mode tool selection and native write-target restrictions also apply before permission approval. A custom write-restricted mode can explicitly offer a third-party local tool. Native mutation tools must match the permitted normalized target, including after an input hook changes their arguments. MCP execution and deferred MCP search remain blocked in write-restricted modes. Approval and YOLO do not bypass these restrictions. `default` resolves per-tool first, then global. The built-in default is `"prompt"`.
 
-Mode restrictions do not provide a sandbox for plugin effects. Lua filesystem writes require the plugin's `fs_write` permission and have no plan-path restriction. See [Modes](/docs/modes/#configuration-changes) for configuration ownership, admission snapshots, and asynchronous saving. If a pinned MCP prompt disappears before execution, setup fails rather than using a replacement.
+Mode restrictions do not provide a sandbox for plugin effects. Lua filesystem writes require the plugin's `fs_write` permission and have no plan-path restriction. See [Modes](/docs/modes/#configuration-changes) for configuration ownership, admission snapshots, and saving. If a pinned MCP prompt disappears before execution, setup fails rather than using a replacement.
 
 ## Builtin Defaults
 
@@ -56,7 +56,7 @@ File-write tools are pre-allowed inside the project working directory (cwd at se
 | `multiedit`    | `<cwd>/**` | Outside cwd requires permission       |
 | `edit_lines`   | `<cwd>/**` | Same, when the opt-in tool is enabled |
 | `insert_lines` | `<cwd>/**` | Same, when the opt-in tool is enabled |
-| `task`         | `*`        | Subagent spawning always allowed      |
+| `task_spawn`   | `*`        | Subagent spawning always allowed      |
 
 The memory plugin uses a plugin rule to pre-allow the file-write tools inside its notes directory (under makima's state dir), so the agent can edit memory notes directly without a prompt.
 
@@ -102,7 +102,15 @@ deny = ["admin_delete"]
 
 Each tool gets its own section with `allow` and `deny` arrays. Values are glob-like scope patterns.
 
-> **Note:** In MCP server sections (`[mcp.*]`), the boolean forms `allow = true` and `deny = true` are deprecated and ignored. Use `default = "allow"` or `default = "deny"` instead. For native tool sections (e.g. `[bash]`), `allow = true` still works.
+> **Note:** In MCP server sections (`[mcp.*]`), `allow` and `deny` take an array of tool names, with `["*"]` for every tool on the server. Use `default = "allow"` or `default = "deny"` for the fallback. Native tool sections (e.g. `[bash]`) take an array of scope patterns, or `allow = true` to cover the whole tool.
+
+A rule that does not parse stops maki from starting, and the error names the file, section and key. This covers unknown keys, a boolean or bare string in an `[mcp.*]` list, section names that are not valid tool names (letters, digits, `-` and `_` only, so the old `["mcp:<server>__<tool>"]` form fails too), and `["*"].default` (use the top-level `default`). It applies to project files too, trusted or not. Maki never skips a rule it cannot read, because a skipped deny would silently allow what it was meant to block.
+
+A well-formed section whose tool does not exist still loads, because a global rule may be for a tool that only some projects have, such as one from a project plugin. At startup maki warns about each rule whose tool nothing registered in the current project, so a typo like `[bassh]` shows up: the TUI flashes the warning, print, SDK and ACP write it to stderr, and every frontend logs it.
+
+When the broken file is the project's `.makima/permissions.toml`, the error ends by suggesting `--no-project`. Start with it to work in that repository anyway: maki then reads nothing from the project's `.makima` directory, this file included. See [Folder Trust](/docs/folder-trust/#loading-nothing-from-the-project).
+
+A `~/.makima/permissions.toml` left from the old home layout also stops startup, because maki no longer reads it and its denies would quietly stop applying. Move its rules to the global file above and delete it.
 
 ### The `default` key
 

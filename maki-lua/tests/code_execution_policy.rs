@@ -6,13 +6,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use maki_agent::AgentMode;
 use maki_agent::mcp::test_support::stub_session;
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{
     DescriptionContext, ToolAudience, ToolContext, ToolFilter, ToolRegistry, TurnToolBindings,
     local_tool,
 };
+use maki_agent::{AgentMode, BufferSnapshot, SpanStyle};
 use maki_lua::PluginHost;
 
 const CODE_EXECUTION_SRC: &str = include_str!("../../plugins/code_execution/init.lua");
@@ -42,6 +42,22 @@ const TOOLS_MCP_PROBE: &str = "tools_mcp_probe";
 /// registry.
 const CLIENT_TOOL: &str = "client_probe";
 const CLIENT_TOOL_OUT: &str = "client ran";
+const SCRIPT_TOOL_ID: &str = "ce-script-1";
+const RESTORE_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(180);
+const MAX_SCRIPT_LINES: usize = 2000;
+const EXPAND_NOTICE: &str = "click to expand";
+const DIVIDER_LINE: &str = "──────";
+// Bulk syntax highlighting can exceed the restore deadline on loaded CI runners.
+// Boundary tests retain the real script cap and view with deterministic styles.
+const SCRIPT_HIGHLIGHT_STUB: &str = r##"
+maki.ui.highlight = function(code)
+    local lines = {}
+    for _, line in ipairs(maki.split(code, "\n")) do
+        lines[#lines + 1] = { { line, { fg = "#ff8000" } } }
+    end
+    return lines
+end
+"##;
 
 fn fixture_plugin() -> String {
     format!(
@@ -115,8 +131,12 @@ maki.api.register_tool({{
 }
 
 fn setup_with(reg: Arc<ToolRegistry>) -> (Arc<ToolRegistry>, PluginHost) {
+    setup_source(reg, CODE_EXECUTION_SRC)
+}
+
+fn setup_source(reg: Arc<ToolRegistry>, source: &str) -> (Arc<ToolRegistry>, PluginHost) {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_source("code_execution", CODE_EXECUTION_SRC)
+    host.load_source("code_execution", source)
         .expect("real plugin should load");
     host.load_source("policy_fixtures", &fixture_plugin())
         .expect("fixture plugin should load");
@@ -373,15 +393,16 @@ fn model_only_client_tool_stays_out_of_the_sandbox() {
 
 // --- script rendering ---
 
-const SCRIPT_TOOL_ID: &str = "ce-script-1";
-const RESTORE_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(180);
-const MAX_SCRIPT_LINES: usize = 2000;
-const EXPAND_NOTICE: &str = "click to expand";
-const DIVIDER_LINE: &str = "──────";
+fn setup_script_rendering() -> (Arc<ToolRegistry>, PluginHost) {
+    setup_source(
+        Arc::new(ToolRegistry::new()),
+        &format!("{SCRIPT_HIGHLIGHT_STUB}\n{CODE_EXECUTION_SRC}"),
+    )
+}
 
 fn event_ctx(reg: &Arc<ToolRegistry>) -> (ToolContext, flume::Receiver<maki_agent::Envelope>) {
     let (tx, rx) = flume::unbounded::<maki_agent::Envelope>();
-    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let event_tx = maki_agent::EventSender::new(tx);
     let mut ctx = maki_agent::tools::test_support::stub_ctx_with(
         &AgentMode::Build,
         Some(&event_tx),
@@ -401,8 +422,12 @@ fn parse_code(reg: &ToolRegistry, code: &str) -> Box<dyn maki_agent::tools::Tool
 
 fn start_preview_text(code: &str) -> String {
     let (reg, _host) = setup();
-    let inv = parse_code(&reg, code);
-    let (ctx, rx) = event_ctx(&reg);
+    start_preview_text_with(&reg, code)
+}
+
+fn start_preview_text_with(reg: &Arc<ToolRegistry>, code: &str) -> String {
+    let inv = parse_code(reg, code);
+    let (ctx, rx) = event_ctx(reg);
     smol::block_on(inv.start(&ctx));
     let body = rx
         .drain()
@@ -428,7 +453,8 @@ fn start_preview_caps_script_at_max_lines(total: usize, truncated: bool) {
         .map(|i| format!("print({i})"))
         .collect::<Vec<_>>()
         .join("\n");
-    let text = start_preview_text(&code);
+    let (reg, _host) = setup_script_rendering();
+    let text = start_preview_text_with(&reg, &code);
     assert!(
         text.contains(&format!("print({MAX_SCRIPT_LINES})")),
         "line at the cap must be visible"
@@ -515,8 +541,13 @@ fn handler_error_keeps_script_and_drops_waiting_notice() {
     );
 }
 
-fn restore_lines_with(code: &str, output: &str, is_error: bool, clicks: Vec<usize>) -> Vec<String> {
-    let (_reg, host) = setup();
+fn restore_snapshot(
+    host: &PluginHost,
+    code: &str,
+    output: &str,
+    is_error: bool,
+    clicks: Vec<usize>,
+) -> BufferSnapshot {
     let eh = host.event_handle();
     let (tx, rx) = flume::unbounded::<maki_agent::Envelope>();
     eh.request_restore(
@@ -531,23 +562,27 @@ fn restore_lines_with(code: &str, output: &str, is_error: bool, clicks: Vec<usiz
             clicks,
             state: None,
         },
-        maki_agent::EventSender::new(tx, 0),
+        maki_agent::EventSender::new(tx),
     );
-    let snapshot = loop {
+    loop {
         let env = rx
             .recv_timeout(RESTORE_SNAPSHOT_TIMEOUT)
             .expect("restore must emit a snapshot");
         if let maki_agent::AgentEvent::ToolSnapshot { id, snapshot, .. } = env.event
             && id == SCRIPT_TOOL_ID
         {
-            break snapshot;
+            return snapshot;
         }
-    };
-    snapshot.text().lines().map(str::to_owned).collect()
+    }
 }
 
 fn restore_lines(output: &str, is_error: bool) -> Vec<String> {
-    restore_lines_with("print('x')", output, is_error, Vec::new())
+    let (_reg, host) = setup();
+    restore_snapshot(&host, "print('x')", output, is_error, Vec::new())
+        .text()
+        .lines()
+        .map(str::to_owned)
+        .collect()
 }
 
 #[test_case::test_case("out1\nout2", false, &["out1", "out2"] ; "output_lines_below_divider")]
@@ -559,6 +594,27 @@ fn restore_body_is_script_divider_output(output: &str, is_error: bool, tail: &[&
     assert_eq!(restore_lines(output, is_error), expected);
 }
 
+#[test]
+fn restore_preserves_real_syntax_highlighting() {
+    const CODE: &str = "print('a')\nprint('b')";
+    const OUTPUT: &str = "a\nb";
+    let (_reg, host) = setup();
+    let snapshot = restore_snapshot(&host, CODE, OUTPUT, false, Vec::new());
+    let text = snapshot.text();
+    assert_eq!(
+        text,
+        format!("1 print('a')\n2 print('b')\n{DIVIDER_LINE}\n{OUTPUT}")
+    );
+    for line in snapshot.lines.iter().take(CODE.lines().count()) {
+        assert!(
+            line.spans
+                .iter()
+                .any(|span| matches!(&span.style, SpanStyle::Inline(style) if style.fg.is_some())),
+            "restored script line must contain syntax highlighting: {line:?}"
+        );
+    }
+}
+
 /// Restoring a session saved with the script expanded replays the buf's
 /// click handler, so the header must rebuild past `MAX_SCRIPT_LINES`.
 #[test]
@@ -568,8 +624,10 @@ fn restore_expanded_shows_full_script_beyond_cap() {
         .map(|i| format!("print({i})"))
         .collect::<Vec<_>>()
         .join("\n");
-    let lines = restore_lines_with(&code, "out1", false, vec![0]);
-    let text = lines.join("\n");
+    let (_reg, host) = setup_script_rendering();
+    let snapshot = restore_snapshot(&host, &code, "out1", false, vec![0]);
+    let text = snapshot.text();
+    let lines: Vec<_> = text.lines().collect();
     assert!(
         text.contains(&format!("print({over})")),
         "expanded restore must show lines beyond the cap"
@@ -579,7 +637,7 @@ fn restore_expanded_shows_full_script_beyond_cap() {
         "no truncation notice when expanded"
     );
     assert_eq!(
-        lines.last().map(String::as_str),
+        lines.last().copied(),
         Some("out1"),
         "output must stay below the expanded script"
     );

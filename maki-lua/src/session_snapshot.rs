@@ -2,83 +2,84 @@
 //! drivers all serialize this struct, so a plugin sees the same keys wherever
 //! it runs and a new field is one edit instead of three `json!` blobs.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-use maki_agent::{AgentEvent, Envelope};
+use maki_agent::{AgentEvent, AgentRef, Envelope};
 use maki_providers::{TokenUsage, add_cost};
+use maki_storage::id::MakiId;
+use maki_storage::sessions::StoredTokenUsage;
 use serde::Serialize;
+use serde_json::{Value, json};
 
-use crate::EventHandle;
+use crate::{EventHandle, agent_autocmd};
 
-pub const MODE_BUILD: &str = "build";
-pub const MODE_PLAN: &str = "plan";
 pub const STATUS_IDLE: &str = "idle";
 pub const STATUS_WORKING: &str = "working";
 pub const STATUS_NEEDS_INPUT: &str = "needs_input";
+/// Agents only: a session that closed is no longer live.
+pub const STATUS_CLOSED: &str = "closed";
 
 #[derive(Serialize)]
 pub struct SessionSnapshot {
     pub id: String,
-    /// Working directory the session runs against.
-    pub cwd: String,
     /// Left out when the host has no title to give. Never filled with the
     /// session id, so a plugin can tell "no title" from a real one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    /// Model spec as shown in the status bar (`provider/id`).
-    pub model: String,
-    pub fast: bool,
-    pub thinking: String,
-    /// [`MODE_BUILD`] or [`MODE_PLAN`].
-    pub mode: &'static str,
     /// [`STATUS_IDLE`], [`STATUS_WORKING`], or [`STATUS_NEEDS_INPUT`].
     pub status: &'static str,
-    /// Whether this is the session the user is looking at. Always true
-    /// for the single-session headless drivers.
-    pub focused: bool,
     /// Unix seconds.
     pub updated_at: u64,
-    /// Omitted by hosts that hold no queue of their own. An sdk client can
-    /// pipeline messages that wait outside the driver's sight, so leaving
-    /// this out beats reporting a zero the plugin would trust.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub queue: Option<SessionQueueSnapshot>,
-    /// Subagent turns included, their tokens are real spend on this session
-    /// too.
-    pub usage: TokenUsage,
-    /// Main session only. A subagent fills its own window, not ours.
-    pub context_size: u32,
-    pub context_window: u32,
-    /// What the session bills, `None` on an unpriced model. No list price
-    /// twin here, because `cost` is re-settled from stored usage when a
-    /// session resumes and list price is not stored. Per turn list price
-    /// lives on the `TurnEnd` autocmd instead.
-    pub cost: Option<f64>,
+    /// From [`session_usage`]; subagent turns included, their tokens are real
+    /// spend on this session too.
+    pub usage: Value,
 }
 
-#[derive(Serialize)]
-pub struct SessionQueueSnapshot {
-    /// Pending user text only. A queued `/compact` is housekeeping, not human
-    /// input a supervisor should yield to.
-    pub count: usize,
-}
-
-/// What a headless driver knows about its session before it runs.
-pub struct HeadlessMeta {
-    pub id: String,
-    pub cwd: String,
-    /// Model spec (`provider/id`).
-    pub model: String,
-    pub fast: bool,
-    pub thinking: String,
+/// The `usage` of a session snapshot: `{total, models}`, models sorted by
+/// total tokens descending, then spec. Costs are what each turn billed, `None`
+/// when unpriced. A host that does not split usage by model passes none.
+pub fn session_usage(
+    total: &TokenUsage,
+    cost: Option<f64>,
+    models: &HashMap<String, StoredTokenUsage>,
+) -> Value {
+    let mut models: Vec<_> = models.iter().collect();
+    models.sort_by(|(a_model, a_usage), (b_model, b_usage)| {
+        b_usage
+            .total()
+            .cmp(&a_usage.total())
+            .then_with(|| a_model.cmp(b_model))
+    });
+    let models: Vec<_> = models
+        .into_iter()
+        .map(|(model, usage)| {
+            json!({
+                "model": model,
+                "input": usage.input,
+                "output": usage.output,
+                "cache_creation": usage.cache_creation,
+                "cache_read": usage.cache_read,
+                "cost": usage.cost,
+            })
+        })
+        .collect();
+    json!({
+        "total": {
+            "input": total.input,
+            "output": total.output,
+            "cache_creation": total.cache_creation,
+            "cache_read": total.cache_read,
+            "cost": cost,
+        },
+        "models": models,
+    })
 }
 
 #[derive(Default)]
 struct Totals {
     usage: TokenUsage,
     cost: Option<f64>,
-    context_size: u32,
-    context_window: u32,
     working: bool,
 }
 
@@ -89,18 +90,40 @@ fn lock(totals: &Mutex<Totals>) -> MutexGuard<'_, Totals> {
     totals.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Backs `maki.session.read` for the single session headless drivers
-/// (`makima --print`, sdk mode). The driver writes while the Lua thread reads, hence
-/// the lock, though the two rarely meet.
-#[derive(Clone, Default)]
-pub struct HeadlessSnapshot(Arc<Mutex<Totals>>);
+/// What a headless driver (print, SDK, ACP) feeds every envelope of its one
+/// session to: the totals `maki.session.read` answers from and the Lua turn
+/// autocmds, so plugins see the same events and numbers as under the TUI. The
+/// driver writes while the Lua thread reads, hence the lock, though the two
+/// rarely meet.
+#[derive(Clone)]
+pub struct HeadlessObserver {
+    handle: EventHandle,
+    session_id: MakiId,
+    totals: Arc<Mutex<Totals>>,
+    root: Arc<OnceLock<AgentRef>>,
+}
 
-impl HeadlessSnapshot {
-    /// Fold one envelope in. The drivers already loop over the stream, so
-    /// they hand every envelope here and keep no bookkeeping of their own.
+impl HeadlessObserver {
+    pub fn new(handle: EventHandle, session_id: MakiId) -> Self {
+        Self {
+            handle,
+            session_id,
+            totals: Arc::default(),
+            root: Arc::default(),
+        }
+    }
+
+    /// Folds one envelope into the totals, then fires its autocmd.
     pub fn observe(&self, envelope: &Envelope) {
+        self.fold(envelope);
+        if let Some(root) = self.root.get() {
+            agent_autocmd::dispatch(&self.handle, root, envelope);
+        }
+    }
+
+    fn fold(&self, envelope: &Envelope) {
         let event = &envelope.event;
-        let mut totals = lock(&self.0);
+        let mut totals = lock(&self.totals);
         // Envelopes only flow while a run is alive, so anything that is not
         // an ending means the agent is busy. Sdk mode runs many turns and no
         // driver has to remember to clear a flag between them.
@@ -110,63 +133,37 @@ impl HeadlessSnapshot {
                 | AgentEvent::ControlComplete { .. }
                 | AgentEvent::ControlError { .. }
         );
-        match event {
-            AgentEvent::TurnOutcome(outcome) => {
-                totals.usage += outcome.usage();
-                add_cost(&mut totals.cost, outcome.cost());
-                totals.context_size = outcome.context_size();
-                totals.context_window = outcome.context_window();
-            }
-            AgentEvent::TurnComplete(turn) if envelope.subagent.is_none() => {
-                totals.context_size = turn.context_size.unwrap_or(totals.context_size);
-                totals.context_window = turn.context_window;
-            }
-            _ => {}
+        if let AgentEvent::TurnOutcome(outcome) = event {
+            totals.usage += outcome.usage();
+            add_cost(&mut totals.cost, outcome.cost());
         }
     }
 
-    /// Install as the provider `maki.session.read` answers from. `mode`
-    /// is a callback because sdk mode can flip between build and plan
-    /// mid-run.
-    ///
-    /// There is no stored session and no rename path under either driver,
-    /// so `title` stays nil rather than echoing the id back as a fake one.
-    pub fn install(
-        &self,
-        handle: &EventHandle,
-        meta: HeadlessMeta,
-        mode: impl Fn() -> &'static str + Send + Sync + 'static,
-    ) {
-        let totals = Arc::clone(&self.0);
-        handle.install_session_snapshot(Box::new(move |id| {
+    /// Installs the provider `maki.session.read` answers from. There is no
+    /// rename path under the headless drivers, so `title` stays nil rather
+    /// than echoing the id back as a fake one, and usage has no per-model
+    /// split.
+    pub fn install(&self, root: AgentRef) {
+        self.handle.observe_agents(&root.manager());
+        let _ = self.root.set(root);
+        let totals = Arc::clone(&self.totals);
+        let id = self.session_id;
+        self.handle.install_session_snapshot(Box::new(move |want| {
             // One session here, so any other id names a tab that is not ours.
-            if let Some(want) = id
-                && want != meta.id
-            {
+            if want != id {
                 return Err(format!("session {want} not live"));
             }
-            let mode = mode();
             let totals = lock(&totals);
             serde_json::to_value(SessionSnapshot {
-                id: meta.id.clone(),
-                cwd: meta.cwd.clone(),
+                id: id.to_string(),
                 title: None,
-                model: meta.model.clone(),
-                fast: meta.fast,
-                thinking: meta.thinking.clone(),
-                mode,
                 status: if totals.working {
                     STATUS_WORKING
                 } else {
                     STATUS_IDLE
                 },
-                focused: true,
                 updated_at: maki_storage::now_epoch(),
-                queue: None,
-                usage: totals.usage,
-                context_size: totals.context_size,
-                context_window: totals.context_window,
-                cost: totals.cost,
+                usage: session_usage(&totals.usage, totals.cost, &HashMap::new()),
             })
             .map_err(|e| e.to_string())
         }));
@@ -191,7 +188,7 @@ mod tests {
         Envelope {
             event,
             subagent: None,
-            run_id: 0,
+            identity: None,
         }
     }
 
@@ -230,18 +227,19 @@ mod tests {
     /// back to life on turn two, with no driver clearing anything by hand.
     #[test]
     fn totals_grow_and_status_revives_across_turns() {
-        let snapshot = HeadlessSnapshot::default();
+        let observer =
+            HeadlessObserver::new(EventHandle::disconnected_for_test(), MakiId::generate());
 
-        snapshot.observe(&turn_complete(FIRST_TURN_INPUT));
-        assert!(lock(&snapshot.0).working);
-        snapshot.observe(&done(FIRST_TURN_INPUT));
-        assert!(!lock(&snapshot.0).working);
+        observer.fold(&turn_complete(FIRST_TURN_INPUT));
+        assert!(lock(&observer.totals).working);
+        observer.fold(&done(FIRST_TURN_INPUT));
+        assert!(!lock(&observer.totals).working);
 
-        snapshot.observe(&turn_complete(SECOND_TURN_INPUT));
-        assert!(lock(&snapshot.0).working, "{WORKING_MSG}");
-        snapshot.observe(&done(SECOND_TURN_INPUT));
+        observer.fold(&turn_complete(SECOND_TURN_INPUT));
+        assert!(lock(&observer.totals).working, "{WORKING_MSG}");
+        observer.fold(&done(SECOND_TURN_INPUT));
 
-        let totals = lock(&snapshot.0);
+        let totals = lock(&observer.totals);
         assert!(!totals.working);
         assert_eq!(
             totals.usage.input,
@@ -249,6 +247,86 @@ mod tests {
             "{GROWS_MSG}"
         );
         assert_eq!(totals.cost, Some(TURN_COST * 2.0), "{GROWS_MSG}");
-        assert_eq!(totals.context_size, SECOND_TURN_INPUT);
+    }
+
+    #[test]
+    fn session_usage_preserves_costs_and_sorts_models_deterministically() {
+        let total = TokenUsage {
+            input: 10,
+            output: 20,
+            cache_creation: 30,
+            cache_read: 40,
+        };
+        let usage_by_model = HashMap::from([
+            (
+                "z/model".to_owned(),
+                StoredTokenUsage {
+                    input: 5,
+                    output: 5,
+                    cache_creation: 0,
+                    cache_read: 0,
+                    cost: None,
+                },
+            ),
+            (
+                "b/model".to_owned(),
+                StoredTokenUsage {
+                    input: 14,
+                    output: 1,
+                    cache_creation: 2,
+                    cache_read: 3,
+                    cost: Some(0.25),
+                },
+            ),
+            (
+                "a/model".to_owned(),
+                StoredTokenUsage {
+                    input: 10,
+                    output: 0,
+                    cache_creation: 0,
+                    cache_read: 0,
+                    cost: Some(0.5),
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            session_usage(&total, None, &usage_by_model),
+            json!({
+                "total": {
+                    "input": 10,
+                    "output": 20,
+                    "cache_creation": 30,
+                    "cache_read": 40,
+                    "cost": null,
+                },
+                "models": [
+                    {
+                        "model": "b/model",
+                        "input": 14,
+                        "output": 1,
+                        "cache_creation": 2,
+                        "cache_read": 3,
+                        "cost": 0.25,
+                    },
+                    {
+                        "model": "a/model",
+                        "input": 10,
+                        "output": 0,
+                        "cache_creation": 0,
+                        "cache_read": 0,
+                        "cost": 0.5,
+                    },
+                    {
+                        "model": "z/model",
+                        "input": 5,
+                        "output": 5,
+                        "cache_creation": 0,
+                        "cache_read": 0,
+                        "cost": null,
+                    },
+                ],
+            })
+        );
     }
 }

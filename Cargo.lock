@@ -2724,6 +2724,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "crossterm",
+ "event-listener",
  "flume 0.11.1",
  "futures-lite",
  "isahc",
@@ -2756,6 +2757,7 @@ version = "0.5.5-makima"
 dependencies = [
  "agent-client-protocol-schema",
  "color-eyre",
+ "event-listener",
  "flume 0.11.1",
  "maki-agent",
  "maki-commands",
@@ -2795,6 +2797,7 @@ dependencies = [
  "libc",
  "maki-commands",
  "maki-config",
+ "maki-domain",
  "maki-match",
  "maki-providers",
  "maki-storage",
@@ -2882,6 +2885,8 @@ version = "0.5.5-makima"
 dependencies = [
  "serde",
  "serde_json",
+ "strum 0.27.2",
+ "test-case",
  "thiserror 2.0.20",
 ]
 
@@ -3061,6 +3066,7 @@ version = "0.5.5-makima"
 dependencies = [
  "bs58",
  "etcetera",
+ "event-listener",
  "flume 0.11.1",
  "fs2",
  "fs4",

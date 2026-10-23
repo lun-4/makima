@@ -1,11 +1,9 @@
 //! Headless-safe half of the `plan_submit` gate (AC.5).
 //!
 //! The plan_submit tool must refuse to run outside plan mode. The full
-//! render/accept/reject UI flow is covered only by the pre-existing `maki-ui`
-//! app tests (kept as-is); here we assert the plugin-level gate fires without a
-//! UI: with `mode.get()` answering nil (the headless shape — no UI lane answers
-//! the mode query), `current_mode()` is nil and the tool errors before touching
-//! `maki.ui.action`.
+//! render/accept/reject UI flow is covered by the `maki-ui` app tests; here we
+//! assert the plugin-level gate reads the executing agent's mode and errors
+//! before touching `maki.ui.action`.
 
 use std::sync::Arc;
 
@@ -24,16 +22,8 @@ const GATE_ERR: &str = "plan_submit is only available in plan mode";
 #[test]
 fn plan_submit_rejected_outside_plan_mode() {
     let reg = Arc::new(ToolRegistry::new());
-    let _host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    // Stub the mode to a non-plan id (the same pattern the task_policy suite
-    // uses to gate without a UI). `current_mode() ~= "plan"` fires the gate
-    // before `maki.ui.action` is ever reached, so no UI lane is needed.
-    let prelude = "maki.api.mode.get = function() return 'build' end\n\n";
-    _host
-        .load_source(
-            "plan_submit_policy",
-            &format!("{prelude}\n{PLAN_SUBMIT_SRC}"),
-        )
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("plan_submit_policy", PLAN_SUBMIT_SRC)
         .unwrap();
 
     let ctx = stub_ctx(&AgentMode::Build);

@@ -40,7 +40,9 @@ use crate::mcp::{
     McpPublishedBinding, McpSession, McpToolBinding, TOOL_SEARCH_TOOL_NAME, wire_tool_name,
 };
 use crate::permissions::PermissionManager;
-use crate::{AgentConfig, AgentMode, CurrentManagedTurn, EventSender, RunLedger, SharedBuf};
+use crate::{
+    AgentConfig, AgentId, AgentMode, CurrentManagedTurn, EventSender, RunLedger, SharedBuf,
+};
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_providers::Model;
 use maki_providers::RequestOptions;
@@ -138,14 +140,14 @@ pub(crate) const TOOL_NAME_FIELD: &str = "name";
 /// the `code_execution` sandbox) cannot drift from what the model was shown.
 #[derive(Debug, Clone)]
 pub struct RequestTools {
-    definitions: Value,
+    definitions: Arc<Value>,
     filter: Arc<ToolFilter>,
 }
 
 impl Default for RequestTools {
     fn default() -> Self {
         Self {
-            definitions: Value::Array(Vec::new()),
+            definitions: Arc::new(Value::Array(Vec::new())),
             filter: Arc::default(),
         }
     }
@@ -172,7 +174,7 @@ impl RequestTools {
             mcp,
         };
         Self {
-            definitions: registry.definitions(vars, &ctx, model.supports_tool_examples()),
+            definitions: Arc::new(registry.definitions(vars, &ctx, model.supports_tool_examples())),
             filter: Arc::new(filter),
         }
     }
@@ -200,7 +202,7 @@ impl RequestTools {
             ToolFilter::Only,
         );
         Self {
-            definitions,
+            definitions: Arc::new(definitions),
             filter: Arc::new(filter),
         }
     }
@@ -222,12 +224,12 @@ pub const GREP_TOOL_NAME: &str = "grep";
 pub const MULTIEDIT_TOOL_NAME: &str = "multiedit";
 pub const QUESTION_TOOL_NAME: &str = "question";
 pub const READ_TOOL_NAME: &str = "read";
-pub const TASK_TOOL_NAME: &str = "task";
+pub const TASK_SPAWN_TOOL_NAME: &str = "task_spawn";
 pub const TODOWRITE_TOOL_NAME: &str = "todo_write";
 pub const VIEW_IMAGE_TOOL_NAME: &str = "view_image";
 pub const WRITE_TOOL_NAME: &str = "write";
 
-pub(crate) const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
+pub const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
 pub(crate) const DEADLINE_EXCEEDED: &str = "timeout exceeded";
 pub const TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -450,6 +452,7 @@ pub struct OutputFinalization {
 
 #[derive(Clone)]
 pub struct ToolContext {
+    pub execution_agent_id: Option<AgentId>,
     pub provider: Arc<dyn Provider>,
     pub model: Arc<Model>,
     pub event_tx: EventSender,
@@ -469,6 +472,8 @@ pub struct ToolContext {
     pub deadline: Deadline,
     pub config: AgentConfig,
     pub tool_filter: Arc<ToolFilter>,
+    /// Admitted tool definitions and filter, retained for exact child inheritance.
+    pub request_tools: Option<RequestTools>,
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
     pub timeouts: maki_providers::Timeouts,
@@ -482,6 +487,7 @@ pub struct ToolContext {
     pub workflow: bool,
     pub audience: ToolAudience,
     pub local_tools: LocalTools,
+    pub local_tool_capture: Option<Arc<Mutex<Option<Value>>>>,
     pub turn_bindings: Arc<TurnToolBindings>,
     /// Streams a dispatched child's live bufs and annotations back to the
     /// caller (`maki.agent.call_tool` with `on_live_buf`/`on_annotation`).
@@ -508,6 +514,20 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
+    /// Overlays an agent's committed configuration onto this template.
+    pub fn apply_effective_config(&mut self, config: &crate::EffectiveAgentConfig) {
+        self.cwd = config.context.cwd().to_path_buf();
+        self.model = Arc::new(config.settings.model.clone());
+        self.provider = Arc::clone(&config.settings.provider);
+        self.opts = RequestOptions {
+            thinking: config.settings.thinking,
+            fast: config.settings.fast,
+        };
+        self.workflow = config.settings.workflow;
+        self.mode = config.mode.clone();
+        self.mode_def = config.mode_def.clone().map(Arc::new);
+    }
+
     pub fn defer_output_limits(&self, mut opts: offload::OutputLimitOptions) -> bool {
         let Some(pending) = &self.pending_output_limits else {
             return false;
@@ -801,7 +821,7 @@ pub fn all_builtin_tool_names() -> Vec<&'static str> {
 
 use maki_providers::{Message, ProviderEvent, StreamResponse};
 
-struct NullProvider;
+pub(crate) struct NullProvider;
 
 impl Provider for NullProvider {
     fn stream_message<'a>(
@@ -830,14 +850,15 @@ pub fn interpreter_ctx(
     cancel: CancelToken,
     permissions: Arc<PermissionManager>,
     file_tracker: Arc<FileReadTracker>,
-    user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     registry: Arc<ToolRegistry>,
+    cwd: PathBuf,
 ) -> ToolContext {
     static PROVIDER: LazyLock<Arc<dyn Provider>> = LazyLock::new(|| Arc::new(NullProvider));
     static MODEL: LazyLock<Arc<Model>> =
         LazyLock::new(|| Arc::new(Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap()));
     let modes = Arc::new(crate::ModeRegistry::builtin());
     ToolContext {
+        execution_agent_id: None,
         provider: Arc::clone(&PROVIDER),
         model: Arc::clone(&MODEL),
         event_tx: event_tx.clone(),
@@ -848,15 +869,16 @@ pub fn interpreter_ctx(
         },
         question_mode: QuestionMode::Headless,
         session_id: None,
-        cwd: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        cwd,
         tool_use_id: None,
-        user_response_rx,
+        user_response_rx: None,
         loaded_instructions: LoadedInstructions::new(),
         cancel,
         mcp: None,
         deadline: Deadline::None,
         config: AgentConfig::default(),
         tool_filter: Arc::default(),
+        request_tools: None,
         tool_output_lines: ToolOutputLines::default(),
         permissions,
         timeouts: maki_providers::Timeouts::default(),
@@ -875,6 +897,7 @@ pub fn interpreter_ctx(
         workflow: false,
         audience: ToolAudience::MAIN,
         local_tools: LocalTools::default(),
+        local_tool_capture: None,
         live_sink: None,
         model_policy: Arc::new(ModelPolicy::default()),
         file_write_locks: Arc::new(FileWriteLocks::new()),
@@ -887,10 +910,9 @@ pub fn interpreter_ctx(
 
 /// Minimal ToolContext for CLI one-shot tool execution (e.g. `maki index`).
 /// Allows everything, sends events to a dummy channel, uses no model.
-pub fn cli_tool_ctx() -> ToolContext {
+pub fn cli_tool_ctx(cwd: PathBuf) -> ToolContext {
     let (tx, _rx) = flume::unbounded::<crate::Envelope>();
-    let event_tx = crate::EventSender::new(tx, 0);
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let event_tx = crate::EventSender::new(tx);
     let project_config = maki_config::ProjectConfig::discover(&cwd);
     interpreter_ctx(
         &AgentMode::Build,
@@ -902,13 +924,13 @@ pub fn cli_tool_ctx() -> ToolContext {
                 rules: vec![],
                 ..Default::default()
             },
-            cwd,
+            cwd.clone(),
             project_config,
             Arc::default(),
         )),
         Arc::new(FileReadTracker::new()),
-        None,
         Arc::clone(ToolRegistry::global_arc()),
+        cwd,
     )
 }
 
@@ -920,6 +942,7 @@ pub mod test_support {
     use super::*;
 
     pub const GUARDED_TOOL_NAME: &str = "guarded_mock";
+    const TEST_CWD_ERR: &str = "test process has a current directory";
 
     /// Registry and routing tests care about the name and audience only, never
     /// about what the tool returns.
@@ -1030,7 +1053,7 @@ pub mod test_support {
         let event_tx = match event_tx {
             Some(tx) => tx,
             None => {
-                fallback_tx = EventSender::new(flume::unbounded::<Envelope>().0, 0);
+                fallback_tx = EventSender::new(flume::unbounded::<Envelope>().0);
                 &fallback_tx
             }
         };
@@ -1040,8 +1063,8 @@ pub mod test_support {
             CancelToken::none(),
             Arc::clone(&TEST_PERMISSIONS),
             Arc::new(FileReadTracker::new()),
-            None,
             Arc::new(ToolRegistry::new()),
+            env::current_dir().expect(TEST_CWD_ERR),
         );
         ctx.tool_use_id = tool_use_id.map(String::from);
         ctx
@@ -1072,15 +1095,15 @@ pub mod test_support {
         permissions: Arc<PermissionManager>,
     ) -> ToolContext {
         let (tx, _rx) = flume::unbounded::<crate::Envelope>();
-        let event_tx = EventSender::new(tx, 0);
+        let event_tx = EventSender::new(tx);
         let mut ctx = interpreter_ctx(
             mode,
             &event_tx,
             CancelToken::none(),
             permissions,
             Arc::new(FileReadTracker::new()),
-            None,
             Arc::new(ToolRegistry::new()),
+            env::current_dir().expect(TEST_CWD_ERR),
         );
         ctx.tool_use_id = None;
         ctx
@@ -1098,6 +1121,22 @@ mod tests {
 
     const LINE_LIMIT: usize = 500;
     const PINNED_TOOL: &str = "pinned";
+
+    #[test]
+    fn cloned_tool_context_shares_published_definitions() {
+        let mut context = cli_tool_ctx(env::current_dir().unwrap());
+        context.request_tools = Some(RequestTools::assembled(
+            serde_json::json!([{ "name": PINNED_TOOL }]),
+            &context.config,
+            &context.model,
+        ));
+        let cloned = context.clone();
+        let original = context.request_tools.as_ref().unwrap();
+        let copied = cloned.request_tools.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&original.definitions, &copied.definitions));
+        assert!(copied.filter().matches(PINNED_TOOL));
+        assert!(!copied.filter().matches(READ_TOOL_NAME));
+    }
 
     #[test_case(false ; "removed")]
     #[test_case(true ; "replaced")]

@@ -7,15 +7,16 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use flume::{Receiver, Sender};
 use maki_config::ToolKey;
+use maki_domain::Post;
 use maki_providers::{
     AgentError, ContentBlock, ImageSource, Message, Role, StopReason, TokenUsage, add_cost,
 };
 use maki_storage::id::{MakiId, MakiIdParseError};
-use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use strum::Display;
 
 pub const NO_FILES_FOUND: &str = "No files found";
+const CHECKPOINT_FAILED_PREFIX: &str = "failed to checkpoint completed turn";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrepFileEntry {
@@ -111,16 +112,7 @@ pub enum TodoPriority {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ToolInput {
-    Code {
-        language: String,
-        code: String,
-    },
-    /// Nothing produces this anymore (script rendering moved to Lua), but
-    /// old persisted sessions still contain it and must keep loading.
-    Script {
-        language: String,
-        code: String,
-    },
+    Code { language: String, code: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,7 +130,7 @@ fn append_instructions(out: &mut String, blocks: &[InstructionBlock]) {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TextOutput {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -169,35 +161,6 @@ impl From<&str> for TextOutput {
     }
 }
 
-impl<'de> Deserialize<'de> for TextOutput {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Raw {
-            Legacy(String),
-            Full {
-                text: String,
-                #[serde(default)]
-                instructions: Option<Vec<InstructionBlock>>,
-                #[serde(default)]
-                state: Option<serde_json::Value>,
-            },
-        }
-        match Raw::deserialize(deserializer)? {
-            Raw::Legacy(text) => Ok(text.into()),
-            Raw::Full {
-                text,
-                instructions,
-                state,
-            } => Ok(Self {
-                text,
-                instructions,
-                state,
-            }),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ToolOutput {
     Plain(TextOutput),
@@ -206,7 +169,6 @@ pub enum ToolOutput {
         path: String,
         start_line: usize,
         lines: Vec<String>,
-        #[serde(default)]
         total_lines: usize,
         #[serde(default)]
         instructions: Option<Vec<InstructionBlock>>,
@@ -219,20 +181,9 @@ pub enum ToolOutput {
         summary: String,
     },
     TodoList(Vec<TodoItem>),
-    WriteCode {
-        path: String,
-        byte_count: usize,
-        lines: Vec<String>,
-    },
 
     GrepResult {
         entries: Vec<GrepFileEntry>,
-    },
-    /// Only here so legacy sessions still deserialize. Batch is a Lua
-    /// plugin now and stores plain text plus a `state` payload, so the old
-    /// per-child `entries` are dropped on load: nothing can render them.
-    Batch {
-        text: String,
     },
     Instructions {
         blocks: Vec<InstructionBlock>,
@@ -267,7 +218,6 @@ impl ToolOutput {
                     Some(format!("{shown} lines"))
                 }
             }
-            Self::WriteCode { byte_count, .. } => Some(format!("{byte_count} bytes")),
             Self::GrepResult { entries } => {
                 let matches: usize = entries.iter().map(|e| e.match_count()).sum();
                 let files = entries.len();
@@ -292,11 +242,9 @@ impl ToolOutput {
         }
     }
 
-    /// Only here for old persisted sessions that still have `WriteCode`/`Diff` variants.
-    /// New code should use `ToolDoneEvent::written_path` instead.
     pub fn written_path(&self) -> Option<&str> {
         match self {
-            Self::WriteCode { path, .. } | Self::Diff { path, .. } => Some(path),
+            Self::Diff { path, .. } => Some(path),
             _ => None,
         }
     }
@@ -331,7 +279,6 @@ impl ToolOutput {
             Self::Diff { .. }
             | Self::ReadCode { .. }
             | Self::ReadDir(_)
-            | Self::WriteCode { .. }
             | Self::GrepResult { .. }
             | Self::TodoList(_) => Some(self.as_display_text()),
             _ => None,
@@ -434,12 +381,6 @@ impl ToolOutput {
                     .collect::<Vec<_>>()
                     .join("\n")
             }
-            Self::WriteCode {
-                path, byte_count, ..
-            } => {
-                let display = crate::tools::relative_path(path);
-                format!("wrote {byte_count} bytes to {display}")
-            }
             Self::GrepResult { entries } => {
                 let mut out = String::new();
                 for (i, entry) in entries.iter().enumerate() {
@@ -461,7 +402,7 @@ impl ToolOutput {
                 }
                 out
             }
-            Self::Batch { text } | Self::Image { text, .. } => text.clone(),
+            Self::Image { text, .. } => text.clone(),
             Self::Instructions { blocks } => {
                 let mut out = String::new();
                 append_instructions(&mut out, blocks);
@@ -702,6 +643,9 @@ pub enum TurnCancellationReason {
     Closed,
     Shutdown,
     Interrupted,
+    /// A queued child-result delivery whose result the parent already
+    /// received through an exact wait.
+    Withdrawn,
 }
 
 /// The authoritative terminal result of an accepted turn.
@@ -819,6 +763,27 @@ impl TurnOutcome {
         }
     }
 
+    /// The turn's outcome once its history could not be checkpointed: a
+    /// failure that keeps what the turn used and cost.
+    pub fn checkpoint_failed(&self, error: String) -> Self {
+        Self::Failed {
+            agent_id: self.agent_id(),
+            turn_id: self.turn_id(),
+            usage: self.usage(),
+            num_turns: self.num_turns(),
+            failure: TurnFailure {
+                kind: TurnFailureKind::Internal,
+                user_message: format!("{CHECKPOINT_FAILED_PREFIX}: {error}"),
+                diagnostic: error,
+                retryable: true,
+            },
+            cost: self.cost(),
+            list_cost: self.list_cost(),
+            context_size: self.context_size(),
+            context_window: self.context_window(),
+        }
+    }
+
     pub fn agent_id(&self) -> AgentId {
         match self {
             Self::Completed { agent_id, .. }
@@ -921,7 +886,10 @@ pub enum AgentEvent {
         mcp_startup_notice: Option<usize>,
         already_displayed: bool,
     },
-    QueueDrained,
+    /// Actor work settled and the actor queue is empty. Emitted once per
+    /// settlement cycle under the actor state lock, carrying the identity of
+    /// the work that settled last.
+    QueueSettled,
     /// A run picked up a model that changed while it was in flight. Carries
     /// the spec now in use, so a frontend showing the run's model can stop
     /// reporting the one it started on.
@@ -967,10 +935,12 @@ pub enum AgentEvent {
     Nudge,
     SubagentHistory {
         tool_use_id: String,
+        history_epoch: u64,
         messages: Vec<Message>,
     },
     /// A live child was permanently closed and no longer accepts input.
     SubagentClosed,
+    Post(Post),
     ToolSnapshot {
         id: String,
         snapshot: BufferSnapshot,
@@ -1233,36 +1203,22 @@ pub struct RunTotals {
     pub list_cost: Option<f64>,
 }
 
-/// Spend accumulator for one run, chained to the run that spawned it.
+/// Spend accumulator for one run.
 ///
-/// A round is added where it was paid for and walks up the chain, so every
-/// ledger holds its own subtree: a subagent reports its own spend, and the
-/// turn that spawned it still gets billed for the whole fan-out. Several
-/// subagents run at once, hence the lock.
+/// A round is added where it was paid for. The turn reports its own totals
+/// through `TurnOutcome`; subagent spend is reported on the subagent's own
+/// turn, so a ledger is never chained to the run that spawned it.
 #[derive(Debug, Default)]
 pub struct RunLedger {
     totals: Mutex<RunTotals>,
-    parent: Option<Arc<RunLedger>>,
 }
 
 impl RunLedger {
-    pub fn child(parent: &Arc<Self>) -> Arc<Self> {
-        Arc::new(Self {
-            totals: Mutex::default(),
-            parent: Some(Arc::clone(parent)),
-        })
-    }
-
     pub fn add(&self, usage: TokenUsage, cost: Option<f64>, list_cost: Option<f64>) {
-        {
-            let mut totals = self.locked();
-            totals.usage += usage;
-            add_cost(&mut totals.cost, cost);
-            add_cost(&mut totals.list_cost, list_cost);
-        }
-        if let Some(parent) = &self.parent {
-            parent.add(usage, cost, list_cost);
-        }
+        let mut totals = self.locked();
+        totals.usage += usage;
+        add_cost(&mut totals.cost, cost);
+        add_cost(&mut totals.list_cost, list_cost);
     }
 
     pub fn totals(&self) -> RunTotals {
@@ -1301,10 +1257,6 @@ pub struct SubagentInfo {
     pub agent_id: AgentId,
     #[serde(skip)]
     pub parent_agent_id: Option<AgentId>,
-    #[serde(skip)]
-    pub parent_is_root: bool,
-    #[serde(skip)]
-    pub auto_deliver: bool,
     pub parent_tool_use_id: String,
     #[serde(rename = "parent_name")]
     pub name: String,
@@ -1319,31 +1271,150 @@ pub struct SubagentInfo {
     pub opts: Option<maki_providers::RequestOptions>,
     #[serde(skip)]
     pub answer_tx: Option<flume::Sender<String>>,
-    /// Queue into the subagent's background driver (async sessions only).
-    #[serde(skip)]
-    pub input_tx: Option<flume::Sender<String>>,
     /// Cancel currently executing and queued work without closing the session.
     #[serde(skip)]
     pub cancel: Option<SubagentCancel>,
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+struct EventObserver(Arc<dyn Fn(&AgentEvent) + Send + Sync>);
+
+#[cfg(test)]
+impl fmt::Debug for EventObserver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("EventObserver")
+    }
+}
+
+/// Which kind of actor operation a [`ActorWorkIdentity`] belongs to. Turns
+/// carry the [`TurnId`] they settle into; control and compact work carry only
+/// the operation that identified them in the actor's FIFO.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ActorWorkKind {
+    Turn { operation_id: u64, turn_id: TurnId },
+    Control { operation_id: u64 },
+    Compact { operation_id: u64 },
+}
+
+impl ActorWorkKind {
+    pub fn turn_id(self) -> Option<TurnId> {
+        match self {
+            Self::Turn { turn_id, .. } => Some(turn_id),
+            Self::Control { .. } | Self::Compact { .. } => None,
+        }
+    }
+}
+
+/// One admitted piece of actor work, from admission to settlement.
+///
+/// Stamped once when the work is admitted and then carried unchanged through
+/// the scheduler, [`TurnContext`](crate::actor::TurnContext), every event the
+/// backend sends, and the actor's settlement notification. `presentation_id`
+/// is the actor-owned id the frontend groups and fences on, so a late event
+/// can never be attributed to whichever presentation is current when it
+/// finally arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ActorWorkIdentity {
+    pub agent_id: AgentId,
+    pub kind: ActorWorkKind,
+    pub presentation_id: u64,
+}
+
+impl ActorWorkIdentity {
+    pub fn new(agent_id: AgentId, kind: ActorWorkKind, presentation_id: u64) -> Self {
+        Self {
+            agent_id,
+            kind,
+            presentation_id,
+        }
+    }
+
+    pub fn turn_id(&self) -> Option<TurnId> {
+        self.kind.turn_id()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EventSender {
     tx: Sender<Envelope>,
-    run_id: u64,
+    identity: Option<ActorWorkIdentity>,
+    output: Option<crate::TurnOutput>,
+    #[cfg(test)]
+    observer: Option<EventObserver>,
 }
 
 impl EventSender {
-    pub fn new(tx: Sender<Envelope>, run_id: u64) -> Self {
-        Self { tx, run_id }
+    /// A sender that stamps no actor work identity, for streams outside any
+    /// actor admission.
+    pub fn new(tx: Sender<Envelope>) -> Self {
+        Self::with_identity(tx, None)
+    }
+
+    pub fn with_identity(tx: Sender<Envelope>, identity: Option<ActorWorkIdentity>) -> Self {
+        Self {
+            tx,
+            identity,
+            output: None,
+            #[cfg(test)]
+            observer: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_observer(
+        mut self,
+        observer: impl Fn(&AgentEvent) + Send + Sync + 'static,
+    ) -> Self {
+        self.observer = Some(EventObserver(Arc::new(observer)));
+        self
+    }
+
+    pub fn with_output(mut self, output: crate::TurnOutput) -> Self {
+        self.output = Some(output);
+        self
+    }
+
+    pub fn without_output(&self) -> Self {
+        self.clone_outputless()
+    }
+
+    fn clone_outputless(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            identity: self.identity,
+            output: None,
+            #[cfg(test)]
+            observer: self.observer.clone(),
+        }
+    }
+
+    pub fn output(&self) -> Option<&crate::TurnOutput> {
+        self.output.as_ref()
+    }
+
+    fn capture(&self, event: &AgentEvent) {
+        #[cfg(test)]
+        if let Some(observer) = &self.observer {
+            (observer.0)(event);
+        }
+        if let Some(output) = &self.output {
+            match event {
+                AgentEvent::TextDelta { text } => output.append_text(text),
+                AgentEvent::Retry { .. } => output.reset_text_attempt(),
+                _ => {}
+            }
+        }
     }
 
     pub fn send(&self, event: impl Into<AgentEvent>) -> Result<(), AgentError> {
+        let event = event.into();
+        self.capture(&event);
         self.tx
             .try_send(Envelope {
-                event: event.into(),
+                event,
                 subagent: None,
-                run_id: self.run_id,
+                identity: self.identity,
             })
             .map_err(|_| AgentError::Channel)
     }
@@ -1353,27 +1424,28 @@ impl EventSender {
     }
 
     pub fn try_send(&self, event: impl Into<AgentEvent>) {
+        let event = event.into();
+        self.capture(&event);
         let _ = self.tx.try_send(Envelope {
-            event: event.into(),
+            event,
             subagent: None,
-            run_id: self.run_id,
+            identity: self.identity,
         });
     }
 
-    pub fn run_id(&self) -> u64 {
-        self.run_id
+    pub fn identity(&self) -> Option<ActorWorkIdentity> {
+        self.identity
     }
 
-    pub fn raw_tx(&self) -> &Sender<Envelope> {
-        &self.tx
-    }
-
-    /// Same stream, different run. Lets a session body stamp per-turn ids
-    /// without keeping the [`EventStreamGuard`] in scope.
-    pub fn with_run_id(&self, run_id: u64) -> Self {
+    /// Same stream, different admitted work. Lets a session body stamp
+    /// per-turn identity without keeping the [`EventStreamGuard`] in scope.
+    pub fn with_identity_of(&self, identity: Option<ActorWorkIdentity>) -> Self {
         Self {
             tx: self.tx.clone(),
-            run_id,
+            identity,
+            output: self.output.clone(),
+            #[cfg(test)]
+            observer: self.observer.clone(),
         }
     }
 }
@@ -1384,7 +1456,19 @@ pub struct Envelope {
     pub event: AgentEvent,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub subagent: Option<SubagentInfo>,
-    pub run_id: u64,
+    /// Identity of the actor work that produced this event. Absent means the
+    /// event came from outside any actor admission, never that it came from a
+    /// root.
+    #[serde(skip)]
+    pub identity: Option<ActorWorkIdentity>,
+}
+
+impl Envelope {
+    /// The presentation this event belongs to, or `None` when it is not actor
+    /// work at all.
+    pub fn presentation(&self) -> Option<u64> {
+        self.identity.map(|identity| identity.presentation_id)
+    }
 }
 
 /// The only way to create a session event stream.
@@ -1414,8 +1498,8 @@ impl EventStreamGuard {
         &self.tx
     }
 
-    pub fn sender(&self, run_id: u64) -> EventSender {
-        EventSender::new(self.tx.clone(), run_id)
+    pub fn sender(&self) -> EventSender {
+        EventSender::new(self.tx.clone())
     }
 }
 
@@ -1424,7 +1508,7 @@ impl Drop for EventStreamGuard {
         let _ = self.tx.try_send(Envelope {
             event: AgentEvent::StreamClosed,
             subagent: None,
-            run_id: 0,
+            identity: None,
         });
     }
 }
@@ -1471,10 +1555,116 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
+    #[test_case(false; "send")]
+    #[test_case(true; "try_send")]
+    fn output_capture_is_synchronous_and_frozen_without_a_receiver(best_effort: bool) {
+        const FIRST: &str = "first";
+        const FAILED: &str = "discarded";
+        const SECOND: &str = "second";
+        const EXPECTED: &str = SECOND;
+        let ticket = crate::TurnTicket::new(TurnId::generate(), Arc::new(()));
+        let (tx, rx) = flume::unbounded();
+        drop(rx);
+        let sender = EventSender::new(tx).with_output(ticket.output());
+        let emit = |event| {
+            if best_effort {
+                sender.try_send(event);
+            } else {
+                assert!(matches!(sender.send(event), Err(AgentError::Channel)));
+            }
+        };
+        sender.output().unwrap().begin_text_attempt();
+        emit(AgentEvent::TextDelta { text: FIRST.into() });
+        sender.output().unwrap().begin_text_attempt();
+        emit(AgentEvent::TextDelta {
+            text: FAILED.into(),
+        });
+        emit(AgentEvent::Retry {
+            attempt: 1,
+            message: FAILED.into(),
+            delay_ms: 0,
+        });
+        emit(AgentEvent::TextDelta {
+            text: SECOND.into(),
+        });
+        ticket.resolve(TurnOutcome::cancelled(
+            AgentId::generate(),
+            ticket.turn_id(),
+            TokenUsage::default(),
+            0,
+            TurnCancellationReason::Closed,
+        ));
+        emit(AgentEvent::TextDelta {
+            text: FAILED.into(),
+        });
+        emit(AgentEvent::Retry {
+            attempt: 2,
+            message: FAILED.into(),
+            delay_ms: 0,
+        });
+        assert_eq!(ticket.peek_result().unwrap().text, EXPECTED);
+    }
+
+    #[test_case(false; "full_channel")]
+    #[test_case(true; "disconnected_channel")]
+    fn output_capture_preserves_channel_errors_in_derived_senders(disconnected: bool) {
+        const TEXT: &str = "captured despite channel failure";
+        let ticket = crate::TurnTicket::new(TurnId::generate(), Arc::new(()));
+        let (tx, rx) = flume::bounded(1);
+        let sender = EventSender::new(tx).with_output(ticket.output());
+        if disconnected {
+            drop(rx);
+        } else {
+            sender.send(AgentEvent::Nudge).unwrap();
+        }
+        let derived = sender.with_identity_of(None);
+        assert!(matches!(
+            derived.send(AgentEvent::TextDelta { text: TEXT.into() }),
+            Err(AgentError::Channel)
+        ));
+        assert!(matches!(
+            derived.without_output().send(AgentEvent::Nudge),
+            Err(AgentError::Channel)
+        ));
+        ticket.resolve(TurnOutcome::cancelled(
+            AgentId::generate(),
+            ticket.turn_id(),
+            TokenUsage::default(),
+            0,
+            TurnCancellationReason::Closed,
+        ));
+        assert_eq!(ticket.peek_result().unwrap().text, TEXT);
+    }
+
+    #[test]
+    fn relayed_envelopes_do_not_contaminate_turn_output() {
+        const RELAYED: &str = "relayed child text";
+        let ticket = crate::TurnTicket::new(TurnId::generate(), Arc::new(()));
+        let (tx, _rx) = flume::unbounded();
+        let sender = EventSender::new(tx).with_output(ticket.output());
+        sender
+            .send_envelope(Envelope {
+                event: AgentEvent::TextDelta {
+                    text: RELAYED.into(),
+                },
+                subagent: None,
+                identity: None,
+            })
+            .unwrap();
+        ticket.resolve(TurnOutcome::cancelled(
+            AgentId::generate(),
+            ticket.turn_id(),
+            TokenUsage::default(),
+            0,
+            TurnCancellationReason::User,
+        ));
+        assert!(ticket.peek_result().unwrap().text.is_empty());
+    }
+
     #[test]
     fn test_session_events_guard_emits_stream_closed_on_drop() {
         let (guard, mut events) = event_stream();
-        let sender = guard.sender(1);
+        let sender = guard.sender();
         sender.send(AgentEvent::Nudge).unwrap();
         drop(guard);
 
@@ -1494,7 +1684,6 @@ mod tests {
     #[test_case(ToolOutput::Plain(String::new().into()),             None                ; "plain_empty_no_annotation")]
     #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 1, lines: vec!["x".into(); 5], total_lines: 5, instructions: None }, Some("5 lines") ; "read_code_full_file")]
     #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 10, lines: vec!["x".into(); 5], total_lines: 100, instructions: None }, Some("5 of 100 lines") ; "read_code_partial")]
-    #[test_case(ToolOutput::WriteCode { path: "a.rs".into(), byte_count: 99, lines: vec![] }, Some("99 bytes") ; "write_code_bytes")]
     #[test_case(ToolOutput::GrepResult { entries: vec![GrepFileEntry { path: "a.rs".into(), groups: vec![GrepMatchGroup::single(1, "hit")] }] }, Some("1 matches in 1 file") ; "grep_file_count")]
     #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: String::new(), after: String::new(), summary: "ok".into() }, None ; "diff_no_annotation")]
     fn annotation_cases(output: ToolOutput, expected: Option<&str>) {
@@ -1594,14 +1783,6 @@ mod tests {
         assert_eq!(fired.load(Ordering::SeqCst), 1);
     }
 
-    #[test]
-    fn legacy_batch_output_with_entries_still_deserializes() {
-        let json = r#"{"Batch":{"entries":[{"tool":"read","summary":"s","status":"Success","input":null,"output":null}],"text":"stored"}}"#;
-        let out: ToolOutput =
-            serde_json::from_str(json).expect("old persisted session JSON must load");
-        assert_eq!(out.as_text(), "stored");
-    }
-
     /// Search and the UI's error-dedup guard depend on this exact shape:
     /// spans join bare, lines join with one newline, no trailing newline.
     #[test]
@@ -1694,7 +1875,6 @@ mod tests {
         assert!(text.contains("20: fn bar()"), "second group: {text}");
     }
 
-    #[test_case(ToolOutput::WriteCode { path: "src/lib.rs".into(), byte_count: 10, lines: vec![] }, Some("src/lib.rs") ; "write_code")]
     #[test_case(ToolOutput::Diff { path: "src/lib.rs".into(), before: String::new(), after: String::new(), summary: String::new() }, Some("src/lib.rs") ; "diff")]
     #[test_case(ToolOutput::Plain("ok".into()), None ; "non_write_variant")]
     fn output_written_path(output: ToolOutput, expected: Option<&str>) {
@@ -1839,29 +2019,11 @@ mod tests {
         assert!(!err_event.wrote_to(Path::new("/plans/slug.md")));
     }
 
-    #[test]
-    fn read_code_backward_compat_deserialization() {
-        let json = r#"{"ReadCode":{"path":"a.rs","start_line":1,"lines":["x"]}}"#;
-        let output: ToolOutput = serde_json::from_str(json).unwrap();
-        match output {
-            ToolOutput::ReadCode {
-                total_lines,
-                instructions,
-                ..
-            } => {
-                assert_eq!(total_lines, 0);
-                assert!(instructions.is_none());
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
     #[test_case(100, 10, 2, 89 ; "middle_of_file")]
     #[test_case(100, 1, 1, 99  ; "first_line_only")]
     #[test_case(5, 1, 5, 0     ; "all_lines_shown")]
     #[test_case(5, 1, 2, 3     ; "partial_from_start")]
     #[test_case(5, 3, 3, 0     ; "partial_to_end")]
-    #[test_case(0, 1, 1, 0     ; "backward_compat_total_zero")]
     #[test_case(0, 1, 0, 0     ; "empty_lines_total_zero")]
     #[test_case(10, 10, 1, 0   ; "last_line")]
     fn lines_remaining(total: usize, start: usize, shown: usize, expected: usize) {
@@ -1979,9 +2141,8 @@ mod tests {
     }
 
     #[test]
-    fn agent_event_tool_snapshot_theme_gen_backwards_compat() {
+    fn agent_event_tool_snapshot_omits_absent_theme_gen() {
         const OMIT_MSG: &str = "theme_gen: None must not appear in serialized JSON";
-        const COMPAT_MSG: &str = "missing theme_gen must deserialize as None (backwards compat)";
 
         let event = AgentEvent::ToolSnapshot {
             id: "t1".into(),
@@ -1992,31 +2153,6 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(!json.contains("theme_gen"), "{OMIT_MSG}");
-
-        #[derive(Deserialize)]
-        struct ToolSnapshotFields {
-            #[allow(dead_code)]
-            id: String,
-            #[serde(default)]
-            theme_gen: Option<u64>,
-        }
-        let json_without = r#"{"id":"t1"}"#;
-        let parsed: ToolSnapshotFields = serde_json::from_str(json_without).unwrap();
-        assert_eq!(parsed.theme_gen, None, "{COMPAT_MSG}");
-    }
-
-    #[test]
-    fn text_output_serde_legacy_bare_string() {
-        const MSG: &str = "old sessions store Plain as a bare string";
-        let json = r#"{"Plain":"hello world"}"#;
-        let output: ToolOutput = serde_json::from_str(json).unwrap();
-        match &output {
-            ToolOutput::Plain(t) => {
-                assert_eq!(t.text, "hello world", "{MSG}");
-                assert!(t.instructions.is_none(), "{MSG}");
-            }
-            _ => panic!("wrong variant"),
-        }
     }
 
     #[test]
@@ -2046,7 +2182,7 @@ mod tests {
     }
 
     #[test_case(
-        ToolOutput::WriteCode { path: "/old/path".into(), byte_count: 10, lines: vec![] },
+        ToolOutput::Diff { path: "/old/path".into(), before: String::new(), after: String::new(), summary: String::new() },
         Some("/new/path".into()), false, Some("/new/path")
         ; "prefers_field_over_output"
     )]
@@ -2101,15 +2237,25 @@ mod tests {
         assert!(!display.contains("Instructions from:"), "{EXCLUDES_MSG}");
     }
 
-    const STREAM_RUN_IDS: [u64; 3] = [1, 2, 3];
+    const STREAM_PRESENTATIONS: [u64; 3] = [1, 2, 3];
     const STILL_PENDING: &str = "an empty stream must not resolve `next()`";
     const NO_LATE_EVENTS: &str = "events queued after the marker must stay invisible";
 
-    fn drain(events: &mut SessionEvents) -> Vec<u64> {
+    fn stamp(presentation: u64) -> ActorWorkIdentity {
+        ActorWorkIdentity::new(
+            AgentId::generate(),
+            ActorWorkKind::Control {
+                operation_id: presentation,
+            },
+            presentation,
+        )
+    }
+
+    fn drain(events: &mut SessionEvents) -> Vec<Option<u64>> {
         smol::block_on(async {
             let mut seen = Vec::new();
             while let Some(envelope) = events.next().await {
-                seen.push(envelope.run_id);
+                seen.push(envelope.identity.map(|identity| identity.presentation_id));
             }
             seen
         })
@@ -2131,12 +2277,20 @@ mod tests {
                 poll_once(pending.as_mut()).await.is_none(),
                 "{STILL_PENDING}"
             );
-            for run_id in STREAM_RUN_IDS {
-                guard.sender(run_id).send(AgentEvent::Nudge).unwrap();
+            for presentation in STREAM_PRESENTATIONS {
+                guard
+                    .sender()
+                    .with_identity_of(Some(stamp(presentation)))
+                    .send(AgentEvent::Nudge)
+                    .unwrap();
             }
         });
         drop(guard);
-        assert_eq!(drain(&mut events), STREAM_RUN_IDS);
+        assert_eq!(
+            drain(&mut events),
+            STREAM_PRESENTATIONS.map(Some),
+            "the stream preserves the identity each event was stamped with"
+        );
     }
 
     /// The marker is a point of no return, even for a reader that has not
@@ -2145,28 +2299,36 @@ mod tests {
     #[test]
     fn events_sent_after_the_close_are_never_observed() {
         let (guard, mut events) = event_stream();
-        let retained = guard.sender(STREAM_RUN_IDS[0]);
+        let retained = guard
+            .sender()
+            .with_identity_of(Some(stamp(STREAM_PRESENTATIONS[0])));
         retained.send(AgentEvent::Nudge).unwrap();
         drop(guard);
         retained.send(AgentEvent::Nudge).unwrap();
-        assert_eq!(drain(&mut events), [STREAM_RUN_IDS[0]], "{NO_LATE_EVENTS}");
+        assert_eq!(
+            drain(&mut events),
+            [Some(STREAM_PRESENTATIONS[0])],
+            "{NO_LATE_EVENTS}"
+        );
         assert!(smol::block_on(events.next()).is_none(), "{NO_LATE_EVENTS}");
     }
 
-    /// A derived sender is just another clone: it stamps its own run id on the
-    /// same FIFO, and dropping it neither ends nor extends the stream.
+    /// A derived sender is just another clone: it stamps its own work identity
+    /// on the same FIFO, and dropping it neither ends nor extends the stream.
     #[test]
-    fn with_run_id_restamps_without_forking_the_stream() {
+    fn with_identity_of_restamps_without_forking_the_stream() {
         let (guard, mut events) = event_stream();
-        let original = guard.sender(STREAM_RUN_IDS[0]);
-        let derived = original.with_run_id(STREAM_RUN_IDS[1]);
+        let original = guard
+            .sender()
+            .with_identity_of(Some(stamp(STREAM_PRESENTATIONS[0])));
+        let derived = original.with_identity_of(Some(stamp(STREAM_PRESENTATIONS[1])));
         derived.send(AgentEvent::Nudge).unwrap();
         drop(derived);
         original.send(AgentEvent::Nudge).unwrap();
         drop(guard);
         assert_eq!(
             drain(&mut events),
-            [STREAM_RUN_IDS[1], STREAM_RUN_IDS[0]],
+            [Some(STREAM_PRESENTATIONS[1]), Some(STREAM_PRESENTATIONS[0])],
             "{NO_LATE_EVENTS}"
         );
     }
@@ -2176,7 +2338,9 @@ mod tests {
     #[test]
     fn dropping_the_guard_after_the_reader_is_harmless() {
         let (guard, events) = event_stream();
-        let retained = guard.sender(STREAM_RUN_IDS[0]);
+        let retained = guard
+            .sender()
+            .with_identity_of(Some(stamp(STREAM_PRESENTATIONS[0])));
         drop(events);
         drop(guard);
         assert!(matches!(
@@ -2189,8 +2353,6 @@ mod tests {
     const SECOND_COST: f64 = 0.25;
     const FIRST_INPUT: u32 = 10;
     const SECOND_INPUT: u32 = 5;
-    const OWN_SUBTREE_MSG: &str = "a child ledger reports only what it spent itself";
-    const ROLLUP_MSG: &str = "a child's spend has to land in the parent's totals";
 
     fn usage(input: u32) -> TokenUsage {
         TokenUsage {
@@ -2214,29 +2376,5 @@ mod tests {
         assert_eq!(totals.usage.input, FIRST_INPUT + SECOND_INPUT);
         assert_eq!(totals.cost, expected);
         assert_eq!(totals.list_cost, expected);
-    }
-
-    #[test]
-    fn ledger_child_spend_rolls_up_into_parent() {
-        let parent = Arc::new(RunLedger::default());
-        parent.add(usage(FIRST_INPUT), Some(FIRST_COST), Some(FIRST_COST));
-        let child = RunLedger::child(&parent);
-        child.add(usage(SECOND_INPUT), Some(SECOND_COST), Some(SECOND_COST));
-
-        let own = child.totals();
-        assert_eq!(own.usage.input, SECOND_INPUT, "{OWN_SUBTREE_MSG}");
-        assert_eq!(own.cost, Some(SECOND_COST), "{OWN_SUBTREE_MSG}");
-
-        let rolled_up = parent.totals();
-        assert_eq!(
-            rolled_up.usage.input,
-            FIRST_INPUT + SECOND_INPUT,
-            "{ROLLUP_MSG}"
-        );
-        assert_eq!(
-            rolled_up.cost,
-            Some(FIRST_COST + SECOND_COST),
-            "{ROLLUP_MSG}"
-        );
     }
 }

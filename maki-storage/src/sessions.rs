@@ -4,8 +4,6 @@
 //! crash-safe: on load, any trailing run of unparseable lines is discarded (a partial
 //! flush may corrupt multiple trailing records). `SessionLog` tracks cursor state to
 //! enable O(delta) incremental saves.
-//!
-//! Legacy `.json` files are loaded transparently and converted to `.jsonl` on next save.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -16,30 +14,28 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
+use tempfile::NamedTempFile;
 use tracing::{info, warn};
-use uuid::Uuid;
 
 use crate::id::MakiId;
 use crate::offload_cleanup::Root;
-use crate::paths::canonical_key;
+use crate::session_lock::SessionPublicationGuard;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub use maki_domain::{Effort, MIN_THINKING_BUDGET, StoredThinking, ThinkingParseError};
+pub use maki_domain::{
+    Effort, MIN_THINKING_BUDGET, Post, PostLevel, StoredThinking, ThinkingParseError,
+};
 
 use crate::{StateDir, StorageError, atomic_write, now_epoch, session_lock};
 
-const SESSION_VERSION: u32 = 1;
 const LOG_FORMAT_VERSION: u32 = 2;
 pub const SESSIONS_DIR: &str = "sessions";
 const CWD_INDEX_FILE: &str = "cwd_latest.json";
-const CWD_INDEX_STEM: &str = "cwd_latest";
 const SCAN_CACHE_FILE: &str = "scan_cache.json";
-const SCAN_CACHE_STEM: &str = "scan_cache";
 const SCAN_CACHE_VERSION: u32 = 1;
 #[cfg(test)]
 const TAIL_BUF: u64 = 4096;
-const NON_SESSION_STEMS: [&str; 2] = [CWD_INDEX_STEM, SCAN_CACHE_STEM];
 const DEFAULT_TITLE: &str = "New session";
 const MAX_TITLE_LEN: usize = 60;
 const EPOCH_CHANGED: &str = "messages were rewritten";
@@ -85,6 +81,15 @@ pub enum SessionError {
     LogDiverged { reason: &'static str },
     #[error("session is open in another terminal; close it there first")]
     OpenElsewhere,
+    #[error(
+        "session log {path} line {line} holds a record this makima cannot read ({reason}); \
+         the session is not loaded so that saving it cannot drop that record"
+    )]
+    UnreadableRecord {
+        path: String,
+        line: usize,
+        reason: String,
+    },
 }
 
 /// Per-model token breakdown entry. Mirrors the four usage counters tracked by
@@ -141,6 +146,8 @@ pub fn add_cost(total: &mut Option<f64>, addend: Option<f64>) {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionMeta {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compacted: bool,
     #[serde(default)]
     pub mode: Option<StoredMode>,
     #[serde(default)]
@@ -169,11 +176,18 @@ pub struct SessionMeta {
     pub session_options: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryDestination {
+    Main,
+    Child(String),
+}
+
 /// Messages plus the token of the run they belong to. Comparing tokens tells
 /// an append from a rewrite, with no need to diff the lists.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct HistorySnapshot<M> {
     pub epoch: u64,
+    pub compacted: bool,
     pub messages: Arc<Vec<M>>,
 }
 
@@ -187,6 +201,7 @@ impl<M> HistorySnapshot<M> {
     pub fn new(messages: Vec<M>) -> Self {
         Self {
             epoch: next_epoch(),
+            compacted: false,
             messages: Arc::new(messages),
         }
     }
@@ -210,46 +225,38 @@ impl<M> Default for HistorySnapshot<M> {
 /// hands over whole on every checkpoint. Whatever the session maintains itself
 /// gets a field of its own instead, so a checkpoint never copies it out and
 /// back in only to compare it against itself.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Session<M, U, T> {
-    pub version: u32,
     pub id: MakiId,
     pub title: String,
     pub cwd: String,
     pub model: String,
     messages: Arc<Vec<M>>,
     pub token_usage: U,
-    #[serde(default = "HashMap::new")]
     tool_outputs: HashMap<String, Arc<T>>,
-    #[serde(default = "HashMap::new", skip_serializing_if = "HashMap::is_empty")]
     subagent_messages: HashMap<String, Arc<Vec<M>>>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    subagent_history_epochs: HashMap<String, u64>,
     subagents: Vec<StoredSubagent>,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    posts: Vec<StoredPost>,
     usage_by_model: HashMap<String, StoredTokenUsage>,
-    #[serde(flatten)]
     pub meta: SessionMeta,
     pub created_at: u64,
     pub updated_at: u64,
     /// Bumped by every mutation, so a checkpoint knows if there is anything
     /// to write.
-    #[serde(skip)]
     revision: u64,
     /// Bumped by every mutation except `meta`, so a checkpoint can tell a tool
     /// result, which has to reach disk now, from a keystroke in the draft,
     /// which can wait for the keystrokes behind it.
-    #[serde(skip)]
     content_revision: u64,
     /// The append-only run `messages` belongs to, adopted from the producer's
     /// snapshot or minted fresh when this session rewrites them itself. Once
     /// it changes, every append cursor into the log is void.
-    #[serde(skip, default = "next_epoch")]
     epoch: u64,
     /// Bumped when this session rewrites a collection in place (replaced
     /// messages, tool outputs or subagent histories). Kept apart from
     /// `epoch` so `set_history` adopting a producer's snapshot can never
     /// erase a locally minted void: cursor validity is the pair.
-    #[serde(skip)]
     rewrites: u64,
 }
 
@@ -324,13 +331,15 @@ pub struct StoredSubagent {
     pub fast: bool,
 }
 
-#[derive(Deserialize)]
-struct LegacyHeader {
-    version: u32,
-    id: MakiId,
-    title: String,
-    cwd: String,
-    updated_at: u64,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredPost {
+    /// Transcript id of the chat holding the post; `None` is the main chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat: Option<String>,
+    /// How many committed messages that chat had when the post arrived.
+    pub after_message: usize,
+    #[serde(flatten)]
+    pub post: Post,
 }
 
 pub trait TitleSource {
@@ -382,6 +391,8 @@ enum LogRecord<M, U, T> {
     Out { id: String, d: T },
     #[serde(rename = "sub_msg")]
     SubMsg { sub: String, d: M },
+    #[serde(rename = "post")]
+    Post { d: StoredPost },
     #[serde(rename = "meta")]
     Meta {
         title: String,
@@ -409,12 +420,45 @@ pub struct SessionLog {
     /// truncated, deleted or wrote it, and an append would corrupt it.
     saved_len: u64,
     saved_msg_count: usize,
+    saved_post_count: usize,
     appends: usize,
     saved_tool_ids: HashSet<String>,
     saved_sub_msg_counts: HashMap<String, usize>,
     /// Serialized trailing meta record; lets `append` persist meta-only
     /// changes (title, draft, updated_at) instead of dropping them.
     saved_meta: Vec<u8>,
+}
+
+pub struct StagedCheckpoint {
+    temporary: NamedTempFile,
+    path: PathBuf,
+}
+
+impl StagedCheckpoint {
+    pub fn publish(
+        self,
+        guard: &SessionPublicationGuard,
+        claim_publication: impl FnOnce() -> bool,
+    ) -> Result<bool, SessionError> {
+        guard
+            .publish(|| self.publish_unowned(claim_publication))
+            .map_err(StorageError::from)?
+            .unwrap_or(Ok(false))
+    }
+
+    pub fn publish_unowned(
+        self,
+        claim_publication: impl FnOnce() -> bool,
+    ) -> Result<bool, SessionError> {
+        if !claim_publication() {
+            return Ok(false);
+        }
+        self.temporary
+            .persist(&self.path)
+            .map_err(|error| StorageError::from(error.error))?;
+        crate::sync_parent_dir(&self.path);
+        Ok(true)
+    }
 }
 
 fn sub_msg_snapshot<M>(map: &HashMap<String, Arc<Vec<M>>>) -> HashMap<String, usize> {
@@ -573,22 +617,6 @@ impl SessionLog {
         U: Serialize,
         T: Serialize,
     {
-        let log = Self::write_canonical(dir, session)?;
-        update_cwd_index(dir, &session.cwd, session.id)?;
-        Ok(log)
-    }
-
-    /// [`Self::rewrite`] without claiming the cwd index: migrating a legacy
-    /// file on load must not make that session the cwd's latest.
-    fn write_canonical<M, U, T>(
-        dir: &Path,
-        session: &Session<M, U, T>,
-    ) -> Result<Self, SessionError>
-    where
-        M: Serialize,
-        U: Serialize,
-        T: Serialize,
-    {
         fs::create_dir_all(dir).map_err(StorageError::from)?;
         let path = jsonl_path(dir, session.id);
         let tmp = path.with_extension("jsonl.tmp");
@@ -601,15 +629,33 @@ impl SessionLog {
         archive_if_shrinking(dir, session);
         fs::rename(&tmp, &path).map_err(StorageError::from)?;
         crate::sync_parent_dir(&path);
-
-        if let Err(e) = remove_legacy_files(dir, session.id) {
-            warn!(error = %e, "legacy session files remain after rewrite");
-        }
         let file = OpenOptions::new()
             .append(true)
             .open(&path)
             .map_err(StorageError::from)?;
+        update_cwd_index(dir, &session.cwd, session.id)?;
         Ok(Self::cursor_from(session, file))
+    }
+
+    /// Stages a complete session without changing its durable file or cwd index.
+    pub fn stage_checkpoint<M, U, T>(
+        dir: &Path,
+        session: &Session<M, U, T>,
+    ) -> Result<StagedCheckpoint, SessionError>
+    where
+        M: Serialize,
+        U: Serialize,
+        T: Serialize,
+    {
+        fs::create_dir_all(dir).map_err(StorageError::from)?;
+        let path = jsonl_path(dir, session.id);
+        let mut temporary = NamedTempFile::new_in(dir).map_err(StorageError::from)?;
+        write_full_session(temporary.as_file_mut(), session)?;
+        temporary
+            .as_file()
+            .sync_data()
+            .map_err(StorageError::from)?;
+        Ok(StagedCheckpoint { temporary, path })
     }
 
     pub fn session_id(&self) -> MakiId {
@@ -664,6 +710,10 @@ impl SessionLog {
             }
         }
 
+        for post in &session.posts[self.saved_post_count..] {
+            append_record(&mut buf, &LogRecord::<&M, &U, &T>::Post { d: post.clone() })?;
+        }
+
         let meta = meta_record(session)?;
         if buf.is_empty() && meta == self.saved_meta {
             return Ok(());
@@ -685,6 +735,7 @@ impl SessionLog {
         self.saved_len += buf.len() as u64;
         self.appends += 1;
         self.saved_msg_count = new_msg_count;
+        self.saved_post_count = session.posts.len();
         self.saved_tool_ids.extend(new_tool_ids);
         for (sub_id, count) in new_sub_counts {
             self.saved_sub_msg_counts.insert(sub_id, count);
@@ -708,6 +759,7 @@ impl SessionLog {
             saved_rewrites: session.rewrites,
             saved_len,
             saved_msg_count: session.messages.len(),
+            saved_post_count: session.posts.len(),
             appends: 0,
             saved_tool_ids: session.tool_outputs.keys().cloned().collect(),
             saved_sub_msg_counts: sub_msg_snapshot(&session.subagent_messages),
@@ -749,6 +801,7 @@ impl SessionLog {
 
     fn cursor_ahead<M, U, T>(&self, session: &Session<M, U, T>) -> bool {
         self.saved_msg_count > session.messages.len()
+            || self.saved_post_count > session.posts.len()
             || self
                 .saved_tool_ids
                 .iter()
@@ -826,6 +879,9 @@ where
             )?;
         }
     }
+    for post in &session.posts {
+        append_record(&mut buf, &LogRecord::<&M, &U, &T>::Post { d: post.clone() })?;
+    }
     buf.extend_from_slice(&meta_record(session)?);
     file.write_all(&buf).map_err(StorageError::from)?;
     Ok(())
@@ -858,6 +914,7 @@ where
     let mut token_usage = U::default();
     let mut updated_at = 0u64;
     let mut subagents = Vec::new();
+    let mut posts = Vec::new();
     let mut usage_by_model = HashMap::new();
     let mut meta = SessionMeta::default();
     for line in data.split(|&b| b == b'\n') {
@@ -865,14 +922,25 @@ where
         if line.is_empty() {
             continue;
         }
+        // A crash can tear an append, so a line that is not JSON at all is
+        // skipped, and so is a bad header, which leaves the log headerless.
+        // Whole JSON after the header that does not decode came from another
+        // version; skipping it would let the next save drop it from disk.
         let record: LogRecord<M, U, T> = match serde_json::from_slice(line) {
             Ok(r) => r,
+            Err(e) if e.is_data() && id.is_some() => {
+                return Err(SessionError::UnreadableRecord {
+                    path: display_path.to_owned(),
+                    line: line_count,
+                    reason: e.to_string(),
+                });
+            }
             Err(e) => {
                 warn!(
                     path = display_path,
                     error = %e,
                     line = line_count,
-                    "skipping unrecognized JSONL record",
+                    "skipping torn JSONL record",
                 );
                 continue;
             }
@@ -903,6 +971,7 @@ where
             LogRecord::SubMsg { sub, d } => {
                 subagent_messages.entry(sub).or_default().push(d);
             }
+            LogRecord::Post { d } => posts.push(d),
             LogRecord::Meta {
                 title: m_title,
                 token_usage: m_usage,
@@ -926,7 +995,6 @@ where
     })?;
 
     Ok(Session {
-        version: SESSION_VERSION,
         id,
         title,
         cwd,
@@ -938,7 +1006,9 @@ where
             .into_iter()
             .map(|(id, msgs)| (id, Arc::new(msgs)))
             .collect(),
+        subagent_history_epochs: HashMap::new(),
         subagents,
+        posts,
         usage_by_model,
         meta,
         created_at,
@@ -959,38 +1029,6 @@ fn load_cwd_index(dir: &Path) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
-/// The directories sessions were recorded in, most recently used first and at
-/// most `limit` of them.
-///
-/// The index is append only and the caller pays filesystem work per entry, so
-/// a limit is what keeps a long history off a startup path. Order comes from
-/// the session id, which is a UUIDv7 and carries the time it was made, so a
-/// history over the limit keeps the directories somebody still works in. A
-/// legacy v4 id has no time in it and sorts last.
-///
-/// Keys go through `canonical_key`, because the index holds whatever string a
-/// session was saved with while callers compare against canonicalized paths: a
-/// symlinked home would otherwise hide a folder's own history from it. A key
-/// that is not valid UTF-8 is dropped, because the callers store what they get
-/// back as text and a lossy path must never stand in for a real one.
-pub(crate) fn recorded_cwds(sessions_dir: &Path, limit: usize) -> Vec<String> {
-    let mut entries: Vec<(Option<(u64, u32)>, String)> = load_cwd_index(sessions_dir)
-        .into_iter()
-        .map(|(cwd, session_id)| (session_time(&session_id), cwd))
-        .collect();
-    entries.sort_unstable_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
-    entries.truncate(limit);
-    entries
-        .into_iter()
-        .filter_map(|(_, cwd)| canonical_key(Path::new(&cwd)).to_str().map(str::to_owned))
-        .collect()
-}
-
-fn session_time(session_id: &str) -> Option<(u64, u32)> {
-    let id: MakiId = session_id.parse().ok()?;
-    Some(Uuid::from_bytes(*id.as_bytes()).get_timestamp()?.to_unix())
-}
-
 fn update_cwd_index(dir: &Path, cwd: &str, session_id: MakiId) -> Result<(), StorageError> {
     let mut index = load_cwd_index(dir);
     let id_str = session_id.to_string();
@@ -1009,20 +1047,8 @@ fn jsonl_path(dir: &Path, id: MakiId) -> PathBuf {
     dir.join(format!("{id}.jsonl"))
 }
 
-fn json_path(dir: &Path, id: MakiId) -> PathBuf {
-    dir.join(format!("{id}.json"))
-}
-
 fn is_jsonl(path: &Path) -> bool {
     path.extension().is_some_and(|e| e == "jsonl")
-}
-
-fn remove_legacy_files(dir: &Path, id: MakiId) -> Result<bool, SessionError> {
-    let mut removed = try_remove(&json_path(dir, id))?;
-    for legacy in find_legacy_files(dir, id) {
-        removed |= try_remove(&legacy)?;
-    }
-    Ok(removed)
 }
 
 fn try_remove(path: &Path) -> Result<bool, StorageError> {
@@ -1036,7 +1062,8 @@ fn try_remove(path: &Path) -> Result<bool, StorageError> {
 fn remove_from_cwd_index(dir: &Path, session_id: MakiId) -> Result<(), StorageError> {
     let mut index = load_cwd_index(dir);
     let before = index.len();
-    index.retain(|_, v| v.parse::<MakiId>() != Ok(session_id));
+    let id = session_id.to_string();
+    index.retain(|_, v| *v != id);
     if index.len() != before {
         atomic_write(&dir.join(CWD_INDEX_FILE), &serde_json::to_vec(&index)?)?;
     }
@@ -1131,15 +1158,10 @@ fn scan_headers(cwd: Option<&str>, dir: &Path) -> Result<Vec<SessionSummary>, St
             Some(e) if e.size == size && e.mtime_ms == mtime_ms => e,
             _ => {
                 dirty = true;
-                let header = if is_jsonl(&path) {
-                    scan_jsonl_header(&path)
-                } else {
-                    scan_legacy_header(&path)
-                };
                 ScanCacheEntry {
                     size,
                     mtime_ms,
-                    header,
+                    header: scan_jsonl_header(&path),
                 }
             }
         };
@@ -1236,66 +1258,13 @@ fn is_complete_msg_record(line: &[u8]) -> bool {
     matches!(value.get("t").and_then(|t| t.as_str()), Some("msg")) && value.get("d").is_some()
 }
 
-fn scan_legacy_header(path: &Path) -> Option<ScannedHeader> {
-    let data = fs::read(path).ok()?;
-    let h: LegacyHeader = serde_json::from_slice(&data).ok()?;
-    if h.version != SESSION_VERSION {
-        return None;
-    }
-    let message_count = serde_json::from_slice::<serde_json::Value>(&data)
-        .ok()
-        .and_then(|value| value.get("messages")?.as_array().map(Vec::len))?;
-    Some(ScannedHeader {
-        id: h.id,
-        cwd: h.cwd,
-        title: h.title,
-        updated_at: h.updated_at,
-        message_count,
-    })
-}
-
 fn session_entries(dir: &Path) -> Result<Vec<PathBuf>, StorageError> {
     Ok(fs::read_dir(dir)?
         .map(|e| e.map(|e| e.path()))
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
-        .filter(|p| is_session_file(p))
+        .filter(|p| is_jsonl(p))
         .collect())
-}
-
-fn is_session_file(p: &Path) -> bool {
-    p.file_stem()
-        .and_then(|s| s.to_str())
-        .is_some_and(|s| !NON_SESSION_STEMS.contains(&s))
-        && p.extension().is_some_and(|e| e == "json" || e == "jsonl")
-}
-
-fn find_legacy_files(dir: &Path, id: MakiId) -> Vec<PathBuf> {
-    let canonical = id.to_string();
-    session_entries(dir)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|p| {
-            p.file_stem()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s != canonical && s.parse::<MakiId>() == Ok(id))
-        })
-        .collect()
-}
-
-fn locate_session_file(dir: &Path, id: MakiId) -> Option<PathBuf> {
-    for ext in ["jsonl", "json"] {
-        let path = dir.join(format!("{id}.{ext}"));
-        if path.exists() {
-            return Some(path);
-        }
-    }
-    let legacy = find_legacy_files(dir, id);
-    legacy
-        .iter()
-        .find(|p| is_jsonl(p))
-        .or_else(|| legacy.first())
-        .cloned()
 }
 
 fn load_session_at<M, U, T>(path: &Path) -> Result<Session<M, U, T>, SessionError>
@@ -1305,22 +1274,9 @@ where
     T: DeserializeOwned,
 {
     let data = fs::read(path).map_err(StorageError::from)?;
-    // Held across both formats: either one decodes the same image payload once
-    // per record that mentions it.
+    // Decodes the same image payload once per record that mentions it.
     let _intern = crate::intern::Scope::enter();
-    let mut session: Session<M, U, T> = if path.extension().is_some_and(|e| e == "jsonl") {
-        load_jsonl(&data, &path.display().to_string())?
-    } else {
-        let session: Session<M, U, T> =
-            serde_json::from_slice(&data).map_err(StorageError::from)?;
-        if session.version != SESSION_VERSION {
-            return Err(SessionError::VersionMismatch {
-                found: session.version,
-                expected: SESSION_VERSION,
-            });
-        }
-        session
-    };
+    let mut session: Session<M, U, T> = load_jsonl(&data, &path.display().to_string())?;
     session.title = normalize_title(&session.title);
     Ok(session)
 }
@@ -1336,7 +1292,6 @@ where
     pub fn new(model: &str, cwd: &str) -> Self {
         let now = now_epoch();
         Self {
-            version: SESSION_VERSION,
             id: MakiId::generate(),
             title: DEFAULT_TITLE.into(),
             cwd: cwd.into(),
@@ -1345,7 +1300,9 @@ where
             token_usage: U::default(),
             tool_outputs: HashMap::new(),
             subagent_messages: HashMap::new(),
+            subagent_history_epochs: HashMap::new(),
             subagents: Vec::new(),
+            posts: Vec::new(),
             usage_by_model: HashMap::new(),
             meta: SessionMeta {
                 mode: Some(StoredMode::Build),
@@ -1374,6 +1331,7 @@ where
     pub fn history_snapshot(&self) -> HistorySnapshot<M> {
         HistorySnapshot {
             epoch: self.epoch,
+            compacted: self.meta.compacted,
             messages: Arc::clone(&self.messages),
         }
     }
@@ -1455,6 +1413,7 @@ where
     pub fn adopt_history(&mut self, snapshot: &HistorySnapshot<M>) {
         self.messages = Arc::clone(&snapshot.messages);
         self.epoch = snapshot.epoch;
+        self.meta.compacted = snapshot.compacted;
         self.touch();
     }
 
@@ -1465,14 +1424,17 @@ where
     pub fn checkpoint(
         this: &mut Arc<Self>,
         history: Option<&HistorySnapshot<M>>,
-        meta: SessionMeta,
+        mut meta: SessionMeta,
         token_usage: U,
     ) where
         M: Clone,
         U: PartialEq + Clone,
         T: Clone,
     {
-        let history = history.filter(|h| !Arc::ptr_eq(&this.messages, &h.messages));
+        meta.compacted = history.map_or(this.meta.compacted, |snapshot| snapshot.compacted);
+        let history = history.filter(|h| {
+            !Arc::ptr_eq(&this.messages, &h.messages) || h.compacted != this.meta.compacted
+        });
         if history.is_none() && this.meta == meta && this.token_usage == token_usage {
             return;
         }
@@ -1497,7 +1459,45 @@ where
         }
     }
 
+    pub fn subagent_history_snapshot(&self, id: &str) -> Option<HistorySnapshot<M>> {
+        self.subagent_messages
+            .get(id)
+            .map(|messages| HistorySnapshot {
+                epoch: self
+                    .subagent_history_epochs
+                    .get(id)
+                    .copied()
+                    .unwrap_or_default(),
+                compacted: false,
+                messages: Arc::clone(messages),
+            })
+    }
+
+    /// Rejects projections from a run superseded by a child history replacement.
+    pub fn adopt_subagent_history(&mut self, id: String, snapshot: &HistorySnapshot<M>) -> bool {
+        if self
+            .subagent_history_epochs
+            .get(&id)
+            .is_some_and(|epoch| *epoch > snapshot.epoch)
+        {
+            return false;
+        }
+        self.subagent_history_epochs
+            .insert(id.clone(), snapshot.epoch);
+        if self
+            .subagent_messages
+            .insert(id, Arc::clone(&snapshot.messages))
+            .is_some()
+        {
+            self.rewrite();
+        } else {
+            self.touch();
+        }
+        true
+    }
+
     pub fn set_subagent_messages(&mut self, id: String, msgs: Vec<M>) {
+        self.subagent_history_epochs.remove(&id);
         if self.subagent_messages.insert(id, Arc::new(msgs)).is_some() {
             self.rewrite();
         } else {
@@ -1534,6 +1534,24 @@ where
         }
         self.subagents = subagents;
         self.touch();
+    }
+
+    pub fn posts(&self) -> &[StoredPost] {
+        &self.posts
+    }
+
+    pub fn push_post(&mut self, post: StoredPost) {
+        self.posts.push(post);
+        self.touch();
+    }
+
+    pub fn prune_posts(&mut self, chat: Option<&str>, new_len: usize) {
+        let previous_len = self.posts.len();
+        self.posts
+            .retain(|stored| stored.chat.as_deref() != chat || stored.after_message <= new_len);
+        if self.posts.len() != previous_len {
+            self.rewrite();
+        }
     }
 
     pub fn usage_by_model(&self) -> &HashMap<String, StoredTokenUsage> {
@@ -1579,27 +1597,84 @@ where
         self.touch();
     }
 
-    /// After `messages` is truncated (rewind), state keyed by tool_use_id can
-    /// point at calls that no longer exist. On restore that shows up as ghost
-    /// subagent tabs and leaked tool outputs, so this drops everything not
-    /// reachable from `messages`.
-    ///
-    /// If you add another field keyed by tool_use_id, prune it here too.
+    /// Removes state unreachable from the main history, its posts, or live
+    /// children. Child messages and posts can retain further descendants.
+    /// Call only for explicit history edits, not compaction.
     pub fn prune_orphans(&mut self, tool_ids: impl Fn(&M) -> Vec<String>) {
-        let main_ids: HashSet<String> = self.messages.iter().flat_map(&tool_ids).collect();
-        self.subagent_messages.retain(|id, _| main_ids.contains(id));
-        self.subagents
-            .retain(|sa| main_ids.contains(&sa.tool_use_id));
+        self.prune_orphans_preserving(tool_ids, &[]);
+    }
 
-        let live: HashSet<String> = self
-            .subagent_messages
-            .values()
-            .flat_map(|msgs| msgs.iter())
+    pub fn prune_orphans_preserving(
+        &mut self,
+        tool_ids: impl Fn(&M) -> Vec<String>,
+        live_ids: &[String],
+    ) {
+        self.prune_posts(None, self.messages.len());
+        let previous_counts = (
+            self.subagent_messages.len(),
+            self.subagent_history_epochs.len(),
+            self.subagents.len(),
+            self.posts.len(),
+            self.tool_outputs.len(),
+        );
+        let mut post_agents: HashMap<Option<&str>, Vec<&str>> = HashMap::new();
+        for stored in &self.posts {
+            if let Some(agent) = stored.post.agent.as_deref() {
+                post_agents
+                    .entry(stored.chat.as_deref())
+                    .or_default()
+                    .push(agent);
+            }
+        }
+        let mut pending: Vec<String> = self
+            .messages
+            .iter()
             .flat_map(&tool_ids)
-            .chain(main_ids)
+            .chain(live_ids.iter().cloned())
+            .chain(
+                post_agents
+                    .get(&None)
+                    .into_iter()
+                    .flatten()
+                    .map(|id| (*id).to_owned()),
+            )
             .collect();
-        self.tool_outputs.retain(|id, _| live.contains(id));
-        self.rewrite();
+        let mut reachable = HashSet::new();
+        while let Some(id) = pending.pop() {
+            if !reachable.insert(id.clone()) {
+                continue;
+            }
+            if let Some(messages) = self.subagent_messages.get(&id) {
+                pending.extend(messages.iter().flat_map(&tool_ids));
+            }
+            if let Some(agents) = post_agents.get(&Some(id.as_str())) {
+                pending.extend(agents.iter().map(|id| (*id).to_owned()));
+            }
+        }
+        self.subagent_messages
+            .retain(|id, _| reachable.contains(id));
+        self.subagent_history_epochs
+            .retain(|id, _| reachable.contains(id));
+        self.subagents
+            .retain(|sa| reachable.contains(&sa.tool_use_id));
+        self.posts.retain(|stored| {
+            stored
+                .chat
+                .as_ref()
+                .is_none_or(|chat| reachable.contains(chat))
+        });
+        self.tool_outputs.retain(|id, _| reachable.contains(id));
+        if previous_counts
+            != (
+                self.subagent_messages.len(),
+                self.subagent_history_epochs.len(),
+                self.subagents.len(),
+                self.posts.len(),
+                self.tool_outputs.len(),
+            )
+        {
+            self.rewrite();
+        }
     }
 
     pub fn save(&mut self, dir: &StateDir) -> Result<(), SessionError> {
@@ -1619,16 +1694,11 @@ where
     }
 
     pub fn load_from(id: MakiId, dir: &Path) -> Result<Self, SessionError> {
-        let Some(path) = locate_session_file(dir, id) else {
+        let path = jsonl_path(dir, id);
+        if !path.exists() {
             return Err(StorageError::NotFound(id.to_string()).into());
-        };
-        let session = load_session_at::<M, U, T>(&path)?;
-        if path != jsonl_path(dir, id)
-            && let Err(e) = SessionLog::write_canonical(dir, &session)
-        {
-            warn!(error = %e, "failed migrate to canonical jsonl; keeping legacy file");
         }
-        Ok(session)
+        load_session_at::<M, U, T>(&path)
     }
 
     pub fn list(cwd: &str, dir: &StateDir) -> Result<Vec<SessionSummary>, SessionError> {
@@ -1711,8 +1781,7 @@ where
         if session_lock::open_elsewhere(dir, &id) {
             return Err(SessionError::OpenElsewhere);
         }
-        let mut removed = try_remove(&jsonl_path(dir, id))?;
-        removed |= remove_legacy_files(dir, id)?;
+        let removed = try_remove(&jsonl_path(dir, id))?;
         // Backups, not the session: failing to sweep them must not fail a
         // delete whose log is already gone, and their presence alone does not
         // make a session exist.
@@ -1741,7 +1810,6 @@ where
             }
             Err(_) => {}
         }
-        session_lock::release(dir, &id);
         if !removed {
             return Err(StorageError::NotFound(id.to_string()).into());
         }
@@ -1757,14 +1825,15 @@ mod tests {
     use super::ThinkingParseError;
     use super::{
         ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE, LOG_BLOATED,
-        MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR, StoredSubagent,
-        TAIL_BUF, generate_title, json_path, jsonl_path, load_cwd_index, next_epoch, offload_dir,
-        update_cwd_index, write_full_session,
+        MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSIONS_DIR, StoredSubagent, TAIL_BUF,
+        generate_title, jsonl_path, load_cwd_index, next_epoch, offload_dir, update_cwd_index,
+        write_full_session,
     };
     use super::{
         HistorySnapshot, SCAN_CACHE_FILE, Session, SessionError, SessionLog, SessionMeta,
         StorageError, TitleSource,
     };
+    use super::{Post, PostLevel, StoredPost};
     use super::{Prefs, read_prefs, write_prefs};
     use crate::StateDir;
     use crate::id::MakiId;
@@ -1788,16 +1857,48 @@ mod tests {
     const OFFLOAD_SENTINEL: &str = "external offload sentinel";
     #[cfg(any(unix, windows))]
     const OFFLOAD_SENTINEL_FILE: &str = "sentinel.txt";
-    const LEGACY_HEX_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const FIXTURE_ID: &str = "CNK1hV6GWoysH3KQMm5wu";
     const SONNET_COST: f64 = 0.42;
     const HAIKU_COST: f64 = 0.08;
     const TAMPERED_TITLE: &str = "tampered cached title";
     const PENDING_DRAFT: &str = "half typed thought";
+    const POST_TEXT: &str = "reviewer has findings";
+    const POST_AGENT: &str = "session-reviewer";
+    const POST_APPEND_COUNT: usize = 64;
+    const POST_DESCENDANT: &str = "post-descendant";
+    const MESSAGE_DESCENDANT: &str = "message-descendant";
+    const LIVE_CHILD: &str = "live-child";
+    const ORPHAN_CHILD: &str = "orphan-child";
     /// Two of these already break the byte budget.
     const FAKE_ARCHIVE_BYTES: u64 = ARCHIVE_MAX_BYTES / 2;
     const EXISTING_ARCHIVE_SEQ: u64 = 7;
     /// A pid no live process on this machine has.
     const FAKE_LOCK_PID: u32 = u32::MAX - 1;
+
+    #[test]
+    fn child_history_epochs_fence_reconstructed_events_without_changing_disk_format() {
+        let mut session = TestSession::new("model", "/tmp");
+        let earlier = HistorySnapshot::new(vec![serde_json::json!("earlier")]);
+        let latest = HistorySnapshot::new(vec![serde_json::json!("latest")]);
+        assert!(session.adopt_subagent_history(POST_AGENT.into(), &earlier));
+        assert!(session.adopt_subagent_history(POST_AGENT.into(), &latest));
+        let reconstructed = HistorySnapshot {
+            messages: Arc::new(earlier.messages.as_ref().clone()),
+            ..earlier
+        };
+        assert!(!session.adopt_subagent_history(POST_AGENT.into(), &reconstructed));
+        let current = session.subagent_history_snapshot(POST_AGENT).unwrap();
+        assert_eq!(current.epoch, latest.epoch);
+        assert_eq!(current.messages, latest.messages);
+        let tmp = TempDir::new().unwrap();
+        session.save_to(tmp.path()).unwrap();
+        let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert_eq!(loaded.subagent_messages(), session.subagent_messages());
+        assert_eq!(
+            loaded.subagent_history_snapshot(POST_AGENT).unwrap().epoch,
+            0
+        );
+    }
 
     impl TitleSource for Value {
         fn first_user_text(&self) -> Option<&str> {
@@ -1830,7 +1931,7 @@ mod tests {
         })
     }
 
-    fn write_legacy_jsonl(path: &Path, session: &TestSession) {
+    fn write_jsonl(path: &Path, session: &TestSession) {
         let mut file = std::fs::File::create(path).unwrap();
         write_full_session(&mut file, session).unwrap();
     }
@@ -1907,7 +2008,6 @@ mod tests {
         assert_eq!(loaded.model, "anthropic/claude-sonnet-4");
         assert_eq!(loaded.cwd, "/home/test/project");
         assert_eq!(loaded.messages().len(), 1);
-        assert_eq!(loaded.version, SESSION_VERSION);
         assert_eq!(loaded.subagent_messages["tool-1"].len(), 2);
     }
 
@@ -1983,18 +2083,17 @@ mod tests {
         meta["usage_by_model"].clone()
     }
 
-    /// Session files predate `cost`, so an entry without the key loads unpriced
-    /// with its counters intact, and saving it back must not mint one: older
-    /// builds still read these files.
+    /// An entry without `cost` loads unpriced with its counters intact, and
+    /// saving it back must not mint one.
     #[test]
-    fn legacy_usage_entry_loads_unpriced_and_stays_that_way_on_disk() {
-        let id: MakiId = LEGACY_HEX_ID.parse().unwrap();
+    fn unpriced_usage_entry_stays_unpriced_on_disk() {
+        let id: MakiId = FIXTURE_ID.parse().unwrap();
         let json = format!(
-            r#"{{"t":"header","v":2,"id":"{LEGACY_HEX_ID}","model":"m","cwd":"/","created_at":0}}
+            r#"{{"t":"header","v":2,"id":"{FIXTURE_ID}","model":"m","cwd":"/","created_at":0}}
 {{"t":"meta","title":"t","token_usage":null,"updated_at":0,"usage_by_model":{{"m":{{"input":7,"output":3}}}}}}"#
         );
         let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join(format!("{LEGACY_HEX_ID}.jsonl")), json).unwrap();
+        fs::write(tmp.path().join(format!("{FIXTURE_ID}.jsonl")), json).unwrap();
 
         let mut loaded = TestSession::load_from(id, tmp.path()).unwrap();
         let entry = loaded.usage_by_model()["m"];
@@ -2036,14 +2135,14 @@ mod tests {
     }
 
     #[test]
-    fn usage_by_model_absent_on_legacy_session() {
-        let id: MakiId = LEGACY_HEX_ID.parse().unwrap();
+    fn usage_by_model_absent_when_meta_omits_it() {
+        let id: MakiId = FIXTURE_ID.parse().unwrap();
         let json = format!(
-            r#"{{"t":"header","v":2,"id":"{LEGACY_HEX_ID}","model":"m","cwd":"/","created_at":0}}
+            r#"{{"t":"header","v":2,"id":"{FIXTURE_ID}","model":"m","cwd":"/","created_at":0}}
 {{"t":"meta","title":"t","token_usage":null,"updated_at":0}}"#
         );
         let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join(format!("{LEGACY_HEX_ID}.jsonl"));
+        let path = tmp.path().join(format!("{FIXTURE_ID}.jsonl"));
         fs::write(&path, json).unwrap();
         let loaded = TestSession::load_from(id, tmp.path()).unwrap();
         assert!(loaded.usage_by_model().is_empty());
@@ -2054,18 +2153,18 @@ mod tests {
     /// the meta record and they still sit there.
     #[test]
     fn session_owned_fields_keep_their_place_in_the_meta_record() {
-        let id: MakiId = LEGACY_HEX_ID.parse().unwrap();
+        let id: MakiId = FIXTURE_ID.parse().unwrap();
         let meta_line = concat!(
             r#"{"t":"meta","title":"t","token_usage":null,"updated_at":0,"fast":true,"#,
             r#""subagents":[{"tool_use_id":"t1","name":"child"}],"#,
             r#""usage_by_model":{"m":{"input":7,"output":3}}}"#,
         );
         let json = format!(
-            r#"{{"t":"header","v":2,"id":"{LEGACY_HEX_ID}","model":"m","cwd":"/","created_at":0}}
+            r#"{{"t":"header","v":2,"id":"{FIXTURE_ID}","model":"m","cwd":"/","created_at":0}}
 {meta_line}"#
         );
         let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join(format!("{LEGACY_HEX_ID}.jsonl")), json).unwrap();
+        fs::write(tmp.path().join(format!("{FIXTURE_ID}.jsonl")), json).unwrap();
 
         let mut loaded = TestSession::load_from(id, tmp.path()).unwrap();
         assert_eq!(loaded.subagents()[0].name, "child");
@@ -2116,9 +2215,187 @@ mod tests {
         assert_eq!(loaded.subagent_messages["sub-2"].len(), 1);
     }
 
+    fn stored_post(chat: Option<&str>, after_message: usize, agent: Option<&str>) -> StoredPost {
+        StoredPost {
+            chat: chat.map(str::to_owned),
+            after_message,
+            post: Post {
+                text: POST_TEXT.into(),
+                level: PostLevel::Warn,
+                agent: agent.map(str::to_owned),
+            },
+        }
+    }
+
+    #[test_case(None; "main")]
+    #[test_case(Some(POST_AGENT); "child")]
+    fn prune_posts_only_changes_the_selected_chat(chat: Option<&str>) {
+        let tmp = TempDir::new().unwrap();
+        let mut session = TestSession::new("m", "/project");
+        for selected in [None, Some(POST_AGENT)] {
+            session.push_post(stored_post(selected, 1, None));
+            session.push_post(stored_post(selected, 2, None));
+        }
+        let mut log = SessionLog::rewrite(tmp.path(), &session).unwrap();
+        session.prune_posts(chat, 1);
+        assert!(matches!(
+            log.append(&session),
+            Err(SessionError::LogDiverged { .. })
+        ));
+        let expected: Vec<_> = [None, Some(POST_AGENT)]
+            .into_iter()
+            .flat_map(|selected| {
+                let mut posts = vec![stored_post(selected, 1, None)];
+                if selected != chat {
+                    posts.push(stored_post(selected, 2, None));
+                }
+                posts
+            })
+            .collect();
+        assert_eq!(session.posts(), expected);
+        SessionLog::rewrite(tmp.path(), &session).unwrap();
+        let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert_eq!(loaded.posts(), expected);
+    }
+
+    #[test]
+    fn posts_are_written_once_instead_of_repeated_in_meta() {
+        let tmp = TempDir::new().unwrap();
+        let mut session = TestSession::new("m", "/project");
+        session.push_message(user_message("first"));
+        let mut log = SessionLog::rewrite(tmp.path(), &session).unwrap();
+        for index in 0..POST_APPEND_COUNT {
+            let post = if index == 0 {
+                stored_post(None, 1, Some(POST_AGENT))
+            } else {
+                stored_post(None, 0, None)
+            };
+            session.push_post(post);
+            log.append(&session).unwrap();
+        }
+        let data = fs::read_to_string(jsonl_path(tmp.path(), session.id)).unwrap();
+        let records: Vec<Value> = data
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let post_records: Vec<_> = records
+            .iter()
+            .filter(|record| record["t"] == "post")
+            .collect();
+        assert_eq!(post_records.len(), POST_APPEND_COUNT);
+        assert_eq!(post_records[0]["d"]["after_message"], 1);
+        assert_eq!(post_records[0]["d"]["agent"], POST_AGENT);
+        assert!(
+            records
+                .iter()
+                .filter(|record| record["t"] == "meta")
+                .all(|record| record.get("posts").is_none())
+        );
+        let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert_eq!(loaded.posts(), session.posts());
+        SessionLog::rewrite(tmp.path(), &session).unwrap();
+        let rewritten = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert_eq!(rewritten.posts(), session.posts());
+    }
+
+    #[test]
+    fn prune_orphans_retains_live_children_and_recursive_message_and_post_references() {
+        fn ids(message: &Value) -> Vec<String> {
+            message
+                .as_str()
+                .map(|id| vec![id.to_owned()])
+                .unwrap_or_default()
+        }
+        let mut session = TestSession::new("m", "/project");
+        session.push_message(Value::String(POST_AGENT.into()));
+        for (id, references) in [
+            (POST_AGENT, vec![Value::String(MESSAGE_DESCENDANT.into())]),
+            (MESSAGE_DESCENDANT, vec![Value::String(POST_AGENT.into())]),
+            (POST_DESCENDANT, Vec::new()),
+            (LIVE_CHILD, Vec::new()),
+            (ORPHAN_CHILD, Vec::new()),
+        ] {
+            session.set_subagent_messages(id.into(), references);
+            session.insert_tool_output(id.into(), Value::Null);
+        }
+        session.push_post(stored_post(
+            Some(MESSAGE_DESCENDANT),
+            0,
+            Some(POST_DESCENDANT),
+        ));
+        session.push_post(stored_post(Some(ORPHAN_CHILD), 0, Some(ORPHAN_CHILD)));
+        session.prune_orphans_preserving(ids, &[LIVE_CHILD.into()]);
+        for id in [POST_AGENT, MESSAGE_DESCENDANT, POST_DESCENDANT, LIVE_CHILD] {
+            assert!(session.subagent_messages().contains_key(id));
+            assert!(session.tool_outputs().contains_key(id));
+        }
+        assert!(!session.subagent_messages().contains_key(ORPHAN_CHILD));
+        assert!(!session.tool_outputs().contains_key(ORPHAN_CHILD));
+        assert_eq!(
+            session.posts(),
+            [stored_post(
+                Some(MESSAGE_DESCENDANT),
+                0,
+                Some(POST_DESCENDANT)
+            )]
+        );
+        let revision = session.revision();
+        session.prune_orphans_preserving(ids, &[LIVE_CHILD.into()]);
+        assert_eq!(session.revision(), revision);
+    }
+
+    #[test]
+    fn prune_orphans_drops_rewound_posts_and_keeps_their_agents() {
+        fn ids(m: &Value) -> Vec<String> {
+            vec![m.as_str().unwrap().to_owned()]
+        }
+        const STALE_AGENT: &str = "session-stale";
+
+        let mut session: TestSession = Session::new("model", "/p");
+        session.push_message("task-live".into());
+        for agent in [POST_AGENT, STALE_AGENT] {
+            session
+                .subagent_messages
+                .insert(agent.into(), Arc::new(Vec::new()));
+        }
+        let kept = stored_post(None, 1, Some(POST_AGENT));
+        let nested = stored_post(Some(POST_AGENT), 0, None);
+        session.push_post(kept.clone());
+        session.push_post(stored_post(None, 2, Some(STALE_AGENT)));
+        session.push_post(nested.clone());
+        session.push_post(stored_post(Some(STALE_AGENT), 0, None));
+
+        session.prune_orphans(ids);
+
+        assert_eq!(session.posts(), [kept, nested]);
+        assert_eq!(
+            session.subagent_messages().keys().collect::<Vec<_>>(),
+            [POST_AGENT]
+        );
+    }
+
     /// The mirror re-adopts the run's snapshot on every checkpoint; that must
     /// not erase the void minted by a same-frame in-place replacement, or the
     /// writer appends onto a stale prefix and persists a mixed transcript.
+    #[test]
+    fn compacted_history_metadata_round_trips_and_survives_meta_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let mut session: Arc<TestSession> = Arc::new(Session::new("m", "/project"));
+        let mut snapshot = HistorySnapshot::new(vec![user_message("summary")]);
+        snapshot.compacted = true;
+        Session::checkpoint(
+            &mut session,
+            Some(&snapshot),
+            SessionMeta::default(),
+            Value::Null,
+        );
+        Session::checkpoint(&mut session, None, SessionMeta::default(), Value::Null);
+        assert!(session.history_snapshot().compacted);
+        SessionLog::rewrite(tmp.path(), &session).unwrap();
+        let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert!(loaded.history_snapshot().compacted);
+    }
+
     #[test]
     fn snapshot_adoption_does_not_erase_a_local_rewrite() {
         let tmp = TempDir::new().unwrap();
@@ -2126,6 +2403,7 @@ mod tests {
         let mut session: Arc<TestSession> = Arc::new(Session::new("m", "/project"));
         let run = HistorySnapshot {
             epoch: next_epoch(),
+            compacted: false,
             messages: Arc::new(vec![user_message("hi")]),
         };
         let meta = session.meta.clone();
@@ -2138,6 +2416,7 @@ mod tests {
             .set_subagent_messages("sub-1".into(), vec![user_message("new")]);
         let advanced = HistorySnapshot {
             epoch: run.epoch,
+            compacted: run.compacted,
             messages: Arc::new(vec![user_message("hi"), assistant_message("reply")]),
         };
         Session::checkpoint(&mut session, Some(&advanced), meta, Value::Null);
@@ -2573,30 +2852,6 @@ mod tests {
     }
 
     #[test]
-    fn migration_json_to_jsonl() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-        let mut session: TestSession = Session::new("m", "/project");
-        session.push_message(user_message("legacy"));
-
-        let json_path = json_path(dir, session.id);
-        fs::write(&json_path, serde_json::to_vec(&session).unwrap()).unwrap();
-        update_cwd_index(dir, &session.cwd, session.id).unwrap();
-
-        let loaded = TestSession::load_from(session.id, dir).unwrap();
-        assert_eq!(loaded.messages().len(), 1);
-
-        let _log = SessionLog::rewrite(dir, &loaded).unwrap();
-
-        assert!(!json_path.exists());
-        assert!(jsonl_path(dir, session.id).exists());
-
-        let reloaded = TestSession::load_from(session.id, dir).unwrap();
-        assert_eq!(reloaded.messages().len(), 1);
-        assert_eq!(reloaded.model, "m");
-    }
-
-    #[test]
     fn load_nonexistent_returns_not_found() {
         let tmp = TempDir::new().unwrap();
         let id = MakiId::generate();
@@ -2605,28 +2860,6 @@ mod tests {
             err,
             SessionError::Storage(StorageError::NotFound(_))
         ));
-    }
-
-    #[test_case("550e8400-e29b-41d4-a716-446655440000")]
-    #[test_case("550e8400e29b41d4a716446655440000")]
-    fn load_legacy_hex_filename_migrates_to_canonical(legacy: &str) {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-
-        let id: MakiId = legacy.parse().unwrap();
-        let mut session: TestSession = Session::new("m", "/project");
-        session.id = id;
-        session.push_message(user_message("legacy"));
-        let legacy_path = dir.join(format!("{legacy}.jsonl"));
-        write_legacy_jsonl(&legacy_path, &session);
-
-        let loaded = TestSession::load_from(id, dir).unwrap();
-        assert_eq!(loaded.id, id);
-        assert_eq!(loaded.messages().len(), 1);
-
-        assert!(!legacy_path.exists());
-        let canonical = jsonl_path(dir, id);
-        assert!(canonical.exists());
     }
 
     #[test]
@@ -2689,17 +2922,14 @@ mod tests {
     }
 
     #[test]
-    fn delete_from_releases_the_session_lock() {
+    fn delete_from_is_not_blocked_by_own_session_lock() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut s: TestSession = Session::new("m", "/project");
         s.save_to(dir).unwrap();
-        session_lock::heartbeat(dir, &s.id).unwrap();
-        assert!(session_lock::lock_path(dir, &s.id).exists());
+        let lease = session_lock::claim(dir, &s.id).unwrap().unwrap();
 
         TestSession::delete_from(s.id, dir).unwrap();
-        assert!(!session_lock::open_elsewhere(dir, &s.id));
-        let lease = session_lock::claim(dir, &s.id).unwrap().unwrap();
         lease.release().unwrap();
     }
 
@@ -2902,164 +3132,6 @@ mod tests {
         ));
     }
 
-    #[test_case("550e8400-e29b-41d4-a716-446655440000")]
-    #[test_case("550e8400e29b41d4a716446655440000")]
-    fn delete_legacy_hex_filename_removes_file(legacy: &str) {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-
-        let id: MakiId = legacy.parse().unwrap();
-        let mut session: TestSession = Session::new("m", "/project");
-        session.id = id;
-        session.push_message(user_message("legacy"));
-        let legacy_path = dir.join(format!("{legacy}.jsonl"));
-        write_legacy_jsonl(&legacy_path, &session);
-
-        TestSession::delete_from(id, dir).unwrap();
-        assert!(!legacy_path.exists());
-        let canonical = jsonl_path(dir, id);
-        assert!(!canonical.exists());
-    }
-
-    #[test]
-    fn delete_removes_coexisting_json_and_jsonl() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-        let mut session: TestSession = Session::new("m", "/project");
-        session.push_message(user_message("hi"));
-
-        let jsonl_file = jsonl_path(dir, session.id);
-        write_legacy_jsonl(&jsonl_file, &session);
-        let json_file = json_path(dir, session.id);
-        fs::write(&json_file, serde_json::to_vec(&session).unwrap()).unwrap();
-
-        TestSession::delete_from(session.id, dir).unwrap();
-        assert!(!jsonl_file.exists());
-        assert!(!json_file.exists());
-    }
-
-    #[test]
-    fn load_picks_jsonl_when_legacy_dual_file_exists() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-
-        let id: MakiId = LEGACY_HEX_ID.parse().unwrap();
-        let mut jsonl_session: TestSession = Session::new("m", "/project");
-        jsonl_session.id = id;
-        jsonl_session.push_message(user_message("newer"));
-
-        let legacy_jsonl = dir.join(format!("{LEGACY_HEX_ID}.jsonl"));
-        write_legacy_jsonl(&legacy_jsonl, &jsonl_session);
-
-        let mut json_session: TestSession = Session::new("m", "/project");
-        json_session.id = id;
-        json_session.push_message(user_message("older"));
-        let legacy_json = dir.join(format!("{LEGACY_HEX_ID}.json"));
-        fs::write(&legacy_json, serde_json::to_vec(&json_session).unwrap()).unwrap();
-
-        let loaded = TestSession::load_from(id, dir).unwrap();
-        assert_eq!(loaded.messages().len(), 1);
-        assert_eq!(loaded.messages()[0], user_message("newer"));
-    }
-
-    #[test]
-    fn load_dual_legacy_files_does_not_leave_duplicate_in_list() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-
-        let id: MakiId = LEGACY_HEX_ID.parse().unwrap();
-        let mut jsonl_session: TestSession = Session::new("m", "/project");
-        jsonl_session.id = id;
-        jsonl_session.push_message(user_message("newer"));
-        let legacy_jsonl = dir.join(format!("{LEGACY_HEX_ID}.jsonl"));
-        write_legacy_jsonl(&legacy_jsonl, &jsonl_session);
-
-        let mut json_session: TestSession = Session::new("m", "/project");
-        json_session.id = id;
-        json_session.push_message(user_message("older"));
-        let legacy_json = dir.join(format!("{LEGACY_HEX_ID}.json"));
-        fs::write(&legacy_json, serde_json::to_vec(&json_session).unwrap()).unwrap();
-
-        TestSession::load_from(id, dir).unwrap();
-
-        assert!(!legacy_json.exists(), "legacy .json sibling left behind");
-        let list = TestSession::list_in("/project", dir).unwrap();
-        assert_eq!(
-            list.len(),
-            1,
-            "session shows up more than once in the picker"
-        );
-    }
-
-    #[test]
-    fn delete_drains_coexisting_legacy_json_and_jsonl() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-
-        let id: MakiId = LEGACY_HEX_ID.parse().unwrap();
-        let mut session: TestSession = Session::new("m", "/project");
-        session.id = id;
-        session.push_message(user_message("legacy"));
-
-        let legacy_jsonl = dir.join(format!("{LEGACY_HEX_ID}.jsonl"));
-        write_legacy_jsonl(&legacy_jsonl, &session);
-
-        let legacy_json = dir.join(format!("{LEGACY_HEX_ID}.json"));
-        fs::write(&legacy_json, serde_json::to_vec(&session).unwrap()).unwrap();
-
-        TestSession::delete_from(id, dir).unwrap();
-        assert!(!legacy_jsonl.exists());
-        assert!(!legacy_json.exists());
-    }
-
-    #[test]
-    fn rewrite_removes_legacy_named_files() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-
-        let id: MakiId = LEGACY_HEX_ID.parse().unwrap();
-        let mut session: TestSession = Session::new("m", "/project");
-        session.id = id;
-        session.push_message(user_message("legacy"));
-
-        let legacy_jsonl = dir.join(format!("{LEGACY_HEX_ID}.jsonl"));
-        write_legacy_jsonl(&legacy_jsonl, &session);
-
-        let legacy_json = dir.join(format!("{LEGACY_HEX_ID}.json"));
-        fs::write(&legacy_json, serde_json::to_vec(&session).unwrap()).unwrap();
-
-        let _log = SessionLog::rewrite(dir, &session).unwrap();
-
-        assert!(!legacy_jsonl.exists());
-        assert!(!legacy_json.exists());
-        assert!(jsonl_path(dir, id).exists());
-    }
-
-    #[test]
-    fn load_migration_does_not_steal_latest_pointer() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-
-        let mut newest: TestSession = Session::new("m", "/project");
-        newest.title = "newest".into();
-        save_with_time(&mut newest, dir, 3000);
-
-        let mut older: TestSession = Session::new("m", "/project");
-        older.title = "older".into();
-        older.updated_at = 1000;
-        let json_path = json_path(dir, older.id);
-        fs::write(&json_path, serde_json::to_vec(&older).unwrap()).unwrap();
-
-        // Opening the older session migrates it to canonical jsonl, but must not
-        // repoint cwd→latest at it.
-        let loaded = TestSession::load_from(older.id, dir).unwrap();
-        assert_eq!(loaded.title, "older");
-        assert!(!json_path.exists());
-
-        let latest = TestSession::latest_in("/project", dir).unwrap().unwrap();
-        assert_eq!(latest.title, "newest");
-    }
-
     #[test]
     fn load_with_corrupt_header_id_reports_missing_header() {
         let tmp = TempDir::new().unwrap();
@@ -3069,7 +3141,7 @@ mod tests {
         session.id = id;
 
         let path = jsonl_path(dir, id);
-        write_legacy_jsonl(&path, &session);
+        write_jsonl(&path, &session);
 
         let corrupted =
             fs::read_to_string(&path)
@@ -3082,52 +3154,11 @@ mod tests {
     }
 
     #[test]
-    fn remove_from_cwd_index_matches_legacy_hex_value() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-
-        let legacy = "550e8400-e29b-41d4-a716-446655440000";
-        let id: MakiId = legacy.parse().unwrap();
-        let mut session: TestSession = Session::new("m", "/project");
-        session.id = id;
-
-        let mut index: HashMap<String, String> = HashMap::new();
-        index.insert("/project".into(), legacy.to_string());
-        fs::write(
-            dir.join(CWD_INDEX_FILE),
-            serde_json::to_vec(&index).unwrap(),
-        )
-        .unwrap();
-
-        super::remove_from_cwd_index(dir, session.id).unwrap();
-        let after = load_cwd_index(dir);
-        assert!(!after.contains_key("/project"));
-    }
-
-    #[test]
     fn title_unicode_safe() {
         let input = "あ".repeat(100);
         let title = generate_title(&[user_message(&input)]);
         assert!(title.len() <= MAX_TITLE_LEN * 4);
         assert!(title.is_char_boundary(title.len()));
-    }
-
-    #[test]
-    fn scan_headers_reads_both_formats() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-
-        let mut s1: TestSession = Session::new("m", "/project");
-        s1.title = "jsonl-session".into();
-        s1.save_to(dir).unwrap();
-
-        let mut s2: TestSession = Session::new("m", "/project");
-        s2.title = "json-session".into();
-        let json_path = json_path(dir, s2.id);
-        fs::write(&json_path, serde_json::to_vec(&s2).unwrap()).unwrap();
-
-        let list = TestSession::list_in("/project", dir).unwrap();
-        assert_eq!(list.len(), 2);
     }
 
     #[test]
@@ -3139,7 +3170,7 @@ mod tests {
         s.push_message(user_message("two"));
         s.set_subagent_messages("sub".into(), vec![user_message("hidden")]);
         s.insert_tool_output("t1".into(), Value::String("output".into()));
-        write_legacy_jsonl(&jsonl_path(dir, s.id), &s);
+        write_jsonl(&jsonl_path(dir, s.id), &s);
 
         let list = TestSession::list_in("/project", dir).unwrap();
         assert_eq!(list.len(), 1);
@@ -3153,7 +3184,7 @@ mod tests {
         let mut s: TestSession = Session::new("m", "/project");
         s.push_message(user_message("one"));
         let path = jsonl_path(dir, s.id);
-        write_legacy_jsonl(&path, &s);
+        write_jsonl(&path, &s);
         assert_eq!(
             TestSession::list_in("/project", dir).unwrap()[0].message_count,
             1
@@ -3171,7 +3202,7 @@ mod tests {
         let mut s: TestSession = Session::new("m", "/project");
         s.push_message(user_message("one"));
         let path = jsonl_path(dir, s.id);
-        write_legacy_jsonl(&path, &s);
+        write_jsonl(&path, &s);
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
         for noise in [
             r#"{"t":"msgx","d":{}}"#,
@@ -3195,7 +3226,7 @@ mod tests {
         let mut s: TestSession = Session::new("m", "/project");
         s.push_message(user_message("one"));
         let path = jsonl_path(dir, s.id);
-        write_legacy_jsonl(&path, &s);
+        write_jsonl(&path, &s);
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
         file.write_all(br#"{"t":"msg","d":{"trun"#).unwrap();
         drop(file);
@@ -3215,7 +3246,7 @@ mod tests {
         let mut s: TestSession = Session::new("m", "/project");
         s.push_message(user_message("one"));
         let path = jsonl_path(dir, s.id);
-        write_legacy_jsonl(&path, &s);
+        write_jsonl(&path, &s);
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
         // The crash happened between the record's closing brace and the
         // newline the writer emits after it. Written literally, because the
@@ -3253,22 +3284,6 @@ mod tests {
         assert_eq!(loaded.meta.yolo, Some(true));
     }
 
-    #[test]
-    fn load_wrong_version_legacy_returns_error() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-        let mut session: TestSession = Session::new("test/model", "/tmp");
-        session.version = 999;
-        let path = json_path(dir, session.id);
-        fs::write(&path, serde_json::to_vec(&session).unwrap()).unwrap();
-
-        let err = TestSession::load_from(session.id, dir).unwrap_err();
-        assert!(matches!(
-            err,
-            SessionError::VersionMismatch { found: 999, .. }
-        ));
-    }
-
     /// A torn tail is what a crash mid-append leaves behind, and the file is
     /// the only thing standing between the user and their conversation, so the
     /// cursor `rewrite` hands back must describe the file it just wrote.
@@ -3302,12 +3317,12 @@ mod tests {
         let bad_header = serde_json::json!({
             "t": "header",
             "v": 999,
-            "id": "01965087-4c71-7f00-8000-000000000000",
+            "id": FIXTURE_ID,
             "model": "m",
             "cwd": "/tmp",
             "created_at": 0
         });
-        let id: MakiId = "01965087-4c71-7f00-8000-000000000000".parse().unwrap();
+        let id: MakiId = FIXTURE_ID.parse().unwrap();
         let path = jsonl_path(dir, id);
         fs::write(&path, format!("{}\n", bad_header)).unwrap();
 
@@ -3397,7 +3412,7 @@ mod tests {
     }
 
     #[test]
-    fn session_meta_backward_compat_defaults() {
+    fn session_meta_defaults_absent_fields() {
         let json = r#"{"mode":"build"}"#;
         let meta: super::SessionMeta = serde_json::from_str(json).unwrap();
         assert!(meta.thinking.is_none());
@@ -3451,7 +3466,7 @@ mod tests {
     fn corrupt_header_line_only_reports_missing_header() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
-        let id: MakiId = "01965087-4c71-7f00-8000-000000000000".parse().unwrap();
+        let id: MakiId = FIXTURE_ID.parse().unwrap();
         let path = jsonl_path(dir, id);
         fs::write(&path, "NOT_A_HEADER\n").unwrap();
 
@@ -3477,8 +3492,9 @@ mod tests {
         assert_eq!(loaded.messages().len(), 2);
     }
 
-    #[test]
-    fn unknown_record_type_is_skipped() {
+    #[test_case(b"{\"t\":\"future_type\",\"d\":{}}\n" ; "unknown_record_type")]
+    #[test_case(b"{\"t\":\"meta\",\"title\":7}\n" ; "record_with_a_field_of_the_wrong_shape")]
+    fn record_another_version_wrote_refuses_the_load_and_stays_on_disk(record: &[u8]) {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
@@ -3487,13 +3503,17 @@ mod tests {
 
         let path = jsonl_path(dir, session.id);
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-        file.write_all(b"{\"t\":\"future_type\",\"d\":{}}\n")
-            .unwrap();
+        file.write_all(record).unwrap();
         drop(file);
         append_raw_msg(&path, user_message("second"));
+        let before = fs::read(&path).unwrap();
 
-        let loaded = TestSession::load_from(session.id, dir).unwrap();
-        assert_eq!(loaded.messages().len(), 2);
+        let error = TestSession::load_from(session.id, dir).unwrap_err();
+        assert!(
+            matches!(error, SessionError::UnreadableRecord { line: 4, .. }),
+            "{error}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 
     #[test]

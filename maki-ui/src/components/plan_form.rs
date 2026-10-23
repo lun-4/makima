@@ -40,7 +40,7 @@ const MENU: &[MenuItem] = &[
     },
     MenuItem {
         label: "Clear context and implement",
-        desc: "  Start fresh session, then implement the plan",
+        desc: "  Clear this agent's context, then implement the plan",
         action: || PlanFormAction::ClearAndImplement,
     },
     MenuItem {

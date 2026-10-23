@@ -1,16 +1,35 @@
 local M = {}
 
-function M.find(snapshot, id)
-  for _, option in ipairs(snapshot.options or {}) do
+-- The definitions this session has a value for, each with its current value.
+function M.options(definitions, values)
+  local options = {}
+  for _, definition in ipairs(definitions) do
+    local current = values[definition.id]
+    if current ~= nil then
+      options[#options + 1] = {
+        id = definition.id,
+        name = definition.name,
+        description = definition.description,
+        category = definition.category,
+        values = definition.values,
+        current_value = current,
+      }
+    end
+  end
+  return options
+end
+
+function M.find(options, id)
+  for _, option in ipairs(options) do
     if option.id == id then
       return option
     end
   end
 end
 
-function M.option_items(snapshot)
+function M.option_items(options)
   local items = {}
-  for _, option in ipairs(snapshot.options or {}) do
+  for _, option in ipairs(options) do
     items[#items + 1] = {
       label = option.name .. ": " .. option.current_value,
       detail = option.description .. " (" .. option.category .. ")",

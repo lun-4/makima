@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
@@ -12,15 +13,32 @@ use maki_commands::{
     CompletionSessionId, InvocationTargetId, MAX_COMPLETION_CANDIDATES,
 };
 
+use maki_lua::orchestration::TrustedTarget;
+use maki_providers::{FAST_VALUES, MODEL_FAST_KEY, MODEL_THINKING_KEY};
+
 const PATH_COMPLETION_BATCH_SIZE: usize = 64;
 
 pub(crate) struct ModelArgSource {
     models: Arc<ArcSwapOption<Vec<String>>>,
+    targets: Option<Arc<Mutex<HashMap<InvocationTargetId, TrustedTarget>>>>,
 }
 
 impl ModelArgSource {
     pub(crate) fn new(models: Arc<ArcSwapOption<Vec<String>>>) -> Self {
-        Self { models }
+        Self {
+            models,
+            targets: None,
+        }
+    }
+
+    pub(crate) fn with_targets(
+        &self,
+        targets: Arc<Mutex<HashMap<InvocationTargetId, TrustedTarget>>>,
+    ) -> Self {
+        Self {
+            models: Arc::clone(&self.models),
+            targets: Some(targets),
+        }
     }
 }
 
@@ -166,12 +184,26 @@ fn path_completion_item((mut insertion, is_directory): (String, bool)) -> Comple
 impl CommandCompletion for ModelArgSource {
     fn complete(
         &self,
-        _context: CompletionContext,
+        context: CompletionContext,
         _cancellation: CancellationToken,
     ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
-        let items = self.models.load_full().map_or_else(Vec::new, |specs| {
+        let target = self.targets.as_ref().and_then(|targets| {
+            targets
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(&context.target_id)
+                .filter(|target| target.target.validate_live().is_ok())
+                .cloned()
+        });
+        let mut items = self.models.load_full().map_or_else(Vec::new, |specs| {
             specs
                 .iter()
+                .filter(|spec| {
+                    self.targets.is_none()
+                        || target
+                            .as_ref()
+                            .is_some_and(|target| target.template.model_policy.allows(spec))
+                })
                 .map(|spec| CompletionItem {
                     label: Arc::from(spec.as_str()),
                     insertion: Arc::from(spec.as_str()),
@@ -179,6 +211,68 @@ impl CommandCompletion for ModelArgSource {
                 })
                 .collect()
         });
+        let preceding = context
+            .preceding_arguments
+            .iter()
+            .flat_map(|argument| argument.values.iter())
+            .filter_map(|value| match value {
+                maki_commands::ArgumentValue::String(value) => Some(value.as_ref()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if preceding.iter().any(|value| !value.contains('=')) || context.argument.contains('=') {
+            items.clear();
+        }
+        let range = context.argument_range.as_ref();
+        let embedded_options = range
+            .and_then(|range| context.arguments[..range.start].rfind('{'))
+            .map(|open| {
+                let end = context.arguments[open..]
+                    .find('}')
+                    .map_or(context.arguments.len(), |end| open + end);
+                (open + 1, end)
+            });
+        if embedded_options.is_some() {
+            items.clear();
+        }
+        for (key, values) in [
+            (
+                MODEL_THINKING_KEY,
+                maki_providers::ThinkingConfig::options().as_slice(),
+            ),
+            (MODEL_FAST_KEY, FAST_VALUES.as_slice()),
+        ] {
+            let prefix = format!("{key}=");
+            let duplicate = embedded_options.map_or_else(
+                || preceding.iter().any(|value| value.starts_with(&prefix)),
+                |(start, end)| {
+                    context.arguments[start..end]
+                        .split(',')
+                        .scan(start, |offset, option| {
+                            let option_start = *offset;
+                            *offset += option.len() + 1;
+                            Some((option_start, option))
+                        })
+                        .any(|(start, option)| {
+                            let start = start + option.len() - option.trim_start().len();
+                            range.is_none_or(|range| start != range.start)
+                                && option.trim_start().starts_with(&prefix)
+                        })
+                },
+            );
+            if !duplicate
+                && (!context.argument.contains('=') || context.argument.starts_with(&prefix))
+            {
+                items.extend(values.iter().map(|value| {
+                    let insertion: Arc<str> = Arc::from(format!("{key}={value}"));
+                    CompletionItem {
+                        label: Arc::clone(&insertion),
+                        insertion,
+                        description: None,
+                    }
+                }));
+            }
+        }
         Box::pin(async move { Ok(items) })
     }
 }
@@ -405,6 +499,69 @@ mod tests {
         session.highlight(candidate).unwrap();
         session.accept(candidate.clone()).unwrap();
         target.id()
+    }
+
+    #[test_case("", "", 0, true, true, true ; "empty")]
+    #[test_case("openai/gpt-5 ", "", 1, false, true, true ; "spec")]
+    #[test_case(r#""openai/gpt-5" "#, "", 1, false, true, true ; "quoted_spec")]
+    #[test_case("fast=false ", "", 1, true, true, false ; "fast_selected")]
+    #[test_case("thinking=high fast=true ", "", 2, true, false, false ; "options_selected")]
+    #[test_case("thinking=", "thinking=", 0, false, true, false ; "thinking_value")]
+    #[test_case("fast=", "fast=", 0, false, false, true ; "fast_value")]
+    fn model_completion_offers_only_remaining_selection_fields(
+        input: &str,
+        argument: &str,
+        index: usize,
+        model: bool,
+        thinking: bool,
+        fast: bool,
+    ) {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Application);
+        let definition = maki_commands::BUILTIN_COMMANDS
+            .iter()
+            .find(|definition| definition.id == maki_commands::BuiltinId::Model)
+            .unwrap();
+        producer
+            .replace(vec![Registration {
+                spec: definition.spec(),
+                behavior: Arc::new(NoBehavior),
+                argument_completions: vec![Some(Arc::new(ModelArgSource::new(Arc::new(
+                    ArcSwapOption::from(Some(Arc::new(vec!["openai/gpt-5".into()]))),
+                ))))],
+            }])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::ALL, Arc::new(NoBehavior));
+        let command = registry.resolve_for(&target, "/model").unwrap();
+        let session = registry.open_completion(command, target.id()).unwrap();
+        let CompletionResult::Items(items) = smol::block_on(session.complete(
+            Arc::from(input),
+            Arc::from(argument),
+            index,
+            Arc::from("insert"),
+        )) else {
+            panic!("expected model completions");
+        };
+        assert_eq!(
+            items
+                .iter()
+                .any(|item| item.item().insertion.as_ref() == "openai/gpt-5"),
+            model
+        );
+        assert_eq!(
+            items.iter().any(|item| item
+                .item()
+                .insertion
+                .starts_with(&format!("{MODEL_THINKING_KEY}="))),
+            thinking
+        );
+        assert_eq!(
+            items.iter().any(|item| item
+                .item()
+                .insertion
+                .starts_with(&format!("{MODEL_FAST_KEY}="))),
+            fast
+        );
     }
 
     const BASE_THEME: &str = "dracula";

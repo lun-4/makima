@@ -119,7 +119,7 @@ fn register(
     let data = lua.create_table()?;
     data.set("registry", registry)?;
     data.set("key", key)?;
-    autocmd::dispatch(lua, STORE_CHANGED, None, Value::Table(data));
+    autocmd::dispatch(lua, STORE_CHANGED, None, Value::Table(data), None);
     Ok(())
 }
 

@@ -207,6 +207,17 @@ pub fn try_from_json(v: &Value) -> Result<&'static ParamSchema, String> {
             let items: &'static ParamSchema = try_from_json(items_val)?;
             ParamSchema::Array { items, description }
         }
+        Some("object")
+            if v.get("additionalProperties").and_then(Value::as_bool) == Some(true)
+                && v.get("properties").is_none_or(|properties| {
+                    properties.as_object().is_some_and(|map| map.is_empty())
+                }) =>
+        {
+            ParamSchema::Primitive {
+                kind: ParamKind::Object,
+                description,
+            }
+        }
         Some("object") => parse_object_schema(v, description)?,
         // A schema that spells out `properties` but forgets `type` is an object
         // and nothing else. Reading it as "any value" used to throw the whole
@@ -1124,6 +1135,16 @@ mod tests {
 
         let explicit = try_from_json(&json!({ "type": "object", "properties": properties }));
         assert!(explicit.is_err(), "{EXPLICIT_OBJECT_STILL_FAILS}");
+    }
+
+    #[test_case(json!({"type": "object", "additionalProperties": true}) ; "without_properties")]
+    #[test_case(json!({"type": "object", "properties": {}, "additionalProperties": true}) ; "empty_properties")]
+    fn try_from_json_open_object_preserves_fields(schema_json: Value) {
+        let schema = try_from_json(&schema_json).unwrap();
+        let input = json!({"type": "object", "properties": {"answer": {"type": "string"}}});
+        assert_eq!(validate(schema, input.clone()).unwrap(), input);
+        assert_eq!(to_json_schema(schema)["type"], "object");
+        assert!(validate(schema, json!([])).is_err());
     }
 
     #[test_case(json!({}) ; "empty_schema")]

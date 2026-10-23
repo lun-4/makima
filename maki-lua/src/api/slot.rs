@@ -9,7 +9,9 @@ use maki_agent::tools::HookStage;
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, MultiValue, Result as LuaResult, Table, Value};
 
-use crate::api::util::dispatch::{DepthGuard, Reentry, call_swallowing};
+use crate::agent_errors::DELEGATED_REGISTRATION;
+use crate::api::util::dispatch::{DepthGuard, call_swallowing};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 
 /// Slot names the host fires itself. A plugin declaring one would shadow a
 /// point whose firing order dispatch guarantees, so the namespace is closed.
@@ -283,7 +285,7 @@ async fn run_chain(
     layers: Arc<[SlotLayer]>,
     args: MultiValue,
 ) -> LuaResult<MultiValue> {
-    let _guard = DepthGuard::enter(lua, SEAM, &name, Reentry::Task).map_err(|_| {
+    let _guard = DepthGuard::enter(lua, SEAM, &name).map_err(|_| {
         mlua::Error::runtime(format!(
             "slot '{name}' exceeded max depth (recursive filler? call prev instead)"
         ))
@@ -396,6 +398,7 @@ fn declare_slot(
     name: String,
     default: Function,
 ) -> LuaResult<Function> {
+    crate::runtime::deny_delegated_registration(lua)?;
     if name.starts_with(HOST_PREFIX) {
         return Err(mlua::Error::runtime(format!(
             "slot '{name}' is host owned: '{HOST_PREFIX}' names are fired by maki itself, \
@@ -441,20 +444,33 @@ fn declare_slot(
 ///
 /// @param name string Slot name to wrap.
 /// @param wrapper function Layer: `function(prev, ...)`. Call `prev(...)` to continue.
-/// @return
+/// @return (boolean|nil, string|nil) true, or nil and an error. Returns nil and an error when called from a delegated tool handler.
 /// @example
 /// maki.api.set_slot("myplugin.render", function(prev, text)
 ///   return prev("[" .. text .. "]")
 /// end)
 #[lua_fn]
-fn set_slot(lua: &Lua, #[ctx] plugin: Arc<str>, name: String, wrapper: Function) -> LuaResult<()> {
-    with_slot_store(lua, &plugin, |store| {
-        store.slots.entry(name).or_default().layers.push(SlotLayer {
-            plugin: Arc::clone(&plugin),
-            func: wrapper,
-        });
-        Ok(())
-    })
+fn set_slot(
+    lua: &Lua,
+    #[ctx] plugin: Arc<str>,
+    name: String,
+    wrapper: Function,
+) -> LuaResult<Pair<bool>> {
+    if crate::runtime::in_delegated_tool(lua) {
+        return Ok(err_pair(DELEGATED_REGISTRATION));
+    }
+    try_pair!(crate::runtime::validate_plugin_effect(lua));
+    let registered = || -> LuaResult<()> {
+        with_slot_store(lua, &plugin, |store| {
+            store.slots.entry(name).or_default().layers.push(SlotLayer {
+                plugin: Arc::clone(&plugin),
+                func: wrapper,
+            });
+            Ok(())
+        })
+    };
+    registered()?;
+    Ok((Some(true), None))
 }
 
 /// List all known slots and their current state. Useful for debugging

@@ -12,10 +12,6 @@ local M = {}
 local VERDICT_TOOL_NAME = "classifier_verdict"
 local VERDICT_ACK = "Verdict recorded."
 
-function M.defaults()
-  return { auto_mode = false, auto_timeout_secs = 30 }
-end
-
 -- Strict tri-state decoder: anything that is not `{approved: boolean}` (with an
 -- optional string `reason`) is "error" (never silently approve or deny).
 function M.parse_verdict(text)
@@ -64,54 +60,62 @@ local classifier_verdict_tool = {
       reason = { type = "string", description = "one-line justification for the verdict" },
     },
   },
+  capture_input = true,
   handler = function(value)
     if type(value) ~= "table" or type(value.approved) ~= "boolean" then
       return nil, VERDICT_TOOL_NAME .. " input must be { approved: boolean }"
-    end
-    local _, commit_err = maki.agent.report_task_result(value)
-    if commit_err then
-      return nil, "no active subagent session"
     end
     return VERDICT_ACK
   end,
 }
 
 local function default_spawn(ctx, opts)
-  return maki.agent.session(ctx, M.spawn_opts(opts))
+  return maki.agent.spawn(ctx, M.spawn_opts(opts))
 end
 
--- The classifier-session table passed to `maki.agent.session`. Factored out so
--- tests can assert the model/system/isolation wiring without a real provider.
+-- Explicit tools prevent the classifier from inheriting request tools.
 function M.spawn_opts(opts)
   local out = {
     system = classifier_system,
+    tools = {},
     local_tools = { [VERDICT_TOOL_NAME] = classifier_verdict_tool },
     name = "bash-guardian",
+    audience = "general_sub",
     mcp = false,
     silent = true,
   }
   if opts.auto_model then
-    out.model_spec = opts.auto_model
+    out.model = { spec = opts.auto_model }
   end
   return out
 end
 
--- One classifier call. `spawn` is injectable for tests; it returns the pair
--- `(session, err)`. Any spawn/send/prompt failure or a non-decodable verdict
--- yields ("error", nil, err) so the caller falls back to the user prompt.
+-- `spawn` is injectable and returns (Agent, err). Failures fall back to the user prompt.
 function M.classify_verdict(command, cwd, opts, ctx, spawn)
   spawn = spawn or default_spawn
-  local ok, sess, sess_err = pcall(spawn, ctx, opts)
+  local ok, agent, spawn_err = pcall(spawn, ctx, opts)
   if not ok then
-    return "error", nil, tostring(sess_err)
+    return "error", nil, tostring(agent)
   end
-  if sess_err then
-    return "error", nil, sess_err
+  if spawn_err then
+    return "error", nil, spawn_err
   end
-  local result, prompt_err = sess:prompt(M.build_classifier_message(command, cwd), { timeout = opts.auto_timeout_secs })
-  sess:close()
+  local prompt_ok, result, prompt_err = pcall(function()
+    local turn, send_err = agent:send(ctx, M.build_classifier_message(command, cwd), { when = "idle" })
+    if not turn then
+      return nil, send_err
+    end
+    return turn:wait(ctx, { timeout = opts.auto_timeout_secs })
+  end)
+  agent:close(ctx)
+  if not prompt_ok then
+    return "error", nil, tostring(result)
+  end
   if prompt_err then
     return "error", nil, prompt_err
+  end
+  if not result or result.status ~= "completed" then
+    return "error", nil, result and (result.error or result.cancellation_reason) or "classifier returned no result"
   end
   local encoded
   if result and result.captured then

@@ -16,11 +16,12 @@ use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, MultiValue, Result as LuaResult, Table, Value};
 use serde::Deserialize;
 
+use crate::agent_errors::DELEGATED_REGISTRATION;
 use crate::api::util::command::{
     CommandArgumentItem, CommandCompletionCallbacks, CommandHandlerMap,
 };
 use crate::api::util::convert::{json_to_lua, lua_to_json};
-use crate::api::util::pair::Pair;
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::runtime::{
     CommandArgumentContext, CommandArgumentLifecycle, CommandArgumentLifecycleRequest,
 };
@@ -56,7 +57,7 @@ pub struct ItemSpec {
 /// Context handed to a source's `get_items` at popup-open time. `mode` is the
 /// active mode id ("build"/"plan"/custom); `models` is the available-models
 /// list the caller already loaded. Both are passed in by value so sources stay
-/// synchronous and never need the async `mode.get()` round-trip.
+/// synchronous and never wait on the agent.
 #[derive(Debug, Clone, Default)]
 pub struct CompletionCtx {
     pub mode: String,
@@ -93,7 +94,7 @@ fn install_store<T: Default + Send + Sync + 'static>(lua: &Lua) {
 ///
 /// @param prefix string The prefix this source owns (e.g. "skill"); labels typically carry the prefix (`skill:review`) so the fuzzy filter narrows by kind as the user types.
 /// @param spec table `{ get_items = function(ctx) -> { {label, kind, insertion, description?} } }`.
-/// @return
+/// @return (boolean|nil, string|nil) true, or nil and an error. Returns nil and an error when called from a delegated tool handler.
 /// @example
 /// maki.api.register_completion_source("skill", {
 ///   get_items = function(ctx)
@@ -107,21 +108,29 @@ fn register_completion_source(
     #[ctx] pending: Arc<Mutex<PendingCompletionStore>>,
     prefix: String,
     spec: Table,
-) -> LuaResult<()> {
-    let get_items: Function = spec.get("get_items")?;
-    let mut store = lua
-        .app_data_mut::<CompletionStore>()
-        .ok_or_else(|| mlua::Error::runtime("completion store not available"))?;
-    if crate::runtime::loading_plugin_is(lua, &plugin) {
-        pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .0
-            .insert(prefix, get_items);
-    } else {
-        store.0.entry(plugin).or_default().insert(prefix, get_items);
+) -> LuaResult<Pair<bool>> {
+    if crate::runtime::in_delegated_tool(lua) {
+        return Ok(err_pair(DELEGATED_REGISTRATION));
     }
-    Ok(())
+    try_pair!(crate::runtime::validate_plugin_effect(lua));
+    let registered = || -> LuaResult<()> {
+        let get_items: Function = spec.get("get_items")?;
+        let mut store = lua
+            .app_data_mut::<CompletionStore>()
+            .ok_or_else(|| mlua::Error::runtime("completion store not available"))?;
+        if crate::runtime::loading_plugin_is(lua, &plugin) {
+            pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .0
+                .insert(prefix, get_items);
+        } else {
+            store.0.entry(plugin).or_default().insert(prefix, get_items);
+        }
+        Ok(())
+    };
+    registered()?;
+    Ok((Some(true), None))
 }
 
 /// Register a submit-time expander for `prefix`. Called with `{ value = "..." }`
@@ -133,7 +142,7 @@ fn register_completion_source(
 ///
 /// @param prefix string The prefix this expander owns (e.g. "skill" or "s").
 /// @param f function `{ value = string } -> (string, string|nil)`.
-/// @return
+/// @return (boolean|nil, string|nil) true, or nil and an error. Returns nil and an error when called from a delegated tool handler.
 /// @example
 /// maki.api.register_expander("skill", function(ref)
 ///   return "<skill:" .. ref.value .. ">", nil
@@ -148,20 +157,28 @@ fn register_expander(
     #[ctx] pending: Arc<Mutex<PendingExpanderStore>>,
     prefix: String,
     f: Function,
-) -> LuaResult<()> {
-    let mut store = lua
-        .app_data_mut::<ExpanderStore>()
-        .ok_or_else(|| mlua::Error::runtime("expander store not available"))?;
-    if crate::runtime::loading_plugin_is(lua, &plugin) {
-        pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .0
-            .insert(prefix, f);
-    } else {
-        store.0.entry(plugin).or_default().insert(prefix, f);
+) -> LuaResult<Pair<bool>> {
+    if crate::runtime::in_delegated_tool(lua) {
+        return Ok(err_pair(DELEGATED_REGISTRATION));
     }
-    Ok(())
+    try_pair!(crate::runtime::validate_plugin_effect(lua));
+    let registered = || -> LuaResult<()> {
+        let mut store = lua
+            .app_data_mut::<ExpanderStore>()
+            .ok_or_else(|| mlua::Error::runtime("expander store not available"))?;
+        if crate::runtime::loading_plugin_is(lua, &plugin) {
+            pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .0
+                .insert(prefix, f);
+        } else {
+            store.0.entry(plugin).or_default().insert(prefix, f);
+        }
+        Ok(())
+    };
+    registered()?;
+    Ok((Some(true), None))
 }
 
 lua_table! {

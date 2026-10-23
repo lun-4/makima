@@ -1,4 +1,5 @@
 pub mod agent_autocmd;
+pub mod agent_errors;
 mod api;
 mod coalesced_latest;
 pub mod docs;
@@ -7,10 +8,13 @@ mod error;
 pub(crate) mod hook;
 pub mod language;
 mod loader;
+pub mod orchestration;
+pub use runtime::current_managed_turn;
 pub(crate) mod plugin_permissions;
 mod runtime;
 pub mod session_snapshot;
 mod splash;
+pub mod ui_sink;
 #[cfg(test)]
 mod write_lock_regression;
 
@@ -19,17 +23,17 @@ pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
 pub use api::time::format_ago;
 pub use api::util::command::{
     Anchor, Axis, Border, BuiltinAction, CommandArgumentItem, Dimension, Edge, FloatConfig,
-    FloatConfigPatch, HintReader, HintSnapshot, ModelRequest, ProviderUsageAck,
-    ProviderUsageInvalidation, ProviderUsageLimit, ProviderUsageReply, ProviderUsageSnapshot,
-    ProviderUsageWindow, SessionReply, SessionRequest, Split, StatusContent, StatusContentReader,
-    StatusContentSnapshot, TitlePos, UiAction, UiReply, WinCommand, WinEvent, WinView,
+    FloatConfigPatch, HintReader, HintSnapshot, ProviderUsageAck, ProviderUsageInvalidation,
+    ProviderUsageLimit, ProviderUsageReply, ProviderUsageSnapshot, ProviderUsageWindow,
+    SessionReply, SessionRequest, Split, StatusContent, StatusContentReader, StatusContentSnapshot,
+    TitlePos, UiAction, UiReply, WinCommand, WinEvent, WinView,
 };
 pub use api::util::picker::{PickerConfig, PickerEvent, PickerItemSpec, PickerResult};
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::{PluginError, SessionOptionMutationError};
 pub use loader::{EventHandle, PERMISSION_NAME_WARNING, PluginHost, TestCompletionBackend};
 pub use plugin_permissions::{Permission, PluginPermissions};
-pub use runtime::{CommandArgumentContext, CommandArgumentLifecycle};
+pub use runtime::{COMMAND_HANDLER_UNAVAILABLE, CommandArgumentContext, CommandArgumentLifecycle};
 pub use runtime::{KILL_GRACE, MAX_INFLIGHT_TOOLS, RestoreItem, WARM_TOOL_CAP};
 pub use splash::{
     SPLASH_PULL_TIMEOUT, SplashFrame, SplashPull, SplashRow, SplashStyle, VersionInfo,
@@ -48,9 +52,75 @@ pub mod test_support {
         HintEntries, HintReader, HintWriter, StatusContentEntries, StatusContentReader,
         StatusContentWriter,
     };
+    use crate::orchestration::TrustedTarget;
     use crate::{EventHandle, KeymapReader, PluginHost, TestCompletionBackend};
+    use maki_commands::{
+        CommandContent, CommandError, CommandFuture, CommandHost, CommandOutcome, CommandRegistry,
+        HostRequest, HostResponse, TargetCapabilities,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
 
     pub use crate::api::util::dispatch::MAX_HOOK_DEPTH;
+
+    pub const COMMAND_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+    struct DetachedCommandHost;
+
+    impl CommandHost for DetachedCommandHost {
+        fn request(&self, _: HostRequest) -> CommandFuture<Result<HostResponse, CommandError>> {
+            Box::pin(async { Ok(HostResponse::Completed) })
+        }
+    }
+
+    /// Dispatches {cmdline} through {registry} at {depth}, the way a frontend
+    /// runs a typed command, with {admission} as the agent the handler's `ctx`
+    /// belongs to. The dispatch runs in the background so a test can drive
+    /// whatever the handler waits on; the receiver yields the handler's result.
+    pub fn run_command(
+        registry: &CommandRegistry,
+        cmdline: &str,
+        depth: usize,
+        admission: Option<TrustedTarget>,
+    ) -> flume::Receiver<Result<(), String>> {
+        let registry = registry.clone();
+        let target = registry.bind_target(TargetCapabilities::ALL, Arc::new(DetachedCommandHost));
+        let dispatch = registry
+            .resolve_input_for(&target, cmdline)
+            .map_err(|error| error.to_string())
+            .map(|resolved| match admission {
+                Some(admission) => registry.dispatch_command_with_admission(
+                    &target,
+                    resolved.command,
+                    resolved.arguments,
+                    CommandContent::default(),
+                    depth,
+                    Arc::new(admission),
+                ),
+                None => registry.dispatch_command_with_depth(
+                    &target,
+                    resolved.command,
+                    resolved.arguments,
+                    CommandContent::default(),
+                    depth,
+                ),
+            });
+        let (result, finished) = flume::bounded(1);
+        smol::spawn(async move {
+            let _target = target;
+            let outcome = match dispatch {
+                Ok(dispatch) => match dispatch.await {
+                    CommandOutcome::Completed => Ok(()),
+                    CommandOutcome::Failed(error) => Err(error.to_string()),
+                    outcome => Err(format!("unexpected Lua command outcome: {outcome:?}")),
+                },
+                Err(error) => Err(error),
+            };
+            let _ = result.send(outcome);
+        })
+        .detach();
+        finished
+    }
 
     /// Stands in for the Lua thread publishing a plugin's status hints.
     pub struct HintWriterHandle(HintWriter);
@@ -98,29 +168,37 @@ pub mod test_support {
             })
         }
 
-        /// Next dispatched slash command as `(command, args, depth)`, skipping
-        /// other requests.
-        pub fn try_recv_command(&self) -> Option<(String, String, u8)> {
+        /// Next Lua command the registry executed, as `(command, args, depth)`,
+        /// skipping other requests. The handler is reported as finished, so
+        /// the frontend sees the command complete. Frontends dispatch in the
+        /// background, so this waits up to [`COMMAND_PROBE_TIMEOUT`].
+        pub fn recv_command(&self) -> Option<(String, String, usize)> {
             use crate::runtime::Request;
-            while let Ok(req) = self.0.try_recv() {
-                if let Request::RunCommand {
+            let deadline = std::time::Instant::now() + COMMAND_PROBE_TIMEOUT;
+            loop {
+                let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
+                if let Request::ExecuteCommand {
                     command,
-                    args,
-                    depth,
+                    invocation,
+                    completion,
                     ..
-                } = req
+                } = self.0.recv_timeout(remaining).ok()?
                 {
-                    return Some((command.to_string(), args, depth));
+                    let _ = completion.send(Ok(()));
+                    return Some((
+                        command.to_string(),
+                        invocation.arguments.to_string(),
+                        invocation.depth,
+                    ));
                 }
             }
-            None
         }
 
         /// Next fired autocmd as `(event, data)`, skipping other requests.
         pub fn try_recv_autocmd(&self) -> Option<(String, serde_json::Value)> {
             use crate::runtime::Request;
             while let Ok(req) = self.0.try_recv() {
-                if let Request::FireAutocmd { event, data } = req {
+                if let Request::FireAutocmd { event, data, .. } = req {
                     return Some((event, data));
                 }
             }
@@ -205,6 +283,23 @@ pub mod test_support {
     pub fn probed_event_handle() -> (crate::EventHandle, RequestProbe) {
         let (tx, rx) = flume::unbounded();
         (crate::EventHandle::probed_for_test(tx), RequestProbe(rx))
+    }
+
+    /// A headless sink that hands notifications to a channel, so a test can
+    /// wait on them where a real frontend would write to stderr.
+    pub struct RecordingUi(flume::Sender<String>);
+
+    impl RecordingUi {
+        pub fn new() -> (Self, flume::Receiver<String>) {
+            let (tx, rx) = flume::unbounded();
+            (Self(tx), rx)
+        }
+    }
+
+    impl crate::ui_sink::UiSink for RecordingUi {
+        fn notify(&mut self, text: String) {
+            let _ = self.0.send(text);
+        }
     }
 
     /// Synthetic state dir for hosts booted by [`spawn_host_for_tests`].

@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use maki_commands::{CommandHost, CommandOutcome, CommandRegistry, HostResponse, InputDispatch};
+use maki_commands::{
+    CommandError, CommandHost, CommandOutcome, CommandRegistry, HostResponse, InputDispatch,
+};
 use maki_lua::{EventHandle, PluginHost, UiAction};
 
 const COMMAND_PLUGIN: &str = r#"
@@ -67,7 +69,6 @@ fn setup() -> (
     CommandRegistry,
     maki_commands::TargetHandle,
     flume::Receiver<UiAction>,
-    EventHandle,
 ) {
     let host = PluginHost::new(Arc::new(maki_agent::tools::ToolRegistry::new())).unwrap();
     host.load_source("typed_routes", COMMAND_PLUGIN).unwrap();
@@ -77,8 +78,7 @@ fn setup() -> (
         Arc::new(TestCommandHost),
     );
     let actions = host.ui_action_rx();
-    let handle = host.event_handle();
-    (host, registry, target, actions, handle)
+    (host, registry, target, actions)
 }
 
 fn next_flash(actions: &flume::Receiver<UiAction>) -> String {
@@ -106,26 +106,8 @@ fn dispatch_via_registry(
     next_flash(actions)
 }
 
-fn dispatch_via_run_command(
-    handle: &EventHandle,
-    actions: &flume::Receiver<UiAction>,
-    raw_args: &str,
-) -> String {
-    let result = handle
-        .run_command_for_test(
-            Arc::from("typed_routes"),
-            Arc::from("/typed"),
-            format!("  {raw_args}  "),
-            0,
-        )
-        .recv_timeout(Duration::from_secs(5))
-        .expect("RunCommand completion was not sent");
-    result.expect("valid typed RunCommand invocation failed");
-    next_flash(actions)
-}
-
 #[test]
-fn typed_registry_and_run_command_routes_are_identical() {
+fn typed_registry_route_reaches_the_handler_with_parsed_values() {
     let cases = [
         (
             r#""hello world" 42 "src/input file.txt" "build output""#,
@@ -138,17 +120,16 @@ fn typed_registry_and_run_command_routes_are_identical() {
     ];
 
     for (raw_args, expected) in cases {
-        let (_host, registry, target, actions, handle) = setup();
-        let registry_result = dispatch_via_registry(&registry, &target, &actions, raw_args);
-        let run_command_result = dispatch_via_run_command(&handle, &actions, raw_args);
-        assert_eq!(registry_result, expected);
-        assert_eq!(run_command_result, expected);
-        assert_eq!(registry_result, run_command_result);
+        let (_host, registry, target, actions) = setup();
+        assert_eq!(
+            dispatch_via_registry(&registry, &target, &actions, raw_args),
+            expected
+        );
     }
 }
 
 fn assert_registry_rejects(raw_args: &str) {
-    let (_host, registry, target, actions, _handle) = setup();
+    let (_host, registry, target, actions) = setup();
     let input = format!(" /typed {raw_args} ");
     let outcome = smol::block_on(registry.dispatch_input(&target, input.as_str().into()));
     assert!(matches!(
@@ -157,24 +138,6 @@ fn assert_registry_rejects(raw_args: &str) {
             maki_commands::CommandError::TypedArguments { .. }
         ))
     ));
-    assert!(matches!(
-        actions.try_recv(),
-        Err(flume::TryRecvError::Empty)
-    ));
-}
-
-fn assert_run_command_rejects(raw_args: &str) {
-    let (_host, _registry, _target, actions, handle) = setup();
-    let result = handle
-        .run_command_for_test(
-            Arc::from("typed_routes"),
-            Arc::from("/typed"),
-            format!(" {raw_args} "),
-            0,
-        )
-        .recv_timeout(Duration::from_secs(5))
-        .expect("invalid RunCommand completion was not sent");
-    assert!(result.is_err(), "invalid RunCommand unexpectedly succeeded");
     assert!(matches!(
         actions.try_recv(),
         Err(flume::TryRecvError::Empty)
@@ -193,12 +156,7 @@ fn queued_execute_command_rejects_retired_generation_before_worker_consumes_it()
     let actions = host.ui_action_rx();
     let release = host.pause_worker_for_test();
 
-    let old_outcome =
-        smol::block_on(registry.dispatch_input(&target, "/typed generation-a".into()));
-    assert!(matches!(
-        old_outcome,
-        InputDispatch::Dispatched(CommandOutcome::Completed)
-    ));
+    let old_outcome = smol::spawn(registry.dispatch_input(&target, "/typed generation-a".into()));
 
     let replacement = host
         .queue_load_source_for_test("generation", GENERATION_B_PLUGIN)
@@ -209,6 +167,11 @@ fn queued_execute_command_rejects_retired_generation_before_worker_consumes_it()
         .expect("replacement load reply")
         .expect("replacement load failed");
     host.wait_for_worker_barrier_for_test();
+    assert!(matches!(
+        smol::block_on(old_outcome),
+        InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::Producer(error)))
+            if error.as_ref() == maki_lua::COMMAND_HANDLER_UNAVAILABLE
+    ));
 
     assert!(matches!(
         actions.try_recv(),
@@ -222,36 +185,6 @@ fn queued_execute_command_rejects_retired_generation_before_worker_consumes_it()
         InputDispatch::Dispatched(CommandOutcome::Completed)
     ));
     assert_eq!(next_flash(&actions), "B:generation-b");
-}
-
-#[test]
-fn queued_legacy_run_command_rejects_retired_generation_before_worker_consumes_it() {
-    let host = PluginHost::new(Arc::new(maki_agent::tools::ToolRegistry::new())).unwrap();
-    host.load_source("legacy_generation", GENERATION_A_PLUGIN)
-        .unwrap();
-    let handle = host.event_handle();
-    let release = host.pause_worker_for_test();
-    let replacement = host
-        .queue_load_source_for_test("legacy_generation", GENERATION_B_PLUGIN)
-        .unwrap();
-    handle.run_command(
-        Arc::from("legacy_generation"),
-        Arc::from("/typed"),
-        "queued".into(),
-        0,
-    );
-
-    release.send(()).unwrap();
-    replacement
-        .recv()
-        .expect("replacement load reply")
-        .expect("replacement load failed");
-    host.wait_for_worker_barrier_for_test();
-
-    assert!(matches!(
-        host.ui_action_rx().try_recv(),
-        Err(flume::TryRecvError::Empty)
-    ));
 }
 
 #[test]
@@ -345,6 +278,5 @@ fn invalid_typed_invocations_never_reach_the_handler() {
 
     for (raw_args, _case_name) in invalid_inputs {
         assert_registry_rejects(raw_args);
-        assert_run_command_rejects(raw_args);
     }
 }

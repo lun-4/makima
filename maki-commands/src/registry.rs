@@ -52,7 +52,8 @@ pub(super) struct RegistryState {
     targets: HashMap<InvocationTargetId, TargetRecord>,
     subscribers: Vec<Weak<SubscriptionCore>>,
     standard_commands_registered: bool,
-    pub(super) completion_sessions: HashMap<CompletionSessionId, Weak<CompletionSessionCore>>,
+    pub(super) completion_sessions:
+        HashMap<CompletionSessionId, (ProducerId, Weak<CompletionSessionCore>)>,
 }
 
 pub(super) struct TargetRecord {
@@ -324,9 +325,10 @@ impl CommandRegistry {
             })
             .ok_or(CompletionError::StaleCommand)?;
         let id = CompletionSessionId::new(self.0.id, state.take_id());
+        let producer_id = command.producer_id();
         let session = CompletionSession::new(
             id,
-            command.producer_id(),
+            producer_id,
             Arc::downgrade(&self.0),
             command,
             argument_completions,
@@ -334,7 +336,9 @@ impl CommandRegistry {
             target_id,
             cwd,
         );
-        state.completion_sessions.insert(id, session.weak_core());
+        state
+            .completion_sessions
+            .insert(id, (producer_id, session.weak_core()));
         Ok(session)
     }
 
@@ -649,18 +653,12 @@ impl RegistryState {
         &mut self,
         producer_id: ProducerId,
     ) -> Vec<CompletionInvalidation> {
-        let sessions = self
-            .completion_sessions
-            .iter()
-            .filter_map(|(id, session)| session.upgrade().map(|session| (*id, session)))
-            .filter(|(_, session)| session.producer_id == producer_id)
-            .collect::<Vec<_>>();
-        sessions
-            .into_iter()
-            .map(|(id, session)| {
-                self.completion_sessions.remove(&id);
-                CompletionInvalidation { session }
-            })
+        // Upgrading another producer's session here could make this lock the
+        // last owner, and its drop relocks the registry.
+        self.completion_sessions
+            .extract_if(|_, (owner, _)| *owner == producer_id)
+            .filter_map(|(_, (_, session))| session.upgrade())
+            .map(|session| CompletionInvalidation { session })
             .collect()
     }
 

@@ -78,54 +78,86 @@ maki.api.register_tool({{
 
 // ---------------------------------------------------------------- events
 
-#[test]
-fn exec_autocmds_pattern_routing_and_ev_shape() {
-    let (_reg, host) = host();
+/// Loads {body} with a `probe` tool returning the global `result`, drains
+/// the callbacks it queued, and returns what the probe reports.
+fn settled(name: &str, body: &str) -> String {
+    let (reg, host) = host();
+    let probe = format!("{name}_probe");
     load(
         &host,
+        name,
+        &format!(
+            "result = 'unset'\n{body}\n{}",
+            probe_tool(&probe, "return tostring(result)")
+        ),
+    );
+    host.drain_tasks_for_test();
+    exec_tool(&reg, &probe)
+}
+
+#[test]
+fn exec_autocmds_pattern_routing_and_ev_shape() {
+    let result = settled(
         "ev_shape",
         r#"
 local got, unfiltered = {}, 0
 maki.api.create_autocmd("User", { callback = function() unfiltered = unfiltered + 1 end })
-maki.api.create_autocmd("User", { pattern = "deploy", callback = function(ev)
-    got[#got + 1] = ev
+maki.api.create_autocmd("User", { pattern = "deploy", callback = function(ev, ctx)
+    got[#got + 1] = { ev = ev, ctx = ctx }
+end })
+maki.api.create_autocmd("Check", { callback = function()
+    assert(#got == 1, "only the matching pattern fires the filtered listener: " .. #got)
+    assert(unfiltered == 3, "unfiltered listener fires always: " .. unfiltered)
+    local ev = got[1].ev
+    assert(ev.event == "User", "ev.event: " .. tostring(ev.event))
+    assert(ev.match == "deploy", "ev.match: " .. tostring(ev.match))
+    assert(type(ev.data) == "table" and ev.data.n == 2, "data nested under ev.data")
+    assert(type(ev.id) == "number", "ev.id is the autocmd id")
+    assert(ev.agent == nil and got[1].ctx == nil, "a plugin event has no agent")
+    result = "ok"
 end })
 maki.api.exec_autocmds("User", { pattern = "other", data = { n = 1 } })
 maki.api.exec_autocmds("User")
-assert(#got == 0, "non-matching or absent pattern must not fire filtered listener")
 maki.api.exec_autocmds("User", { pattern = "deploy", data = { n = 2 } })
-assert(#got == 1, "matching pattern fires")
-assert(unfiltered == 3, "unfiltered listener fires always: " .. unfiltered)
-local ev = got[1]
-assert(ev.event == "User", "ev.event: " .. tostring(ev.event))
-assert(ev.match == "deploy", "ev.match: " .. tostring(ev.match))
-assert(type(ev.data) == "table" and ev.data.n == 2, "data nested under ev.data")
-assert(type(ev.id) == "number", "ev.id is the autocmd id")
+maki.api.create_autocmd("Ready", { once = true, callback = function()
+    maki.api.exec_autocmds("Check")
+end })
+maki.api.exec_autocmds("Ready")
 "#,
     );
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn exec_autocmds_returns_before_callbacks_run() {
+    let result = settled(
+        "ev_detached",
+        r#"
+local ran = false
+maki.api.create_autocmd("Later", { callback = function() ran = true end })
+maki.api.exec_autocmds("Later")
+result = tostring(ran)
+"#,
+    );
+    assert_eq!(result, "false");
 }
 
 #[test]
 fn autocmd_error_isolation() {
-    let (_reg, host) = host();
-    load(
-        &host,
+    let result = settled(
         "ev_isolation",
         r#"
-local ran = false
 maki.api.create_autocmd("Err", { callback = function() error("boom") end })
-maki.api.create_autocmd("Err", { callback = function() ran = true end })
+maki.api.create_autocmd("Err", { callback = function() result = "ran" end })
 maki.api.exec_autocmds("Err")
-assert(ran, "second callback runs after first errors")
 "#,
     );
+    assert_eq!(result, "ran");
 }
 
 #[test]
 fn once_callback_semantics() {
-    let (_reg, host) = host();
-    load(
-        &host,
+    let result = settled(
         "ev_once",
         r#"
 local n, filtered = 0, 0
@@ -136,39 +168,43 @@ end })
 maki.api.create_autocmd("Once", { once = true, pattern = "p", callback = function()
     filtered = filtered + 1
 end })
+maki.api.create_autocmd("Count", { callback = function()
+    result = n .. "/" .. filtered
+end })
 maki.api.exec_autocmds("Once")
-assert(n == 1, "reentrant refire: once callback ran " .. n .. " times")
-assert(filtered == 0)
 maki.api.exec_autocmds("Once", { pattern = "p" })
 maki.api.exec_autocmds("Once", { pattern = "p" })
-assert(n == 1, "consumed once entry must stay consumed")
-assert(filtered == 1, "non-matching fire must not consume a once entry: " .. filtered)
+maki.api.exec_autocmds("Count")
 "#,
     );
+    assert_eq!(result, "1/1");
 }
 
 #[test]
 fn mutual_recursion_stops_at_depth_guard() {
-    let (_reg, host) = host();
-    load(
-        &host,
+    let result = settled(
         "ev_mutual",
         r#"
 local x, y = 0, 0
-maki.api.create_autocmd("X", { callback = function() x = x + 1; maki.api.exec_autocmds("Y") end })
-maki.api.create_autocmd("Y", { callback = function() y = y + 1; maki.api.exec_autocmds("X") end })
+maki.api.create_autocmd("X", { callback = function()
+    x = x + 1
+    result = x .. "/" .. y
+    maki.api.exec_autocmds("Y")
+end })
+maki.api.create_autocmd("Y", { callback = function()
+    y = y + 1
+    result = x .. "/" .. y
+    maki.api.exec_autocmds("X")
+end })
 maki.api.exec_autocmds("X")
-assert(x > 1, "reentrant cross-event dispatch must nest, got " .. x)
-assert(x == y and x < 100, "bounded by depth guard, got x=" .. x .. " y=" .. y)
 "#,
     );
+    assert_eq!(result, "4/4");
 }
 
 #[test]
 fn ev_table_fresh_per_callback() {
-    let (_reg, host) = host();
-    load(
-        &host,
+    let result = settled(
         "ev_fresh",
         r#"
 local first_saw, second_saw
@@ -177,27 +213,30 @@ maki.api.create_autocmd("Fresh", { callback = function(ev)
     first_saw = ev.injected
 end })
 maki.api.create_autocmd("Fresh", { callback = function(ev) second_saw = ev.injected end })
+maki.api.create_autocmd("Done", { callback = function()
+    result = tostring(first_saw) .. "/" .. tostring(second_saw)
+end })
 maki.api.exec_autocmds("Fresh")
-assert(first_saw == true and second_saw == nil, "ev mutation must not leak to next callback")
+maki.api.exec_autocmds("Done")
 "#,
     );
+    assert_eq!(result, "true/nil");
 }
 
 #[test]
 fn del_autocmd_stops_delivery() {
-    let (_reg, host) = host();
-    load(
-        &host,
+    let result = settled(
         "ev_del",
         r#"
 local n = 0
 local id = maki.api.create_autocmd("Del", { callback = function() n = n + 1 end })
-maki.api.exec_autocmds("Del")
 maki.api.del_autocmd(id)
 maki.api.exec_autocmds("Del")
-assert(n == 1, "deleted autocmd must not fire")
+maki.api.create_autocmd("Count", { callback = function() result = tostring(n) end })
+maki.api.exec_autocmds("Count")
 "#,
     );
+    assert_eq!(result, "0");
 }
 
 #[test]
@@ -236,6 +275,7 @@ maki.api.exec_autocmds("User", { pattern = "deploy", data = { msg = "hi" } })
 maki.api.exec_autocmds("User", { pattern = "nope", data = { msg = "skipped" } })
 "#,
     );
+    host.drain_tasks_for_test();
     assert_eq!(exec_tool(&reg, "probe_events"), "User|deploy|hi");
 }
 
@@ -255,6 +295,7 @@ end }})
     load(&host, "listener", &listener);
     host.event_handle()
         .fire_autocmd("TurnEnd", serde_json::json!({ "k": "v" }));
+    host.drain_tasks_for_test();
     assert_eq!(exec_tool(&reg, "probe_turn_end"), "TurnEnd|nil|v");
 }
 
@@ -275,6 +316,7 @@ maki.api.create_autocmd("Shared", {{ callback = function() n = n + 1 end }})
     load(&host, "gone", &listener("probe_gone"));
     host.unload("gone").unwrap();
     load(&host, "firer", r#"maki.api.exec_autocmds("Shared")"#);
+    host.drain_tasks_for_test();
     assert_eq!(exec_tool(&reg, "probe_keep"), "1");
 }
 

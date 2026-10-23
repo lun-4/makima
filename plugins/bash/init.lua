@@ -293,8 +293,10 @@ local opts = maki.api.register_options(output_limits.extend({
   },
 }))
 
-local auto_mode = maki.api.register_session_option({
-  id = "bash.auto_mode",
+local AUTO_MODE = "bash.auto_mode"
+
+maki.api.register_session_option({
+  id = AUTO_MODE,
   name = "Bash auto mode",
   description = "Classify every bash command before executing it",
   category = "mode",
@@ -307,33 +309,49 @@ local auto_mode = maki.api.register_session_option({
 })
 
 -- Sessionless contexts (`maki index`, an embedding host with no coordinator)
--- have no per-session value to read. They still run bash, so fall back to the
+-- have no session options. They still run bash, so fall back to the
 -- configured default rather than refusing to execute.
-local function auto_mode_enabled(session_id)
-  local target = session_id and { session = session_id } or nil
-  local value, err = auto_mode:get(target)
-  if not value then
-    if session_id then
-      return nil, err
-    end
-    return opts.auto_mode and true or false, nil
+local function auto_mode_enabled(options)
+  local value = options and options[AUTO_MODE]
+  if value == nil then
+    return opts.auto_mode and true or false
   end
-  return value == "enabled", nil
+  return value == "enabled"
+end
+
+-- The session options of the agent {ctx} runs for; nil without an error when
+-- there is no agent.
+local function session_options(ctx)
+  local agent = ctx:agent()
+  if not agent then
+    return nil, nil
+  end
+  local config, err = agent:config(ctx)
+  if not config then
+    return nil, err
+  end
+  return config.options, nil
 end
 
 maki.api.register_command({
   name = "/automode",
   description = "Toggle bash auto mode (classifier gates every bash command)",
   tui_only = false,
-  handler = function()
-    local enabled, err = auto_mode_enabled()
-    if enabled == nil then
+  handler = function(_, ctx)
+    local agent, err = ctx and ctx:agent()
+    if not agent then
+      maki.ui.flash(err or "no agent")
+      return
+    end
+    local config
+    config, err = agent:config(ctx)
+    if not config then
       maki.ui.flash(err)
       return
     end
-    local value = enabled and "disabled" or "enabled"
+    local value = auto_mode_enabled(config.options) and "disabled" or "enabled"
     local ok
-    ok, err = auto_mode:set(value)
+    ok, err = agent:set_option(ctx, AUTO_MODE, value)
     if not ok then
       maki.ui.flash(err)
       return
@@ -379,14 +397,7 @@ maki.api.register_tool({
     },
   },
   permission_scopes = function(input, ctx)
-    if not ctx or not ctx.session_id then
-      return command_scopes(input.command)
-    end
-    local enabled = auto_mode_enabled(ctx.session_id)
-    if enabled == nil then
-      return command_scopes(input.command)
-    end
-    if enabled then
+    if ctx and ctx.session_id and auto_mode_enabled(ctx.options) then
       return nil
     end
     return command_scopes(input.command)
@@ -446,14 +457,11 @@ maki.api.register_tool({
     local timeout_secs = input.timeout or opts.timeout_secs
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
 
-    local session_id, session_err = ctx:session_id()
-    if session_err then
-      return { llm_output = session_err, is_error = true }
+    local options, options_err = session_options(ctx)
+    if options_err then
+      return { llm_output = options_err, is_error = true }
     end
-    local enabled, option_err = auto_mode_enabled(session_id)
-    if enabled == nil then
-      return { llm_output = option_err, is_error = true }
-    end
+    local enabled = auto_mode_enabled(options)
 
     local auto_annotation
     if enabled then
@@ -463,7 +471,7 @@ maki.api.register_tool({
         -- fall through to the jobstart path unchanged
       else
         local failure = reason or err or "no classifier verdict"
-        if maki.agent.is_yolo(ctx) then
+        if options and options.yolo == "enabled" then
           return {
             llm_output = "command denied by auto-mode: " .. failure,
             is_error = true,

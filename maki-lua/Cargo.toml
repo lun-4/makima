@@ -95,7 +95,7 @@ maki-lua = { path = ".", features = ["test-support"] }
 base64 = { workspace = true }
 criterion = { workspace = true }
 image = { workspace = true }
-maki-agent = { workspace = true }
+maki-agent = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 test-case = { workspace = true }
 tracing-subscriber = { workspace = true }

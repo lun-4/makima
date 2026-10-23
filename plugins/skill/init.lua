@@ -8,8 +8,9 @@ local helpers = require("skill_helpers")
 local parse_frontmatter = helpers.parse_frontmatter
 local build_skill_list = helpers.build_skill_list
 
+local MAKIMA_SKILL_DIR = ".makima/skills"
 local PROJECT_SKILL_DIRS = {
-  ".makima/skills",
+  MAKIMA_SKILL_DIR,
   ".claude/skills",
   ".opencode/skills",
   ".agents/skills",
@@ -122,9 +123,12 @@ local function discover_skills(cwd)
     end
   end
 
+  local no_project = maki.env.no_project()
   for _, ancestor in ipairs(find_project_ancestors(cwd)) do
     for _, rel in ipairs(PROJECT_SKILL_DIRS) do
-      scan_skill_dir(maki.fs.joinpath(ancestor, rel), skills)
+      if not (no_project and rel == MAKIMA_SKILL_DIR) then
+        scan_skill_dir(maki.fs.joinpath(ancestor, rel), skills)
+      end
     end
   end
 

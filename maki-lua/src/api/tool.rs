@@ -26,18 +26,20 @@ use maki_agent::{
     TextOutput, ToolOutput,
 };
 use maki_commands::{
-    ArgumentKind, CommandArguments, CommandContent, CommandError, CommandOutcome, CompletionPolicy,
-    InputDispatch, PositionalArgument,
+    ArgumentKind, CommandArguments, CommandContent, CompletionPolicy, PositionalArgument,
 };
 use maki_config::{AgentConfig, Effect, Permission, PermissionRule, ToolKey, ToolOutputLines};
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_storage::id::SessionRef;
 use mlua::{
-    Function, Lua, LuaSerdeExt, MultiValue, RegistryKey, Result as LuaResult, Table,
+    Function, Lua, LuaSerdeExt, MultiValue, RegistryKey, Result as LuaResult, Table, UserDataRef,
     Value as LuaValue,
 };
 use serde_json::{Value, json};
 
+use crate::agent_errors::{
+    DELEGATED_REGISTRATION, NO_ORCHESTRATION_SERVICES, TRUSTED_RUN_COMMAND_REQUIRED,
+};
 use crate::api::PluginLoadContext;
 use crate::api::completion::add_completion_fns;
 use crate::api::options::{PluginOpts, register_options__doc, register_options__register};
@@ -45,11 +47,12 @@ use crate::api::session_option::add_session_option_fn;
 use crate::api::ui::buf::{BufHandle, line_to_lua};
 use crate::api::util::command::{
     ArgumentCompletion, ArgumentCompletionNavigation, CommandEntry, CommandHandlerMap,
-    PendingCommandMap, UiAction, ui_roundtrip,
+    PendingCommandMap,
 };
 use crate::api::util::convert::{json_to_lua, lua_to_json};
 use crate::api::util::ctx::LuaCtx;
-use crate::api::util::pair::{Pair, try_pair};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::orchestration::{TrustedTarget, detached_outcome, services};
 use crate::plugin_permissions::PluginPermissions;
 use crate::runtime::{
     HintContent, LiveCtx, PromptHintRegistration, Request, command_depth, command_invocation,
@@ -137,7 +140,7 @@ fn local_tool_handles(tool: &str) -> Option<ToolHandles> {
 
 fn dctx_json(ctx: &DescriptionContext) -> Value {
     let mut obj = json!({
-        "audience": ctx.audience.name().unwrap_or("main"),
+        "audience": if ctx.audience.is_empty() { "reference" } else { ctx.audience.name().unwrap_or("main") },
         "workflow": ctx.workflow,
         "mcp": ctx.mcp,
     });
@@ -783,7 +786,6 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///                                llm_output  (string)  Text sent to the model.
 ///                                is_error    (boolean) When true, the result is treated as an error.
 ///                                output_limits (table) Bounds raw plain-text `llm_output` after the handler or `ctx:finish` returns.
-///                                content     (string)  Alias for llm_output (legacy).
 ///                                body        (BufHandle) Rich rendered body shown in the UI.
 ///                                header      (BufHandle) One-line header shown before the body.
 ///                                format      (string)  "plain" (default) or "markdown".
@@ -803,7 +805,7 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///   start           (function) Optional. Called when the tool call starts, before the handler runs.
 ///   describe        (function) Optional. Returns a custom description string for the current context.
 ///   examples        (table)    Optional. Array of example input objects for documentation.
-///   permission_scopes (string|function) Field name in schema (string) or `function(input, ctx)` returning a list of path scopes that need write permission. `ctx.session_id` identifies the invocation session when available.
+///   permission_scopes (string|function) Field name in schema (string) or `function(input, ctx)` returning a list of path scopes that need write permission. `ctx.session_id` identifies the invocation session when available, and `ctx.options` maps its session option ids to their values.
 ///   mutable_path    (string|function) Schema field name (type: string) for the primary path the tool writes, or `function(input, ctx)` returning the resolved target path (nil when the call does not mutate). `ctx.cwd` is the invocation session's working directory. When dispatched through the agent, tools declaring a `mutable_path` participate in same-process per-path mutation serialization: concurrent calls mutating the same normalized path run in non-overlapping order. Recursive same-path reentry from inside a locked mutable tool is unsupported and fails with `same-path mutation is already in progress`.
 ///   start_annotation (string|table) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 ///
@@ -1024,8 +1026,16 @@ fn allow_is_delegated(
 ///   arguments   (table)    Use `{ raw = true }` for an unparsed argument
 ///                          remainder. Add `required = true` to reject empty
 ///                          input. Raw handlers receive `opts.args` only.
-///   handler     (function) Required. Called with one opts table after the
-///                          command arguments pass validation. `opts.args` is
+///   handler     (function) Required. Called as `handler(opts, ctx)` after the
+///                          command arguments pass validation. `ctx` is a trusted
+///                          invocation-scoped LuaCtx, or nil if the host has no
+///                          agent target. `ctx:agent()` resolves its
+///                          pinned agent; later focus changes do not retarget it.
+///                          Retaining ctx does not extend its authority beyond
+///                          the handler. Existing one-argument handlers still work.
+///                          The command finishes when the handler returns, and
+///                          fails with the handler's error if it raises.
+///                          `opts.args` is
 ///                          the outer-trimmed original argument remainder. It
 ///                          keeps inner whitespace and source quotes. For typed
 ///                          commands, `opts.fargs` is the decoded token array
@@ -1054,6 +1064,7 @@ fn allow_is_delegated(
 ///                            and the command completion context. Raw commands do
 ///                            not have argument completion providers.
 /// @return
+/// @return (boolean|nil, string|nil) true, or nil and an error. Returns nil and an error when called from a delegated tool handler.
 /// @example
 /// -- Documentation and test example. It is not bundled and never copies files.
 /// local recorded
@@ -1088,8 +1099,14 @@ fn register_command(
     #[ctx] pending: PendingCommandMap,
     #[ctx] plugin: Arc<str>,
     spec: Table,
-) -> LuaResult<()> {
-    register_command_from_lua(lua, &spec, plugin, pending)
+) -> LuaResult<Pair<bool>> {
+    if crate::runtime::in_delegated_tool(lua) {
+        return Ok(err_pair(DELEGATED_REGISTRATION));
+    }
+    try_pair!(crate::runtime::validate_plugin_effect(lua));
+    let registered = || -> LuaResult<()> { register_command_from_lua(lua, &spec, plugin, pending) };
+    registered()?;
+    Ok((Some(true), None))
 }
 
 /// Runs a slash command by name, as the explicit name-based executor: the
@@ -1108,26 +1125,32 @@ fn register_command(
 /// reports an error instead of running the closest command, and a cycle of
 /// aliases stops with one too.
 ///
-/// This returns as soon as the command has been dispatched, not when it
-/// finishes, so aliasing something long-running like `/compact` does not
-/// block your handler.
+/// The call waits for the command's handler and returns its error when it
+/// fails. A model turn, `/compact` or another long command it starts keeps
+/// running after the call returns, so aliasing `/compact` does not block
+/// your handler.
 ///
-/// Called from inside another command's handler there is no frontend waiting
-/// on the result, so a command that needs one to run it -- a model turn, a
-/// custom Markdown command, `/compact`, `/btw`, `/cd` -- reports an error
-/// instead of pretending it ran. Call it from a keybinding or an autocmd if
-/// you need those.
+/// The command runs on the agent {ctx} is pinned to, through the frontend's
+/// own command target for it, the same way in every frontend: a model turn
+/// starts on that agent's session. Only `/btw` needs the TUI, because its
+/// answer has nowhere else to show. Inside another command's handler the
+/// nested command shares that handler's invocation, so one that needs more
+/// than its handler -- a model turn, a custom Markdown command, `/compact`,
+/// `/btw` -- reports an error instead of pretending it ran. Call it from a
+/// keybinding or an autocmd if you need those. Only a trusted ctx (command,
+/// keymap, autocmd) can run commands; delegated tool handlers cannot.
 ///
+/// @param ctx LuaCtx? Trusted context naming the agent to run the command for. Required outside a command handler; a nested call shares its handler's invocation.
 /// @param cmdline string Command line, e.g. `"/new"` or `"/cd ~/src"`.
-/// @return (boolean|nil, string|nil) `true` once dispatched, or nil and an error message if the command is unknown or cannot run here.
+/// @return (boolean|nil, string|nil) `true` once the command ran, or nil and an error message if it is unknown, failed or cannot run here.
 /// @example
 /// -- /resume as an alias for the built-in session picker:
 /// maki.api.register_command({
 ///   name = "/resume",
 ///   description = "Alias for /sessions",
 ///   tui_only = false,
-///   handler = function()
-///     local ok, err = maki.api.run_command("/sessions")
+///   handler = function(_, ctx)
+///     local ok, err = maki.api.run_command(ctx, "/sessions")
 ///     if not ok then
 ///       maki.ui.flash("could not run /sessions: " .. err)
 ///     end
@@ -1136,9 +1159,13 @@ fn register_command(
 #[lua_fn]
 async fn run_command(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    ctx: Option<UserDataRef<LuaCtx>>,
     cmdline: String,
 ) -> LuaResult<Pair<bool>> {
+    if crate::runtime::in_delegated_tool(&lua) {
+        return Ok(err_pair(TRUSTED_RUN_COMMAND_REQUIRED));
+    }
+    try_pair!(crate::runtime::validate_plugin_effect(&lua));
     let depth = command_depth(&lua).saturating_add(1);
     let cmdline = format!("/{}", cmdline.trim().trim_start_matches('/'));
     if let Some(invocation) = command_invocation(&lua) {
@@ -1146,43 +1173,22 @@ async fn run_command(
             .invocation
             .dispatch(CommandContent::from(cmdline.as_str()))
             .await;
-        try_pair!(nested_dispatch_result(&cmdline, result));
-    } else {
-        let reply = try_pair!(
-            ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::RunCommand {
-                cmdline,
-                depth,
-                reply_tx,
-            })
-            .await
-        );
-        try_pair!(reply);
+        try_pair!(detached_outcome(&cmdline, result));
+        return Ok((Some(true), None));
     }
+    let Some(ctx) = ctx else {
+        return Ok(err_pair(TRUSTED_RUN_COMMAND_REQUIRED));
+    };
+    let trusted = try_pair!(ctx.trusted(&lua).map_err(|_| TRUSTED_RUN_COMMAND_REQUIRED));
+    let target = TrustedTarget {
+        target: trusted.target.clone(),
+        template: trusted.template.clone(),
+    };
+    drop(ctx);
+    let services = try_pair!(services(&lua).ok_or(NO_ORCHESTRATION_SERVICES));
+    let run = try_pair!(services.command_runner(&target.target));
+    try_pair!(run(cmdline, depth, target).await);
     Ok((Some(true), None))
-}
-
-const NESTED_NEEDS_FRONTEND: &str =
-    "needs a frontend to run it and cannot be nested inside another command";
-
-/// A nested dispatch has no frontend behind it: the outcome comes back here
-/// and stops. Only `Completed` is actually finished by the time it arrives, so
-/// every outcome that still needs a frontend to run it is an error rather than
-/// a `true` the caller would read as "it ran".
-fn nested_dispatch_result(cmdline: &str, result: InputDispatch) -> Result<(), String> {
-    match result {
-        InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::UnknownCommand(_))) => {
-            Err("unknown command".to_owned())
-        }
-        InputDispatch::Dispatched(CommandOutcome::Failed(error)) => Err(error.to_string()),
-        InputDispatch::Dispatched(CommandOutcome::Completed) => Ok(()),
-        InputDispatch::Dispatched(
-            CommandOutcome::AgentTurn(_)
-            | CommandOutcome::IsolatedTurn(_)
-            | CommandOutcome::ManualCompaction(_)
-            | CommandOutcome::FrontendFeedback(_),
-        ) => Err(format!("{cmdline} {NESTED_NEEDS_FRONTEND}")),
-        InputDispatch::LiteralInput(_) => Err("unknown command".to_owned()),
-    }
 }
 
 /// Add a piece of text to an aggregate prompt slot. Multiple plugins can each
@@ -1387,7 +1393,6 @@ pub(crate) fn create_api_table(
     context: PluginLoadContext,
     plugin: Arc<str>,
     opts: PluginOpts,
-    ui_action_tx: Option<flume::Sender<UiAction>>,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
     add_tool_fns(
@@ -1408,13 +1413,8 @@ pub(crate) fn create_api_table(
         context.pending_sources.clone(),
         context.pending_expanders.clone(),
     )?;
-    add_session_option_fn(
-        &t,
-        lua,
-        context.pending_session_options.clone(),
-        ui_action_tx.clone(),
-    )?;
-    run_command__register(&t, lua, ui_action_tx)?;
+    add_session_option_fn(&t, lua, context.pending_session_options.clone())?;
+    run_command__register(&t, lua)?;
     Ok(t)
 }
 
@@ -2496,11 +2496,7 @@ fn extract_instructions(t: &mlua::Table) -> Option<Vec<InstructionBlock>> {
 }
 
 fn extract_tool_output(t: &Table) -> mlua::Result<Option<String>> {
-    let output = match t.get::<LuaValue>("llm_output")? {
-        LuaValue::Nil => t.get::<LuaValue>("content")?,
-        output => output,
-    };
-    match output {
+    match t.get::<LuaValue>("llm_output")? {
         LuaValue::Nil => Ok(None),
         LuaValue::String(output) => output.to_str().map(|output| Some(output.to_owned())),
         _ => Err(mlua::Error::runtime("tool output must be a string")),
@@ -2889,47 +2885,6 @@ mod tests {
         );
     }
 
-    #[test_case::test_case(false; "success")]
-    #[test_case::test_case(true; "error")]
-    fn coerce_legacy_content_preserves_result_kind(is_error: bool) {
-        let lua = Lua::new();
-        let t = lua.create_table().unwrap();
-        t.set("content", "body").unwrap();
-        t.set("is_error", is_error).unwrap();
-        assert_eq!(
-            coerce_tool_result(&LuaValue::Table(t)),
-            if is_error {
-                Err("body".to_owned())
-            } else {
-                Ok("body".to_owned())
-            }
-        );
-    }
-
-    #[test]
-    fn coerce_llm_output_precedes_legacy_content() {
-        let lua = Lua::new();
-        let t = lua.create_table().unwrap();
-        t.set("llm_output", "primary").unwrap();
-        t.set("content", "legacy").unwrap();
-        assert_eq!(
-            coerce_tool_result(&LuaValue::Table(t)),
-            Ok("primary".to_owned())
-        );
-    }
-
-    #[test]
-    fn coerce_unsupported_llm_output_does_not_fall_back_to_content() {
-        let lua = Lua::new();
-        let t = lua.create_table().unwrap();
-        t.set("llm_output", false).unwrap();
-        t.set("content", "legacy").unwrap();
-        assert_eq!(
-            coerce_tool_result(&LuaValue::Table(t)),
-            Err(TOOL_HANDLER_RETURN_ERR.to_owned())
-        );
-    }
-
     #[test]
     fn coerce_error_paths() {
         let lua = Lua::new();
@@ -3164,17 +3119,6 @@ mod tests {
         }
 
         let reply = lua.create_table().unwrap();
-        reply.set("content", "legacy body").unwrap();
-        reply
-            .set("output_limits", lua.create_table().unwrap())
-            .unwrap();
-        let parsed = ToolCallReply::from_lua_value(&lua, &LuaValue::Table(reply));
-        assert!(
-            parsed.result.is_err(),
-            "content alias must not satisfy llm_output"
-        );
-
-        let reply = lua.create_table().unwrap();
         reply
             .set("llm_output", lua.create_string(&[0xff][..]).unwrap())
             .unwrap();
@@ -3328,53 +3272,5 @@ mod tests {
         };
         let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
         smol::block_on(inv.start(&ctx));
-    }
-
-    #[test_case::test_case(
-        InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::UnknownCommand(
-            Arc::from("/bogus")
-        ))),
-        Err("unknown command".to_owned()) ;
-        "unknown command is rejected"
-    )]
-    #[test_case::test_case(
-        InputDispatch::Dispatched(CommandOutcome::Completed),
-        Ok(()) ;
-        "dispatched command succeeds"
-    )]
-    #[test_case::test_case(
-        InputDispatch::LiteralInput(CommandContent::from("prose")),
-        Err("unknown command".to_owned()) ;
-        "literal input is not a command"
-    )]
-    #[test_case::test_case(
-        InputDispatch::Dispatched(CommandOutcome::AgentTurn(maki_commands::AgentTurn {
-            content: CommandContent::from("review this"),
-            prompt: None,
-        })),
-        Err(format!("/nested {NESTED_NEEDS_FRONTEND}")) ;
-        "an agent turn has no frontend to run it"
-    )]
-    #[test_case::test_case(
-        InputDispatch::Dispatched(CommandOutcome::IsolatedTurn(maki_commands::IsolatedTurn {
-            content: CommandContent::from("why?"),
-        })),
-        Err(format!("/nested {NESTED_NEEDS_FRONTEND}")) ;
-        "an isolated turn has no frontend to run it"
-    )]
-    #[test_case::test_case(
-        InputDispatch::Dispatched(CommandOutcome::ManualCompaction(None)),
-        Err(format!("/nested {NESTED_NEEDS_FRONTEND}")) ;
-        "manual compaction has no frontend to run it"
-    )]
-    #[test_case::test_case(
-        InputDispatch::Dispatched(CommandOutcome::FrontendFeedback(
-            maki_commands::FrontendFeedback::Text(Arc::from("use session/new")),
-        )),
-        Err(format!("/nested {NESTED_NEEDS_FRONTEND}")) ;
-        "frontend feedback has no frontend to show it"
-    )]
-    fn nested_dispatch_result_maps_outcomes(result: InputDispatch, expected: Result<(), String>) {
-        assert_eq!(nested_dispatch_result("/nested", result), expected);
     }
 }

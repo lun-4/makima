@@ -6,17 +6,20 @@ use crate::chat::{Chat, DONE_TEXT, history_to_display};
 use crate::components::DisplayRole;
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::{Action, SessionReplacementKind, SessionReplacementRequest};
+use maki_agent::HistorySnapshot;
+use maki_agent::actor::HistoryChange;
 use maki_agent::agent::estimate_message_tokens;
 #[cfg(test)]
 use maki_providers::Model;
 use maki_storage::id::MakiId;
-use maki_storage::sessions::{SessionMeta, StoredSubagent};
+use maki_storage::sessions::{SessionMeta, StoredPost, StoredSubagent};
 
 use crate::AppSession;
 use maki_providers::RequestOptions;
 
 #[cfg(test)]
 use super::PendingInput;
+use super::mode::Mode;
 #[cfg(test)]
 use super::session_state::SessionState;
 use super::session_state::rules_to_stored;
@@ -26,6 +29,8 @@ use super::{App, Status};
 
 /// The shortest gap between two writes that carry only UI state.
 const SOFT_SAVE_DELAY: Duration = Duration::from_millis(1000);
+const FLASH_AGENT_UNAVAILABLE: &str = "agent is no longer available";
+const FLASH_REWIND_UNAVAILABLE: &str = "rewind selection is no longer available";
 
 /// What `App::checkpoint` last handed to the writer: which session, how far
 /// along it was, and when. The id is part of it because a session swapped into
@@ -69,7 +74,27 @@ impl App {
         self.checkpoint_with(Duration::ZERO);
     }
 
+    pub(crate) fn sync_live_children(&self) {
+        self.storage_writer
+            .set_live_children(self.state.session.id, self.live_child_keys());
+    }
+
+    fn live_child_keys(&self) -> Vec<String> {
+        self.chats
+            .iter()
+            .filter(|chat| {
+                chat.agent_id.is_some_and(|id| {
+                    self.subagent_channels
+                        .get(&id)
+                        .is_some_and(|channels| !channels.closed)
+                })
+            })
+            .filter_map(|chat| chat.subagent_id.clone())
+            .collect()
+    }
+
     pub(super) fn checkpoint_with(&mut self, soft_delay: Duration) {
+        self.sync_live_children();
         let snapshot = self.shared_history.as_ref().map(|h| h.load_full());
         let meta = self.build_meta();
         AppSession::checkpoint(
@@ -123,22 +148,24 @@ impl App {
     /// and an empty `Vec` does not allocate.
     pub(super) fn build_meta(&self) -> SessionMeta {
         let state = &self.state;
+        let config = self.root_config();
         let draft = self.input_box.buffer.value();
         SessionMeta {
-            mode: Some(state.mode.clone().into()),
+            compacted: state.session.meta.compacted,
+            mode: Some(Mode::from(&config.mode).into()),
             plan_path: state.plan.path().map(|p| p.to_string_lossy().into_owned()),
             plan_written: state.plan.is_ready(),
             session_rules: rules_to_stored(&self.permissions.session_rules_snapshot()),
             context_size: state.context_size,
             input_draft: (!draft.is_empty()).then_some(draft),
             queued_messages: if self.recoverable_queue.is_empty() {
-                self.queue.text_messages()
+                self.queue.root_text_messages()
             } else {
                 self.recoverable_queue.clone()
             },
-            thinking: Some(state.thinking.into()),
-            fast: state.fast_intent(),
-            workflow: state.workflow,
+            thinking: Some(config.thinking.into()),
+            fast: config.fast || state.fast_pending,
+            workflow: config.workflow,
             yolo: self.permissions.persisted_yolo(),
             session_options: Default::default(),
         }
@@ -176,6 +203,7 @@ impl App {
     pub(super) fn reset_ui_chrome(&mut self) {
         let _ = self.cancel_middle_scroll();
         let splash_frame = self.chats.first().and_then(Chat::splash_frame).cloned();
+        let root = self.chats.first().and_then(|chat| chat.agent_id);
         self.chats.clear();
         let mut main = Chat::new(
             "Main".into(),
@@ -185,6 +213,7 @@ impl App {
         );
         main.set_restore_channel(self.restore_event_tx.clone());
         main.set_splash_frame(splash_frame);
+        main.agent_id = root;
         self.chats.push(main);
         self.active_chat = 0;
         self.chat_index.clear();
@@ -192,7 +221,7 @@ impl App {
         self.terminal_subagents.clear();
         self.status = super::Status::Idle;
         self.clear_exit_request();
-        self.queue.clear();
+        self.queue.clear_root_user_work();
         self.recoverable_queue.clear();
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
@@ -212,6 +241,7 @@ impl App {
             self.state.session.messages(),
             self.state.session.tool_outputs(),
             &self.ui_config.tool_output_lines,
+            &posts_in(self.state.session.posts(), None),
         );
         self.main_chat().load_messages(display_msgs);
         let cost = self.state.cost;
@@ -240,6 +270,7 @@ impl App {
                 Arc::clone(&self.theme_provider),
             );
             chat.set_restore_channel(self.restore_event_tx.clone());
+            chat.subagent_id = Some(sa.tool_use_id.clone());
             chat.model_id = sa.model;
             chat.opts = sa.thinking.map(|thinking| RequestOptions {
                 thinking: thinking.into(),
@@ -250,6 +281,7 @@ impl App {
                     messages,
                     self.state.session.tool_outputs(),
                     &self.ui_config.tool_output_lines,
+                    &posts_in(self.state.session.posts(), Some(&sa.tool_use_id)),
                 );
                 chat.load_messages(display);
                 chat.mark_finished(DisplayRole::Done, DONE_TEXT);
@@ -282,8 +314,7 @@ impl App {
     }
 
     /// Resume at process start: the agent was already spawned with this
-    /// history, so no respawn follows and the restored queue must be
-    /// flushed here.
+    /// history, so the restored queue must be flushed here.
     pub(crate) fn restore_resumed_session(&mut self) {
         self.permissions
             .set_session_yolo(self.state.session.meta.yolo);
@@ -298,11 +329,12 @@ impl App {
         self.checkpoint_now();
         let ended_id = self.state.session.id;
         let mut session = AppSession::new(&self.state.session.model, &self.state.session.cwd);
-        session.meta.mode = Some(self.state.mode.clone().into());
+        let config = self.root_config();
+        session.meta.mode = Some(Mode::from(&config.mode).into());
         session.meta.session_rules = self.state.session.meta.session_rules.clone();
-        session.meta.thinking = Some(self.state.thinking.into());
-        session.meta.fast = self.state.fast_intent();
-        session.meta.workflow = self.state.workflow;
+        session.meta.thinking = Some(config.thinking.into());
+        session.meta.fast = config.fast || self.state.fast_pending;
+        session.meta.workflow = config.workflow;
         session.meta.yolo = self.permissions.persisted_yolo();
         vec![Action::ReplaceSession(Box::new(
             SessionReplacementRequest {
@@ -313,7 +345,13 @@ impl App {
     }
 
     pub(super) fn open_rewind_picker(&mut self) -> Vec<Action> {
-        match self.rewind_picker.open(self.state.session.messages()) {
+        let result = self
+            .command_runtime
+            .target_agent(&self.command_target)
+            .filter(|target| Some(target.id()) == self.selected_agent_id())
+            .ok_or_else(|| FLASH_AGENT_UNAVAILABLE.to_owned())
+            .and_then(|target| self.rewind_picker.open_actor(target));
+        match result {
             Ok(()) => vec![],
             Err(msg) => {
                 self.status_bar.flash(msg);
@@ -323,25 +361,85 @@ impl App {
     }
 
     pub(super) fn rewind_to(&mut self, entry: RewindEntry) -> Vec<Action> {
-        self.checkpoint_now();
-        let baseline = self
-            .state
+        if let Some((target, boundary)) = self.rewind_picker.target_boundary(entry.turn_index) {
+            return vec![Action::RewindAgent { target, boundary }];
+        }
+        self.flash(FLASH_REWIND_UNAVAILABLE.into());
+        vec![]
+    }
+
+    pub(crate) fn apply_history_change(&mut self, change: HistoryChange) {
+        let Some(index) = self
+            .chats
+            .iter()
+            .position(|chat| chat.agent_id == Some(change.agent_id))
+        else {
+            return;
+        };
+        let draft = change.draft.user_text().unwrap_or("").to_owned();
+        let baseline = self.chats[index]
             .context_size
-            .saturating_sub(estimate_message_tokens(self.state.session.messages()));
-        let mut session = self.state.session.as_ref().clone();
-        session.truncate_messages(entry.turn_index);
-        session.prune_orphans(|m| m.tool_uses().map(|(id, _, _)| id.to_owned()).collect());
-        session.update_title_if_default();
-        let kept = estimate_message_tokens(session.messages());
-        session.meta.context_size = if kept == 0 { 0 } else { baseline + kept };
-        session.meta.input_draft = Some(entry.prompt_text);
-        session.meta.queued_messages.clear();
-        vec![Action::ReplaceSession(Box::new(
-            SessionReplacementRequest {
-                session,
-                kind: SessionReplacementKind::Rewind,
-            },
-        ))]
+            .saturating_sub(if index == 0 {
+                estimate_message_tokens(self.state.session.messages())
+            } else {
+                self.chats[index]
+                    .subagent_id
+                    .as_ref()
+                    .and_then(|key| self.state.session.subagent_messages().get(key))
+                    .map_or(0, |messages| estimate_message_tokens(messages))
+            });
+        let context_size = baseline.saturating_add(estimate_message_tokens(&change.messages));
+        if index == 0 {
+            let baseline = self
+                .state
+                .context_size
+                .saturating_sub(estimate_message_tokens(self.state.session.messages()));
+            self.state
+                .session_mut()
+                .replace_shared_messages(Arc::clone(&change.messages));
+            self.state.context_size =
+                baseline.saturating_add(estimate_message_tokens(&change.messages));
+            self.state.session_mut().meta.input_draft = Some(draft.clone());
+        } else if let Some(key) = self.chats[index].subagent_id.clone()
+            && !self.state.session_mut().adopt_subagent_history(
+                key,
+                &HistorySnapshot {
+                    epoch: change.epoch,
+                    compacted: false,
+                    messages: Arc::clone(&change.messages),
+                },
+            )
+        {
+            return;
+        }
+        let chat = self.chats[index].subagent_id.clone();
+        self.state
+            .session_mut()
+            .prune_posts(chat.as_deref(), change.messages.len());
+        if index == 0 {
+            let live_children = self.live_child_keys();
+            self.state.session_mut().prune_orphans_preserving(
+                |message| {
+                    message
+                        .tool_uses()
+                        .map(|(id, _, _)| id.to_owned())
+                        .collect()
+                },
+                &live_children,
+            );
+        }
+        let (display, items) = history_to_display(
+            &change.messages,
+            self.state.session.tool_outputs(),
+            &self.ui_config.tool_output_lines,
+            &posts_in(self.state.session.posts(), chat.as_deref()),
+        );
+        self.chats[index].load_messages(display);
+        self.chats[index].context_size = context_size;
+        self.fire_restore_items(items);
+        self.refresh_at_ref_labels(&draft);
+        self.input_box.set_input(draft);
+        self.input_box.buffer.move_to_end();
     }
 
     #[cfg(test)]
@@ -351,8 +449,7 @@ impl App {
         self.permissions.set_session_yolo(session.meta.yolo);
         self.permissions
             .load_session_rules(stored_to_rules(&session.meta.session_rules));
-        self.state =
-            SessionState::from_session(session, fallback_model, &self.storage, &self.model_policy);
+        self.state = SessionState::from_session(session, fallback_model, &self.model_policy);
         for w in self.state.warnings.drain(..) {
             self.status_bar.flash(w);
         }
@@ -373,4 +470,11 @@ impl App {
             },
         ))]
     }
+}
+
+fn posts_in<'a>(posts: &'a [StoredPost], chat: Option<&str>) -> Vec<&'a StoredPost> {
+    posts
+        .iter()
+        .filter(|stored| stored.chat.as_deref() == chat)
+        .collect()
 }

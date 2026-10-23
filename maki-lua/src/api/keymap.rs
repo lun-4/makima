@@ -6,6 +6,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, RegistryKey, Result as LuaResult, Table};
 
+use crate::agent_errors::DELEGATED_REGISTRATION;
+use crate::api::util::pair::{Pair, err_pair, try_pair};
+
 static NEXT_KEYMAP_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug)]
@@ -348,9 +351,14 @@ fn loading(lua: &Lua, plugin: &str) -> bool {
 ///
 /// @param mode string Mode letter. Currently only `"n"` is accepted.
 /// @param lhs string Key in Vim notation, e.g. `"<C-t>"`, `"<Space>"`, `"a"`.
-/// @param rhs function Called when the key is pressed.
+/// @param rhs function Called as `rhs(nil, ctx)` when the key is pressed.
+///   `ctx` is a trusted invocation-scoped LuaCtx, or nil if the host has no
+///   agent target. Resolve the callback's agent with `ctx:agent()`.
+///   Later focus changes do not retarget an already resolved context. Retaining
+///   the context does not extend its authority beyond the callback.
 /// @param opts table? Options:
 ///   `desc` (string) short description shown in the keymap list.
+/// @return (boolean|nil, string|nil) true, or nil and an error. Returns nil and an error when called from a delegated tool handler.
 /// @example
 /// maki.keymap.set("n", "<C-t>", function()
 ///   print("toggle!")
@@ -364,36 +372,44 @@ fn set(
     lhs: String,
     rhs: mlua::Function,
     opts: Option<Table>,
-) -> LuaResult<()> {
-    if mode != "n" {
-        return Err(mlua::Error::runtime(format!(
-            "unsupported keymap mode: {mode}"
-        )));
+) -> LuaResult<Pair<bool>> {
+    if crate::runtime::in_delegated_tool(lua) {
+        return Ok(err_pair(DELEGATED_REGISTRATION));
     }
-    let (key, modifiers) = parse_key_notation(&lhs).map_err(mlua::Error::runtime)?;
-    let desc = opts
-        .as_ref()
-        .and_then(|o| o.get::<String>("desc").ok())
-        .unwrap_or_default();
-    let registry_key = lua.create_registry_value(rhs)?;
-    if loading(lua, &plugin) {
-        pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .set(key, modifiers, registry_key, Arc::clone(&plugin), desc);
-    } else {
-        let old = lua
-            .app_data_mut::<KeymapStore>()
-            .ok_or_else(|| mlua::Error::runtime("keymap store not initialized"))?
-            .set(key, modifiers, registry_key, Arc::clone(&plugin), desc)
-            .1;
-        if let Some(old_key) = old {
-            tracing::warn!(key = %lhs, plugin = %plugin, "keymap shadowed by plugin");
-            let _ = lua.remove_registry_value(old_key);
+    try_pair!(crate::runtime::validate_plugin_effect(lua));
+    let registered = || -> LuaResult<()> {
+        if mode != "n" {
+            return Err(mlua::Error::runtime(format!(
+                "unsupported keymap mode: {mode}"
+            )));
         }
-        publish_keymap_snapshot(lua);
-    }
-    Ok(())
+        let (key, modifiers) = parse_key_notation(&lhs).map_err(mlua::Error::runtime)?;
+        let desc = opts
+            .as_ref()
+            .and_then(|o| o.get::<String>("desc").ok())
+            .unwrap_or_default();
+        let registry_key = lua.create_registry_value(rhs)?;
+        if loading(lua, &plugin) {
+            pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .set(key, modifiers, registry_key, Arc::clone(&plugin), desc);
+        } else {
+            let old = lua
+                .app_data_mut::<KeymapStore>()
+                .ok_or_else(|| mlua::Error::runtime("keymap store not initialized"))?
+                .set(key, modifiers, registry_key, Arc::clone(&plugin), desc)
+                .1;
+            if let Some(old_key) = old {
+                tracing::warn!(key = %lhs, plugin = %plugin, "keymap shadowed by plugin");
+                let _ = lua.remove_registry_value(old_key);
+            }
+            publish_keymap_snapshot(lua);
+        }
+        Ok(())
+    };
+    registered()?;
+    Ok((Some(true), None))
 }
 
 /// Remove the mapping for {lhs} in {mode}. Does nothing if no mapping
@@ -401,6 +417,7 @@ fn set(
 ///
 /// @param mode string Mode letter (reserved for future modes).
 /// @param lhs string Key to unmap, in Vim notation.
+/// @return (boolean|nil, string|nil) true, or nil and an error. Returns nil and an error when called from a delegated tool handler.
 /// @example
 /// maki.keymap.del("n", "<C-t>")
 #[lua_fn]
@@ -410,25 +427,33 @@ fn del(
     #[ctx] plugin: Arc<str>,
     mode: String,
     lhs: String,
-) -> LuaResult<()> {
-    let _ = mode;
-    let (key, modifiers) = parse_key_notation(&lhs).map_err(mlua::Error::runtime)?;
-    let old = if loading(lua, &plugin) {
-        pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .del(key, modifiers)
-    } else {
-        lua.app_data_mut::<KeymapStore>()
-            .and_then(|mut store| store.del(key, modifiers))
+) -> LuaResult<Pair<bool>> {
+    if crate::runtime::in_delegated_tool(lua) {
+        return Ok(err_pair(DELEGATED_REGISTRATION));
+    }
+    try_pair!(crate::runtime::validate_plugin_effect(lua));
+    let registered = || -> LuaResult<()> {
+        let _ = mode;
+        let (key, modifiers) = parse_key_notation(&lhs).map_err(mlua::Error::runtime)?;
+        let old = if loading(lua, &plugin) {
+            pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .del(key, modifiers)
+        } else {
+            lua.app_data_mut::<KeymapStore>()
+                .and_then(|mut store| store.del(key, modifiers))
+        };
+        if let Some(old_key) = old {
+            let _ = lua.remove_registry_value(old_key);
+        }
+        if !loading(lua, &plugin) {
+            publish_keymap_snapshot(lua);
+        }
+        Ok(())
     };
-    if let Some(old_key) = old {
-        let _ = lua.remove_registry_value(old_key);
-    }
-    if !loading(lua, &plugin) {
-        publish_keymap_snapshot(lua);
-    }
-    Ok(())
+    registered()?;
+    Ok((Some(true), None))
 }
 
 lua_table! {

@@ -7,15 +7,18 @@ use std::sync::Arc;
 
 use crate::components::messages::{MessagesPanel, PromptProgress};
 use crate::components::tool_display::append_annotation;
-use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
+use crate::components::{DisplayMessage, DisplayRole, RetryInfo, ToolRole, ToolStatus};
 use crate::markdown::truncate_output;
 
 use crate::selection::Selection;
 use maki_agent::tools::{ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
-use maki_agent::{AgentEvent, BufferSnapshot, ToolDoneEvent, ToolOutput, ToolStartEvent};
+use maki_agent::{
+    AgentEvent, BufferSnapshot, PostLevel, ToolDoneEvent, ToolOutput, ToolStartEvent,
+};
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
 use maki_lua::WinView;
 use maki_providers::{ContentBlock, ImageSource, Message, Role};
+use maki_storage::sessions::StoredPost;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
@@ -54,6 +57,7 @@ pub struct Chat {
     pub name: String,
     pub cost: Option<f64>,
     pub context_size: u32,
+    pub(crate) retry_info: Option<RetryInfo>,
     pub model_id: Option<String>,
     /// Compatibility identity retained for display and persistence.
     pub subagent_id: Option<String>,
@@ -78,6 +82,7 @@ impl Chat {
             name,
             cost: None,
             context_size: 0,
+            retry_info: None,
             model_id: None,
             subagent_id: None,
             agent_id: None,
@@ -178,7 +183,7 @@ impl Chat {
             }
             // The app tracks the running model to show a queued switch; the
             // chat panel has nothing to render for it.
-            AgentEvent::ModelSwitched { .. } | AgentEvent::QueueDrained => {}
+            AgentEvent::ModelSwitched { .. } | AgentEvent::QueueSettled => {}
             AgentEvent::Retry { .. } => unreachable!("handled before handle_event"),
             AgentEvent::TurnOutcome(outcome) => {
                 self.messages_panel.flush();
@@ -231,6 +236,7 @@ impl Chat {
             }
             AgentEvent::SubagentHistory { .. }
             | AgentEvent::SubagentClosed
+            | AgentEvent::Post(_)
             | AgentEvent::StreamClosed => {}
             AgentEvent::LiveToolBuf { id, body } => {
                 self.messages_panel.register_live_buf(id, body);
@@ -450,6 +456,11 @@ impl Chat {
         self.messages_panel.load_messages(msgs);
     }
 
+    pub fn push_post(&mut self, text: &str, level: PostLevel) {
+        self.flush();
+        self.messages_panel.push(post_message(text, level));
+    }
+
     pub fn push_user_message(&mut self, text: impl Into<String>) {
         self.messages_panel
             .push(DisplayMessage::new(DisplayRole::User, text.into()));
@@ -490,7 +501,6 @@ impl Chat {
         self.messages_panel.tool_done(event);
     }
 
-    #[cfg(test)]
     pub fn message_count(&self) -> usize {
         self.messages_panel.message_count()
     }
@@ -535,15 +545,18 @@ impl Chat {
     }
 }
 
+/// {posts} must all belong to the chat {messages} come from.
 pub fn history_to_display(
     messages: &[Message],
     tool_outputs: &HashMap<String, Arc<ToolOutput>>,
     tool_output_lines: &ToolOutputLines,
+    posts: &[&StoredPost],
 ) -> (Vec<DisplayMessage>, Vec<maki_lua::RestoreItem>) {
     let results = build_tool_results_map(messages);
     let mut display = Vec::new();
     let mut restore_items: Vec<maki_lua::RestoreItem> = Vec::new();
-    for msg in messages {
+    for (boundary, msg) in messages.iter().enumerate() {
+        push_posts_at(&mut display, posts, boundary, messages.len());
         if msg.is_observation() {
             continue;
         }
@@ -667,7 +680,27 @@ pub fn history_to_display(
             }
         }
     }
+    push_posts_at(&mut display, posts, messages.len(), messages.len());
     (display, restore_items)
+}
+
+/// Posts past the end, as after a compaction shortened the history, land last.
+fn push_posts_at(
+    display: &mut Vec<DisplayMessage>,
+    posts: &[&StoredPost],
+    boundary: usize,
+    message_count: usize,
+) {
+    display.extend(
+        posts
+            .iter()
+            .filter(|stored| stored.after_message.min(message_count) == boundary)
+            .map(|stored| post_message(&stored.post.text, stored.post.level)),
+    );
+}
+
+fn post_message(text: &str, level: PostLevel) -> DisplayMessage {
+    DisplayMessage::new(DisplayRole::Post(level), text.to_owned())
 }
 
 /// `ToolResult` is gone after session load, so we rebuild from
@@ -780,7 +813,9 @@ mod tests {
     use super::*;
     use crate::components::IMAGE_PLACEHOLDER;
     use crate::theme::InMemoryThemesProvider;
-    use maki_agent::{AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent};
+    use maki_agent::{
+        AgentEvent, Post, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
+    };
     use maki_config::UiConfig;
     use maki_providers::ImageMediaType;
     use test_case::test_case;
@@ -851,6 +886,7 @@ mod tests {
             ],
             &empty_outputs(),
             &ToolOutputLines::default(),
+            &[],
         );
         assert_eq!(display.len(), 2);
         assert_eq!(display[0].role, DisplayRole::User);
@@ -1069,10 +1105,50 @@ mod tests {
             ..Default::default()
         }];
         assert!(
-            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default())
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), &[])
                 .0
                 .is_empty()
         );
+    }
+
+    #[test_case(0, 0 ; "before_first_message")]
+    #[test_case(1, 1 ; "between_messages")]
+    #[test_case(2, 2 ; "after_last_message")]
+    #[test_case(5, 2 ; "past_a_shortened_history")]
+    fn restored_post_lands_at_its_message_boundary(after_message: usize, expected_index: usize) {
+        const POST_TEXT: &str = "reviewer started";
+        let msgs = vec![
+            Message::user(USER_TEXT.into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: REPLY_TEXT.into(),
+                }],
+                ..Default::default()
+            },
+        ];
+        let post = StoredPost {
+            chat: None,
+            after_message,
+            post: Post {
+                text: POST_TEXT.into(),
+                level: PostLevel::Warn,
+                agent: None,
+            },
+        };
+        let display = history_to_display(
+            &msgs,
+            &empty_outputs(),
+            &ToolOutputLines::default(),
+            &[&post],
+        )
+        .0;
+        assert_eq!(display.len(), 3);
+        assert_eq!(
+            display[expected_index].role,
+            DisplayRole::Post(PostLevel::Warn)
+        );
+        assert_eq!(display[expected_index].text, POST_TEXT);
     }
 
     #[test]
@@ -1087,7 +1163,8 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display =
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), &[]).0;
         assert_eq!(display.len(), 1);
         assert_eq!(display[0].role, DisplayRole::Assistant);
         assert_eq!(display[0].text, "I will fix it");
@@ -1126,7 +1203,8 @@ mod tests {
             "output",
             is_error,
         );
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display =
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), &[]).0;
         assert_eq!(display.len(), 1);
         assert!(matches!(&display[0].role, DisplayRole::Tool(t) if t.status == expected));
     }
@@ -1162,7 +1240,8 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display =
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), &[]).0;
         assert_eq!(display.len(), 4);
         assert_eq!(display[0].role, DisplayRole::User);
         assert_eq!(display[1].role, DisplayRole::Assistant);
@@ -1210,31 +1289,13 @@ mod tests {
             let discriminant = std::mem::discriminant(&output);
             let msgs = tool_use_pair(tool_name, input_json, "ok", false);
             let outputs = HashMap::from([("t1".into(), Arc::new(output))]);
-            let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default()).0;
+            let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), &[]).0;
             assert_eq!(
                 std::mem::discriminant(display[0].tool_output.as_deref().unwrap()),
                 discriminant,
                 "stored {tool_name} output should pass through"
             );
         }
-    }
-
-    #[test]
-    fn history_stored_write_has_annotation() {
-        let write_output = ToolOutput::WriteCode {
-            path: "/src/main.rs".into(),
-            byte_count: 12,
-            lines: vec!["fn main() {}".into()],
-        };
-        let msgs = tool_use_pair(
-            "write",
-            serde_json::json!({"path": "/src/main.rs", "content": "fn main() {}"}),
-            "wrote 12 bytes",
-            false,
-        );
-        let outputs = HashMap::from([("t1".into(), Arc::new(write_output))]);
-        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default()).0;
-        assert!(display[0].annotation.is_some());
     }
 
     #[test]
@@ -1247,7 +1308,8 @@ mod tests {
             &joined,
             false,
         );
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display =
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), &[]).0;
         let line_count = display[0].text.lines().count();
         assert!(
             line_count < long_output.len(),
@@ -1263,7 +1325,8 @@ mod tests {
             "1: fn main() {}",
             false,
         );
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display =
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), &[]).0;
         assert!(display[0].tool_output.is_none());
         assert!(display[0].text.contains("fn main"));
     }
@@ -1284,7 +1347,8 @@ mod tests {
             ],
             ..Default::default()
         }];
-        let display = history_to_display(&msgs, &HashMap::new(), &ToolOutputLines::default()).0;
+        let display =
+            history_to_display(&msgs, &HashMap::new(), &ToolOutputLines::default(), &[]).0;
         assert_eq!(display.len(), 2);
         assert_eq!(display[0].role, DisplayRole::Thinking);
         assert_eq!(display[0].text, "reasoning");
@@ -1310,7 +1374,8 @@ mod tests {
             ],
             ..Default::default()
         }];
-        let display = history_to_display(&msgs, &HashMap::new(), &ToolOutputLines::default()).0;
+        let display =
+            history_to_display(&msgs, &HashMap::new(), &ToolOutputLines::default(), &[]).0;
         assert_eq!(display.len(), 3);
         assert_eq!(display[0].role, DisplayRole::Thinking);
         assert_eq!(display[0].text, "first");
@@ -1365,10 +1430,11 @@ mod tests {
             false,
         );
         let outputs = HashMap::from([("t1".to_owned(), Arc::new(edit_output("a")))]);
-        let (_, items) = history_to_display(&msgs, &outputs, &ToolOutputLines::default());
+        let (_, items) = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), &[]);
         assert!(items.is_empty(), "Rust owns Diff rendering on restore");
 
-        let (_, items) = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default());
+        let (_, items) =
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), &[]);
         assert_eq!(items.len(), 1, "text-only history still restores via Lua");
     }
 

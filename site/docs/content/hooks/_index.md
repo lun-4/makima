@@ -14,8 +14,10 @@ Maki has two ways for Lua to react to what the agent does.
 | Know that something happened | [Autocmds](/docs/lua-api/#maki-api-create_autocmd) |
 | Change what happens, or stop it | Slots |
 
-Autocmds are notifications. Many plugins can listen to one event, they run in no
-particular order, and what they return is ignored. Slots are a chain: each layer
+Autocmds are notifications. Many plugins can listen to one event, each callback
+runs as its own task in no particular order, and what it returns is ignored. An
+agent event reaches its callback with the agent's handle and a ctx, so the
+callback can act on that agent. Slots are a chain: each layer
 gets the value, decides, and passes it down by calling `prev`. The last layer
 registered runs first.
 
@@ -149,7 +151,7 @@ debug logs rather than as a warning at load.
 | declares none: `read`, `batch`, MCP tools, ACP client tools, `tool_search` | every permission |
 
 Declaring no capability does not mean a tool uses none. `batch`,
-`code_execution` and `task` declare nothing while invoking any other tool, so
+`code_execution` and `task_spawn` declare nothing while invoking any other tool, so
 reading undeclared as free would hand a plugin everything. Undeclared costs the
 maximum instead. See [plugin permissions](/docs/lua-api/#plugin-permissions).
 
@@ -236,5 +238,5 @@ Use `maki.api.get_slots()` to see who owns and who wraps each slot.
 ## Limits
 
 A layer has no agent context, so `maki.agent.call_tool` and
-`maki.agent.session` are out of reach inside one. Read files, run jobs, and
+`maki.agent.spawn` are out of reach inside one. Read files, run jobs, and
 decide from those.

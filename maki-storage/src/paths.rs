@@ -4,7 +4,6 @@ use std::sync::OnceLock;
 
 use etcetera::base_strategy::BaseStrategy;
 
-const FALLBACK_DIR: &str = ".makima";
 const APP_NAME: &str = "makima";
 
 static STRATEGY: OnceLock<Option<Paths>> = OnceLock::new();
@@ -16,7 +15,6 @@ struct Paths {
     state: PathBuf,
     logs: PathBuf,
     cache: PathBuf,
-    xdg_config: PathBuf,
 }
 
 /// Lexical path normalization that never hits the filesystem.
@@ -227,8 +225,7 @@ pub fn init_at(root: PathBuf) -> Result<(), PathsInitError> {
             data: root.clone(),
             state: root.clone(),
             logs: root.clone(),
-            cache: root.clone(),
-            xdg_config: root,
+            cache: root,
         }),
     )
 }
@@ -247,31 +244,14 @@ fn initialize(lock: &OnceLock<Option<Paths>>, paths: Option<Paths>) -> Result<()
 
 fn discover() -> Option<Paths> {
     let s = etcetera::base_strategy::choose_base_strategy().ok()?;
-    let fallback_dir = etcetera::home_dir()
-        .ok()
-        .map(|h| h.join(FALLBACK_DIR))
-        .filter(|d| d.is_dir());
-    let xdg_config = s.config_dir().join(APP_NAME);
-    let (data, cache, config) = match &fallback_dir {
-        Some(dir) => (dir.clone(), dir.clone(), dir.clone()),
-        None => (
-            s.data_dir().join(APP_NAME),
-            s.cache_dir().join(APP_NAME),
-            xdg_config.clone(),
-        ),
-    };
-    let (state, logs) = if fallback_dir.is_some() {
-        (data.clone(), data.clone())
-    } else {
-        state_logs(&s, &data)
-    };
+    let data = s.data_dir().join(APP_NAME);
+    let (state, logs) = state_logs(&s, &data);
     Some(Paths {
-        config,
+        config: s.config_dir().join(APP_NAME),
         data,
         state,
         logs,
-        cache,
-        xdg_config,
+        cache: s.cache_dir().join(APP_NAME),
     })
 }
 
@@ -296,11 +276,6 @@ pub fn config_dir() -> Result<PathBuf, std::io::Error> {
     ensure(&p.config)
 }
 
-pub fn xdg_config_dir() -> Result<PathBuf, std::io::Error> {
-    let p = resolve().ok_or_else(err)?;
-    ensure(&p.xdg_config)
-}
-
 pub fn data_dir() -> Result<PathBuf, std::io::Error> {
     let p = resolve().ok_or_else(err)?;
     ensure(&p.data)
@@ -321,59 +296,13 @@ pub fn cache_dir() -> Result<PathBuf, std::io::Error> {
     ensure(&p.cache)
 }
 
-pub struct XdgPaths {
-    pub config: PathBuf,
-    pub state: PathBuf,
-    pub logs: PathBuf,
-}
-
-pub fn xdg_paths() -> Result<XdgPaths, std::io::Error> {
-    let s = etcetera::choose_base_strategy().map_err(|_| err())?;
-    let data = s.data_dir().join(APP_NAME);
-    let (state, logs) = state_logs(&s, &data);
-    Ok(XdgPaths {
-        config: s.config_dir().join(APP_NAME),
-        state,
-        logs,
-    })
+pub fn find_config_path(name: &str) -> Option<PathBuf> {
+    let path = resolve()?.config.join(name);
+    path.exists().then_some(path)
 }
 
 pub fn home() -> Option<PathBuf> {
     etcetera::home_dir().ok()
-}
-
-pub fn legacy_home_dir() -> Option<PathBuf> {
-    etcetera::home_dir()
-        .ok()
-        .map(|h| h.join(FALLBACK_DIR))
-        .filter(|d| d.is_dir())
-}
-
-/// Where to look for user config, best match first. Writes still go to
-/// `config_dir()`.
-///
-/// The two are not the same: `config_dir()` collapses to `~/.makima` the moment
-/// that directory exists, so anything that reads it alone goes blind to
-/// `~/.config/makima`, which is where the docs tell people to put their files.
-pub fn config_search_dirs() -> Vec<PathBuf> {
-    config_search_dirs_from(home().as_deref(), xdg_config_dir().ok().as_deref())
-}
-
-pub fn find_config_path(name: &str) -> Option<PathBuf> {
-    config_search_dirs()
-        .into_iter()
-        .map(|dir| dir.join(name))
-        .find(|path| path.exists())
-}
-
-/// Pure core of `config_search_dirs`: no env reads, no process-home fallback,
-/// so tests can hand it tempdirs.
-pub fn config_search_dirs_from(home: Option<&Path>, xdg_config: Option<&Path>) -> Vec<PathBuf> {
-    let legacy = home.map(|h| h.join(FALLBACK_DIR)).filter(|d| d.is_dir());
-    let xdg = xdg_config
-        .map(Path::to_path_buf)
-        .filter(|d| Some(d) != legacy.as_ref());
-    [legacy, xdg].into_iter().flatten().collect()
 }
 
 #[cfg(test)]
@@ -442,7 +371,6 @@ mod tests {
             state: root.to_path_buf(),
             logs: root.to_path_buf(),
             cache: root.to_path_buf(),
-            xdg_config: root.to_path_buf(),
         })
     }
 
@@ -516,81 +444,6 @@ mod tests {
         assert!(
             !s.starts_with(r"\\?\"),
             "should not have \\\\?\\ prefix: {s}"
-        );
-    }
-
-    #[test]
-    fn search_dirs_returns_legacy_and_xdg() {
-        let home = tempfile::tempdir().unwrap();
-        let legacy = home.path().join(FALLBACK_DIR);
-        let xdg = home.path().join(".config").join(APP_NAME);
-        fs::create_dir(&legacy).unwrap();
-
-        let dirs = config_search_dirs_from(Some(home.path()), Some(&xdg));
-        assert_eq!(dirs, vec![legacy, xdg]);
-    }
-
-    #[test]
-    fn search_dirs_omits_legacy_when_it_does_not_exist() {
-        let home = tempfile::tempdir().unwrap();
-        let xdg = home.path().join(".config").join(APP_NAME);
-
-        let dirs = config_search_dirs_from(Some(home.path()), Some(&xdg));
-        assert_eq!(dirs, vec![xdg]);
-    }
-
-    #[test]
-    fn search_dirs_omits_legacy_when_home_none() {
-        let xdg = tempfile::tempdir().unwrap();
-
-        let dirs = config_search_dirs_from(None, Some(xdg.path()));
-        assert_eq!(dirs, vec![xdg.path().to_path_buf()]);
-    }
-
-    #[test]
-    fn search_dirs_omits_xdg_when_xdg_none() {
-        let home = tempfile::tempdir().unwrap();
-        let legacy = home.path().join(FALLBACK_DIR);
-        fs::create_dir(&legacy).unwrap();
-
-        let dirs = config_search_dirs_from(Some(home.path()), None);
-        assert_eq!(dirs, vec![legacy]);
-    }
-
-    #[test]
-    fn search_dirs_does_not_repeat_the_same_dir() {
-        let home = tempfile::tempdir().unwrap();
-        let legacy = home.path().join(FALLBACK_DIR);
-        fs::create_dir(&legacy).unwrap();
-
-        let dirs = config_search_dirs_from(Some(home.path()), Some(&legacy));
-        assert_eq!(dirs, vec![legacy]);
-    }
-
-    #[test]
-    fn search_dirs_neither_depends_on_process_env() {
-        let home_a = tempfile::tempdir().unwrap();
-        let xdg_a = home_a.path().join(".config").join(APP_NAME);
-
-        let hostile = tempfile::tempdir().unwrap();
-
-        let prev = std::env::var_os("XDG_CONFIG_HOME");
-        // SAFETY: tests run single-threaded within a process nextest invokes once.
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", hostile.path()) };
-
-        let dirs = config_search_dirs_from(Some(home_a.path()), Some(&xdg_a));
-
-        // SAFETY: same single-threaded assumption as above.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
-
-        assert!(
-            !dirs.iter().any(|p| p.starts_with(hostile.path())),
-            "combiner read XDG_CONFIG_HOME: {dirs:?}"
         );
     }
 }

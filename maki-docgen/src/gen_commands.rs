@@ -29,7 +29,7 @@ for _, alias in ipairs(aliases) do
 end
 ```
 
-Both names stay in the palette: aliasing adds a name, it does not rename or hide the original. It works for any command listed above, plus plugin commands and MCP prompts. See [`maki.api.run_command`](/docs/lua-api/#maki-api-run_command) for matching and error handling, or [`maki.ui.action`](/docs/lua-api/#maki-ui-action) to bind a key instead of a name."#;
+Both names stay in the palette: aliasing adds a name, it does not rename or hide the original. It works for commands that finish in their handler, such as `/new`, `/sessions`, `/cd` and plugin commands. A command that starts a model turn (custom Markdown commands, MCP prompts), `/compact` and `/btw` report an error from inside another command's handler; bind those to a key with `maki.ui.action` instead. See [`maki.api.run_command`](/docs/lua-api/#maki-api-run_command) for matching and error handling, or [`maki.ui.action`](/docs/lua-api/#maki-ui-action) to bind a key instead of a name."#;
 
 fn markdown_cell(value: &str) -> String {
     value
@@ -55,7 +55,7 @@ fn argument_hint(arguments: &CommandArguments, explicit_hint: Option<&str>) -> S
 }
 
 fn frontends(required: TargetCapabilities) -> &'static str {
-    if maki_agent::command::portable_capabilities().contains_all(required) {
+    if maki_agent::command::session_capabilities().contains_all(required) {
         "all"
     } else {
         "TUI only"
@@ -110,7 +110,7 @@ pub fn generate() -> color_eyre::Result<String> {
     writeln!(out).unwrap();
     writeln!(
         out,
-        "Type `/` in the TUI input box to open the command palette. A leading slash command is also recognized in `--print`, SDK stream mode, and ACP. Command names use exact ASCII-insensitive matching. Unknown and unavailable slash-prefixed text is rejected with an error instead of becoming a prompt. Prefix a literal message that starts with `/` with another slash to send it as text: `//lmao` sends `/lmao`. Text sent programmatically (`maki.session.prompt`, subagent chat) is not parsed as a command. A known available command with invalid arguments returns an error instead of becoming a prompt."
+        "Type `/` in the TUI input box to open the command palette. A leading slash command is also recognized in `--print`, SDK stream mode, and ACP. Command names use exact ASCII-insensitive matching. Unknown and unavailable slash-prefixed text is rejected with an error instead of becoming a prompt. Prefix a literal message that starts with `/` with another slash to send it as text: `//lmao` sends `/lmao`. Text sent programmatically (`Agent:send`, subagent chat) is not parsed as a command. A known available command with invalid arguments returns an error instead of becoming a prompt."
     )
     .unwrap();
     writeln!(out).unwrap();
@@ -219,6 +219,11 @@ pub fn generate() -> color_eyre::Result<String> {
     .unwrap();
     writeln!(
         out,
+        "- **`/model [spec] [thinking=value] [fast=true|false]`**: options change the thinking level and fast mode together with the spec, as one change to the selected agent. Options without a spec keep the current model, so `/model thinking=high` only changes thinking. The same options also fit in braces after the spec, as in `/model openai/gpt-5{{thinking=high,fast=true}}`; braces are understood by `/model` only. Each option may appear once, and unknown options are rejected. Asking for fast mode or thinking on a model without them is rejected; values carried over from the previous model are adjusted to what the new model supports."
+    )
+    .unwrap();
+    writeln!(
+        out,
         "- **`/theme <name>`**: the exact name is applied and persisted. A fragment that matches one theme name (like `toky` for `tokyonight`) is resolved the same way; unknown or ambiguous names flash a note and leave the current theme. With no argument, the picker opens and previews each theme as you navigate."
     )
     .unwrap();
@@ -252,7 +257,7 @@ pub fn generate() -> color_eyre::Result<String> {
     .unwrap();
     writeln!(
         out,
-        "- **`/workflow`**: let `code_execution` call the `task` tool (and other workflow-only tools) from inside the Python sandbox. Config: `always_workflow = true`."
+        "- **`/workflow`**: let `code_execution` call the task tools (and other workflow-only tools) from inside the Python sandbox. Config: `always_workflow = true`."
     )
     .unwrap();
     writeln!(
@@ -294,11 +299,7 @@ pub fn generate() -> color_eyre::Result<String> {
     )
     .unwrap();
     writeln!(out).unwrap();
-    writeln!(
-        out,
-        "1. User config: `~/.config/makima/commands/` (and legacy `~/.makima/commands/` if present)"
-    )
-    .unwrap();
+    writeln!(out, "1. User config: `~/.config/makima/commands/`").unwrap();
     writeln!(out, "2. User third-party: `~/.claude/commands/`").unwrap();
     writeln!(
         out,
@@ -438,7 +439,7 @@ mod tests {
             "| `/sessions` | Browse and switch sessions | typed | [query] | TUI only |",
             "| `/splash` | Preview and select a splash renderer | typed | [splash] | TUI only |",
             "| `/splash-fps` | Toggle the splash fps overlay: live fps and per-frame render time. | none |  | TUI only |",
-            "| `/thinking` | Set thinking effort (bare opens a selector) | typed | [effort] | TUI only |",
+            "| `/thinking` | Set thinking effort (bare opens a selector) | typed | [effort] | all |",
             "| `/usage` | Show provider quota and focused-session token usage | none |  | TUI only |",
         ] {
             assert!(plugins.contains(row), "{row}");

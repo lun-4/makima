@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 
 use crate::{StateDir, StorageError};
 
-const PLANS_DIR: &str = "plans";
+pub const PLANS_DIR: &str = "plans";
 const SLUG_RETRIES: usize = 10;
 
 static ADJECTIVES: LazyLock<Vec<&str>> =

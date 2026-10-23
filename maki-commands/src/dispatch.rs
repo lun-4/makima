@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,6 +50,16 @@ impl CommandRegistry {
         content: CommandContent,
         depth: usize,
     ) -> CommandFuture<InputDispatch> {
+        self.dispatch_input_with_admission(target, content, depth, None)
+    }
+
+    fn dispatch_input_with_admission(
+        &self,
+        target: TargetHandle,
+        content: CommandContent,
+        depth: usize,
+        admission: Option<Option<Arc<dyn Any + Send + Sync>>>,
+    ) -> CommandFuture<InputDispatch> {
         let class = classify_input(&content.text);
         if let SlashClass::EscapedLiteral(literal) = class {
             let attachments = content.attachments.clone();
@@ -77,14 +88,15 @@ impl CommandRegistry {
                 return Box::pin(async move { InputDispatch::LiteralInput(content) });
             }
         };
-        let registry = self.clone();
-        Box::pin(async move {
-            InputDispatch::Dispatched(
-                registry
-                    .dispatch_resolved(resolved.command, resolved.arguments, content, target, depth)
-                    .await,
-            )
-        })
+        let dispatched = self.dispatch_resolved(
+            resolved.command,
+            resolved.arguments,
+            content,
+            target,
+            depth,
+            admission,
+        );
+        Box::pin(async move { InputDispatch::Dispatched(dispatched.await) })
     }
 
     pub fn dispatch_command(
@@ -105,7 +117,28 @@ impl CommandRegistry {
         content: CommandContent,
         depth: usize,
     ) -> CommandFuture<CommandOutcome> {
-        self.dispatch_resolved(command, arguments, content, target.clone(), depth)
+        self.dispatch_resolved(command, arguments, content, target.clone(), depth, None)
+    }
+
+    /// Dispatches with an admission the caller pinned earlier, instead of
+    /// the target's current one.
+    pub fn dispatch_command_with_admission(
+        &self,
+        target: &TargetHandle,
+        command: ResolvedCommand,
+        arguments: Arc<str>,
+        content: CommandContent,
+        depth: usize,
+        admission: Arc<dyn Any + Send + Sync>,
+    ) -> CommandFuture<CommandOutcome> {
+        self.dispatch_resolved(
+            command,
+            arguments,
+            content,
+            target.clone(),
+            depth,
+            Some(Some(admission)),
+        )
     }
 
     fn dispatch_resolved(
@@ -115,7 +148,19 @@ impl CommandRegistry {
         content: CommandContent,
         target: TargetHandle,
         depth: usize,
+        admission: Option<Option<Arc<dyn Any + Send + Sync>>>,
     ) -> CommandFuture<CommandOutcome> {
+        let admission = admission.unwrap_or_else(|| {
+            {
+                let state = self
+                    .0
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                target_record(&state, self.0.id, &target).map(|record| Arc::clone(&record.host))
+            }
+            .and_then(|host| host.admission_context())
+        });
         let registry = self.clone();
         Box::pin(async move {
             if depth > MAX_COMMAND_DEPTH {
@@ -163,6 +208,7 @@ impl CommandRegistry {
                 }
             };
             let invocation = CommandInvocation {
+                admission,
                 command_id: command.command_id(),
                 canonical_name: Arc::clone(&command.spec().name),
                 invoked_name: Arc::clone(&command.invoked_name),
@@ -318,6 +364,17 @@ pub enum FrontendFeedback {
     Text(Arc<str>),
 }
 
+impl fmt::Display for FrontendFeedback {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WorkingDirectory(path) => {
+                write!(formatter, "Working directory: {}", path.display())
+            }
+            Self::Text(text) => formatter.write_str(text),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandOutcome {
     Completed,
@@ -345,7 +402,18 @@ pub enum HostResponse {
 }
 
 pub trait CommandHost: Send + Sync + 'static {
+    fn admission_context(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        None
+    }
     fn request(&self, request: HostRequest) -> CommandFuture<Result<HostResponse, CommandError>>;
+
+    fn request_with_admission(
+        &self,
+        request: HostRequest,
+        _admission: Option<Arc<dyn Any + Send + Sync>>,
+    ) -> CommandFuture<Result<HostResponse, CommandError>> {
+        self.request(request)
+    }
 }
 
 pub trait CommandBehavior: Send + Sync + 'static {
@@ -357,6 +425,7 @@ pub trait CommandBehavior: Send + Sync + 'static {
 
 #[derive(Clone)]
 pub struct CommandInvocation {
+    admission: Option<Arc<dyn Any + Send + Sync>>,
     pub command_id: CommandId,
     pub canonical_name: Arc<str>,
     pub invoked_name: Arc<str>,
@@ -371,16 +440,24 @@ pub struct CommandInvocation {
 }
 
 impl CommandInvocation {
+    pub fn admission_context<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.admission.as_ref()?.downcast_ref()
+    }
     pub fn host_request(
         &self,
         request: HostRequest,
     ) -> CommandFuture<Result<HostResponse, CommandError>> {
-        self.host.request(request)
+        self.host
+            .request_with_admission(request, self.admission.clone())
     }
 
     pub fn dispatch(&self, content: CommandContent) -> CommandFuture<InputDispatch> {
-        self.dispatcher
-            .dispatch(self.target.clone(), content, self.depth + 1)
+        self.dispatcher.dispatch(
+            self.target.clone(),
+            content,
+            self.depth + 1,
+            self.admission.clone(),
+        )
     }
 
     pub fn target_id(&self) -> InvocationTargetId {
@@ -418,8 +495,10 @@ impl InvocationDispatcher {
         target: TargetHandle,
         content: CommandContent,
         depth: usize,
+        admission: Option<Arc<dyn Any + Send + Sync>>,
     ) -> CommandFuture<InputDispatch> {
-        self.registry.dispatch_input_at(target, content, depth)
+        self.registry
+            .dispatch_input_with_admission(target, content, depth, Some(admission))
     }
 }
 

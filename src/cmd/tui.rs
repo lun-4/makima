@@ -1,6 +1,5 @@
-use std::env;
 use std::io::{self, IsTerminal, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
@@ -11,14 +10,15 @@ use crossterm::style::Stylize;
 
 use maki_agent::command::{self, CustomCommand};
 use maki_agent::tools::ToolRegistry;
-use maki_config::project::{self, ProjectDecision, TrustAnswer, TrustMode, policy_grant};
+use maki_config::project::{self, ProjectDecision, TrustAnswer, policy_grant};
 use maki_config::{Config, ModelPolicy, ProjectConfig, load_env_files, load_permissions};
 use maki_lua::PluginHost;
+use maki_lua::ui_sink::{HeadlessUi, HostUi};
 use maki_providers::model::Model;
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
 use maki_storage::session_lock;
-use maki_storage::sessions::{SESSIONS_DIR, StoredThinking};
+use maki_storage::sessions::SESSIONS_DIR;
 use maki_ui::{AppSession, RunOutcome};
 
 use crate::cli::{Cli, normalize_tool_name};
@@ -82,11 +82,11 @@ impl Drop for Teardown {
     }
 }
 
-fn discover_commands(disable: bool, cwd: &Path) -> Vec<CustomCommand> {
+fn discover_commands(disable: bool, cwd: &Path, project: &ProjectConfig) -> Vec<CustomCommand> {
     if disable {
         return Vec::new();
     }
-    command::discover_commands(cwd)
+    command::discover_commands(cwd, project)
 }
 
 fn load_config(
@@ -104,7 +104,7 @@ fn load_config(
         .into_config()
         .context("invalid config")?;
     maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
-    config.permissions = load_permissions(project_config);
+    config.permissions = load_permissions(project_config)?;
 
     if cli.yolo || config.always_yolo {
         config.permissions.yolo = true;
@@ -161,6 +161,11 @@ fn build_stack(
         Arc::clone(ToolRegistry::global_arc()),
         command_registry,
         !cli.no_jit,
+        if cli.print || cli.is_sdk_mode() {
+            HostUi::Sink(Box::new(HeadlessUi))
+        } else {
+            HostUi::Frontend
+        },
     )
     .context("initialize lua plugin host")?;
 
@@ -181,7 +186,7 @@ fn build_stack(
         }
     }
 
-    let commands = discover_commands(cli.no_commands, cwd);
+    let commands = discover_commands(cli.no_commands, cwd, &trust.project_config);
 
     let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, storage);
     let (model, needs_login) = match (model_result, fallback_model) {
@@ -301,7 +306,7 @@ fn exit_resume_hint(id: &str, colored: bool) -> String {
     )
 }
 
-pub fn run(mut cli: Cli) -> Result<()> {
+pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
     if cli.print && session_picker_requested(&cli) {
         bail!(PICKER_NEEDS_TUI_ERR);
     }
@@ -310,16 +315,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
 
-    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-
-    let mode = if cli.trust {
-        TrustMode::Session
-    } else {
-        TrustMode::Consult
-    };
+    let mode = cli.trust_mode();
     let mut trust = project::resolve(&storage, &cwd, mode);
     load_env_files(&trust.project_config);
-    warn_stale_config_toml(&trust.project_config);
 
     let (mut stack, mut startup_warnings) = build_stack(&cli, &cwd, &storage, &trust, None)?;
 
@@ -355,6 +353,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
     setup::init_logging(&stack.config.storage);
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
+    startup_warnings.extend(super::unmatched_permission_rules(&stack.config.permissions));
 
     if cli.is_sdk_mode() || cli.print {
         for warning in &startup_warnings {
@@ -363,16 +362,16 @@ pub fn run(mut cli: Cli) -> Result<()> {
     }
 
     if cli.is_sdk_mode() {
-        let prompt_slots = stack.plugin_host.event_handle().collect_prompt_slots();
         let timeouts = stack.timeouts();
         crate::sdk_mode::run(crate::sdk_mode::SdkParams {
             cli,
+            cwd,
             model: stack.model,
             explicit_model,
             config: stack.config.agent,
             permissions_config: stack.config.permissions,
             timeouts,
-            prompt_slots,
+            prompt_slots: stack.plugin_host.event_handle().prompt_slot_source(),
             defaults: stack.config.session_defaults,
             model_policy: Arc::new(stack.config.provider.model_policy.clone()),
             plugin_rules: stack.plugin_host.plugin_rules(),
@@ -390,6 +389,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
     if cli.print {
         let timeouts = stack.timeouts();
         crate::print::run(
+            cwd,
             &stack.model,
             initial_prompt,
             cli.images,
@@ -406,7 +406,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
             stack.plugin_host.plugin_rules(),
             &stack.commands,
             stack.plugin_host.command_registry(),
-            stack.plugin_host.mode_registry(),
             trust.project_config.clone(),
         )
         .context("run print mode")?;
@@ -426,18 +425,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
     let mut focused = 0;
     let mut warnings = startup_warnings;
     let mut teardown = Teardown::default();
-    let default_thinking: Option<StoredThinking> = maki_storage::sessions::read_prefs(&storage)
-        .default_thinking
-        .or(stack.config.session_defaults.thinking);
-
     loop {
-        for session in &mut tabs {
-            if session.messages().is_empty() {
-                let mut defaults = stack.config.session_defaults;
-                defaults.thinking = default_thinking;
-                defaults.seed(&mut session.meta);
-            }
-        }
         let focused_tab = &tabs[focused];
         let model = restored_session_model(
             &stack.model,
@@ -448,6 +436,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
 
         let outcome = maki_ui::run(
             maki_ui::EventLoopParams {
+                cwd: cwd.clone(),
                 model,
                 needs_login: stack.needs_login,
                 explicit_model: apply_explicit_model,
@@ -475,6 +464,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 ui_action_rx: stack.plugin_host.ui_action_rx(),
                 lua_event_handle: stack.plugin_host.event_handle(),
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),
+                session_defaults: stack.config.session_defaults,
                 system_prompt_override: cli.system_prompt.clone(),
                 append_system_prompt: cli.append_system_prompt.clone(),
                 project_config: trust.project_config.clone(),
@@ -551,28 +541,12 @@ pub fn run(mut cli: Cli) -> Result<()> {
     }
 }
 
-fn warn_stale_config_toml(project_config: &ProjectConfig) {
-    let stale_paths = [
-        maki_config::global_config_dir().map(|d| d.join("config.toml")),
-        Some(project_config.config_root().join(".makima/config.toml")),
-    ];
-    for path in stale_paths.into_iter().flatten() {
-        if path.is_file() {
-            tracing::warn!(
-                path = %path.display(),
-                "config.toml found but no longer used. Migrate to init.lua. See https://makima.ln4.net/docs/configuration/"
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use color_eyre::eyre::eyre;
     use maki_config::RawConfig;
     use std::fs;
-    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use test_case::test_case;
 
@@ -731,8 +705,9 @@ mod tests {
         let cli = Cli::parse_from(["makima", "--no-plugins"]);
         assert!(cli.no_plugins);
 
-        let mut plugin_host = PluginHost::with_jit(Arc::new(ToolRegistry::new()), true)
-            .expect("live host boots under --no-plugins");
+        let mut plugin_host =
+            PluginHost::with_jit(Arc::new(ToolRegistry::new()), true, HostUi::Frontend)
+                .expect("live host boots under --no-plugins");
 
         let config = load_config(
             &plugin_host,
@@ -774,8 +749,11 @@ mod tests {
     fn print_mode_bare_continue_errors() {
         use clap::Parser;
 
-        let err = run(Cli::parse_from(["makima", "--print", "-c"]))
-            .expect_err("bare -c under --print fails before any stack work");
+        let err = run(
+            Cli::parse_from(["makima", "--print", "-c"]),
+            PathBuf::from(THIS_CWD),
+        )
+        .expect_err("bare -c under --print fails before any stack work");
         assert!(err.to_string().contains(PICKER_NEEDS_TUI_ERR));
     }
 
@@ -886,7 +864,8 @@ mod tests {
         assert!(!cli.no_plugins);
 
         let mut plugin_host =
-            PluginHost::with_jit(Arc::new(ToolRegistry::new()), true).expect("live host boots");
+            PluginHost::with_jit(Arc::new(ToolRegistry::new()), true, HostUi::Frontend)
+                .expect("live host boots");
 
         match load_config(
             &plugin_host,

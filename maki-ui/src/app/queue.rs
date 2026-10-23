@@ -1,17 +1,23 @@
-//! Queue for messages typed while the agent is busy.
+//! Focused actor pending-message presentation.
 
-use maki_agent::AgentInput;
+use crate::theme;
+use maki_agent::actor::{
+    AgentActorHandle, PendingQueueEntry, SubmissionId, TurnAdmissionOptions, TurnOrigin,
+    TurnProvenance,
+};
+use maki_agent::{AgentId, AgentInput, AgentRef, EffectiveAgentConfig};
+use maki_commands::COMPACT_COMMAND_NAME;
+use std::borrow::Cow;
+use std::sync::Arc;
 
 use super::{Action, App, Status};
 
-use crate::agent::shared_queue::{QueueItem, QueueSender};
+use crate::agent::shared_queue::{QueueItem, QueueSender, visible_pending};
 use crate::components::queue_panel::QueueEntry;
 
 pub(crate) use crate::agent::shared_queue::QueuedMessage;
 
 pub(crate) const EMPTY_PROMPT_ERR: &str = "prompt is empty";
-pub(crate) const NO_QUEUE_ERR: &str = "session cannot queue messages";
-const NO_SUBAGENT_IMAGE_ERR: &str = "images cannot be sent to a subagent";
 pub(crate) const NO_SUBAGENT_ERR: &str = "subagent is no longer accepting messages";
 
 pub(crate) enum SubmitOutcome {
@@ -23,12 +29,82 @@ pub(crate) enum SubmitOutcome {
 #[derive(Default)]
 pub(crate) struct MessageQueue {
     shared: Option<QueueSender>,
-    focus: Option<usize>,
+    target: Option<AgentActorHandle>,
+    target_id: Option<AgentId>,
+    child_selected: bool,
+    focused: Option<PendingIdentity>,
+    cancelled_through: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingIdentity {
+    Message(SubmissionId),
+    Compact(u64),
+}
+
+fn pending_identity(entry: &PendingQueueEntry) -> PendingIdentity {
+    match entry {
+        PendingQueueEntry::Message(entry) => PendingIdentity::Message(entry.id),
+        PendingQueueEntry::Compact { operation_id, .. } => PendingIdentity::Compact(*operation_id),
+    }
+}
+
+fn panel_entry(entry: PendingQueueEntry) -> QueueEntry<'static> {
+    match entry {
+        PendingQueueEntry::Message(entry) => QueueEntry {
+            text: Cow::Owned(entry.text),
+            color: theme::current().foreground,
+        },
+        PendingQueueEntry::Compact { instructions, .. } => QueueEntry {
+            text: instructions.map_or(Cow::Borrowed(COMPACT_COMMAND_NAME), |extra| {
+                Cow::Owned(format!("{COMPACT_COMMAND_NAME} {extra}"))
+            }),
+            color: theme::current()
+                .queue
+                .fg
+                .unwrap_or(theme::current().foreground),
+        },
+    }
 }
 
 impl MessageQueue {
+    pub(crate) fn select(
+        &mut self,
+        id: Option<AgentId>,
+        child: bool,
+        actor: Option<AgentActorHandle>,
+    ) {
+        if self.target_id != id || self.child_selected != child {
+            self.unfocus();
+        }
+        self.target_id = id;
+        self.child_selected = child;
+        self.target = actor;
+    }
+
     pub(crate) fn set_shared(&mut self, shared: QueueSender) {
         self.shared = Some(shared);
+    }
+
+    pub(crate) fn fence_cancelled_presentations(&mut self, run_id: u64) {
+        self.cancelled_through = self.cancelled_through.max(run_id);
+    }
+
+    pub(crate) fn accepts_actor_presentation(&self, run_id: u64) -> bool {
+        run_id > self.cancelled_through
+            && self
+                .current_run_id()
+                .is_some_and(|allocated| run_id <= allocated)
+    }
+
+    pub(crate) fn reserve_run_id(&self, displayed_run_id: u64) -> u64 {
+        self.shared.as_ref().map_or(displayed_run_id + 1, |shared| {
+            shared.reserve_run_id(displayed_run_id)
+        })
+    }
+
+    pub(crate) fn current_run_id(&self) -> Option<u64> {
+        self.shared.as_ref().map(QueueSender::current_run_id)
     }
 
     pub(crate) fn set_run_id(&self, run_id: u64) {
@@ -37,33 +113,63 @@ impl MessageQueue {
         }
     }
 
+    fn entries(&self) -> Vec<PendingQueueEntry> {
+        self.target.as_ref().map_or(Vec::new(), visible_pending)
+    }
+
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.shared.as_ref().is_none_or(|s| s.is_empty())
+        self.len() == 0
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.shared.as_ref().map_or(0, |s| s.len())
+        self.entries().len()
     }
 
-    pub(crate) fn remove(&mut self, index: usize) {
-        // Removal success (or absence) only affects whether focus clamps;
-        // the panel must never point past the (possibly unchanged) list.
-        if let Some(ref shared) = self.shared {
-            shared.remove(index);
+    fn remove(&self, index: usize) {
+        let Some(actor) = &self.target else {
+            return;
+        };
+        match self.entries().get(index).map(pending_identity) {
+            Some(PendingIdentity::Message(id)) => {
+                actor.remove_submission(id);
+            }
+            Some(PendingIdentity::Compact(operation_id)) => {
+                actor.remove_pending_compact(operation_id);
+            }
+            None => {}
         }
-        self.clamp_focus();
     }
 
-    pub(crate) fn clear(&mut self) {
+    pub(crate) fn clear_root_user_work(&mut self) {
         if let Some(ref shared) = self.shared {
-            shared.clear();
+            shared.clear_user_work();
         }
-        self.focus = None;
+        if !self.child_selected {
+            self.unfocus();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn root_actor(&self) -> Option<&AgentActorHandle> {
+        self.shared.as_ref().map(QueueSender::actor)
+    }
+
+    pub(crate) fn root_config(&self) -> Option<Arc<EffectiveAgentConfig>> {
+        self.shared.as_ref()?.effective_config()
+    }
+
+    pub(crate) fn root_text_messages(&self) -> Vec<String> {
+        self.shared
+            .as_ref()
+            .map_or(Vec::new(), QueueSender::text_messages)
     }
 
     pub(crate) fn focus(&self) -> Option<usize> {
-        self.focus
+        let identity = self.focused?;
+        self.entries()
+            .iter()
+            .position(|entry| pending_identity(entry) == identity)
     }
 
     pub(crate) fn set_focus(&mut self) {
@@ -71,79 +177,65 @@ impl MessageQueue {
     }
 
     pub(crate) fn unfocus(&mut self) {
-        self.focus = None;
+        self.focused = None;
     }
 
     pub(crate) fn move_focus_up(&mut self) {
-        if let Some(sel) = self.focus
+        if let Some(sel) = self.focus()
             && sel > 0
         {
-            self.focus = Some(sel - 1);
+            self.set_focus_at(sel - 1);
         }
     }
 
     pub(crate) fn move_focus_down(&mut self) {
-        if let Some(sel) = self.focus {
-            let len = self.len();
-            if sel + 1 < len {
-                self.focus = Some(sel + 1);
-            }
+        if let Some(sel) = self.focus() {
+            self.set_focus_at(sel + 1);
         }
     }
 
+    /// Removes the focused entry and moves focus to whatever now sits in its
+    /// row, so repeated removals walk down the list.
     pub(crate) fn remove_focused(&mut self) {
-        if let Some(sel) = self.focus {
-            self.remove(sel);
+        let Some(index) = self.focus() else {
+            return;
+        };
+        self.remove(index);
+        self.unfocus();
+        let len = self.len();
+        if len > 0 {
+            self.set_focus_at(index.min(len - 1));
         }
     }
 
     pub(crate) fn pop_newest(&mut self) {
-        if let Some(index) = self.panel_len().checked_sub(1) {
+        if let Some(index) = self.len().checked_sub(1) {
             self.remove(index);
         }
     }
 
-    pub(crate) fn panel_len(&self) -> usize {
-        self.shared.as_ref().map_or(0, |s| s.panel_len())
-    }
-
     pub(crate) fn panel_entries(&self) -> Vec<QueueEntry<'static>> {
-        self.shared.as_ref().map_or(vec![], |s| s.panel_entries())
+        self.entries().into_iter().map(panel_entry).collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn text_messages(&self) -> Vec<String> {
-        self.shared.as_ref().map_or(vec![], |s| s.text_messages())
-    }
-
-    fn clamp_focus(&mut self) {
-        let len = self.len();
-        self.focus = match self.focus {
-            Some(_) if len == 0 => None,
-            Some(sel) if sel >= len => Some(len - 1),
-            other => other,
-        };
+        crate::agent::shared_queue::pending_texts(self.entries())
     }
 
     pub(crate) fn set_focus_at(&mut self, index: usize) {
-        if index < self.len() {
-            self.focus = Some(index);
+        if let Some(identity) = self.entries().get(index).map(pending_identity) {
+            self.focused = Some(identity);
         }
     }
 }
 
 impl App {
-    /// The one queue-or-start decision, shared by the keyboard and Lua
-    /// paths so they cannot drift. Expects raw text: interpretation (slash
-    /// commands, `exit`, `!`) is the caller's job, or skipped on purpose.
+    /// Submits raw keyboard input to the focused actor after reference expansion.
+    /// The caller handles slash commands, `exit`, and shell prefixes.
     pub(crate) fn submit_prompt(&mut self, msg: QueuedMessage) -> SubmitOutcome {
         if msg.text.trim().is_empty() && msg.images.is_empty() {
             return SubmitOutcome::Rejected(EMPTY_PROMPT_ERR.into());
-        }
-        // Submitting text in a subagent tab routes to that subagent's driver
-        // input queue instead of the main agent. `@`-reference expansion is a
-        // main-agent concern, so subagent tabs pass text through verbatim.
-        if self.is_subagent_focused() {
-            return self.submit_to_subagent(msg);
         }
         // Expand `@prefix:value` tokens once, here, via the registered Lua
         // expanders. A rejected expander flashes and aborts the run. The
@@ -155,15 +247,7 @@ impl App {
         };
         let mut msg = msg;
         msg.text = expanded;
-        if self.status == Status::Streaming {
-            if self.queue_and_notify(msg) {
-                SubmitOutcome::Queued
-            } else {
-                SubmitOutcome::Rejected(NO_QUEUE_ERR.into())
-            }
-        } else {
-            SubmitOutcome::Started(self.start_from_queue(&msg))
-        }
+        self.submit_to_focused_actor(msg)
     }
 
     /// Keyboard path: nobody is around to receive an `Err`, so
@@ -179,42 +263,81 @@ impl App {
         }
     }
 
-    /// True while a subagent chat tab is focused (rather than the main chat),
-    /// so text goes to that subagent instead of the main agent.
-    fn is_subagent_focused(&self) -> bool {
-        let Some(chat) = self.chats.get(self.active_chat) else {
-            return false;
+    fn submit_to_focused_actor(&mut self, msg: QueuedMessage) -> SubmitOutcome {
+        if self.active_subagent_closed() {
+            return SubmitOutcome::Rejected(NO_SUBAGENT_ERR.into());
+        }
+        let Some(target) = self
+            .command_runtime
+            .target_agent(&self.command_target)
+            .filter(|target| Some(target.id()) == self.selected_agent_id())
+        else {
+            return SubmitOutcome::Rejected(NO_SUBAGENT_ERR.into());
         };
-        chat.subagent_id.is_some()
+        let input = self.build_agent_input(&msg);
+        match self.admit_user_turn(&target, input, Some(msg.text)) {
+            Ok(true) => SubmitOutcome::Started(Vec::new()),
+            Ok(false) => SubmitOutcome::Queued,
+            Err(error) => SubmitOutcome::Rejected(error),
+        }
     }
 
-    /// Queue a message into the focused subagent's driver queue, showing it in
-    /// that subagent's chat. Images cannot ride the text-only driver queue.
-    fn submit_to_subagent(&mut self, msg: QueuedMessage) -> SubmitOutcome {
-        if !msg.images.is_empty() {
-            return SubmitOutcome::Rejected(NO_SUBAGENT_IMAGE_ERR.into());
+    /// Admits a user turn to `target` and reports whether it started a root
+    /// run. Typed input (`display`) is submitted so it can fold into an active
+    /// turn, and a starting one is drawn at once; command turns are admitted
+    /// as their own turn and drawn on consumption. A starting root turn is
+    /// admitted under the presentation reserved here, so the app records the
+    /// id the actor stamps.
+    pub(super) fn admit_user_turn(
+        &mut self,
+        target: &AgentRef,
+        mut input: AgentInput,
+        display: Option<String>,
+    ) -> Result<bool, String> {
+        let actor = target
+            .validate_live()
+            .and_then(|()| target.actor())
+            .map_err(|error| error.to_string())?;
+        let root = self.chats[0].agent_id == Some(target.id());
+        input.preamble = self.shell.results_for(Some(target.id())).to_vec();
+        if root {
+            input
+                .preamble
+                .extend_from_slice(self.shell.results_for(None));
         }
-        let Some(_) = self.chats[self.active_chat].subagent_id else {
-            return SubmitOutcome::Started(self.start_from_queue(&msg));
+        let starting = root && self.status != Status::Streaming;
+        let reserved = starting.then(|| actor.reserve_presentation(self.run_id));
+        let images = input.images.clone();
+        let options = TurnAdmissionOptions {
+            provenance: TurnProvenance {
+                origin: TurnOrigin::User,
+                ..Default::default()
+            },
+            already_displayed: starting && display.is_some(),
+            displayed_presentation: reserved,
+            ..Default::default()
         };
-        let Some(agent_id) = self.chats[self.active_chat].agent_id else {
-            return SubmitOutcome::Rejected(NO_SUBAGENT_ERR.into());
-        };
-        let Some(input_tx) = self
-            .subagent_channels
-            .get(&agent_id)
-            .filter(|channels| !channels.closed)
-            .and_then(|channels| channels.input_tx.as_ref())
-        else {
-            // Live-channel gone (subagent finished); never silently reroute to
-            // the main agent. Surface the rejection via the caller's flash.
-            return SubmitOutcome::Rejected(NO_SUBAGENT_ERR.into());
-        };
-        self.chats[self.active_chat].show_user_message(msg.text.clone(), msg.images.clone());
-        if input_tx.try_send(msg.text).is_err() {
-            return SubmitOutcome::Rejected(NO_SUBAGENT_ERR.into());
+        let landed = if display.is_some() {
+            actor
+                .submit_presented(input, None, String::new(), options)
+                .map(|(_, presentation)| reserved.and(Some(presentation)))
+        } else {
+            actor
+                .admit_turn_with_options(input, None, String::new(), options)
+                .map(|_| reserved)
         }
-        SubmitOutcome::Queued
+        .map_err(|error| error.to_string())?;
+        self.shell.drain_results_for(Some(target.id()));
+        if root {
+            self.shell.drain_results();
+        }
+        if let Some(run_id) = landed {
+            self.record_run_start(run_id);
+            if let Some(text) = display {
+                self.main_chat().show_user_message(text, images);
+            }
+        }
+        Ok(starting)
     }
 
     /// Deferred path: the agent is busy, so park the message and let
@@ -225,19 +348,16 @@ impl App {
             return false;
         };
         let input = self.build_agent_input(&msg);
-        shared.push(QueueItem::Message {
-            text: msg.text,
-            image_count: msg.images.len(),
-            input,
-            run_id: self.run_id,
-            displayed: false,
-        });
-        true
+        shared
+            .try_push(QueueItem {
+                input,
+                displayed: None,
+            })
+            .is_ok()
     }
 
-    /// Push restored queue items only here, never in `restore_display`: on
-    /// load/rewind the display is restored before `respawn` swaps the shared
-    /// queue, so pushing earlier would fill a queue that is about to die.
+    /// Push restored queue items only here, never in `restore_display`, which
+    /// runs before the loaded or rewound history is committed.
     pub(crate) fn flush_restored_queue(&mut self) {
         // The live queue owns the text from here on, so the recovery
         // snapshot must stop overriding it on save.
@@ -250,28 +370,6 @@ impl App {
                 images: Vec::new(),
             });
         }
-    }
-
-    pub(super) fn queue_compact(&mut self, instructions: Option<String>) -> bool {
-        let Some(ref shared) = self.queue.shared else {
-            return false;
-        };
-        shared.push(QueueItem::Compact {
-            run_id: self.run_id,
-            instructions,
-        });
-        true
-    }
-
-    /// Agent reached a deferred message: time to draw the bubble. Restored
-    /// queue items start runs without `start_run`, so this is where the app
-    /// learns the agent is busy. Immediate-dispatch items skip this event,
-    /// so no dedup needed.
-    /// Immediate path: kick off the agent and draw the bubble in the same
-    /// frame, so the user sees their message land where it will stay.
-    pub(super) fn start_from_queue(&mut self, msg: &QueuedMessage) -> Vec<Action> {
-        let input = self.build_agent_input(msg);
-        self.start_run(input, msg.text.clone())
     }
 
     pub(crate) fn start_mailbox_run(
@@ -290,7 +388,7 @@ impl App {
     /// `Action::SendMessage` must go through here so `run_id` bumps exactly
     /// once per run.
     pub(super) fn start_run(&mut self, input: AgentInput, display: String) -> Vec<Action> {
-        self.record_run_start(self.run_id + 1);
+        self.record_run_start(self.queue.reserve_run_id(self.run_id));
         if !display.is_empty() || !input.images.is_empty() {
             self.main_chat()
                 .show_user_message(display, input.images.clone());
@@ -300,6 +398,7 @@ impl App {
 
     pub(super) fn record_run_start(&mut self, run_id: u64) {
         self.run_id = run_id;
+        self.queue.set_run_id(run_id);
         self.clear_exit_request();
         self.stamped_subagent_outcomes.clear();
         // New work supersedes text held for recovery after an agent error.
@@ -308,7 +407,6 @@ impl App {
         // The turn runs on whatever the model is now; a change after this
         // point lands on the next turn.
         self.run_model = Some(self.state.session.model.clone());
-        self.run_context_window = Some(self.state.model.context_window);
-        self.fire_session_autocmd("TurnStart", serde_json::json!({}));
+        self.run_context_window = Some(self.root_config().model.context_window);
     }
 }

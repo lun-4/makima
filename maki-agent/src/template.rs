@@ -4,10 +4,6 @@ use std::path::Path;
 
 use jiff::Timestamp;
 
-pub fn env_vars() -> Vars {
-    env_vars_for(&env::current_dir().unwrap_or_else(|_| ".".into()))
-}
-
 pub fn env_vars_for(cwd: &Path) -> Vars {
     let date = Timestamp::now().strftime("%Y-%m-%d").to_string();
     Vars::new()
@@ -83,7 +79,7 @@ mod tests {
 
     #[test]
     fn env_vars_includes_date() {
-        let vars = env_vars();
+        let vars = env_vars_for(Path::new("/"));
         let result = vars.apply("{date}");
         assert_ne!(result.as_ref(), "{date}");
     }

@@ -539,6 +539,9 @@ impl ToolRegistry {
                 continue;
             }
             let description = vars.apply(&entry.tool.description(ctx)).into_owned();
+            if description.trim().is_empty() {
+                continue;
+            }
             let mut def = json!({
                 "name": entry.name(),
                 "description": description,

@@ -1,7 +1,11 @@
 -- /thinking selector: pick an effort level by navigating left/right and
--- confirm with Enter. Any argument still passes straight through to
--- set_thinking, and choosing a level (or passing an argument) saves it as the
--- default for new sessions.
+-- confirm with Enter. Any argument passes straight through to the target
+-- agent's set_model, and choosing a level (or passing an argument) saves it as
+-- the default for new sessions. Without an interactive UI the selector has
+-- nowhere to open, so only the argument form works there. A level that cannot
+-- be set fails the command; the M-t keymap flashes the reason instead.
+
+local NO_SELECTOR = "the selector needs the TUI; pass a level, e.g. /thinking high"
 
 local function index_of(list, value)
   for i, v in ipairs(list) do
@@ -27,32 +31,55 @@ local function render_ladder(active, levels)
   return spans
 end
 
-local function set_thinking(mode)
-  local result, err = maki.session.set_thinking({ mode = mode, set_default = true })
-  if err then
-    maki.ui.flash("Thinking: " .. err)
+local function fail(err)
+  error("Thinking: " .. tostring(err), 0)
+end
+
+-- Resolves the agent this invocation targets: the command's pinned target or
+-- the agent selected when the key was pressed.
+local function target(ctx)
+  if not ctx then
+    return nil, nil, "no agent target"
+  end
+  local agent, err = ctx:agent()
+  if not agent then
+    return nil, nil, err
+  end
+  local config, config_err = agent:config(ctx)
+  if not config then
+    return nil, nil, config_err
+  end
+  return agent, config.model
+end
+
+local function set_thinking(ctx, agent, mode)
+  local committed, err = agent:set_model(ctx, { thinking = mode })
+  if not committed then
+    fail(err)
+  end
+  local _, default_err = maki.session.set_default_thinking(committed.thinking)
+  if default_err then
+    maki.ui.flash("Thinking: " .. committed.thinking .. " (default not saved: " .. default_err .. ")")
   else
-    maki.ui.flash("Thinking: " .. result.mode .. " (default for new sessions)")
+    maki.ui.flash("Thinking: " .. committed.thinking .. " (default for new sessions)")
   end
 end
 
-local function open_selector()
-  local info, err = maki.session.thinking()
-  if err then
-    maki.ui.flash("Thinking: " .. err)
-    return
+local function open_selector(ctx)
+  local agent, selection, err = target(ctx)
+  if not agent then
+    fail(err)
+  end
+  local info, info_err = maki.model.info(selection.spec)
+  if not info then
+    fail(info_err)
   end
   if not info.supports_thinking then
-    maki.ui.flash("Thinking requires a model that supports it")
-    return
+    fail("requires a model that supports it")
   end
 
-  local levels = info.options or {}
-  if #levels == 0 then
-    maki.ui.flash("Thinking: host returned no options")
-    return
-  end
-  local cursor = index_of(levels, info.mode) or 1
+  local levels = maki.model.thinking_levels()
+  local cursor = index_of(levels, selection.thinking) or 1
   local buf = maki.ui.buf()
   buf:set_lines({ render_ladder(cursor, levels) })
 
@@ -66,8 +93,13 @@ local function open_selector()
     },
   })
 
+  local opened = false
   while true do
     local ev = win:recv()
+    if not ev and not opened then
+      error(NO_SELECTOR)
+    end
+    opened = true
     if not ev or ev.type == "close" then
       break
     end
@@ -80,7 +112,7 @@ local function open_selector()
         buf:set_lines({ render_ladder(cursor, levels) })
       elseif ev.key == "enter" then
         win:close()
-        set_thinking(levels[cursor])
+        set_thinking(ctx, agent, levels[cursor])
         return
       elseif ev.key == "esc" then
         win:close()
@@ -93,7 +125,7 @@ end
 maki.api.register_command({
   name = "/thinking",
   description = "Set thinking effort (bare opens a selector)",
-  tui_only = true,
+  tui_only = false,
   arguments = {
     {
       name = "effort",
@@ -101,27 +133,32 @@ maki.api.register_command({
       optional = true,
       completion = {
         get_items = function()
-          local info, err = maki.session.thinking()
-          if err or not info.supports_thinking or not info.options then
-            return {}
-          end
           local items = {}
-          for _, option in ipairs(info.options) do
-            items[#items + 1] = { label = option, insertion = option }
+          for _, level in ipairs(maki.model.thinking_levels()) do
+            items[#items + 1] = { label = level, insertion = level }
           end
           return items
         end,
       },
     },
   },
-  handler = function(opts)
-    local args = opts.values.effort
-    if args then
-      set_thinking(args)
+  handler = function(opts, ctx)
+    local effort = opts.values.effort
+    if not effort then
+      open_selector(ctx)
       return
     end
-    open_selector()
+    local agent, _, err = target(ctx)
+    if not agent then
+      fail(err)
+    end
+    set_thinking(ctx, agent, effort)
   end,
 })
 
-maki.keymap.set("n", "<M-t>", open_selector, { desc = "Thinking effort" })
+maki.keymap.set("n", "<M-t>", function(_, ctx)
+  local ok, err = pcall(open_selector, ctx)
+  if not ok then
+    maki.ui.flash(tostring(err))
+  end
+end, { desc = "Thinking effort" })

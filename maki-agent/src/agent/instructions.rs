@@ -74,17 +74,22 @@ pub fn build_system_prompt_with_def(
     let instructions = format!("{env}{instructions}");
     let mut out = crate::prompt::assemble(crate::prompt::PromptId::System, slots, &instructions);
 
-    if let Some(snippet) = &def.system_prompt {
-        let plan_path = mode
-            .plan_path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-        let vars = vars.clone().with_custom("{plan_path}", plan_path);
-        let snippet = vars.apply(snippet);
-        out.push_str(&snippet);
-    }
-
+    out.push_str(&build_mode_system_prompt(vars, def, mode));
     out
+}
+
+pub fn build_mode_system_prompt(vars: &Vars, def: &crate::ModeDef, mode: &AgentMode) -> String {
+    let Some(snippet) = &def.system_prompt else {
+        return String::new();
+    };
+    let plan_path = mode
+        .plan_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    vars.clone()
+        .with_custom("{plan_path}", plan_path)
+        .apply(snippet)
+        .into_owned()
 }
 
 fn read_instruction(path: &Path, loaded: &LoadedInstructions) -> Option<(PathBuf, String)> {
@@ -98,8 +103,7 @@ fn read_instruction(path: &Path, loaded: &LoadedInstructions) -> Option<(PathBuf
 
 fn collect_instruction_files(
     cwd: &str,
-    home: Option<&Path>,
-    xdg_config: Option<&Path>,
+    global_config: Option<&Path>,
     loaded: &LoadedInstructions,
 ) -> Vec<(String, String)> {
     let mut out = Vec::new();
@@ -134,33 +138,26 @@ fn collect_instruction_files(
         }
     }
 
-    for dir in maki_storage::paths::config_search_dirs_from(home, xdg_config) {
-        let path = dir.join(GLOBAL_INSTRUCTION_FILE);
-        if let Some((canonical, content)) = read_instruction(&path, loaded) {
-            let label = format!("Global instructions ({})", canonical.display());
-            out.push((label, content));
-            break;
-        }
+    if let Some(dir) = global_config
+        && let Some((canonical, content)) =
+            read_instruction(&dir.join(GLOBAL_INSTRUCTION_FILE), loaded)
+    {
+        out.push((
+            format!("Global instructions ({})", canonical.display()),
+            content,
+        ));
     }
 
     out
 }
 
 pub fn load_instruction_text(cwd: &str) -> String {
-    load_instruction_text_with_home(
-        cwd,
-        maki_storage::paths::home().as_deref(),
-        maki_storage::paths::xdg_config_dir().ok().as_deref(),
-    )
+    load_instruction_text_with_global(cwd, maki_storage::paths::config_dir().ok().as_deref())
 }
 
-pub(crate) fn load_instruction_text_with_home(
-    cwd: &str,
-    home: Option<&Path>,
-    xdg_config: Option<&Path>,
-) -> String {
+pub(crate) fn load_instruction_text_with_global(cwd: &str, global_config: Option<&Path>) -> String {
     let loaded = LoadedInstructions::new();
-    let files = collect_instruction_files(cwd, home, xdg_config, &loaded);
+    let files = collect_instruction_files(cwd, global_config, &loaded);
 
     let mut text = String::new();
     for (label, content) in files {
@@ -170,20 +167,15 @@ pub(crate) fn load_instruction_text_with_home(
 }
 
 pub fn load_instructions(cwd: &str) -> Instructions {
-    load_instructions_with_home(
-        cwd,
-        maki_storage::paths::home().as_deref(),
-        maki_storage::paths::xdg_config_dir().ok().as_deref(),
-    )
+    load_instructions_with_global(cwd, maki_storage::paths::config_dir().ok().as_deref())
 }
 
-pub(crate) fn load_instructions_with_home(
+pub(crate) fn load_instructions_with_global(
     cwd: &str,
-    home: Option<&Path>,
-    xdg_config: Option<&Path>,
+    global_config: Option<&Path>,
 ) -> Instructions {
     let mut instr = Instructions::default();
-    let files = collect_instruction_files(cwd, home, xdg_config, &instr.loaded);
+    let files = collect_instruction_files(cwd, global_config, &instr.loaded);
 
     for (label, content) in files {
         instr.text.push_str(&format!("\n\n{label}:\n{content}"));
@@ -368,7 +360,7 @@ mod tests {
         fs::write(dir.path().join("AGENTS.md"), "team rules").unwrap();
         fs::write(dir.path().join("AGENTS.local.md"), "my preferences").unwrap();
 
-        let text = &load_instructions_with_home(dir.path().to_str().unwrap(), None, None).text;
+        let text = &load_instructions_with_global(dir.path().to_str().unwrap(), None).text;
         assert!(text.contains("team rules"));
         assert!(text.contains("my preferences"));
         assert!(
@@ -382,7 +374,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("AGENTS.local.md"), "solo preferences").unwrap();
         assert!(
-            load_instructions_with_home(dir.path().to_str().unwrap(), None, None)
+            load_instructions_with_global(dir.path().to_str().unwrap(), None)
                 .text
                 .contains("solo preferences")
         );
@@ -392,36 +384,31 @@ mod tests {
     fn load_instructions_empty_when_no_files() {
         let dir = tempfile::tempdir().unwrap();
         assert!(
-            load_instructions_with_home(dir.path().to_str().unwrap(), None, None)
+            load_instructions_with_global(dir.path().to_str().unwrap(), None)
                 .text
                 .is_empty()
         );
     }
 
     #[test]
-    fn load_instructions_empty_when_home_has_no_global_file() {
+    fn load_instructions_empty_when_global_dir_has_no_file() {
         let cwd = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
         assert!(
-            load_instructions_with_home(cwd.path().to_str().unwrap(), Some(home.path()), None)
+            load_instructions_with_global(cwd.path().to_str().unwrap(), Some(global.path()))
                 .text
                 .is_empty()
         );
     }
 
     #[test]
-    fn load_instructions_includes_global_from_home() {
+    fn load_instructions_includes_global_file() {
         let cwd = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        fs::create_dir_all(home.path().join(".makima")).unwrap();
-        fs::write(
-            home.path().join(".makima").join("AGENTS.md"),
-            "global rules",
-        )
-        .unwrap();
+        let global = tempfile::tempdir().unwrap();
+        fs::write(global.path().join(GLOBAL_INSTRUCTION_FILE), "global rules").unwrap();
 
         let text =
-            load_instructions_with_home(cwd.path().to_str().unwrap(), Some(home.path()), None).text;
+            load_instructions_with_global(cwd.path().to_str().unwrap(), Some(global.path())).text;
         assert!(text.contains("global rules"));
     }
 
@@ -436,7 +423,7 @@ mod tests {
         fs::write(dir.path().join("AGENTS.md"), "root rules").unwrap();
         fs::write(sub.join("AGENTS.md"), "crate rules").unwrap();
 
-        let text = load_instructions_with_home(sub.to_str().unwrap(), None, None).text;
+        let text = load_instructions_with_global(sub.to_str().unwrap(), None).text;
         assert!(
             text.contains("crate rules"),
             "should load instructions from cwd"
@@ -506,7 +493,7 @@ mod tests {
         let agents_path = dir.path().join("AGENTS.md");
         fs::write(&agents_path, "content").unwrap();
 
-        let instr = load_instructions_with_home(dir.path().to_str().unwrap(), None, None);
+        let instr = load_instructions_with_global(dir.path().to_str().unwrap(), None);
         assert!(
             instr
                 .loaded

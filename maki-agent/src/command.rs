@@ -1,36 +1,75 @@
 use std::{
+    any::Any,
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
 };
 
 use maki_commands::{
     AgentTurn, ArgumentValue, BUILTIN_COMMANDS, BuiltinOperation, CancellationToken,
-    CommandBehavior, CommandCompletion, CommandContent, CommandError, CommandFuture,
-    CommandInvocation, CommandOutcome, CommandRegistry, CompletionContext, CompletionError,
-    CompletionItem, HostContextRequest, HostContextResponse, HostRequest, HostResponse, Producer,
-    ProducerPrecedence, Registration, RegistrationError, TargetCapabilities, TargetCapability,
-    resolve_path,
+    CommandAttachment, CommandBehavior, CommandCompletion, CommandContent, CommandError,
+    CommandFuture, CommandInvocation, CommandOutcome, CommandRegistry, CompletionContext,
+    CompletionError, CompletionItem, FrontendFeedback, HostContextRequest, HostContextResponse,
+    HostRequest, HostResponse, Producer, ProducerPrecedence, Registration, RegistrationError,
+    TargetCapabilities, TargetCapability, resolve_path,
 };
+use maki_config::ProjectConfig;
 use maki_match::{MatchCandidate, Resolution, fuzzy_resolve, fuzzy_resolve_candidates};
-use maki_providers::Model;
+use maki_providers::{ImageMediaType, ImageSource, Model};
 
-use crate::headless::InteractiveControl;
+use crate::headless::{InteractiveControl, InteractiveControlSender};
+use crate::session_coordinator::SessionCoordinatorHandle;
+use crate::session_options::{FAST_OPTION_ID, MODEL_OPTION_ID, WORKFLOW_OPTION_ID, YOLO_OPTION_ID};
+use crate::{AgentInput, McpPromptRef};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
 const COMMANDS_DIR: &str = "commands";
 const PROJECT_COMMAND_DIRS: &[&str] = &[".makima/commands", ".claude/commands"];
+const MAKIMA_COMMAND_DIR: &str = ".makima/commands";
 const GLOBAL_THIRD_PARTY_COMMAND_DIRS: &[&str] = &[".claude/commands"];
 const ARGUMENTS_PLACEHOLDER: &str = "$ARGUMENTS";
 const STANDARD_COMMANDS_ALREADY_REGISTERED: &str = "standard commands are already registered";
 const LOCAL_COMMAND_ATTACHMENTS: &str = "local commands cannot include non-text content";
-const NONINTERACTIVE_MODEL_USAGE: &str = "Usage: /model <model>";
+pub const NONINTERACTIVE_MODEL_USAGE: &str =
+    "Usage: /model [spec] [thinking=value] [fast=true|false]";
 pub const FAST_UNSUPPORTED: &str = "Fast mode needs Anthropic Opus 4.6+ with an API key, or an eligible Codex model with a ChatGPT subscription";
+
+pub fn command_images(attachments: &[CommandAttachment]) -> Result<Vec<ImageSource>, String> {
+    attachments
+        .iter()
+        .map(|attachment| {
+            let media_type =
+                ImageMediaType::from_mime(&attachment.media_type).ok_or_else(|| {
+                    format!(
+                        "unsupported command attachment media type: {}",
+                        attachment.media_type
+                    )
+                })?;
+            Ok(ImageSource::new(media_type, Arc::clone(&attachment.data)))
+        })
+        .collect()
+}
+
+/// The turn a command asked for, as the actor admits it.
+pub fn command_input(turn: AgentTurn) -> Result<AgentInput, String> {
+    let mut input = AgentInput::new(
+        turn.content.text.to_string(),
+        command_images(&turn.content.attachments)?,
+    );
+    input.prompt = turn.prompt.map(|prompt| {
+        Box::new(McpPromptRef {
+            qualified_name: prompt.qualified_name.to_string(),
+            arguments: prompt
+                .arguments
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        })
+    });
+    Ok(input)
+}
 
 pub fn portable_capabilities() -> TargetCapabilities {
     TargetCapabilities::from_slice(&[
@@ -43,105 +82,39 @@ pub fn portable_capabilities() -> TargetCapabilities {
     ])
 }
 
-struct ModelCommandState {
-    current: String,
-    fast: bool,
-}
-
-pub struct SessionCommandState {
-    model: Mutex<ModelCommandState>,
-    model_specs: Mutex<Arc<[Arc<str>]>>,
-    cwd: Mutex<PathBuf>,
-    workflow: AtomicBool,
-}
-
-impl SessionCommandState {
-    pub fn new(
-        current_model: String,
-        model_specs: Arc<[Arc<str>]>,
-        cwd: PathBuf,
-        fast: bool,
-        workflow: bool,
-    ) -> Self {
-        Self {
-            model: Mutex::new(ModelCommandState {
-                current: current_model,
-                fast,
-            }),
-            model_specs: Mutex::new(model_specs),
-            cwd: Mutex::new(cwd),
-            workflow: AtomicBool::new(workflow),
-        }
-    }
-
-    pub fn set_model(&self, model: &Model) {
-        let mut state = self.model.lock().unwrap_or_else(|error| error.into_inner());
-        state.current = model.spec();
-        state.fast &= model.supports_fast();
-    }
-
-    pub fn current_model(&self) -> String {
-        self.model
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .current
-            .clone()
-    }
-
-    pub fn set_model_specs(&self, specs: impl IntoIterator<Item = String>) {
-        *self
-            .model_specs
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) =
-            specs.into_iter().map(Arc::from).collect::<Vec<_>>().into();
-    }
-
-    pub fn fast(&self) -> bool {
-        self.model
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .fast
-    }
-
-    pub fn set_fast(&self, enabled: bool) -> Result<(), &'static str> {
-        let mut state = self.model.lock().unwrap_or_else(|error| error.into_inner());
-        if enabled
-            && !Model::from_spec(&state.current)
-                .is_ok_and(|model| model.supports_fast() || model.fast_pending())
-        {
-            return Err(FAST_UNSUPPORTED);
-        }
-        state.fast = enabled;
-        Ok(())
-    }
-
-    pub fn workflow(&self) -> bool {
-        self.workflow.load(Ordering::Relaxed)
-    }
-
-    pub fn set_workflow(&self, enabled: bool) {
-        self.workflow.store(enabled, Ordering::Relaxed);
-    }
+/// What a [`SessionCommandHost`] can run: the portable set plus replacing
+/// the session's history.
+pub fn session_capabilities() -> TargetCapabilities {
+    portable_capabilities().union(TargetCapabilities::from_capability(
+        TargetCapability::SessionReplacement,
+    ))
 }
 
 pub struct SessionCommandHost {
-    control_tx: flume::Sender<InteractiveControl>,
-    state: Arc<SessionCommandState>,
+    control_tx: InteractiveControlSender,
+    coordinator: SessionCoordinatorHandle,
     reset_session_guidance: Option<Arc<str>>,
-    coordinator: Option<crate::session_coordinator::SessionCoordinatorHandle>,
+    admission: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl SessionCommandHost {
     pub fn new(
-        control_tx: flume::Sender<InteractiveControl>,
-        state: Arc<SessionCommandState>,
+        control_tx: InteractiveControlSender,
+        coordinator: SessionCoordinatorHandle,
     ) -> Self {
         Self {
             control_tx,
-            state,
+            coordinator,
             reset_session_guidance: None,
-            coordinator: None,
+            admission: None,
         }
+    }
+
+    /// Pins every command this host runs to {admission}, such as the root it
+    /// serves.
+    pub fn with_admission_context(mut self, admission: impl Any + Send + Sync) -> Self {
+        self.admission = Some(Arc::new(admission));
+        self
     }
 
     pub fn with_reset_session_guidance(mut self, guidance: impl Into<Arc<str>>) -> Self {
@@ -149,50 +122,13 @@ impl SessionCommandHost {
         self
     }
 
-    pub fn with_coordinator(
-        mut self,
-        coordinator: crate::session_coordinator::SessionCoordinatorHandle,
-    ) -> Self {
-        self.coordinator = Some(coordinator);
-        self
-    }
-
-    fn toggle_option(&self, id: &'static str) -> CommandFuture<Result<(), CommandError>> {
+    fn toggle_option(&self, id: &'static str) -> CommandFuture<Result<HostResponse, CommandError>> {
         let coordinator = self.coordinator.clone();
         Box::pin(async move {
-            let coordinator = coordinator.ok_or(CommandError::StaleTarget)?;
-            let current = coordinator
-                .read()
-                .options()
-                .options
-                .iter()
-                .find(|option| option.definition.id.as_ref() == id)
-                .map(|option| {
-                    option.current_value.as_ref() == crate::session_options::ENABLED_VALUE
-                })
-                .ok_or_else(|| {
-                    CommandError::Producer(Arc::from(format!("unknown session option: {id}")))
-                })?;
-            let value = if current {
-                crate::session_options::DISABLED_VALUE
-            } else {
-                crate::session_options::ENABLED_VALUE
-            };
             coordinator
-                .set_option(id, value)
+                .toggle_boolean_option(id)
                 .await
-                .map_err(|error| CommandError::Producer(Arc::from(error.to_string())))?;
-            Ok(())
-        })
-    }
-
-    fn toggle_option_response(
-        &self,
-        id: &'static str,
-    ) -> CommandFuture<Result<HostResponse, CommandError>> {
-        let future = self.toggle_option(id);
-        Box::pin(async move {
-            future.await?;
+                .map_err(producer_error)?;
             Ok(HostResponse::Completed)
         })
     }
@@ -206,6 +142,7 @@ impl SessionCommandHost {
             let (reply, response) = flume::bounded(1);
             control_tx
                 .send(make(reply))
+                .await
                 .map_err(|_| CommandError::StaleTarget)?;
             response
                 .recv_async()
@@ -218,116 +155,90 @@ impl SessionCommandHost {
 }
 
 impl maki_commands::CommandHost for SessionCommandHost {
+    fn admission_context(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.admission.clone()
+    }
+
     fn request(&self, request: HostRequest) -> CommandFuture<Result<HostResponse, CommandError>> {
+        let read = self.coordinator.read();
         let operation = match request {
-            HostRequest::Context(HostContextRequest::ModelSpecs) => {
-                let specs = self
-                    .state
-                    .model_specs
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .clone();
-                return Box::pin(async move {
-                    Ok(HostResponse::Context(HostContextResponse::Values(specs)))
-                });
-            }
-            HostRequest::Context(HostContextRequest::ThemeNames) => {
-                return Box::pin(async {
-                    Ok(HostResponse::Context(HostContextResponse::Unavailable))
-                });
-            }
-            HostRequest::Context(HostContextRequest::WorkingDirectory) => {
-                let cwd = self
-                    .state
-                    .cwd
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .clone();
-                return Box::pin(async move {
-                    Ok(HostResponse::Context(
-                        HostContextResponse::WorkingDirectory(cwd),
-                    ))
-                });
-            }
-            HostRequest::Context(HostContextRequest::FastModeSupported) => {
-                let model = self
-                    .coordinator
-                    .as_ref()
-                    .map(|coordinator| coordinator.read().model())
-                    .unwrap_or_else(|| Arc::from(self.state.current_model()));
-                let supported = Model::from_spec(&model)
-                    .is_ok_and(|model| model.supports_fast() || model.fast_pending());
-                return Box::pin(async move {
-                    Ok(HostResponse::Context(
-                        HostContextResponse::FastModeSupported(supported),
-                    ))
-                });
-            }
-            HostRequest::Context(HostContextRequest::SessionId) => {
-                let Some(coordinator) = &self.coordinator else {
-                    return Box::pin(async {
-                        Ok(HostResponse::Context(HostContextResponse::Unavailable))
-                    });
+            HostRequest::Context(context) => {
+                let response = match context {
+                    HostContextRequest::ModelSpecs => HostContextResponse::Values(
+                        read.options()
+                            .options
+                            .iter()
+                            .find(|option| option.definition.id.as_ref() == MODEL_OPTION_ID)
+                            .map(|option| {
+                                option
+                                    .definition
+                                    .values
+                                    .iter()
+                                    .map(|value| Arc::clone(&value.value))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    ),
+                    HostContextRequest::ThemeNames => HostContextResponse::Unavailable,
+                    HostContextRequest::WorkingDirectory => {
+                        read.cwd().map_or(HostContextResponse::Unavailable, |cwd| {
+                            HostContextResponse::WorkingDirectory(cwd)
+                        })
+                    }
+                    HostContextRequest::FastModeSupported => {
+                        HostContextResponse::FastModeSupported(read.model().is_some_and(|spec| {
+                            Model::from_spec(&spec)
+                                .is_ok_and(|model| model.supports_fast() || model.fast_pending())
+                        }))
+                    }
+                    HostContextRequest::SessionId => {
+                        HostContextResponse::SessionId(Arc::from(read.session_id().to_string()))
+                    }
                 };
-                let id = Arc::from(coordinator.read().session_id().to_string());
-                return Box::pin(async move {
-                    Ok(HostResponse::Context(HostContextResponse::SessionId(id)))
-                });
+                return Box::pin(async move { Ok(HostResponse::Context(response)) });
             }
             HostRequest::Builtin(operation) => operation,
         };
+        let coordinator = self.coordinator.clone();
         match operation {
-            maki_commands::BuiltinOperation::Compact(instructions) => {
+            BuiltinOperation::Compact(instructions) => {
                 Box::pin(async move { Ok(HostResponse::ManualCompaction(instructions)) })
             }
-            maki_commands::BuiltinOperation::ResetSession => {
-                if let Some(guidance) = self.reset_session_guidance.clone() {
-                    Box::pin(async move {
-                        Ok(HostResponse::FrontendFeedback(
-                            maki_commands::FrontendFeedback::Text(guidance),
-                        ))
-                    })
-                } else {
-                    self.control(InteractiveControl::Reset)
-                }
-            }
-            maki_commands::BuiltinOperation::ToggleYolo => {
-                self.toggle_option_response(crate::session_options::YOLO_OPTION_ID)
-            }
-            maki_commands::BuiltinOperation::ToggleFast => {
-                self.toggle_option_response(crate::session_options::FAST_OPTION_ID)
-            }
-            maki_commands::BuiltinOperation::ToggleWorkflow => {
-                self.toggle_option_response(crate::session_options::WORKFLOW_OPTION_ID)
-            }
-            maki_commands::BuiltinOperation::ChangeDirectory { path } => {
-                let coordinator = self.coordinator.clone();
-                let state = Arc::clone(&self.state);
-                Box::pin(async move {
-                    let coordinator = coordinator.ok_or(CommandError::StaleTarget)?;
-                    let canonical = coordinator
-                        .change_directory(path)
-                        .await
-                        .map_err(|error| CommandError::Producer(Arc::from(error.to_string())))?;
-                    *state.cwd.lock().unwrap_or_else(|error| error.into_inner()) =
-                        canonical.clone();
-                    Ok(HostResponse::FrontendFeedback(
-                        maki_commands::FrontendFeedback::WorkingDirectory(canonical),
-                    ))
-                })
-            }
-            maki_commands::BuiltinOperation::SetModel { spec } => {
-                let coordinator = self.coordinator.clone();
-                Box::pin(async move {
-                    let coordinator = coordinator.ok_or(CommandError::StaleTarget)?;
-                    coordinator
-                        .set_option(crate::session_options::MODEL_OPTION_ID, Arc::clone(&spec))
-                        .await
-                        .map_err(|error| CommandError::Producer(Arc::from(error.to_string())))?;
-                    Ok(HostResponse::Completed)
-                })
-            }
-            maki_commands::BuiltinOperation::QuickQuestion {
+            BuiltinOperation::ResetSession => match self.reset_session_guidance.clone() {
+                Some(guidance) => Box::pin(async move {
+                    Ok(HostResponse::FrontendFeedback(FrontendFeedback::Text(
+                        guidance,
+                    )))
+                }),
+                None => self.control(InteractiveControl::Reset),
+            },
+            BuiltinOperation::ToggleYolo => self.toggle_option(YOLO_OPTION_ID),
+            BuiltinOperation::ToggleFast => self.toggle_option(FAST_OPTION_ID),
+            BuiltinOperation::ToggleWorkflow => self.toggle_option(WORKFLOW_OPTION_ID),
+            BuiltinOperation::ChangeDirectory { path } => Box::pin(async move {
+                let canonical = coordinator
+                    .change_directory(path)
+                    .await
+                    .map_err(producer_error)?;
+                Ok(HostResponse::FrontendFeedback(
+                    FrontendFeedback::WorkingDirectory(canonical),
+                ))
+            }),
+            BuiltinOperation::SelectModel(selection) => Box::pin(async move {
+                coordinator
+                    .set_model(selection.spec, selection.fast, selection.thinking)
+                    .await
+                    .map_err(producer_error)?;
+                Ok(HostResponse::Completed)
+            }),
+            BuiltinOperation::SetModel { spec } => Box::pin(async move {
+                coordinator
+                    .set_option(MODEL_OPTION_ID, spec)
+                    .await
+                    .map_err(producer_error)?;
+                Ok(HostResponse::Completed)
+            }),
+            BuiltinOperation::QuickQuestion {
                 question,
                 attachments,
             } => Box::pin(async move {
@@ -345,6 +256,10 @@ impl maki_commands::CommandHost for SessionCommandHost {
             }),
         }
     }
+}
+
+fn producer_error(error: impl std::fmt::Display) -> CommandError {
+    CommandError::Producer(Arc::from(error.to_string()))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -515,7 +430,6 @@ impl CommandBehavior for BuiltinBehavior {
             });
         }
         let arguments = invocation.arguments.trim().to_owned();
-        let model = parsed_string_argument(&invocation, "model");
         let theme = parsed_string_argument(&invocation, "theme");
         let directory = parsed_directory_argument(&invocation, "path");
         let id = self.id;
@@ -529,7 +443,7 @@ impl CommandBehavior for BuiltinBehavior {
                 maki_commands::BuiltinId::New => BuiltinOperation::ResetSession,
                 maki_commands::BuiltinId::Help => BuiltinOperation::ToggleHelp,
                 maki_commands::BuiltinId::Queue => BuiltinOperation::FocusQueue,
-                maki_commands::BuiltinId::Model if model.as_ref().is_ok_and(Option::is_none) => {
+                maki_commands::BuiltinId::Model if arguments.is_empty() => {
                     if !invocation.target_supports(TargetCapability::InteractiveUi) {
                         return Err(CommandError::Producer(Arc::from(
                             NONINTERACTIVE_MODEL_USAGE,
@@ -538,10 +452,9 @@ impl CommandBehavior for BuiltinBehavior {
                     BuiltinOperation::OpenModelPicker
                 }
                 maki_commands::BuiltinId::Model => {
-                    let model = model?.ok_or_else(|| {
-                        CommandError::Producer(Arc::from("model argument is unavailable"))
-                    })?;
-                    let specs = if model.contains('/') {
+                    let mut selection = maki_commands::parse_model_selection(&arguments)?;
+                    let model = selection.spec.as_deref().unwrap_or("");
+                    let specs = if model.is_empty() || model.contains('/') {
                         Arc::from([])
                     } else {
                         let HostContextResponse::Values(specs) =
@@ -553,8 +466,16 @@ impl CommandBehavior for BuiltinBehavior {
                         };
                         specs
                     };
-                    BuiltinOperation::SetModel {
-                        spec: resolve_model(&model, &specs)?,
+                    if !model.is_empty() {
+                        selection.spec = Some(resolve_model(model, &specs)?);
+                    }
+                    match selection {
+                        maki_commands::ModelSelection {
+                            spec: Some(spec),
+                            thinking: None,
+                            fast: None,
+                        } => BuiltinOperation::SetModel { spec },
+                        selection => BuiltinOperation::SelectModel(selection),
                     }
                 }
                 maki_commands::BuiltinId::Theme if theme.as_ref().is_ok_and(Option::is_none) => {
@@ -809,22 +730,26 @@ impl CustomCommand {
     }
 }
 
-pub fn discover_commands(cwd: &Path) -> Vec<CustomCommand> {
+/// Commands from the user's dirs and the project's, leaving out
+/// `.makima/commands` when {project} is ignored.
+pub fn discover_commands(cwd: &Path, project: &ProjectConfig) -> Vec<CustomCommand> {
     discover_commands_inner(
         cwd,
         maki_storage::paths::home().as_deref(),
-        maki_storage::paths::xdg_config_dir().ok().as_deref(),
+        maki_storage::paths::config_dir().ok().as_deref(),
+        project.is_ignored(),
     )
 }
 
 fn discover_commands_inner(
     cwd: &Path,
     home: Option<&Path>,
-    xdg_config: Option<&Path>,
+    global_config: Option<&Path>,
+    ignore_project: bool,
 ) -> Vec<CustomCommand> {
     let mut commands: HashMap<String, CustomCommand> = HashMap::new();
 
-    for dir in maki_storage::paths::config_search_dirs_from(home, xdg_config) {
+    if let Some(dir) = global_config {
         scan_command_dir(&dir.join(COMMANDS_DIR), CommandScope::User, &mut commands);
     }
     if let Some(home) = home {
@@ -834,7 +759,10 @@ fn discover_commands_inner(
     }
 
     for dir in find_project_ancestor_dirs(cwd) {
-        for cmd_dir in PROJECT_COMMAND_DIRS {
+        for cmd_dir in PROJECT_COMMAND_DIRS
+            .iter()
+            .filter(|cmd_dir| !(ignore_project && **cmd_dir == MAKIMA_COMMAND_DIR))
+        {
             scan_command_dir(&dir.join(cmd_dir), CommandScope::Project, &mut commands);
         }
     }
@@ -901,10 +829,10 @@ fn parse_command(content: &str, path: &Path, scope: CommandScope) -> Option<Cust
 mod tests {
     use crate::session_coordinator::SessionCoordinatorHandle;
     use maki_commands::CommandHost;
+    use maki_commands::ModelSelection;
     use maki_config::ModelPolicy;
-    use maki_storage::checkpoint::{
-        CheckpointAck, CheckpointFuture, CheckpointRequest, CheckpointWriter,
-    };
+    use maki_providers::{Effort, ThinkingConfig};
+    use maki_storage::checkpoint::ClaimingWriter;
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -948,24 +876,16 @@ mod tests {
     }
 
     struct FakeCommandHost;
-
     fn test_coordinator(
         model: &str,
         models: impl IntoIterator<Item = Arc<str>>,
-    ) -> crate::session_coordinator::SessionCoordinatorHandle {
-        let checkpoint: Arc<dyn CheckpointWriter<crate::session_coordinator::SessionCheckpoint>> =
-            Arc::new(
-                |request: CheckpointRequest<crate::session_coordinator::SessionCheckpoint>| {
-                    Box::pin(async move {
-                        Ok(CheckpointAck {
-                            session_id: request.session_id,
-                            version: request.version,
-                        })
-                    }) as CheckpointFuture
-                },
-            );
+    ) -> (
+        crate::session_coordinator::SessionCoordinatorHandle,
+        crate::headless::InteractiveHandle,
+    ) {
+        let checkpoint = ClaimingWriter::accept_all();
         let session_id = maki_storage::id::MakiId::generate();
-        crate::session_coordinator::SessionCoordinatorHandle::register(
+        let coordinator = crate::session_coordinator::SessionCoordinatorHandle::register(
             crate::session_coordinator::SessionCoordinatorParams {
                 session_id,
                 catalog: Default::default(),
@@ -975,29 +895,25 @@ mod tests {
                     false,
                     false,
                     false,
-                    maki_providers::ThinkingConfig::Off,
+                    ThinkingConfig::Off,
                 ),
                 persisted_options: Default::default(),
-                history: Vec::new(),
-                model: Arc::from(model),
-                cwd: PathBuf::from("/project"),
                 model_policy: Arc::new(ModelPolicy::default()),
-                model_adopter: Arc::new(|_: Model| {
-                    Box::pin(async { Ok(()) }) as crate::session_coordinator::ModelAdoptionFuture
-                }),
-                directory_adopter: Arc::new(|path: PathBuf| {
-                    Box::pin(async move { Ok(path) })
-                        as crate::session_coordinator::DirectoryAdoptionFuture
-                }),
                 checkpoint,
                 mailbox: crate::SessionMailbox::new(session_id),
             },
         )
-        .unwrap()
+        .unwrap();
+        let handle = crate::headless::tests::command_fixture(
+            Model::from_spec(model).unwrap(),
+            coordinator.clone(),
+        );
+        smol::block_on(handle.initialized_root()).unwrap();
+        (coordinator, handle)
     }
 
     #[derive(Default)]
-    struct RecordingCommandHost(Mutex<Vec<maki_commands::BuiltinOperation>>);
+    struct RecordingCommandHost(std::sync::Mutex<Vec<maki_commands::BuiltinOperation>>);
 
     impl maki_commands::CommandHost for RecordingCommandHost {
         fn request(
@@ -1221,6 +1137,67 @@ mod tests {
         );
     }
 
+    const STRUCTURED_MODEL_SPEC: &str = "openai/gpt-5";
+
+    fn dispatch_model_input(input: &str) -> (maki_commands::InputDispatch, Vec<BuiltinOperation>) {
+        let registry = maki_commands::CommandRegistry::new();
+        let _commands =
+            StandardCommands::register(&registry, &[], StandardCompletions::default()).unwrap();
+        let host = Arc::new(RecordingCommandHost::default());
+        let target = registry.bind_target(portable_capabilities(), host.clone());
+        let dispatched = smol::block_on(registry.dispatch_input(&target, input.into()));
+        let operations = host.0.lock().unwrap().clone();
+        (dispatched, operations)
+    }
+
+    #[test_case(
+        &format!("/model {STRUCTURED_MODEL_SPEC}{{thinking=high, fast=true}}"),
+        ModelSelection {
+            spec: Some(Arc::from(STRUCTURED_MODEL_SPEC)),
+            thinking: Some(ThinkingConfig::Effort(Effort::High)),
+            fast: Some(true),
+        }
+        ; "spec_with_brace_options"
+    )]
+    #[test_case(
+        "/model fast=false",
+        ModelSelection { fast: Some(false), ..Default::default() }
+        ; "fast_only"
+    )]
+    #[test_case(
+        "/model thinking=2048",
+        ModelSelection { thinking: Some(ThinkingConfig::Budget(2048)), ..Default::default() }
+        ; "thinking_budget_only"
+    )]
+    fn structured_model_routes_options(input: &str, expected: ModelSelection) {
+        let (dispatched, operations) = dispatch_model_input(input);
+        assert!(matches!(
+            dispatched,
+            maki_commands::InputDispatch::Dispatched(CommandOutcome::Completed)
+        ));
+        assert_eq!(operations, vec![BuiltinOperation::SelectModel(expected)]);
+    }
+
+    #[test_case("/model fast=true fast=false" ; "duplicate_fast")]
+    #[test_case("/model thinking=high thinking=off" ; "duplicate_thinking")]
+    #[test_case("/model wat=true" ; "unknown_option")]
+    #[test_case("/model fast=on" ; "invalid_fast")]
+    #[test_case("/model thinking=0" ; "zero_budget")]
+    #[test_case("/model thinking=toggle" ; "thinking_toggle")]
+    #[test_case("/model fast=toggle" ; "fast_toggle")]
+    #[test_case(r#"/model "" fast=false"# ; "empty_quoted_spec")]
+    #[test_case(r#"/model "openai/gpt-5" "openai/gpt-4""# ; "two_quoted_specs")]
+    #[test_case(r#"/model "openai/gpt-5" thinking="high" thinking=off"# ; "duplicate_after_quoted_spec")]
+    #[test_case("/model openai/gpt-5 openai/gpt-4" ; "two_specs")]
+    fn structured_model_rejects_invalid_input(input: &str) {
+        let (dispatched, operations) = dispatch_model_input(input);
+        assert!(matches!(
+            dispatched,
+            maki_commands::InputDispatch::Dispatched(CommandOutcome::Failed(_))
+        ));
+        assert!(operations.is_empty());
+    }
+
     #[test]
     fn portable_target_separates_compaction_from_session_replacement() {
         let registry = maki_commands::CommandRegistry::new();
@@ -1255,20 +1232,11 @@ mod tests {
 
     #[test]
     fn session_host_dispatches_portable_state_operations() {
-        let (control_tx, _control_rx) = flume::unbounded();
-        let state = Arc::new(SessionCommandState::new(
-            FAST_MODEL.into(),
-            Arc::from([]),
-            PathBuf::from("/project"),
-            false,
-            false,
-        ));
-        let coordinator = test_coordinator(
+        let (coordinator, handle) = test_coordinator(
             FAST_MODEL,
             [Arc::from(FAST_MODEL), Arc::from(OFFLINE_MODEL)],
         );
-        let host = SessionCommandHost::new(control_tx, Arc::clone(&state))
-            .with_coordinator(coordinator.clone());
+        let host = SessionCommandHost::new(handle.control_tx.clone(), coordinator.clone());
         let request = |operation| HostRequest::Builtin(operation);
         assert!(matches!(
             smol::block_on(host.request(request(maki_commands::BuiltinOperation::ToggleYolo))),
@@ -1278,10 +1246,13 @@ mod tests {
             option_value(&coordinator, crate::session_options::YOLO_OPTION_ID),
             crate::session_options::ENABLED_VALUE.into()
         );
-        assert!(matches!(
-            smol::block_on(host.request(request(maki_commands::BuiltinOperation::ToggleFast))),
-            Ok(HostResponse::Completed)
-        ));
+        let fast =
+            smol::block_on(host.request(request(maki_commands::BuiltinOperation::ToggleFast)));
+        assert!(
+            matches!(fast, Ok(HostResponse::Completed)),
+            "{:?}",
+            fast.err()
+        );
         assert_eq!(
             option_value(&coordinator, crate::session_options::FAST_OPTION_ID),
             crate::session_options::ENABLED_VALUE.into()
@@ -1325,7 +1296,14 @@ mod tests {
                 maki_commands::FrontendFeedback::WorkingDirectory(path)
             )) if path == Path::new("/tmp")
         ));
-        assert_eq!(coordinator.read().cwd(), PathBuf::from("/tmp"));
+        assert_eq!(coordinator.read().cwd().unwrap(), PathBuf::from("/tmp"));
+        let elsewhere = TempDir::new().unwrap();
+        let elsewhere =
+            smol::block_on(coordinator.change_directory(elsewhere.path().into())).unwrap();
+        assert!(matches!(
+            smol::block_on(host.request(HostRequest::Context(HostContextRequest::WorkingDirectory))),
+            Ok(HostResponse::Context(HostContextResponse::WorkingDirectory(path))) if path == elsewhere
+        ));
 
         let model = Model::from_spec(OFFLINE_MODEL).unwrap();
         let result = smol::block_on(host.request(HostRequest::Builtin(
@@ -1338,6 +1316,7 @@ mod tests {
             option_value(&coordinator, crate::session_options::MODEL_OPTION_ID),
             model.spec().into()
         );
+        smol::block_on(handle.task.cancel());
         smol::block_on(coordinator.close()).unwrap();
     }
 
@@ -1360,16 +1339,10 @@ mod tests {
         let registry = maki_commands::CommandRegistry::new();
         let _commands =
             StandardCommands::register(&registry, &[], StandardCompletions::default()).unwrap();
-        let state = Arc::new(SessionCommandState::new(
-            OFFLINE_MODEL.into(),
-            Arc::from([]),
-            PathBuf::from("/project"),
-            false,
-            false,
-        ));
+        let (coordinator, handle) = test_coordinator(OFFLINE_MODEL, [Arc::from(OFFLINE_MODEL)]);
         let host = Arc::new(SessionCommandHost::new(
-            flume::unbounded().0,
-            Arc::clone(&state),
+            handle.control_tx.clone(),
+            coordinator.clone(),
         ));
         let target = registry.bind_target(portable_capabilities(), host);
 
@@ -1381,7 +1354,12 @@ mod tests {
                 CommandError::Producer(message)
             )) if message.as_ref() == FAST_UNSUPPORTED
         ));
-        assert!(!state.fast());
+        assert_eq!(
+            option_value(&coordinator, crate::session_options::FAST_OPTION_ID),
+            crate::session_options::DISABLED_VALUE.into()
+        );
+        smol::block_on(handle.task.cancel());
+        smol::block_on(coordinator.close()).unwrap();
     }
 
     #[test]
@@ -1462,7 +1440,7 @@ mod tests {
         .unwrap();
 
         let global = TempDir::new().unwrap();
-        let global_cmd_dir = global.path().join(".makima/commands");
+        let global_cmd_dir = global.path().join(COMMANDS_DIR);
         fs::create_dir_all(&global_cmd_dir).unwrap();
         fs::write(
             global_cmd_dir.join("overlap.md"),
@@ -1470,15 +1448,16 @@ mod tests {
         )
         .unwrap();
 
-        let commands = discover_commands_inner(project.path(), Some(global.path()), None);
+        let commands = discover_commands_inner(project.path(), None, Some(global.path()), false);
         let overlap: Vec<_> = commands.iter().filter(|c| c.name == "overlap").collect();
         assert_eq!(overlap.len(), 1);
         assert_eq!(overlap[0].description, "Project version");
         assert_eq!(overlap[0].scope, CommandScope::Project);
     }
 
-    #[test]
-    fn discover_supports_both_dir_sources() {
+    #[test_case(false ; "both_sources")]
+    #[test_case(true ; "no_project_skips_makima")]
+    fn discover_supports_both_dir_sources(ignore_project: bool) {
         let dir = TempDir::new().unwrap();
 
         for (cmd_dir, filename) in [
@@ -1490,9 +1469,9 @@ mod tests {
             fs::write(path.join(filename), "Content").unwrap();
         }
 
-        let commands = discover_commands_inner(dir.path(), None, None);
+        let commands = discover_commands_inner(dir.path(), None, None, ignore_project);
         let names: Vec<_> = commands.iter().map(|c| c.name.as_str()).collect();
-        assert!(names.contains(&"a-cmd"));
+        assert_eq!(names.contains(&"a-cmd"), !ignore_project);
         assert!(names.contains(&"b-cmd"));
     }
 
@@ -1504,7 +1483,7 @@ mod tests {
         fs::write(cmd_dir.join("valid.md"), "Content").unwrap();
         fs::write(cmd_dir.join("invalid.txt"), "Content").unwrap();
 
-        let commands = discover_commands_inner(dir.path(), None, None);
+        let commands = discover_commands_inner(dir.path(), None, None, false);
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].name, "valid");
     }

@@ -44,13 +44,13 @@ After approval, the picked model becomes the session model and the agent starts 
 
 ## Configuration changes
 
-The model, thinking, fast, workflow, and mode settings belong to the session. You change them with `/model`, `/thinking`, `/fast`, `/workflow`, Tab, a plan approval, or a plugin. Makima shows the new value as soon as it accepts the change. When you pick a model that does not support thinking or fast, those turn off.
+The model, thinking, fast, workflow, and mode settings belong to each agent, so changing the viewed subagent leaves the main agent alone. You change them with `/model`, `/thinking`, `/fast`, `/workflow`, Tab, a plan approval, or a plugin. When you pick a model that does not support thinking or fast, those turn off.
 
-A change never touches a turn that has already started. The running turn finishes with the model, settings, mode, and tools it started with. A message you send while the agent works usually joins the running turn, but not after a change: then it waits for the running turn to finish and starts its own turn with the new settings. Messages that were already in the queue keep the settings they were queued with. The same is true when a plugin redefines a mode: running and queued turns keep the old definition.
+A change never touches a turn that has already started. The running turn finishes with the model, settings, mode, and tools it started with. A message you send while the agent works usually joins the running turn, but not after a change: then it waits for the running turn to finish and starts its own turn with the new settings. SDK and ACP messages behave the same as typing in the TUI. Messages that were already in the queue keep the settings they were queued with. The same is true when a plugin redefines a mode: running and queued turns keep the old definition.
 
-Makima saves the change with the session in the background, so you never wait on the disk. If saving fails, the change still applies, and a warning says the configuration was applied but not saved. Makima keeps retrying and tells you when the save recovers. If Makima crashes before the save lands, the session comes back with the older settings.
+Makima saves the change with the session before it applies it. If the save fails, nothing changes and you see an error. A change a plugin requested is also dropped when the plugin reloads or its call ends before the save starts. Once the save has started, the change always applies.
 
-All of this is how the TUI and Lua agent sessions work. Headless, print, and ACP runs set these options their own way. YOLO and plugin options sit outside it, and a YOLO change applies to permission checks right away.
+The TUI, print, SDK, ACP and Lua agent sessions all follow these rules. One-shot print runs apply changes the same way but do not save the session. YOLO and plugin options belong to the session, not to one agent: they sit outside this, `Agent:set_option` sets them only through the root agent and refuses them on a subagent, and a YOLO change applies to permission checks right away.
 
 ## What a mode is
 
@@ -104,14 +104,15 @@ supply both when you override.
 Other methods:
 
 ```lua
-maki.api.mode.get()          -- current mode id: "build", "plan", or a custom name
-maki.api.mode.set("plan")    -- enter a mode; fails if it is not defined
+local agent = ctx:agent()  -- in a command, keymap or tool handler
+agent:config(ctx).mode       -- the agent's mode id: "build", "plan", or a custom name
+agent:set_mode(ctx, "plan")  -- enter a mode; fails if it is not defined
 maki.api.mode.list()         -- all modes as { name, label }
 maki.api.mode.reset("plan")  -- drop a plugin override, restore the built-in
 maki.api.mode.reset()        -- restore every built-in
 ```
 
-Switching modes fires the autocmd `ModeChanged` with data `{ mode = "<id>" }`. Setting the mode you are already in does not fire it.
+Every committed config change of an agent fires the autocmd `ConfigChanged`, with the agent's mode in `ev.data.mode`. Compare it with the last value you saw to react to mode switches.
 
 ## Example: a plan-review workflow
 
@@ -127,10 +128,10 @@ maki.setup({
 })
 ```
 
-- `mode_plan_override` replaces the built-in `plan` mode with a verbatim clone of polytoken's plan directive (via the `plan` plugin override). It focuses the model on producing a reviewable artifact, restricts writes to the plan file, swaps the toolset to `read`, `grep`, `glob`, `webfetch`, `write`, `edit`, `plan_submit`, and `task`, and adds `/plan` and `/build` slash commands. The directive and the plan reviewer splice one shared plan specification, so both always see the exact same document.
+- `mode_plan_override` replaces the built-in `plan` mode with a verbatim clone of polytoken's plan directive (via the `plan` plugin override). It focuses the model on producing a reviewable artifact, restricts writes to the plan file, swaps the toolset to `read`, `grep`, `glob`, `webfetch`, `write`, `edit`, `plan_submit`, and the task tools (`task_spawn`, `task_wait`, `task_send`, `task_despawn`), and adds `/plan` and `/build` slash commands. The directive and the plan reviewer splice one shared plan specification, so both always see the exact same document.
 - `plan_submit_tool` is a mode-scoped tool: it prints the finished plan inline as a display-only message (kept out of the model context) and opens the [plan form](#plan-approval). It only exists in plan mode because plan's toolset lists it. While `plan_submit` is in an active mode's toolset, the built-in auto-hooks that open the plan form on a plan-file write are skipped; the model calls `plan_submit` explicitly when the plan is ready. The form works the same way as after a plan-file write.
 
-The built-in `task` tool grows a `plan_reviewer` subagent type when the plan
+The built-in task tools grow a `plan_reviewer` subagent type when the plan
 override is active: a read-only audit that verifies the plan follows the shared
 plan specification, maps every acceptance criterion to a named test, and checks
 test-infrastructure adequacy before answering `VERDICT: pass|fail`. It is only
@@ -143,8 +144,9 @@ With all three enabled, a typical loop is:
 
 1. Switch to plan mode (`/plan`). The model drafts `plan.md` using the cloned
    directive and the reduced toolset.
-2. The model calls `task` with `subagent_type = "plan_reviewer"` to audit the
-   plan, then iterates until `VERDICT: pass`.
+2. The model calls `task_spawn` with `subagent_type = "plan_reviewer"` to audit
+   the plan, collects the verdict with `task_wait`, then iterates until
+   `VERDICT: pass`.
 3. The model calls `plan_submit`; the plan prints inline and you accept, refine,
    or concede through the plan review form.
 4. Switch to build mode (`/build`) to implement with the full toolset.

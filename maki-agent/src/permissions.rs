@@ -18,7 +18,7 @@ pub const DEFAULT_DENY_GUIDANCE: &str =
 /// Tests assert on this exact prefix; a wording tweak here updates them in one place.
 pub const PERMISSION_DENIED_PREFIX: &str = "Permission denied for";
 
-const TASK_TOOL: &str = "task";
+const TASK_SPAWN_TOOL: &str = "task_spawn";
 const BASH_TOOL: &str = "bash";
 
 /// Words that open a block the bash plugin keeps as one scope. Their first
@@ -42,19 +42,19 @@ fn builtin_rules(cwd: &Path) -> Vec<PermissionRule> {
         .iter()
         .map(|tool| allow(tool, &cwd_glob))
         .collect();
-    rules.push(allow(TASK_TOOL, "*"));
+    rules.push(allow(TASK_SPAWN_TOOL, "*"));
     rules
 }
 
 pub const BOUNDARY_UNVERIFIABLE_PREFIX: &str = "Cannot verify project boundary for";
 
 /// Whether the builtin defaults treat `tool` specially. File write tools get
-/// the cwd allow and the plan mode allow, `task` gets a blanket allow, and an
+/// the cwd allow and the plan mode allow, `task_spawn` gets a blanket allow, and an
 /// "allow always" for `bash` is stored under the first word of the command.
 /// Rules are keyed by name alone, so a plugin taking one of these names
 /// inherits all of it.
 pub fn carries_builtin_defaults(tool: &str) -> bool {
-    FILE_WRITE_TOOLS.contains(&tool) || matches!(tool, TASK_TOOL | BASH_TOOL)
+    FILE_WRITE_TOOLS.contains(&tool) || matches!(tool, TASK_SPAWN_TOOL | BASH_TOOL)
 }
 
 #[derive(Debug)]
@@ -320,18 +320,18 @@ impl PermissionManager {
         if has_wildcard_deny {
             warn!(
                 "wildcard deny detected — this blocks ALL tools including \
-                 builtins (write/edit/multiedit/task). Use per-tool rules \
+                 builtins (write/edit/multiedit/task_spawn). Use per-tool rules \
                  instead if you want selective access."
             );
         }
-        // Warn if wildcard allow is present — it permits ALL tools including write/edit/task.
+        // Warn if wildcard allow is present — it permits ALL tools including write/edit/task_spawn.
         let has_wildcard_allow = config_rules
             .iter()
             .any(|r| matches!(r.tool, ToolKey::Wildcard) && r.effect == Effect::Allow);
         if has_wildcard_allow {
             warn!(
                 "wildcard allow detected — this permits ALL tools including \
-                 write/edit/multiedit/task. Use per-tool rules \
+                 write/edit/multiedit/task_spawn. Use per-tool rules \
                  instead if you want selective access."
             );
         }
@@ -1099,7 +1099,7 @@ mod tests {
 
     #[test_case("write", "/tmp/file.txt" => true ; "write_in_cwd")]
     #[test_case("write", "/etc/passwd" => false ; "write_outside_cwd")]
-    #[test_case("task", "task:research" => true ; "task_allowed")]
+    #[test_case("task_spawn", "research" => true ; "task_spawn_allowed")]
     #[test_case("bash", "cargo test" => false ; "bash_prompts")]
     fn builtin_check(tool: &str, scope: &str) -> bool {
         matches!(

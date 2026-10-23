@@ -6,21 +6,101 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use event_listener::Event;
+use maki_storage::checkpoint::CheckpointPublication;
 
 use crate::types::TurnCancellationReason;
 
+#[derive(Default)]
+struct CancellationState {
+    publications: Vec<Weak<CheckpointPublication>>,
+    children: Vec<Weak<Shared>>,
+}
+
 struct Shared {
     cancelled: AtomicBool,
+    state: Mutex<CancellationState>,
+    publication_gate: Arc<Mutex<()>>,
     event: Event,
+    _parent_registration: Option<CancelRegistration>,
 }
 
 impl Shared {
+    fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+            || self
+                ._parent_registration
+                .as_ref()
+                .is_some_and(|registration| registration.source.cancelled())
+    }
+
     fn fire(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        let _gate = self
+            .publication_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.fire_locked();
+    }
+
+    fn fire_locked(&self) {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.cancelled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        for publication in state.publications.iter().filter_map(Weak::upgrade) {
+            publication.cancel();
+        }
+        let children: Vec<_> = state.children.iter().filter_map(Weak::upgrade).collect();
+        drop(state);
+        for child in children {
+            child.fire_locked();
+        }
         self.event.notify(usize::MAX);
+    }
+}
+
+/// Keeps a request registered with its cancellation source until completion.
+#[must_use]
+pub struct PublicationRegistration {
+    source: Weak<Shared>,
+    publication: Arc<CheckpointPublication>,
+}
+
+impl PublicationRegistration {
+    pub(crate) fn cancel(&self) {
+        self.publication.cancel();
+    }
+}
+
+impl Drop for PublicationRegistration {
+    fn drop(&mut self) {
+        if let Some(source) = self.source.upgrade() {
+            let publication = Arc::downgrade(&self.publication);
+            source
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .publications
+                .retain(|registered| !registered.ptr_eq(&publication));
+        }
+    }
+}
+
+struct CancelRegistration {
+    source: Arc<Shared>,
+    child: Weak<Shared>,
+}
+
+impl Drop for CancelRegistration {
+    fn drop(&mut self) {
+        self.source
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .children
+            .retain(|registered| !registered.ptr_eq(&self.child));
     }
 }
 
@@ -128,7 +208,10 @@ impl CancelToken {
     pub fn new() -> (CancelTrigger, Self) {
         let shared = Arc::new(Shared {
             cancelled: AtomicBool::new(false),
+            state: Mutex::default(),
+            publication_gate: Arc::default(),
             event: Event::new(),
+            _parent_registration: None,
         });
         (CancelTrigger(Arc::clone(&shared)), Self(shared))
     }
@@ -136,12 +219,15 @@ impl CancelToken {
     pub fn none() -> Self {
         Self(Arc::new(Shared {
             cancelled: AtomicBool::new(false),
+            state: Mutex::default(),
+            publication_gate: Arc::default(),
             event: Event::new(),
+            _parent_registration: None,
         }))
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.cancelled.load(Ordering::Acquire)
+        self.0.cancelled()
     }
 
     pub async fn race<T>(&self, future: impl Future<Output = T>) -> Result<T, String> {
@@ -168,16 +254,69 @@ impl CancelToken {
         }
     }
 
+    pub fn register_publication(
+        &self,
+        publication: &CheckpointPublication,
+    ) -> PublicationRegistration {
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        let publication = Arc::new(publication.clone());
+        if self.is_cancelled() {
+            publication.cancel();
+        } else {
+            state.publications.push(Arc::downgrade(&publication));
+        }
+        PublicationRegistration {
+            source: Arc::downgrade(&self.0),
+            publication,
+        }
+    }
+
+    /// Serializes the request CAS with cancellation of this source.
+    pub fn claim_publication(&self, publication: &CheckpointPublication) -> bool {
+        self.claim_publication_if(publication, || true)
+    }
+
+    /// The predicate must inspect captured cheap state only; it runs under the cancellation guard.
+    pub fn claim_publication_if(
+        &self,
+        publication: &CheckpointPublication,
+        valid: impl FnOnce() -> bool,
+    ) -> bool {
+        let _gate = self
+            .0
+            .publication_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if self.is_cancelled() || !valid() {
+            publication.cancel();
+            return false;
+        }
+        publication.try_publish()
+    }
+
     pub fn child(&self) -> (CancelTrigger, Self) {
-        let (child_trigger, child_token) = Self::new();
-        let parent = self.clone();
-        let child_shared = Arc::clone(&child_token.0);
-        smol::spawn(async move {
-            parent.cancelled().await;
-            child_shared.fire();
-        })
-        .detach();
-        (child_trigger, child_token)
+        let _gate = self
+            .0
+            .publication_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        let shared = Arc::new_cyclic(|child| Shared {
+            cancelled: AtomicBool::new(false),
+            state: Mutex::default(),
+            publication_gate: Arc::clone(&self.0.publication_gate),
+            event: Event::new(),
+            _parent_registration: Some(CancelRegistration {
+                source: Arc::clone(&self.0),
+                child: child.clone(),
+            }),
+        });
+        if self.is_cancelled() {
+            shared.fire_locked();
+        } else {
+            state.children.push(Arc::downgrade(&shared));
+        }
+        (CancelTrigger(Arc::clone(&shared)), Self(shared))
     }
 }
 
@@ -310,13 +449,43 @@ mod tests {
 
     #[test]
     fn child_cancelled_by_parent() {
-        smol::block_on(async {
-            let (parent_trigger, parent_token) = CancelToken::new();
-            let (_child_trigger, child_token) = parent_token.child();
-            parent_trigger.cancel();
-            child_token.cancelled().await;
-            assert!(child_token.is_cancelled());
-        });
+        let (parent_trigger, parent_token) = CancelToken::new();
+        let (_child_trigger, child_token) = parent_token.child();
+        let publication = CheckpointPublication::default();
+        let _registration = child_token.register_publication(&publication);
+        parent_trigger.cancel();
+        assert!(child_token.is_cancelled());
+        assert!(publication.is_cancelled());
+        assert!(!publication.try_publish());
+    }
+
+    #[test_case::test_case(false; "cancel_before_claim")]
+    #[test_case::test_case(true; "cancel_after_claim")]
+    fn publication_registration_orders_cancellation(claim_first: bool) {
+        let (trigger, token) = CancelToken::new();
+        let publication = CheckpointPublication::default();
+        let registration = token.register_publication(&publication);
+        if claim_first {
+            assert!(token.claim_publication(&publication));
+        }
+        trigger.cancel();
+        assert_eq!(publication.is_cancelled(), !claim_first);
+        assert!(!publication.try_publish());
+        drop(registration);
+        assert!(token.0.state.lock().unwrap().publications.is_empty());
+    }
+
+    #[test]
+    fn publication_registration_rejects_cancelled_source_and_deregisters_on_abort() {
+        let (trigger, token) = CancelToken::new();
+        let abandoned = CheckpointPublication::default();
+        drop(token.register_publication(&abandoned));
+        trigger.cancel();
+        assert!(!abandoned.is_cancelled());
+        let publication = CheckpointPublication::default();
+        let _registration = token.register_publication(&publication);
+        assert!(publication.is_cancelled());
+        assert!(!token.claim_publication(&publication));
     }
 
     #[test]

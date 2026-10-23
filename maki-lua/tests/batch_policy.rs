@@ -319,7 +319,7 @@ fn start_batch(tool_calls: Value) -> RunningBatch {
 
 fn start_batch_with(child_src: String, tool_calls: Value) -> RunningBatch {
     let (event_tx, events) = flume::unbounded();
-    let event_tx = EventSender::new(event_tx, 0);
+    let event_tx = EventSender::new(event_tx);
     let (trigger, token) = CancelToken::new();
     let (result_tx, result) = flume::bounded(1);
     std::thread::spawn(move || {
@@ -647,7 +647,7 @@ fn restore_snapshot_lines_opts(
             clicks,
             state,
         },
-        EventSender::new(tx, 0),
+        EventSender::new(tx),
     );
     handle.wait_restore_complete_for_test();
     barrier(host);
@@ -1187,7 +1187,7 @@ fn exec_batch_live(
     tool_calls: Value,
 ) -> (Value, Vec<BufferSnapshot>) {
     let (tx, rx) = flume::unbounded();
-    let event_tx = EventSender::new(tx, 0);
+    let event_tx = EventSender::new(tx);
     let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(BATCH_ID));
     ctx.registry = Arc::clone(reg);
 

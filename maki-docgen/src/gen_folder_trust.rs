@@ -30,9 +30,7 @@ Trust, `n` answers Not now, and "Never" needs the arrow keys and Enter. Ctrl-C
 exits Makima. A project that ships no gated file is never asked about.
 
 One answer covers one project root: the active Git checkout, or the working
-directory outside Git. Linked worktrees answer for themselves. Starting Makima in
-your home directory loads no project configuration, because `~/.makima` there is
-your global configuration.
+directory outside Git. Linked worktrees answer for themselves.
 
 ## What Trust Does Not Cover
 
@@ -140,6 +138,25 @@ maki.setup({
     trust = { paths = { "/workspace/**" } },
 })
 ```
+
+## Loading Nothing From the Project
+
+Trust decides what an untrusted project may load. `--no-project` loads nothing
+from the project's `.makima` directory, whatever its trust: no gated file, no
+`permissions.toml`, and no commands or skills under `.makima`. It records no
+decision, and the TUI, `--print`, the SDK, ACP and the utility subcommands all
+honour it.
+
+Use it to work in a repository whose `.makima` files are broken, such as a
+`permissions.toml` that stops Makima from starting, or that you would rather not
+run at all:
+
+```bash
+makima --no-project
+```
+
+Instruction files such as `AGENTS.md`, and other tools' directories such as
+`.claude/commands`, still load. `--no-project` cannot be combined with `--trust`.
 
 ## What a Yes Covers
 

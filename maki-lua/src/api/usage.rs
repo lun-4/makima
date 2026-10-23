@@ -4,10 +4,11 @@ use std::sync::Arc;
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, Result as LuaResult, Table, Value};
 
+use crate::agent_errors::DELEGATED_REGISTRATION;
 use crate::api::util::command::{ProviderUsageSnapshot, UiAction, ui_roundtrip};
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::dispatch::call_isolated;
-use crate::api::util::pair::{Pair, try_pair};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 
 const CALLBACK_SEAM: &str = "maki.usage.on_change";
 
@@ -106,28 +107,37 @@ async fn fetch(
 /// Callback failures are logged and do not stop other callbacks.
 ///
 /// @param callback function Called with `{provider_id, provider, model, status}`.
-/// @return function Idempotent unsubscribe callback.
+/// @return (function|nil, string|nil) Idempotent unsubscribe callback. Returns nil and an error when called from a delegated tool handler.
 #[lua_fn]
-fn on_change(lua: &Lua, #[ctx] plugin: Arc<str>, callback: Function) -> LuaResult<Function> {
-    let mut mirror = lua
-        .app_data_mut::<UsageMirror>()
-        .ok_or_else(|| mlua::Error::runtime("usage mirror not initialized"))?;
-    mirror
-        .callbacks
-        .entry(Arc::clone(&plugin))
-        .or_default()
-        .push(callback.clone());
-    let key = lua.create_registry_value(callback)?;
-    let plugin_key = plugin;
-    lua.create_function(move |lua, ()| {
-        let Some(mut mirror) = lua.app_data_mut::<UsageMirror>() else {
-            return Ok(());
-        };
-        if let Some(callbacks) = mirror.callbacks.get_mut(&plugin_key) {
-            callbacks.retain(|callback| callback != &lua.registry_value::<Function>(&key).unwrap());
-        }
-        Ok(())
-    })
+fn on_change(lua: &Lua, #[ctx] plugin: Arc<str>, callback: Function) -> LuaResult<Pair<Function>> {
+    if crate::runtime::in_delegated_tool(lua) {
+        return Ok(err_pair(DELEGATED_REGISTRATION));
+    }
+    try_pair!(crate::runtime::validate_plugin_effect(lua));
+    let registered = || -> LuaResult<Function> {
+        let mut mirror = lua
+            .app_data_mut::<UsageMirror>()
+            .ok_or_else(|| mlua::Error::runtime("usage mirror not initialized"))?;
+        mirror
+            .callbacks
+            .entry(Arc::clone(&plugin))
+            .or_default()
+            .push(callback.clone());
+        let key = lua.create_registry_value(callback)?;
+        let plugin_key = plugin;
+        lua.create_function(move |lua, ()| {
+            let Some(mut mirror) = lua.app_data_mut::<UsageMirror>() else {
+                return Ok(());
+            };
+            if let Some(callbacks) = mirror.callbacks.get_mut(&plugin_key) {
+                callbacks
+                    .retain(|callback| callback != &lua.registry_value::<Function>(&key).unwrap());
+            }
+            Ok(())
+        })
+    };
+    let value = registered()?;
+    Ok((Some(value), None))
 }
 
 lua_table! {

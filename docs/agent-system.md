@@ -1,24 +1,22 @@
 # Agent system
 
-This document describes the agent implementation that exists now. It covers the reliable turn lifecycle, shared actor, and per-outer-session agent manager introduced by the first three Issue 24 deliveries.
-
-It does not describe the intended final form of Issue 24 as if it already exists. See [Deferred work](#deferred-work) for the current boundary.
+The reliable turn lifecycle, shared actor, and per-outer-session agent manager below describe the current implementation. See the [Lua API reference](../site/docs/content/lua-api/_index.md) and [plugin guide](../site/docs/content/plugins/_index.md) for the public contract.
 
 ## Vocabulary
 
-- **Outer session**: the TUI session runtime that owns one agent manager and one rooted agent graph.
+- **Outer session**: one frontend session (TUI, print, SDK or ACP) that owns one agent manager and one rooted agent graph.
 - **Agent**: one graph node with a stable `AgentId`, persistent actor, history, FIFO queue, and reusable lifecycle.
 - **Root agent**: the graph node with no parent. It uses the same actor implementation as descendants.
 - **Turn**: one accepted model/tool run, identified by a `TurnId` and ending in one `TurnOutcome`.
 - **Actor**: the per-agent scheduler and state owner.
 - **Manager**: the per-outer-session graph, factory, authority, task, and cross-agent concurrency owner.
-- **Subagent** and **task**: compatibility and product-facing names for descendant agents. They are not separate core runtime types.
-- **Correlation id**: a frontend or protocol value such as a TUI `run_id`, task id, or provider tool-use id. It is not agent identity or authority.
+- **Subagent** and **task**: product-facing names for descendant agents. They are not separate core runtime types.
+- **Correlation id**: a frontend or protocol value such as a headless cancel key, task id, or provider tool-use id. It is not agent identity or authority.
 
 ## Architecture
 
 ```text
-TUI outer session
+Outer session (TUI, print, SDK or ACP)
 └── AgentManagerHandle
     ├── graph, limits, runner tasks, turn permits, wait watchers
     └── root AgentActorHandle
@@ -27,7 +25,7 @@ TUI outer session
             └── Lua-created grandchild AgentActorHandle
 
 AgentActorHandle
-└── ActorBackend (TUI or Lua adapter)
+└── ActorBackend (TUI, headless or Lua adapter)
     └── transient Agent
         └── Agent::run(turn_id, input) -> TurnOutcome
 ```
@@ -39,9 +37,9 @@ The layers deliberately own different state:
 | `Agent::run` | One model/tool run, invocation-local usage and model-turn count, terminal outcome emission | The persistent queue, graph topology, or frontend lifecycle |
 | `AgentActorHandle` | One agent's stable identity, history, FIFO scheduling, active cancellation, tickets, outcomes, cumulative usage | Parent-child topology, graph limits, or a second copy of frontend state |
 | `AgentManagerHandle` | One outer session's rooted graph, actor factory, runner tasks, topology, spawn authority, global active-turn limit, subtree lifecycle | A second per-agent queue, history, or outcome store |
-| TUI and Lua backends | Dynamic provider/model/tool/prompt preparation and compatibility presentation | Lifecycle truth or graph authority derived from presentation ids |
+| TUI, headless and Lua backends | Dynamic provider/model/tool/prompt preparation and presentation | Lifecycle truth or graph authority derived from presentation ids |
 
-The core is dependency-neutral. `maki-agent` does not depend on `maki-ui` or `maki-lua`; those crates implement `ActorBackend` to prepare and execute their own turns against actor-owned history.
+The core is dependency-neutral. `maki-agent` does not depend on `maki-ui` or `maki-lua`; those crates implement `ActorBackend` to prepare and execute their own turns against actor-owned history. `maki-agent::headless` holds the print, SDK and ACP backend.
 
 ## Turn lifecycle
 
@@ -65,7 +63,30 @@ Standalone controls and compaction are not turns. They have no `TurnId`, create 
 
 Managed actors own the committed `EffectiveAgentConfig`. Typed changes and admissions share one FIFO; materialized work runs through the separate execution queue. Preparation runs outside actor locks, and completion checks the reserved entry identity before committing or enqueueing work. Active execution does not wait for later configuration preparation.
 
-An actor commit publishes its identity, generation, and full configuration to frontend projections. Provider slots and coordinator reads do not supply managed execution settings. Configuration saves use the existing session format and do not replace history. The user-visible commit, retry, and crash semantics are described in [Modes: Configuration changes](../site/docs/content/modes/_index.md#configuration-changes).
+Every frontend, the coordinator and Lua commit a config change through one `config_change::ConfigChangeTicket`. Reserving takes the durable mutation (for a root, the session option lease) and then the FIFO slot, both synchronously, so changes hold the lease in dispatch order. A change that meets a held lease or idle guard joins a per-actor wait queue and takes its slot once the holder lets go, so waiting changes keep dispatch order too; it fails only when the target closes or the change is rejected. A model a change switches to is re-resolved against discovery when the change commits, under the actor's state lock, so discovery that lands while the change is in flight still reaches it. Every frontend fills one `orchestration::ModelCatalog` through `ModelCatalog::discover`. Each provider's batch merges into the catalog at once; its refresh then commits rediscovered metadata to the agents of every attached orchestration, reading their committed configs only after the provider's metadata is written (so a change in flight is caught by either side), and republishes their sessions' model values when the catalog grew. Print waits up to `ACTIVE_DISCOVERY_BOUND` for its own provider's batch before the first turn. A coordinator option that needs no actor change (yolo, plugin options) takes the same queue place through `config_change::reserve_in_turn`, so it waits rather than failing busy. Errors are a typed `ConfigChangeError`; `is_busy()` means an idle guard or the lease refused a change, which only plugin option replacement across sessions still reports.
+
+Every mode name goes through one `modes::resolve`, against the registry the Lua host owns (`EventHandle::mode_registry`), and every frontend and Lua commit a mode with `ConfigChangeTicket::commit_mode`. `plan` keeps the current plan file or allocates one under the state directory. A mode is durable config committed once, like any other change: headless frontends admit turns without a mode of their own.
+
+An actor commit publishes its identity, generation, and full configuration to frontend projections. Provider slots and coordinator reads do not supply managed execution settings. Configuration checkpoints use the existing session format and project onto stored metadata without replacing history. The user-visible behaviour is described in [Modes: Configuration changes](../site/docs/content/modes/_index.md#configuration-changes).
+
+### Durable publication
+
+Durable configuration changes commit through `PreparedOperationTicket::commit_durable`. History edits made under an idle guard (rewind, plan approval that clears context) commit through `ActorIdleGuard::commit_prepared_transaction_held`. In both, the actor captures a candidate snapshot, the host stages it on disk, and the actor commits only after the host has published it. One `CheckpointPublication` per request arbitrates between cancellation and the final replacement:
+
+```text
+writer guard      SessionPublicationGuard: session lock held, owner still ours
+  plugin gate     PluginAuthority::publication_gate: plugin generation alive
+    task scope    TaskCell: invocation live, same plugin origin
+      cancel      CancelToken publication gate: not cancelled
+        CAS       CheckpointPublication PENDING -> PUBLISHING
+          rename  staged file replaces the session file
+```
+
+The claim runs synchronously inside the writer guard and takes the locks in this order (`LuaCtx::publication_claim`). Hosts outside a Lua invocation use `session_coordinator::publication_claim`, which is the CAS alone. The claim callback must not take actor, manager, or option-catalog locks.
+
+Invalidation before the claim wins. Plugin revocation, the invocation ending, cancellation, or a dropped waiter moves the publication to `CANCELLED`. The staged file is discarded, the operation fails, and the finalizer never runs, so the actor, public options, host snapshot and disk all keep their previous state. A lost session lock or a failed rename has the same effect.
+
+After the claim, nothing can cancel the publication. The commit runs on an actor-owned task or the actor runner, so dropping the waiter does not drop it. Once the rename succeeds the actor commits, and the `PreparedFinalization` installs reserved public options and the host snapshot before observers see the new configuration. A publish callback that returns success without claiming is treated as a failure.
 
 ## The actor
 
@@ -96,23 +117,25 @@ Outcomes remain queryable with `outcome(turn_id)`. `wait_outcome(turn_id)` eithe
 
 The actor returns to `Idle` before publishing the retained outcome and resolving its ticket. Therefore completion of a ticket means the actor is immediately reusable.
 
-### Root queue compatibility path
+### Shared ordinary-message submission
 
-The TUI root uses `rush(RootWork)` rather than explicit admission. A queued root input has no externally visible `TurnId` or ticket. When idle, the scheduler assigns an internal turn id and starts it. While another root turn is active, the same queue is exposed as an `InterruptSource`, allowing the input to fold into the active turn instead of creating an orphan turn.
+TUI main input, child input, Lua `Agent:send` with `when = "join"`, and headless prompts (print, SDK, ACP, through `headless::RootSubmission`) use `AgentActorHandle::submit`, so a message sent while a turn runs joins it in every frontend. SDK and ACP submit under their own bookkeeping lock and record the turn's presentation before its events can reach their pump; an ACP prompt that joins is answered with the turn it joined, and one that gets a new turn waits behind the running one. An ordinary message starts work or joins compatible work whose instruction admission remains open. The call returns the `TurnTicket` covering that message. Several submissions can share one turn; each pending message has its own stable `SubmissionId` for queue projection, consumption, and removal.
 
-For this compatibility path, `Agent::run` still emits the authoritative terminal event, but the actor does not retain a separately waitable root outcome. Do not convert root queue entries into explicit admissions without redesigning interrupt and queue-panel semantics.
+The actor orders submissions with configuration, working-directory changes, controls, and explicit turns. Those operations prevent later messages from joining earlier work across the operation. Every backend consumes pending inputs before an eligible model request, preserving separate messages, images, preambles, and presentation metadata. Admission and finish share actor-state synchronization so an input joins the open turn or receives a new ticket.
 
-Controls and compact requests also use the FIFO, but never become turns.
+`admit_turn` still queues a distinct turn, and idle-only admission rejects a busy actor. These policies do not require a separate root scheduler. Controls and compact requests use the FIFO but never become turns.
+
+`CompletionPolicy::Independent` lets the main agent finish while children run. `CompletionPolicy::JoinReportingChildren` makes non-main agents wait for reporting children before completing. Both policies use the same submission mechanism. See [Agent work](../site/docs/content/agent-work/_index.md) for user-visible queue, cancellation, and late-report behavior.
 
 ### Backend contract
 
 `ActorBackend` has three methods:
 
-- `run_turn`: execute an explicit admission or started root against actor-owned history.
+- `run_turn`: execute an admitted turn against actor-owned history.
 - `run_control`: execute a standalone control with no turn identity.
 - `run_compact`: compact history with no turn identity.
 
-A turn backend returns `BackendResult::EnteredRun(outcome)` only after `Agent::run` has already attempted terminal event delivery. The actor retains that outcome but must not emit it again. If setup fails before entering `Agent::run`, the backend reports `SetupFailed`; the actor synthesizes and delivers the sole failed outcome.
+A turn backend returns `BackendResult::EnteredRun(outcome)` only after `Agent::run` has already attempted terminal event delivery. The actor retains that outcome but must not emit it again. A failed terminal checkpoint turns that outcome into a failure that keeps the turn's usage and cost. If setup fails before entering `Agent::run`, the backend reports `SetupFailed`, optionally with its specific failure; the actor synthesizes and delivers the sole failed outcome, and the turn has no history.
 
 The `AgentInput` is moved exactly once from queue to backend. It is intentionally not cloned to paper over ownership or lifetime problems.
 
@@ -124,7 +147,7 @@ Actor operations have different semantics:
 |---|---|---|
 | `cancel_turn(turn_id)` | Cancels one queued, active, or pop/install-gap turn | Yes |
 | `cancel_existing()` / `cancel_all()` | Atomically cuts active and currently queued work | Yes |
-| `cancel_correlation(...)` | Cancels matching compatibility work and supports precancellation | Yes |
+| `cancel_correlation(...)` | Cancels work admitted under a correlation key (headless cancel requests) and supports precancellation | Yes |
 | `remove` / `clear` | Removes queued work; explicit admissions terminalize as cancelled | Yes |
 | `close()` | Rejects admission, cancels active work as `Closed`, drains queue, exits runner | No |
 | `shutdown()` | Rejects admission, cancels active work as `Shutdown`, drains queue, exits runner | No |
@@ -135,7 +158,7 @@ Ordinary completion, failure, and user cancellation do not close an actor.
 
 ## The manager and graph
 
-`AgentManagerHandle` owns one graph for one managed TUI outer session. It is the production factory for that root and all descendants created from managed Lua tool execution.
+`AgentManagerHandle` owns one graph for one outer session. It is the production factory for that root and all descendants created from managed Lua tool execution or trusted plugin handlers.
 
 The graph stores each node's:
 
@@ -145,7 +168,7 @@ The graph stores each node's:
 - child ids
 - graph lifecycle
 - actor handle and runner task
-- optional compatibility metadata
+- metadata: display label and spawning tool-use id
 
 Graph lifecycle is distinct from actor lifecycle:
 
@@ -164,17 +187,18 @@ let manager = AgentManagerHandle::new(limits)?;
 let root = manager.create_root(initial_messages, mirror, backend)?;
 
 // Only from a currently active managed turn:
-let child = current.spawn_child(metadata, initial_messages, mirror, backend)?;
+let child = manager.spawn_child(&current, metadata, initial_messages, mirror, backend)?;
 ```
 
-`create_root` succeeds once. `spawn_child` requires `CurrentManagedTurn`, a manager-issued capability for a specific active `(AgentId, TurnId)` and manager generation/nonce. The manager reserves topology and capacity under its graph lock, runs the caller's factory without that lock, then commits or rolls back. Returned factory errors and panics restore the reservation and capacity.
+`create_root` succeeds once; frontends use `create_root_deferred_with_config` so the root factory can run after the manager exists. `spawn_child` requires `CurrentManagedTurn`, a manager-issued capability for a specific active `(AgentId, TurnId)` and manager generation/nonce. `spawn_child_trusted_with_config` is the host-only path for trusted plugin handlers; it validates a live parent reference instead and must not be exposed as tool authority. The manager reserves topology and capacity under its graph lock, runs the caller's factory without that lock, then commits or rolls back. Returned factory errors and panics restore the reservation and capacity.
 
 No graph lock may be held across an await, actor call, backend call, or factory call that can re-enter agent execution.
 
 ### Inspection and handles
 
 - `limits()` and `generation()` expose manager metadata.
-- `root_id()` returns the committed/reserved root identity.
+- `root_id()` and `root()` return the committed/reserved root.
+- `lookup(id)` and `list()` return `AgentRef`s.
 - `node(id)` returns one `AgentNodeSnapshot`.
 - `snapshot()` returns all nodes sorted deterministically by depth and id.
 - `actor(id)` returns the actor only for a live node.
@@ -193,7 +217,7 @@ The manager enforces these per-outer-session limits:
 | `agent.max_children_per_agent` | 16 | Live or reserved direct children of one node |
 | `agent.max_live_agents` | 64 | Live, reserved, or closing nodes including root |
 
-Every value must be at least one. Limit checks and graph reservation are atomic. The deprecated `plugins.task.max_concurrent` is only an unmanaged-frontend compatibility fallback; managed TUI sessions do not apply both limits.
+Every value must be at least one. Limit checks and graph reservation are atomic. The manager's `max_concurrent_agent_turns` limiter is the only cross-agent turn limit.
 
 ### Managed turn authority
 
@@ -207,9 +231,9 @@ A manager-created actor receives an internal managed-admission hook. Before its 
 
 Clones carry a restricted token, not the unique activation guard. Validation checks the manager and the still-active exact turn. A token retained after the turn ends becomes unusable. Agent ids, parent links, TUI focus, task ids, and tool-use ids are never bearer authority.
 
-This context propagates through `AgentParams` and `ToolContext` into the Lua invocation scope. `maki.agent.session(ctx, ...)` requires the invocation's current managed authority to exactly match the supplied `ctx`; stale, context-free, or wrong-manager attempts fail before child creation. A managed child receives its own context when it later executes, so it can create a grandchild subject to limits.
+This context propagates through `AgentParams` and `ToolContext` into the Lua invocation scope. `maki.agent.spawn(ctx, ...)` requires the invocation's current managed authority to exactly match the supplied `ctx`; stale, context-free, or wrong-manager attempts fail before child creation. A managed child receives its own context when it later executes, so it can create a grandchild subject to limits.
 
-### Cross-agent concurrency and blocking child waits
+### Cross-agent concurrency and child waits
 
 The manager semaphore counts managed turns actively executing across the whole graph, not actors or queued work. Per-agent FIFO still belongs to each actor.
 
@@ -222,13 +246,9 @@ A parent that blocks on its own descendant must not consume the last permit and 
 5. When the last suspension ends, require the parent execution poll gate to reacquire capacity.
 6. Resume the waiting Lua continuation only after logical ownership is restored.
 
-Dropping a prompt wait cancels the watcher, not the child. A prompt timeout closes the child's subtree. Parent cancellation signals its watchers and still reacquires capacity before polling backend cleanup, so cleanup cannot run outside the global limit.
+Production waits use `TurnPermitLease::observe_descendant`: Lua `AgentTurn:wait`, `Agent:prompt` and the reporting-children completion join. A timeout or dropped wait ends the watcher, never the child. Parent cancellation signals its watchers and still reacquires capacity before polling backend cleanup, so cleanup cannot run outside the global limit. Ticket ownership is checked against the actor identity the ticket was issued by, so a child that finishes before the watcher registers is still observed.
 
-A managed `Session:prompt` called without a current managed invocation uses an ordinary exact-ticket wait. The child remains subject to manager capacity, but there is no parent permit to yield. A timeout still closes the child's managed subtree.
-
-This machinery is an internal compatibility primitive, not the future public agent wait API.
-
-There is a current race to account for when changing this path: turn retirement removes the actor's ticket registration before resolving the ticket, while managed wait registration verifies ownership through that registration. A sufficiently fast child can therefore terminalize between `admit_and_wait_for_descendant` admission and watcher registration, producing `TicketActorMismatch` even though the passed ticket itself belongs to the actor. The actor's direct `TurnTicket::wait` and `wait_outcome` paths do not have this race. Do not describe managed admit-and-wait as fully race-free until registration accepts an already-retained matching outcome or otherwise closes this window.
+A wait without a current managed invocation (a trusted plugin handler) uses an ordinary exact-ticket wait. The child remains subject to manager capacity, but there is no parent permit to yield.
 
 ### Graph cancellation and shutdown
 
@@ -252,40 +272,37 @@ Dropping ordinary `AgentRef` or actor-handle clones does not cancel work.
 
 Each prepared TUI session runtime creates an `AgentManagerHandle`, creates exactly one root through it, and obtains the root actor from the returned `AgentRef`. The root backend still owns dynamic TUI preparation such as provider/model selection, prompts, tools, MCP state, cwd/instruction refresh, event stamping, and control handling.
 
-The TUI queue is a presentation facade over the actor's one scheduling queue. It must not become a shadow scheduler. Root `run_id` values remain stale-event and cancellation correlation only.
+The TUI queue is a presentation facade over the actor's one scheduling queue. It must not become a shadow scheduler. Every envelope carries the actor's `ActorWorkIdentity`, so `run_id` values are presentation and cancellation fences only.
 
-Live child routing uses `AgentId`; compatibility strings remain labels and protocol/history correlation. Restored child tabs without a live `AgentId` are display-only. The current UI remains a flat compatibility view, not a graph navigator.
+Live child routing uses `AgentId`; task ids and tool-use ids remain labels and history correlation. Restored child tabs without a live `AgentId` are display-only. The UI is a flat list of agents, not a graph navigator.
 
 Session runtime replacement is prepared inertly and activated as a transaction. The new manager/root, mailbox, command target, provider, permissions, and session-lock lease are not partially published before activation. Old manager shutdown starts only after the replacement is active.
 
-### Lua compatibility sessions
+### Lua agent API
 
-`maki.agent.session(ctx, opts)` remains the existing public compatibility API.
+`maki.agent.spawn(ctx, opts)` is the only way to create a child agent. It requires an active managed turn or a trusted manager-backed invocation and fails closed otherwise.
 
-- In a managed TUI turn, it creates a child through `CurrentManagedTurn::spawn_child`.
-- In deferred unmanaged frontends, it still creates an unmanaged actor directly.
-- `prompt` admits one exact child turn and waits for that result.
-- `send` admits asynchronously through the same actor FIFO.
-- `status` adapts actor state and cumulative usage to the existing `running | done | closed` shape.
-- `close` and `task_despawn` permanently close the managed subtree.
-- Interactive child cancellation uses reusable actor cancellation and keeps the session available for later turns.
+- Spawn creates a child through the manager and returns an `Agent` handle.
+- `Agent:send` admits a turn only when the agent has no active, preparing or queued work; `Agent:prompt` does the same and waits for that exact turn.
+- `Agent:enqueue` queues a distinct turn; `Agent:submit` uses the shared submission path above.
+- `Agent:close` permanently closes the managed subtree.
+- Interactive child cancellation uses reusable actor cancellation and keeps the agent available for later turns.
 
 A descendant's cancellation token is independent of the spawning parent turn. Background children can outlive that parent turn. Structured outcomes and history are stamped for TUI routing, while presentation notifications must not be inserted into provider history.
 
 `maki.async.run` inherits the originating task's exact managed authority, so its worker may act only while that turn remains active. Timer fires intentionally start without registration-time managed authority because they may run after the turn ends.
 
-The bundled task API and current Session result shapes remain compatibility surfaces. Their ids are not graph identity.
+The bundled task plugin's ids are labels, not graph identity.
 
-### Deferred unmanaged frontends
+### Frontend roots
 
-Headless, ACP, SDK, and print paths still construct low-level agents or unmanaged actors directly where applicable. This is an explicit migration exception, not permission for managed TUI roots or descendants to bypass the manager.
+TUI, print, ACP and SDK all execute through a manager-owned root created by the configured or deferred root factory. No frontend constructs an unmanaged actor or a bare low-level agent for prompt execution. Print, SDK and ACP bind their root through `maki_lua::orchestration::bind_frontend_root`, and their root configuration and history commit through the session coordinator's durable publication. SDK and ACP coordinators write the session log; print's writes nothing (`accept_all`), so the same commits apply without reaching disk. The SDK and ACP report a turn's terminal result only after its history checkpoint settles.
 
 ## Known implementation caveats
 
 These are current code observations, not intended invariants:
 
-- Managed admit-and-wait has the fast-child ticket-registration race described above.
-- `ActorBackend::run_compact` is documented and checked by the runner as returning `BackendResult::CompactDone`, but the TUI backend currently returns `ControlDone` or `ControlFailed`. The user-facing compaction event comes from `agent::compact`, but the actor runner logs the backend result as unexpected.
+- `ActorBackend::run_compact` is documented and checked by the runner as returning `BackendResult::CompactDone`, but the TUI backend returns `ControlFailed` on the error path. The user-facing compaction event comes from `agent::compact`, but the actor runner logs the backend result as unexpected.
 - `GraphLifecycle::Removed` is defined but is not currently assigned by the manager.
 - Manager shutdown uses a bounded 10 ms poll for runner completion before joining or handing ownership to the reaper.
 
@@ -293,18 +310,12 @@ Keep these visible when touching the relevant code. Fixing them should update or
 
 ## Deferred work
 
-The following Issue 24 work is not part of the current implementation contract:
+The following work is not part of the current implementation contract:
 
-- moving model, provider binding, prompt, tools, permissions, mode, and request options into durable per-agent state
-- immutable queued policy snapshots and FIFO model/mode setter barriers
-- first-class public Lua `Agent` and visibility-only `AgentRef` userdata
-- public spawn, send, exact-turn wait, inspect, subscribe, and graph APIs
-- replacing task polling and all compatibility Session/task adapters
-- agent graph, outcome, pending-delivery, and policy persistence or restart recovery
+- agent graph, outcome, and pending-delivery persistence, and restart recovery of live children (root and child configuration and history are saved; restored child tabs are display-only)
 - guest-defined agent presets and complete guest-defined mode bundles
 - guest implementations of build and plan workflows
 - graph/tree UI, arbitrary-agent focus, and a uniform full promptbox for every focused agent
-- migration of headless, ACP, SDK, and print onto the manager
 - removal of the native mode enum and remaining host special cases
 - queue coalescing and contextual automode
 
@@ -326,7 +337,12 @@ Runtime `AgentId` and `TurnId` values are not yet restart-durable. Graph snapsho
 | Manager errors | `maki-agent/src/manager/manager_error.rs` |
 | TUI root construction/backend | `maki-ui/src/agent/mod.rs`, `maki-ui/src/agent/agent_loop.rs` |
 | TUI cancellation routing | `maki-ui/src/agent/command_router.rs` |
-| Lua Session adapter | `maki-lua/src/api/agent.rs` |
+| Lua agent backend and API | `maki-lua/src/api/agent.rs`, `maki-lua/src/api/agent/handles/` |
+| Lua orchestration, targets and plugin authority | `maki-lua/src/orchestration.rs`, `maki-lua/src/orchestration/targets.rs` |
+| Prepared operations and durable commit | `maki-agent/src/actor/prepared.rs`, `maki-agent/src/actor/history_edit.rs` |
+| Publication state and session lock guard | `maki-storage/src/checkpoint.rs`, `maki-storage/src/session_lock.rs` |
+| Session coordinator and checkpoint projection | `maki-agent/src/session_coordinator.rs`, `maki-agent/src/session_checkpoint.rs` |
+| Print, SDK and ACP backend | `maki-agent/src/headless.rs` |
 | Lua turn-scoped authority | `maki-lua/src/runtime.rs`, `maki-lua/src/api/util/ctx.rs` |
 | Configured graph limits | `maki-config/src/lib.rs` |
 

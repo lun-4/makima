@@ -280,7 +280,6 @@ fn tier_for_position(pos: usize) -> ModelTier {
 // On-disk format: { "tier": "spec", ... } keyed by tier, matching the in-memory
 // `BTreeMap<ModelTier, String>`. Tier-keyed storage preserves a model assigned
 // to multiple tiers; a spec-keyed file would collapse them to a single entry.
-// Legacy files were spec-keyed and are inverted on read.
 
 fn read_overrides(path: &Path) -> BTreeMap<ModelTier, String> {
     let Ok(raw) = std::fs::read_to_string(path) else {
@@ -289,12 +288,8 @@ fn read_overrides(path: &Path) -> BTreeMap<ModelTier, String> {
     if raw.trim().is_empty() {
         return BTreeMap::new();
     }
-    if let Ok(map) = serde_json::from_str::<BTreeMap<ModelTier, String>>(&raw) {
-        return map;
-    }
-    // Legacy format: { "provider/model": "tier" } — invert on read.
-    match serde_json::from_str::<BTreeMap<String, ModelTier>>(&raw) {
-        Ok(legacy) => legacy.into_iter().map(|(s, t)| (t, s)).collect(),
+    match serde_json::from_str(&raw) {
+        Ok(map) => map,
         Err(e) => {
             warn!(path = %path.display(), error = %e, "failed to parse tier overrides, ignoring");
             BTreeMap::new()
@@ -577,18 +572,6 @@ mod tests {
     fn has_override_returns_false_for_no_override() {
         let reg = make_map(&[], &[]);
         assert!(!reg.has_override("ollama/a", ModelTier::Strong));
-    }
-
-    #[test]
-    fn backwards_compat_reads_legacy_format() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join(TIERS_FILE);
-        let legacy = r#"{"ollama/a": "strong", "ollama/b": "strong", "ollama/c": "weak"}"#;
-        std::fs::write(&path, legacy).unwrap();
-
-        let loaded = read_overrides(&path);
-        assert_eq!(loaded.get(&ModelTier::Strong).unwrap(), "ollama/b");
-        assert_eq!(loaded.get(&ModelTier::Weak).unwrap(), "ollama/c");
     }
 
     #[test]

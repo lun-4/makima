@@ -17,7 +17,7 @@ Each reference has a long prefix, a one-letter short form, and a fixed meaning a
 |---|---|---|---|
 | File | `@path/to/file` | - | Stays in the message as plain text. The agent reads the file lazily with its tools when it needs it. |
 | Skill | `@skill:name` | `@s:name` | Becomes `<skill:name>` in place. The agent loads that skill with the `skill` tool before answering. |
-| Subagent | `@subagent:type` | `@a:type` | Becomes `<subagent:type>` in place. The agent delegates the request to a `task` subagent of the given type. |
+| Subagent | `@subagent:type` | `@a:type` | Becomes `<subagent:type>` in place. The agent delegates the request to a subagent of the given type, started with `task_spawn`. |
 | Model | `@model:spec` | `@m:spec` | Becomes `<model:spec>` in place. Paired with a subagent, sets that subagent's model. |
 
 Prefixes are case-insensitive, so `@SKILL:pdf` and `@s:pdf` are the same. A bare `@skill:` with nothing after it is not a reference yet. It keeps the popup open while the user types.
@@ -36,7 +36,7 @@ The opening and closing quote must match. Completion adds quotes when an inserti
 
 File references are the odd one out. They are never expanded or stripped. Makima does not inject file contents at submit time. The agent gets the path as text and decides when to read it. This keeps big files out of context until they are actually needed.
 
-Project-relative file completion uses the project index. A file value that starts with `~`, `/`, or `.` instead reads one directory at a time. For example, `@~/`, `@/var/`, `@./`, and `@../` list the immediate children of those directories. Selecting a directory keeps the popup open at the next level. Selecting a file completes the reference and closes the popup. Missing or unreadable directories produce no candidates and remain editable.
+File completion and reference expansion use the viewed agent's working directory and pinned invocation target. Changing tabs while submission is in progress does not retarget it. Project-relative file completion uses the project index for that directory. A file value that starts with `~`, `/`, or `.` instead reads one directory at a time. For example, `@~/`, `@/var/`, `@./`, and `@../` list the immediate children of those directories. Selecting a directory keeps the popup open at the next level. Selecting a file completes the reference and closes the popup. Missing or unreadable directories produce no candidates and remain editable.
 
 Project-index completion and the file picker use Nucleo for coarse retrieval and the shared matcher for final admission, highlighting, and ranking. Each surface materializes at most 640 coarse results for final matching. Additional coarse results are not ranked and are not guaranteed to appear.
 
@@ -50,17 +50,17 @@ Project-index completion and the file picker use Nucleo for coarse retrieval and
 
 The list is filtered by your current mode, which the source reads from the context it is given. In plan mode, `general` is hidden. Outside plan mode, `plan_reviewer` is hidden. You can never pick a type the plugin would reject.
 
-Submitting `@subagent:research review this package` becomes `<subagent:research> review this package`. The agent sees the `<subagent:research>` intent token and delegates to a `task` subagent of that type, relaying its result.
+Submitting `@subagent:research review this package` becomes `<subagent:research> review this package`. The agent sees the `<subagent:research>` intent token and delegates to a subagent of that type through `task_spawn`, relaying its result.
 
-More than one `@subagent:` token each expands in place, so a single message can ask for several subagents at once; the agent launches them as it sees fit (the task tool is built for parallel launches).
+More than one `@subagent:` token each expands in place, so a single message can ask for several subagents at once; the agent launches them as it sees fit (`task_spawn` returns at once, so launches run in parallel).
 
 ## Models
 
 `@model:` (short `@m:`) lists model specs from the available-models slot, the same list the `/model` picker uses. The list comes from the `model` plugin's completion source.
 
-A `@model:spec` next to a subagent reference sets that subagent's model; the `<model:spec>` token sits beside the `<subagent:type>` token and the agent applies it when spawning the subagent. If the requested model is unavailable (the `task` tool's `allow_model` option is off, so its schema has no `model` parameter), the agent asks you how to proceed via the `question` tool if it is loaded, or rejects the request and asks you to clarify. It does not silently pick another model.
+A `@model:spec` next to a subagent reference sets that subagent's model; the `<model:spec>` token sits beside the `<subagent:type>` token and the agent applies it when spawning the subagent. If the requested model is unavailable (the `task` plugin's `allow_model` option is off, so its schema has no `model` parameter), the agent asks you how to proceed via the `question` tool if it is loaded, or rejects the request and asks you to clarify. It does not silently pick another model.
 
-A `<model:spec>` reference without a subagent has no effect. Use the `/model` command to switch the session model.
+A `<model:spec>` reference without a subagent has no effect. The `/model` command switches the viewed agent's model.
 
 ## Skills
 

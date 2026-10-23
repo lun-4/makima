@@ -101,11 +101,6 @@ maki.api.register_tool({
       return { llm_output = "error: " .. tostring(path_err), is_error = true }
     end
 
-    local ok, err = ctx:check_before_edit(path)
-    if not ok then
-      return { llm_output = err, is_error = true }
-    end
-
     local before, read_err = existing_text(path)
     if before == nil then
       return { llm_output = "read error: " .. tostring(read_err), is_error = true }

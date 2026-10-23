@@ -162,7 +162,9 @@ impl ModelPicker {
         let specs = self.available.get();
         let mut entries = Vec::new();
         for spec in &self.recents {
-            if let Some(mut e) = parse_model_entry(spec) {
+            if specs.is_none_or(|specs| specs.contains(spec))
+                && let Some(mut e) = parse_model_entry(spec)
+            {
                 e.suffix = Some(std::mem::take(&mut e.provider_display));
                 e.provider_display = RECENT_SECTION.to_string();
                 entries.push(e);

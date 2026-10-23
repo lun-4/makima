@@ -63,6 +63,7 @@ pub(super) async fn compact_history(
     instructions: Option<&str>,
     session_id: Option<&SessionRef>,
 ) -> Result<TokenUsage, AgentError> {
+    let event_tx = event_tx.without_output();
     let compact_start = std::time::Instant::now();
     let mut compaction_history: Vec<Message> = history.as_slice().to_vec();
     remove_orphaned_tool_results(&mut compaction_history);
@@ -82,7 +83,7 @@ pub(super) async fn compact_history(
             &compaction_history,
             crate::prompt::COMPACTION_SYSTEM,
             &empty_tools,
-            event_tx,
+            &event_tx,
             cancel,
             RequestOptions::default(),
             session_id,
@@ -97,7 +98,7 @@ pub(super) async fn compact_history(
                         "compaction succeeded after truncating oldest rounds"
                     );
                 }
-                return finish_compact(response, history, event_tx, compact_start, model);
+                return finish_compact(response, history, &event_tx, compact_start, model);
             }
             Err(StreamError::Other(e)) if e.is_context_overflow() && attempt < max_attempts - 1 => {
                 last_error = Some(e);
@@ -136,7 +137,7 @@ fn finish_compact(
         Message::user("What did we do so far?".into()),
         response.message,
     ];
-    history.replace(new_history);
+    history.replace_compacted(new_history);
     info!(
         model = %model.id,
         duration_ms = compact_start.elapsed().as_millis() as u64,
@@ -366,6 +367,48 @@ mod tests {
     }
 
     #[test]
+    fn compaction_does_not_capture_internal_summary_in_turn_output() {
+        smol::block_on(async {
+            const BEFORE: &str = "assistant before";
+            const AFTER: &str = "assistant after";
+            const EXPECTED: &str = "assistant beforeassistant after";
+            let ticket = crate::TurnTicket::new(crate::TurnId::generate(), std::sync::Arc::new(()));
+            let (tx, _rx) = flume::unbounded();
+            let sender = EventSender::new(tx).with_output(ticket.output());
+            sender
+                .send(AgentEvent::TextDelta {
+                    text: BEFORE.into(),
+                })
+                .unwrap();
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let mut history = History::new(vec![Message::user("work".into())]);
+            compact_history(
+                &provider,
+                &default_model(),
+                &mut history,
+                &sender,
+                &CancelToken::none(),
+                &AgentConfig::default(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            sender
+                .send(AgentEvent::TextDelta { text: AFTER.into() })
+                .unwrap();
+            ticket.resolve(crate::TurnOutcome::completed(
+                crate::AgentId::generate(),
+                ticket.turn_id(),
+                TokenUsage::default(),
+                1,
+                crate::DoneReason::EndTurn,
+            ));
+            assert_eq!(ticket.peek_result().unwrap().text, EXPECTED);
+        });
+    }
+
+    #[test]
     fn compact_forwards_session_to_provider() {
         smol::block_on(async {
             let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
@@ -377,7 +420,7 @@ mod tests {
                 &provider,
                 &default_model(),
                 &mut history,
-                &EventSender::new(raw_tx, 0),
+                &EventSender::new(raw_tx),
                 &CancelToken::none(),
                 &AgentConfig::default(),
                 None,
@@ -416,7 +459,7 @@ mod tests {
                 &*provider,
                 &model,
                 &mut history,
-                &EventSender::new(raw_tx, 0),
+                &EventSender::new(raw_tx),
                 &CancelToken::none(),
                 &AgentConfig::default(),
                 None,
@@ -453,7 +496,7 @@ mod tests {
                 &provider,
                 &default_model(),
                 &mut history,
-                &EventSender::new(raw_tx, 0),
+                &EventSender::new(raw_tx),
                 &CancelToken::none(),
                 &AgentConfig::default(),
                 None,
@@ -490,7 +533,7 @@ mod tests {
                 &provider,
                 &default_model(),
                 &mut history,
-                &EventSender::new(raw_tx, 0),
+                &EventSender::new(raw_tx),
                 &CancelToken::none(),
                 &config,
                 Some(REQUEST_EXTRA),
@@ -570,7 +613,7 @@ mod tests {
                 &provider,
                 &default_model(),
                 &mut history,
-                &EventSender::new(raw_tx, 0),
+                &EventSender::new(raw_tx),
                 &CancelToken::none(),
                 &AgentConfig::default(),
                 None,
@@ -803,7 +846,7 @@ mod tests {
                 &provider,
                 &default_model(),
                 &mut history,
-                &EventSender::new(raw_tx, 0),
+                &EventSender::new(raw_tx),
                 &CancelToken::none(),
                 &AgentConfig::default(),
                 None,
@@ -847,7 +890,7 @@ mod tests {
                 &provider,
                 &default_model(),
                 &mut history,
-                &EventSender::new(raw_tx, 0),
+                &EventSender::new(raw_tx),
                 &CancelToken::none(),
                 &AgentConfig::default(),
                 None,

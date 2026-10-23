@@ -21,6 +21,8 @@ echo "list all TODO comments" | makima --print
 
 With both `-p` and piped stdin, the prompt is the `-p` text, a blank line, then everything read from stdin. Makima reads stdin until it closes, so a run whose stdin stays open waits for it. Inside a `while read` loop, Makima would also read the rest of the loop's input. Give such runs `</dev/null` (see the [migration example](#examples)).
 
+Nobody can answer a question in `--print`, so every permission ask is refused at once, for subagents too. Pass `--yolo` or allow rules in `permissions.toml` for the tools a run needs.
+
 ## Output Formats
 
 | Format | Description |
@@ -41,9 +43,11 @@ Add `--verbose` to include full turn-by-turn messages in the output.
 
 A prompt whose first token is an available slash command runs that command before Maki creates model input. Custom Markdown commands, MCP prompts, and Lua commands can produce a normal agent turn. A side-effect-only command succeeds with empty output. A known available command with invalid arguments exits with an error. Unknown and unavailable slash-prefixed text is rejected with an error; prefix a literal message that starts with `/` with another slash to send it as text (`//lmao` sends `/lmao`).
 
-SDK stream mode and ACP project the built-ins supported by their target capabilities. `/model` accepts an explicit model spec. One-shot print mode supports `/exit`. Commands that require TUI capabilities are rejected in headless frontends. The `//` escape also works there, so `/help` becomes text via `//help`. Local commands reject image attachments, while agent-turn commands preserve them.
+Print, SDK stream mode and ACP share one set of built-ins: `/model`, `/fast`, `/yolo`, `/workflow`, `/cd`, `/compact`, `/new` (or `/clear`) and `/btw`. `/model` accepts an explicit model spec. A plugin's `maki.api.run_command` runs them on the agent its `ctx` is pinned to, a subagent included, as in the TUI: `/model`, `/fast`, `/workflow`, `/cd` and `/compact` change that agent and a command's turn runs on it, while `/yolo` and `/new` act on the session. `/btw` answers beside the conversation without adding to it, and its answer is the result; `/compact` succeeds with empty output. In ACP, `/new` tells you to start a new session instead. Commands that need an interactive UI are rejected in headless frontends. The `//` escape also works there, so `/help` becomes text via `//help`. Local commands reject image attachments, while agent-turn commands preserve them.
 
 See [Commands](/docs/commands/) for matching, collision priority, and the generated command list.
+
+Plugins run the same way as in the TUI. A notification from `maki.ui.flash` or `maki.notify` is written to stderr, and any other UI call, such as opening a window or a picker, returns `nil, "no interactive UI attached"` right away.
 
 ## Claude Code Compatibility
 
@@ -80,14 +84,15 @@ your orchestrator                     makima --print --input-format stream-json
         │  one JSON object per line       (stdout)    │
 ```
 
-Inbound messages (`user`, `control_request`, `control_response`, `control_cancel_request`) drive the agent; outbound messages match the Claude Code SDK shape. The initialization and control projections list the active slash commands. A `system/commands_update` event reports registry changes after plugin reloads or MCP updates. Under the hood it reuses the same driver as the TUI and ACP server, so sessions, tools, and permissions all work the same way.
+Inbound messages (`user`, `control_request`, `control_response`, `control_cancel_request`) drive the agent; outbound messages match the Claude Code SDK shape. The initialization and control projections list the active slash commands. A `system/commands_update` event reports registry changes after plugin reloads or MCP updates. Under the hood it shares the ACP server's driver and the TUI's turn setup, command host and session rules, so sessions, tools, and permissions all work the same way. When stdin closes, the work still running finishes and reports its `result`, subagents left working in the background and the turns their results start included, then the process exits, as it does in ACP. So `echo '{"type":"user",...}' | makima --print --input-format stream-json --output-format stream-json` works. Permission asks that come after stdin closed are denied, since no answer can arrive. To stop a turn early, send an `interrupt` control request before closing stdin. If stdout breaks instead (the reading process died), the work in flight is cancelled, since its result can no longer reach anyone.
+
+A `user` message sent while a turn runs joins that turn, as typing does in the TUI (see [messages and turns](/docs/agent-work/#messages-and-turns)), and the turn's one `result` covers both. A message that cannot join, for example after a model switch, runs as the next turn and gets its own `result`. While `/compact` or `/btw` runs, a new message is rejected. A plugin command whose handler runs turns also gets one `result`: the reply of the last turn it ran, the same text print prints for it.
 
 SDK-only flags (`--max-turns`, `--session-id`, `--fork-session`, `--permission-mode`, `--include-partial-messages`, ...) are listed in the [CLI flag matrix](/docs/cli/#flags-by-run-path). `--system-prompt` / `--append-system-prompt` apply in every run path.
 
-Two caveats:
+One caveat: one-shot `--print` always starts a **new** session in **build** mode and does not save it. Model, mode and directory changes made during the run apply to it, but session resume needs the SDK path (or the TUI). It saves no preferences either: `/thinking high` sets the level for the run, not the saved default for new sessions. Before the first turn it waits a few seconds at most for its own provider's model list, so the run uses the discovered context window; other providers are listed in the background.
 
-- One-shot `--print` always starts a **new** session in **build** mode. Plan mode and session resume need the SDK path (or the TUI).
-- The plan file for SDK `--permission-mode plan` is `./plan.md` under cwd, not the state-dir `plans/<slug>.md` files the TUI uses.
+SDK `set_permission_mode` commits plan mode for `plan` and build mode for any other value, as durable session config, the same way `/mode` does in the TUI.
 
 ### Quick example
 

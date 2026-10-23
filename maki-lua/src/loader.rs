@@ -9,7 +9,8 @@ use include_dir::{Dir, include_dir};
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::session_coordinator::SessionOptionCatalog;
 use maki_agent::tools::{ToolRegistry, ToolSource};
-use maki_commands::CommandRegistry;
+use maki_agent::{AgentManagerHandle, AgentRef};
+use maki_commands::{CommandBehavior, CommandRegistry};
 use maki_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
 
 use crate::api::completion::{CompletionCtx, ItemSpec};
@@ -20,13 +21,16 @@ use crate::api::util::command::{CommandGenerationMap, HintReader, StatusContentR
 use crate::api::util::picker::PickerEvent;
 use crate::coalesced_latest::CoalescedLatest;
 use crate::error::PluginError;
+use crate::orchestration::TrustedTarget;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
 use crate::runtime::{
     self, ClickFallback, CommandArgumentContext, CommandArgumentLifecycle,
-    CommandArgumentLifecycleRequest, CommandArgumentRequest, LuaThread, Request, RestoreItem,
-    SplashFrameRequest, lifecycle_superseded,
+    CommandArgumentLifecycleRequest, CommandArgumentRequest, LuaCommandBehavior, LuaThread,
+    Request, RestoreItem, SplashFrameRequest, lifecycle_superseded,
 };
 use crate::splash::{SPLASH_PULL_TIMEOUT, SplashFrame, SplashPull};
+use crate::ui_sink::HostUi;
+use maki_agent::agent::PromptSlotSource;
 use maki_agent::prompt::ResolvedSlots;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -234,29 +238,38 @@ impl Drop for PluginHost {
 }
 
 impl PluginHost {
+    /// A host whose UI actions the caller drains itself, for tests and
+    /// tools that never show them.
     pub fn new(registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
-        Self::with_jit(registry, true)
+        Self::with_jit(registry, true, HostUi::Frontend)
     }
 
     pub fn with_command_registry(
         registry: Arc<ToolRegistry>,
         command_registry: CommandRegistry,
         jit: bool,
+        ui: HostUi,
     ) -> Result<Self, PluginError> {
-        Self::with_jit_and_state_dir(registry, command_registry, jit, Arc::new(RealFs), None)
+        Self::spawn(
+            registry,
+            command_registry,
+            jit,
+            Arc::new(RealFs),
+            None,
+            None,
+            ui,
+        )
     }
 
     /// `jit: false` (the `--no-jit` flag) runs plugin Lua on the O1
     /// interpreter with full debug info. Applied at VM creation, so
     /// every chunk gets it, init.lua files included.
-    pub fn with_jit(registry: Arc<ToolRegistry>, jit: bool) -> Result<Self, PluginError> {
-        Self::with_jit_and_state_dir(
-            registry,
-            CommandRegistry::new(),
-            jit,
-            Arc::new(RealFs),
-            None,
-        )
+    pub fn with_jit(
+        registry: Arc<ToolRegistry>,
+        jit: bool,
+        ui: HostUi,
+    ) -> Result<Self, PluginError> {
+        Self::with_command_registry(registry, CommandRegistry::new(), jit, ui)
     }
 
     #[cfg(feature = "test-support")]
@@ -265,19 +278,20 @@ impl PluginHost {
         fs: Arc<dyn FsBackend>,
         state_dir: PathBuf,
     ) -> Result<Self, PluginError> {
-        Self::with_jit_and_state_dir(registry, CommandRegistry::new(), true, fs, Some(state_dir))
+        Self::spawn(
+            registry,
+            CommandRegistry::new(),
+            true,
+            fs,
+            Some(state_dir),
+            None,
+            HostUi::Frontend,
+        )
     }
 
-    fn with_jit_and_state_dir(
-        registry: Arc<ToolRegistry>,
-        command_registry: CommandRegistry,
-        jit: bool,
-        fs: Arc<dyn FsBackend>,
-        state_dir: Option<PathBuf>,
-    ) -> Result<Self, PluginError> {
-        Self::with_session_provider_preparer(registry, command_registry, jit, fs, state_dir, None)
-    }
-
+    /// A host whose Lua child agents prepare their models through
+    /// {session_provider_preparer} instead of the real providers.
+    #[cfg(feature = "test-support")]
     pub fn with_session_provider_preparer(
         registry: Arc<ToolRegistry>,
         command_registry: CommandRegistry,
@@ -285,6 +299,27 @@ impl PluginHost {
         fs: Arc<dyn FsBackend>,
         state_dir: Option<PathBuf>,
         session_provider_preparer: Option<crate::api::agent::SessionProviderPreparer>,
+        ui: HostUi,
+    ) -> Result<Self, PluginError> {
+        Self::spawn(
+            registry,
+            command_registry,
+            jit,
+            fs,
+            state_dir,
+            session_provider_preparer,
+            ui,
+        )
+    }
+
+    fn spawn(
+        registry: Arc<ToolRegistry>,
+        command_registry: CommandRegistry,
+        jit: bool,
+        fs: Arc<dyn FsBackend>,
+        state_dir: Option<PathBuf>,
+        session_provider_preparer: Option<crate::api::agent::SessionProviderPreparer>,
+        ui: HostUi,
     ) -> Result<Self, PluginError> {
         let modes = Arc::new(maki_agent::ModeRegistry::builtin());
         let plugin_rules = Arc::new(PluginRuleStore::default());
@@ -301,8 +336,13 @@ impl PluginHost {
                 state_dir,
                 fs,
                 session_provider_preparer,
+                orchestration_services: Default::default(),
             },
         )?;
+        if let HostUi::Sink(sink) = ui {
+            let actions = lua.ui_action_rx.clone();
+            std::thread::spawn(move || crate::ui_sink::serve(actions, sink));
+        }
         Ok(Self {
             inner: lua,
             plugin_rules,
@@ -353,11 +393,7 @@ impl PluginHost {
         init_files: InitFiles,
         warnings: &mut Vec<String>,
     ) -> Result<Option<RawConfig>, PluginError> {
-        self.load_init_files_from_dirs(
-            init_files,
-            maki_storage::paths::config_search_dirs(),
-            warnings,
-        )
+        self.load_init_files_from_dirs(init_files, maki_storage::paths::config_dir().ok(), warnings)
     }
 
     fn load_init_files_from_dirs(
@@ -408,6 +444,9 @@ impl PluginHost {
         project_config: &ProjectConfig,
         warnings: &mut Vec<String>,
     ) -> Result<Option<RawConfig>, PluginError> {
+        if project_config.is_ignored() {
+            let _ = self.inner.tx.send(Request::IgnoreProject);
+        }
         self.load_init_files(InitFiles::resolve(project_config, no_plugins), warnings)
     }
 
@@ -562,6 +601,34 @@ impl PluginHost {
             })
             .map_err(|_| PluginError::HostDead)?;
         Ok(reply_rx)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn collect_garbage_for_test(&self) -> Result<(), PluginError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::TestCollectGarbage { reply: reply_tx })
+            .map_err(|_| PluginError::HostDead)?;
+        reply_rx
+            .recv()
+            .map_err(|_| PluginError::HostDead)?
+            .map_err(|source| PluginError::Lua {
+                plugin: "<test-gc>".to_owned(),
+                source,
+            })
+    }
+
+    /// Waits until every queued and running Lua task, event callbacks
+    /// included, has finished.
+    #[cfg(feature = "test-support")]
+    pub fn drain_tasks_for_test(&self) {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::TestDrainTasks { reply: reply_tx })
+            .expect("Lua worker is alive");
+        reply_rx.recv().expect("Lua worker drained its tasks");
     }
 
     #[cfg(feature = "test-support")]
@@ -912,22 +979,34 @@ impl EventHandle {
             .map_err(|_| crate::SessionOptionMutationError::HostDead)?
     }
 
-    fn command_generation(&self, plugin: &Arc<str>, command: &Arc<str>) -> u64 {
+    #[doc(hidden)]
+    pub fn command_generation_for_test(&self, plugin: &str, command: &str) -> u64 {
         self.command_generations
             .as_ref()
             .and_then(|generations| {
                 generations
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .get(&(Arc::clone(plugin), Arc::clone(command)))
+                    .get(&(Arc::from(plugin), Arc::from(command)))
                     .copied()
             })
             .unwrap_or_default()
     }
 
+    /// The behavior the registry runs for {plugin}'s {command}, sending its
+    /// `ExecuteCommand` request down this handle.
     #[doc(hidden)]
-    pub fn command_generation_for_test(&self, plugin: &str, command: &str) -> u64 {
-        self.command_generation(&Arc::from(plugin), &Arc::from(command))
+    pub fn command_behavior_for_test(
+        &self,
+        plugin: &str,
+        command: &str,
+    ) -> Arc<dyn CommandBehavior> {
+        Arc::new(LuaCommandBehavior {
+            plugin: Arc::from(plugin),
+            command: Arc::from(command),
+            generation: self.command_generation_for_test(plugin, command),
+            tx: self.tx.clone(),
+        })
     }
 
     #[doc(hidden)]
@@ -1015,43 +1094,31 @@ impl EventHandle {
         }
     }
 
-    pub fn run_command(&self, plugin: Arc<str>, command: Arc<str>, args: String, depth: u8) {
-        let generation = self.command_generation(&plugin, &command);
-        let _ = self.prio_tx.try_send(Request::RunCommand {
-            plugin,
-            command,
-            generation,
-            args,
-            depth,
-            completion: None,
-        });
-    }
-
-    #[doc(hidden)]
-    pub fn run_command_for_test(
+    /// Install explicit agent target and discovery services supplied by the host.
+    pub fn install_orchestration_services(
         &self,
-        plugin: Arc<str>,
-        command: Arc<str>,
-        args: String,
-        depth: u8,
-    ) -> flume::Receiver<Result<(), String>> {
-        let (completion, rx) = flume::bounded(1);
-        let generation = self.command_generation(&plugin, &command);
-        let _ = self.prio_tx.try_send(Request::RunCommand {
-            plugin,
-            command,
-            generation,
-            args,
-            depth,
-            completion: Some(completion),
-        });
-        rx
+        services: Arc<dyn crate::orchestration::OrchestrationServices>,
+    ) {
+        let _ = self.tx.try_send(Request::InstallOrchestrationServices(
+            crate::orchestration::OrchestrationServicesSlot(Some(services)),
+        ));
     }
 
-    /// Headless drivers install their own provider so `maki.session.read` has
-    /// something to answer with instead of "no interactive UI attached". The UI
-    /// leaves the slot empty and answers through its event loop, which owns the
-    /// live session runtimes.
+    /// Makes `maki.session.set_default_thinking` refuse, for print, which
+    /// saves nothing.
+    pub fn save_no_preferences(&self) {
+        let _ = self.tx.try_send(Request::SaveNoPreferences);
+    }
+
+    /// Drop the services of a host whose session closed, so Lua stops
+    /// resolving targets against it and its resources are released.
+    pub fn clear_orchestration_services(&self) {
+        let _ = self.tx.try_send(Request::InstallOrchestrationServices(
+            crate::orchestration::OrchestrationServicesSlot(None),
+        ));
+    }
+
+    /// Supply session snapshots for hosts without an interactive event loop.
     pub fn install_session_snapshot(&self, provider: crate::api::session::SessionSnapshotFn) {
         let _ = self
             .tx
@@ -1146,11 +1213,9 @@ impl EventHandle {
         rx
     }
 
-    pub async fn collect_prompt_slots_async(&self) -> ResolvedSlots {
-        self.request_prompt_slots()
-            .recv_async()
-            .await
-            .unwrap_or_default()
+    pub fn prompt_slot_source(&self) -> PromptSlotSource {
+        let handle = self.clone();
+        PromptSlotSource::new(move || handle.request_prompt_slots())
     }
 
     pub fn request_restore(&self, item: RestoreItem, event_tx: maki_agent::EventSender) {
@@ -1208,7 +1273,22 @@ impl EventHandle {
         let _ = self.tx.try_send(Request::FireAutocmd {
             event: event.to_owned(),
             data,
+            agent: None,
         });
+    }
+
+    /// Fires {event} as {agent}'s, so callbacks get its handle and a ctx.
+    pub fn fire_agent_autocmd(&self, event: &str, agent: AgentRef, data: serde_json::Value) {
+        let _ = self.tx.try_send(Request::FireAutocmd {
+            event: event.to_owned(),
+            data,
+            agent: Some(agent),
+        });
+    }
+
+    /// Fires the lifecycle autocmds of every agent in {manager}'s graph.
+    pub fn observe_agents(&self, manager: &AgentManagerHandle) {
+        let _ = self.tx.try_send(Request::ObserveAgents(manager.clone()));
     }
 
     /// Queues one `splash.render` frame without waiting for the Lua host.
@@ -1286,9 +1366,14 @@ impl EventHandle {
             .is_ok()
     }
 
-    pub fn run_keybind_callback(&self, id: u64) -> bool {
+    /// Runs keymap callback {id} against the target the host captured when
+    /// the key was pressed.
+    pub fn run_keybind_callback(&self, id: u64, target: Option<TrustedTarget>) -> bool {
         self.prio_tx
-            .try_send(Request::RunKeybindCallback { id })
+            .try_send(Request::RunKeybindCallback {
+                id,
+                target: target.map(Box::new),
+            })
             .is_ok()
     }
 
@@ -1303,16 +1388,17 @@ impl EventHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::run_command;
     use maki_agent::SessionMailbox;
     use maki_agent::prompt::{PromptId, ResolvedSlots, Slot};
     use maki_agent::session_coordinator::{
-        DirectoryAdoptionFuture, ModelAdoptionFuture, SessionCheckpoint, SessionCoordinatorHandle,
-        SessionCoordinatorParams, builtin_option_definitions,
+        SessionCheckpoint, SessionCoordinatorHandle, SessionCoordinatorParams,
+        builtin_option_definitions,
     };
     use maki_agent::tools::ToolRegistry;
-    use maki_providers::Model;
     use maki_storage::checkpoint::{
         CheckpointAck, CheckpointError, CheckpointFuture, CheckpointRequest, CheckpointWriter,
+        accept_all,
     };
     use maki_storage::id::MakiId;
     use std::collections::BTreeMap;
@@ -1350,15 +1436,7 @@ mod tests {
         catalog: SessionOptionCatalog,
         persisted_options: BTreeMap<String, String>,
     ) -> SessionCoordinatorHandle {
-        let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> =
-            Arc::new(|request: CheckpointRequest<SessionCheckpoint>| {
-                Box::pin(async move {
-                    Ok(CheckpointAck {
-                        session_id: request.session_id,
-                        version: request.version,
-                    })
-                }) as CheckpointFuture
-            });
+        let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = accept_all();
         test_coordinator_with_checkpoint(catalog, persisted_options, checkpoint)
     }
 
@@ -1380,14 +1458,7 @@ mod tests {
                 maki_agent::ThinkingConfig::Off,
             ),
             persisted_options,
-            history: Vec::new(),
-            model: Arc::from("test/model"),
-            cwd: PathBuf::from("/project"),
             model_policy: Arc::default(),
-            model_adopter: Arc::new(|_: Model| Box::pin(async { Ok(()) }) as ModelAdoptionFuture),
-            directory_adopter: Arc::new(|path: PathBuf| {
-                Box::pin(async move { Ok(path) }) as DirectoryAdoptionFuture
-            }),
             checkpoint,
             mailbox: SessionMailbox::new(id),
         })
@@ -1400,7 +1471,7 @@ mod tests {
     #[test]
     fn with_jit_off_loads_builtins_and_registers_tools() {
         let reg = Arc::new(ToolRegistry::new());
-        let mut host = PluginHost::with_jit(Arc::clone(&reg), false).unwrap();
+        let mut host = PluginHost::with_jit(Arc::clone(&reg), false, HostUi::Frontend).unwrap();
         host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
             .unwrap();
         assert!(reg.has("glob"));
@@ -1742,10 +1813,7 @@ mod tests {
                                 message: Arc::from("deterministic unload failure"),
                             })
                         } else {
-                            Ok(CheckpointAck {
-                                session_id: request.session_id,
-                                version: request.version,
-                            })
+                            Ok(CheckpointAck::for_request(&request))
                         }
                     }) as CheckpointFuture
                 })
@@ -1996,51 +2064,6 @@ mod tests {
                 .iter()
                 .any(|command| command.spec().name.as_ref() == "/usage")
         );
-    }
-
-    #[test]
-    fn run_command_sends_correct_request() {
-        let (prio_tx, prio_rx) = flume::bounded(8);
-        let (tx, _rx) = flume::bounded(8);
-        let handle = EventHandle {
-            tx,
-            shutdown: Arc::default(),
-            prio_tx: prio_tx.clone(),
-            modes: Arc::new(maki_agent::ModeRegistry::builtin()),
-            session_options: SessionOptionCatalog::default(),
-            completion: None,
-            command_generations: None,
-            command_arguments: CoalescedLatest::new(|_| false),
-            command_argument_lifecycle: CoalescedLatest::new(|_| false),
-            splash_frames: CoalescedLatest::new(move |work| {
-                prio_tx.send(Request::SplashFrame(work)).is_ok()
-            }),
-        };
-        handle.run_command(
-            Arc::from("myplugin"),
-            Arc::from("/greet"),
-            "world".into(),
-            2,
-        );
-        let req = prio_rx.try_recv().unwrap();
-        match req {
-            Request::RunCommand {
-                plugin,
-                command,
-                generation,
-                args,
-                depth,
-                completion,
-            } => {
-                assert_eq!(plugin.as_ref(), "myplugin");
-                assert_eq!(generation, 0);
-                assert_eq!(command.as_ref(), "/greet");
-                assert_eq!(args, "world");
-                assert_eq!(depth, 2);
-                assert!(completion.is_none());
-            }
-            _ => panic!("expected RunCommand"),
-        }
     }
 
     #[test]
@@ -2312,7 +2335,7 @@ mod tests {
         );
 
         let handle = host.event_handle();
-        handle.run_keybind_callback(entry.id);
+        handle.run_keybind_callback(entry.id, None);
 
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -2438,7 +2461,7 @@ mod tests {
         assert_eq!(keymaps.entries.len(), 1);
         assert_eq!(keymaps.entries[0].desc, "old keymap");
         host.event_handle()
-            .run_keybind_callback(keymaps.entries[0].id);
+            .run_keybind_callback(keymaps.entries[0].id, None);
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while !command_snapshot(&host)
@@ -2659,9 +2682,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = host
-            .event_handle()
-            .run_command_for_test(Arc::from("late"), Arc::from("/late"), String::new(), 0)
+        let result = run_command(&host.command_registry(), "/late", 0, None)
             .recv()
             .unwrap();
         let error = result.unwrap_err();

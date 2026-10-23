@@ -16,8 +16,7 @@ reference is at the end of this document.
 
 Plugins live in the makima config dir. There are two of them, same layout:
 
-- `~/.config/makima/` - global, every project (if `~/.makima/` exists, makima reads
-  that one instead)
+- `~/.config/makima/` - global, every project
 - `<project>/.makima/` - this project only
 
 ```
@@ -94,6 +93,28 @@ with full debug info.
 - Tool handlers report failures with `{ llm_output = "error: ...", is_error = true }`, not by raising.
 - The model picks tools by reading `description`, so state precisely what the tool does and when to use it.
 - Reusable helpers ship with makima; see "Shared helper modules" in the API reference.
+
+## Agent context and lifetime
+
+Tool handlers receive `handler(input, ctx)`. Slash-command handlers receive `handler(opts, ctx)`. Keymap callbacks receive `callback(nil, ctx)`. A command or keymap context can be nil when the host has no agent target. Callbacks may omit the second argument.
+
+`ctx:agent()` resolves the invocation's agent. A tool context refers to the executing agent, not UI focus. A trusted command context pins its target. A keymap context is pinned to the agent selected when the key was pressed, so later focus changes do not retarget it. If the pinned agent closes, the context keeps its plugin authority: `maki.agent.root`, `list` and `get` still work, and only calls that address the closed agent, such as `ctx:agent()` or `spawn` under it, fail. `maki.ui.focused_agent()` resolves the agent that has UI focus at call time as a visibility-only reference; pass it to `maki.agent.get(ctx, ref)` for control. `agent:defer_close(ctx)` registers authorized host-held cleanup at callback exit, including cancellation. Context authority expires when its invocation ends or is cancelled, or when its plugin generation is revoked. Storing a context for a later handler does not extend that authority.
+
+In a tool handler, `ctx:model()` reads the selection admitted for the executing turn. `agent:config(ctx).model` reads the agent's committed selection. These can differ after a configuration update while the turn is running. Both selections contain `spec`, `thinking`, and `fast`; descriptive model metadata is separate. `ctx:mode()` and `agent:config(ctx).mode` differ the same way.
+
+`Agent` handles do not close their agents when garbage-collected. Children outlive the turn that spawned them; [Agent work](/docs/agent-work/#cancellation) defines which cancellations and closes reach them. `AgentSubscription` handles, from the `Agent:on_*` aliases for an agent-filtered autocmd, do not unsubscribe when garbage-collected. A subscription requires trusted authority; delegated tool handlers cannot register one. Call `subscription:close()` to revoke future deliveries and cancel active handlers. Plugin unload also revokes registrations. Delegated tool handlers cannot enter the trusted `maki.api.run_command()` route. They also cannot register commands, keymaps, autocmds, completion sources, expanders, usage callbacks, notify handlers, slots, timers, or deferred callbacks, because those later run with host authority. Mutators of the global mode registry, such as `maki.api.mode.define`, refuse them as well, and session mutators accept only the tool's own session. Callbacks a delegated tool fires, such as autocmds from `exec_autocmds`, run with the same delegated restrictions. These checks confine what a delegated invocation can register. They do not sandbox the plugin's own code, which other callbacks of the same plugin can still call.
+
+`Agent:send(ctx, message, { when = ... })` is the one way to start a turn, and returns the ticket of the turn that carries the message. `when = "idle"` requires an idle agent, `"queue"` queues a distinct FIFO turn, and `"join"` uses the shared [message queue](/docs/agent-work/#messages-and-turns): it starts work or joins compatible work. Wait for the result with `ticket:wait(ctx, { timeout })`; a timeout stops the wait, not the turn.
+
+### Focused-agent UI
+
+UI agent actions keep the target selected when the action starts. `maki.session.*` retains session scope. See [Agent work](/docs/agent-work/#focused-controls) for shared input, working directories, closed targets, and pending-message controls.
+
+### Roots in other frontends
+
+Print, SDK and ACP roots are managed agents in the same graph as the TUI, so every `Agent` operation, including child spawn, works the same way there. Root model, mode and working-directory changes go through the session coordinator in all three. SDK and ACP persist them with the session; print applies them and saves nothing. Concurrent ACP root prompts are rejected.
+
+The [Lua API reference](/docs/lua-api/) defines the method signatures and returned fields. The Context concepts page describes model context windows, not Lua invocation authority.
 
 ## A complete real example
 

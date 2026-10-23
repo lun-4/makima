@@ -1,9 +1,9 @@
 //! plan_reviewer through the real driver (AC.10).
 //!
-//! The reviewer is spawned via the real `task` plugin (`subagent_type =
+//! The reviewer is spawned via the real task plugin (`subagent_type =
 //! "plan_reviewer"`), which gates it to plan mode and hands it a `research_sub`
-//! (read-only) tool set. These tests drive the real `maki.agent.session` (wrapped
-//! only to set `inherit_provider = true`) against a canned provider, so the
+//! (read-only) tool set. These tests drive real managed children (with
+//! `inherit_provider = true`) against a canned provider, so the
 //! verdict text and the tool set the reviewer actually received are observable.
 //! The plan-mode UI flow on a fail verdict is UI behavior, intentionally not
 //! tested here.
@@ -11,31 +11,28 @@
 use std::sync::Arc;
 
 use maki_agent::tools::{ToolContext, ToolRegistry};
+use maki_agent::{AgentLimits, AgentMode};
 use maki_lua::PluginHost;
 use serde_json::{Value, json};
 
 mod common;
-use common::{CannedProvider, canned_reply, ctx_with_provider, exec_tool_text, tool_names};
+use common::{CannedProvider, canned_reply, ctx_with_provider, exec_tool, tool_names};
 
 const TASK_PLUGIN_SRC: &str = include_str!("../../plugins/task/init.lua");
 const PLAN_REVIEWER_ONLY_ERR: &str = "plan_reviewer is only available in plan mode";
-const TASK_FAMILY: [&str; 5] = [
-    "task",
-    "task_spawn",
-    "task_get",
-    "task_send",
-    "task_despawn",
-];
+const TASK_SPAWN_TOOL: &str = "task_spawn";
+const TASK_WAIT_TOOL: &str = "task_wait";
+const TASK_FAMILY: [&str; 4] = [TASK_SPAWN_TOOL, TASK_WAIT_TOOL, "task_send", "task_despawn"];
 
-/// Wrap the real `maki.agent.session` to reuse the parent (canned) provider, and
+/// Wrap `maki.agent.spawn` to reuse the parent (canned) provider, and
 /// stub the model/system lookups so no real model resolution or file read is
 /// needed. `maki.agent.tools` is left real when `real_tools` is set (so the
 /// reviewer's tool set can be inspected); otherwise it is stubbed to empty.
 const SESSION_WRAPPER: &str = r#"
-local real_session = maki.agent.session
-maki.agent.session = function(ctx, opts)
+local real_spawn = maki.agent.spawn
+maki.agent.spawn = function(ctx, opts)
   opts.inherit_provider = true
-  return real_session(ctx, opts)
+  return real_spawn(ctx, opts)
 end
 maki.agent.resolve_model = function(ctx, opts)
   return { spec = "anthropic/claude-sonnet-4-20250514" }
@@ -57,7 +54,7 @@ maki.api.register_tool({
   description = "fake read",
   kind = "execute",
   schema = { type = "object", properties = {}, additionalProperties = false },
-  audiences = { "research_sub" },
+  audiences = { "main", "research_sub" },
   handler = function() return "read-only" end,
 })
 maki.api.register_tool({
@@ -70,22 +67,27 @@ maki.api.register_tool({
 })
 "#;
 
-fn load_reviewer_host(mode: &str, real_tools: bool) -> (Arc<ToolRegistry>, PluginHost) {
+fn load_reviewer_host(real_tools: bool) -> (Arc<ToolRegistry>, PluginHost) {
     let reg: Arc<ToolRegistry> = if real_tools {
         ToolRegistry::global_arc().clone()
     } else {
         Arc::new(ToolRegistry::new())
     };
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let mode_stub = format!("maki.api.mode.get = function() return '{mode}' end\n");
     let tools = if real_tools {
         FAKE_READ_WRITE_TOOLS
     } else {
         TOOLS_STUB
     };
-    let src = format!("{mode_stub}\n{tools}\n{SESSION_WRAPPER}\n{TASK_PLUGIN_SRC}");
+    let src = format!("{tools}\n{SESSION_WRAPPER}\n{TASK_PLUGIN_SRC}");
     host.load_source("plan_reviewer_policy", &src).unwrap();
     (reg, host)
+}
+
+fn bind_root(host: &PluginHost, reg: &ToolRegistry, ctx: &mut ToolContext, mode: AgentMode) {
+    ctx.mode = mode;
+    let config = common::effective_config(ctx);
+    common::bind_parked_root(host, reg, ctx, config, AgentLimits::default());
 }
 
 fn reviewer_input(description: &str) -> Value {
@@ -94,24 +96,38 @@ fn reviewer_input(description: &str) -> Value {
     input
 }
 
-/// Run the blocking `task` composite (which drives the real reviewer session via
-/// `:prompt`) against the canned provider. `:prompt` blocks on the driver's
-/// `done_rx` and `smol::block_on` pumps the background driver to completion, the
-/// same pattern the automode suite proves. No `task_spawn`/`task_get` polling.
+/// Spawn the reviewer and block in `task_wait` until it settles, returning the
+/// reviewer's final text.
 fn run_reviewer(
     reg: &ToolRegistry,
     ctx: &ToolContext,
     description: &str,
 ) -> Result<String, String> {
-    exec_tool_text(reg, ctx, "task", reviewer_input(description))
+    let spawned = exec_tool(reg, ctx, TASK_SPAWN_TOOL, reviewer_input(description))?;
+    let waited = exec_tool(
+        reg,
+        ctx,
+        TASK_WAIT_TOOL,
+        json!({ "task_id": spawned["task_id"], "turn_id": spawned["turn_id"] }),
+    )?;
+    waited["result"]["text"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("reviewer turn has no text: {waited}"))
 }
 
 #[test]
 fn plan_reviewer_audits_plan_and_returns_verdict() {
-    let (reg, _host) = load_reviewer_host("plan", false);
+    let (reg, host) = load_reviewer_host(false);
 
     let pass = Arc::new(CannedProvider::new(vec![canned_reply("VERDICT: pass")]));
-    let (ctx_pass, _rx, _trigger) = ctx_with_provider(Arc::clone(&pass));
+    let (mut ctx_pass, _rx, _trigger) = ctx_with_provider(Arc::clone(&pass));
+    bind_root(
+        &host,
+        &reg,
+        &mut ctx_pass,
+        AgentMode::Plan("/plan.md".into()),
+    );
     let text =
         run_reviewer(&reg, &ctx_pass, "pass-review").expect("reviewer must run in plan mode");
     assert!(
@@ -122,7 +138,13 @@ fn plan_reviewer_audits_plan_and_returns_verdict() {
     let fail = Arc::new(CannedProvider::new(vec![canned_reply(
         "VERDICT: fail\n- finding: missing AC mapping",
     )]));
-    let (ctx_fail, _rx, _trigger) = ctx_with_provider(Arc::clone(&fail));
+    let (mut ctx_fail, _rx, _trigger) = ctx_with_provider(Arc::clone(&fail));
+    bind_root(
+        &host,
+        &reg,
+        &mut ctx_fail,
+        AgentMode::Plan("/plan.md".into()),
+    );
     let text =
         run_reviewer(&reg, &ctx_fail, "fail-review").expect("reviewer must run in plan mode");
     assert!(
@@ -134,8 +156,26 @@ fn plan_reviewer_audits_plan_and_returns_verdict() {
 #[test]
 fn plan_reviewer_is_read_only_even_when_asked_to_write() {
     let provider = Arc::new(CannedProvider::new(vec![canned_reply("VERDICT: pass")]));
-    let (ctx, _rx, _trigger) = ctx_with_provider(Arc::clone(&provider));
-    let (reg, _host) = load_reviewer_host("plan", true);
+    let (mut ctx, _rx, _trigger) = ctx_with_provider(Arc::clone(&provider));
+    let (reg, host) = load_reviewer_host(true);
+    ctx.registry = Arc::clone(&reg);
+    ctx.turn_bindings = Arc::new(maki_agent::tools::TurnToolBindings::capture(
+        &reg,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
+    bind_root(&host, &reg, &mut ctx, AgentMode::Plan("/plan.md".into()));
+    let parent = common::with_request_tools(&reg, &ctx);
+    assert!(
+        maki_agent::agent::tool_dispatch::callable(&parent)
+            .iter()
+            .any(|tool| tool.name == "read")
+    );
+    assert!(
+        tool_names(parent.request_tools.as_ref().unwrap().definitions())
+            .iter()
+            .any(|name| name == "read")
+    );
 
     run_reviewer(&reg, &ctx, "readonly-review").expect("reviewer must run in plan mode");
 
@@ -159,8 +199,9 @@ fn plan_reviewer_is_read_only_even_when_asked_to_write() {
 #[test]
 fn plan_reviewer_only_in_plan_mode() {
     let provider = Arc::new(CannedProvider::new(vec![]));
-    let (ctx, _rx, _trigger) = ctx_with_provider(Arc::clone(&provider));
-    let (reg, _host) = load_reviewer_host("build", false);
+    let (mut ctx, _rx, _trigger) = ctx_with_provider(Arc::clone(&provider));
+    let (reg, host) = load_reviewer_host(false);
+    bind_root(&host, &reg, &mut ctx, AgentMode::Build);
 
     let err = run_reviewer(&reg, &ctx, "gated-review")
         .expect_err("plan_reviewer must be blocked outside plan mode");

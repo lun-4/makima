@@ -4,16 +4,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
-use maki_agent::SharedBuf;
+use maki_agent::{AgentRef, SharedBuf};
 use maki_commands::{CommandArguments, PositionalArgument};
+use maki_storage::id::MakiId;
 use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
 use strum::{EnumString, VariantNames};
 
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::pair::{Pair, try_pair};
 
-pub(crate) const NO_UI_ERR: &str = "no interactive UI attached";
-pub(crate) const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
+pub(crate) use crate::ui_sink::NO_UI_ERR;
 
 pub type StatusContent = Vec<(String, String)>;
 pub type StatusContentEntries = Vec<(Arc<str>, StatusContent)>;
@@ -448,57 +448,11 @@ pub enum SessionRequest {
     List,
     ListAll,
     Live,
-    Current,
-    Usage,
-    Read {
-        id: Option<String>,
-    },
-    New {
-        prompt: Option<String>,
-        focus: bool,
-    },
-    Prompt {
-        id: Option<String>,
-        text: String,
-    },
-    Focus {
-        id: String,
-    },
-    Delete {
-        id: String,
-    },
-    SetTitle {
-        id: String,
-        title: String,
-    },
-    GetThinking,
-    SetThinking {
-        set_default: bool,
-        thinking: String,
-    },
-    Options {
-        session: String,
-    },
-    SetOption {
-        session: String,
-        id: String,
-        value: String,
-        version: u64,
-    },
-    SetMode {
-        session: Option<String>,
-        id: String,
-    },
-}
-
-pub enum ModelRequest {
-    Get,
-    Available,
-    Set {
-        spec: Option<String>,
-        thinking: Option<String>,
-        fast: Option<bool>,
-    },
+    Read { id: MakiId },
+    New { prompt: Option<String>, focus: bool },
+    Focus { id: String },
+    Delete { id: String },
+    SetTitle { id: String, title: String },
 }
 
 pub type UiReply = Result<serde_json::Value, String>;
@@ -581,12 +535,6 @@ pub enum BuiltinAction {
 }
 
 pub enum UiAction {
-    SetMode {
-        id: String,
-    },
-    GetMode {
-        reply_tx: flume::Sender<String>,
-    },
     OpenWin {
         buf: Arc<SharedBuf>,
         config: FloatConfig,
@@ -606,15 +554,12 @@ pub enum UiAction {
     Flash(String),
     SetWindowTitle(String),
     OpenEditor {
+        target: Option<AgentRef>,
         path: PathBuf,
         reply_tx: flume::Sender<i32>,
     },
     Session {
         req: SessionRequest,
-        reply_tx: flume::Sender<UiReply>,
-    },
-    Model {
-        req: ModelRequest,
         reply_tx: flume::Sender<UiReply>,
     },
     UsageFetch {
@@ -629,14 +574,6 @@ pub enum UiAction {
         scroll_top: u16,
     },
     Builtin(BuiltinAction),
-    /// `reply_tx` answers whether {cmdline} resolved to a known command, not
-    /// how the command itself went: `/compact` streams for a minute, and the
-    /// Lua caller must not park for that long.
-    RunCommand {
-        cmdline: String,
-        depth: u8,
-        reply_tx: flume::Sender<Result<(), String>>,
-    },
 }
 
 /// Hand an action to the UI event loop. A full or closed channel means the
@@ -648,16 +585,17 @@ pub(crate) fn ui_send(
     tx.ok_or(NO_UI_ERR)?.try_send(action).map_err(|_| NO_UI_ERR)
 }
 
-/// Send an action carrying a reply channel and await the answer. Only
-/// works from a callback: the loop drains `UiAction` between frames, so a
-/// call at config load time would wait forever.
+/// Send an action carrying a reply channel and await the answer. A frontend
+/// that does not render the action drops it, which lands here as
+/// `NO_UI_ERR`. The TUI drains between frames, so a call at config load time
+/// waits until its loop starts.
 pub(crate) async fn ui_roundtrip<T>(
     tx: Option<&flume::Sender<UiAction>>,
     action: impl FnOnce(flume::Sender<T>) -> UiAction,
 ) -> Result<T, &'static str> {
     let (reply_tx, reply_rx) = flume::bounded(1);
     ui_send(tx, action(reply_tx))?;
-    reply_rx.recv_async().await.map_err(|_| UI_DROPPED_ERR)
+    reply_rx.recv_async().await.map_err(|_| NO_UI_ERR)
 }
 
 /// `ui_roundtrip` for JSON replies, shaped into the `(value, err)` pair Lua

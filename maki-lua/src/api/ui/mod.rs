@@ -7,24 +7,35 @@ use humantime::format_duration;
 use jiff::{Timestamp, tz::TimeZone};
 use maki_config::ClockFormat;
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{Lua, Result as LuaResult, Table};
+use mlua::{Lua, Result as LuaResult, Table, UserDataRef};
 use strum::VariantNames;
 
+use maki_agent::{POST_LEVELS, Post, PostLevel};
+
+use crate::agent_errors::{
+    BLANK_POST, UNKNOWN_POST_LEVEL, UNKNOWN_POST_OPTION, UNLINKABLE_POST_AGENT,
+};
+use crate::api::agent::{LuaAgent, LuaAgentRef, focused_agent_ref, send_post};
 use crate::api::util::command::{
     Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, Split,
     StatusContent, StatusContentEntries, StatusContentWriter, TitlePos, UiAction, WinCommand,
     WinEvent, ui_send,
 };
 use crate::api::util::convert::opt_bool;
-use crate::api::util::pair::{Pair, try_pair};
+use crate::api::util::ctx::LuaCtx;
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::api::util::picker::{PickerCallbackEntry, PickerCallbacks, PickerResult};
 use crate::docs::{FnDoc, ParamDoc};
 pub(crate) mod blit;
 pub(crate) mod buf;
 pub(crate) mod win;
 
-use crate::runtime::with_task_bufs;
+use crate::runtime::{
+    current_managed_turn, in_delegated_tool, pinned_target, validate_plugin_effect, with_task_bufs,
+};
 use win::WinHandle;
+
+const POST_OPTIONS: &[&str] = &["agent", "level"];
 
 pub(crate) struct StatusContentStore {
     content: BTreeMap<Arc<str>, StatusContent>,
@@ -414,14 +425,38 @@ fn action(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, name: String) -> LuaRe
 ///   maki.ui.flash("File saved")
 /// end
 #[lua_fn]
-async fn open_editor(
-    _lua: Lua,
-    #[ctx] tx: flume::Sender<UiAction>,
-    path: String,
-) -> LuaResult<i32> {
+async fn open_editor(lua: Lua, #[ctx] tx: flume::Sender<UiAction>, path: String) -> LuaResult<i32> {
+    if validate_plugin_effect(&lua).is_err() {
+        return Ok(-1);
+    }
+    let target = if in_delegated_tool(&lua) {
+        match current_managed_turn(&lua) {
+            Some(turn) => {
+                if turn.validate_active().is_err() {
+                    return Ok(-1);
+                }
+                match turn.agent_ref() {
+                    Ok(target) => Some(target),
+                    Err(_) => return Ok(-1),
+                }
+            }
+            None => None,
+        }
+    } else {
+        pinned_target(&lua).map(|target| target.target)
+    };
+    if let Some(services) = crate::orchestration::services(&lua) {
+        let Some(target) = &target else {
+            return Ok(-1);
+        };
+        if target.validate_live().is_err() || services.validate_target(target).is_err() {
+            return Ok(-1);
+        }
+    }
     let (reply_tx, reply_rx) = flume::bounded::<i32>(1);
     if tx
         .try_send(UiAction::OpenEditor {
+            target,
             path: PathBuf::from(path),
             reply_tx,
         })
@@ -672,6 +707,87 @@ pub(crate) const set_status_hint__doc: FnDoc = FnDoc {
     example: "maki.ui.set_status_hint({ {\"q\", \"quit\"}, {\"j\", \"down\"} })\n-- later, clear them:\nmaki.ui.set_status_hint(nil)",
 };
 
+/// Resolve the agent that has UI focus now. Later focus changes do not
+/// retarget the returned reference. Pass it to `maki.agent.get(ctx, ref)` for
+/// control; this call grants no authority. Delegated tool handlers cannot read
+/// UI focus.
+///
+/// @return (AgentRef?, string?) Visibility-only reference, or nil and an error when no agent has focus.
+/// @example
+/// local focused, err = maki.ui.focused_agent()
+/// if focused then
+///   local agent = assert(maki.agent.get(ctx, focused))
+///   local model = assert(agent:config(ctx)).model
+/// end
+#[lua_fn]
+fn focused_agent(lua: &Lua) -> LuaResult<Pair<LuaAgentRef>> {
+    Ok((Some(try_pair!(focused_agent_ref(lua))), None))
+}
+
+/// Show {text} as a row in the chat of the agent {ctx} is pinned to. A post
+/// is for the user only: it never reaches the model, and later focus changes
+/// do not move it. It is saved with the session and comes back on restore.
+/// Trusted commands, keymaps and callbacks can post; delegated tool handlers
+/// cannot, since their tool row already speaks for them.
+///
+/// `maki.agent.spawn` posts a row for each child it shows; see its `show`
+/// option.
+///
+/// @param ctx LuaCtx Trusted invocation context.
+/// @param text string Row text. Must not be blank.
+/// @param opts table? Optional fields:
+///   `level` (string?) - "info" (default), "warn" or "error".
+///   `agent` (Agent?) - a child spawned from Lua that the post is about. Keeps
+///     that child's transcript when this post survives a rewind.
+/// Any other option key is an error.
+/// @return (boolean?, string?) True once sent, or nil and an error.
+/// @example
+/// local ok, err = maki.ui.post(ctx, "review found 3 issues", {
+///   level = "warn",
+///   agent = reviewer,
+/// })
+#[lua_fn]
+fn post(
+    lua: &Lua,
+    ctx: UserDataRef<LuaCtx>,
+    text: String,
+    opts: Option<Table>,
+) -> LuaResult<Pair<bool>> {
+    let target = try_pair!(ctx.trusted(lua));
+    if text.trim().is_empty() {
+        return Ok(err_pair(BLANK_POST));
+    }
+    let mut post = Post {
+        text,
+        level: PostLevel::default(),
+        agent: None,
+    };
+    if let Some(opts) = opts {
+        for entry in opts.pairs::<mlua::Value, mlua::Value>() {
+            let (key, _) = entry?;
+            let known = matches!(&key, mlua::Value::String(name) if POST_OPTIONS.contains(&&*name.to_str()?));
+            if !known {
+                return Ok(err_pair(format!(
+                    "{UNKNOWN_POST_OPTION}: {}",
+                    key.to_string()?
+                )));
+            }
+        }
+        if let Some(level) = opts.get::<Option<String>>("level")? {
+            post.level = try_pair!(PostLevel::parse(&level).ok_or_else(|| format!(
+                "{UNKNOWN_POST_LEVEL} '{level}', expected one of: {}",
+                POST_LEVELS.join(", ")
+            )));
+        }
+        if let Some(agent) = opts.get::<Option<UserDataRef<LuaAgent>>>("agent")? {
+            post.agent =
+                Some(try_pair!(agent.transcript_id().ok_or(UNLINKABLE_POST_AGENT)).to_owned());
+        }
+    }
+    try_pair!(send_post(lua, target, post));
+    Ok((Some(true), None))
+}
+
 lua_table! {
     /// Functions for building interactive UI. Create buffers to hold
     /// content, open floating or split windows to display them, highlight
@@ -684,7 +800,7 @@ lua_table! {
     /// ```
     extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
         buf, theme_color, format_time, highlight, markdown, humantime, terminal_size,
-        display_width, truncate_text,
+        display_width, truncate_text, focused_agent, post,
         manual flash, manual action, manual open_editor, manual open_list_picker, manual open_win,
         manual set_status_content, manual set_status_hint, manual set_window_title,
     ]
@@ -974,8 +1090,176 @@ mod tests {
     use mlua::Lua;
     use test_case::test_case;
 
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
     const MISSING_KEY: &str = "missing";
     const ORANGE_HEX: &str = "#ff8000";
+
+    #[test_case(false ; "no_target")]
+    #[test_case(true ; "delegated")]
+    fn editor_does_not_resolve_focus_without_a_pinned_subject(delegated: bool) {
+        struct Services;
+        impl crate::orchestration::OrchestrationServices for Services {
+            fn resolve_target(
+                &self,
+                _: Option<&maki_commands::CommandInvocation>,
+            ) -> Result<Option<crate::orchestration::TrustedTarget>, String> {
+                panic!("editor must not resolve current focus");
+            }
+        }
+        let lua = Lua::new();
+        lua.set_app_data(crate::orchestration::OrchestrationServicesSlot(Some(
+            Arc::new(Services),
+        )));
+        let scope = crate::runtime::TaskScope::detached(&lua);
+        if delegated {
+            crate::runtime::lock_cell(scope.handle()).delegated_tool = Some(Default::default());
+        }
+        let (tx, rx) = flume::unbounded();
+        assert_eq!(
+            smol::block_on(open_editor(lua.clone(), tx, "plan.md".into())).unwrap(),
+            -1
+        );
+        assert!(rx.is_empty());
+    }
+
+    #[test_case(false ; "active_own_agent")]
+    #[test_case(true ; "expired_turn")]
+    fn delegated_editor_uses_only_its_active_turn(expired: bool) {
+        struct Services;
+        impl crate::orchestration::OrchestrationServices for Services {
+            fn resolve_target(
+                &self,
+                _: Option<&maki_commands::CommandInvocation>,
+            ) -> Result<Option<crate::orchestration::TrustedTarget>, String> {
+                panic!("delegated editor must not resolve focus");
+            }
+
+            fn validate_target(&self, target: &AgentRef) -> Result<(), String> {
+                target.validate_live().map_err(|error| error.to_string())
+            }
+        }
+        use maki_agent::{
+            ActorBackend, AgentInput, AgentLimits, AgentManagerHandle, AgentRef, BackendResult,
+            ControlWork, CurrentManagedTurn, History, TurnContext, WorkKind,
+        };
+        use std::{future::Future, pin::Pin};
+
+        struct Backend(flume::Sender<CurrentManagedTurn>, flume::Receiver<()>);
+        impl ActorBackend for Backend {
+            fn run_turn<'a>(
+                &'a mut self,
+                _: &'a mut History,
+                context: TurnContext,
+                _: AgentInput,
+                _: WorkKind,
+            ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+                Box::pin(async move {
+                    self.0.send(context.managed_turn.unwrap()).unwrap();
+                    self.1.recv_async().await.unwrap();
+                    BackendResult::SetupFailed(None)
+                })
+            }
+            fn run_control<'a>(
+                &'a mut self,
+                _: &'a mut History,
+                _: TurnContext,
+                _: &'a ControlWork,
+            ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+                unreachable!()
+            }
+            fn run_compact<'a>(
+                &'a mut self,
+                _: &'a mut History,
+                _: TurnContext,
+                _: Option<&'a str>,
+            ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+                unreachable!()
+            }
+        }
+        smol::block_on(async {
+            let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+            let (entered_tx, entered_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            let root = manager
+                .create_root(Vec::new(), None, Box::new(Backend(entered_tx, release_rx)))
+                .unwrap();
+            let ticket = manager
+                .actor(root.id())
+                .unwrap()
+                .admit_turn(
+                    AgentInput {
+                        message: "editor".into(),
+                        images: Vec::new(),
+                        preamble: Vec::new(),
+                        prompt: None,
+                    },
+                    None,
+                    String::new(),
+                )
+                .unwrap();
+            let turn = entered_rx.recv_async().await.unwrap();
+            if expired {
+                release_tx.send(()).unwrap();
+                ticket.wait().await;
+            }
+            let lua = Lua::new();
+            lua.set_app_data(crate::orchestration::OrchestrationServicesSlot(Some(
+                Arc::new(Services),
+            )));
+            let scope = crate::runtime::TaskScope::detached(&lua);
+            {
+                let mut cell = crate::runtime::lock_cell(scope.handle());
+                cell.delegated_tool = Some(Default::default());
+                cell.managed_turn = Some(turn);
+            }
+            let (tx, rx) = flume::unbounded();
+            let request = open_editor(lua.clone(), tx, "plan.md".into());
+            if expired {
+                assert_eq!(request.await.unwrap(), -1);
+                assert!(rx.is_empty());
+            } else {
+                let consume = async {
+                    let UiAction::OpenEditor {
+                        target, reply_tx, ..
+                    } = rx.recv_async().await.unwrap()
+                    else {
+                        panic!("expected editor request");
+                    };
+                    assert_eq!(target.unwrap().id(), root.id());
+                    reply_tx.send(0).unwrap();
+                };
+                let (code, ()) = futures_lite::future::zip(request, consume).await;
+                assert_eq!(code.unwrap(), 0);
+                release_tx.send(()).unwrap();
+                ticket.wait().await;
+            }
+            manager.shutdown(SHUTDOWN_TIMEOUT).await;
+        });
+    }
+
+    #[test]
+    fn standalone_editor_roundtrip_preserves_exit_code() {
+        smol::block_on(async {
+            let lua = Lua::new();
+            let (tx, rx) = flume::unbounded();
+            let request = open_editor(lua, tx, "plan.md".into());
+            let consume = async {
+                let UiAction::OpenEditor {
+                    target,
+                    path,
+                    reply_tx,
+                } = rx.recv_async().await.unwrap()
+                else {
+                    panic!("expected editor request");
+                };
+                assert!(target.is_none());
+                assert_eq!(path, PathBuf::from("plan.md"));
+                reply_tx.send(0).unwrap();
+            };
+            let (code, ()) = futures_lite::future::zip(request, consume).await;
+            assert_eq!(code.unwrap(), 0);
+        });
+    }
 
     fn footer_entry(lua: &Lua, key: &str, label: &str) -> Table {
         let t = lua.create_table().unwrap();

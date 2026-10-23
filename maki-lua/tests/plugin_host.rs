@@ -22,16 +22,21 @@ use maki_commands::{CommandOutcome, InputDispatch, TargetCapabilities};
 use maki_config::{
     AlwaysThinking, DEFAULT_AUTOCOMPLETE_HEIGHT, Effect, PluginsConfig, ToolKey, ToolOutputLines,
 };
-use maki_lua::test_support::{InMemoryFs, InMemoryOffloadBackend};
+use maki_lua::agent_errors::{
+    DELEGATED_FOREIGN_SESSION, DELEGATED_SESSION_LIFECYCLE, SESSION_REQUIRED_ERR,
+};
+use maki_lua::test_support::{InMemoryFs, InMemoryOffloadBackend, run_command};
 use maki_lua::{
     MAX_INFLIGHT_TOOLS, PluginError, PluginHost, SessionRequest, UiAction, WARM_TOOL_CAP,
     WinCommand, WinEvent,
 };
 use maki_providers::Model;
-use maki_storage::id::SessionRef;
+use maki_storage::id::{MakiId, SessionRef};
 #[cfg(unix)]
 use rustix::process::{Pid, test_kill_process_group};
 use serde_json::{Value, json};
+
+mod common;
 
 const USAGE_TOOL_NAME: &str = "usage_child";
 const USAGE_VALUE: &str = "12.3k↑ 456↓ $0.123";
@@ -164,23 +169,12 @@ fn tool_description(reg: &ToolRegistry, agent: &maki_config::AgentConfig, name: 
 
 fn test_session(host: &PluginHost) -> maki_agent::session_coordinator::SessionCoordinatorHandle {
     use maki_agent::session_coordinator::{
-        DirectoryAdoptionFuture, ModelAdoptionFuture, SessionCheckpoint, SessionCoordinatorParams,
-        builtin_option_definitions,
+        SessionCheckpoint, SessionCoordinatorParams, builtin_option_definitions,
     };
-    use maki_storage::checkpoint::{
-        CheckpointAck, CheckpointFuture, CheckpointRequest, CheckpointWriter,
-    };
+    use maki_storage::checkpoint::{CheckpointWriter, accept_all};
 
     let id = maki_storage::id::MakiId::generate();
-    let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> =
-        Arc::new(|request: CheckpointRequest<SessionCheckpoint>| {
-            Box::pin(async move {
-                Ok(CheckpointAck {
-                    session_id: request.session_id,
-                    version: request.version,
-                })
-            }) as CheckpointFuture
-        });
+    let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = accept_all();
     maki_agent::session_coordinator::SessionCoordinatorHandle::register(SessionCoordinatorParams {
         session_id: id,
         catalog: host.event_handle().session_option_catalog(),
@@ -193,16 +187,7 @@ fn test_session(host: &PluginHost) -> maki_agent::session_coordinator::SessionCo
             maki_agent::ThinkingConfig::Off,
         ),
         persisted_options: Default::default(),
-        history: Vec::new(),
-        model: Arc::from("test/model"),
-        cwd: "/tmp".into(),
         model_policy: Arc::default(),
-        model_adopter: Arc::new(|_: maki_providers::Model| {
-            Box::pin(async { Ok(()) }) as ModelAdoptionFuture
-        }),
-        directory_adopter: Arc::new(|path| {
-            Box::pin(async move { Ok(path) }) as DirectoryAdoptionFuture
-        }),
         checkpoint,
         mailbox: maki_agent::SessionMailbox::new(id),
     })
@@ -219,7 +204,7 @@ fn exec_tool_in(
     input: serde_json::Value,
     registry_override: Option<Arc<ToolRegistry>>,
 ) -> Result<String, String> {
-    exec_output_in(reg, name, input, registry_override).map(|out| match out {
+    exec_output_in(reg, name, input, registry_override, None).map(|out| match out {
         maki_agent::ToolOutput::Plain(s) => s.text,
         other => panic!("unexpected output: {other:?}"),
     })
@@ -230,7 +215,19 @@ fn exec_tool_output(
     name: &str,
     input: serde_json::Value,
 ) -> Result<maki_agent::ToolOutput, String> {
-    exec_output_in(reg, name, input, None)
+    exec_output_in(reg, name, input, None, None)
+}
+
+fn exec_tool_in_session(
+    reg: &ToolRegistry,
+    name: &str,
+    input: serde_json::Value,
+    session: MakiId,
+) -> String {
+    match exec_output_in(reg, name, input, None, Some(session)).unwrap() {
+        maki_agent::ToolOutput::Plain(s) => s.text,
+        other => panic!("unexpected output: {other:?}"),
+    }
 }
 
 fn exec_output_in(
@@ -238,6 +235,7 @@ fn exec_output_in(
     name: &str,
     input: serde_json::Value,
     registry_override: Option<Arc<ToolRegistry>>,
+    session: Option<MakiId>,
 ) -> Result<maki_agent::ToolOutput, String> {
     let entry = reg
         .get(name)
@@ -246,6 +244,9 @@ fn exec_output_in(
     let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
     if let Some(r) = registry_override {
         ctx.registry = r;
+    }
+    if let Some(session) = session {
+        maki_agent::tools::test_support::set_session(&mut ctx, session);
     }
     ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
         &ctx.registry,
@@ -414,31 +415,20 @@ fn register_echo_tool() {
     assert_eq!(out, "hello");
 }
 
-/// The point of the whole thing: a handler learns who called it without
-/// asking `maki.session.current()`, which answers with whoever is focused.
+/// The point of the whole thing: a handler learns who called it from its ctx,
+/// never from whoever is focused.
 #[test]
 fn handler_reads_the_calling_session() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source("session_plugin", SESSION_PLUGIN).unwrap();
 
-    let session: SessionRef = "01965087-4c71-7f00-8000-000000000000"
-        .parse()
-        .expect("valid session id");
+    let session: SessionRef = "CNK1hV6GWoysH3KQMm5wu".parse().expect("valid session id");
     let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
     ctx.session_id = Some(session.clone());
 
     let out = exec_with_ctx(&reg, "whoami", json!({}), &ctx).unwrap();
-    assert_eq!(
-        out,
-        format!("id:{}", session.id()),
-        "lua sees the canonical form, so it compares equal to maki.session.current()"
-    );
-    assert_ne!(
-        out,
-        format!("id:{}", session.as_str()),
-        "the verbatim form would not match ids from maki.session.live()"
-    );
+    assert_eq!(out, format!("id:{}", session.id()));
 }
 
 #[test]
@@ -758,7 +748,7 @@ fn restore_snapshot_text(
             clicks,
             state,
         },
-        maki_agent::EventSender::new(tx, 0),
+        maki_agent::EventSender::new(tx),
     );
     handle.wait_restore_complete_for_test();
 
@@ -1289,7 +1279,7 @@ fn bundled_commands_project_complete_metadata() {
                 "Set thinking effort (bare opens a selector)".into(),
                 None,
                 Some("[effort]".into()),
-                true
+                false
             ),
             (
                 "/usage".into(),
@@ -1891,7 +1881,7 @@ fn warm_ctx(
     flume::Receiver<maki_agent::Envelope>,
 ) {
     let (tx, rx) = flume::unbounded::<maki_agent::Envelope>();
-    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let event_tx = maki_agent::EventSender::new(tx);
     let ctx = maki_agent::tools::test_support::stub_ctx_with(
         &maki_agent::AgentMode::Build,
         Some(&event_tx),
@@ -1933,7 +1923,7 @@ fn warm_click_reaches_finished_tool(is_error: bool) {
         WARM_ID.to_owned(),
         0,
         warm_restore_item(WARM_ID, vec![0]),
-        maki_agent::EventSender::new(fb_tx, 0),
+        maki_agent::EventSender::new(fb_tx),
     );
     barrier(&host);
 
@@ -1958,7 +1948,7 @@ fn click_fallback_restores_when_warm_missing() {
         GONE_ID.to_owned(),
         0,
         warm_restore_item(GONE_ID, vec![0]),
-        maki_agent::EventSender::new(tx, 0),
+        maki_agent::EventSender::new(tx),
     );
     barrier(&host);
 
@@ -1985,7 +1975,7 @@ fn click_fallback_restores_when_warm_buf_has_no_handler() {
         WARM_ID.to_owned(),
         0,
         warm_restore_item(WARM_ID, vec![0]),
-        maki_agent::EventSender::new(fb_tx, 0),
+        maki_agent::EventSender::new(fb_tx),
     );
     barrier(&host);
 
@@ -2011,7 +2001,7 @@ fn restore_evicts_warm_handle() {
     let eh = host.event_handle();
     eh.request_restore(
         warm_restore_item(WARM_ID, Vec::new()),
-        maki_agent::EventSender::new(tx, 0),
+        maki_agent::EventSender::new(tx),
     );
     eh.request_click(WARM_ID.to_owned(), 0);
     barrier(&host);
@@ -2393,8 +2383,12 @@ fn failed_plugin_reload_preserves_old_job_and_kills_candidate() {
         "transactional_jobs",
         &format!(
             r#"
-            local id = maki.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{ owner = "plugin" }})
-            maki.fn.jobwait(id, 100)
+            assert(maki.async.await(1, function(ready)
+                maki.fn.jobstart("printf %s $$ > '{}' && printf 'ready\\n'; exec sleep 30", {{
+                    owner = "plugin",
+                    on_stdout = function(_, line) if line == "ready" then ready(true) end end,
+                }})
+            end))
             error("reject candidate")
             "#,
             candidate_path.display()
@@ -3580,13 +3574,7 @@ fn command_completion_timeout_returns_empty_and_keeps_host_live() {
     );
 
     let flashes = host.ui_action_rx();
-    handle
-        .run_command_for_test(
-            Arc::from("slow_completion"),
-            Arc::from("/slow"),
-            String::new(),
-            0,
-        )
+    run_command(&host.command_registry(), "/slow", 0, None)
         .recv_timeout(Duration::from_secs(5))
         .expect("timed-out completion stopped the Lua host")
         .expect("command handler should succeed");
@@ -3626,6 +3614,8 @@ fn required_raw_arguments_reject_empty_dispatch() {
         Arc::new(FakeCommandHost),
     );
 
+    let actions = host.ui_action_rx();
+
     let outcome = smol::block_on(commands.dispatch_input(&target, "/required".into()));
 
     assert!(matches!(
@@ -3637,22 +3627,6 @@ fn required_raw_arguments_reject_empty_dispatch() {
             }
         ))
     ));
-
-    let actions = host.ui_action_rx();
-    let result = host
-        .event_handle()
-        .run_command_for_test(
-            Arc::from("required_raw"),
-            Arc::from("/required"),
-            String::new(),
-            0,
-        )
-        .recv_timeout(Duration::from_secs(5))
-        .expect("required raw RunCommand completion was not sent");
-    assert!(
-        result.is_err(),
-        "required raw RunCommand unexpectedly succeeded"
-    );
     assert!(matches!(
         actions.try_recv(),
         Err(flume::TryRecvError::Empty)
@@ -3678,13 +3652,13 @@ fn command_handler_receives_raw_args_without_typed_fields(args: &str, expected_f
     )
     .unwrap();
     let rx = host.ui_action_rx();
-    host.event_handle()
-        .run_command(Arc::from("p"), Arc::from("/echo"), args.into(), 0);
+    let echoed = run_command(&host.command_registry(), &format!("/echo {args}"), 0, None);
 
     let action = rx
         .recv_timeout(Duration::from_secs(5))
         .expect("command handler did not run");
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == expected_flash));
+    assert_eq!(echoed.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
 }
 
 const COPY_COMMAND_PLUGIN: &str = r#"
@@ -3828,53 +3802,52 @@ fn invalid_typed_copy_input_does_not_execute(input: &str) {
     ));
 }
 
-const RUN_COMMAND_NO_ACTION: &str = "run_command did not reach the UI";
+const RUN_COMMAND_NO_ACTION: &str = "run_command did not reach the frontend runner";
+const RUN_COMMAND_EVENT: &str = "RunCommandProbe";
 
-/// `/go` asks for `/cd ~/src` and flashes the `ok, err` pair it gets back. A
-/// handler reached at depth 0 asks for depth 1 so a chain of aliases keeps
-/// counting toward the cap.
+/// An autocmd asks for `/cd ~/src` and flashes the `ok, err` pair the
+/// frontend's runner gives back. A callback outside any command runs at depth
+/// 0 and asks for depth 1, so a chain of aliases keeps counting toward the cap.
 #[test_case::test_case(Ok(()), "true|nil" ; "dispatched")]
 #[test_case::test_case(Err("unknown command".into()), "nil|unknown command" ; "rejected")]
-fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash: &str) {
+fn run_command_goes_to_the_frontend_runner(reply: Result<(), String>, expected_flash: &str) {
     let host = PluginHost::new(fresh_registry()).unwrap();
+    let (runs_tx, runs) = flume::unbounded();
+    let manager = common::install_command_root(
+        &host,
+        Arc::new(move |cmdline, depth, _| {
+            runs_tx.send((cmdline, depth)).unwrap();
+            let reply = reply.clone();
+            Box::pin(async move { reply })
+        }),
+    );
     host.load_source(
         "p",
-        r#"
-        maki.api.register_command({
-            name = "/go",
-            tui_only = false,
-            handler = function()
-                local ok, err = maki.api.run_command("  //cd ~/src  ")
+        &format!(
+            r#"
+            maki.api.create_autocmd("{RUN_COMMAND_EVENT}", {{ callback = function(_, ctx)
+                local ok, err = maki.api.run_command(ctx, "  //cd ~/src  ")
                 maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
-            end,
-        })
-        "#,
+            end }})
+            "#
+        ),
     )
     .unwrap();
     let rx = host.ui_action_rx();
     host.event_handle()
-        .run_command(Arc::from("p"), Arc::from("/go"), String::new(), 0);
+        .fire_agent_autocmd(RUN_COMMAND_EVENT, manager.root().unwrap(), json!({}));
 
-    let maki_lua::UiAction::RunCommand {
-        cmdline,
-        depth,
-        reply_tx,
-    } = rx
+    let (cmdline, depth) = runs
         .recv_timeout(Duration::from_secs(5))
-        .expect(RUN_COMMAND_NO_ACTION)
-    else {
-        panic!("{RUN_COMMAND_NO_ACTION}");
-    };
+        .expect(RUN_COMMAND_NO_ACTION);
     assert_eq!((cmdline.as_str(), depth), ("/cd ~/src", 1));
-    reply_tx.send(reply).unwrap();
-
     let action = rx
         .recv_timeout(Duration::from_secs(5))
         .expect(RUN_COMMAND_NO_ACTION);
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == expected_flash));
 }
 
-/// `/go` nests `maki.api.run_command("/bogus")` from inside a real command
+/// `/go` nests `maki.api.run_command(ctx, "/bogus")` from inside a real command
 /// invocation (dispatched through the registry, so the handler runs with an
 /// invocation context): the nested dispatch rejects the unknown command
 /// without touching the UI.
@@ -3895,8 +3868,8 @@ fn nested_run_command_strips_extra_leading_slashes() {
         maki.api.register_command({
             name = "/go",
             tui_only = false,
-            handler = function()
-                local ok, err = maki.api.run_command("  //target value  ")
+            handler = function(_, ctx)
+                local ok, err = maki.api.run_command(ctx, "  //target value  ")
                 maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
             end,
         })
@@ -3936,8 +3909,8 @@ fn nested_run_command_reports_recursion_limit() {
         maki.api.register_command({
             name = "/cycle",
             tui_only = false,
-            handler = function()
-                local ok, err = maki.api.run_command("/cycle")
+            handler = function(_, ctx)
+                local ok, err = maki.api.run_command(ctx, "/cycle")
                 if not ok then
                     maki.ui.flash(err)
                 end
@@ -3972,8 +3945,8 @@ fn nested_run_command_rejects_unknown_command() {
         maki.api.register_command({
             name = "/go",
             tui_only = false,
-            handler = function()
-                local ok, err = maki.api.run_command("/bogus")
+            handler = function(_, ctx)
+                local ok, err = maki.api.run_command(ctx, "/bogus")
                 maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
             end,
         })
@@ -4279,7 +4252,7 @@ const BASH_PARTIAL_CMD: &str = "printf '%s%s\\n' X Y && sleep 30";
 #[test]
 fn cancelled_bash_keeps_streamed_output_as_partial() {
     let (tx, events) = flume::unbounded();
-    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let event_tx = maki_agent::EventSender::new(tx);
     let (trigger, token) = maki_agent::CancelToken::new();
     let (result_tx, result_rx) = flume::bounded(1);
     std::thread::spawn(move || {
@@ -4326,7 +4299,7 @@ fn restore_tool_async_ordering_and_delivery() {
 
     let handle = host.event_handle();
     let (tx, rx) = flume::unbounded();
-    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let event_tx = maki_agent::EventSender::new(tx);
 
     let bash_item = |id: &str| maki_lua::RestoreItem {
         tool: Arc::from("bash"),
@@ -4417,7 +4390,7 @@ fn restore_rebuilds_body_from_input_content(
             clicks: vec![0],
             state: None,
         },
-        maki_agent::EventSender::new(tx, 0),
+        maki_agent::EventSender::new(tx),
     );
     handle.wait_restore_complete_for_test();
 
@@ -4917,7 +4890,7 @@ fn run_start_in_mode(
     mode: &maki_agent::AgentMode,
 ) -> flume::Receiver<maki_agent::Envelope> {
     let (tx, rx) = flume::unbounded::<maki_agent::Envelope>();
-    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let event_tx = maki_agent::EventSender::new(tx);
     let ctx = maki_agent::tools::test_support::stub_ctx_with(
         mode,
         Some(&event_tx),
@@ -5001,8 +4974,6 @@ fn interpreter_on_output_streams_lines() {
     let out = exec_tool(&reg, "interp_stream", serde_json::json!({})).unwrap();
     assert_eq!(out, "a|b;stdout=a\nb");
 }
-
-const SESSION_CLOSED_ERR: &str = "session closed";
 
 fn interp_tool_plugin(name: &str, python: &str, tools_lua: &str) -> String {
     format!(
@@ -5169,7 +5140,7 @@ fn question_tool_elicits_from_the_host_in_elicitation_mode() {
     let (event_tx, _event_rx) = flume::unbounded::<maki_agent::Envelope>();
     let mut ctx = maki_agent::tools::test_support::stub_ctx_with(
         &maki_agent::AgentMode::Build,
-        Some(&maki_agent::EventSender::new(event_tx, 0)),
+        Some(&maki_agent::EventSender::new(event_tx)),
         None,
     );
     ctx.question_mode = QuestionMode::Elicitation;
@@ -5190,7 +5161,7 @@ fn question_tool_dismissed_by_the_host() {
     let (event_tx, _event_rx) = flume::unbounded::<maki_agent::Envelope>();
     let mut ctx = maki_agent::tools::test_support::stub_ctx_with(
         &maki_agent::AgentMode::Build,
-        Some(&maki_agent::EventSender::new(event_tx, 0)),
+        Some(&maki_agent::EventSender::new(event_tx)),
         None,
     );
     ctx.question_mode = QuestionMode::Elicitation;
@@ -5222,81 +5193,6 @@ fn question_tool_fails_gracefully_without_a_host() {
     )
     .expect_err("headless question must fail, not hang");
     assert!(err.contains("interactive UI"), "got: {err}");
-}
-
-#[test]
-fn session_close_idempotent_and_prompt_after_close_errors() {
-    let reg = fresh_registry();
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let src = format!(
-        r#"maki.api.register_tool({{
-            name = "session_probe",
-            description = "test",
-            schema = {MINIMAL_SCHEMA},
-            audiences = {{ "main" }},
-            handler = function(input, ctx)
-                local sess = maki.agent.session(ctx, {{}})
-                sess:close()
-                sess:close()
-                local result, err = sess:prompt("x")
-                if result ~= nil then return "unexpected result" end
-                return err or "no error"
-            end
-        }})"#
-    );
-    host.load_source("session_plugin", &src).unwrap();
-    let out = exec_tool(&reg, "session_probe", serde_json::json!({})).unwrap();
-    assert_eq!(out, SESSION_CLOSED_ERR);
-}
-
-#[test]
-fn session_prompt_timeout_cancels_blocked_turn() {
-    let reg = fresh_registry();
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let src = format!(
-        r#"maki.api.register_tool({{
-            name = "session_timeout_probe",
-            description = "test",
-            schema = {MINIMAL_SCHEMA},
-            audiences = {{ "main" }},
-            handler = function(input, ctx)
-                local semaphore = maki.async.semaphore(1)
-                local permit = semaphore:acquire()
-                local sess = maki.agent.session(ctx, {{ semaphore = semaphore }})
-                local result, err = sess:prompt("x", {{ timeout = 1 }})
-                permit:release()
-                if result ~= nil then return "unexpected result" end
-                return err or "no error"
-            end
-        }})"#
-    );
-    host.load_source("session_timeout_plugin", &src).unwrap();
-    let out = exec_tool(&reg, "session_timeout_probe", serde_json::json!({})).unwrap();
-    assert_eq!(out, "session prompt timed out after 1s");
-}
-
-#[test_case::test_case("{ audience = 'wurkflow' }", "unknown audience: wurkflow" ; "unknown_audience")]
-#[test_case::test_case("{ local_tools = { foo = { handler = function() return '' end } } }", "local_tools.foo: 'description' is required" ; "local_tool_missing_description")]
-#[test_case::test_case("{ local_tools = { foo = { description = 'd' } } }", "local_tools.foo: 'handler' is required" ; "local_tool_missing_handler")]
-fn session_opts_validation_rejects(opts: &str, expected: &str) {
-    let reg = fresh_registry();
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let src = format!(
-        r#"maki.api.register_tool({{
-            name = "session_opts_probe",
-            description = "test",
-            schema = {MINIMAL_SCHEMA},
-            audiences = {{ "main" }},
-            handler = function(input, ctx)
-                local sess, err = maki.agent.session(ctx, {opts})
-                if sess ~= nil then return "unexpected session" end
-                return err or "no error"
-            end
-        }})"#
-    );
-    host.load_source("session_opts_plugin", &src).unwrap();
-    let out = exec_tool(&reg, "session_opts_probe", serde_json::json!({})).unwrap();
-    assert!(out.contains(expected), "got: {out}");
 }
 
 fn load_img_tool(host: &PluginHost) {
@@ -5566,8 +5462,7 @@ fn async_run_from_parked_command_handler_runs_promptly() {
     )
     .unwrap();
     let rx = host.ui_action_rx();
-    let handle = host.event_handle();
-    handle.run_command(Arc::from("p"), Arc::from("/park"), String::new(), 0);
+    let _parked = run_command(&host.command_registry(), "/park", 0, None);
 
     let action = rx
         .recv_timeout(Duration::from_secs(5))
@@ -5598,8 +5493,7 @@ fn job_callbacks_fire_while_command_handler_parked() {
     )
     .unwrap();
     let rx = host.ui_action_rx();
-    let handle = host.event_handle();
-    handle.run_command(Arc::from("p"), Arc::from("/stream"), String::new(), 0);
+    let _parked = run_command(&host.command_registry(), "/stream", 0, None);
 
     let action = rx
         .recv_timeout(Duration::from_secs(5))
@@ -5647,8 +5541,7 @@ fn host_list_picker_roundtrip() {
     .unwrap();
     let rx = host.ui_action_rx();
     let handle = host.event_handle();
-    let completion =
-        handle.run_command_for_test(Arc::from("p"), Arc::from("/pick"), String::new(), 0);
+    let completion = run_command(&host.command_registry(), "/pick", 0, None);
 
     let UiAction::OpenListPicker {
         id,
@@ -5751,8 +5644,7 @@ fn host_list_picker_ui_drop_drains_callbacks() {
     .unwrap();
     let rx = host.ui_action_rx();
     let handle = host.event_handle();
-    let completion =
-        handle.run_command_for_test(Arc::from("p"), Arc::from("/pick"), String::new(), 0);
+    let completion = run_command(&host.command_registry(), "/pick", 0, None);
 
     let UiAction::OpenListPicker { id, reply_tx, .. } = rx
         .recv_timeout(Duration::from_secs(5))
@@ -6197,16 +6089,6 @@ fn host_roundtrip_bounded(
 #[test]
 fn session_picker_requested_autocmd_does_not_wedge_host() {
     let (_handle, guard) = maki_lua::test_support::spawn_host_for_tests(&["sessions"]);
-    // Answer the deferred `RunCommand` so the wrapper task completes: a bare
-    // host leaves it parked, and load barriers hold up every later request.
-    let ui_rx = guard.host().ui_action_rx();
-    std::thread::spawn(move || {
-        while let Ok(action) = ui_rx.recv() {
-            if let maki_lua::UiAction::RunCommand { reply_tx, .. } = action {
-                let _ = reply_tx.send(Ok(()));
-            }
-        }
-    });
     // Firing the event must return promptly instead of suspending the dispatch.
     let guard = host_roundtrip_bounded(guard, |host| {
         host.load_source("fire", "maki.api.exec_autocmds('SessionPickerRequested')")
@@ -6217,46 +6099,29 @@ fn session_picker_requested_autocmd_does_not_wedge_host() {
     });
 }
 
-/// The picker must open through the `/sessions` command, which the host runs
-/// as a deadline-free coroutine. A silent no-op autocmd would never emit the
-/// `RunCommand`, and a direct `open()` call would never route through it.
+/// The autocmd callback is its own deadline-free task, so it opens the
+/// picker itself; a silent no-op autocmd would never open a window.
 #[test]
-fn session_picker_requested_routes_through_sessions_command() {
+fn session_picker_requested_opens_the_picker() {
     let (handle, guard) = maki_lua::test_support::spawn_host_for_tests(&["sessions"]);
     let actions = guard.host().ui_action_rx();
     handle.fire_autocmd("SessionPickerRequested", json!({}));
-    let UiAction::RunCommand {
-        cmdline,
-        depth,
-        reply_tx,
-    } = next_picker_action(&actions)
-    else {
-        panic!("SessionPickerRequested did not route through RunCommand");
-    };
-    assert_eq!(cmdline, PICKER_COMMAND);
-    let registry = guard.host().command_registry();
-    let target = registry.bind_target(TargetCapabilities::ALL, Arc::new(FakeCommandHost));
-    let resolved = registry.resolve_input_for(&target, &cmdline).unwrap();
-    let outcome = smol::block_on(registry.dispatch_command_with_depth(
-        &target,
-        resolved.command,
-        resolved.arguments,
-        cmdline.as_str().into(),
-        usize::from(depth),
-    ));
-    reply_tx.send(Ok(())).unwrap();
-    assert!(matches!(outcome, CommandOutcome::Completed));
     let picker = SessionsPicker::load(&actions);
     picker.wait_for_unfiltered_rows();
     picker.close("esc");
 }
 
-fn dispatch_sessions_command(host: &PluginHost, input: &str) {
+/// Starts {input}; the command completes once its picker closes.
+fn dispatch_sessions_command(host: &PluginHost, input: &str) -> smol::Task<InputDispatch> {
     let registry = host.command_registry();
     let target = registry.bind_target(TargetCapabilities::ALL, Arc::new(FakeCommandHost));
-    let outcome = smol::block_on(registry.dispatch_input(&target, input.into()));
+    let dispatch = registry.dispatch_input(&target, input.into());
+    smol::spawn(dispatch)
+}
+
+fn assert_completed(dispatch: smol::Task<InputDispatch>) {
     assert!(matches!(
-        outcome,
+        smol::block_on(dispatch),
         InputDispatch::Dispatched(CommandOutcome::Completed)
     ));
 }
@@ -6273,7 +6138,7 @@ fn reply_picker_sessions(actions: &flume::Receiver<UiAction>, expected: SessionR
     };
     let rows = match (expected, req) {
         (SessionRequest::Live, SessionRequest::Live) => json!([{
-            "id": "00000000-0000-4000-8000-000000000001",
+            "id": "1111114bZ6BZRUqUqZep",
             "title": PICKER_OTHER_TITLE,
             "status": "idle",
             "focused": true,
@@ -6282,7 +6147,7 @@ fn reply_picker_sessions(actions: &flume::Receiver<UiAction>, expected: SessionR
             "message_count": 2,
         }]),
         (SessionRequest::List, SessionRequest::List) => json!([{
-            "id": "00000000-0000-4000-8000-000000000002",
+            "id": "1111114bZ6BZRUqUqZeq",
             "title": PICKER_MATCH_TITLE,
             "status": "idle",
             "focused": false,
@@ -6382,22 +6247,25 @@ impl SessionsPicker {
 fn sessions_command_initializes_closes_and_reopens(input: &str, close_key: &str) {
     let (_handle, guard) = maki_lua::test_support::spawn_host_for_tests(&["sessions"]);
     let actions = guard.host().ui_action_rx();
-    dispatch_sessions_command(guard.host(), input);
+    let dispatch = dispatch_sessions_command(guard.host(), input);
     let first = SessionsPicker::load(&actions);
     first.wait_for_unfiltered_rows();
     first.close(close_key);
-    dispatch_sessions_command(guard.host(), input);
+    assert_completed(dispatch);
+    let dispatch = dispatch_sessions_command(guard.host(), input);
     let second = SessionsPicker::load(&actions);
     assert!(!Arc::ptr_eq(&first.buf, &second.buf));
     second.wait_for_unfiltered_rows();
     second.close(close_key);
+    assert_completed(dispatch);
 }
 
 #[test_case::test_case(PICKER_QUERY)]
 fn sessions_command_query_filters_and_escape_clears(query: &str) {
     let (_handle, guard) = maki_lua::test_support::spawn_host_for_tests(&["sessions"]);
     let actions = guard.host().ui_action_rx();
-    dispatch_sessions_command(guard.host(), &format!("{PICKER_COMMAND} \"{query}\""));
+    let dispatch =
+        dispatch_sessions_command(guard.host(), &format!("{PICKER_COMMAND} \"{query}\""));
     let picker = SessionsPicker::load(&actions);
     let filter = format!("{PICKER_FILTER_PREFIX} {query}");
     picker.wait_for_render(|text| {
@@ -6411,6 +6279,7 @@ fn sessions_command_query_filters_and_escape_clears(query: &str) {
     picker.key("esc");
     picker.wait_for_unfiltered_rows();
     picker.close("esc");
+    assert_completed(dispatch);
 }
 
 #[test_case::test_case("esc")]
@@ -6428,129 +6297,51 @@ fn sessions_keybind_initializes_and_closes(close_key: &str) {
                 && entry.plugin.as_ref() == "sessions"
         })
         .expect("bundled sessions Ctrl+P keybind is missing");
-    assert!(handle.run_keybind_callback(entry.id));
+    assert!(handle.run_keybind_callback(entry.id, None));
     let picker = SessionsPicker::load(&actions);
     picker.wait_for_unfiltered_rows();
     picker.close(close_key);
 }
 
-const SESSION_OPTION_PLUGIN_ID: &str = "session_option_e2e.choice";
-const SESSION_OPTION_VALIDATOR_REJECTION: &str = "c is not allowed";
-const SESSION_OPTION_PLUGIN: &str = r#"
-maki.api.register_session_option({
-    id = "session_option_e2e.choice",
-    name = "Choice",
-    description = "e2e choice",
-    category = "mode",
-    values = {
-        { value = "a", name = "A" },
-        { value = "b", name = "B" },
-        { value = "c", name = "C" },
-    },
-    initial_value = "a",
-    validate = function(value)
-        if value == "c" then return false, "c is not allowed" end
-        return true
-    end,
-})
-
+const SESSION_MUTATION_PLUGIN: &str = r#"
 maki.api.register_tool({
-    name = "set_choice",
-    description = "sets the plugin-owned session option",
+    name = "mutate_session",
+    description = "calls one maki.session function",
     schema = {
         type = "object",
-        properties = {
-            session = { type = "string" },
-            value = { type = "string" },
-        },
-        required = { "session", "value" },
+        properties = { call = { type = "string" }, session = { type = "string" } },
+        required = { "call", "session" },
     },
-    handler = function(input, ctx)
-        local ok, err = maki.session.set_option(
-            "session_option_e2e.choice",
-            input.value,
-            { session = input.session })
-        if not ok then
-            return "error: " .. tostring(err)
-        end
-        return "ok"
+    handler = function(input)
+        local calls = {
+            set_title = function() return maki.session.set_title({ id = input.session, title = "t" }) end,
+            new = function() return maki.session.new() end,
+            focus = function() return maki.session.focus(input.session) end,
+            delete = function() return maki.session.delete(input.session) end,
+            read = function() return maki.session.read({}) end,
+        }
+        local _, err = calls[input.call]()
+        return tostring(err)
     end,
 })
 "#;
 
-const SESSION_OPTION_SET_OK: &str = "ok";
-
-fn plugin_option_state(
-    session: &maki_agent::session_coordinator::SessionCoordinatorHandle,
-) -> (String, u64) {
-    let snapshot = session.read().options();
-    let state = snapshot
-        .options
-        .iter()
-        .find(|option| option.definition.id.as_ref() == SESSION_OPTION_PLUGIN_ID)
-        .expect("plugin-owned option missing from session snapshot");
-    (state.current_value.to_string(), snapshot.version)
-}
-
-/// Covers the Lua-facing set path end to end: a plugin loaded through the
-/// real host registers a plugin-owned option (including its validator), and a
-/// tool handler mutates a live session through `maki.session.set_option`.
-#[test]
-fn session_set_option_applies_plugin_owned_option_on_live_session() {
+#[test_case::test_case("set_title", DELEGATED_FOREIGN_SESSION ; "set_title")]
+#[test_case::test_case("new", DELEGATED_SESSION_LIFECYCLE ; "new")]
+#[test_case::test_case("focus", DELEGATED_SESSION_LIFECYCLE ; "focus")]
+#[test_case::test_case("delete", DELEGATED_SESSION_LIFECYCLE ; "delete")]
+#[test_case::test_case("read", SESSION_REQUIRED_ERR ; "read")]
+fn tool_handlers_cannot_reach_other_sessions_or_focus(call: &str, expected: &str) {
     let (reg, host) = builtins_host();
-    let session = test_session(&host);
-    host.load_source("session_option_e2e", SESSION_OPTION_PLUGIN)
+    host.load_source("session_mutation", SESSION_MUTATION_PLUGIN)
         .unwrap();
-    let session_id = session.read().session_id().to_string();
-    let actions = host.ui_action_rx();
-    let responder_session = session.clone();
-    let responder = std::thread::spawn(move || {
-        let action = actions.recv_timeout(Duration::from_secs(5)).unwrap();
-        if let maki_lua::UiAction::Session {
-            req:
-                maki_lua::SessionRequest::SetOption {
-                    id, value, version, ..
-                },
-            reply_tx,
-        } = action
-        {
-            let result =
-                smol::block_on(responder_session.set_option_if_version(id, value, Some(version)))
-                    .map(|_| json!(true))
-                    .map_err(|error| error.to_string());
-            reply_tx.send(result).unwrap();
-        }
-    });
-
-    let (value, _) = plugin_option_state(&session);
-    assert_eq!(value, "a");
-
-    let out = exec_tool(
+    let out = exec_tool_in_session(
         &reg,
-        "set_choice",
-        json!({ "session": session_id, "value": "b" }),
-    )
-    .unwrap();
-    assert_eq!(out, SESSION_OPTION_SET_OK);
-    let (value, version) = plugin_option_state(&session);
-    assert_eq!(value, "b");
-    let set_version = version;
-
-    let out = exec_tool(
-        &reg,
-        "set_choice",
-        json!({ "session": session_id, "value": "c" }),
-    )
-    .unwrap();
-    assert!(
-        out.contains(SESSION_OPTION_VALIDATOR_REJECTION),
-        "expected validator rejection, got: {out}"
+        "mutate_session",
+        json!({ "call": call, "session": MakiId::generate().to_string() }),
+        MakiId::generate(),
     );
-    let (value, version) = plugin_option_state(&session);
-    assert_eq!(value, "b");
-    assert_eq!(version, set_version);
-    responder.join().unwrap();
-    smol::block_on(session.close()).unwrap();
+    assert_eq!(out, expected);
 }
 
 const CUT_LINE_BYTES: usize = 100;
@@ -7207,7 +6998,7 @@ fn write_new_file_with_preview_cut_marker_is_rejected() {
 #[test]
 fn cancelled_bash_large_output_keeps_partial_marker_last() {
     let (tx, events) = flume::unbounded();
-    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let event_tx = maki_agent::EventSender::new(tx);
     let (trigger, token) = maki_agent::CancelToken::new();
     let (result_tx, result_rx) = flume::bounded(1);
     let dir = tempfile::tempdir().unwrap();
@@ -7343,7 +7134,7 @@ fn code_execution_cancel_deferred_output_offloads() {
     let (trigger, token) = maki_agent::CancelToken::new();
     ctx.cancel = token;
     let (events_tx, events_rx) = flume::unbounded();
-    ctx.event_tx = maki_agent::EventSender::new(events_tx, 0);
+    ctx.event_tx = maki_agent::EventSender::new(events_tx);
     ctx.tool_use_id = Some("interpreter-cancel-output".to_owned());
     let invocation = reg.get("code_execution").unwrap().tool.parse(&json!({
         "code": format!("print({})\nawait {CODE_EXECUTION_BLOCKED_TOOL}()", json!(CODE_EXECUTION_CANCEL_BODY)),

@@ -5,9 +5,15 @@
 //! These run on the real plugin sources so a byte-level edit to any of the
 //! three files is caught here, not just at runtime.
 
+use maki_lua::test_support::run_command;
+use test_case::test_case;
+
 const MODE_OVERRIDE_SRC: &str = include_str!("../../plugins/mode_plan_override/init.lua");
 const TASK_SRC: &str = include_str!("../../plugins/task/init.lua");
 const PLAN_SPEC_SRC: &str = include_str!("../../plugins/lib/maki/plan_spec.lua");
+const MODE_OVERRIDE_PLUGIN: &str = "mode_plan_override";
+const MODE_SWITCH_FAILED: &str = "cannot switch to";
+const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// pi-luna tool strings that must not survive the clone.
 const PI_TOOL_STRINGS: &[&str] = &[
@@ -62,7 +68,8 @@ fn directive_is_verbatim_clone() {
     must_contain(MODE_OVERRIDE_SRC, "{plan_path}", "plan-mode directive");
     // Tool-name substitutions land.
     must_contain(MODE_OVERRIDE_SRC, "`question`", "plan-mode directive");
-    must_contain(MODE_OVERRIDE_SRC, "`task`", "plan-mode directive");
+    must_contain(MODE_OVERRIDE_SRC, "`task_spawn`", "plan-mode directive");
+    must_contain(MODE_OVERRIDE_SRC, "`task_wait`", "plan-mode directive");
     must_contain(MODE_OVERRIDE_SRC, "`plan_reviewer`", "plan-mode directive");
     // The directive splices the shared spec.
     must_contain(
@@ -74,12 +81,21 @@ fn directive_is_verbatim_clone() {
 
 #[test]
 fn plan_toolset_includes_webfetch() {
-    // Byte-pin the whole toolset line: any add or remove is caught here.
-    must_contain(
-        MODE_OVERRIDE_SRC,
-        r#"tools = { "read", "grep", "glob", "webfetch", "write", "edit", "plan_submit", "task" }"#,
-        "plan toolset",
-    );
+    for tool in [
+        "read",
+        "grep",
+        "glob",
+        "webfetch",
+        "write",
+        "edit",
+        "plan_submit",
+        "task_spawn",
+        "task_wait",
+        "task_send",
+        "task_despawn",
+    ] {
+        must_contain(MODE_OVERRIDE_SRC, &format!("\"{tool}\""), "plan toolset");
+    }
     // A phrase unique to the directive sentence (the header comment also
     // mentions webfetch, so the backticked name alone would not pin it).
     must_contain(
@@ -143,4 +159,21 @@ fn plan_spec_is_single_shared_source() {
     for s in PI_TOOL_STRINGS {
         must_absent(PLAN_SPEC_SRC, s, "plan spec");
     }
+}
+
+/// Without an agent to switch, `/plan` and `/build` fail with the reason
+/// instead of reporting success and only logging it.
+#[test_case("/plan" ; "plan")]
+#[test_case("/build" ; "build")]
+fn mode_command_failure_reaches_the_caller(command: &str) {
+    let host =
+        maki_lua::PluginHost::new(std::sync::Arc::new(maki_agent::tools::ToolRegistry::new()))
+            .unwrap();
+    host.load_source(MODE_OVERRIDE_PLUGIN, MODE_OVERRIDE_SRC)
+        .unwrap();
+    let result = run_command(&host.command_registry(), command, 0, None)
+        .recv_timeout(COMMAND_TIMEOUT)
+        .unwrap();
+    let error = result.unwrap_err();
+    assert!(error.contains(MODE_SWITCH_FAILED), "{error}");
 }

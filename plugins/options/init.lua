@@ -1,19 +1,25 @@
 local helpers = require("options_helpers")
 
-local function read_options()
-  local snapshot, err = maki.session.options()
-  if not snapshot then
+local function read_options(ctx, agent)
+  local config, err = agent:config(ctx)
+  if not config then
     maki.ui.flash("Options unavailable: " .. tostring(err))
+    return nil
   end
-  return snapshot
+  return helpers.options(maki.api.get_session_options(), config.options)
 end
 
-local function command()
-  local snapshot = read_options()
-  if not snapshot then
+local function command(_, ctx)
+  local agent, agent_err = ctx and ctx:agent()
+  if not agent then
+    maki.ui.flash("Options unavailable: " .. tostring(agent_err or "no agent"))
     return
   end
-  local option_items = helpers.option_items(snapshot)
+  local options = read_options(ctx, agent)
+  if not options then
+    return
+  end
+  local option_items = helpers.option_items(options)
   if #option_items == 0 then
     maki.ui.flash("No session options available")
     return
@@ -27,11 +33,11 @@ local function command()
     return
   end
 
-  snapshot = read_options()
-  if not snapshot then
+  options = read_options(ctx, agent)
+  if not options then
     return
   end
-  local option = helpers.find(snapshot, selected_item.id)
+  local option = helpers.find(options, selected_item.id)
   if not option then
     maki.ui.flash("Option is no longer available: " .. selected_item.id)
     return
@@ -48,28 +54,7 @@ local function command()
   if not value_item then
     return
   end
-
-  snapshot = read_options()
-  if not snapshot then
-    return
-  end
-  option = helpers.find(snapshot, selected_item.id)
-  if not option then
-    maki.ui.flash("Option is no longer available: " .. selected_item.id)
-    return
-  end
-  local valid = false
-  for _, value in ipairs(option.values or {}) do
-    if value.value == value_item.value then
-      valid = true
-      break
-    end
-  end
-  if not valid then
-    maki.ui.flash("Option values changed: " .. selected_item.id)
-    return
-  end
-  local ok, err = maki.session.set_option(selected_item.id, value_item.value)
+  local ok, err = agent:set_option(ctx, selected_item.id, value_item.value)
   if not ok then
     maki.ui.flash("Option update failed: " .. tostring(err))
   end

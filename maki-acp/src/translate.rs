@@ -122,7 +122,7 @@ pub fn permission_request(
     title: String,
     tool: &str,
     raw_input: Option<&serde_json::Value>,
-    cwd: &Path,
+    cwd: Option<&Path>,
     home: Option<&Path>,
 ) -> ToolCallUpdate {
     let mut fields = ToolCallUpdateFields::new()
@@ -148,7 +148,7 @@ pub fn permission_request(
 fn write_diff(
     tool: &str,
     raw_input: &serde_json::Value,
-    cwd: &Path,
+    cwd: Option<&Path>,
     home: Option<&Path>,
 ) -> Option<Diff> {
     if tool != WRITE_TOOL {
@@ -182,7 +182,11 @@ pub fn local_operation_terminal(id: &str, error: Option<&str>) -> SessionUpdate 
     ))
 }
 
-pub fn tool_start(event: &ToolStartEvent, cwd: &Path, home: Option<&Path>) -> SessionUpdate {
+pub fn tool_start(
+    event: &ToolStartEvent,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> SessionUpdate {
     let mut fields = ToolCallUpdateFields::new()
         .status(ToolCallStatus::Pending)
         .title(event.summary.clone());
@@ -208,7 +212,7 @@ pub fn tool_start(event: &ToolStartEvent, cwd: &Path, home: Option<&Path>) -> Se
 fn tool_locations(
     tool: &str,
     raw_input: Option<&serde_json::Value>,
-    cwd: &Path,
+    cwd: Option<&Path>,
     home: Option<&Path>,
 ) -> Vec<ToolCallLocation> {
     if !FILE_TOOLS.contains(&tool) {
@@ -238,8 +242,9 @@ fn input_path(raw_input: &serde_json::Value) -> Option<&str> {
 
 /// `~`, `~/x`, and relative paths become absolute; other `~` spellings
 /// (`~user`) have no expansion. ACP clients require absolute paths in
-/// locations, so anything unresolvable yields None instead of a bogus path.
-fn resolve_path(raw: &str, cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
+/// locations, so anything unresolvable, a relative path with no known cwd
+/// included, yields None instead of a bogus path.
+fn resolve_path(raw: &str, cwd: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
     if raw.starts_with('~') {
         if raw == "~" {
             return home.map(Path::to_path_buf);
@@ -248,11 +253,11 @@ fn resolve_path(raw: &str, cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
         return home.map(|h| h.join(rest));
     }
     let p = Path::new(raw);
-    Some(if p.is_absolute() {
-        p.to_path_buf()
+    if p.is_absolute() {
+        Some(p.to_path_buf())
     } else {
-        cwd.join(p)
-    })
+        cwd.map(|cwd| cwd.join(p))
+    }
 }
 
 /// The line a tool call focuses on, when its input says so. ACP `line` is
@@ -294,7 +299,11 @@ fn location(path: PathBuf, line: Option<u32>) -> ToolCallLocation {
 /// locations instead of merging them, so re-reporting would drop the line the
 /// client is following. Paths are already absolute (the plugins abspath them),
 /// so resolve_path is a no-op here; it only guards against a relative slip.
-fn done_locations(event: &ToolDoneEvent, cwd: &Path, home: Option<&Path>) -> Vec<ToolCallLocation> {
+fn done_locations(
+    event: &ToolDoneEvent,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> Vec<ToolCallLocation> {
     if event.is_error || FILE_TOOLS.contains(&&*event.tool) {
         return Vec::new();
     }
@@ -317,7 +326,7 @@ pub fn tool_output(id: &str, content: &str) -> SessionUpdate {
     ))
 }
 
-pub fn tool_done(event: &ToolDoneEvent, cwd: &Path, home: Option<&Path>) -> SessionUpdate {
+pub fn tool_done(event: &ToolDoneEvent, cwd: Option<&Path>, home: Option<&Path>) -> SessionUpdate {
     let status = if event.is_error {
         ToolCallStatus::Failed
     } else {
@@ -389,7 +398,11 @@ pub fn usage_update(event: &TurnCompleteEvent, cost_total: Option<f64>) -> Sessi
     SessionUpdate::UsageUpdate(update)
 }
 
-pub fn replay_history(messages: &[Message], cwd: &Path, home: Option<&Path>) -> Vec<SessionUpdate> {
+pub fn replay_history(
+    messages: &[Message],
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> Vec<SessionUpdate> {
     let mut updates = Vec::new();
     for msg in messages {
         match msg.role {
@@ -432,7 +445,7 @@ fn replay_user(msg: &Message, updates: &mut Vec<SessionUpdate>) {
 fn replay_assistant(
     msg: &Message,
     updates: &mut Vec<SessionUpdate>,
-    cwd: &Path,
+    cwd: Option<&Path>,
     home: Option<&Path>,
 ) {
     let mut prev_thinking = false;
@@ -460,7 +473,7 @@ fn replay_tool_call(
     id: &str,
     name: &str,
     input: &serde_json::Value,
-    cwd: &Path,
+    cwd: Option<&Path>,
     home: Option<&Path>,
 ) -> SessionUpdate {
     let call = ToolCall::new(ToolCallId::from(id.to_string()), name.to_string())
@@ -537,7 +550,7 @@ mod tests {
     }
 
     fn updates_json(messages: &[Message]) -> Vec<serde_json::Value> {
-        replay_history(messages, Path::new(CWD), Some(Path::new(HOME)))
+        replay_history(messages, Some(Path::new(CWD)), Some(Path::new(HOME)))
             .iter()
             .map(|u| serde_json::to_value(u).unwrap())
             .collect()
@@ -714,7 +727,7 @@ mod tests {
     ) -> Option<serde_json::Value> {
         let update = tool_start(
             &start_event(tool, raw_input),
-            Path::new(CWD),
+            Some(Path::new(CWD)),
             Some(Path::new(HOME)),
         );
         serde_json::to_value(update)
@@ -757,13 +770,27 @@ mod tests {
     fn tool_start_with_no_raw_input_has_no_locations_field() {
         let update = tool_start(
             &start_event("read", None),
-            Path::new(CWD),
+            Some(Path::new(CWD)),
             Some(Path::new(HOME)),
         );
         let json = serde_json::to_value(update).unwrap();
         assert!(
             json.get("locations").is_none(),
             "empty locations must be omitted: {json}"
+        );
+    }
+
+    #[test]
+    fn relative_path_without_cwd_has_no_locations() {
+        let update = tool_start(
+            &start_event("read", Some(json!({"path": "src/lib.rs"}))),
+            None,
+            Some(Path::new(HOME)),
+        );
+        let json = serde_json::to_value(update).unwrap();
+        assert!(
+            json.get("locations").is_none(),
+            "a relative path must not resolve without a cwd: {json}"
         );
     }
 
@@ -784,7 +811,7 @@ mod tests {
     }
 
     fn done_locations_of(event: &ToolDoneEvent) -> Option<serde_json::Value> {
-        let update = tool_done(event, Path::new(CWD), Some(Path::new(HOME)));
+        let update = tool_done(event, Some(Path::new(CWD)), Some(Path::new(HOME)));
         serde_json::to_value(update)
             .unwrap()
             .get("locations")
@@ -923,7 +950,7 @@ mod tests {
             PERMISSION_TITLE.to_string(),
             tool,
             raw_input,
-            cwd,
+            Some(cwd),
             Some(Path::new(HOME)),
         );
         serde_json::to_value(update).unwrap()

@@ -64,8 +64,8 @@ All fields are optional. Typos in field names cause an error right away.
 | `always_yolo` | bool | `false` | Start every session with YOLO mode (skip permission prompts, deny rules still apply) |
 | `always_automode` | bool | `false` | Start every session with bash auto mode (classify every bash command) |
 | `always_fast` | bool | `false` | Start every session with fast mode (Anthropic Opus or eligible Codex subscription models, ignored elsewhere) |
-| `always_workflow` | bool | `false` | Start every session with workflow mode (task callable inside code_execution) |
-| `always_thinking` | bool \| string | `false` | Start every session with extended thinking (true/"adaptive", "off", an effort level ("minimal" to "max"), or a token budget) |
+| `always_workflow` | bool | `false` | Start every session with workflow mode (task tools callable inside code_execution) |
+| `always_thinking` | bool \| string | `false` | Start every session with extended thinking (true/"adaptive", "off", an effort level ("minimal" to "max"), or a token budget). A default saved with `/thinking` wins over it |
 
 ### `ui`
 
@@ -122,7 +122,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 |-------|---------|
 | `bash` | 5 |
 | `code_execution` | 5 |
-| `task` | 5 |
+| `task_spawn` | 5 |
 | `index` | 3 |
 | `grep` | 3 |
 | `read` | 3 |
@@ -219,7 +219,7 @@ maki.setup({
 
 The `plugins` table turns plugins on or off and passes options to them. All bundled plugins are on by default. Set `enabled = false` to turn one off.
 
-A plugin that is off never loads, so its tool name is free for one of your own plugins to take. Permission rules are keyed by the tool name alone, and names such as `bash`, `write`, and `task` already have rules in maki. A plugin that takes one of them inherits those rules, together with any "always allow" you saved. Maki warns you at load when this happens.
+A plugin that is off never loads, so its tool name is free for one of your own plugins to take. Permission rules are keyed by the tool name alone, and names such as `bash`, `write`, and `task_spawn` already have rules in maki. A plugin that takes one of them inherits those rules, together with any "always allow" you saved. Maki warns you at load when this happens.
 
 Each plugin checks its own options at startup. A typo, a wrong type, or an unknown plugin name gives you a clear error right away.
 
@@ -310,7 +310,6 @@ maki.setup({
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
 | `allow_model` | boolean | `false` | - | Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves. |
-| `max_concurrent` | integer | `8` | 1 | Deprecated. Process-wide fallback limit for unmanaged frontends; managed TUI sessions use agent.max_concurrent_agent_turns. |
 
 ### `plugins.webfetch`
 
@@ -346,18 +345,6 @@ Makima follows platform directory conventions. On Linux and macOS that is XDG. O
 | Cache | `~/.cache/makima/` | `%LOCALAPPDATA%\makima\` |
 
 Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\makima` on Windows; that is separate from these runtime dirs.
-
-`~/.makima/` (or `%USERPROFILE%\.makima\`) is checked as a legacy fallback. If that directory still exists, maki uses it for everything until you migrate.
-
-### Migrating from ~/.makima/
-
-```
-makima migrate xdg
-```
-
-This safely moves sessions, auth, plans, memories, logs, and preferences to the platform locations above. Where both old and new files exist, they are merged (input history, model tiers, etc.). Nothing is deleted until it has been copied. At the end you get a summary of where everything lives now.
-
-Safe to run more than once.
 
 ## Personal Instructions
 

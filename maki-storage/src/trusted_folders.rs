@@ -5,27 +5,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::lock::{Lock, LockError};
 use crate::paths::{canonicalize_clean, normalize_path};
-use crate::sessions::{SESSIONS_DIR, recorded_cwds};
 use crate::{StateDir, StorageError, atomic_write};
 
 const DOCUMENT_FILE: &str = "trusted-folders.json";
+/// The store holds no compatibility with older formats, so the way out of an
+/// unreadable one is to start over.
+const RESET_HINT: &str = "delete the file and makima asks about each folder again";
 const DOCUMENT_VERSION: u32 = 2;
-/// Version 1 kept a bare path per trusted folder. Those answers are still good,
-/// they just do not say which files they covered, so they load as `Unrecorded`.
-const OLDEST_SUPPORTED_VERSION: u32 = 1;
 const LOCK_FILE: &str = "trusted-folders.lock";
-/// Lives next to the session index on purpose, see [`TrustedFolders::grandfathered_roots`].
-const PRE_TRUST_FILE: &str = "pre-trust-roots.json";
-/// The answer a damaged snapshot is settled as: no project root predates folder
-/// trust. It is a real, parseable answer, so writing it retires the one-time
-/// migration question for good, see [`TrustedFolders::grandfathered_roots`].
-const EMPTY_SNAPSHOT: &[u8] = b"[]";
-/// How many recorded working directories the snapshot is willing to resolve.
-/// Resolving one costs a realpath per path component and a stat per ancestor,
-/// and this runs on the first start after an upgrade, on the same thread ACP
-/// answers its client on. A thousand distinct working directories is already a
-/// long history, and the ones kept are the ones used most recently.
-const MAX_FROZEN_CWDS: usize = 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalFolder {
@@ -87,12 +74,6 @@ pub enum TrustStatus {
     Unknown,
 }
 
-/// How a recorded working directory maps to the folder a trust answer is about.
-/// The project root rule (the git checkout that owns a directory, stopping below
-/// the home directory) lives in `maki-config`, which sits above this crate, so
-/// the caller hands it in.
-pub type ProjectRootOf<'a> = &'a dyn Fn(&Path) -> PathBuf;
-
 /// What the store says about a folder, read against the gated files that folder
 /// ships right now.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -105,12 +86,6 @@ pub enum TrustDecision {
     Widened {
         added: Vec<String>,
     },
-    /// A yes from a store written before Maki wrote down what a yes covered.
-    Unrecorded,
-    /// No answer, but this is the project root of a folder that was already in
-    /// use before folder trust existed, so its shared config used to load
-    /// without a question.
-    Grandfathered,
     Rejected,
     Unknown,
 }
@@ -133,7 +108,7 @@ pub enum TrustedFoldersError {
     ControlCharacter { path: PathBuf },
     #[error("a missing folder must be removed by absolute path: {path:?}")]
     RelativeMissing { path: PathBuf },
-    #[error("unsupported trusted folder store version {version} in {path:?}")]
+    #[error("unsupported trusted folder store version {version} in {path:?}; {RESET_HINT}")]
     UnsupportedVersion { path: PathBuf, version: u32 },
     #[error("trusted folders are being changed by another Maki process: {path:?}")]
     Locked { path: PathBuf },
@@ -143,7 +118,7 @@ pub enum TrustedFoldersError {
         #[source]
         source: std::io::Error,
     },
-    #[error("cannot parse trusted folder state at {path:?}: {source}")]
+    #[error("cannot parse trusted folder state at {path:?}: {source}; {RESET_HINT}")]
     Json {
         path: PathBuf,
         #[source]
@@ -163,38 +138,15 @@ pub enum TrustedFoldersError {
 /// arrives in a later pull. It is a set of file names, never a hash of their
 /// contents, so editing a file the user already trusted asks nothing.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(untagged)]
-enum FolderEntry {
-    Recorded {
-        path: String,
-        files: Vec<String>,
-    },
-    /// How version 1 spelled a trusted folder. Nothing recorded what such an
-    /// answer covered, so it keeps covering everything until the next start
-    /// writes down what the folder ships that day.
-    Unrecorded(String),
-}
-
-impl FolderEntry {
-    fn path(&self) -> &str {
-        match self {
-            Self::Recorded { path, .. } | Self::Unrecorded(path) => path,
-        }
-    }
-
-    fn files(&self) -> Option<&[String]> {
-        match self {
-            Self::Recorded { files, .. } => Some(files),
-            Self::Unrecorded(_) => None,
-        }
-    }
+struct FolderEntry {
+    path: String,
+    files: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Document {
     version: u32,
     folders: Vec<FolderEntry>,
-    #[serde(default)]
     rejected: Vec<String>,
 }
 
@@ -212,7 +164,6 @@ impl Default for Document {
 pub struct TrustedFolders {
     document_path: PathBuf,
     lock_path: PathBuf,
-    sessions_dir: PathBuf,
 }
 
 impl TrustedFolders {
@@ -220,7 +171,6 @@ impl TrustedFolders {
         Self {
             document_path: state.path().join(DOCUMENT_FILE),
             lock_path: state.path().join(LOCK_FILE),
-            sessions_dir: state.path().join(SESSIONS_DIR),
         }
     }
 
@@ -235,108 +185,12 @@ impl TrustedFolders {
 
     /// `present` is the gated file kinds the folder ships now. Passing them in
     /// keeps this crate out of the business of knowing which files are gated.
-    ///
-    /// This is also where the grandfather snapshot gets frozen, because it is
-    /// the one call every startup makes before it opens a session.
     pub fn decide(
         &self,
         folder: &CanonicalFolder,
         present: &[&str],
-        project_root: ProjectRootOf,
     ) -> Result<TrustDecision, TrustedFoldersError> {
-        let grandfathered = self.grandfathered_roots(project_root);
-        Ok(self.load()?.decide(folder, present, &grandfathered))
-    }
-
-    /// Grandfathering answers a one-time migration question: which project
-    /// roots already loaded their `.maki` without anybody being asked, back
-    /// before folder trust existed. So the set is taken once and then frozen.
-    /// Reading the live session index on every start would instead let a run
-    /// that was just denied write its own evidence, because every entry point
-    /// records a session for the folder it was refused in, and come back
-    /// trusted next time. A fresh install has no sessions yet, so its snapshot
-    /// is empty and nothing is grandfathered.
-    ///
-    /// The snapshot lives beside the session index rather than in the trust
-    /// store, and it is claimed with a create-new open rather than the store
-    /// lock. That is what keeps the two in step: a run can only add a working
-    /// directory to the index if it can write that directory, and if it can
-    /// write that directory it could also have frozen the snapshot first. So
-    /// there is no longer a run that is refused, records its own working
-    /// directory anyway, and gets it grandfathered by the next start. A
-    /// concurrent `maki trust add` holding the store lock cannot delay the
-    /// freeze either, because the freeze does not want that lock.
-    ///
-    /// Whatever ends up on disk is what this run uses, never the set it just
-    /// computed, so a run only ever trusts a snapshot that is durable and that
-    /// every later run will read the same way.
-    ///
-    /// A snapshot that cannot be parsed grandfathers nothing, here and on every
-    /// later start, because it is replaced with an explicitly empty one rather
-    /// than taken again. Taking it again would answer the migration question a
-    /// second time against a session index that has moved on, and by then it
-    /// holds the working directory of every run that was just refused. If the
-    /// replacement cannot be written, this run still grandfathers nothing.
-    fn grandfathered_roots(&self, project_root: ProjectRootOf) -> Vec<String> {
-        let path = self.sessions_dir.join(PRE_TRUST_FILE);
-        if !path.exists()
-            && let Err(error) = self.freeze_pre_trust_roots(&path, project_root)
-        {
-            tracing::warn!(%error, path = %path.display(), "cannot record which folders predate folder trust");
-        }
-        let frozen = match fs::read(&path) {
-            Ok(frozen) => frozen,
-            Err(error) => {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(%error, path = %path.display(), "cannot read which folders predate folder trust, nothing is grandfathered this run");
-                }
-                return Vec::new();
-            }
-        };
-        match serde_json::from_slice(&frozen) {
-            Ok(roots) => roots,
-            Err(error) => {
-                tracing::warn!(%error, path = %path.display(), "the record of folders that predate folder trust is damaged, nothing is grandfathered from now on");
-                if let Err(error) = atomic_write(&path, EMPTY_SNAPSHOT) {
-                    tracing::warn!(%error, path = %path.display(), "cannot settle the damaged record of folders that predate folder trust");
-                }
-                Vec::new()
-            }
-        }
-    }
-
-    /// The snapshot is about project roots, so every recorded working directory
-    /// goes through the same walk a start in that directory would do. A prefix
-    /// test instead of this would hand a grant to every directory above a
-    /// session, including one that only happens to contain somebody's checkout.
-    /// Every one of those walks touches the disk, so how many a start pays for
-    /// is capped, see [`MAX_FROZEN_CWDS`].
-    ///
-    /// The path is claimed with a create-new open before anything is written,
-    /// so two starts racing here cannot freeze two different sets: the loser
-    /// stops and reads what the winner wrote. The content then arrives through
-    /// `atomic_write`, because a half-written snapshot would be read as an
-    /// answer by every later start. A crash in the gap between the claim and
-    /// the write leaves an empty file, which nobody can parse and which
-    /// [`TrustedFolders::grandfathered_roots`] therefore settles as "nothing
-    /// predates folder trust" rather than freezing a second, later set.
-    fn freeze_pre_trust_roots(
-        &self,
-        path: &Path,
-        project_root: ProjectRootOf,
-    ) -> Result<(), StorageError> {
-        fs::create_dir_all(&self.sessions_dir)?;
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)?;
-        let mut roots: Vec<String> = recorded_cwds(&self.sessions_dir, MAX_FROZEN_CWDS)
-            .iter()
-            .filter_map(|cwd| path_entry(&project_root(Path::new(cwd))).ok())
-            .collect();
-        roots.sort();
-        roots.dedup();
-        atomic_write(path, &serde_json::to_vec(&roots)?)
+        Ok(self.load()?.decide(folder, present))
     }
 
     /// Records a yes for `folder` covering `files`. An existing entry keeps
@@ -353,11 +207,11 @@ impl TrustedFolders {
         let index = document
             .folders
             .iter()
-            .position(|entry| entry.path() == folder.as_str());
+            .position(|entry| entry.path == folder.as_str());
 
         let mut covered: Vec<String> = files.iter().map(|file| (*file).to_owned()).collect();
-        if let Some(recorded) = index.and_then(|index| document.folders[index].files()) {
-            covered.extend_from_slice(recorded);
+        if let Some(index) = index {
+            covered.extend_from_slice(&document.folders[index].files);
         }
         covered.sort();
         covered.dedup();
@@ -366,14 +220,13 @@ impl TrustedFolders {
             .rejected
             .iter()
             .any(|entry| entry == folder.as_str());
-        let already_covered =
-            index.is_some_and(|index| document.folders[index].files() == Some(covered.as_slice()));
+        let already_covered = index.is_some_and(|index| document.folders[index].files == covered);
         if already_covered && !was_rejected {
             return Ok(Change::Unchanged);
         }
 
         document.rejected.retain(|entry| entry != folder.as_str());
-        let entry = FolderEntry::Recorded {
+        let entry = FolderEntry {
             path: folder.as_str().to_owned(),
             files: covered,
         };
@@ -390,8 +243,7 @@ impl TrustedFolders {
     /// the project added and ask about it.
     ///
     /// A folder with no answer keeps none: writing a file into a folder is not
-    /// a reason to trust it. An answer from before file sets already covers
-    /// everything, so it is left alone rather than narrowed to this one file.
+    /// a reason to trust it.
     pub fn cover_written_file(
         &self,
         folder: &CanonicalFolder,
@@ -399,10 +251,10 @@ impl TrustedFolders {
     ) -> Result<Change, TrustedFoldersError> {
         let _lock = self.mutation_lock()?;
         let mut document = self.load()?;
-        let Some(FolderEntry::Recorded { files, .. }) = document
+        let Some(FolderEntry { files, .. }) = document
             .folders
             .iter_mut()
-            .find(|entry| entry.path() == folder.as_str())
+            .find(|entry| entry.path == folder.as_str())
         else {
             return Ok(Change::Unchanged);
         };
@@ -427,7 +279,7 @@ impl TrustedFolders {
         }
         document
             .folders
-            .retain(|entry| entry.path() != folder.as_str());
+            .retain(|entry| entry.path != folder.as_str());
         document.rejected.push(folder.as_str().to_owned());
         self.save(&mut document)?;
         Ok(Change::Changed)
@@ -445,7 +297,7 @@ impl TrustedFolders {
             document
                 .folders
                 .iter()
-                .any(|entry| names_same_folder(entry.path(), candidate))
+                .any(|entry| names_same_folder(&entry.path, candidate))
                 || document
                     .rejected
                     .iter()
@@ -455,7 +307,7 @@ impl TrustedFolders {
         };
         document
             .folders
-            .retain(|entry| !names_same_folder(entry.path(), candidate));
+            .retain(|entry| !names_same_folder(&entry.path, candidate));
         document
             .rejected
             .retain(|entry| !names_same_folder(entry, candidate));
@@ -469,7 +321,7 @@ impl TrustedFolders {
             .folders
             .iter()
             .map(|entry| FolderTrustDecision {
-                path: PathBuf::from(entry.path()),
+                path: PathBuf::from(&entry.path),
                 status: TrustStatus::Trusted,
             })
             .chain(document.rejected.iter().map(|path| FolderTrustDecision {
@@ -502,18 +354,17 @@ impl TrustedFolders {
                 });
             }
         };
-        let mut document: Document =
+        let document: Document =
             serde_json::from_str(&contents).map_err(|source| TrustedFoldersError::Json {
                 path: self.document_path.clone(),
                 source,
             })?;
-        if !(OLDEST_SUPPORTED_VERSION..=DOCUMENT_VERSION).contains(&document.version) {
+        if document.version != DOCUMENT_VERSION {
             return Err(TrustedFoldersError::UnsupportedVersion {
                 path: self.document_path.clone(),
                 version: document.version,
             });
         }
-        document.version = DOCUMENT_VERSION;
 
         // A malformed entry cannot grant anything, because `status` compares
         // against a canonical absolute path and nothing else. Refusing to load
@@ -525,10 +376,10 @@ impl TrustedFolders {
     fn save(&self, document: &mut Document) -> Result<(), TrustedFoldersError> {
         document
             .folders
-            .sort_by(|left, right| left.path().cmp(right.path()));
+            .sort_by(|left, right| left.path.cmp(&right.path));
         document
             .folders
-            .dedup_by(|left, right| left.path() == right.path());
+            .dedup_by(|left, right| left.path == right.path);
         document.rejected.sort();
         document.rejected.dedup();
         let mut bytes =
@@ -548,7 +399,7 @@ impl Document {
     fn entry(&self, folder: &CanonicalFolder) -> Option<&FolderEntry> {
         self.folders
             .iter()
-            .find(|entry| entry.path() == folder.as_str())
+            .find(|entry| entry.path == folder.as_str())
     }
 
     fn status(&self, folder: &CanonicalFolder) -> TrustStatus {
@@ -561,30 +412,16 @@ impl Document {
         }
     }
 
-    /// `grandfathered` already holds project roots and `folder` is the project
-    /// root the caller is deciding about, so this is an exact compare. Anything
-    /// looser would grant a folder that never had a session of its own.
-    fn decide(
-        &self,
-        folder: &CanonicalFolder,
-        present: &[&str],
-        grandfathered: &[String],
-    ) -> TrustDecision {
+    fn decide(&self, folder: &CanonicalFolder, present: &[&str]) -> TrustDecision {
         let Some(entry) = self.entry(folder) else {
             return match self.status(folder) {
                 TrustStatus::Rejected => TrustDecision::Rejected,
-                _ if grandfathered.iter().any(|root| root == folder.as_str()) => {
-                    TrustDecision::Grandfathered
-                }
                 _ => TrustDecision::Unknown,
             };
         };
-        let Some(covered) = entry.files() else {
-            return TrustDecision::Unrecorded;
-        };
         let added: Vec<String> = present
             .iter()
-            .filter(|file| !covered.iter().any(|recorded| recorded == *file))
+            .filter(|file| !entry.files.iter().any(|recorded| recorded == *file))
             .map(|file| (*file).to_owned())
             .collect();
         if added.is_empty() {
@@ -654,15 +491,11 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::sessions::{Session, TitleSource};
 
-    const SESSION_MODEL: &str = "test-model";
     const INIT_LUA: &str = "init.lua";
     const MCP_TOML: &str = "mcp.toml";
     const ENV_FILE: &str = ".env";
     const NOTHING: &[&str] = &[];
-    const GIT_DIR: &str = ".git";
-    const SOURCE_DIR: &str = "src";
 
     fn store(dir: &tempfile::TempDir) -> TrustedFolders {
         TrustedFolders::new(&StateDir::from_path(dir.path().to_path_buf()))
@@ -672,37 +505,6 @@ mod tests {
         let path = dir.path().join(name);
         fs::create_dir(&path).unwrap();
         CanonicalFolder::resolve(&path).unwrap()
-    }
-
-    fn checkout(dir: &tempfile::TempDir, name: &str) -> CanonicalFolder {
-        let folder = folder(dir, name);
-        fs::create_dir(folder.path().join(GIT_DIR)).unwrap();
-        folder
-    }
-
-    /// Stands in for the rule `maki-config` owns: the checkout a directory
-    /// belongs to, or the directory itself when it belongs to none.
-    fn checkout_root(cwd: &Path) -> PathBuf {
-        cwd.ancestors()
-            .find(|path| path.join(GIT_DIR).is_dir())
-            .unwrap_or(cwd)
-            .to_path_buf()
-    }
-
-    #[derive(Clone, Deserialize, Serialize)]
-    struct StoredMessage;
-
-    impl TitleSource for StoredMessage {
-        fn first_user_text(&self) -> Option<&str> {
-            None
-        }
-    }
-
-    fn record_session(dir: &tempfile::TempDir, cwd: &Path) {
-        let state = StateDir::from_path(dir.path().to_path_buf());
-        let mut session: Session<StoredMessage, u32, ()> =
-            Session::new(SESSION_MODEL, cwd.to_str().unwrap());
-        session.save(&state).unwrap();
     }
 
     #[test]
@@ -759,15 +561,6 @@ mod tests {
         assert_eq!(store.status(&folder).unwrap(), TrustStatus::Unknown);
     }
 
-    #[test]
-    fn old_documents_default_to_no_rejections() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(&dir);
-        fs::write(&store.document_path, r#"{"version":1,"folders":[]}"#).unwrap();
-
-        assert!(store.list().unwrap().is_empty());
-    }
-
     /// The recorded set is what a later start compares against, so an answer
     /// only ever covers the kinds of file the user was shown.
     #[test_case(&[INIT_LUA], &[INIT_LUA], TrustDecision::Trusted ; "same_file_is_covered")]
@@ -783,10 +576,7 @@ mod tests {
         let folder = folder(&dir, "project");
         store.add(&folder, recorded).unwrap();
 
-        assert_eq!(
-            store.decide(&folder, present, &checkout_root).unwrap(),
-            expected
-        );
+        assert_eq!(store.decide(&folder, present).unwrap(), expected);
     }
 
     /// The defect this field exists to prevent: a yes about one file must not
@@ -799,9 +589,7 @@ mod tests {
         store.add(&folder, &[MCP_TOML]).unwrap();
 
         assert_eq!(
-            store
-                .decide(&folder, &[INIT_LUA, MCP_TOML], &checkout_root)
-                .unwrap(),
+            store.decide(&folder, &[INIT_LUA, MCP_TOML]).unwrap(),
             TrustDecision::Widened {
                 added: vec![INIT_LUA.to_owned()],
             }
@@ -809,9 +597,7 @@ mod tests {
 
         store.add(&folder, &[INIT_LUA]).unwrap();
         assert_eq!(
-            store
-                .decide(&folder, &[INIT_LUA, MCP_TOML], &checkout_root)
-                .unwrap(),
+            store.decide(&folder, &[INIT_LUA, MCP_TOML]).unwrap(),
             TrustDecision::Trusted
         );
     }
@@ -827,207 +613,8 @@ mod tests {
 
         assert_eq!(store.add(&folder, &[ENV_FILE]).unwrap(), Change::Unchanged);
         assert_eq!(
-            store
-                .decide(&folder, &[INIT_LUA, ENV_FILE], &checkout_root)
-                .unwrap(),
+            store.decide(&folder, &[INIT_LUA, ENV_FILE]).unwrap(),
             TrustDecision::Trusted
-        );
-    }
-
-    /// Version 1 stored a bare path. Those answers survive the upgrade, and
-    /// they report that nothing recorded what they covered, so the caller can
-    /// write down today's files instead of asking again.
-    #[test]
-    fn a_version_one_document_keeps_its_decisions() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(&dir);
-        let trusted = folder(&dir, "trusted");
-        let rejected = folder(&dir, "rejected");
-        fs::write(
-            &store.document_path,
-            serde_json::json!({
-                "version": 1,
-                "folders": [trusted.as_str()],
-                "rejected": [rejected.as_str()],
-            })
-            .to_string(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            store.decide(&trusted, &[INIT_LUA], &checkout_root).unwrap(),
-            TrustDecision::Unrecorded
-        );
-        assert_eq!(
-            store
-                .decide(&rejected, &[INIT_LUA], &checkout_root)
-                .unwrap(),
-            TrustDecision::Rejected
-        );
-
-        store.add(&trusted, &[INIT_LUA]).unwrap();
-        let upgraded = fs::read_to_string(&store.document_path).unwrap();
-        assert!(upgraded.contains(r#""version": 2"#), "{upgraded}");
-        assert_eq!(
-            store.decide(&trusted, &[INIT_LUA], &checkout_root).unwrap(),
-            TrustDecision::Trusted
-        );
-        assert_eq!(
-            store.decide(&trusted, &[MCP_TOML], &checkout_root).unwrap(),
-            TrustDecision::Widened {
-                added: vec![MCP_TOML.to_owned()],
-            }
-        );
-    }
-
-    /// The bypass a live session index would leave open: every entry point
-    /// records a session in the folder it just refused to trust, so the next
-    /// start would find that history and hand the folder trust with nobody
-    /// asked. The snapshot is taken once, so only folders used before it
-    /// counts.
-    #[test]
-    fn the_grandfather_set_is_frozen_at_the_first_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(&dir);
-        let used_before = checkout(&dir, "used-before");
-        let used_after = checkout(&dir, "used-after");
-        record_session(&dir, &used_before.path().join(SOURCE_DIR));
-
-        assert_eq!(
-            store
-                .decide(&used_before, &[INIT_LUA], &checkout_root)
-                .unwrap(),
-            TrustDecision::Grandfathered
-        );
-
-        record_session(&dir, used_after.path());
-
-        assert_eq!(
-            store
-                .decide(&used_after, &[INIT_LUA], &checkout_root)
-                .unwrap(),
-            TrustDecision::Unknown
-        );
-        assert_eq!(
-            store
-                .decide(&used_before, &[INIT_LUA], &checkout_root)
-                .unwrap(),
-            TrustDecision::Grandfathered
-        );
-    }
-
-    /// The window a lock-guarded freeze left open. A run whose snapshot was
-    /// blocked went on to record its own working directory anyway, and the next
-    /// start froze that record as history nobody had ever been asked about.
-    #[test]
-    fn a_held_mutation_lock_cannot_put_this_run_into_the_snapshot() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(&dir);
-        let refused = checkout(&dir, "refused");
-        let held = store.mutation_lock().unwrap();
-
-        assert_eq!(
-            store.decide(&refused, &[INIT_LUA], &checkout_root).unwrap(),
-            TrustDecision::Unknown
-        );
-
-        record_session(&dir, refused.path());
-        drop(held);
-
-        assert_eq!(
-            store.decide(&refused, &[INIT_LUA], &checkout_root).unwrap(),
-            TrustDecision::Unknown
-        );
-    }
-
-    /// A session only says its own project root used to load `.maki` without a
-    /// question. It says nothing about a directory that merely holds that
-    /// checkout, and that directory can be one an attacker writes into.
-    #[test]
-    fn a_session_in_a_nested_checkout_grandfathers_only_that_checkout() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(&dir);
-        let parent = folder(&dir, "parent");
-        let nested_path = parent.path().join("nested");
-        fs::create_dir_all(nested_path.join(GIT_DIR)).unwrap();
-        let nested = CanonicalFolder::resolve(&nested_path).unwrap();
-        record_session(&dir, &nested_path.join(SOURCE_DIR));
-
-        assert_eq!(
-            store.decide(&nested, &[INIT_LUA], &checkout_root).unwrap(),
-            TrustDecision::Grandfathered
-        );
-        assert_eq!(
-            store.decide(&parent, &[INIT_LUA], &checkout_root).unwrap(),
-            TrustDecision::Unknown
-        );
-    }
-
-    /// A snapshot left half written by an older Maki, or by a disk that filled
-    /// up mid write, must not be taken again: by then the session index holds
-    /// the working directory of every run that was refused, so a second freeze
-    /// would hand a folder the user said no to a silent yes. The migration
-    /// question is answered once, and a damaged answer settles as "nothing".
-    #[test_case("" ; "empty_from_a_crash_between_create_and_write")]
-    #[test_case("[\"/wo" ; "truncated_json")]
-    fn a_damaged_snapshot_grandfathers_nothing_for_good(damaged: &str) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(&dir);
-        let used_before = checkout(&dir, "used-before");
-        record_session(&dir, &used_before.path().join(SOURCE_DIR));
-        let snapshot = dir.path().join(SESSIONS_DIR).join(PRE_TRUST_FILE);
-        fs::write(&snapshot, damaged).unwrap();
-
-        assert_eq!(
-            store
-                .decide(&used_before, &[INIT_LUA], &checkout_root)
-                .unwrap(),
-            TrustDecision::Unknown,
-            "a snapshot nobody can read must grandfather nothing"
-        );
-        assert_eq!(
-            serde_json::from_slice::<Vec<String>>(&fs::read(&snapshot).unwrap()).unwrap(),
-            Vec::<String>::new(),
-            "the damaged snapshot must be settled as an explicit empty answer"
-        );
-
-        let refused = checkout(&dir, "refused");
-        record_session(&dir, refused.path());
-
-        for _ in 0..2 {
-            assert_eq!(
-                store
-                    .decide(&used_before, &[INIT_LUA], &checkout_root)
-                    .unwrap(),
-                TrustDecision::Unknown,
-                "every later start reads the same empty answer"
-            );
-            assert_eq!(
-                store.decide(&refused, &[INIT_LUA], &checkout_root).unwrap(),
-                TrustDecision::Unknown,
-                "a folder recorded after the damage must never be grandfathered"
-            );
-        }
-    }
-
-    /// Nobody has session history on a first install, so the snapshot is empty
-    /// and every folder is answered for by the user.
-    #[test]
-    fn a_store_that_never_saw_a_session_grandfathers_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(&dir);
-        let folder = folder(&dir, "project");
-
-        assert_eq!(
-            store.decide(&folder, &[INIT_LUA], &checkout_root).unwrap(),
-            TrustDecision::Unknown
-        );
-
-        record_session(&dir, folder.path());
-
-        assert_eq!(
-            store.decide(&folder, &[INIT_LUA], &checkout_root).unwrap(),
-            TrustDecision::Unknown
         );
     }
 
@@ -1069,11 +656,31 @@ mod tests {
             Err(TrustedFoldersError::Json { .. })
         ));
 
-        fs::write(&store.document_path, r#"{"version":3,"folders":[]}"#).unwrap();
+        fs::write(
+            &store.document_path,
+            r#"{"version":3,"folders":[],"rejected":[]}"#,
+        )
+        .unwrap();
         assert!(matches!(
             store.list(),
             Err(TrustedFoldersError::UnsupportedVersion { version: 3, .. })
         ));
+    }
+
+    /// Stores upgraded from version 1 kept bare-string entries. Nothing reads
+    /// them any more, so the store is refused with a way out, not migrated.
+    #[test]
+    fn old_bare_string_entry_refuses_the_store_and_says_how_to_reset_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        fs::write(
+            &store.document_path,
+            format!(r#"{{"version":{DOCUMENT_VERSION},"folders":["/old/project"],"rejected":[]}}"#),
+        )
+        .unwrap();
+        let error = store.list().unwrap_err();
+        assert!(matches!(error, TrustedFoldersError::Json { .. }), "{error}");
+        assert!(error.to_string().ends_with(RESET_HINT), "{error}");
     }
 
     #[test]
@@ -1097,7 +704,15 @@ mod tests {
         let real = folder(&dir, "project");
         fs::write(
             &store.document_path,
-            serde_json::json!({"version": 1, "folders": [entry, real.as_str()]}).to_string(),
+            serde_json::json!({
+                "version": DOCUMENT_VERSION,
+                "folders": [
+                    {"path": entry, "files": []},
+                    {"path": real.as_str(), "files": []},
+                ],
+                "rejected": [],
+            })
+            .to_string(),
         )
         .unwrap();
 
@@ -1116,8 +731,12 @@ mod tests {
         let target = folder(&dir, "project");
         fs::write(
             &store.document_path,
-            serde_json::json!({"version": 1, "folders": [format!("{}/", target.as_str())]})
-                .to_string(),
+            serde_json::json!({
+                "version": DOCUMENT_VERSION,
+                "folders": [{"path": format!("{}/", target.as_str()), "files": []}],
+                "rejected": [],
+            })
+            .to_string(),
         )
         .unwrap();
 

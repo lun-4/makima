@@ -5,18 +5,8 @@
 --   [plugins.plan_submit_tool]
 --   enabled = true
 
--- Current mode id from the UI. With no UI (headless/tests) `mode.get()` returns
--- (nil, err), which we treat as "not in plan mode" so the tool stays gated.
-local function current_mode()
-  local mode, err = maki.api.mode.get()
-  if err then
-    return nil
-  end
-  return mode
-end
-
-local function handler(_input, _ctx)
-  if current_mode() ~= "plan" then
+local function handler(_input, ctx)
+  if ctx:mode() ~= "plan" then
     return {
       llm_output = "plan_submit is only available in plan mode",
       is_error = true,

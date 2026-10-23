@@ -665,6 +665,23 @@ impl CommandPalette {
             self.cancel_arguments();
             return abandoned;
         };
+        let arguments = command_args(input);
+        let arguments_start = input.len() - arguments.len();
+        let completion_input = CompletionInput {
+            arguments: Arc::from(arguments),
+            argument: Arc::from(argument.as_str()),
+            argument_index: index,
+            argument_range: Some(start - arguments_start..end - arguments_start),
+            mode: Arc::from(mode),
+        }
+        .normalized(command.spec().name.as_ref(), cursor - arguments_start);
+        let Some(range) = completion_input.argument_range.as_ref() else {
+            self.cancel_arguments();
+            return abandoned;
+        };
+        let (start, end) = (range.start + arguments_start, range.end + arguments_start);
+        let argument = completion_input.argument.to_string();
+        let index = completion_input.argument_index;
         self.typed_argument_owned = typed;
         self.active_argument_start = Some(start);
         let descriptor = typed
@@ -726,16 +743,8 @@ impl CommandPalette {
         let (tx, rx) = flume::bounded(1);
         let latest_snapshot = Arc::new(std::sync::Mutex::new(None::<CompletionSnapshot>));
         let sink_snapshot = Arc::clone(&latest_snapshot);
-        let arguments = command_args(input);
-        let arguments_start = input.len() - arguments.len();
         let request = session.complete_input_with_sink(
-            CompletionInput {
-                arguments: Arc::from(arguments),
-                argument: Arc::from(argument.as_str()),
-                argument_index: index,
-                argument_range: Some(start - arguments_start..end - arguments_start),
-                mode: Arc::from(mode),
-            },
+            completion_input,
             Some(CompletionSnapshotSink::new(move |snapshot| {
                 *sink_snapshot
                     .lock()
@@ -1079,6 +1088,19 @@ impl CommandPalette {
     pub fn cancel_arguments(&mut self) {
         self.notify_lifecycle(PaletteLifecycle::Cancel);
         self.reset_argument_state();
+    }
+
+    pub(crate) fn refresh_model_arguments(&mut self) {
+        let Some((input, cursor, mode)) = self.latest_argument_context.clone() else {
+            return;
+        };
+        if self
+            .argument_command(&input)
+            .is_some_and(|(command, _)| command.spec().name.as_ref() == "/model")
+        {
+            self.cancel_arguments();
+            self.sync_arguments(&input, cursor, &mode);
+        }
     }
 
     fn replace_argument(&self, input: &str, replacement: &str) -> String {
@@ -3019,6 +3041,69 @@ mod tests {
             argument_visible_rows(3, 20, 20, DEFAULT_AUTOCOMPLETE_HEIGHT),
             3
         );
+    }
+
+    #[test_case("/model openai/gpt-5{thi", None, "thinking=high", "/model openai/gpt-5{thinking=high"; "open_brace")]
+    #[test_case("/model openai/gpt-5{", None, "thinking=high", "/model openai/gpt-5{thinking=high"; "empty_open_brace")]
+    #[test_case("/model openai/gpt-5{fast=false,", None, "thinking=high", "/model openai/gpt-5{fast=false,thinking=high"; "empty_comma")]
+    #[test_case("/model openai/gpt-5{,fast=false}", Some("/model openai/gpt-5{".len()), "thinking=high", "/model openai/gpt-5{thinking=high,fast=false}"; "duplicate_after_cursor")]
+    #[test_case("/model openai/gpt-5{fast=false,thi", None, "thinking=high", "/model openai/gpt-5{fast=false,thinking=high"; "comma")]
+    #[test_case("/model openai/gpt-5{fast=false, thi", None, "thinking=high", "/model openai/gpt-5{fast=false, thinking=high"; "comma_space")]
+    #[test_case("/model openai/gpt-5{thinking=high, ", None, "fast=true", "/model openai/gpt-5{thinking=high, fast=true"; "empty_after_space")]
+    #[test_case("/model openai/gpt-5{thinking=off,fast=false}", Some("/model openai/gpt-5{thinking=".len()), "thinking=high", "/model openai/gpt-5{thinking=high,fast=false}"; "cursor_inside_field")]
+    fn model_palette_shows_and_inserts_embedded_options(
+        input: &str,
+        cursor: Option<usize>,
+        selection: &str,
+        expected: &str,
+    ) {
+        use crate::components::arg_completion::ModelArgSource;
+        use arc_swap::ArcSwapOption;
+
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        let mut registration = registration("/model", "Select model");
+        let mut argument = PositionalArgument::optional("model", ArgumentKind::String)
+            .with_completion(CompletionPolicy::Replace);
+        argument.variadic = true;
+        registration.spec.arguments = CommandArguments::Positional(Arc::from([argument]));
+        registration.argument_completions = vec![Some(Arc::new(ModelArgSource::new(Arc::new(
+            ArcSwapOption::from(Some(Arc::new(vec!["openai/gpt-5".into()]))),
+        ))))];
+        producer.replace(vec![registration]).unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
+        let mut palette = CommandPalette::new(registry, target);
+        palette.sync_arguments(input, cursor.unwrap_or(input.len()), "insert");
+        let deadline = std::time::Instant::now() + MATCHER_SETTLE_TIMEOUT;
+        while palette.pending_arguments.is_some() {
+            let _ = palette.poll_arguments();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let items = palette.argument_match_items();
+        let item = items
+            .iter()
+            .find(|item| item.insertion.as_ref() == selection)
+            .unwrap();
+        let other_key = if selection.starts_with("thinking=") {
+            "fast="
+        } else {
+            "thinking="
+        };
+        if input.contains(other_key) {
+            assert!(
+                !items
+                    .iter()
+                    .any(|item| item.insertion.starts_with(other_key))
+            );
+        }
+        palette.select_for_test(item);
+        let action = palette.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), input);
+        let CommandAction::Complete { text, cursor } = action else {
+            panic!("expected argument completion");
+        };
+        assert_eq!(text, expected);
+        assert_eq!(cursor, expected.find(selection).unwrap() + selection.len());
     }
 
     #[test]

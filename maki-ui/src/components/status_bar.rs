@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::env;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -79,8 +78,7 @@ pub struct StatusBar {
 }
 
 impl StatusBar {
-    pub fn new(flash_duration: Duration) -> Self {
-        let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
+    pub fn new(flash_duration: Duration, cwd: PathBuf) -> Self {
         Self {
             flash: None,
             started_at: Instant::now(),
@@ -106,6 +104,9 @@ impl StatusBar {
     }
 
     pub fn set_cwd(&mut self, cwd: PathBuf) {
+        if self.cwd == cwd {
+            return;
+        }
         self.cwd_branch = cwd_branch_label(&cwd);
         self.branch_update_rx = spawn_branch_watcher(&cwd);
         self.cwd = cwd;
@@ -469,6 +470,7 @@ fn spawn_branch_watcher(cwd: &Path) -> Option<flume::Receiver<()>> {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use std::fs;
     use std::sync::Arc;
 
@@ -489,6 +491,10 @@ mod tests {
     const SESSION_COST_TEXT: &str = "\u{03a3}$1.500";
     const SIGMA: char = '\u{03a3}';
 
+    fn test_cwd() -> PathBuf {
+        env::current_dir().unwrap()
+    }
+
     fn render_context(status_content: Option<&StatusContentSnapshot>, width: u16) -> String {
         render_context_with(status_content, width, false)
     }
@@ -498,7 +504,7 @@ mod tests {
         width: u16,
         model_switch_queued: bool,
     ) -> String {
-        let bar = StatusBar::new(FLASH_TTL);
+        let bar = StatusBar::new(FLASH_TTL, test_cwd());
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1)).unwrap();
         let status = Status::Idle;
@@ -607,7 +613,7 @@ mod tests {
     }
 
     fn render(global_cost: Option<f64>, show_global: bool) -> String {
-        let bar = StatusBar::new(FLASH_TTL);
+        let bar = StatusBar::new(FLASH_TTL, test_cwd());
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(BAR_WIDTH, 1)).unwrap();
         let ctx = StatusBarContext {
@@ -644,7 +650,7 @@ mod tests {
     #[test_case(true  => true  ; "a_restricted_folder_says_so")]
     #[test_case(false => false ; "a_trusted_folder_stays_quiet")]
     fn the_bar_advertises_restricted(restricted: bool) -> bool {
-        let bar = StatusBar::new(FLASH_TTL);
+        let bar = StatusBar::new(FLASH_TTL, test_cwd());
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(BAR_WIDTH, 1)).unwrap();
         let ctx = StatusBarContext {
@@ -679,7 +685,7 @@ mod tests {
     #[test_case(true  => true  ; "a_bypassed_session_says_so")]
     #[test_case(false => false ; "a_prompting_session_stays_quiet")]
     fn the_bar_advertises_yolo(yolo: bool) -> bool {
-        let bar = StatusBar::new(FLASH_TTL);
+        let bar = StatusBar::new(FLASH_TTL, test_cwd());
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(BAR_WIDTH, 1)).unwrap();
         let ctx = StatusBarContext {
@@ -808,7 +814,7 @@ mod tests {
     #[test_case(true,  FLASH_TTL      => Dirty::NO  ; "flash_still_visible")]
     #[test_case(true,  Duration::ZERO => Dirty::YES ; "flash_expired")]
     fn clear_expired_hint_owes_the_frame_only_once(flashing: bool, ttl: Duration) -> Dirty {
-        let mut bar = StatusBar::new(ttl);
+        let mut bar = StatusBar::new(ttl, test_cwd());
         if flashing {
             bar.flash(FLASH_MSG.into());
         }
@@ -829,7 +835,7 @@ mod tests {
         let cwd = env::current_dir().unwrap();
         let label = cwd_branch_label(&cwd);
         let (tx, rx) = flume::bounded(1);
-        let mut bar = StatusBar::new(FLASH_TTL);
+        let mut bar = StatusBar::new(FLASH_TTL, cwd);
         bar.cwd_branch = if stale {
             STALE_BRANCH.into()
         } else {
@@ -849,7 +855,7 @@ mod tests {
 
     #[test]
     fn clear_flash_removes_flash() {
-        let mut bar = StatusBar::new(Duration::from_secs(999));
+        let mut bar = StatusBar::new(Duration::from_secs(999), test_cwd());
         bar.flash("Copied".into());
         bar.clear_flash();
         assert!(bar.flash.is_none());
@@ -868,7 +874,7 @@ mod tests {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         let mut term = Terminal::new(TestBackend::new(120, 1)).unwrap();
-        let bar = StatusBar::new(Duration::from_secs(999));
+        let bar = StatusBar::new(Duration::from_secs(999), test_cwd());
         let status = Status::Idle;
         let ctx = StatusBarContext {
             status: &status,

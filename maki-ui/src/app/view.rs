@@ -1,4 +1,4 @@
-use maki_providers::{RequestOptions, ThinkingConfigExt};
+use maki_providers::ThinkingConfigExt;
 use std::sync::atomic::Ordering;
 
 use crate::components::Overlay;
@@ -16,7 +16,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
+use ratatui::widgets::{Block, Clear, Paragraph, Widget};
 
 use super::{App, Mode, Status, mouse::MIDDLE_SCROLL_ANCHOR};
 
@@ -51,6 +51,8 @@ struct ViewLayout {
 
 impl App {
     pub fn view(&mut self, frame: &mut Frame) {
+        self.sync_focused_queue();
+        self.status_bar.set_cwd(self.focused_cwd());
         let form_visible = self.permission_active() || self.plan_form_active();
         let layout = self.compute_layout(frame.area(), form_visible);
         let render_chat = self.resolve_render_chat();
@@ -123,19 +125,13 @@ impl App {
             0
         } else if form_visible {
             self.plan_form
-                .height(inner.width, &self.state.model.spec())
+                .height(inner.width, &self.focused_model_spec())
                 .min(max_bottom)
-        } else if self.is_main_chat() {
+        } else {
             let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
-            queue_panel::height(self.queue.panel_len())
+            queue_panel::height(self.queue.len())
                 + panel_h
                 + self.input_box.height(inner.width).min(max_bottom)
-        } else {
-            // Subagent tab: float panels (if any), a separator, then the input
-            // box so the user can send a message to that subagent.
-            let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
-            let sep: u16 = if panel_h > 0 { 1 } else { 0 };
-            panel_h + sep + self.input_box.height(inner.width).min(max_bottom)
         };
 
         // The `below` split lives outside `inner` (drawn by render_splits), so
@@ -152,7 +148,7 @@ impl App {
         let queue_height = if bottom_takeover {
             0
         } else {
-            queue_panel::height(self.queue.panel_len())
+            queue_panel::height(self.queue.len())
         };
 
         let mut constraints = vec![Constraint::Length(queue_height)];
@@ -271,69 +267,32 @@ impl App {
         if self.permission_active() {
             // The active permission form is painted by the topmost pass
             // (`render_active_input`) so it lands above pickers/modals.
-        } else if !self.is_main_chat() {
-            let panel_reqs = self.float_mgr.panel_reqs();
-            let panel_h: u16 = panel_reqs.iter().map(|(_, h)| *h).sum();
-            let (panel_areas, sep_area) = if panel_h > 0 {
-                let [panels, s] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)])
-                    .areas(layout.bottom_area);
-                let constraints: Vec<_> = panel_reqs
-                    .iter()
-                    .map(|&(_, h)| Constraint::Length(h))
-                    .collect();
-                let sub = Layout::vertical(constraints).split(panels);
-                let areas: Vec<(usize, Rect)> = panel_reqs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &(idx, _))| (idx, sub[i]))
-                    .collect();
-                (Some(areas), s)
-            } else {
-                (None, layout.bottom_area)
-            };
-            if let Some(areas) = panel_areas {
-                for (idx, rect) in areas {
-                    self.float_mgr.view_panel(frame, idx, rect);
-                }
-            }
-            if panel_h > 0 {
-                let sep = Block::default()
-                    .borders(Borders::TOP)
-                    .border_style(self.separator_style());
-                frame.render_widget(sep, sep_area);
-            }
-            if layout.input_area.height > 0 {
-                self.input_box.view(
-                    frame,
-                    layout.input_area,
-                    Placeholder::Blank,
-                    self.separator_style(),
-                    !self.any_overlay_open(),
-                    subagent_input_hint(true, self.active_subagent_closed()),
-                    &self.state.session.cwd,
-                );
-            }
         } else if self.plan_form_active() {
-            self.plan_form
-                .view(frame, layout.bottom_area, &self.state.model.spec());
+            let model = self.focused_model_spec();
+            self.plan_form.view(frame, layout.bottom_area, &model);
         } else if layout.bottom_area.height > 0 {
             let queue_entries = self.queue.panel_entries();
             queue_panel::view(frame, layout.queue_area, &queue_entries, self.queue.focus());
             for &(idx, rect) in &layout.panel_windows {
                 self.float_mgr.view_panel(frame, idx, rect);
             }
-            let streaming = self.status == Status::Streaming;
+            let streaming = self.focused_streaming();
             let placeholder = if streaming {
                 Placeholder::Queue
-            } else if self.state.session.messages().is_empty() {
+            } else if self.chats[self.active_chat].message_count() == 0 {
                 Placeholder::Suggestion
             } else {
                 Placeholder::Blank
             };
-            let panel_hint = (self.state.mode == Mode::Plan)
-                .then(|| self.plan_form.hint_line())
-                .flatten()
-                .or_else(|| self.lua_hint_line());
+            let panel_hint =
+                subagent_input_hint(!self.is_main_chat(), self.active_subagent_closed())
+                    .or_else(|| {
+                        (self.focused_mode() == Mode::Plan)
+                            .then(|| self.plan_form.hint_line())
+                            .flatten()
+                    })
+                    .or_else(|| self.lua_hint_line());
+            let cwd = self.focused_cwd().to_string_lossy().into_owned();
             self.input_box.view(
                 frame,
                 layout.input_area,
@@ -341,7 +300,7 @@ impl App {
                 self.separator_style(),
                 !self.any_overlay_open(),
                 panel_hint,
-                &self.state.session.cwd,
+                &cwd,
             );
             if !streaming && !self.command_palette.is_active() && !self.any_overlay_open() {
                 self.file_completion.view(frame, layout.input_area);
@@ -461,12 +420,25 @@ impl App {
                 }
             }
         };
-        let opts = chat.opts.unwrap_or(RequestOptions {
-            thinking: self.state.thinking,
-            fast: self.state.fast,
-        });
+        let config = self.focused_config();
+        let model_switch_queued = render_chat == 0 && model_switch_queued;
+        let model_id = if model_switch_queued {
+            model_id
+        } else {
+            config
+                .as_ref()
+                .map_or(model_id, |config| config.model.id.as_str())
+        };
+        let opts = self.displayed_config(render_chat).options();
+        let status = if self.focused_streaming() {
+            Status::Streaming
+        } else if render_chat == 0 && matches!(self.status, Status::Error { .. }) {
+            self.status.clone()
+        } else {
+            Status::Idle
+        };
         let ctx = StatusBarContext {
-            status: self.status_for_chat(render_chat),
+            status: &status,
             mode_label,
             mode_style,
             model_id,
@@ -475,19 +447,21 @@ impl App {
                 global_cost: self.state.cost,
                 context_size: chat.context_size,
                 cost: chat.cost,
-                context_window: if self.status == Status::Streaming {
+                context_window: if let Some(config) = &config {
+                    config.model.context_window
+                } else if self.focused_streaming() {
                     self.run_context_window
-                        .unwrap_or(self.state.model.context_window)
+                        .unwrap_or_else(|| self.root_config().model.context_window)
                 } else {
-                    self.state.model.context_window
+                    self.root_config().model.context_window
                 },
                 show_global: self.chats.len() > 1,
             },
             auto_scroll: chat.auto_scroll(),
-            retry_info: self.retry_info.as_ref(),
+            retry_info: chat.retry_info.as_ref(),
             thinking_label: opts.thinking.status_label(),
             fast: opts.fast,
-            workflow: self.state.workflow,
+            workflow: self.displayed_config(render_chat).workflow(),
             yolo: self.permissions.is_yolo(),
             restricted: self.trust_question.is_some(),
             restoring: self.restoring.load(Ordering::Relaxed),
@@ -521,7 +495,7 @@ impl App {
             zone: SelectionZone::Messages,
         });
 
-        if layout.input_area.height > 0 && !layout.bottom_takeover && self.is_main_chat() {
+        if layout.input_area.height > 0 && !layout.bottom_takeover {
             let input_inner = Rect::new(
                 layout.input_area.x,
                 layout.input_area.y + 1,
@@ -542,10 +516,6 @@ impl App {
 
         for &(_, rect) in &layout.panel_windows {
             self.zones.push_overlay(selection::inset_border(rect));
-        }
-
-        if !self.is_main_chat() && layout.bottom_area.height > 0 {
-            self.zones.push_overlay(layout.bottom_area);
         }
 
         if layout.queue_area.height > 0 && !layout.bottom_takeover {
@@ -671,7 +641,7 @@ impl App {
         } else if self.file_picker.is_open() {
             contexts.push(KeybindContext::FilePicker);
         } else {
-            if self.status == Status::Streaming {
+            if self.focused_streaming() {
                 contexts.push(KeybindContext::Streaming);
             }
             contexts.push(KeybindContext::Editing);

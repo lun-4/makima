@@ -1,20 +1,24 @@
 //! Backend trait and the dependency-neutral work shapes the scheduler moves.
 
+use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 
-use maki_providers::{ImageSource, TokenUsage};
+use maki_providers::TokenUsage;
 use std::sync::Arc;
 
 use crate::cancel::{CancelToken, ReasonedCancelToken};
 use crate::manager::{CurrentManagedTurn, ManagerInner};
-use crate::types::{AgentId, TurnId, TurnOutcome};
+use crate::tools::offload::OffloadStore;
+use crate::types::{ActorWorkIdentity, AgentId, TurnFailure, TurnId, TurnOutcome};
 use crate::{AgentMode, InterruptSource, RunSettings};
 
 #[derive(Clone)]
 pub(crate) struct ManagedTurnAdmission {
     pub(crate) manager: std::sync::Weak<ManagerInner>,
     pub(crate) agent_id: AgentId,
+    pub(crate) is_child: bool,
+    pub(crate) parent_delivery: Option<super::delivery::ParentDelivery>,
 }
 
 /// The actor's immutable per-admission configuration snapshot.
@@ -23,6 +27,8 @@ pub struct EffectiveAgentConfig {
     pub settings: RunSettings,
     pub mode: AgentMode,
     pub mode_def: Option<crate::ModeDef>,
+    pub context: super::AgentContextSnapshot,
+    pub(super) mode_authority: Option<super::ModeCeiling>,
 }
 
 impl EffectiveAgentConfig {
@@ -31,7 +37,24 @@ impl EffectiveAgentConfig {
             settings,
             mode,
             mode_def: None,
+            mode_authority: None,
+            context: super::AgentContextSnapshot::new(".".into()),
         }
+    }
+
+    /// Sets creation authority independently of the initial runtime mode.
+    pub fn with_mode_authority(mut self, authority: super::ModeCeiling) -> Self {
+        self.mode_authority = Some(authority);
+        self
+    }
+
+    pub fn mode_authority(&self) -> Option<super::ModeCeiling> {
+        self.mode_authority.clone()
+    }
+
+    pub fn with_context(mut self, context: super::AgentContextSnapshot) -> Self {
+        self.context = context;
+        self
     }
 
     pub fn with_mode_def(mut self, mode_def: Option<crate::ModeDef>) -> Self {
@@ -50,39 +73,19 @@ impl std::ops::Deref for EffectiveAgentConfig {
 
 impl ManagedTurnAdmission {
     pub(crate) fn new(manager: std::sync::Weak<ManagerInner>, agent_id: AgentId) -> Self {
-        Self { manager, agent_id }
+        Self {
+            manager,
+            agent_id,
+            is_child: false,
+            parent_delivery: None,
+        }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EarlierRoot {
-    pub run_id: u64,
-    pub displayed: bool,
-    pub text: String,
-    pub images: Vec<ImageSource>,
-    pub correlation: String,
-    pub mcp_startup_notice: Option<usize>,
-    pub already_displayed: bool,
-}
-
-/// What category of work the backend is asked to execute. Controls and
-/// compacts never produce a [`TurnOutcome`]; turns and started roots settle
-/// into one. A started root carries the neutral display metadata the host
-/// queued (`run_id`, displayed, text, images) so the backend can emit
-/// `QueueItemConsumed` only for roots that were not yet drawn.
+/// What category of work the backend executes. Only turns produce a [`TurnOutcome`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkKind {
     Turn,
-    Root {
-        run_id: u64,
-        displayed: bool,
-        text: String,
-        images: Vec<ImageSource>,
-        earlier: Vec<EarlierRoot>,
-        mcp_startup_notice: Option<usize>,
-        already_displayed: bool,
-    },
-
     Control,
     Compact,
 }
@@ -91,21 +94,25 @@ pub enum WorkKind {
 /// backend on every execution so it can build correlated events and cancel
 /// cooperatively. The reasoned token records the first cancellation reason;
 /// `Agent::run` reads it once when constructing its terminal outcome. The
-/// interrupt source lets the running agent fold queued roots into its own
-/// turn and process compact commands between model turns.
+/// interrupt source processes compact commands between model requests.
+///
+/// `work` is the identity of the admitted work this execution is running,
+/// stamped at admission and never re-derived, so every event it emits carries
+/// the presentation it was admitted under.
 #[derive(Clone)]
 pub struct TurnContext {
     pub agent_id: AgentId,
     pub turn_id: Option<TurnId>,
+    pub work: ActorWorkIdentity,
+    pub output: super::TurnOutput,
+    pub provenance: super::TurnProvenance,
     pub cancel: CancelToken,
     pub cancel_reason: ReasonedCancelToken,
-    /// Adapter-local correlation (the sink's run id or the control's key).
-    pub correlation: String,
     pub generation: u64,
     pub policy: Option<Arc<EffectiveAgentConfig>>,
-    /// Extracts root/compact work out of the actor's queue while the run is
-    /// active, so it can fold them instead of waiting for the turn to end.
+    /// Extracts compatible compaction work while the turn is active.
     pub interrupt: Option<std::sync::Arc<dyn InterruptSource>>,
+    pub inbox: Option<Arc<dyn super::TurnInbox>>,
     pub managed_turn: Option<CurrentManagedTurn>,
     pub admission: Option<crate::agent::TurnAdmissionSnapshot>,
 }
@@ -121,62 +128,25 @@ pub enum BackendResult {
     /// The backend entered the run and produced a real outcome.
     EnteredRun(TurnOutcome),
     /// Setup failed before the run entered; the actor synthesizes one
-    /// `TurnOutcome::Failed` for the admission and delivers it once.
-    SetupFailed {
-        agent_id: AgentId,
-        turn_id: TurnId,
-    },
+    /// `TurnOutcome::Failed` for the admission, carrying the backend's
+    /// failure when it has a specific one, and delivers it once.
+    SetupFailed(Option<TurnFailure>),
     ControlDone,
     ControlFailed,
     CompactDone,
+    /// A control that compacted the history ended this way.
+    ControlCompacted(super::CompactionStatus),
 }
 
-/// A root input queued by the host. It carries neutral display metadata
-/// (`run_id`, displayed, text, image count) so the TUI can project the queue
-/// without importing UI types into the core.
-pub struct RootWork {
-    pub input: crate::AgentInput,
-    pub run_id: u64,
-    pub displayed: bool,
-    pub text: String,
-    pub images: Vec<ImageSource>,
-    pub correlation: String,
-    pub earlier: Vec<EarlierRoot>,
-    pub generation: u64,
-    pub(crate) policy: Option<Arc<EffectiveAgentConfig>>,
-    pub(crate) admission: Option<crate::agent::TurnAdmissionSnapshot>,
-}
-
-impl RootWork {
-    pub fn new(
-        input: crate::AgentInput,
-        run_id: u64,
-        displayed: bool,
-        text: String,
-        images: Vec<ImageSource>,
-        correlation: String,
-    ) -> Self {
-        Self {
-            input,
-            run_id,
-            displayed,
-            text,
-            images,
-            correlation,
-            earlier: Vec::new(),
-            generation: 0,
-            policy: None,
-            admission: None,
-        }
-    }
-}
-
-/// A standalone control operation. Compact correlation only: the host's
-/// control key, enough to route the result back.
+/// A standalone control operation. Carries the actor admission that identified
+/// it so its events settle under the same identity.
 #[derive(Debug, Clone)]
 pub struct ControlWork {
     pub name: String,
     pub correlation: String,
+    pub work: ActorWorkIdentity,
+    /// Host data for the backend; dropped with the work if it never runs.
+    pub payload: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 /// A turn admitted by the host. Holds the agent input plus the admission's
@@ -187,14 +157,17 @@ pub struct TurnAdmission {
     pub input: Option<crate::AgentInput>,
     pub event_sender: Option<crate::EventSender>,
     pub correlation: String,
-    /// True when this admission was synthesized from a queued root input.
-    /// A root-started turn that is cancelled before entering produces no
-    /// retained outcome and no terminal delivery.
-    pub(crate) root: bool,
+    pub work: ActorWorkIdentity,
     pub(crate) generation: u64,
     pub(crate) policy: Option<Arc<EffectiveAgentConfig>>,
     pub(crate) ticket: super::TurnTicket,
     pub(crate) admission: Option<crate::agent::TurnAdmissionSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompletionPolicy {
+    Independent,
+    JoinReportingChildren,
 }
 
 /// The actor's lifecycle. `Closed` and `Shutdown` are terminal and reject
@@ -234,11 +207,7 @@ pub struct ActorSnapshot {
 /// implementations must use its resolved mode definition when present. Cancellation
 /// can retire the admission before this callback returns.
 pub type AdmissionPreparation = Arc<
-    dyn Fn(
-            &crate::AgentInput,
-            &AgentMode,
-            Option<&EffectiveAgentConfig>,
-        ) -> crate::agent::TurnAdmissionSnapshot
+    dyn Fn(&crate::AgentInput, Option<&EffectiveAgentConfig>) -> crate::agent::TurnAdmissionSnapshot
         + Send
         + Sync,
 >;
@@ -256,11 +225,11 @@ pub type PreparedReadiness = Arc<
 >;
 
 pub trait ActorBackend: Send {
-    fn prepared_readiness(&self) -> Option<PreparedReadiness> {
+    fn offload_store(&self) -> Option<Arc<OffloadStore>> {
         None
     }
 
-    fn root_preparation_error_handler(&self) -> Option<Arc<dyn Fn(u64, String) + Send + Sync>> {
+    fn prepared_readiness(&self) -> Option<PreparedReadiness> {
         None
     }
 
@@ -268,10 +237,8 @@ pub trait ActorBackend: Send {
         None
     }
 
-    /// Executes one accepted turn or a started root. `turn_id` is `Some`;
-    /// `work` distinguishes `Turn` from `Root`. Returns `EnteredRun` with
-    /// the authoritative outcome, or `SetupFailed` for a turn that never
-    /// entered.
+    /// Executes one accepted turn. Returns `EnteredRun` with the authoritative
+    /// outcome, or `SetupFailed` for a turn that never entered.
     fn run_turn<'a>(
         &'a mut self,
         history: &'a mut crate::History,

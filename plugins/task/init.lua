@@ -1,48 +1,20 @@
--- Structured-output story: the subagent gets a session-local structured_output
--- tool whose validated input is captured by the Rust driver.
--- Invalid input is an inline tool error the model can fix in the same run.
---
--- Subagents run on a background driver, so the main agent is not blocked while
--- one runs. Four tools split the lifecycle:
---   task_spawn   -> { task_id }                 (kickoff)
---   task_get     -> { status, result?, error? } (manual polling)
---   task_send    -> { queued = true }           (queue a message / nudge)
---   task_despawn -> { ok = true }               (cancel + flush history)
--- A direct child of the root agent returns its result automatically when it
--- finishes. Managed general subagents must use the blocking `task` tool so
--- `session:prompt` yields their turn permit. Unmanaged callers retain the four-tool
--- lifecycle for compatibility.
---
--- Rust exposes primitives only (`maki.agent.session`, `maki.json.schema_validator`,
--- `maki.async.semaphore`).
-
+-- Async tasks retain exact turn tickets, not invocation authority.
+-- Completion delivery belongs to the runtime; a wait in the parent's own turn withdraws it.
 local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
 local plan_spec = require("maki.plan_spec")
 
-local STRUCTURED_OUTPUT_NAME = "structured_output"
-local STRUCTURED_OUTPUT_DESCRIPTION = "Report your final result. Call it exactly once when your task is complete."
-local STRUCTURED_OUTPUT_ACK = "Output recorded."
-local STRUCTURED_OUTPUT_PROMPT_SUFFIX = "\n\nWhen finished, call the structured_output tool with your final result."
-local MAX_NUDGES = 2
-local MAX_SCHEMA_ERRORS = 3
-local SCHEMA_COMPILE_ERROR = "invalid output_schema"
-local SCHEMA_ROOT_ERROR = "output_schema must have type object"
-local STRUCTURED_MISSING_ERROR = "subagent finished without calling structured_output"
-local STRUCTURED_INVALID_ERROR = "subagent result does not match output_schema"
-local SUMMARY_MISSING_ERROR = "subagent finished without providing a summary"
+local MAX_RETAINED_TASKS = 128
+local MAX_RETAINED_TURNS = 64
+local TURN_UNAVAILABLE_ERR = "turn_result_unavailable"
+local TASK_LIMIT_ERR = "task record limit reached; despawn unused tasks"
+local GENERAL_SEND_IN_PLAN_ERR =
+  "general subagents cannot take new work in plan mode; despawn the task or switch to build mode"
 local GENERAL_BLOCKED_IN_PLAN_ERR =
   "general subagents are blocked in plan mode; use research or plan_reviewer (read-only)"
-local NUDGE_MISSING =
-  "You did not call the structured_output tool. Call it now with your final result matching its input schema."
-local NUDGE_SUMMARY =
-  "You finished your work but did not provide a summary. Reply with a concise summary of what you did and found."
-local INVALID_INPUT_PREFIX =
-  "Input does not match the required schema. Fix the errors and call structured_output again:\n"
 local UNKNOWN_TASK_ERR = "unknown task_id"
 local TASK_ACCESS_ERR = "task is owned by another agent branch"
-local RECURSIVE_UNMANAGED_TASK_ERR = "blocking task is unavailable from an unmanaged subagent; use task_spawn"
-local MANAGED_NESTED_SPAWN_ERR = "managed general subagents must use the blocking task tool"
+local TURN_WAIT_TIMEOUT = "agent turn wait timed out"
 local TASK_CLOSED_ERR = "task was despawned before its message was admitted"
 local BODY_INDENT_COLS = 4
 local MIN_MD_WIDTH = 20
@@ -55,12 +27,9 @@ Subagent types (set via `subagent_type`):
 - `general`: Full tool access. For delegating implementation work.
 - `plan_reviewer`: Read-only audit of a finished plan. Only available in plan mode. Evaluates shape, test-to-acceptance-criteria coverage, and severity of risks, and answers with VERDICT: pass|fail.
 
-Subagents run in the background, so the main agent is never blocked by one. Use
-`task_spawn` to start a subagent. A direct child of the root agent returns its
-result automatically, so the root may wait for that reply. A managed general
-subagent must use the blocking `task` tool for nested work so its turn capacity is
-yielded while the child runs. Unmanaged callers retain `task_spawn`, `task_get`,
-`task_send`, and `task_despawn` compatibility.
+Use `task_spawn` to start work and `task_wait` to observe its exact turn. A
+waiting agent yields its turn capacity while its descendants run. Submit
+follow-up instructions with `task_send` and close the child subtree with `task_despawn`.
 
 Notes:
 1. Launch multiple tasks concurrently when possible.
@@ -93,18 +62,13 @@ Report findings classified by severity (critical / high / medium / low), quoting
 ]] .. plan_spec
 
 local opts = maki.api.register_options({
-  max_concurrent = {
-    default = 8,
-    min = 1,
-    desc = "Deprecated. Process-wide fallback limit for unmanaged frontends; managed TUI sessions use agent.max_concurrent_agent_turns.",
-  },
   allow_model = {
     default = false,
     desc = "Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves.",
   },
 })
 
-local schema = {
+local spawn_schema = {
   type = "object",
   required = { "description", "prompt" },
   additionalProperties = false,
@@ -126,7 +90,10 @@ local schema = {
       description = 'Model tier (optional, omit to use current model, capped at current tier):\n- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.\n- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.\n- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits.',
     },
     output_schema = {
-      description = "JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string.",
+      type = "object",
+      properties = {},
+      additionalProperties = true,
+      description = "JSON Schema the subagent's final result must match. task_wait returns the validated object in result.captured; result.text contains assistant text.",
     },
     thinking = {
       description = "Thinking: off|adaptive|minimal|low|medium|high|xhigh|max|int budget. Omit to inherit parent; capped at parent.",
@@ -137,40 +104,20 @@ local schema = {
 -- Only advertise `model` when the plugin opts in: it costs tokens in every
 -- task schema, and an off-by-default flag keeps the common path lean.
 if opts.allow_model then
-  schema.properties.model = {
+  spawn_schema.properties.model = {
     type = "string",
     description = 'Exact model spec, e.g. "ollama/glm-5.2". You tell makima the model; makima will not guess. Overrides model_tier.',
   }
 end
 
-local examples = {
-  {
-    description = "Find auth middleware",
-    prompt = "Search the codebase for authentication middleware. Return file paths and a summary of how auth is implemented.",
-    model_tier = "weak",
-  },
-}
-
--- Process-wide cap on concurrent subagents, released on despawn or gc.
-local semaphore = maki.async.semaphore(opts.max_concurrent)
-
 -- Live tasks keyed by task_id.
 local tasks = {}
+local task_order = {}
 
-local function bounded_errors(errors)
-  local out = {}
-  for i = 1, math.min(#errors, MAX_SCHEMA_ERRORS) do
-    out[i] = errors[i]
-  end
-  return table.concat(out, "\n")
-end
-
-local function current_mode()
-  local mode, err = maki.api.mode.get()
-  if err then
-    return nil
-  end
-  return mode
+-- The executing agent's own mode, never the focused session's. Plan-specific
+-- gating stays here until plan mode becomes a guest plugin.
+local function current_mode(ctx)
+  return ctx:mode()
 end
 
 -- Validates the shared setup for a subagent and returns
@@ -180,23 +127,15 @@ local function prepare(input, ctx)
   if subagent_type ~= "research" and subagent_type ~= "general" and subagent_type ~= "plan_reviewer" then
     return nil, { llm_output = "unknown subagent type: " .. subagent_type, is_error = true }
   end
-  if subagent_type == "plan_reviewer" and current_mode() ~= "plan" then
+  local mode, mode_err = current_mode(ctx)
+  if mode_err then
+    return nil, { llm_output = mode_err, is_error = true }
+  end
+  if subagent_type == "plan_reviewer" and mode ~= "plan" then
     return nil, { llm_output = "plan_reviewer is only available in plan mode", is_error = true }
   end
-  if subagent_type == "general" and current_mode() == "plan" then
+  if subagent_type == "general" and mode == "plan" then
     return nil, { llm_output = GENERAL_BLOCKED_IN_PLAN_ERR, is_error = true }
-  end
-
-  local validator
-  if input.output_schema then
-    if type(input.output_schema) ~= "table" or input.output_schema.type ~= "object" then
-      return nil, { llm_output = SCHEMA_ROOT_ERROR, is_error = true }
-    end
-    local compile_err
-    validator, compile_err = maki.json.schema_validator(input.output_schema)
-    if compile_err then
-      return nil, { llm_output = SCHEMA_COMPILE_ERROR .. ": " .. compile_err, is_error = true }
-    end
   end
 
   local model, model_err = maki.agent.resolve_model(ctx, {
@@ -231,141 +170,222 @@ local function prepare(input, ctx)
     return nil, { llm_output = tools_err, is_error = true }
   end
 
-  local local_tools
-  if validator then
-    -- Invalid input is an inline tool error the model can fix in the same run;
-    -- the last validation errors are kept on the tool spec so the composite
-    -- can report them if the subagent never commits.
-    local_tools = {
-      [STRUCTURED_OUTPUT_NAME] = {
-        description = STRUCTURED_OUTPUT_DESCRIPTION,
-        input_schema = input.output_schema,
-        last_errors = nil,
-        capture_input = true,
-        handler = function(value)
-          local errs = validator:validate(value)
-          if errs then
-            local spec = local_tools[STRUCTURED_OUTPUT_NAME]
-            spec.last_errors = bounded_errors(errs)
-            return nil, INVALID_INPUT_PREFIX .. spec.last_errors
-          end
-          return STRUCTURED_OUTPUT_ACK
-        end,
-      },
-    }
-  end
-
   return {
     model = model,
     system = system,
     tools = tool_defs,
     audience = audience,
-    local_tools = local_tools,
+    output_schema = input.output_schema,
     subagent_type = subagent_type,
   },
     nil
 end
 
-local function ctx_opts(spec, input, turn_semaphore, auto_deliver)
+local function spawn_options(spec, input)
   return {
-    model_spec = spec.model.spec,
+    model = { spec = spec.model.spec, thinking = input.thinking },
     system = spec.system,
     tools = spec.tools,
-    local_tools = spec.local_tools,
+    output_schema = spec.output_schema,
     audience = spec.audience,
     name = input.description,
-    semaphore = turn_semaphore,
-    auto_deliver = auto_deliver,
-    thinking = input.thinking,
   }
 end
 
-local function fail_task(task, err)
+local function project_result(result)
+  local output = result.output or {}
+  return {
+    text = result.text,
+    duration_ms = result.duration_ms,
+    input_tokens = result.input_tokens,
+    output_tokens = result.output_tokens,
+    captured = result.captured or output[#output],
+    error = result.error or (result.status == "cancelled" and (result.cancellation_reason or "cancelled")),
+    user_message = result.user_message,
+    retryable = result.retryable,
+    turn_id = result.turn_id,
+    status = result.status,
+    cancellation_reason = result.cancellation_reason,
+  }
+end
+
+local function spawn_agent(ctx, options)
+  local agent, err = maki.agent.spawn(ctx, options)
+  if not agent then
+    return nil, err
+  end
+  local latest
+  local tickets = {}
+  local order = {}
+  local turns = {}
+  local function make_ticket_room(call_ctx)
+    for index, id in ipairs(order) do
+      if #order < MAX_RETAINED_TURNS then
+        break
+      end
+      if tickets[id]:result(call_ctx) then
+        tickets[id] = nil
+        table.remove(order, index)
+        break
+      end
+    end
+  end
+  local function retain_ticket(ticket, call_ctx)
+    local id = ticket:id()
+    if not tickets[id] then
+      make_ticket_room(call_ctx)
+      if #order >= MAX_RETAINED_TURNS then
+        return nil
+      end
+      tickets[id] = ticket
+      order[#order + 1] = id
+    end
+    return ticket
+  end
+  function turns:send(message, call_ctx)
+    local authorized, auth_err = agent:status(call_ctx)
+    if not authorized then
+      return nil, auth_err, true
+    end
+    make_ticket_room(call_ctx)
+    local ticket, send_err =
+      agent:send(call_ctx, message, { when = "join", existing_only = #order >= MAX_RETAINED_TURNS })
+    if not ticket then
+      return nil, send_err, true
+    end
+    if not retain_ticket(ticket, call_ctx) then
+      return nil, TURN_UNAVAILABLE_ERR, true
+    end
+    latest = ticket:id()
+    return latest
+  end
+  function turns:wait(call_ctx, turn_id, timeout)
+    -- Without an id, wait on the child's latest turn, which may be one the
+    -- runtime admitted to hand it a result from its own subagents.
+    local ticket
+    if turn_id then
+      ticket = tickets[turn_id]
+    else
+      ticket = agent:latest_turn(call_ctx) or tickets[latest]
+      if ticket then
+        ticket = retain_ticket(ticket, call_ctx)
+      end
+    end
+    if not ticket then
+      return nil, TURN_UNAVAILABLE_ERR
+    end
+    local result, wait_err = ticket:wait(call_ctx, { timeout = timeout })
+    if not result then
+      return nil, wait_err
+    end
+    return project_result(result)
+  end
+  function turns:idle(call_ctx)
+    local status = agent:status(call_ctx)
+    return status ~= nil and status.status ~= "working" and status.queued == 0
+  end
+  return agent, turns
+end
+local function fail_task(task, err, ctx)
   if task.closed then
     return
   end
   task.closed = true
   task.error = err
-  task.sess:close()
+  task.agent:close(ctx)
 end
 
-local function enqueue(task, message)
+local function enqueue(task, message, ctx)
   if task.closed then
     return nil, task.error or TASK_CLOSED_ERR
   end
-  local ok, admitted, admission_err = pcall(function()
-    return task.sess:send(message)
+  local ok, admitted, admission_err, nonfatal = pcall(function()
+    return task.turns:send(message, ctx)
   end)
   if not ok then
-    fail_task(task, admitted or TASK_CLOSED_ERR)
+    fail_task(task, admitted or TASK_CLOSED_ERR, ctx)
     return nil, admitted or TASK_CLOSED_ERR
   end
   if not admitted then
-    fail_task(task, admission_err or TASK_CLOSED_ERR)
+    if not nonfatal then
+      fail_task(task, admission_err or TASK_CLOSED_ERR, ctx)
+    end
     return nil, admission_err or TASK_CLOSED_ERR
   end
-  return true, nil
+  return admitted, nil
 end
 
 local function spawn(spec, input, ctx)
-  local ok, sess, sess_err = pcall(function()
-    return maki.agent.session(ctx, ctx_opts(spec, input, semaphore, true))
+  local i = 1
+  while i <= #task_order do
+    local id = task_order[i]
+    local task = tasks[id]
+    if not task or task.owner:_maki_retired() then
+      tasks[id] = nil
+      table.remove(task_order, i)
+    elseif #task_order >= MAX_RETAINED_TASKS and task.owner:_maki_can_control() then
+      if task.closed or task.turns:idle(ctx) then
+        task.agent:close(ctx)
+        tasks[id] = nil
+        table.remove(task_order, i)
+      else
+        i = i + 1
+      end
+    else
+      i = i + 1
+    end
+  end
+  if #task_order >= MAX_RETAINED_TASKS then
+    return nil, TASK_LIMIT_ERR
+  end
+  local ok, agent, turns = pcall(function()
+    return spawn_agent(ctx, spawn_options(spec, input))
   end)
   if not ok then
-    return nil, sess_err
+    return nil, tostring(agent)
   end
-  if sess_err then
-    return nil, sess_err
+  if not agent then
+    return nil, turns
   end
-  local task_id = sess:session_id()
+  local task_id = agent:_maki_session_id()
   if tasks[task_id] then
-    sess:close()
+    agent:close(ctx)
     return nil, "duplicate task_id"
   end
   local task = {
-    sess = sess,
-    owner = sess:_maki_task_owner(),
+    agent = agent,
+    turns = turns,
+    owner = agent:_maki_task_owner(ctx),
     closed = false,
-    validator = spec.local_tools ~= nil,
+    writes = spec.subagent_type == "general",
   }
   tasks[task_id] = task
-  local message = input.prompt
-  if spec.local_tools then
-    message = message .. STRUCTURED_OUTPUT_PROMPT_SUFFIX
-  end
-  local admitted, enqueue_err = enqueue(task, message)
+  task_order[#task_order + 1] = task_id
+  local admitted, enqueue_err = enqueue(task, input.prompt, ctx)
   if not admitted then
+    fail_task(task, enqueue_err, ctx)
     tasks[task_id] = nil
+    table.remove(task_order)
     return nil, enqueue_err
   end
-  return task_id, nil
+  return { task_id = task_id, turn_id = admitted }, nil
 end
 
 -- task_spawn -----------------------------------------------------------------
 
-local spawn_schema = {
-  type = "object",
-  required = { "description", "prompt" },
-  additionalProperties = false,
-  properties = schema.properties,
-}
-
 local function spawn_handler(input, ctx)
-  if ctx:audience() == "general_sub" and ctx:_maki_managed() then
-    return { llm_output = MANAGED_NESTED_SPAWN_ERR, is_error = true }
-  end
   local spec, err = prepare(input, ctx)
   if err then
     return err
   end
   local ok, task_id, spawn_err = pcall(spawn, spec, input, ctx)
   if not ok then
-    return { llm_output = tostring(spawn_err), is_error = true }
+    return { llm_output = tostring(task_id), is_error = true }
   end
   if spawn_err then
     return { llm_output = spawn_err, is_error = true }
   end
-  return { llm_output = maki.json.encode({ task_id = task_id }) }
+  return { llm_output = maki.json.encode(task_id) }
 end
 
 local function resolve_task(task_id)
@@ -379,33 +399,6 @@ local function resolve_task(task_id)
   return task, nil
 end
 
--- task_get -------------------------------------------------------------------
-
-local get_schema = {
-  type = "object",
-  required = { "task_id" },
-  additionalProperties = false,
-  properties = {
-    task_id = { type = "string", description = "Task id returned by task_spawn." },
-  },
-}
-
-local function get_handler(input)
-  local task, access_err = resolve_task(input.task_id)
-  if not task then
-    return { llm_output = access_err, is_error = true }
-  end
-  local status, err = task.sess:status()
-  if err then
-    return { llm_output = err, is_error = true }
-  end
-  if task.closed and task.error then
-    status.status = "closed"
-    status.error = task.error
-  end
-  return { llm_output = maki.json.encode(status) }
-end
-
 -- task_send ------------------------------------------------------------------
 
 local send_schema = {
@@ -416,21 +409,28 @@ local send_schema = {
     task_id = { type = "string", description = "Task id returned by task_spawn." },
     message = {
       type = "string",
-      description = "Message to queue to the subagent. A done subagent restarts on the next turn.",
+      description = "Follow-up instructions for the subagent.",
     },
   },
 }
 
-local function send_handler(input)
+local function send_handler(input, ctx)
   local task, access_err = resolve_task(input.task_id)
   if not task then
     return { llm_output = access_err, is_error = true }
   end
-  local ok, err = enqueue(task, input.message)
+  local mode, mode_err = current_mode(ctx)
+  if mode_err then
+    return { llm_output = mode_err, is_error = true }
+  end
+  if task.writes and mode == "plan" then
+    return { llm_output = GENERAL_SEND_IN_PLAN_ERR, is_error = true }
+  end
+  local ok, err = enqueue(task, input.message, ctx)
   if not ok then
     return { llm_output = err, is_error = true }
   end
-  return { llm_output = maki.json.encode({ queued = true }) }
+  return { llm_output = maki.json.encode({ queued = true, turn_id = ok }) }
 end
 
 -- task_despawn ---------------------------------------------------------------
@@ -444,103 +444,56 @@ local despawn_schema = {
   },
 }
 
-local function despawn_handler(input)
+local function despawn_handler(input, ctx)
   local task, access_err = resolve_task(input.task_id)
   if not task then
     return { llm_output = access_err, is_error = true }
   end
-  fail_task(task, TASK_CLOSED_ERR)
+  fail_task(task, TASK_CLOSED_ERR, ctx)
   tasks[input.task_id] = nil
+  for i, id in ipairs(task_order) do
+    if id == input.task_id then
+      table.remove(task_order, i)
+      break
+    end
+  end
   return { llm_output = maki.json.encode({ ok = true }) }
 end
 
--- task (blocking composite) --------------------------------------------------
-local function handler(input, ctx)
-  local spec, err = prepare(input, ctx)
-  if err then
-    return err
+local wait_schema = {
+  type = "object",
+  required = { "task_id" },
+  additionalProperties = false,
+  properties = {
+    task_id = { type = "string", description = "Task id returned by task_spawn." },
+    turn_id = { type = "string", description = "Exact admitted turn. Omit to snapshot the latest retained turn once." },
+    timeout = {
+      type = "integer",
+      description = "Observation timeout in seconds. Zero checks without waiting; timeout never cancels work.",
+    },
+  },
+}
+
+local function wait_handler(input, ctx)
+  local task, access_err = resolve_task(input.task_id)
+  if not task then
+    return { llm_output = access_err, is_error = true }
   end
-
-  -- Declared out here so the epilogue closes it on every path: left to the
-  -- garbage collector it keeps the subagent's event relay alive on an idle VM.
-  local sess
-
-  -- pcall so a raised error cannot leak the session.
-  local ok, out = pcall(function()
-    local ok_sess, s, sess_err = pcall(function()
-      return maki.agent.session(ctx, ctx_opts(spec, input, semaphore, false))
-    end)
-    if not ok_sess then
-      error(s, 0)
-    end
-    if sess_err then
-      error(sess_err, 0)
-    end
-    sess = s
-    if ctx:audience() == "general_sub" and not sess:_maki_managed() then
-      return { llm_output = RECURSIVE_UNMANAGED_TASK_ERR, is_error = true }
-    end
-
-    local message = input.prompt
-    if spec.local_tools then
-      message = message .. STRUCTURED_OUTPUT_PROMPT_SUFFIX
-    end
-
-    local result = {}
-    local prompt_err
-    local retries = 0
-    result, prompt_err = sess:prompt(message)
-    result = result or {}
-    while not prompt_err and retries < MAX_NUDGES do
-      if spec.local_tools then
-        if result.captured then
-          break
-        end
-        retries = retries + 1
-        result, prompt_err = sess:prompt(NUDGE_MISSING)
-      elseif result.text == "" then
-        retries = retries + 1
-        result, prompt_err = sess:prompt(NUDGE_SUMMARY)
-      else
-        break
-      end
-      result = result or {}
-    end
-
-    if prompt_err then
-      -- A result alongside the error means the run was cut short after
-      -- streaming some text, and half a transcript beats a bare error.
-      if result and result.text and result.text ~= "" then
-        return {
-          llm_output = "sub-agent interrupted (" .. prompt_err .. "). Partial output:\n" .. result.text,
-          is_error = true,
-        }
-      end
-      return { llm_output = "sub-agent error: " .. prompt_err, is_error = true }
-    end
-    if spec.local_tools and not result.captured then
-      local last_errors = spec.local_tools[STRUCTURED_OUTPUT_NAME].last_errors
-      local msg = last_errors and (STRUCTURED_INVALID_ERROR .. ":\n" .. last_errors) or STRUCTURED_MISSING_ERROR
-      return { llm_output = msg, is_error = true }
-    end
-    if not spec.local_tools and result.text == "" then
-      return { llm_output = SUMMARY_MISSING_ERROR, is_error = true }
-    end
-    return {
-      llm_output = result.captured and maki.json.encode(result.captured) or result.text,
-      format = "markdown",
-    }
-  end)
-
-  if sess then
-    sess:close()
+  local result, wait_err = task.turns:wait(ctx, input.turn_id, input.timeout)
+  if wait_err == TURN_WAIT_TIMEOUT then
+    return { llm_output = maki.json.encode({ status = "running" }) }
   end
-  if not ok then
-    error(out, 0)
+  if wait_err then
+    return { llm_output = tostring(wait_err), is_error = true }
   end
-  return out
+  return {
+    llm_output = maki.json.encode(result and {
+      status = "done",
+      result = result,
+      error = result.error,
+    } or { status = "running" }),
+  }
 end
-
 local function header(input)
   return input.description
 end
@@ -550,7 +503,7 @@ end
 local function restore(_input, output, is_error, ctx)
   local tol = ctx:tool_output_lines()
   return ToolView.restore_markdown(output, is_error, {
-    max_lines = (tol and tol.task) or DEFAULT_OUTPUT_LINES,
+    max_lines = (tol and tol.task_spawn) or DEFAULT_OUTPUT_LINES,
     keep = "head",
     max_line_bytes = output_limits.DEFAULT_MAX_LINE_BYTES,
     width = math.max(maki.ui.terminal_size().cols - BODY_INDENT_COLS, MIN_MD_WIDTH),
@@ -559,7 +512,8 @@ end
 
 maki.api.register_tool({
   name = "task_spawn",
-  description = "Start a background subagent and return its task_id immediately. Each task's messages run FIFO, acquiring concurrency capacity only when each turn starts. Direct children of the root agent are delivered automatically, so the root may wait for the reply. Managed general subagents must use the blocking task tool for nested work so their turn capacity is yielded while the child runs. Unmanaged callers retain task_spawn/task_get compatibility. Queue messages with task_send and finish with task_despawn. Also callable from a code_execution script as a Python async function.",
+  description = "Start a background subagent and return {task_id, turn_id} immediately. Observe results with task_wait, which yields the caller's turn capacity while it waits. Steer work with task_send and finish with task_despawn. Also callable from code_execution.\n\n"
+    .. description,
   kind = "execute",
   audiences = { "main", "general_sub", "interpreter", "workflow" },
   examples = {},
@@ -570,22 +524,21 @@ maki.api.register_tool({
 })
 
 maki.api.register_tool({
-  name = "task_get",
-  description = 'Poll a background subagent. Returns { status = "running" | "done" | "closed", result?, error? }. Managed general subagents cannot spawn background nested tasks and must use the blocking task tool instead. Unmanaged callers retain task_spawn/task_get compatibility. Direct children of the root agent are delivered automatically, so the root may wait for the reply. Does not block the caller. Also callable from a code_execution script as a Python async function.',
+  name = "task_wait",
+  description = "Wait for one exact task turn. Omit turn_id to select the latest turn once. Messages joining that turn extend its work; the wait never follows a later turn. Returns {status, result?, error?}, with per-turn usage and duration_ms. Timeout returns running without cancelling work; zero checks without waiting. Unavailable or evicted turn IDs return turn_result_unavailable. The caller releases its turn capacity while waiting. Also callable from code_execution. See [Agent work](/docs/agent-work/#task-waits) for completion and retention rules.",
   kind = "execute",
   audiences = { "main", "general_sub", "interpreter", "workflow" },
-  examples = {},
-  schema = get_schema,
-  handler = get_handler,
-  header = function()
-    return "task_get"
+  schema = wait_schema,
+  handler = wait_handler,
+  header = function(input)
+    return "task_wait → " .. input.task_id
   end,
   restore = restore,
 })
 
 maki.api.register_tool({
   name = "task_send",
-  description = "Queue a message to a background subagent in per-task FIFO order and return immediately. A done subagent processes it as a new turn, acquiring concurrency capacity when the turn starts. Returns { queued = true }, or a session error if queueing fails. Also callable from a code_execution script as a Python async function.",
+  description = "Submit follow-up instructions to a background subagent and return { queued = true, turn_id }, or an admission error. Compatible messages join open work and share its turn_id; otherwise they start a new turn. Messages wait for the next model request, without interrupting a running request or tool. Acceptance does not mean processing. Overflow rejects only the new message. Also callable from code_execution. See [Agent work](/docs/agent-work/#messages-and-turns) for queue rules.",
   kind = "execute",
   audiences = { "main", "general_sub", "interpreter", "workflow" },
   examples = {},
@@ -599,7 +552,7 @@ maki.api.register_tool({
 
 maki.api.register_tool({
   name = "task_despawn",
-  description = "Cancel a background subagent, discard messages not yet admitted, flush its chat transcript, and release active turn permits. Returns { ok = true }. Also callable from a code_execution script as a Python async function.",
+  description = "Permanently close a background subagent and its descendants, discard pending work, flush its chat transcript, and release active turn permits. Unlike local UI cancellation, this retires the subtree. Returns { ok = true }. Also callable from a code_execution script as a Python async function.",
   kind = "execute",
   audiences = { "main", "general_sub", "interpreter", "workflow" },
   examples = {},
@@ -608,18 +561,6 @@ maki.api.register_tool({
   header = function(input)
     return "task_despawn → " .. input.task_id
   end,
-  restore = restore,
-})
-
-maki.api.register_tool({
-  name = "task",
-  description = description,
-  kind = "execute",
-  audiences = { "main", "general_sub", "workflow" },
-  examples = examples,
-  schema = schema,
-  handler = handler,
-  header = header,
   restore = restore,
 })
 
@@ -673,5 +614,5 @@ maki.api.register_expander("a", expand_subagent)
 -- what the token means without costing subagent prompts any tokens.
 maki.api.register_prompt_hint({
   slot = "after_instructions",
-  content = "A `<subagent:type>` token in a user message (typed as `@subagent:type`) is a delegation request: launch a subagent with the task tool, setting `subagent_type` to `type`.",
+  content = "A `<subagent:type>` token in a user message (typed as `@subagent:type`) is a delegation request: launch a subagent with task_spawn and observe it with task_wait, setting `subagent_type` to `type`.",
 })

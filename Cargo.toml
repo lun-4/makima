@@ -40,10 +40,13 @@ thiserror = { workspace = true }
 libc = { workspace = true }
 uuid = { workspace = true }
 flume = { workspace = true }
+event-listener = { workspace = true }
 open = { workspace = true }
 
 [dev-dependencies]
+maki-storage = { workspace = true, features = ["test-util"] }
 maki-config = { workspace = true, features = ["test-util"] }
+maki-lua = { workspace = true, features = ["test-support"] }
 test-case = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-rust = { workspace = true }

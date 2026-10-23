@@ -186,7 +186,10 @@ maki.keymap.set("n", "<C-t>", toggle, { desc = "Toggle todo panel" })
 
 maki.api.create_autocmd({ "TurnEnd", "SessionReset" }, {
   callback = function(ev)
-    local sid = ev.data and ev.data.session_id or ""
+    if ev.data.parent_id then
+      return
+    end
+    local sid = ev.data.session_id or ""
     todos[sid], popped[sid] = nil, nil
     if is_focused(sid) then
       hide_panel()

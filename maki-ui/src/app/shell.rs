@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::time::{Duration, Instant};
 
@@ -9,7 +10,8 @@ use async_process::{Command, Stdio};
 use futures_lite::StreamExt;
 use futures_lite::io::{AsyncBufReadExt, BufReader};
 use maki_agent::{
-    AgentConfig, CancelToken, CancelTrigger, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
+    AgentConfig, AgentId, CancelToken, CancelTrigger, ToolDoneEvent, ToolInput, ToolOutput,
+    ToolStartEvent,
 };
 use maki_providers::Message;
 
@@ -70,17 +72,19 @@ pub(crate) enum ShellEvent {
 
 #[derive(Default)]
 pub(crate) struct ShellState {
-    cancel_triggers: Vec<CancelTrigger>,
-    pending_results: Vec<Message>,
+    cancel_triggers: HashMap<String, CancelTrigger>,
+    pending_results: HashMap<Option<AgentId>, Vec<Message>>,
+    targets: HashMap<String, Option<AgentId>>,
     id_counter: u64,
     active_ids: HashSet<String>,
 }
 
 impl ShellState {
-    pub fn reserve_id(&mut self) -> String {
+    pub(crate) fn reserve_for(&mut self, target: Option<AgentId>) -> String {
         self.id_counter += 1;
         let id = format!("shell-{}", self.id_counter);
         self.active_ids.insert(id.clone());
+        self.targets.insert(id.clone(), target);
         id
     }
 
@@ -90,32 +94,64 @@ impl ShellState {
 
     pub fn release_id(&mut self, id: &str) {
         self.active_ids.remove(id);
+        self.targets.remove(id);
+        self.cancel_triggers.remove(id);
     }
 
-    pub fn add_trigger(&mut self, trigger: CancelTrigger) {
-        self.cancel_triggers.push(trigger);
+    pub fn add_trigger_for(&mut self, id: String, trigger: CancelTrigger) {
+        self.cancel_triggers.insert(id, trigger);
     }
 
-    pub fn cancel_all(&mut self) {
-        for trigger in self.cancel_triggers.drain(..) {
-            trigger.cancel();
+    pub fn cancel_for(&mut self, target: Option<AgentId>) {
+        let ids: Vec<_> = self
+            .targets
+            .iter()
+            .filter(|(_, owner)| **owner == target)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            if let Some(trigger) = self.cancel_triggers.remove(&id) {
+                trigger.cancel();
+            }
         }
     }
 
-    pub fn push_result(&mut self, msg: Message) {
-        self.pending_results.push(msg);
+    pub fn results_for(&self, target: Option<AgentId>) -> &[Message] {
+        self.pending_results.get(&target).map_or(&[], Vec::as_slice)
+    }
+
+    pub fn drain_results_for(&mut self, target: Option<AgentId>) -> Vec<Message> {
+        self.pending_results.remove(&target).unwrap_or_default()
     }
 
     pub fn drain_results(&mut self) -> Vec<Message> {
-        std::mem::take(&mut self.pending_results)
+        self.drain_results_for(None)
     }
 }
 
 impl App {
     pub(crate) fn handle_shell_event(&mut self, event: ShellEvent) {
+        let id = match &event {
+            ShellEvent::Start { id, .. }
+            | ShellEvent::Output { id, .. }
+            | ShellEvent::Done { id, .. } => id,
+        };
+        let Some(target) = self.shell.targets.get(id).copied() else {
+            return;
+        };
+        let chat_idx = match target {
+            Some(target) => self
+                .chats
+                .iter()
+                .position(|chat| chat.agent_id == Some(target)),
+            None => Some(0),
+        };
+        let Some(chat_idx) = chat_idx else {
+            return;
+        };
         match event {
             ShellEvent::Start { id, command } => {
-                self.main_chat().shell_tool_start(ToolStartEvent {
+                self.chats[chat_idx].shell_tool_start(ToolStartEvent {
                     id,
                     tool: "bash".into(),
                     summary: command.clone(),
@@ -130,7 +166,7 @@ impl App {
                 });
             }
             ShellEvent::Output { id, content } => {
-                self.main_chat().shell_tool_output(&id, &content);
+                self.chats[chat_idx].shell_tool_output(&id, &content);
             }
             ShellEvent::Done {
                 id,
@@ -147,7 +183,7 @@ impl App {
                 } else {
                     None
                 };
-                self.main_chat().shell_tool_done(ToolDoneEvent {
+                self.chats[chat_idx].shell_tool_done(ToolDoneEvent {
                     id: id.clone(),
                     tool: "bash".into(),
                     output: ToolOutput::Plain(output.into()),
@@ -156,7 +192,11 @@ impl App {
                     written_path: None,
                 });
                 if let Some(msg) = result_msg {
-                    self.shell.push_result(msg);
+                    self.shell
+                        .pending_results
+                        .entry(target)
+                        .or_default()
+                        .push(msg);
                 }
                 self.shell.release_id(&id);
             }
@@ -171,6 +211,7 @@ pub(crate) fn spawn_shell(
     tx: flume::Sender<ShellEvent>,
     cancel: CancelToken,
     config: AgentConfig,
+    cwd: PathBuf,
 ) {
     smol::spawn(async move {
         let _ = tx.send(ShellEvent::Start {
@@ -185,6 +226,7 @@ pub(crate) fn spawn_shell(
             &cancel,
             config.max_output_lines,
             config.max_output_bytes,
+            &cwd,
         )
         .await;
 
@@ -211,11 +253,13 @@ async fn run_command(
     cancel: &CancelToken,
     max_output_lines: usize,
     max_output_bytes: usize,
+    cwd: &Path,
 ) -> Result<String, String> {
     let mut std_cmd = StdCommand::new("bash");
     std_cmd
         .arg("-c")
         .arg(command)
+        .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0");
 
     #[cfg(unix)]

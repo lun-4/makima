@@ -93,10 +93,14 @@ Type what you want done, press Enter, watch it work. Worth knowing on day one:
 - **Models.** `/model` switches mid-session. Type `@` in the input to reference a file, skill, subagent, or model inline; see [References](/docs/references/).
 - **Sessions.** `/new` starts a second session while the first keeps working in the background; `/sessions` jumps between them. Tomorrow, `makima -l` resumes where you left off, `makima sessions --json` lists stored sessions, and `makima -c` opens the session picker for this directory (or `makima -c <ID>` jumps straight in).
 - **Your shell.** Prefix input with `!` to run a command yourself (`!cargo test`). `!!` hides command and output from the agent.
-- **Escape hatch.** `Esc Esc` cancels a streaming response. When idle, it rewinds instead.
+- **Cancellation.** `Esc Esc` stops the viewed agent's current work and clears its pending messages. Its subagents continue. When idle, it opens rewind instead. See [Agent work](/docs/agent-work/#cancellation).
 - **Help.** `Ctrl+H` lists every keybinding, or see [Keybindings](/docs/keybindings/).
 
 Middle-click the conversation transcript to start continuous scrolling, then release the button. A marker shows the starting position. Move above it to scroll up or below it to scroll down; greater vertical distance increases speed, while the starting row and one row on either side pause scrolling. Scrolling continues when the pointer stops. Middle-click again or press Escape to stop; other key presses, paste, mouse clicks and wheel scrolling also stop it and retain their usual action. This works only in the transcript, not input fields, pickers or overlays. The terminal must report middle-clicks and pointer movement without a held button; some terminals or multiplexers paste on middle-click or do not report these events.
+
+## Agent input and cancellation
+
+Main and subagent views use the same input and controls. Messages sent during work wait for the next model request; they do not interrupt a running request or tool. [Agent work](/docs/agent-work/) explains message queues, focused controls, cancellation, and child reports.
 
 ## Default model (optional)
 

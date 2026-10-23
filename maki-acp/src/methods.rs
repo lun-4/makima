@@ -13,9 +13,6 @@ use agent_client_protocol_schema::{
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const MODE_BUILD: &str = "build";
-const MODE_PLAN: &str = "plan";
-
 pub const MODEL_CONFIG_ID: &str = "model";
 
 pub fn initialize_response() -> InitializeResponse {
@@ -53,12 +50,16 @@ pub fn mode_state(current: &str, modes: &ModeRegistry) -> SessionModeState {
     SessionModeState::new(SessionModeId::from(current.to_string()), list)
 }
 
-pub fn new_session_response(session_id: &str, modes: &ModeRegistry) -> NewSessionResponse {
-    NewSessionResponse::new(session_id.to_string()).modes(mode_state(MODE_BUILD, modes))
+pub fn new_session_response(
+    session_id: &str,
+    current_mode: &str,
+    modes: &ModeRegistry,
+) -> NewSessionResponse {
+    NewSessionResponse::new(session_id.to_string()).modes(mode_state(current_mode, modes))
 }
 
-pub fn load_session_response(modes: &ModeRegistry) -> LoadSessionResponse {
-    LoadSessionResponse::new().modes(mode_state(MODE_BUILD, modes))
+pub fn load_session_response(current_mode: &str, modes: &ModeRegistry) -> LoadSessionResponse {
+    LoadSessionResponse::new().modes(mode_state(current_mode, modes))
 }
 
 pub fn session_config_options(
@@ -118,21 +119,6 @@ pub fn session_config_options(
                 .description(definition.description.to_string())
         })
         .collect()
-}
-
-pub fn mode_id_to_agent_mode(mode_id: &str, modes: &ModeRegistry) -> Option<maki_agent::AgentMode> {
-    match mode_id {
-        MODE_BUILD => Some(maki_agent::AgentMode::Build),
-        MODE_PLAN => {
-            let storage = maki_storage::StateDir::resolve().ok()?;
-            let plan_path = maki_storage::plans::new_plan_path(&storage).ok()?;
-            Some(maki_agent::AgentMode::Plan(plan_path))
-        }
-        name if modes.contains(name) => {
-            Some(maki_agent::AgentMode::Custom(ModeId::Custom(name.into())))
-        }
-        _ => None,
-    }
 }
 
 #[cfg(test)]

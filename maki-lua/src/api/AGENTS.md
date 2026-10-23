@@ -27,4 +27,4 @@ The backend is resolved per Lua state via app_data (`FsBackendHandle`); a state 
 
 ## Callback seams
 
-Autocmd callbacks run synchronously on the Lua thread and must never suspend (UI roundtrips, `win:recv`); defer suspending work via `maki.async.run` or a command/keymap handler instead, since command handlers run as deadline-free coroutines. See the `SessionPickerRequested` autocmd in `plugins/sessions/init.lua`.
+Autocmd callbacks (and the `Agent:on_*` aliases, which are autocmds filtered to one agent) each run as their own deadline-free task, so they may suspend. Agent events come from the graph (`agent_autocmd::observe`) for every agent, children included, and from frontend envelopes for tool and compaction events; their callbacks get the agent's handle in `ev.agent` and a trusted ctx pinned to it.
