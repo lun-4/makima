@@ -4641,6 +4641,24 @@ local t0 = maki.time.now()
 print(maki.time.ago(t0))
 ```
 
+---
+
+### `maki.time.parse_rfc3339()` {#maki-time-parse_rfc3339}
+
+```lua
+maki.time.parse_rfc3339({value})
+```
+
+Parse an RFC3339 timestamp into nonnegative Unix milliseconds.
+Sub-millisecond precision is truncated. Invalid or pre-epoch timestamps
+return nil and an error message.
+
+**Parameters:**
+
+- `{value}` (`string`) RFC3339 timestamp with a UTC offset.
+
+**Returns:** (`integer?`, `string?`) Unix milliseconds, or nil and an error.
+
 
 ## maki.timer {#maki-timer}
 
@@ -7000,6 +7018,7 @@ function M.build_request(request, options)
 ```lua
 M.models = {}
 function M.stream(response, emit)
+function M.discover(ctx, config)
 function M.prepare(_, model, config)
 function M.register()
 ```
@@ -7151,7 +7170,7 @@ function M.register()
 
 ```lua
 function M.parse_usage(response)
-function M.prepare(_, model, config)
+function M.prepare(ctx, model, config)
 function M.discover(ctx, config)
 function M.register()
 ```
@@ -7335,9 +7354,9 @@ function M.new(body, max_event_bytes)
 ### `require("maki.synthetic")`
 
 ```lua
--- parse_timestamp is supplied by the host so malformed or pre-epoch dates can be ignored.
 function M.parse_quotas(response, parse_timestamp)
 function M.encode_thinking(body, intent, max_thinking_budget)
+function M.discover(ctx, config)
 function M.prepare(_, model, config)
 function M.register()
 ```
@@ -7500,5 +7519,15 @@ function ToolView.restore(output, opts)
 -- "markdown"`); {opts.width} is the wrap width. Errors stay plain, as they do
 -- live.
 function ToolView.restore_markdown(output, is_error, opts)
+```
+
+### `require("maki.zai")`
+
+```lua
+function M.supports_thinking(id)
+function M.build_request(request)
+function M.parse_quotas(body)
+function M.prepare(_, model_value, config)
+function M.register()
 ```
 

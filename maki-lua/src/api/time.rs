@@ -9,8 +9,11 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use jiff::Timestamp as JiffTimestamp;
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
+
+use crate::api::util::pair::{Pair, err_pair};
 
 const NANOS_PER_SEC: u128 = 1_000_000_000;
 const FIELD_RANGE_ERR: &str = "timestamp secs must be an integer; nanosecs an integer 0..1e9";
@@ -92,6 +95,24 @@ fn at(lua: &Lua, secs: u64) -> LuaResult<Table> {
     ts_to_table(lua, Timestamp { secs, nanosecs: 0 })
 }
 
+/// Parse an RFC3339 timestamp into nonnegative Unix milliseconds.
+/// Sub-millisecond precision is truncated. Invalid or pre-epoch timestamps
+/// return nil and an error message.
+///
+/// @param value string RFC3339 timestamp with a UTC offset.
+/// @return (integer?, string?) Unix milliseconds, or nil and an error.
+#[lua_fn]
+fn parse_rfc3339(_lua: &Lua, value: String) -> LuaResult<Pair<u64>> {
+    let timestamp: JiffTimestamp = match value.parse() {
+        Ok(timestamp) => timestamp,
+        Err(err) => return Ok(err_pair(err)),
+    };
+    if timestamp.as_nanosecond() < 0 {
+        return Ok(err_pair("timestamp is before the Unix epoch"));
+    }
+    Ok((Some(timestamp.as_millisecond() as u64), None))
+}
+
 /// Format {instant} as a relative age like `3h ago`, or `just now` for less
 /// than a minute. {instant} is a timestamp from `maki.time.now` (or
 /// `maki.time.at`). If {reference} is given, age is measured from it instead
@@ -149,7 +170,7 @@ lua_table! {
     /// print(maki.time.ago(t0))
     /// ```
     "maki.time" => pub(crate) fn create_time_table(), DOCS [
-        now, at, ago,
+        now, at, ago, parse_rfc3339,
     ]
 }
 
@@ -157,6 +178,23 @@ lua_table! {
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    #[test_case("1970-01-01T00:00:00Z", Some(0); "epoch")]
+    #[test_case("2024-01-01T00:00:00.123456789Z", Some(1_704_067_200_123); "fraction")]
+    #[test_case("2024-01-01T02:30:00+02:30", Some(1_704_067_200_000); "offset")]
+    #[test_case("1969-12-31T23:59:59.999999999Z", None; "before epoch")]
+    #[test_case("2024-01-01T00:00:00", None; "missing offset")]
+    #[test_case("not a timestamp", None; "invalid")]
+    fn parse_rfc3339_from_lua(input: &str, expected: Option<u64>) {
+        let lua = Lua::new();
+        let function: mlua::Function = create_time_table(&lua)
+            .unwrap()
+            .get("parse_rfc3339")
+            .unwrap();
+        let (value, error): Pair<u64> = function.call(input).unwrap();
+        assert_eq!(value, expected);
+        assert_eq!(error.is_some(), expected.is_none());
+    }
 
     const ONE_MIN: u64 = 60;
     const ONE_HOUR: u64 = 3600;

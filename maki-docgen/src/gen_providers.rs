@@ -4,6 +4,9 @@ use maki_providers::model::{ModelEntry, ModelTier};
 use maki_providers::pricing::PricingSchedule;
 use maki_providers::provider::ProviderKind;
 use std::fmt::Write;
+
+use color_eyre::eyre::{Result, eyre};
+use maki_lua::provider_docs::{OfflineModel, OfflineProvider, load_bundled_providers};
 use strum::IntoEnumIterator;
 
 const FRONT_MATTER: &str = r#"+++
@@ -542,7 +545,66 @@ fn no_catalog_note(kind: ProviderKind) -> &'static str {
     }
 }
 
-fn write_section(out: &mut String, section: &ProviderSection) {
+fn write_offline_model_table(out: &mut String, entries: &[OfflineModel]) {
+    let _ = writeln!(
+        out,
+        "| Tier | Models | Pricing (in/out per 1M tokens) | Context |"
+    );
+    let _ = writeln!(
+        out,
+        "|------|--------|-------------------------------|---------|"
+    );
+    for tier in [
+        Some(ModelTier::Weak),
+        Some(ModelTier::Medium),
+        Some(ModelTier::Strong),
+        Some(ModelTier::Compaction),
+        None,
+    ] {
+        for entry in entries.iter().filter(|entry| entry.tier == tier) {
+            let names = entry.prefixes.join(", ");
+            let names = if entry.default {
+                format!("**{names}** (default)")
+            } else {
+                names
+            };
+            let pricing = entry.info.pricing.as_ref().map_or_else(
+                || "—".to_owned(),
+                |pricing| format!("${:.2} / ${:.2}", pricing.input, pricing.output),
+            );
+            let context = entry.info.context_window.map_or_else(
+                || "—".to_owned(),
+                |context| match entry.info.max_output_tokens {
+                    Some(output) => format!("{}K ctx / {}K out", context / 1_000, output / 1_000),
+                    None => format!("{}K ctx", context / 1_000),
+                },
+            );
+            let _ = writeln!(
+                out,
+                "| {} | {names} | {pricing} | {context} |",
+                tier.map_or("Unclassified", tier_label)
+            );
+        }
+    }
+    let defaults: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| {
+            if !entry.default {
+                return None;
+            }
+            Some(format!(
+                "{} ({})",
+                entry.prefixes.first()?,
+                tier_label(entry.tier?).to_lowercase()
+            ))
+        })
+        .collect();
+    if !defaults.is_empty() {
+        let _ = writeln!(out, "\nDefaults: {}", defaults.join(", "));
+    }
+}
+
+fn write_section(out: &mut String, section: &ProviderSection, offline: Option<&OfflineProvider>) {
     let _ = writeln!(out, "### {}\n", section.name);
     let _ = writeln!(out, "- **Env var**: {}", section.auth_line);
 
@@ -569,10 +631,18 @@ fn write_section(out: &mut String, section: &ProviderSection) {
 
     let _ = writeln!(out);
 
-    if section.entries.is_empty() {
+    if let Some(provider) = offline.filter(|provider| !provider.models.is_empty()) {
+        write_offline_model_table(out, &provider.models);
+    } else if section.entries.is_empty() {
         let _ = writeln!(out, "{}", no_catalog_note(section.kind));
     } else {
         write_model_table(out, section.entries);
+    }
+
+    if let Some(provider) = offline {
+        for note in &provider.docs_notes {
+            let _ = writeln!(out, "\n{note}");
+        }
     }
 
     if section.name == "Anthropic" {
@@ -590,7 +660,9 @@ fn write_section(out: &mut String, section: &ProviderSection) {
     }
 }
 
-pub fn generate() -> String {
+pub fn generate() -> Result<String> {
+    let providers = load_bundled_providers()
+        .map_err(|error| eyre!("offline provider registration: {error}"))?;
     let mut out = String::with_capacity(4096);
 
     let _ = writeln!(out, "{FRONT_MATTER}\n");
@@ -608,7 +680,10 @@ pub fn generate() -> String {
     let _ = writeln!(out, "## Built-in Providers\n");
 
     for section in &build_sections() {
-        write_section(&mut out, section);
+        let offline = providers
+            .iter()
+            .find(|provider| provider.id == section.kind.to_string());
+        write_section(&mut out, section, offline);
         let _ = writeln!(out);
     }
 
@@ -620,12 +695,31 @@ pub fn generate() -> String {
     let _ = writeln!(out, "{}\n", providers_toml_section());
     let _ = writeln!(out, "{}", dynamic_providers_section());
 
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{ProviderSection, build_sections, write_section};
+
+    #[test]
+    fn provider_docs_render_offline_catalog() {
+        let providers = maki_lua::provider_docs::load_bundled_providers().unwrap();
+        let provider = providers
+            .iter()
+            .find(|provider| provider.id == "synthetic")
+            .unwrap();
+        let section = build_sections()
+            .into_iter()
+            .find(|section| section.kind.to_string() == provider.id)
+            .unwrap();
+        let mut output = String::new();
+        write_section(&mut output, &section, Some(provider));
+        for model in &provider.models {
+            assert!(output.contains(&model.prefixes.join(", ")));
+        }
+        assert!(output.contains("Defaults:"));
+    }
 
     #[test]
     fn section_renders_its_supplied_pricing_schedule() {
@@ -644,12 +738,12 @@ mod tests {
             pricing_schedule: None,
         };
         let mut output = String::new();
-        write_section(&mut output, &section);
+        write_section(&mut output, &section, None);
         assert!(!output.contains("- **Peak pricing**:"));
 
         section.pricing_schedule = scheduled.pricing_schedule;
         output.clear();
-        write_section(&mut output, &section);
+        write_section(&mut output, &section, None);
         assert!(output.contains(&format!("at {}", scheduled.pricing_schedule.unwrap())));
     }
 }

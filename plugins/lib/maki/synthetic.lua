@@ -56,7 +56,6 @@ local function percentage(used, limit)
   return math.clamp(math.floor(100 * used / limit + 0.5), 0, 100)
 end
 
--- parse_timestamp is supplied by the host so malformed or pre-epoch dates can be ignored.
 function M.parse_quotas(response, parse_timestamp)
   local value, err = maki.json.decode(response)
   if not value then
@@ -117,8 +116,7 @@ function M.encode_thinking(body, intent, max_thinking_budget)
   return true
 end
 
-function M.prepare(_, model, config)
-  config = config or {}
+local function credentials(config)
   local key = maki.uv.os_getenv(config.api_key_env or "SYNTHETIC_API_KEY")
   if not key or key == "" then
     key = config.api_key
@@ -135,6 +133,62 @@ function M.prepare(_, model, config)
   end
   if #keys == 0 then
     return nil, { kind = "config", message = "Synthetic API key is not configured" }
+  end
+  return keys
+end
+
+local function headers(config, key)
+  local result = { Authorization = "Bearer " .. key, ["Content-Type"] = "application/json" }
+  for name, value in pairs(config.headers or {}) do
+    for existing in pairs(result) do
+      if existing:lower() == name:lower() then
+        result[existing] = nil
+      end
+    end
+    result[name] = value
+  end
+  return result
+end
+
+local function base_url(config)
+  local base = maki.uv.os_getenv("SYNTHETIC_BASE_URL")
+  if not base or base == "" then
+    base = config.base_url or "https://api.synthetic.new/openai/v1"
+  end
+  return base:gsub("/+$", "")
+end
+
+function M.discover(ctx, config)
+  config = config or {}
+  local keys, err = credentials(config)
+  if not keys then
+    return nil, err
+  end
+  local response, send_err = ctx:send({
+    url = base_url(config) .. "/models",
+    method = "GET",
+    headers = headers(config, keys[1]),
+  })
+  if not response then
+    return nil, send_err or { kind = "network", message = "Synthetic model discovery failed" }
+  end
+  if response.status < 200 or response.status >= 300 then
+    response:close()
+    return nil, { kind = "api", status = response.status, message = "Synthetic model discovery failed" }
+  end
+  local value, read_err = require("maki.json_response").read(response, 4 * 1024 * 1024)
+  response:close()
+  if not value then
+    return nil, read_err or { kind = "api", message = "Invalid Synthetic models response" }
+  end
+  return require("maki.openai_models").parse_platform(value)
+end
+
+function M.prepare(_, model, config)
+  config = config or {}
+  local keys, err = credentials(config)
+  if not keys then
+    return nil, err
   end
   local index = 1
   local function safe_message(message)
@@ -153,23 +207,7 @@ function M.prepare(_, model, config)
     end
     return message
   end
-  local function headers()
-    local result = { Authorization = "Bearer " .. keys[index], ["Content-Type"] = "application/json" }
-    for name, value in pairs(config.headers or {}) do
-      for existing in pairs(result) do
-        if existing:lower() == name:lower() then
-          result[existing] = nil
-        end
-      end
-      result[name] = value
-    end
-    return result
-  end
-  local base = maki.uv.os_getenv("SYNTHETIC_BASE_URL")
-  if not base or base == "" then
-    base = config.base_url or "https://api.synthetic.new/openai/v1"
-  end
-  base = base:gsub("/+$", "")
+  local base = base_url(config)
   return {
     model = model,
     key_count = #keys,
@@ -184,7 +222,7 @@ function M.prepare(_, model, config)
       local response, err = ctx:send({
         url = "https://api.synthetic.new/v2/quotas",
         method = "GET",
-        headers = headers(),
+        headers = headers(config, keys[index]),
       })
       if not response then
         return nil, err
@@ -211,7 +249,7 @@ function M.prepare(_, model, config)
         chunks[#chunks + 1] = chunk
       end
       response:close()
-      return M.parse_quotas(table.concat(chunks))
+      return M.parse_quotas(table.concat(chunks), maki.time.parse_rfc3339)
     end,
     stream = function(ctx, request, emit)
       local chat = require("maki.chat_completions")
@@ -230,7 +268,7 @@ function M.prepare(_, model, config)
       local response, send_err = ctx:send({
         url = base .. "/chat/completions",
         method = "POST",
-        headers = headers(),
+        headers = headers(config, keys[index]),
         body = encoded,
       })
       if not response then
@@ -277,7 +315,13 @@ function M.prepare(_, model, config)
 end
 
 function M.register()
-  maki.api.register_provider({ id = "synthetic", display_name = "Synthetic", models = M.models, prepare = M.prepare })
+  maki.api.register_provider({
+    id = "synthetic",
+    display_name = "Synthetic",
+    models = M.models,
+    prepare = M.prepare,
+    discover = M.discover,
+  })
 end
 
 return M

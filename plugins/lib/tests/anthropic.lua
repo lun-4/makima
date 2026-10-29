@@ -28,6 +28,43 @@ assert(result.message.content[2].input.x == 1 and emitted[2].type == "tool_use_s
 assert(result.usage.input == 12 and result.usage.cache_read == 3 and result.usage.output == 7)
 assert(result.stop_reason == "tool_use")
 assert(#direct.models == 13 and direct.models[1].id == "claude-haiku-4-5")
+local failed = {
+  read = function()
+    return 'event: error\ndata: {"error":{"type":"overloaded_error","message":"busy"}}\n\n'
+  end,
+}
+local _, stream_error = direct.stream(failed, function()
+  return true
+end)
+assert(stream_error.status == 529 and stream_error.message == "busy")
+local prepared = assert(
+  direct.prepare(nil, { id = "claude-sonnet-5" }, { api_key = "first, second", base_url = "https://fixture.invalid" })
+)
+assert(prepared.key_count == 2 and prepared.rotate_key())
+local sent
+local ctx = {
+  send = function(_, request)
+    sent = request
+    local read = false
+    return {
+      status = 429,
+      headers = { ["retry-after"] = "3" },
+      read = function()
+        if read then
+          return ""
+        end
+        read = true
+        return "first"
+      end,
+      close = function() end,
+    }
+  end,
+}
+local _, api_error = prepared.stream(ctx, { model = { id = "claude-sonnet-5" }, messages = {} }, function()
+  return true
+end)
+assert(sent.headers["x-api-key"] == "second")
+assert(api_error.status == 429 and api_error.retry_after_ms == 3000 and api_error.message == "Anthropic request failed")
 local request = {
   model = { id = "claude-opus-4-7-1m", max_output_tokens = 8192, fast = true },
   system = "system",

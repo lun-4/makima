@@ -164,7 +164,11 @@ function M.refresh(ctx, current, now_ms)
   if not value then
     return nil, err
   end
-  return tokens(value, now_ms)
+  local refreshed, token_err = tokens(value, now_ms)
+  if refreshed and not refreshed.account_id then
+    refreshed.account_id = current.account_id
+  end
+  return refreshed, token_err
 end
 
 return M

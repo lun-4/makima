@@ -1,6 +1,41 @@
 local messages = require("maki.anthropic")
 local sse = require("maki.sse")
 local M = {}
+local MAX_ERROR_BYTES = 65536
+local MAX_BLOCKS = 4096
+local ERROR_STATUS = {
+  overloaded_error = 529,
+  server_is_overloaded = 529,
+  service_unavailable_error = 503,
+  provider_overloaded = 503,
+  provider_unavailable = 502,
+  api_error = 500,
+  server_error = 500,
+  rate_limit_error = 429,
+  rate_limit_exceeded = 429,
+  tokens = 429,
+  request_too_large = 413,
+  not_found_error = 404,
+  permission_error = 403,
+  billing_error = 402,
+  insufficient_quota = 402,
+  authentication_error = 401,
+  invalid_api_key = 401,
+}
+
+local function error_status(detail)
+  local code = detail.code
+  local numeric = tonumber(code)
+  if not numeric or numeric % 1 ~= 0 or numeric < 100 or numeric >= 600 then
+    numeric = nil
+  end
+  local metadata = type(detail.metadata) == "table" and detail.metadata or {}
+  return ERROR_STATUS[code] or numeric or ERROR_STATUS[detail.type] or ERROR_STATUS[metadata.error_type] or 400
+end
+
+local function valid_index(index)
+  return type(index) == "number" and index >= 0 and index < MAX_BLOCKS and index % 1 == 0
+end
 
 local profiles = {
   { "claude-haiku-4-5", "weak", true, 64000, 1, 5, 1.25, 0.1 },
@@ -42,7 +77,7 @@ end
 
 function M.stream(response, emit)
   local next_event = sse.new(response, 1024 * 1024)
-  local content, arguments = {}, {}
+  local content, arguments = assert(maki.json.decode("[]")), {}
   local usage = { input = 0, output = 0, cache_creation = 0, cache_read = 0 }
   local stop_reason
   while true do
@@ -66,7 +101,7 @@ function M.stream(response, emit)
         cache_creation = u.cache_creation_input_tokens or 0,
         cache_read = u.cache_read_input_tokens or 0,
       }
-    elseif kind == "content_block_start" and type(value.index) == "number" and type(value.content_block) == "table" then
+    elseif kind == "content_block_start" and valid_index(value.index) and type(value.content_block) == "table" then
       local b = value.content_block
       local block
       if b.type == "text" then
@@ -86,7 +121,7 @@ function M.stream(response, emit)
       if block then
         content[value.index + 1] = block
       end
-    elseif kind == "content_block_delta" and type(value.index) == "number" and type(value.delta) == "table" then
+    elseif kind == "content_block_delta" and valid_index(value.index) and type(value.delta) == "table" then
       local b, d = content[value.index + 1], value.delta
       if d.type == "text_delta" or d.type == "thinking_delta" then
         local field = d.type == "text_delta" and "text" or "thinking"
@@ -105,7 +140,7 @@ function M.stream(response, emit)
       elseif d.type == "input_json_delta" and arguments[value.index] then
         arguments[value.index][#arguments[value.index] + 1] = d.partial_json or ""
       end
-    elseif kind == "content_block_stop" and type(value.index) == "number" then
+    elseif kind == "content_block_stop" and valid_index(value.index) then
       local b = content[value.index + 1]
       if b and b.type == "tool_use" then
         b.input = maki.json.decode(table.concat(arguments[value.index] or {}), { preserve_null = true }) or {}
@@ -119,7 +154,12 @@ function M.stream(response, emit)
           or "end_turn"
       end
     elseif kind == "error" then
-      return nil, { kind = "api", status = 400, message = "Anthropic stream failed" }
+      local detail = type(value.error) == "table" and value.error or {}
+      local message = detail.message
+      if type(message) ~= "string" or message:match("^%s*$") then
+        message = "provider sent an error frame with no detail"
+      end
+      return nil, { kind = "api", status = error_status(detail), message = message }
     elseif kind == "message_stop" then
       break
     end
@@ -127,8 +167,7 @@ function M.stream(response, emit)
   return { message = { role = "assistant", content = content }, usage = usage, stop_reason = stop_reason }
 end
 
-function M.prepare(_, model, config)
-  config = config or {}
+local function credentials(config)
   local key = maki.uv.os_getenv(config.api_key_env or "ANTHROPIC_API_KEY")
   if not key or key == "" then
     key = config.api_key
@@ -146,12 +185,95 @@ function M.prepare(_, model, config)
   if #keys == 0 then
     return nil, { kind = "config", message = "Anthropic API key is not configured" }
   end
-  local index = 1
+  return keys
+end
+
+local function base_url(config)
   local base = maki.uv.os_getenv("ANTHROPIC_BASE_URL")
   if not base or base == "" then
     base = config.base_url or "https://api.anthropic.com"
   end
-  base = base:match("^[^?#]*"):gsub("/+$", ""):gsub("/v1/messages$", "")
+  return base:match("^[^?#]*"):gsub("/+$", ""):gsub("/v1/messages$", "")
+end
+
+function M.discover(ctx, config)
+  config = config or {}
+  local keys, err = credentials(config)
+  if not keys then
+    return nil, err
+  end
+  local models, cursor, seen = {}, nil, {}
+  repeat
+    local path = "/v1/models?limit=1000"
+    if cursor then
+      path = path .. "&after_id=" .. cursor
+    end
+    local response, send_err = ctx:send({
+      url = base_url(config) .. path,
+      method = "GET",
+      headers = { ["x-api-key"] = keys[1], ["anthropic-version"] = "2023-06-01" },
+    })
+    if not response then
+      return nil, send_err
+    end
+    if response.status ~= 200 then
+      response:close()
+      return nil, { kind = "api", status = response.status, message = "Anthropic model discovery failed" }
+    end
+    local page, read_err = require("maki.json_response").read(response, 4 * 1024 * 1024)
+    response:close()
+    if type(page) ~= "table" or type(page.data) ~= "table" then
+      return nil, read_err or { kind = "api", message = "Invalid Anthropic models response" }
+    end
+    for _, item in ipairs(page.data) do
+      if type(item.id) == "string" then
+        models[#models + 1] = { id = item.id }
+        if type(item.max_input_tokens) == "number" and item.max_input_tokens >= 1000000 then
+          models[#models + 1] = { id = item.id .. "-1m" }
+        end
+      end
+    end
+    if page.has_more and (type(page.last_id) ~= "string" or page.last_id == "") then
+      return nil, { kind = "api", message = "Invalid Anthropic model pagination cursor" }
+    end
+    cursor = page.has_more and page.last_id or nil
+    if cursor and (type(cursor) ~= "string" or not cursor:match("^[%w_-]+$") or seen[cursor]) then
+      return nil, { kind = "api", message = "Invalid Anthropic model pagination cursor" }
+    end
+    if cursor then
+      seen[cursor] = true
+    end
+  until not cursor
+  table.sort(models, function(a, b)
+    return a.id < b.id
+  end)
+  return models
+end
+
+function M.prepare(_, model, config)
+  config = config or {}
+  local keys, err = credentials(config)
+  if not keys then
+    return nil, err
+  end
+  local index = 1
+  local function safe_message(message)
+    if type(message) ~= "string" or message == "" then
+      return "Anthropic request failed"
+    end
+    for _, secret in ipairs(keys) do
+      if message:find(secret, 1, true) then
+        return "Anthropic request failed"
+      end
+    end
+    for _, secret in pairs(config.headers or {}) do
+      if type(secret) == "string" and secret ~= "" and message:find(secret, 1, true) then
+        return "Anthropic request failed"
+      end
+    end
+    return message
+  end
+  local base = base_url(config)
   return {
     model = model,
     key_count = #keys,
@@ -188,18 +310,48 @@ function M.prepare(_, model, config)
         return nil, type(send_err) == "table" and send_err or { kind = "network", message = "Anthropic request failed" }
       end
       if response.status ~= 200 then
+        local chunks, size = {}, 0
+        while size < MAX_ERROR_BYTES do
+          local chunk = response:read()
+          if not chunk or chunk == "" then
+            break
+          end
+          size = size + #chunk
+          if size > MAX_ERROR_BYTES then
+            chunks = {}
+            break
+          end
+          chunks[#chunks + 1] = chunk
+        end
+        local retry = response.headers and response.headers["retry-after"]
+        local seconds = type(retry) == "string" and tonumber(retry:match("^%s*(%d+)%s*$"))
         response:close()
-        return nil, { kind = "api", status = response.status, message = "Anthropic request failed" }
+        return nil,
+          {
+            kind = "api",
+            status = response.status,
+            message = safe_message(table.concat(chunks)),
+            retry_after_ms = seconds and seconds > 0 and seconds <= 9007199254740 and seconds * 1000 or nil,
+          }
       end
       local result, stream_err = M.stream(response, emit)
       response:close()
+      if stream_err and stream_err.kind == "api" then
+        stream_err.message = safe_message(stream_err.message)
+      end
       return result, stream_err
     end,
   }
 end
 
 function M.register()
-  maki.api.register_provider({ id = "anthropic", display_name = "Anthropic", models = M.models, prepare = M.prepare })
+  maki.api.register_provider({
+    id = "anthropic",
+    display_name = "Anthropic",
+    models = M.models,
+    discover = M.discover,
+    prepare = M.prepare,
+  })
 end
 
 return M

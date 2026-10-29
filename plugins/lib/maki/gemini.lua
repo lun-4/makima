@@ -286,14 +286,21 @@ M.models = models
 local function settings(config)
   config = config or {}
   local key = maki.uv.os_getenv(config.api_key_env or "GEMINI_API_KEY")
-  if not key or key == "" then
-    key = config.api_key
-  end
   local keys = {}
   for part in (key or ""):gmatch("[^,]+") do
     local trimmed = part:match("^%s*(.-)%s*$")
     if trimmed ~= "" then
       keys[#keys + 1] = trimmed
+    end
+  end
+  if #keys == 0 then
+    local ok, data = pcall(function()
+      return maki.fs.read(maki.fs.joinpath(maki.env.state_dir(), "auth", "google.json"))
+    end)
+    local saved = ok and data and maki.json.decode(data)
+    key = type(saved) == "table" and type(saved.api_key) == "string" and saved.api_key or config.api_key
+    if type(key) == "string" and key ~= "" then
+      keys[1] = key
     end
   end
   if #keys == 0 then

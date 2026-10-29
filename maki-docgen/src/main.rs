@@ -22,7 +22,7 @@ type Page = (&'static str, fn() -> Result<String>);
 const PAGES: [Page; 8] = [
     ("tools", || Ok(gen_tools::generate())),
     ("plugins", || Ok(gen_plugins::generate())),
-    ("providers", || Ok(gen_providers::generate())),
+    ("providers", gen_providers::generate),
     ("configuration", || Ok(gen_config::generate())),
     ("lua-api", || Ok(gen_lua_api::generate())),
     ("keybindings", || Ok(gen_keybindings::generate())),

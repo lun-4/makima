@@ -140,8 +140,17 @@ local finished = assert(gemini.stream(
 assert(finished.stop_reason == "max_tokens")
 
 assert(#gemini.models == 3)
+local getenv, read, state_dir = maki.uv.os_getenv, maki.fs.read, maki.env.state_dir
+maki.env.state_dir = function()
+  return "/test-state"
+end
+maki.uv.os_getenv = function(name)
+  if name == "GEMINI_API_KEY" then
+    return "first, second"
+  end
+end
 local instance = assert(gemini.prepare(nil, { id = "gemini-2.5-pro" }, {
-  api_key = "first, second",
+  api_key = "config-key",
   base_url = "http://localhost:8080/v1/",
 }))
 local sent, closed
@@ -169,3 +178,46 @@ assert(instance.stream(ctx, request, function()
   return true
 end))
 assert(sent.headers["x-goog-api-key"] == "second")
+
+maki.uv.os_getenv = function(name)
+  if name == "GEMINI_API_KEY" then
+    return " , "
+  end
+end
+maki.fs.read = function(path)
+  assert(path == "/test-state/auth/google.json")
+  return '{"api_key":"saved-key"}'
+end
+local saved = assert(gemini.prepare(nil, { id = "m" }, { api_key = "config-key" }))
+assert(saved.key_count == 1)
+assert(saved.stream(ctx, request, function()
+  return true
+end))
+assert(sent.headers["x-goog-api-key"] == "saved-key")
+maki.fs.read = function()
+  return nil
+end
+local configured = assert(gemini.prepare(nil, { id = "m" }, { api_key = "config-key" }))
+assert(configured.stream(ctx, request, function()
+  return true
+end))
+assert(sent.headers["x-goog-api-key"] == "config-key")
+local discovery_ctx = {
+  send = function(_, outgoing)
+    sent = outgoing
+    local response = body_for({
+      '{"models":[{"name":"models/z","supportedGenerationMethods":["generateContent"]},{"name":"models/a","supportedGenerationMethods":["generateContent"]},{"name":"models/no","supportedGenerationMethods":["embedContent"]}]}',
+    })
+    response.status = 200
+    response.close = function()
+      closed = true
+    end
+    return response
+  end,
+}
+closed = false
+local discovered =
+  assert(gemini.discover(discovery_ctx, { api_key = "config-key", base_url = "http://localhost:8080/v1" }))
+assert(#discovered == 2 and discovered[1].id == "a" and discovered[2].id == "z")
+assert(sent.url == "http://localhost:8080/v1/models?key=config-key&pageSize=1000" and closed)
+maki.uv.os_getenv, maki.fs.read, maki.env.state_dir = getenv, read, state_dir

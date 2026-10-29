@@ -1854,6 +1854,58 @@ case("synthetic_key_rotation_and_header_override", function()
   eq(captured[4].Authorization, "Bearer second")
 end)
 
+case("synthetic_discovers_models_with_configured_auth", function()
+  local synthetic = require("maki.synthetic")
+  local sent, closed = nil, false
+  local chunks = { [[{"data":[{"id":"z"},{"id":"a","context_length":123,"input_modalities":["image"]}]}]], "" }
+  local models = assert(synthetic.discover({
+    send = function(_, request)
+      sent = request
+      return {
+        status = 200,
+        read = function()
+          return table.remove(chunks, 1)
+        end,
+        close = function()
+          closed = true
+        end,
+      }
+    end,
+  }, {
+    api_key_env = "MAKI_TEST_SYNTHETIC_MISSING_KEY",
+    api_key = "first, second",
+    base_url = "https://fixture.invalid/v1/",
+    headers = { authorization = "gateway" },
+  }))
+  eq(sent.url, "https://fixture.invalid/v1/models")
+  eq(sent.method, "GET")
+  eq(sent.headers.authorization, "gateway")
+  eq(sent.headers.Authorization, nil)
+  eq(models[1].id, "a")
+  eq(models[1].context_window, 123)
+  eq(models[1].vision, true)
+  eq(models[2].id, "z")
+  assert(closed)
+end)
+
+case("synthetic_discovery_closes_http_errors", function()
+  local synthetic = require("maki.synthetic")
+  local closed = false
+  local result, err = synthetic.discover({
+    send = function()
+      return {
+        status = 401,
+        close = function()
+          closed = true
+        end,
+      }
+    end,
+  }, { api_key_env = "MAKI_TEST_SYNTHETIC_MISSING_KEY", api_key = "key" })
+  eq(result, nil)
+  eq(err.status, 401)
+  assert(closed)
+end)
+
 case("synthetic_fetch_usage_closes_response", function()
   local synthetic = require("maki.synthetic")
   local instance = assert(synthetic.prepare(nil, { id = "fixture" }, {
@@ -1861,7 +1913,10 @@ case("synthetic_fetch_usage_closes_response", function()
     api_key = "fixture-key",
   }))
   local sent, closed = nil, false
-  local chunks = { [[{"subscription":{"requests":1,"limit":4}}]], "" }
+  local chunks = {
+    [[{"subscription":{"requests":1,"limit":4,"renewsAt":"2025-01-01T01:00:00+01:00"},"weeklyTokenLimit":{"percentRemaining":50,"nextRegenAt":"invalid"}}]],
+    "",
+  }
   local usage = assert(instance.fetch_usage({
     send = function(_, request)
       sent = request
@@ -1880,6 +1935,8 @@ case("synthetic_fetch_usage_closes_response", function()
   eq(sent.url, "https://api.synthetic.new/v2/quotas")
   eq(sent.headers.Authorization, "Bearer fixture-key")
   eq(usage.limits[1].percentage, 25)
+  eq(usage.limits[1].reset_at, 1735689600000)
+  eq(usage.limits[2].reset_at, nil)
   assert(closed)
 end)
 

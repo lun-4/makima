@@ -27,12 +27,18 @@ do
   replies[1] = { status = 200, body = [[{"device_auth_id":"device","user_code":"user","interval":"7"}]] }
   local session = assert(auth.start(ctx))
   assert(session.interval == 10 and session.user_code == "user" and session.verification_url == auth.verification_url)
-  assert(requests[1].body:find("client_id", 1, true))
+  assert(requests[1].url == "https://auth.openai.com/api/accounts/deviceauth/usercode")
+  assert(requests[1].method == "POST" and requests[1].headers["Content-Type"] == "application/json")
+  local start_body = assert(maki.json.decode(requests[1].body))
+  assert(start_body.client_id == "app_EMoamEEZ73f0CkXaXp7hrann")
   replies[1] = { status = 403 }
   local value, err = auth.poll(ctx, session)
   assert(not value and err.kind == "pending" and err.status == 403)
   replies[1] = { status = 200, body = [[{"authorization_code":"a+b","code_verifier":"x/y"}]] }
   local device = assert(auth.poll(ctx, session))
+  assert(requests[3].url == "https://auth.openai.com/api/accounts/deviceauth/token")
+  local poll_body = assert(maki.json.decode(requests[3].body))
+  assert(poll_body.device_auth_id == "device" and poll_body.user_code == "user")
   local payload = maki.base64
     .encode([[{"https://api.openai.com/auth":{"chatgpt_account_id":"account"}}]])
     :gsub("=+$", "")
@@ -47,10 +53,17 @@ do
   }
   local tokens = assert(auth.exchange(ctx, device, 1000))
   assert(tokens.account_id == "account" and tokens.expires == 21000 and tokens.refresh == "refresh")
+  assert(requests[4].url == "https://auth.openai.com/oauth/token")
+  assert(requests[4].headers["Content-Type"] == "application/x-www-form-urlencoded")
+  assert(requests[4].body:find("grant_type=authorization_code", 1, true))
   assert(requests[4].body:find("code=a%%2Bb") and requests[4].body:find("code_verifier=x%%2Fy"))
+  assert(requests[4].body:find("redirect_uri=https%%3A%%2F%%2Fauth.openai.com%%2Fdeviceauth%%2Fcallback"))
   replies[1] = { status = 200, body = [[{"access_token":"new","refresh_token":"rotated"}]] }
   local refreshed = assert(auth.refresh(ctx, tokens, 2000))
-  assert(refreshed.refresh == "rotated" and refreshed.expires == 3602000)
+  assert(refreshed.access == "new" and refreshed.refresh == "rotated" and refreshed.expires == 3602000)
+  assert(requests[5].url == requests[4].url)
+  assert(requests[5].body:find("grant_type=refresh_token", 1, true))
+  assert(requests[5].body:find("refresh_token=refresh", 1, true))
   replies[1] = { status = 200, body = [[{"access_token":"secret"}]] }
   value, err = auth.refresh(ctx, tokens, 2000)
   assert(not value and err.kind == "api")
@@ -58,6 +71,22 @@ do
   value, err = auth.poll(ctx, session)
   assert(not value and err.kind == "api" and not err.message:find("secret"))
   assert(auth.account_id("bad.token") == nil and closed == 7)
+end
+
+do
+  local sent = 0
+  local ctx = {
+    send = function()
+      sent = sent + 1
+      return nil, "sensitive network detail"
+    end,
+  }
+  local value, err = auth.start(ctx)
+  assert(not value and err.kind == "network" and not err.message:find("sensitive"))
+  value, err = auth.exchange(ctx, { authorization_code = "", code_verifier = "verifier" }, 0)
+  assert(not value and err.kind == "config" and sent == 1)
+  value, err = auth.refresh(ctx, {}, 0)
+  assert(not value and err.kind == "config" and sent == 1)
 end
 
 do
@@ -90,6 +119,107 @@ do
   instance.stream(ctx, request, function() end)
   assert(sent.url == "https://example.test/v1/responses" and sent.headers.Authorization == "Bearer second")
   maki.uv.os_getenv = previous
+end
+
+do
+  local stored = { access = "old-access", refresh = "old-refresh", expires = 9999999999999, account_id = "account" }
+  local requests, replies, closed = {}, {}, 0
+  local credentials = {
+    read = function(_, key)
+      assert(key == "chatgpt")
+      return stored
+    end,
+    refresh = function(_, key, callback)
+      assert(key == "chatgpt")
+      local updated, err = callback(stored)
+      if not updated then
+        return nil, err
+      end
+      stored = updated
+      return stored
+    end,
+  }
+  local ctx = {
+    credentials = credentials,
+    send = function(_, request)
+      requests[#requests + 1] = request
+      local reply = assert(table.remove(replies, 1), "unexpected request")
+      local body = reply.body or ""
+      return {
+        status = reply.status,
+        read = function()
+          local chunk = body
+          body = ""
+          return chunk
+        end,
+        close = function()
+          closed = closed + 1
+        end,
+      }
+    end,
+  }
+  local model = { id = "gpt-5.6-luna", max_output_tokens = 1000 }
+  local provider =
+    assert(openai.prepare(ctx, model, { api_key = "fallback", headers = { Authorization = "override" } }))
+  local request = { model = model, messages = {}, tools = {}, thinking = { mode = "off" } }
+  replies[1] = {
+    status = 200,
+    body = 'event: response.output_text.delta\ndata: {"delta":"hello"}\n\nevent: response.completed\ndata: {"response":{"status":"completed"}}\n\n',
+  }
+  local result = assert(provider.stream(ctx, request, function()
+    return true
+  end))
+  assert(result.message.content[1].text == "hello")
+  assert(requests[1].url == "https://chatgpt.com/backend-api/codex/responses")
+  assert(requests[1].headers.Authorization == "Bearer old-access")
+  assert(requests[1].headers["chatgpt-account-id"] == "account")
+  assert(assert(maki.json.decode(requests[1].body)).model == model.id)
+
+  replies[1] = {
+    status = 200,
+    body = [[{"models":[{"slug":"discovered","visibility":"list","service_tiers":[{"id":"priority"}]}]}]],
+  }
+  local discovered = assert(openai.discover(ctx, { api_key = "fallback" }))
+  assert(discovered[1].id == "discovered" and discovered[1].fast)
+  assert(discovered[1].provider_data.account_id == "account")
+  assert(requests[2].url:find("https://chatgpt.com/backend-api/codex/models?client_version=", 1, true) == 1)
+  assert(requests[2].headers.Authorization == "Bearer old-access")
+  assert(requests[2].headers["chatgpt-account-id"] == "account")
+
+  local payload = maki.base64.encode([[{"chatgpt_account_id":"account"}]]):gsub("=+$", "")
+  replies[1] = {
+    status = 200,
+    body = assert(maki.json.encode({
+      access_token = "new-access",
+      refresh_token = "new-refresh",
+      id_token = "header." .. payload .. ".signature",
+      expires_in = 3600,
+    })),
+  }
+  assert(provider.refresh_auth(ctx))
+  assert(stored.access == "new-access" and stored.refresh == "new-refresh")
+  assert(requests[3].url == "https://auth.openai.com/oauth/token")
+  assert(requests[3].body:find("refresh_token=old-refresh", 1, true))
+  replies[1] = {
+    status = 200,
+    body = [[{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":20,"limit_window_seconds":18000}}}]],
+  }
+  local quota = assert(provider.fetch_usage(ctx))
+  assert(quota.plan == "pro" and quota.limits[1].percentage == 20)
+  assert(requests[4].url == "https://chatgpt.com/backend-api/wham/usage" and requests[4].method == "GET")
+  assert(requests[4].headers.Authorization == "Bearer new-access")
+
+  stored = { access = "reloaded", refresh = "refresh", account_id = "other", expires = 9999999999999 }
+  assert(provider.reload_auth(ctx))
+  replies[1] = { status = 500, body = "secret" }
+  local _, err = provider.stream(ctx, request, function() end)
+  assert(err.status == 500 and not err.message:find("secret"))
+  assert(requests[5].headers.Authorization == "Bearer reloaded")
+  assert(requests[5].headers["chatgpt-account-id"] == "other")
+  stored = nil
+  local ok, reload_err = provider.reload_auth(ctx)
+  assert(not ok and reload_err.kind == "config")
+  assert(closed == 5)
 end
 
 local usage = assert(

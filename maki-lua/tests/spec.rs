@@ -15,6 +15,7 @@ use test_case::test_case;
 #[test_case("anthropic", include_str!("../../plugins/lib/tests/anthropic.lua") ; "anthropic_spec")]
 #[test_case("gemini", include_str!("../../plugins/lib/tests/gemini.lua") ; "gemini_spec")]
 #[test_case("mistral", include_str!("../../plugins/lib/tests/mistral.lua") ; "mistral_spec")]
+#[test_case("zai", include_str!("../../plugins/lib/tests/zai.lua") ; "zai_spec")]
 #[test_case("regolo", include_str!("../../plugins/lib/tests/regolo.lua") ; "regolo_spec")]
 #[test_case("list", include_str!("../../plugins/list/tests/spec.lua") ; "list_plugin_spec")]
 #[test_case("memory", include_str!("../../plugins/memory/tests/spec.lua") ; "memory_plugin_spec")]

@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
-use maki_providers::model::ModelInfo;
+use maki_providers::model::{ModelInfo, ModelTier};
 use mlua::{Error, Lua, Result, Table, Value, VmState};
 
 use crate::provider_staging::model_descriptors;
@@ -13,7 +13,15 @@ const INTERRUPT_LIMIT: usize = 100_000;
 pub struct OfflineProvider {
     pub id: String,
     pub display_name: String,
-    pub models: Vec<ModelInfo>,
+    pub models: Vec<OfflineModel>,
+    pub docs_notes: Vec<String>,
+}
+
+pub struct OfflineModel {
+    pub info: ModelInfo,
+    pub prefixes: Vec<String>,
+    pub tier: Option<ModelTier>,
+    pub default: bool,
 }
 
 fn module_source(name: &str) -> Option<&'static str> {
@@ -96,7 +104,33 @@ fn load_sources(sources: &[(&str, &str)]) -> Result<Vec<OfflineProvider>> {
                 )));
             }
             let display_name: Option<String> = table.raw_get("display_name")?;
-            let models = model_descriptors(&table).map_err(Error::runtime)?;
+            let descriptors = model_descriptors(&table).map_err(Error::runtime)?;
+            let model_table: Option<Table> = table.raw_get("models")?;
+            let mut models = Vec::with_capacity(descriptors.len());
+            for (index, info) in descriptors.into_iter().enumerate() {
+                let table = model_table
+                    .as_ref()
+                    .ok_or_else(|| Error::runtime("models: expected an array"))?;
+                let model: Table = table.raw_get(index + 1)?;
+                let prefixes: Option<Vec<String>> = model.raw_get("prefixes")?;
+                let tier: Option<String> = model.raw_get("tier")?;
+                let tier = tier
+                    .map(|tier| tier.parse::<ModelTier>().map_err(Error::external))
+                    .transpose()?;
+                let default = match model.raw_get::<Value>("default")? {
+                    Value::Nil => false,
+                    Value::Boolean(value) => value,
+                    _ => return Err(Error::runtime("model default: expected a boolean")),
+                };
+                let prefixes = prefixes.unwrap_or_else(|| vec![info.id.clone()]);
+                models.push(OfflineModel {
+                    info,
+                    prefixes,
+                    tier,
+                    default,
+                });
+            }
+            let docs_notes: Option<Vec<String>> = table.raw_get("docs_notes")?;
             registered
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -104,6 +138,7 @@ fn load_sources(sources: &[(&str, &str)]) -> Result<Vec<OfflineProvider>> {
                     display_name: display_name.unwrap_or_else(|| id.clone()),
                     id,
                     models,
+                    docs_notes: docs_notes.unwrap_or_default(),
                 });
             Ok(())
         })?,
@@ -137,7 +172,52 @@ pub fn load_bundled_providers() -> Result<Vec<OfflineProvider>> {
 
 #[cfg(test)]
 mod tests {
+    use maki_providers::model::ModelTier;
+
     use super::{load_bundled_providers, load_sources};
+
+    #[test]
+    fn preserves_documentation_metadata() {
+        let source = r#"
+            maki.api.register_provider({
+                id = 'test', docs_notes = {'first', 'second'},
+                models = {
+                    {id = 'one', prefixes = {'one-', 'alias-'}, tier = 'strong', default = true},
+                    {id = 'two'},
+                    {id = 'three', prefixes = {}},
+                },
+            })
+        "#;
+        let providers = load_sources(&[("test", source)]).unwrap();
+        let provider = &providers[0];
+        assert_eq!(provider.docs_notes, ["first", "second"]);
+        assert_eq!(provider.models[0].info.id, "one");
+        assert_eq!(provider.models[0].prefixes, ["one-", "alias-"]);
+        assert_eq!(provider.models[0].tier, Some(ModelTier::Strong));
+        assert!(provider.models[0].default);
+        assert_eq!(provider.models[1].info.id, "two");
+        assert_eq!(provider.models[1].prefixes, ["two"]);
+        assert_eq!(provider.models[1].tier, None);
+        assert!(!provider.models[1].default);
+        assert!(provider.models[2].prefixes.is_empty());
+    }
+
+    #[test]
+    fn rejects_invalid_documentation_metadata() {
+        for field in ["tier = 'unknown'", "default = 'yes'", "prefixes = {false}"] {
+            let source = format!(
+                "maki.api.register_provider({{id='test', models={{{{id='one', {field}}}}}}})"
+            );
+            assert!(load_sources(&[("test", &source)]).is_err(), "{field}");
+        }
+        assert!(
+            load_sources(&[(
+                "test",
+                "maki.api.register_provider({id='test', docs_notes={false}})"
+            )])
+            .is_err()
+        );
+    }
 
     #[test]
     fn bundled_catalogs_load() {
@@ -170,7 +250,9 @@ mod tests {
     fn validates_without_invoking_callbacks() {
         let source = "maki.api.register_provider({id='test', models={{id='model'}}, prepare=function() error('called') end, discover=function() error('called') end})";
         assert_eq!(
-            load_sources(&[("test", source)]).unwrap()[0].models[0].id,
+            load_sources(&[("test", source)]).unwrap()[0].models[0]
+                .info
+                .id,
             "model"
         );
         assert!(

@@ -7,6 +7,10 @@ local MAX_U64 = 18446744073709551616
 local MILLIS_PER_SECOND = 1000
 local INVALID_USAGE = "Invalid Codex usage response"
 local EMPTY_USAGE = "OpenAI usage response contained no plan or rate limits; the endpoint schema likely changed"
+local CODEX_BASE = "https://chatgpt.com/backend-api/codex"
+local USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+local TOKEN_KEY = "chatgpt"
+local REFRESH_BUFFER_MS = 60000
 
 local function unsigned(value)
   return type(value) == "number" and value >= 0 and value < MAX_U64 and value == math.floor(value)
@@ -77,15 +81,89 @@ end
 
 local thinking = { mode = "effort", levels = { "minimal", "low", "medium", "high", "xhigh" } }
 
-function M.prepare(_, model, config)
+local function read_tokens(ctx)
+  if not ctx or not ctx.credentials then
+    return nil
+  end
+  local tokens, err = ctx.credentials:read(TOKEN_KEY)
+  if err then
+    return nil, err
+  end
+  if tokens and (type(tokens) ~= "table" or type(tokens.access) ~= "string" or tokens.access == "") then
+    return nil, { kind = "config", message = "Invalid OpenAI credentials" }
+  end
+  return tokens
+end
+
+local function now_ms()
+  local now = maki.time.now()
+  return now.secs * 1000 + math.floor(now.nanosecs / 1000000)
+end
+
+local function expired(tokens)
+  return type(tokens.expires) ~= "number"
+    or tokens.expires ~= tokens.expires
+    or now_ms() + REFRESH_BUFFER_MS >= tokens.expires
+end
+
+local function refresh_tokens(ctx, previous, force)
+  local current, err = ctx.credentials:refresh(TOKEN_KEY, function(saved)
+    if type(saved) ~= "table" or type(saved.access) ~= "string" or saved.access == "" then
+      return nil, { kind = "config", message = "OpenAI credentials are missing or invalid" }
+    end
+    if saved.account_id ~= previous.account_id then
+      return nil, { kind = "config", message = "OpenAI account changed; prepare the provider again" }
+    end
+    if saved.access ~= previous.access or (not force and not expired(saved)) then
+      return nil
+    end
+    local refreshed, refresh_err = require("maki.openai_auth").refresh(ctx, saved, now_ms())
+    if refreshed and refreshed.account_id ~= saved.account_id then
+      return nil, { kind = "config", message = "OpenAI account changed; prepare the provider again" }
+    end
+    return refreshed, refresh_err
+  end)
+  if not current then
+    return nil, err or { kind = "config", message = "OpenAI credentials are missing" }
+  end
+  return current
+end
+
+local function usable_tokens(ctx, tokens)
+  if tokens and expired(tokens) then
+    return refresh_tokens(ctx, tokens, false)
+  end
+  return tokens
+end
+
+local function codex_headers(tokens)
+  local headers = { Authorization = "Bearer " .. tokens.access }
+  if type(tokens.account_id) == "string" and tokens.account_id ~= "" then
+    headers["chatgpt-account-id"] = tokens.account_id
+  end
+  return headers
+end
+
+function M.prepare(ctx, model, config)
   config = config or {}
+  local tokens, token_err = read_tokens(ctx)
+  if token_err then
+    return nil, token_err
+  end
+  if tokens then
+    tokens, token_err = usable_tokens(ctx, tokens)
+    if not tokens then
+      return nil, token_err
+    end
+  end
   local key = maki.uv.os_getenv(config.api_key_env or "OPENAI_API_KEY")
   if not key or key == "" then
     key = config.api_key
   end
-  if not key or key == "" then
+  if (not key or key == "") and not tokens then
     return nil, { kind = "config", message = "OpenAI API key is not configured" }
   end
+  key = key or ""
   local keys = {}
   for part in key:gmatch("[^,]+") do
     local trimmed = part:match("^%s*(.-)%s*$")
@@ -93,7 +171,7 @@ function M.prepare(_, model, config)
       keys[#keys + 1] = trimmed
     end
   end
-  if #keys == 0 then
+  if #keys == 0 and not tokens then
     return nil, { kind = "config", message = "OpenAI API key is not configured" }
   end
   local index = 1
@@ -112,8 +190,72 @@ function M.prepare(_, model, config)
       index = index % #keys + 1
       return true
     end,
+    reload_auth = tokens and function(ctx)
+      local current, err = read_tokens(ctx)
+      if not current then
+        return nil, err or { kind = "config", message = "OpenAI credentials are missing" }
+      end
+      tokens = current
+      return true
+    end or nil,
+    refresh_auth = tokens and function(ctx)
+      local current, err = refresh_tokens(ctx, tokens, true)
+      if not current then
+        return nil, err
+      end
+      tokens = current
+      return true
+    end or nil,
+    fetch_usage = tokens
+        and function(ctx)
+          local current, token_err = usable_tokens(ctx, tokens)
+          if not current then
+            return nil, token_err
+          end
+          tokens = current
+          local sent_tokens = tokens
+          local response, err = ctx:send({ url = USAGE_URL, method = "GET", headers = codex_headers(sent_tokens) })
+          if response and response.status == 401 then
+            response:close()
+            current, token_err = refresh_tokens(ctx, sent_tokens, true)
+            if not current then
+              return nil, token_err
+            end
+            tokens = current
+            response, err = ctx:send({ url = USAGE_URL, method = "GET", headers = codex_headers(tokens) })
+          end
+          if not response then
+            return nil, err
+          end
+          if response.status < 200 or response.status >= 300 then
+            response:close()
+            return nil, { kind = "api", status = response.status, message = "OpenAI usage request failed" }
+          end
+          local value, read_err = require("maki.json_response").read(response, 1024 * 1024)
+          response:close()
+          if not value then
+            return nil, read_err
+          end
+          local encoded, encode_err = maki.json.encode(value)
+          if not encoded then
+            return nil, { kind = "api", message = tostring(encode_err) }
+          end
+          return M.parse_usage(encoded)
+        end
+      or nil,
     stream = function(ctx, request, emit)
+      if tokens then
+        local current, token_err = usable_tokens(ctx, tokens)
+        if not current then
+          return nil, token_err
+        end
+        tokens = current
+      end
       local responses = require("maki.openai_models").plan_context_window(request.model.id) ~= nil
+      local codex = responses and tokens ~= nil
+      if not tokens and #keys == 0 then
+        return nil, { kind = "config", message = "OpenAI API key is not configured for this model" }
+      end
       local adapter = require(responses and "maki.responses" or "maki.chat_completions")
       local resolution, err = require("maki.thinking").resolve(request.thinking, thinking, {
         max_tokens = request.model.max_output_tokens,
@@ -145,21 +287,44 @@ function M.prepare(_, model, config)
       if not encoded then
         return nil, { kind = "config", message = tostring(encode_err) }
       end
-      local headers = { Authorization = "Bearer " .. keys[index], ["Content-Type"] = "application/json" }
-      for name, value in pairs(config.headers or {}) do
-        for existing in pairs(headers) do
-          if existing:lower() == name:lower() then
-            headers[existing] = nil
+      local function send(current)
+        local headers = codex and codex_headers(current)
+          or { Authorization = "Bearer " .. (current and current.access or keys[index]) }
+        headers["Content-Type"] = "application/json"
+        for name, value in pairs(codex and {} or config.headers or {}) do
+          for existing in pairs(headers) do
+            if existing:lower() == name:lower() then
+              headers[existing] = nil
+            end
+          end
+          headers[name] = value
+        end
+        return ctx:send({
+          url = (codex and CODEX_BASE or base) .. (responses and "/responses" or "/chat/completions"),
+          method = "POST",
+          headers = headers,
+          body = encoded,
+        })
+      end
+      local sent_tokens = tokens
+      local overridden_auth = false
+      if not codex then
+        for name in pairs(config.headers or {}) do
+          if name:lower() == "authorization" then
+            overridden_auth = true
           end
         end
-        headers[name] = value
       end
-      local response, send_err = ctx:send({
-        url = base .. (responses and "/responses" or "/chat/completions"),
-        method = "POST",
-        headers = headers,
-        body = encoded,
-      })
+      local response, send_err = send(sent_tokens)
+      if sent_tokens and not overridden_auth and response and response.status == 401 then
+        response:close()
+        local current, refresh_err = refresh_tokens(ctx, sent_tokens, true)
+        if not current then
+          return nil, refresh_err
+        end
+        tokens = current
+        response, send_err = send(current)
+      end
       if not response then
         return nil, type(send_err) == "table" and send_err or { kind = "network", message = "OpenAI request failed" }
       end
@@ -179,6 +344,21 @@ end
 
 function M.discover(ctx, config)
   config = config or {}
+  local tokens, token_err = read_tokens(ctx)
+  if token_err then
+    return nil, token_err
+  end
+  if tokens then
+    tokens, token_err = usable_tokens(ctx, tokens)
+    if not tokens then
+      return nil, token_err
+    end
+    return require("maki.openai_models").discover(ctx, {
+      kind = "codex",
+      headers = codex_headers(tokens),
+      account_id = tokens.account_id,
+    })
+  end
   local key = maki.uv.os_getenv(config.api_key_env or "OPENAI_API_KEY")
   if not key or key == "" then
     key = config.api_key

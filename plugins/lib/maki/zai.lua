@@ -1,0 +1,222 @@
+local M = {}
+local chat = require("maki.chat_completions")
+local thinking = { mode = "effort", levels = { "high", "xhigh" } }
+local none = { mode = "none" }
+
+local function model(id, prefixes, tier, default, context, output, vision, price, supports_thinking)
+  return {
+    id = id,
+    prefixes = prefixes,
+    tier = tier,
+    family = "glm",
+    default = default,
+    context_window = context,
+    max_output_tokens = output,
+    vision = vision,
+    thinking = supports_thinking and thinking or none,
+    pricing = { input = price[1], output = price[2], cache_write = 0, cache_read = price[3] },
+  }
+end
+
+M.models = {
+  model("glm-5-code", { "glm-5-code" }, "strong", true, 200000, 131072, false, { 1.2, 5, 0.3 }, false),
+  model("glm-5.3", { "glm-5.3" }, "strong", false, 1000000, 131072, false, { 1.4, 4.4, 0.26 }, true),
+  model("glm-5.3-flash", { "glm-5.3-flash" }, "weak", false, 1000000, 131072, true, { 0.15, 0.5, 0.03 }, true),
+  model("glm-5.2", { "glm-5.2" }, "strong", false, 1000000, 131072, false, { 1, 3.2, 0.2 }, true),
+  model("glm-5.1", { "glm-5.1", "glm-5" }, "strong", false, 200000, 131072, false, { 1, 3.2, 0.2 }, false),
+  model("glm-4.7-flash", { "glm-4.7-flash" }, "weak", true, 200000, 131072, false, { 0, 0, 0 }, false),
+  model("glm-4.7", { "glm-4.7", "glm-4.6" }, "medium", true, 200000, 131072, false, { 0.6, 2.2, 0.11 }, false),
+  model("glm-4.5-flash", { "glm-4.5-flash" }, "weak", false, 131072, 98304, false, { 0, 0, 0 }, false),
+  model("glm-4.5-air", { "glm-4.5-air" }, "weak", false, 131072, 98304, false, { 0.2, 1.1, 0.03 }, false),
+  model("glm-4.5", { "glm-4.5" }, "medium", false, 131072, 98304, false, { 0.6, 2.2, 0.11 }, false),
+}
+
+function M.supports_thinking(id)
+  local major, minor = id:match("^glm%-(%d+)%.(%d+)")
+  if not major then
+    major = id:match("^glm%-(%d+)")
+    minor = 0
+  end
+  major, minor = tonumber(major), tonumber(minor)
+  return major ~= nil and (major > 5 or (major == 5 and minor >= 2))
+end
+
+function M.build_request(request)
+  local body, err = chat.build_request(request, { max_tokens_field = "max_tokens" })
+  if not body then
+    return nil, err
+  end
+  if M.supports_thinking(request.model.id) then
+    local intent = request.thinking
+    if intent.mode == "off" then
+      body.reasoning_effort = "none"
+    elseif intent.mode == "adaptive" then
+      body.reasoning_effort = "high"
+    else
+      local result, resolve_err = require("maki.thinking").resolve(intent, thinking)
+      if not result then
+        return nil, resolve_err
+      end
+      body.reasoning_effort = result.effective.level
+    end
+  end
+  return body
+end
+
+function M.parse_quotas(body)
+  local value = maki.json.decode(body)
+  if type(value) ~= "table" or type(value.data) ~= "table" then
+    return nil, { kind = "api", message = "Invalid Z.AI quota response" }
+  end
+  local data, limits = value.data, {}
+  if data.level ~= nil and type(data.level) ~= "string" then
+    return nil, { kind = "api", message = "Invalid Z.AI quota response" }
+  end
+  if data.limits ~= nil and type(data.limits) ~= "table" then
+    return nil, { kind = "api", message = "Invalid Z.AI quota response" }
+  end
+  for _, item in ipairs(data.limits or {}) do
+    if
+      type(item) ~= "table"
+      or type(item.type) ~= "string"
+      or type(item.unit) ~= "number"
+      or type(item.percentage) ~= "number"
+      or (item.nextResetTime ~= nil and type(item.nextResetTime) ~= "number")
+    then
+      return nil, { kind = "api", message = "Invalid Z.AI quota response" }
+    end
+    local kind
+    if item.type == "TOKENS_LIMIT" and item.unit == 3 then
+      kind = { type = "hours", hours = 5 }
+    elseif item.type == "TOKENS_LIMIT" and item.unit == 6 then
+      kind = { type = "weekly" }
+    elseif item.type == "TIME_LIMIT" then
+      kind = { type = "subscription" }
+    else
+      kind = { type = "other", label = item.type .. " #" .. item.unit }
+    end
+    limits[#limits + 1] = { kind = kind, percentage = item.percentage, reset_at = item.nextResetTime }
+  end
+  return { plan = data.level, limits = limits, by_model_today = {} }
+end
+
+function M.prepare(_, model_value, config)
+  config = config or {}
+  local key = maki.uv.os_getenv(config.api_key_env or "ZHIPU_API_KEY")
+  if not key or key == "" then
+    key = config.api_key
+  end
+  local keys = {}
+  for part in (key or ""):gmatch("[^,]+") do
+    local trimmed = part:match("^%s*(.-)%s*$")
+    if trimmed ~= "" then
+      keys[#keys + 1] = trimmed
+    end
+  end
+  if #keys == 0 then
+    return nil, { kind = "config", message = "Z.AI API key is not configured" }
+  end
+  local index = 1
+  local base = (config.base_url or "https://api.z.ai/api/paas/v4"):gsub("/+$", "")
+  local function headers()
+    local result = { Authorization = "Bearer " .. keys[index], ["Content-Type"] = "application/json" }
+    for name, value in pairs(config.headers or {}) do
+      for existing in pairs(result) do
+        if existing:lower() == name:lower() then
+          result[existing] = nil
+        end
+      end
+      result[name] = value
+    end
+    return result
+  end
+  local function read_body(response)
+    local chunks, size = {}, 0
+    while true do
+      local chunk, err = response:read()
+      if not chunk then
+        return nil, err or { kind = "network", message = "Z.AI response read failed" }
+      end
+      if chunk == "" then
+        return table.concat(chunks)
+      end
+      size = size + #chunk
+      if size > 65536 then
+        return nil, { kind = "api", message = "Z.AI response too large" }
+      end
+      chunks[#chunks + 1] = chunk
+    end
+  end
+  return {
+    model = model_value,
+    key_count = #keys,
+    rotate_key = function()
+      if #keys < 2 then
+        return false
+      end
+      index = index % #keys + 1
+      return true
+    end,
+    fetch_usage = function(ctx)
+      local response, err =
+        ctx:send({ url = "https://api.z.ai/api/monitor/usage/quota/limit", method = "GET", headers = headers() })
+      if not response then
+        return nil, err
+      end
+      if response.status < 200 or response.status >= 300 then
+        response:close()
+        return nil, { kind = "api", status = response.status, message = "Z.AI quota request failed" }
+      end
+      local body, read_err = read_body(response)
+      response:close()
+      if not body then
+        return nil, read_err
+      end
+      return M.parse_quotas(body)
+    end,
+    stream = function(ctx, request, emit)
+      local body, err = M.build_request(request)
+      if not body then
+        return nil, { kind = "config", message = tostring(err) }
+      end
+      local encoded, encode_err = maki.json.encode(body)
+      if not encoded then
+        return nil, { kind = "config", message = tostring(encode_err) }
+      end
+      local response, send_err =
+        ctx:send({ url = base .. "/chat/completions", method = "POST", headers = headers(), body = encoded })
+      if not response then
+        return nil, send_err
+      end
+      if response.status < 200 or response.status >= 300 then
+        local text = read_body(response) or ""
+        local status = response.status
+        local retry = response.headers and response.headers["retry-after"]
+        local seconds = type(retry) == "string" and tonumber(retry:match("^%s*(%d+)%s*$"))
+        response:close()
+        if (status == 429 or status >= 500) and (text:find("1113", 1, true) or text:find("nsufficien", 1, true)) then
+          status = 402
+        end
+        return nil,
+          {
+            kind = "api",
+            status = status,
+            message = "Z.AI request failed",
+            retry_after_ms = seconds and seconds > 0 and seconds <= 9007199254740 and seconds * 1000 or nil,
+          }
+      end
+      local result, stream_err = chat.stream(response, emit)
+      response:close()
+      if stream_err and stream_err.kind == "api" then
+        return nil, { kind = "api", status = stream_err.status, message = "Z.AI request failed" }
+      end
+      return result, stream_err
+    end,
+  }
+end
+
+function M.register()
+  maki.api.register_provider({ id = "zai", display_name = "Z.AI", models = M.models, prepare = M.prepare })
+end
+
+return M
