@@ -85,6 +85,10 @@ struct BundledPlugin {
 /// `require()` shared modules across boundaries.
 static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
+        name: "mistral",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/mistral"),
+    },
+    BundledPlugin {
         name: "zai",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/zai"),
     },
@@ -281,6 +285,19 @@ impl Drop for PluginHost {
 }
 
 impl PluginHost {
+    #[cfg(feature = "test-support")]
+    pub fn install_provider_resolver_for_tests(
+        &self,
+        resolver: crate::api::net::ProviderEndpointResolver,
+    ) -> Result<(), PluginError> {
+        let (reply, received) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(runtime::Request::InstallProviderResolver { resolver, reply })
+            .map_err(|_| PluginError::HostDead)?;
+        received.recv().map_err(|_| PluginError::HostDead)
+    }
+
     pub fn provider_registry(&self) -> Arc<maki_providers::provider_registry::ProviderRegistry> {
         Arc::clone(&self.provider_registry)
     }

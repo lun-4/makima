@@ -102,6 +102,53 @@ local _, invalid = direct.prepare(
   { api_key_env = "MAKI_TEST_MISSING_ANTHROPIC_KEY" }
 )
 assert(invalid.kind == "config" and invalid.message == "Invalid Anthropic credentials")
+local saved
+local auth_ctx = {
+  credentials = {
+    read = function()
+      return saved
+    end,
+    write = function(_, key, value)
+      assert(key == "api_key")
+      saved = value
+      return true
+    end,
+    delete = function(_, key)
+      assert(key == "api_key")
+      saved = nil
+      return true
+    end,
+  },
+}
+local auth_config = { api_key_env = "MAKI_TEST_MISSING_ANTHROPIC_KEY", api_key = "config-key" }
+assert(direct.auth_status(auth_ctx, auth_config).source == "config")
+assert(direct.login(auth_ctx, {
+  input = function(_, prompt, secret, optional)
+    assert(prompt == "Anthropic API key" and secret and not optional)
+    return "  logged-in-key  "
+  end,
+}))
+assert(saved.api_key == "logged-in-key" and direct.auth_status(auth_ctx, auth_config).source == "stored")
+assert(direct.logout(auth_ctx) and direct.auth_status(auth_ctx, auth_config).source == "config")
+assert(direct.login(auth_ctx, {
+  input = function()
+    return nil
+  end,
+}) == false)
+local _, empty_login = direct.login(auth_ctx, {
+  input = function()
+    return "  "
+  end,
+})
+assert(empty_login.kind == "config" and saved == nil)
+local denied = {
+  credentials = {
+    read = function()
+      return nil, { kind = "config", message = "credential access denied" }
+    end,
+  },
+}
+assert(direct.auth_status(denied, auth_config).source == "config")
 local request = {
   model = { id = "claude-opus-4-7-1m", max_output_tokens = 8192, fast = true },
   system = "system",

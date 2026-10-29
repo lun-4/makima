@@ -209,20 +209,20 @@ fn google_direct_host_stream_and_discovery_use_http_contract() {
     assert!(
         headers
             .to_ascii_lowercase()
-            .contains("x-goog-api-key: saved-first\r\n")
+            .contains("x-goog-api-key: fixture key\r\n")
     );
     let body: Value = serde_json::from_str(body).unwrap();
     assert_eq!(body["systemInstruction"]["parts"][0]["text"], "system");
     assert_eq!(body["contents"][0]["parts"][0]["text"], "question");
-    assert!(requests[1].starts_with("GET /v1/models?key=saved-first&pageSize=1000 "));
+    assert!(requests[1].starts_with("GET /v1/models?key=fixture%20key&pageSize=1000 "));
     assert!(
         requests[1]
             .to_ascii_lowercase()
-            .contains("x-goog-api-key: saved-first\r\n")
+            .contains("x-goog-api-key: fixture key\r\n")
     );
     assert!(
         requests[3]
             .to_ascii_lowercase()
-            .contains("x-goog-api-key: saved-second\r\n")
+            .contains("x-goog-api-key: fixture key\r\n")
     );
 }

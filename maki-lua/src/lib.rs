@@ -312,6 +312,7 @@ pub mod test_support {
     pub const TEST_STATE_DIR: &str = "/maki-test-state";
 
     pub use crate::api::fs::{InMemoryFs, InMemoryOffloadBackend};
+    pub use crate::api::net::ProviderEndpointResolver;
 
     /// Boots a real `PluginHost` (background Lua thread) pre-loading the given
     /// builtins on an in-memory FS backend with a synthetic state dir, so the

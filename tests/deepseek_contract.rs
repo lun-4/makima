@@ -94,13 +94,17 @@ fn deepseek_discovery_rotation_stream_and_balance() {
     ]).unwrap();
     maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
     let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-    let source = include_str!("../plugins/deepseek/init.lua")
+    let source = include_str!("../plugins/lib/maki/deepseek.lua")
         .replace("ctx.credentials:read(\"api_key\")", "nil, nil")
         .replace(
             "https://api.deepseek.com/user/balance",
             &format!("http://{}/user/balance", server.addr),
         );
-    host.load_source("deepseek", &source).unwrap();
+    host.load_source(
+        "deepseek",
+        &format!("local provider = (function()\n{source}\nend)()\nprovider.register()"),
+    )
+    .unwrap();
     let snapshot = host.provider_registry().snapshot();
     let registration = snapshot.get("deepseek").unwrap();
     let config = json!({"api_key_env": "MAKI_DEEPSEEK_TEST_MISSING_KEY", "api_key": " first, second ", "base_url": format!("http://{}", server.addr)});

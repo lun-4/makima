@@ -915,7 +915,10 @@ impl App {
 
     pub fn poll_login_picker(&mut self) -> Vec<Action> {
         match self.login_picker.poll_codex() {
-            Some(action) => self.login_picker_actions(action),
+            Some(action) => {
+                self.pending_dirty |= Dirty::YES;
+                self.login_picker_actions(action)
+            }
             None => Vec::new(),
         }
     }

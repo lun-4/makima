@@ -167,10 +167,29 @@ function M.stream(response, emit)
   return { message = { role = "assistant", content = content }, usage = usage, stop_reason = stop_reason }
 end
 
+local CREDENTIAL_KEY = "api_key"
+local MISSING_KEY = "Anthropic API key is not configured"
+
+local function split_keys(key)
+  local keys = {}
+  if type(key) == "string" then
+    for part in key:gmatch("[^,]+") do
+      local trimmed = part:match("^%s*(.-)%s*$")
+      if trimmed ~= "" then
+        keys[#keys + 1] = trimmed
+      end
+    end
+  end
+  return keys
+end
+
 local function credentials(ctx, config)
-  local key = maki.uv.os_getenv(config.api_key_env or "ANTHROPIC_API_KEY")
-  if (not key or key == "") and ctx and ctx.credentials then
-    local saved, err = ctx.credentials:read("api_key")
+  local keys = split_keys(maki.uv.os_getenv(config.api_key_env or "ANTHROPIC_API_KEY"))
+  if #keys > 0 then
+    return keys, nil, "env"
+  end
+  if ctx and ctx.credentials then
+    local saved, err = ctx.credentials:read(CREDENTIAL_KEY)
     if err and err.message ~= "credential access denied" then
       return nil, err
     end
@@ -178,26 +197,44 @@ local function credentials(ctx, config)
       if type(saved) ~= "table" or type(saved.api_key) ~= "string" or saved.api_key == "" then
         return nil, { kind = "config", message = "Invalid Anthropic credentials" }
       end
-      key = saved.api_key
+      return { saved.api_key }, nil, "stored"
     end
   end
-  if not key or key == "" then
-    key = config.api_key
-  end
-  if not key or key == "" then
-    return nil, { kind = "config", message = "Anthropic API key is not configured" }
-  end
-  local keys = {}
-  for part in key:gmatch("[^,]+") do
-    local trimmed = part:match("^%s*(.-)%s*$")
-    if trimmed ~= "" then
-      keys[#keys + 1] = trimmed
-    end
-  end
+  keys = split_keys(config.api_key)
   if #keys == 0 then
-    return nil, { kind = "config", message = "Anthropic API key is not configured" }
+    return nil, { kind = "config", message = MISSING_KEY }
   end
-  return keys
+  return keys, nil, "config"
+end
+
+function M.login(ctx, ui)
+  local key, err = ui:input("Anthropic API key", true, false)
+  if err then
+    return nil, err
+  end
+  if not key then
+    return false
+  end
+  key = key:match("^%s*(.-)%s*$")
+  if key == "" then
+    return nil, { kind = "config", message = MISSING_KEY }
+  end
+  return ctx.credentials:write(CREDENTIAL_KEY, { api_key = key })
+end
+
+function M.auth_status(ctx, config)
+  local keys, err, source = credentials(ctx, config or {})
+  if not keys then
+    if err and err.message ~= MISSING_KEY then
+      return nil, err
+    end
+    return { configured = false }
+  end
+  return { configured = true, source = source, method = "api_key" }
+end
+
+function M.logout(ctx)
+  return ctx.credentials:delete(CREDENTIAL_KEY)
 end
 
 local function base_url(config)
@@ -492,6 +529,9 @@ function M.register()
       features = "Prompt caching, thinking mode (adaptive/budgeted), advanced tool use",
     },
     models = M.models,
+    auth = { { id = "api_key", label = "API key", login = M.login } },
+    auth_status = M.auth_status,
+    logout = M.logout,
     discover = M.discover,
     prepare = M.prepare,
   })

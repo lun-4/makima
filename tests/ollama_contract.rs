@@ -1,7 +1,10 @@
 #[path = "support/http_contract.rs"]
 mod http_contract;
 
-use std::sync::{Arc, Mutex};
+use std::io::Write;
+use std::net::TcpListener;
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use std::time::Duration;
 
 use http_contract::{HttpContract, Response, Step};
@@ -63,18 +66,131 @@ fn ollama_discovery_reads_details_and_tolerates_show_failure() {
     })))
     .unwrap()
     .unwrap();
-    assert_eq!(models[0].id, "a");
-    assert_eq!(models[0].supports_vision, None);
-    assert_eq!(models[1].context_window, Some(32768));
-    assert_eq!(models[1].supports_vision, Some(true));
-    for target in ["/v1/models", "/api/show", "/api/show"] {
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "z"]
+    );
+    let list = server
+        .requests
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(list.target, "/v1/models");
+    for success in [true, false] {
         let request = server
             .requests
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap();
-        assert_eq!(request.target, target);
+        assert_eq!(request.target, "/api/show");
+        let body = request.json().unwrap();
+        let model = models
+            .iter()
+            .find(|model| body["model"] == model.id)
+            .unwrap();
+        assert_eq!(model.context_window, success.then_some(32768));
+        assert_eq!(model.supports_vision, success.then_some(true));
     }
+}
+
+#[test]
+fn ollama_show_requests_overlap_and_keep_model_details() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (requests_tx, requests) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut list, _) = listener.accept().unwrap();
+        let request = http_contract::read_request(&mut list).unwrap();
+        assert_eq!(request.target, "/v1/models");
+        let body = r#"{"data":[{"id":"z"},{"id":"a"}]}"#;
+        write!(
+            list,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+        let (mut first, _) = listener.accept().unwrap();
+        let first_request = http_contract::read_request(&mut first).unwrap();
+        requests_tx.send(first_request).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (mut second, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    thread::yield_now()
+                }
+                Err(error) => panic!("second show request did not arrive: {error}"),
+            }
+        };
+        let second_request = http_contract::read_request(&mut second).unwrap();
+        requests_tx.send(second_request).unwrap();
+        for (stream, body) in [
+            (
+                &mut second,
+                r#"{"model_info":{"context_length":8192},"capabilities":["vision"]}"#,
+            ),
+            (
+                &mut first,
+                r#"{"model_info":{"context_length":2048},"capabilities":["completion"]}"#,
+            ),
+        ] {
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        }
+    });
+    maki_lua::set_allowed_private_hosts(&[addr.to_string()]);
+    let _private_host_guard = PrivateHostGuard;
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("ollama", include_str!("../plugins/ollama/init.lua"))
+        .unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let (result_tx, result_rx) = mpsc::channel();
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            let result = smol::block_on(snapshot.get("ollama").unwrap().factory.discover(&json!({
+                "base_url": format!("http://{addr}"), "api_key_env": "OLLAMA_CONTRACT_UNUSED_KEY", "api_key": "secret"
+            })));
+            result_tx.send(result).unwrap();
+        });
+        let first = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        let second = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        let models = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["a", "z"]
+        );
+        for (request, context, vision) in [(first, 2048, false), (second, 8192, true)] {
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.target, "/api/show");
+            assert_eq!(request.header("authorization"), Some("Bearer secret"));
+            let body = request.json().unwrap();
+            let model = models
+                .iter()
+                .find(|model| body["model"] == model.id)
+                .unwrap();
+            assert_eq!(model.context_window, Some(context));
+            assert_eq!(model.supports_vision, Some(vision));
+        }
+    });
+    server.join().unwrap();
 }
 
 #[test]
@@ -204,14 +320,10 @@ fn ollama_discovery_sends_model_names_and_extracts_fallback_details() {
             .collect::<Vec<_>>(),
         ["a", "z"]
     );
-    assert_eq!(models[0].context_window, Some(8192));
-    assert_eq!(models[0].supports_vision, Some(true));
-    assert_eq!(models[1].context_window, Some(2048));
-    assert_eq!(models[1].supports_vision, Some(false));
-    for (method, target, model) in [
+    for (method, target, details) in [
         ("GET", "/v1/models", None),
-        ("POST", "/api/show", Some("z")),
-        ("POST", "/api/show", Some("a")),
+        ("POST", "/api/show", Some((2048, false))),
+        ("POST", "/api/show", Some((8192, true))),
     ] {
         let request = server
             .requests
@@ -221,8 +333,14 @@ fn ollama_discovery_sends_model_names_and_extracts_fallback_details() {
         assert_eq!(request.method, method);
         assert_eq!(request.target, target);
         assert_eq!(request.header("authorization"), Some("Bearer first"));
-        if let Some(model) = model {
-            assert_eq!(request.json().unwrap(), json!({"model": model}));
+        if let Some((context, vision)) = details {
+            let body = request.json().unwrap();
+            let model = models
+                .iter()
+                .find(|model| body == json!({"model": model.id}))
+                .unwrap();
+            assert_eq!(model.context_window, Some(context));
+            assert_eq!(model.supports_vision, Some(vision));
         }
     }
 }

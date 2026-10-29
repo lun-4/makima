@@ -7,7 +7,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use event_listener::Event;
 use futures_lite::io::{AsyncRead, AsyncReadExt};
-use isahc::config::{Configurable, RedirectPolicy, ResolveMap, VersionNegotiation};
+use isahc::config::{Configurable, Dialer, RedirectPolicy, ResolveMap, VersionNegotiation};
 use isahc::{AsyncBody, HttpClient, Request, Response};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{AnyUserData, Lua, ObjectLike, Result as LuaResult, Table, UserData, UserDataMethods};
@@ -61,7 +61,7 @@ pub fn set_allowed_private_hosts(entries: &[String]) {
 
 /// Split by how far a rule may be trusted: a name only ever answers for the
 /// host written in the URL, a range answers for resolved addresses too.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct HostAllowlist {
     /// Name and the port it is pinned to, `None` for any port.
     names: Vec<(String, Option<u16>)>,
@@ -178,6 +178,31 @@ struct DnsPin {
     host: String,
     port: u16,
     addr: IpAddr,
+    connect_port: u16,
+}
+
+#[derive(Clone, Default)]
+pub struct ProviderEndpointResolver {
+    entries: Vec<(String, u16, Vec<SocketAddr>)>,
+    allowed_hosts: Vec<String>,
+}
+
+impl ProviderEndpointResolver {
+    pub fn add(&mut self, host: &str, port: u16, addresses: Vec<SocketAddr>) {
+        self.entries
+            .push((host.to_ascii_lowercase(), port, addresses));
+    }
+
+    pub fn allow_private_host(&mut self, host: &str, port: u16) {
+        self.allowed_hosts.push(format!("{host}:{port}"));
+    }
+
+    fn addresses(&self, host: &str, port: u16) -> Option<&[SocketAddr]> {
+        self.entries
+            .iter()
+            .find(|(name, p, _)| name == &host.to_ascii_lowercase() && *p == port)
+            .map(|(_, _, addresses)| addresses.as_slice())
+    }
 }
 
 struct RequestParams {
@@ -190,6 +215,7 @@ struct RequestParams {
     retries: u32,
     /// `None` when the guard reached its verdict without DNS.
     pin: Option<DnsPin>,
+    resolver: Option<ProviderEndpointResolver>,
 }
 
 struct ResponseData {
@@ -477,7 +503,10 @@ pub(crate) fn provider_context(
                     ));
                 }
                 let url: String = request.get("url")?;
-                let allowed_hosts = ALLOWED_PRIVATE_HOSTS.load_full();
+                let resolver = lua
+                    .app_data_ref::<ProviderEndpointResolver>()
+                    .map(|r| r.clone());
+                let allowed_hosts = allowed_for_resolver(resolver.as_ref());
                 match validate_and_upgrade_url(&url, &allowed_hosts) {
                     Ok(validated)
                         if Url::parse(&url).is_ok_and(|parsed| validated != parsed.as_str()) =>
@@ -509,7 +538,9 @@ pub(crate) fn provider_context(
                         if !alive.load(Ordering::Acquire) {
                             return Err("provider context expired".to_string());
                         }
-                        let params = extract_request_params(&url, Some(&request)).await?;
+                        let params =
+                            extract_request_params_with_resolver(&url, Some(&request), resolver)
+                                .await?;
                         if !alive.load(Ordering::Acquire) {
                             return Err("provider context expired".to_string());
                         }
@@ -595,9 +626,17 @@ lua_table! {
 }
 
 async fn extract_request_params(url: &str, opts: Option<&Table>) -> Result<RequestParams, String> {
-    let allowed = ALLOWED_PRIVATE_HOSTS.load_full();
+    extract_request_params_with_resolver(url, opts, None).await
+}
+
+async fn extract_request_params_with_resolver(
+    url: &str,
+    opts: Option<&Table>,
+    resolver: Option<ProviderEndpointResolver>,
+) -> Result<RequestParams, String> {
+    let allowed = allowed_for_resolver(resolver.as_ref());
     let url = validate_and_upgrade_url(url, &allowed)?;
-    let pin = check_ssrf(&url, &allowed).await?;
+    let pin = check_ssrf_with_resolver(&url, &allowed, resolver.as_ref()).await?;
 
     let method = opts
         .and_then(|o| o.get::<String>("method").ok())
@@ -642,6 +681,7 @@ async fn extract_request_params(url: &str, opts: Option<&Table>) -> Result<Reque
         max_bytes,
         retries,
         pin,
+        resolver,
     })
 }
 
@@ -760,7 +800,16 @@ fn build_client(params: &RequestParams) -> Result<HttpClient, String> {
     // Connect to the address the guard vetted instead of asking DNS again and
     // trusting whatever the second answer says.
     if let Some(pin) = &params.pin {
-        builder = builder.dns_resolve(ResolveMap::new().add(&pin.host, pin.port, pin.addr));
+        if pin.connect_port != pin.port {
+            builder = builder
+                .dial(Dialer::ip_socket(SocketAddr::new(
+                    pin.addr,
+                    pin.connect_port,
+                )))
+                .proxy(None);
+        } else {
+            builder = builder.dns_resolve(ResolveMap::new().add(&pin.host, pin.port, pin.addr));
+        }
     }
 
     builder.build().map_err(|e| format!("client error: {e}"))
@@ -789,7 +838,7 @@ async fn send_redirects(
     mut params: RequestParams,
     retries: bool,
 ) -> Result<Response<AsyncBody>, String> {
-    let allowed = ALLOWED_PRIVATE_HOSTS.load_full();
+    let allowed = allowed_for_resolver(params.resolver.as_ref());
     let mut response = send_once(&params, retries).await?;
 
     for _ in 0..MAX_REDIRECTS {
@@ -879,7 +928,7 @@ impl RequestParams {
             self.headers.clear();
         }
 
-        let pin = check_ssrf(&target, allowed).await?;
+        let pin = check_ssrf_with_resolver(&target, allowed, self.resolver.as_ref()).await?;
 
         // 301, 302 and 303 turn anything that is not a read into a `GET`, the
         // way browsers and curl do it. 307 and 308 keep method and body.
@@ -939,8 +988,49 @@ async fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
 
 /// Runs the guard and, when it had to resolve a name to reach its verdict,
 /// hands back the address the request must then be pinned to.
+#[cfg(test)]
 async fn check_ssrf(url: &str, allowed: &HostAllowlist) -> Result<Option<DnsPin>, String> {
+    check_ssrf_with_resolver(url, allowed, None).await
+}
+
+fn allowed_for_resolver(resolver: Option<&ProviderEndpointResolver>) -> HostAllowlist {
+    let mut allowed = (*ALLOWED_PRIVATE_HOSTS.load_full()).clone();
+    if let Some(resolver) = resolver {
+        for entry in &resolver.allowed_hosts {
+            allowed.add(entry);
+        }
+    }
+    allowed
+}
+
+async fn check_ssrf_with_resolver(
+    url: &str,
+    allowed: &HostAllowlist,
+    resolver: Option<&ProviderEndpointResolver>,
+) -> Result<Option<DnsPin>, String> {
     let (host, port) = extract_host_port(url).ok_or("cannot extract host from URL")?;
+    if let Some(addresses) = resolver.and_then(|resolver| resolver.addresses(host, port)) {
+        for address in addresses {
+            let ip = address.ip();
+            if is_private_ip(&ip)
+                && !allowed.allows_host(host, port)
+                && !allowed.allows_ip(ip, port)
+            {
+                return Err(format!(
+                    "blocked: {host} resolves to private address {ip} ({ALLOWLIST_HINT})"
+                ));
+            }
+        }
+        let addr = *addresses.first().ok_or_else(|| {
+            format!("blocked: {host} resolves to no addresses ({ALLOWLIST_HINT})")
+        })?;
+        return Ok(Some(DnsPin {
+            host: host.to_string(),
+            port,
+            addr: addr.ip(),
+            connect_port: addr.port(),
+        }));
+    }
     // A name on the allowlist is trusted whatever it resolves to, and a URL
     // carrying a literal address leaves curl nothing to resolve. Neither
     // reached a verdict through DNS, so neither has anything to pin.
@@ -983,6 +1073,7 @@ async fn check_ssrf(url: &str, allowed: &HostAllowlist) -> Result<Option<DnsPin>
         host: host.to_string(),
         port,
         addr,
+        connect_port: port,
     }))
 }
 
@@ -1368,6 +1459,41 @@ mod tests {
     }
 
     #[test]
+    fn provider_resolver_is_host_scoped_and_checked() {
+        let mut resolver = ProviderEndpointResolver::default();
+        let public: IpAddr = "8.8.8.8".parse().unwrap();
+        let private: IpAddr = "127.0.0.1".parse().unwrap();
+        resolver.add("api.example.com", 443, vec![SocketAddr::new(public, 443)]);
+        resolver.add(
+            "private.example.com",
+            443,
+            vec![SocketAddr::new(public, 443), SocketAddr::new(private, 443)],
+        );
+        assert!(resolver.addresses("API.EXAMPLE.COM", 443).is_some());
+        assert!(resolver.addresses("api.example.com", 80).is_none());
+        assert!(resolver.addresses("other.example.com", 443).is_none());
+        let allowed = HostAllowlist::default();
+        let pin = smol::block_on(check_ssrf_with_resolver(
+            "https://api.example.com/path",
+            &allowed,
+            Some(&resolver),
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(pin.host, "api.example.com");
+        assert_eq!(pin.port, 443);
+        assert_eq!(pin.addr, public);
+        assert!(
+            smol::block_on(check_ssrf_with_resolver(
+                "https://private.example.com/",
+                &allowed,
+                Some(&resolver)
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn stream_redirect_refuses_cross_authority() {
         let allowed = allowlist(&["127.0.0.1"]);
         let mut params = RequestParams {
@@ -1379,6 +1505,7 @@ mod tests {
             max_bytes: DEFAULT_MAX_BYTES,
             retries: 0,
             pin: None,
+            resolver: None,
         };
         params.headers.push(("x-api-key".into(), "secret".into()));
         let error =
@@ -1497,6 +1624,7 @@ mod tests {
             max_bytes: DEFAULT_MAX_BYTES,
             retries: 0,
             pin: None,
+            resolver: None,
         }
     }
 
@@ -1530,6 +1658,7 @@ mod tests {
             host: LOCALHOST_ENTRY.to_string(),
             port: ALLOWED_PORT,
             addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            connect_port: ALLOWED_PORT,
         });
         redirect(
             &mut params,

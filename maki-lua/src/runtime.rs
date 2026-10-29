@@ -517,6 +517,11 @@ pub enum Request {
     /// Plugins are loaded, so native codegen may start using idle time. Sent
     /// last so it never interleaves with the loads themselves.
     WarmJit,
+    #[cfg(feature = "test-support")]
+    InstallProviderResolver {
+        resolver: crate::api::net::ProviderEndpointResolver,
+        reply: flume::Sender<()>,
+    },
     ProviderAuth {
         provider: String,
         generation: Option<u64>,
@@ -5558,6 +5563,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
             let gate = Rc::new(InflightGate::new(rt.lua.clone()));
             let callbacks = Rc::new(InflightGate::new(rt.lua.clone()));
             let provider_gate = Rc::new(InflightGate::new(rt.lua.clone()));
+            let mut provider_auth_epochs: HashMap<String, (CancelTrigger, CancelToken)> = HashMap::new();
             let provider_paused = Rc::new(Cell::new(false));
             let provider_resume = Rc::new(Event::new());
             let restores = Rc::new(RestoreTracker::default());
@@ -5657,11 +5663,20 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                     match msg {
                         Request::Shutdown => break,
                         Request::WarmJit => codegen_armed = true,
+                        #[cfg(feature = "test-support")]
+                        Request::InstallProviderResolver { resolver, reply } => {
+                            rt.lua.set_app_data(resolver);
+                            let _ = reply.send(());
+                        }
                         Request::ProviderAuth { provider, generation, hook, method, input, interaction, cancel, reply } => {
                             let candidate = rt.providers.get(&provider)
                                 .filter(|(_, current, _, _)| generation.is_none_or(|generation| generation == *current))
                                 .and_then(|(owner, _, source, table)| rt.provider_generations.get(owner)
                                     .map(|(_, cancel)| (source.clone(), table.clone(), cancel.clone(), rt.plugins.borrow().get(owner).map(|plugin| plugin.permissions.clone()).unwrap_or_else(PluginPermissions::denied))));
+                            if hook == "logout" && candidate.is_some() && !cancel.is_cancelled() {
+                                provider_auth_epochs.insert(provider.clone(), CancelToken::new());
+                            }
+                            let auth_epoch = provider_auth_epochs.entry(provider.clone()).or_insert_with(CancelToken::new).1.clone();
                             let lua = rt.lua.clone();
                             let provider_gate = Rc::clone(&provider_gate);
                             let paused = Rc::clone(&provider_paused);
@@ -5693,7 +5708,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                     let scope = TaskScope::new(&lua, TaskCell::new(cancel.clone(), None, None));
                                     let (context, _net_scope) = crate::api::net::provider_context(&lua, scope.handle().clone(), &permissions).map_err(|e| config_error(e.to_string()))?;
                                     crate::provider_credentials::attach(&lua, &context, scope.handle().clone(), generation_cancel.clone(), source, provider.clone()).map_err(|e| config_error(e.to_string()))?;
-                                    let result = generation_cancel.race(cancel.race(scope.scope_future(function.call_async::<MultiValue>((context, input))))).await;
+                                    let result = auth_epoch.race(generation_cancel.race(cancel.race(scope.scope_future(function.call_async::<MultiValue>((context, input)))))).await.map_err(|_| maki_providers::AgentError::Cancelled)?;
                                     let values = match result {
                                         Err(_) => { scope.fire_cancel_hooks(); return Err(config_error("provider generation revoked".into())); }
                                         Ok(Err(_)) => { scope.fire_cancel_hooks(); return Err(maki_providers::AgentError::Cancelled); }
@@ -5825,6 +5840,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                         }
                         Request::ProviderHook { instance, hook, cancel, reply } => {
                             let candidate = rt.provider_instances.borrow().get(&instance).map(|(owner, table, _, generation, source, provider)| (table.clone(), generation.clone(), source.clone(), provider.clone(), rt.plugins.borrow().get(owner.as_str()).map(|plugin| plugin.permissions.clone()).unwrap_or_else(PluginPermissions::denied)));
+                            let auth_epoch = candidate.as_ref().map(|(_, _, _, provider, _)| provider_auth_epochs.entry(provider.clone()).or_insert_with(CancelToken::new).1.clone());
                             let lua = rt.lua.clone();
                             let provider_gate = Rc::clone(&provider_gate);
                             let paused = Rc::clone(&provider_paused);
@@ -5833,7 +5849,8 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                 let result = ProviderPoll { paused, event, listener: None, inner: async {
                                     let (instance, generation, source, provider, permissions) = candidate.ok_or_else(|| maki_providers::AgentError::Config { message: "provider instance is unavailable".to_owned() })?;
                                     let _slot = generation.race(provider_gate.acquire_before_abandoned(&cancel, None)).await.map_err(|_| maki_providers::AgentError::Config { message: "provider generation revoked".to_owned() })?.map_err(|_| maki_providers::AgentError::Cancelled)?;
-                                    crate::provider_stream::run_hook(&lua, &instance, hook, cancel, generation, &permissions, source, provider).await
+                                    let auth_epoch = auth_epoch.ok_or_else(|| maki_providers::AgentError::Config { message: "provider instance is unavailable".to_owned() })?;
+                                    auth_epoch.race(crate::provider_stream::run_hook(&lua, &instance, hook, cancel, generation, &permissions, source, provider)).await.map_err(|_| maki_providers::AgentError::Cancelled)?
                                 }}.await;
                                 let _ = reply.send(result);
                             }).detach();

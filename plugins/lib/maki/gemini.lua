@@ -283,9 +283,10 @@ for _, model in ipairs(models) do
 end
 M.models = models
 
-local function settings(config)
+local function settings(ctx, config)
   config = config or {}
   local key = maki.uv.os_getenv(config.api_key_env or "GEMINI_API_KEY")
+  local source = "env"
   local keys = {}
   for part in (key or ""):gmatch("[^,]+") do
     local trimmed = part:match("^%s*(.-)%s*$")
@@ -294,11 +295,18 @@ local function settings(config)
     end
   end
   if #keys == 0 then
-    local ok, data = pcall(function()
-      return maki.fs.read(maki.fs.joinpath(maki.env.state_dir(), "auth", "google.json"))
-    end)
-    local saved = ok and data and maki.json.decode(data)
-    key = type(saved) == "table" and type(saved.api_key) == "string" and saved.api_key or config.api_key
+    local saved, err
+    if ctx and ctx.credentials then
+      saved, err = ctx.credentials:read("api_key")
+      if err and err.message ~= "credential access denied" then
+        return nil, err
+      end
+    end
+    if saved ~= nil and (type(saved) ~= "table" or type(saved.api_key) ~= "string") then
+      return nil, { kind = "config", message = "Invalid Google credentials" }
+    end
+    key = saved and saved.api_key or config.api_key
+    source = saved and "stored" or "config"
     if type(key) == "string" and key ~= "" then
       keys[1] = key
     end
@@ -309,6 +317,7 @@ local function settings(config)
   local base = maki.uv.os_getenv("GOOGLE_BASE_URL")
   return {
     keys = keys,
+    source = source,
     base = (base and base ~= "" and base or config.base_url or BASE_URL):gsub("/+$", ""),
     headers = config.headers or {},
   }
@@ -376,8 +385,8 @@ local function response_error(response, opts)
   }
 end
 
-function M.prepare(_, model, config)
-  local opts, err = settings(config)
+function M.prepare(ctx, model, config)
+  local opts, err = settings(ctx, config)
   if not opts then
     return nil, err
   end
@@ -385,8 +394,8 @@ function M.prepare(_, model, config)
   return {
     model = model,
     key_count = #opts.keys,
-    reload_auth = function()
-      local refreshed, reload_err = settings(config)
+    reload_auth = function(reload_ctx)
+      local refreshed, reload_err = settings(reload_ctx, config)
       if not refreshed then
         return nil, reload_err
       end
@@ -430,7 +439,7 @@ function M.prepare(_, model, config)
 end
 
 function M.discover(ctx, config)
-  local opts, err = settings(config)
+  local opts, err = settings(ctx, config)
   if not opts then
     return nil, err
   end
@@ -470,6 +479,36 @@ function M.discover(ctx, config)
   return result
 end
 
+function M.login(ctx, ui)
+  local key, err = ui:input("Google API key", true, false)
+  if err then
+    return nil, err
+  end
+  if not key then
+    return false
+  end
+  key = key:match("^%s*(.-)%s*$")
+  if key == "" then
+    return nil, { kind = "config", message = "Google API key is not configured" }
+  end
+  return ctx.credentials:write("api_key", { api_key = key })
+end
+
+function M.auth_status(ctx, config)
+  local opts, err = settings(ctx, config)
+  if not opts then
+    if err.message == "Google API key is not configured" then
+      return { configured = false }
+    end
+    return nil, err
+  end
+  return { configured = true, source = opts.source, method = "api_key" }
+end
+
+function M.logout(ctx)
+  return ctx.credentials:delete("api_key")
+end
+
 function M.register()
   maki.api.register_provider({
     id = "google",
@@ -480,6 +519,9 @@ function M.register()
       features = "Native Gemini API with thinking support",
     },
     models = M.models,
+    auth = { { id = "api_key", label = "API key", login = M.login } },
+    auth_status = M.auth_status,
+    logout = M.logout,
     discover = M.discover,
     prepare = M.prepare,
   })

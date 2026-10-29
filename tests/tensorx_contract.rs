@@ -31,7 +31,7 @@ fn tensorx_is_embedded_but_not_loaded_by_default() {
 #[test]
 fn tensorx_discovery_drives_stream_parameters() {
     const ENDPOINT: &str = "https://api.tensorx.ai/v1";
-    const CATALOG: &str = r#"{"data":[{"model_name":"vendor/chat","model_info":{"mode":"chat","max_tokens":100000,"max_output_tokens":4096,"supports_reasoning":true,"supports_vision":true,"input_cost_per_token":0.000002,"output_cost_per_token":0.000004,"supported_openai_params":["thinking","reasoning_effort",null]}},{"model_name":"vendor/embed","model_info":{"mode":"embedding"}}]}"#;
+    const CATALOG: &str = r#"{"data":[{"model_name":"vendor/chat","model_info":{"mode":"chat","max_tokens":100000,"max_output_tokens":4096,"supports_reasoning":true,"supports_vision":true,"input_cost_per_token":0.000002,"output_cost_per_token":0.000004,"cache_creation_input_token_cost":0.000001,"cache_read_input_token_cost":0.0000005,"supported_openai_params":["thinking","reasoning_effort",null]}},{"model_name":"vendor/embed","model_info":{"mode":"embedding"}}]}"#;
     const SSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
     let server = HttpContract::start(vec![
         Response {
@@ -50,7 +50,9 @@ fn tensorx_discovery_drives_stream_parameters() {
     let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
     let source = include_str!("../plugins/tensorx/init.lua");
     assert_eq!(source.matches(ENDPOINT).count(), 1);
-    let source = source.replace(ENDPOINT, &format!("http://{}/v1", server.addr));
+    let source = source
+        .replace(ENDPOINT, &format!("http://{}/v1", server.addr))
+        .replace("if ctx and ctx.credentials then", "if false then");
     host.load_source("tensorx", &source).unwrap();
     let snapshot = host.provider_registry().snapshot();
     let registration = snapshot.get("tensorx").unwrap();
@@ -64,7 +66,11 @@ fn tensorx_discovery_drives_stream_parameters() {
     assert_eq!(models[0].max_output_tokens, None);
     assert_eq!(models[0].supports_thinking, Some(true));
     assert_eq!(models[0].supports_vision, Some(true));
-    assert_eq!(models[0].pricing.as_ref().unwrap().input, 2.0);
+    let pricing = models[0].pricing.as_ref().unwrap();
+    assert_eq!(pricing.input, 2.0);
+    assert_eq!(pricing.output, 4.0);
+    assert_eq!(pricing.cache_write, 1.0);
+    assert_eq!(pricing.cache_read, 0.5);
     let discovery = server
         .requests
         .recv_timeout(Duration::from_secs(5))
@@ -114,8 +120,9 @@ fn tensorx_registration_streams_deepseek_template() {
     }]).unwrap();
     maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
     let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-    host.load_source("tensorx", include_str!("../plugins/tensorx/init.lua"))
-        .unwrap();
+    let source = include_str!("../plugins/tensorx/init.lua")
+        .replace("if ctx and ctx.credentials then", "if false then");
+    host.load_source("tensorx", &source).unwrap();
     let snapshot = host.provider_registry().snapshot();
     let registration = snapshot.get("tensorx").unwrap();
     let model = Model::from_spec("tensorx/deepseek/deepseek-flash").unwrap();

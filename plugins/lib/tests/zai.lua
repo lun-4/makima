@@ -32,7 +32,7 @@ local provider = assert(
     { api_key_env = "MAKI_TEST_NO_ZAI_KEY", api_key = "first, second", base_url = "https://example.test/" }
   )
 )
-assert(provider.key_count == 2 and provider.rotate_key())
+assert(provider.key_count == 1 and not provider.rotate_key())
 local sent
 local ctx = {
   send = function(_, req)
@@ -53,7 +53,7 @@ local ctx = {
   end,
 }
 local _, err = provider.stream(ctx, request, function() end)
-assert(sent.url == "https://example.test/chat/completions" and sent.headers.Authorization == "Bearer second")
+assert(sent.url == "https://example.test/chat/completions" and sent.headers.Authorization == "Bearer first, second")
 assert(err.status == 402 and err.message == "1113 insufficient balance" and err.retry_after_ms == nil)
 
 local saved

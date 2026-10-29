@@ -136,6 +136,11 @@ local function discover(ctx, config)
     return nil, models_err
   end
   local entries = type(data.data) == "table" and data.data or {}
+  for _, entry in ipairs(entries) do
+    if type(entry) ~= "table" or type(entry.id) ~= "string" then
+      return nil, { kind = "api", message = "Invalid LlamaCpp model entry" }
+    end
+  end
   local mode = props.role == "router" and "router"
     or entries[1] and entries[1].max_model_len ~= nil and "legacy"
     or "single"
@@ -143,10 +148,7 @@ local function discover(ctx, config)
   for _, entry in ipairs(entries) do
     local arch = entry.architecture
     if
-      type(entry.id) == "string"
-      and (
-        type(arch) ~= "table" or (contains(arch.input_modalities, "text") and contains(arch.output_modalities, "text"))
-      )
+      type(arch) ~= "table" or (contains(arch.input_modalities, "text") and contains(arch.output_modalities, "text"))
     then
       local context
       if mode == "legacy" then

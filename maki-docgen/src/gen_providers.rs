@@ -569,7 +569,11 @@ fn write_offline_model_table(out: &mut String, entries: &[OfflineModel]) {
         None,
     ] {
         for entry in entries.iter().filter(|entry| entry.tier == tier) {
-            let names = entry.prefixes.join(", ");
+            let names = if entry.prefixes.is_empty() {
+                entry.info.id.clone()
+            } else {
+                entry.prefixes.join(", ")
+            };
             let names = if entry.default {
                 format!("**{names}** (default)")
             } else {
@@ -601,7 +605,7 @@ fn write_offline_model_table(out: &mut String, entries: &[OfflineModel]) {
             }
             Some(format!(
                 "{} ({})",
-                entry.prefixes.first()?,
+                entry.prefixes.first().unwrap_or(&entry.info.id),
                 tier_label(entry.tier?).to_lowercase()
             ))
         })
@@ -686,9 +690,11 @@ fn write_offline_section(out: &mut String, provider: &OfflineProvider) {
     }
     let _ = writeln!(out);
     if provider.models.is_empty() {
-        if let Some(note) = &docs.no_catalog_note {
-            let _ = writeln!(out, "{note}");
-        }
+        let note = docs
+            .no_catalog_note
+            .as_deref()
+            .unwrap_or("No hardcoded model catalog. Use any model ID supported by this provider.");
+        let _ = writeln!(out, "{note}");
     } else {
         write_offline_model_table(out, &provider.models);
     }
@@ -785,6 +791,18 @@ mod tests {
         assert!(output.contains("fixture-alias"));
         assert!(output.contains("$42.25"));
         assert!(!output.contains("hf:moonshotai/Kimi-K2.5"));
+    }
+
+    #[test]
+    fn offline_empty_prefix_uses_model_id() {
+        let mut providers = maki_lua::provider_docs::load_bundled_providers().unwrap();
+        let provider = providers.iter_mut().find(|p| p.id == "synthetic").unwrap();
+        provider.models[0].prefixes.clear();
+        let model_id = provider.models[0].info.id.clone();
+        let mut output = String::new();
+        super::write_offline_section(&mut output, provider);
+        assert!(output.contains(&format!("**{model_id}** (default)")));
+        assert!(output.contains(&format!("{model_id} (strong)")));
     }
 
     #[test]

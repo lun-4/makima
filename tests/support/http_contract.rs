@@ -170,7 +170,7 @@ impl Drop for HttpContract {
     }
 }
 
-fn read_request(stream: &mut TcpStream) -> io::Result<Request> {
+pub(crate) fn read_request(stream: &mut TcpStream) -> io::Result<Request> {
     let deadline = Instant::now() + IO_TIMEOUT;
     let mut bytes = Vec::new();
     let header_end = loop {

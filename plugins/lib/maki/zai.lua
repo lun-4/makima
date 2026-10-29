@@ -140,11 +140,10 @@ local function credentials(ctx, config)
       return { saved.api_key }, nil, "stored"
     end
   end
-  keys = split_keys(config.api_key)
-  if #keys == 0 then
-    return nil, { kind = "config", message = MISSING_KEY }
+  if type(config.api_key) == "string" and config.api_key ~= "" then
+    return { config.api_key }, nil, "config"
   end
-  return keys, nil, "config"
+  return nil, { kind = "config", message = MISSING_KEY }
 end
 
 function M.login(ctx, ui)
@@ -175,6 +174,38 @@ end
 
 function M.logout(ctx)
   return ctx.credentials:delete(CREDENTIAL_KEY)
+end
+
+function M.discover(ctx, config)
+  config = config or {}
+  local keys, err = credentials(ctx, config)
+  if not keys then
+    return nil, err
+  end
+  local headers = { Authorization = "Bearer " .. keys[1] }
+  for name, value in pairs(config.headers or {}) do
+    for existing in pairs(headers) do
+      if existing:lower() == name:lower() then
+        headers[existing] = nil
+      end
+    end
+    headers[name] = value
+  end
+  local base = (config.base_url or "https://api.z.ai/api/paas/v4"):gsub("/+$", "")
+  local response, send_err = ctx:send({ url = base .. "/models", method = "GET", headers = headers })
+  if not response then
+    return nil, send_err
+  end
+  if response.status ~= 200 then
+    response:close()
+    return nil, { kind = "api", status = response.status, message = "Z.AI model discovery failed" }
+  end
+  local value, read_err = require("maki.json_response").read(response, 4 * 1024 * 1024)
+  response:close()
+  if not value then
+    return nil, read_err
+  end
+  return require("maki.openai_models").parse_platform(value)
 end
 
 function M.prepare(ctx, model_value, config)
@@ -317,6 +348,7 @@ function M.register()
     display_name = "Z.AI",
     models = M.models,
     prepare = M.prepare,
+    discover = M.discover,
     auth = { { id = "api_key", label = "API key", login = M.login } },
     auth_status = M.auth_status,
     logout = M.logout,

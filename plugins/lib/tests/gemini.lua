@@ -140,10 +140,7 @@ local finished = assert(gemini.stream(
 assert(finished.stop_reason == "max_tokens")
 
 assert(#gemini.models == 3)
-local getenv, read, state_dir = maki.uv.os_getenv, maki.fs.read, maki.env.state_dir
-maki.env.state_dir = function()
-  return "/test-state"
-end
+local getenv = maki.uv.os_getenv
 maki.uv.os_getenv = function(name)
   if name == "GEMINI_API_KEY" then
     return "first, second"
@@ -211,28 +208,43 @@ maki.uv.os_getenv = function(name)
     return " , "
   end
 end
-maki.fs.read = function(path)
-  assert(path == "/test-state/auth/google.json")
-  return '{"api_key":"saved-key"}'
-end
-local saved = assert(gemini.prepare(nil, { id = "m" }, { api_key = "config-key" }))
+local saved_key = "saved-key"
+local auth_ctx = {
+  credentials = {
+    read = function(_, key)
+      assert(key == "api_key")
+      return saved_key and { api_key = saved_key }
+    end,
+    write = function(_, _, value)
+      saved_key = value.api_key
+      return true
+    end,
+    delete = function()
+      saved_key = nil
+      return true
+    end,
+  },
+}
+local saved = assert(gemini.prepare(auth_ctx, { id = "m" }, { api_key = "config-key" }))
 assert(saved.key_count == 1)
 assert(saved.stream(ctx, request, function()
   return true
 end))
 assert(sent.headers["x-goog-api-key"] == "saved-key")
-maki.fs.read = function(path)
-  assert(path == "/test-state/auth/google.json")
-  return '{"api_key":"changed-key"}'
-end
-assert(saved.reload_auth())
+saved_key = "changed-key"
+assert(saved.reload_auth(auth_ctx))
 assert(saved.stream(ctx, request, function()
   return true
 end))
 assert(sent.headers["x-goog-api-key"] == "changed-key")
-maki.fs.read = function()
-  return nil
-end
+assert(gemini.auth_status(auth_ctx, {}).source == "stored")
+assert(gemini.login(auth_ctx, {
+  input = function()
+    return " login-key "
+  end,
+}))
+assert(saved_key == "login-key")
+assert(gemini.logout(auth_ctx) and saved_key == nil)
 local configured = assert(gemini.prepare(nil, { id = "m" }, { api_key = "config-key" }))
 assert(configured.stream(ctx, request, function()
   return true
@@ -256,4 +268,4 @@ local discovered =
   assert(gemini.discover(discovery_ctx, { api_key = "config-key", base_url = "http://localhost:8080/v1" }))
 assert(#discovered == 2 and discovered[1].id == "a" and discovered[2].id == "z")
 assert(sent.url == "http://localhost:8080/v1/models?key=config-key&pageSize=1000" and closed)
-maki.uv.os_getenv, maki.fs.read, maki.env.state_dir = getenv, read, state_dir
+maki.uv.os_getenv = getenv

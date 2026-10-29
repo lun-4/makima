@@ -6,10 +6,15 @@ use std::time::Duration;
 
 use http_contract::{HttpContract, Response, Step};
 use maki_agent::tools::ToolRegistry;
+use maki_commands::CommandRegistry;
 use maki_config::PluginsConfig;
-use maki_lua::PluginHost;
+use maki_lua::{PluginHost, test_support::InMemoryFs, ui_sink::HostUi};
 use maki_providers::{
     AgentError, Message, Model, ProviderEvent, RequestOptions, ThinkingConfig, UsageWindow,
+};
+use maki_storage::{
+    StateDir,
+    auth::{ProviderCredentials, load_provider_credentials, save_provider_credentials},
 };
 use serde_json::json;
 
@@ -44,7 +49,27 @@ fn regolo_registration_discovery_usage_and_stream() {
         )),
     ]).unwrap();
     maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
-    let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let state = StateDir::from_path(temp.path().to_path_buf());
+    save_provider_credentials(
+        &state,
+        "regolo",
+        &ProviderCredentials {
+            api_key: "saved-key".into(),
+            host: None,
+        },
+    )
+    .unwrap();
+    let mut host = PluginHost::with_session_provider_preparer(
+        Arc::new(ToolRegistry::new()),
+        CommandRegistry::new(),
+        true,
+        Arc::new(InMemoryFs::new()),
+        Some(temp.path().to_path_buf()),
+        None,
+        HostUi::Frontend,
+    )
+    .unwrap();
     let defaults = PluginsConfig::from_plugins(Default::default());
     host.load_builtins(&defaults).unwrap();
     assert!(host.provider_registry().snapshot().get("regolo").is_none());
@@ -63,6 +88,17 @@ fn regolo_registration_discovery_usage_and_stream() {
             .any(|model| model.id == "qwen3-coder-next")
     );
     let config = json!({"api_key_env":"MAKI_REGOLO_CONTRACT_UNUSED_KEY", "api_key":" first, second ", "base_url":format!("http://{}/v1/", server.addr)});
+    let saved_config = json!({"api_key_env":"MAKI_REGOLO_CONTRACT_UNUSED_KEY"});
+    assert_eq!(
+        smol::block_on(registration.factory.auth_status(&saved_config)).unwrap()["source"],
+        "stored"
+    );
+    smol::block_on(registration.factory.logout(&saved_config)).unwrap();
+    assert!(load_provider_credentials(&state, "regolo").is_none());
+    assert_eq!(
+        smol::block_on(registration.factory.auth_status(&config)).unwrap()["source"],
+        "config"
+    );
     let models = smol::block_on(registration.factory.discover(&config))
         .unwrap()
         .unwrap();

@@ -320,6 +320,72 @@ do
   maki.uv.os_getenv = previous
 end
 
+do
+  local previous_now, previous_await, previous_defer = maki.time.now, maki.async.await, maki.defer_fn
+  local millis, waits, written = 0, {}, nil
+  maki.time.now = function()
+    return { secs = math.floor(millis / 1000), nanosecs = (millis % 1000) * 1000000 }
+  end
+  maki.async.await = function(_, schedule)
+    local result, err
+    schedule(function(value, failure)
+      result, err = value, failure
+    end)
+    return result, err
+  end
+  maki.defer_fn = function(callback, delay)
+    waits[#waits + 1] = delay
+    millis = millis + delay
+    callback()
+    return {}
+  end
+  local replies = {
+    { status = 200, body = [[{"device_auth_id":"device","user_code":"user","interval":"7"}]] },
+    { status = 403 },
+    { status = 200, body = [[{"authorization_code":"code","code_verifier":"verifier"}]] },
+    { status = 200, body = [[{"access_token":"access","refresh_token":"refresh","expires_in":3600}]] },
+  }
+  local ctx = {
+    credentials = {
+      write = function(_, key, value)
+        assert(key == "chatgpt")
+        written = value
+        return true
+      end,
+    },
+    send = function()
+      local reply = assert(table.remove(replies, 1))
+      local body = reply.body or ""
+      return {
+        status = reply.status,
+        read = function()
+          local chunk = body
+          body = ""
+          return chunk
+        end,
+        close = function() end,
+      }
+    end,
+  }
+  local ui = {
+    device_challenge = function(_, url, code)
+      assert(url == auth.verification_url and code == "user")
+      return true
+    end,
+  }
+  assert(auth.login(ctx, ui))
+  assert(written.access == "access" and written.refresh == "refresh" and written.expires == 3610000)
+  assert(#waits == 1 and waits[1] == 10000)
+  written = nil
+  replies = { { status = 200, body = [[{"device_auth_id":"device","user_code":"user"}]] } }
+  ui.device_challenge = function()
+    return false
+  end
+  local ok, err = auth.login(ctx, ui)
+  assert(not ok and err.kind == "config" and written == nil)
+  maki.time.now, maki.async.await, maki.defer_fn = previous_now, previous_await, previous_defer
+end
+
 local usage = assert(
   openai.parse_usage(
     [[{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":12.5,"limit_window_seconds":18000,"reset_at":1760000000},"secondary_window":{"used_percent":150,"limit_window_seconds":604800}}}]]

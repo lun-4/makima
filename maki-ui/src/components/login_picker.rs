@@ -11,8 +11,14 @@ use ratatui::widgets::Wrap;
 use maki_config::providers::{
     self, Protocol, ProviderDef, ProvidersConfig, VERTEX_LOGIN_INSTRUCTIONS, slugify,
 };
+use maki_providers::AgentError;
 use maki_providers::catalog_providers_if_available;
 use maki_providers::openai_auth;
+use maki_providers::provider::BoxFuture;
+use maki_providers::provider_registry::{
+    AuthChoice, InteractionRequest, InteractionResponse, InteractionService, ProviderRegistration,
+    ProviderRegistry,
+};
 use maki_storage::StateDir;
 use maki_storage::auth::{
     ProviderCredentials, load_provider_credentials, load_tokens, save_provider_credentials,
@@ -108,8 +114,60 @@ enum CodexEvent {
     Done(Result<(), String>),
 }
 
+struct InteractionMessage {
+    request: InteractionRequest,
+    reply: flume::Sender<InteractionResponse>,
+}
+
+struct TuiInteraction(flume::Sender<InteractionMessage>);
+
+impl InteractionService for TuiInteraction {
+    fn interact(
+        &self,
+        request: InteractionRequest,
+    ) -> BoxFuture<'_, Result<InteractionResponse, AgentError>> {
+        Box::pin(async move {
+            let (tx, rx) = flume::bounded(1);
+            self.0
+                .send_async(InteractionMessage { request, reply: tx })
+                .await
+                .map_err(|_| AgentError::Cancelled)?;
+            Ok(rx
+                .recv_async()
+                .await
+                .unwrap_or(InteractionResponse::Cancelled))
+        })
+    }
+}
+
+impl PickerItem for AuthChoice {
+    fn label(&self) -> &str {
+        &self.label
+    }
+}
+
 enum Step {
     Closed,
+    RegistryMethods {
+        picker: ListPicker<AuthChoice>,
+        provider: ProviderRegistration,
+    },
+    RegistryWaiting,
+    RegistryInput {
+        prompt: String,
+        secret: bool,
+        optional: bool,
+        input: TextBuffer,
+        reply: flume::Sender<InteractionResponse>,
+    },
+    RegistryChoice {
+        picker: ListPicker<AuthChoice>,
+        reply: flume::Sender<InteractionResponse>,
+    },
+    RegistryNotice {
+        text: String,
+        reply: flume::Sender<InteractionResponse>,
+    },
     PickProvider(ListPicker<ProviderItem>),
     PickPlan {
         picker: ListPicker<PlanItem>,
@@ -201,6 +259,10 @@ pub struct LoginPicker {
     step: Step,
     provider_items: Vec<ProviderItem>,
     storage: Option<maki_storage::StateDir>,
+    registry: Arc<ProviderRegistry>,
+    registry_task: Option<smol::Task<()>>,
+    registry_rx: Option<flume::Receiver<InteractionMessage>>,
+    registry_done: Option<flume::Receiver<(String, Result<serde_json::Value, AgentError>)>>,
 }
 
 impl LoginPicker {
@@ -209,10 +271,20 @@ impl LoginPicker {
             step: Step::Closed,
             provider_items: Vec::new(),
             storage: None,
+            registry: Arc::new(ProviderRegistry::default()),
+            registry_task: None,
+            registry_rx: None,
+            registry_done: None,
         }
     }
 
+    pub fn set_registry(&mut self, registry: Arc<ProviderRegistry>) {
+        self.registry = registry;
+    }
+
     pub fn open(&mut self, storage: maki_storage::StateDir) {
+        self.abort_codex();
+        self.cancel_registry();
         let builtins = providers::all_builtins();
         let config = providers::ProvidersConfig::load();
         let mut items: Vec<ProviderItem> = builtins
@@ -254,18 +326,43 @@ impl LoginPicker {
             });
         }
 
-        items.push(ProviderItem {
-            slug: OPENAI_CODEX_SLUG.to_string(),
-            display_name: OPENAI_CODEX_LABEL.to_string(),
-            has_key: false,
-            has_env: false,
-            configured: false,
-            section: None,
-        });
+        for provider in self
+            .registry
+            .snapshot()
+            .providers()
+            .filter(|p| !p.auth_methods.is_empty())
+        {
+            if let Some(item) = items.iter_mut().find(|item| item.slug == provider.id) {
+                item.display_name.clone_from(&provider.display_name);
+            } else {
+                items.push(ProviderItem {
+                    slug: provider.id.clone(),
+                    display_name: provider.display_name.clone(),
+                    has_key: false,
+                    has_env: false,
+                    configured: false,
+                    section: None,
+                });
+            }
+        }
+
+        if !items.iter().any(|item| item.slug == OPENAI_CODEX_SLUG) {
+            items.push(ProviderItem {
+                slug: OPENAI_CODEX_SLUG.to_string(),
+                display_name: OPENAI_CODEX_LABEL.to_string(),
+                has_key: false,
+                has_env: false,
+                configured: false,
+                section: None,
+            });
+        }
 
         if let Some(catalog) = catalog_providers_if_available() {
             let state_dir = StateDir::resolve().ok();
             for cat in catalog {
+                if items.iter().any(|item| item.slug == cat.slug) {
+                    continue;
+                }
                 let has_key = state_dir
                     .as_ref()
                     .and_then(|s| cat.load_key_from_storage(s))
@@ -291,14 +388,16 @@ impl LoginPicker {
             });
         }
 
-        items.push(ProviderItem {
-            slug: "custom".to_string(),
-            display_name: "Custom provider...".to_string(),
-            has_key: false,
-            has_env: false,
-            configured: false,
-            section: None,
-        });
+        if !items.iter().any(|item| item.slug == "custom") {
+            items.push(ProviderItem {
+                slug: "custom".to_string(),
+                display_name: "Custom provider...".to_string(),
+                has_key: false,
+                has_env: false,
+                configured: false,
+                section: None,
+            });
+        }
 
         self.provider_items = items.clone();
         let mut picker = ListPicker::new();
@@ -309,7 +408,8 @@ impl LoginPicker {
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
         match &mut self.step {
-            Step::EnterKey { input, .. }
+            Step::RegistryInput { input, .. }
+            | Step::EnterKey { input, .. }
             | Step::CustomName { input }
             | Step::CustomUrl { input, .. }
             | Step::BuiltinUrl { input, .. } => {
@@ -323,13 +423,102 @@ impl LoginPicker {
     pub fn handle_key(&mut self, key: KeyEvent) -> LoginPickerAction {
         let action = match &mut self.step {
             Step::Closed => return LoginPickerAction::Consumed,
+            Step::RegistryMethods { picker, provider } => match picker.handle_key(key) {
+                PickerAction::Select(choice) => {
+                    let provider = provider.clone();
+                    let method = choice.id.clone();
+                    self.start_registry_login(provider, method);
+                    return LoginPickerAction::Consumed;
+                }
+                PickerAction::Close => StepAction::Back,
+                _ => StepAction::None,
+            },
+            Step::RegistryWaiting => {
+                if key.code == KeyCode::Esc {
+                    self.cancel_registry();
+                    StepAction::Back
+                } else {
+                    StepAction::None
+                }
+            }
+            Step::RegistryInput {
+                input,
+                optional,
+                reply,
+                ..
+            } => match key.code {
+                KeyCode::Esc => {
+                    self.cancel_registry();
+                    StepAction::Back
+                }
+                KeyCode::Enter => {
+                    let value = input.value().to_string();
+                    if value.is_empty() && !*optional {
+                        return LoginPickerAction::Consumed;
+                    }
+                    let _ = reply.send(InteractionResponse::Input(if value.is_empty() {
+                        None
+                    } else {
+                        Some(value)
+                    }));
+                    self.step = Step::RegistryWaiting;
+                    return LoginPickerAction::Consumed;
+                }
+                _ => {
+                    input.handle_key(key);
+                    return LoginPickerAction::Consumed;
+                }
+            },
+            Step::RegistryChoice { picker, reply } => match picker.handle_key(key) {
+                PickerAction::Select(choice) => {
+                    let _ = reply.send(InteractionResponse::Choice(choice.id.clone()));
+                    self.step = Step::RegistryWaiting;
+                    return LoginPickerAction::Consumed;
+                }
+                PickerAction::Close => {
+                    self.cancel_registry();
+                    StepAction::Back
+                }
+                _ => StepAction::None,
+            },
+            Step::RegistryNotice { reply, .. } => match key.code {
+                KeyCode::Enter => {
+                    let _ = reply.send(InteractionResponse::Acknowledged(true));
+                    self.step = Step::RegistryWaiting;
+                    return LoginPickerAction::Consumed;
+                }
+                KeyCode::Esc => {
+                    self.cancel_registry();
+                    StepAction::Back
+                }
+                _ => StepAction::None,
+            },
             Step::Instructions { .. } => match key.code {
                 KeyCode::Esc | KeyCode::Enter => StepAction::Back,
                 _ => return LoginPickerAction::Consumed,
             },
             Step::PickProvider(picker) => match picker.handle_key(key) {
                 PickerAction::Select(item) => {
-                    if item.slug == CATALOG_UNAVAILABLE_SLUG {
+                    if let Some(provider) = self
+                        .registry
+                        .snapshot()
+                        .get(&item.slug)
+                        .filter(|p| !p.auth_methods.is_empty())
+                        .cloned()
+                    {
+                        let choices = provider
+                            .auth_methods
+                            .iter()
+                            .map(|m| AuthChoice {
+                                id: m.id.clone(),
+                                label: m.label.clone(),
+                            })
+                            .collect();
+                        let mut picker = ListPicker::new();
+                        picker.open(choices, " Authentication method ");
+                        self.step = Step::RegistryMethods { picker, provider };
+                        return LoginPickerAction::Consumed;
+                    } else if item.slug == CATALOG_UNAVAILABLE_SLUG {
                         StepAction::None
                     } else if item.slug == "custom" {
                         StepAction::GoCustomName
@@ -776,7 +965,97 @@ impl LoginPicker {
         }
     }
 
+    fn cancel_registry(&mut self) {
+        self.registry_task = None;
+        self.registry_rx = None;
+        self.registry_done = None;
+    }
+
+    fn start_registry_login(&mut self, provider: ProviderRegistration, method: String) {
+        let (tx, rx) = flume::unbounded();
+        let (done_tx, done_rx) = flume::bounded(1);
+        self.registry_task = Some(smol::spawn(async move {
+            let result = provider
+                .factory
+                .login_interactive(&method, Arc::new(TuiInteraction(tx)))
+                .await;
+            let _ = done_tx.send((provider.id, result));
+        }));
+        self.registry_rx = Some(rx);
+        self.registry_done = Some(done_rx);
+        self.step = Step::RegistryWaiting;
+    }
+
     pub fn poll_codex(&mut self) -> Option<LoginPickerAction> {
+        if let Some((slug, result)) = self
+            .registry_done
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        {
+            self.cancel_registry();
+            return Some(match result {
+                Ok(serde_json::Value::Bool(true)) => {
+                    self.step = Step::Done {
+                        message: format!("Configured: {slug}"),
+                    };
+                    LoginPickerAction::Configured { slug }
+                }
+                result => {
+                    self.step = Step::Done {
+                        message: match result {
+                            Err(error) => format!("Login failed: {error}"),
+                            _ => "Login cancelled".into(),
+                        },
+                    };
+                    LoginPickerAction::Consumed
+                }
+            });
+        }
+        if matches!(self.step, Step::RegistryWaiting)
+            && let Some(message) = self.registry_rx.as_ref().and_then(|rx| rx.try_recv().ok())
+        {
+            self.step = match message.request {
+                InteractionRequest::Input {
+                    prompt,
+                    secret,
+                    optional,
+                } => Step::RegistryInput {
+                    prompt,
+                    secret,
+                    optional,
+                    input: TextBuffer::new(String::new()),
+                    reply: message.reply,
+                },
+                InteractionRequest::Choice { prompt, choices } => {
+                    let mut picker = ListPicker::new();
+                    picker.open(choices, prompt);
+                    Step::RegistryChoice {
+                        picker,
+                        reply: message.reply,
+                    }
+                }
+                InteractionRequest::Instructions { text } => Step::RegistryNotice {
+                    text,
+                    reply: message.reply,
+                },
+                InteractionRequest::DeviceChallenge { url, code } => Step::RegistryNotice {
+                    text: format!("Visit {url} and enter code {code}"),
+                    reply: message.reply,
+                },
+                InteractionRequest::OpenBrowser { url } => {
+                    if open::that(&url).is_ok() {
+                        let _ = message.reply.send(InteractionResponse::Acknowledged(true));
+                        Step::RegistryWaiting
+                    } else {
+                        Step::RegistryNotice {
+                            text: format!("Open this URL in your browser: {url}"),
+                            reply: message.reply,
+                        }
+                    }
+                }
+            };
+            return Some(LoginPickerAction::Consumed);
+        }
         let event = {
             let Step::CodexWaiting { codex_rx, .. } = &self.step else {
                 return None;
@@ -793,7 +1072,7 @@ impl LoginPicker {
             {
                 *slot = Some(user_code.clone());
             }
-            return None;
+            return Some(LoginPickerAction::Consumed);
         }
         match event {
             CodexEvent::Done(Ok(())) => {
@@ -823,6 +1102,63 @@ impl LoginPicker {
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
         match &mut self.step {
             Step::Closed => Rect::default(),
+            Step::RegistryMethods { picker, .. } | Step::RegistryChoice { picker, .. } => {
+                picker.view(frame, area)
+            }
+            Step::RegistryWaiting => {
+                let modal = Modal {
+                    title: TITLE,
+                    width_percent: 65,
+                    max_height_percent: 40,
+                };
+                let (popup, inner) = modal.render(frame, area, 1);
+                frame.render_widget(
+                    ratatui::widgets::Paragraph::new("Waiting for login... (Esc to cancel)"),
+                    inner,
+                );
+                popup
+            }
+            Step::RegistryInput {
+                prompt,
+                secret,
+                input,
+                ..
+            } => {
+                let modal = Modal {
+                    title: TITLE,
+                    width_percent: 65,
+                    max_height_percent: 40,
+                };
+                let (popup, inner) = modal.render(frame, area, 2);
+                let value = if *secret {
+                    Line::from("[hidden]")
+                } else {
+                    input_line_with_cursor(input)
+                };
+                frame.render_widget(
+                    ratatui::widgets::Paragraph::new(vec![Line::from(prompt.clone()), value])
+                        .wrap(Wrap { trim: true }),
+                    inner,
+                );
+                popup
+            }
+            Step::RegistryNotice { text, .. } => {
+                let modal = Modal {
+                    title: TITLE,
+                    width_percent: 70,
+                    max_height_percent: 60,
+                };
+                let (popup, inner) = modal.render(frame, area, INSTRUCTIONS_HEIGHT);
+                frame.render_widget(
+                    ratatui::widgets::Paragraph::new(vec![
+                        Line::from(text.clone()),
+                        Line::from("Enter to continue, Esc to cancel"),
+                    ])
+                    .wrap(Wrap { trim: true }),
+                    inner,
+                );
+                popup
+            }
             Step::PickProvider(picker) => picker.view(frame, area),
             Step::PickPlan { picker, .. } => picker.view(frame, area),
             Step::CodexWaiting {
@@ -931,7 +1267,11 @@ impl LoginPicker {
                     "Paste API key, then Enter"
                 };
                 let hint = Span::styled(hint_text, t.input_placeholder);
-                let input_line = input_line_with_cursor(input);
+                let input_line = if input.value().is_empty() {
+                    Line::from("")
+                } else {
+                    Line::from("[hidden]")
+                };
                 frame.render_widget(
                     ratatui::widgets::Paragraph::new(vec![Line::from(hint), input_line])
                         .style(Style::new().bg(t.background))
@@ -989,6 +1329,7 @@ impl Overlay for LoginPicker {
 
     fn close(&mut self) {
         self.abort_codex();
+        self.cancel_registry();
         self.step = Step::Closed;
     }
 }
@@ -1022,6 +1363,87 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn registry_input_hides_secret_and_accepts_optional_empty() {
+        let (tx, rx) = flume::bounded(1);
+        let mut picker = LoginPicker::new();
+        picker.step = Step::RegistryInput {
+            prompt: "Secret".into(),
+            secret: true,
+            optional: true,
+            input: TextBuffer::new("sensitive-value".into()),
+            reply: tx,
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+        let screen = crate::components::buffer_text(terminal.backend().buffer());
+        assert!(!screen.contains("sensitive-value"));
+        if let Step::RegistryInput { input, .. } = &mut picker.step {
+            *input = TextBuffer::new(String::new());
+        }
+        picker.handle_key(crate::components::key(KeyCode::Enter));
+        assert_eq!(rx.try_recv().unwrap(), InteractionResponse::Input(None));
+    }
+
+    #[test_case(serde_json::Value::Bool(true), true; "success")]
+    #[test_case(serde_json::Value::Null, false; "null is not success")]
+    #[test_case(serde_json::Value::Bool(false), false; "false is not success")]
+    fn registry_login_requires_explicit_success(value: serde_json::Value, success: bool) {
+        let (tx, rx) = flume::bounded(1);
+        tx.send(("fixture".into(), Ok(value))).unwrap();
+        let mut picker = LoginPicker::new();
+        picker.step = Step::RegistryWaiting;
+        picker.registry_done = Some(rx);
+        let action = picker.poll_codex().unwrap();
+        assert_eq!(
+            matches!(action, LoginPickerAction::Configured { .. }),
+            success
+        );
+    }
+
+    #[test]
+    fn registry_choice_returns_id() {
+        let (tx, rx) = flume::bounded(1);
+        let mut choices = ListPicker::new();
+        choices.open(
+            vec![AuthChoice {
+                id: "method-id".into(),
+                label: "Method label".into(),
+            }],
+            "Choose",
+        );
+        let mut picker = LoginPicker::new();
+        picker.step = Step::RegistryChoice {
+            picker: choices,
+            reply: tx,
+        };
+        picker.handle_key(crate::components::key(KeyCode::Enter));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            InteractionResponse::Choice("method-id".into())
+        );
+    }
+
+    #[test]
+    fn closing_registry_input_disconnects_response() {
+        let (tx, rx) = flume::bounded(1);
+        let mut picker = LoginPicker::new();
+        picker.step = Step::RegistryInput {
+            prompt: "Input".into(),
+            secret: false,
+            optional: false,
+            input: TextBuffer::new(String::new()),
+            reply: tx,
+        };
+        picker.close();
+        assert!(rx.is_disconnected());
+    }
+
     fn provider_slugs() -> Vec<String> {
         let dir = StateDir::from_path(tempfile::tempdir().unwrap().keep());
         let mut picker = LoginPicker::new();
@@ -1042,6 +1464,7 @@ mod tests {
             },
             provider_items: Vec::new(),
             storage: None,
+            ..LoginPicker::new()
         };
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
@@ -1061,6 +1484,7 @@ mod tests {
             step: Step::PickProvider(ListPicker::new()),
             provider_items: Vec::new(),
             storage: None,
+            ..LoginPicker::new()
         };
         picker.transition(StepAction::GoInstructions {
             display_name: "Google Vertex AI".into(),
@@ -1091,6 +1515,7 @@ mod tests {
             },
             provider_items: Vec::new(),
             storage: None,
+            ..LoginPicker::new()
         }
     }
 
@@ -1135,12 +1560,16 @@ mod tests {
             },
             provider_items: Vec::new(),
             storage: None,
+            ..LoginPicker::new()
         };
         tx.send(CodexEvent::Started {
             user_code: "ABCD-EFGH".into(),
         })
         .unwrap();
-        assert!(picker.poll_codex().is_none());
+        assert!(matches!(
+            picker.poll_codex(),
+            Some(LoginPickerAction::Consumed)
+        ));
         let Step::CodexWaiting { user_code, .. } = &picker.step else {
             panic!("expected codex waiting");
         };

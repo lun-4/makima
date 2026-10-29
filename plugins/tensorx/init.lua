@@ -2,10 +2,28 @@ local chat = require("maki.chat_completions")
 local parameter_flags = {}
 local endpoint = "https://api.tensorx.ai/v1"
 
-local function credentials(config)
+local function credentials(ctx, config)
   local key = maki.uv.os_getenv(config.api_key_env or "TENSORX_API_KEY")
-  if not key or key == "" then
+  local source = "env"
+  if not key or not key:find("[^,%s]") then
+    source = "stored"
+    if ctx and ctx.credentials then
+      local saved, err = ctx.credentials:read("api_key")
+      if err then
+        return nil, err
+      end
+      if saved ~= nil then
+        if type(saved) ~= "table" or type(saved.api_key) ~= "string" or saved.api_key == "" then
+          return nil, { kind = "config", message = "Invalid TensorX credentials" }
+        end
+        return { saved.api_key }, nil, source
+      end
+    end
     key = config.api_key
+    source = "config"
+  end
+  if key ~= nil and type(key) ~= "string" then
+    return nil, { kind = "config", message = "Invalid TensorX credentials" }
   end
   local keys = {}
   for part in (key or ""):gmatch("[^,]+") do
@@ -17,7 +35,7 @@ local function credentials(config)
   if #keys == 0 then
     return nil, { kind = "config", message = "TensorX API key is not configured" }
   end
-  return keys
+  return keys, nil, source
 end
 
 local function headers(config, key)
@@ -35,7 +53,7 @@ end
 
 local function discover(ctx, config)
   config = config or {}
-  local keys, err = credentials(config)
+  local keys, err = credentials(ctx, config)
   if not keys then
     return nil, err
   end
@@ -126,9 +144,9 @@ local function discover(ctx, config)
   return models
 end
 
-local function prepare(_, model, config)
+local function prepare(ctx, model, config)
   config = config or {}
-  local keys, err = credentials(config)
+  local keys, err = credentials(ctx, config)
   if not keys then
     return nil, err
   end
@@ -196,12 +214,42 @@ local function prepare(_, model, config)
   }
 end
 
+local function login(ctx, ui)
+  local key, err = ui:input("TensorX API key", true, false)
+  if err then
+    return nil, err
+  end
+  if not key then
+    return false
+  end
+  if key:match("^%s*$") then
+    return nil, { kind = "config", message = "TensorX API key is empty" }
+  end
+  return ctx.credentials:write("api_key", { api_key = key:match("^%s*(.-)%s*$") })
+end
+
+local function auth_status(ctx, config)
+  local keys, err, source = credentials(ctx, config or {})
+  if not keys then
+    if err and err.message ~= "TensorX API key is not configured" then
+      return nil, err
+    end
+    return { configured = false }
+  end
+  return { configured = true, method = "api_key", source = source }
+end
+
 maki.api.register_provider({
   id = "tensorx",
   display_name = "TensorX",
   models = {},
   discover = discover,
   prepare = prepare,
+  auth = { { id = "api_key", label = "API key", login = login } },
+  auth_status = auth_status,
+  logout = function(ctx)
+    return ctx.credentials:delete("api_key")
+  end,
   supports_thinking = true,
   accepts_arbitrary_models = true,
   fallback_context_window = 200000,

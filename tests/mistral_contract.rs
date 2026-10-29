@@ -6,9 +6,15 @@ use std::time::Duration;
 
 use http_contract::{HttpContract, Response, Step};
 use maki_agent::tools::ToolRegistry;
-use maki_lua::PluginHost;
+use maki_commands::CommandRegistry;
+use maki_config::PluginsConfig;
+use maki_lua::{PluginHost, test_support::InMemoryFs, ui_sink::HostUi};
 use maki_providers::{Message, Model, ProviderEvent, RequestOptions, ThinkingConfig};
 use maki_storage::id::SessionRef;
+use maki_storage::{
+    StateDir,
+    auth::{ProviderCredentials, load_provider_credentials, save_provider_credentials},
+};
 use serde_json::{Value, json};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -26,8 +32,62 @@ fn response(body: &str) -> Response {
     }
 }
 
+fn mistral_legacy_auth_discovery_and_logout() {
+    let server = HttpContract::start(vec![response(
+        r#"{"data":[{"id":"chat","capabilities":{"completion_chat":true,"reasoning":true}}]}"#,
+    )])
+    .unwrap();
+    maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
+    let temp = tempfile::tempdir().unwrap();
+    let state = StateDir::from_path(temp.path().to_path_buf());
+    save_provider_credentials(
+        &state,
+        "mistral",
+        &ProviderCredentials {
+            api_key: "saved-key".into(),
+            host: None,
+        },
+    )
+    .unwrap();
+    let mut host = PluginHost::with_session_provider_preparer(
+        Arc::new(ToolRegistry::new()),
+        CommandRegistry::new(),
+        true,
+        Arc::new(InMemoryFs::new()),
+        Some(temp.path().to_path_buf()),
+        None,
+        HostUi::Frontend,
+    )
+    .unwrap();
+    host.load_builtins(&PluginsConfig {
+        enabled: true,
+        names: vec!["mistral".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let factory = &snapshot.get("mistral").unwrap().factory;
+    let config = json!({"api_key_env":"MAKI_MISTRAL_CONTRACT_MISSING", "api_key":"config-key", "base_url":format!("http://{}/v1", server.addr)});
+    assert_eq!(
+        smol::block_on(factory.auth_status(&config)).unwrap()["source"],
+        "stored"
+    );
+    let models = smol::block_on(factory.discover(&config)).unwrap().unwrap();
+    assert_eq!(models[0].supports_thinking, Some(true));
+    let request = server.requests.recv_timeout(TIMEOUT).unwrap().unwrap();
+    assert_eq!(request.header("authorization"), Some("Bearer saved-key"));
+    smol::block_on(factory.logout(&config)).unwrap();
+    assert!(load_provider_credentials(&state, "mistral").is_none());
+    assert_eq!(
+        smol::block_on(factory.auth_status(&config)).unwrap()["source"],
+        "config"
+    );
+    maki_lua::set_allowed_private_hosts(&[]);
+}
+
 #[test]
 fn mistral_discovery_and_rotated_stream() {
+    mistral_legacy_auth_discovery_and_logout();
     let server = HttpContract::start(vec![
         response(r#"{"data":[{"id":"chat","max_context_length":12345,"capabilities":{"completion_chat":true,"reasoning":false,"vision":true}},{"id":"other","capabilities":{"completion_chat":false}},{"id":"unknown","max_context_length":0,"capabilities":{"completion_chat":true}}]}"#),
         response(STREAM),

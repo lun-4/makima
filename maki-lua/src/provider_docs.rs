@@ -46,6 +46,12 @@ fn module_source(name: &str) -> Option<&'static str> {
         "maki.mistral" => Some(include_str!("../../plugins/lib/maki/mistral.lua")),
         "maki.regolo" => Some(include_str!("../../plugins/lib/maki/regolo.lua")),
         "maki.zai" => Some(include_str!("../../plugins/lib/maki/zai.lua")),
+        "maki.deepseek" => Some(include_str!("../../plugins/lib/maki/deepseek.lua")),
+        "maki.openai" => Some(include_str!("../../plugins/lib/maki/openai.lua")),
+        "maki.openai_auth" => Some(include_str!("../../plugins/lib/maki/openai_auth.lua")),
+        "maki.json_response" => Some(include_str!("../../plugins/lib/maki/json_response.lua")),
+        "maki.requesty" => Some(include_str!("../../plugins/lib/maki/requesty.lua")),
+        "maki.responses" => Some(include_str!("../../plugins/lib/maki/responses.lua")),
         "maki.synthetic" => Some(include_str!("../../plugins/lib/maki/synthetic.lua")),
         "maki.provider_types" => Some(include_str!("../../plugins/lib/maki/provider_types.lua")),
         _ => None,
@@ -232,6 +238,13 @@ pub fn load_bundled_providers() -> Result<Vec<OfflineProvider>> {
         ("deepseek", include_str!("../../plugins/deepseek/init.lua")),
         ("google", include_str!("../../plugins/google/init.lua")),
         ("mistral", include_str!("../../plugins/mistral/init.lua")),
+        ("openai", include_str!("../../plugins/openai/init.lua")),
+        ("requesty", include_str!("../../plugins/requesty/init.lua")),
+        (
+            "llama-cpp",
+            include_str!("../../plugins/llama-cpp/init.lua"),
+        ),
+        ("tensorx", include_str!("../../plugins/tensorx/init.lua")),
         ("regolo", include_str!("../../plugins/regolo/init.lua")),
         ("zai", include_str!("../../plugins/zai/init.lua")),
         (
@@ -351,6 +364,12 @@ mod tests {
         for id in ["synthetic", "regolo", "zai"] {
             assert!(
                 providers.iter().any(|p| p.id == id && !p.models.is_empty()),
+                "{id}"
+            );
+        }
+        for id in ["openai", "requesty", "llama-cpp", "tensorx"] {
+            assert!(
+                providers.iter().any(|p| p.id == id && p.models.is_empty()),
                 "{id}"
             );
         }

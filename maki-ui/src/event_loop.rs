@@ -1432,6 +1432,9 @@ impl SpawnCtx {
             crate::theme::default_provider().clone(),
             Arc::clone(&self.command_runtime),
         );
+        app.app
+            .login_picker
+            .set_registry(Arc::clone(&self.provider_registry));
         let handles = AgentHandles::prepare(
             &model_slot,
             config,

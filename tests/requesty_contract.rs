@@ -140,6 +140,7 @@ fn requesty_discovery_tolerates_one_failure_and_rejects_two() {
     const CATALOG: &str = r#"{"data":[{"id":"available","context_window":8192}]}"#;
     for statuses in [
         ["200 OK", "503 Service Unavailable"],
+        ["503 Service Unavailable", "200 OK"],
         ["503 Service Unavailable", "503 Service Unavailable"],
     ] {
         let server = HttpContract::start(
@@ -157,7 +158,7 @@ fn requesty_discovery_tolerates_one_failure_and_rejects_two() {
             "api_key": "fixture-key", "api_key_env": "REQUESTY_CONTRACT_UNUSED_KEY",
             "base_url": format!("http://{}/v1", server.addr)
         })));
-        if statuses[0] == "200 OK" {
+        if statuses.contains(&"200 OK") {
             let models = result.unwrap().unwrap();
             assert_eq!(models.len(), 1);
             assert_eq!(models[0].id, "available");

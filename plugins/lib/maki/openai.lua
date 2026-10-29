@@ -450,6 +450,7 @@ function M.register()
     display_name = "OpenAI",
     prepare = M.prepare,
     discover = M.discover,
+    auth = { { id = "chatgpt", label = "ChatGPT login", login = require("maki.openai_auth").login } },
     auth_status = M.auth_status,
     logout = M.logout,
   })

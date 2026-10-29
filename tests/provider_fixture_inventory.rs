@@ -22,7 +22,10 @@ struct Fixture {
     check: fn() -> Result<(), String>,
 }
 
-fn run_inventory(fixtures: &[Fixture]) -> Result<BTreeSet<FixtureId>, Vec<String>> {
+fn run_inventory(
+    fixtures: &[Fixture],
+    required: &[FixtureId],
+) -> Result<BTreeSet<FixtureId>, Vec<String>> {
     let mut counts = BTreeMap::new();
     for fixture in fixtures {
         *counts.entry(fixture.id).or_insert(0usize) += 1;
@@ -43,6 +46,11 @@ fn run_inventory(fixtures: &[Fixture]) -> Result<BTreeSet<FixtureId>, Vec<String
                 passed.insert(fixture.id);
             }
             Err(error) => errors.push(format!("{:?}: {error}", fixture.id)),
+        }
+    }
+    for id in required {
+        if !counts.contains_key(id) {
+            errors.push(format!("missing fixture: {id:?}"));
         }
     }
     if errors.is_empty() {
@@ -145,6 +153,8 @@ fn custom_chat_request() -> Result<(), String> {
     Ok(())
 }
 
+const REQUIRED_RUST_FIXTURES: &[FixtureId] = &[KEY_ROTATION, CUSTOM_CHAT];
+
 const RUST_FIXTURES: &[Fixture] = &[
     Fixture {
         id: KEY_ROTATION,
@@ -158,7 +168,10 @@ const RUST_FIXTURES: &[Fixture] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::{CUSTOM_CHAT, Fixture, FixtureId, KEY_ROTATION, RUST_FIXTURES, run_inventory};
+    use super::{
+        CUSTOM_CHAT, Fixture, FixtureId, KEY_ROTATION, REQUIRED_RUST_FIXTURES, RUST_FIXTURES,
+        run_inventory,
+    };
 
     const OTHER: FixtureId = FixtureId {
         case: "other",
@@ -175,7 +188,7 @@ mod tests {
 
     #[test]
     fn rust_inventory_executes_real_key_rotation() {
-        let passed = run_inventory(RUST_FIXTURES).unwrap();
+        let passed = run_inventory(RUST_FIXTURES, REQUIRED_RUST_FIXTURES).unwrap();
         assert_eq!(passed.len(), 2);
         assert!(passed.contains(&KEY_ROTATION));
         assert!(passed.contains(&CUSTOM_CHAT));
@@ -187,8 +200,22 @@ mod tests {
             id: OTHER,
             check: fail,
         }];
-        let errors = run_inventory(&fixtures).unwrap_err();
+        let errors = run_inventory(&fixtures, &[]).unwrap_err();
         assert!(errors[0].contains(FAILURE));
+    }
+
+    #[test]
+    fn missing_required_fixture_is_rejected() {
+        let fixtures = [Fixture {
+            id: KEY_ROTATION,
+            check: pass,
+        }];
+        let errors = run_inventory(&fixtures, &[KEY_ROTATION, OTHER]).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("missing fixture") && error.contains("other"))
+        );
     }
 
     #[test]
@@ -203,7 +230,7 @@ mod tests {
                 check: pass,
             },
         ];
-        let errors = run_inventory(&fixtures).unwrap_err();
+        let errors = run_inventory(&fixtures, &[]).unwrap_err();
         assert!(
             errors
                 .iter()

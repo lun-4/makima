@@ -7018,6 +7018,9 @@ function M.build_request(request, options)
 ```lua
 M.models = {}
 function M.stream(response, emit)
+function M.login(ctx, ui)
+function M.auth_status(ctx, config)
+function M.logout(ctx)
 function M.discover(ctx, config)
 function M.prepare(ctx, model, config)
 function M.parse_usage(value, parse_timestamp)
@@ -7064,6 +7067,11 @@ end
 return M
 ```
 
+### `require("maki.deepseek")`
+
+```lua
+```
+
 ### `require("maki.dir_listing")`
 
 ```lua
@@ -7096,8 +7104,11 @@ function M.convert_tools(tools)
 function M.build_request(request)
 function M.stream(body, emit, max_event_bytes)
 M.models = models
-function M.prepare(_, model, config)
+function M.prepare(ctx, model, config)
 function M.discover(ctx, config)
+function M.login(ctx, ui)
+function M.auth_status(ctx, config)
+function M.logout(ctx)
 function M.register()
 ```
 
@@ -7190,6 +7201,7 @@ function M.account_id(token)
 function M.start(ctx)
 function M.poll(ctx, session)
 function M.exchange(ctx, device_token, now_ms)
+function M.login(ctx, ui)
 function M.refresh(ctx, current, now_ms)
 ```
 
@@ -7278,6 +7290,11 @@ function M.login(ctx, ui)
 function M.auth_status(ctx, config)
 function M.logout(ctx)
 function M.register()
+```
+
+### `require("maki.requesty")`
+
+```lua
 ```
 
 ### `require("maki.responses")`
@@ -7543,6 +7560,7 @@ function M.parse_quotas(body)
 function M.login(ctx, ui)
 function M.auth_status(ctx, config)
 function M.logout(ctx)
+function M.discover(ctx, config)
 function M.prepare(ctx, model_value, config)
 function M.register()
 ```

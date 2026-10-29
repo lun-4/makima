@@ -195,9 +195,9 @@ local function discover(ctx, config)
   if not is_object(data) or (data.data ~= nil and not is_array(data.data)) then
     return nil, { kind = "api", message = "Invalid Ollama models response" }
   end
-  local models = {}
+  local models, requests = {}, {}
   local root = base:gsub("/v1$", "")
-  for _, entry in ipairs(data.data or {}) do
+  for i, entry in ipairs(data.data or {}) do
     if not is_object(entry) or type(entry.id) ~= "string" then
       return nil, { kind = "api", message = "Invalid Ollama model id" }
     end
@@ -205,9 +205,14 @@ local function discover(ctx, config)
     if not body then
       return nil, { kind = "config", message = tostring(encode_err) }
     end
-    local show = json_request(ctx, root .. "/api/show", "POST", request_headers, body)
-    local context, vision = details(show)
-    models[#models + 1] = {
+    requests[i] = function()
+      return json_request(ctx, root .. "/api/show", "POST", request_headers, body)
+    end
+  end
+  local results = maki.async.gather(requests)
+  for i, entry in ipairs(data.data or {}) do
+    local context, vision = details(results[i].value)
+    models[i] = {
       id = entry.id,
       context_window = context,
       supports_vision = vision,

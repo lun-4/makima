@@ -42,21 +42,25 @@ M.models = {
 
 local function credentials(ctx, config)
   local key = maki.uv.os_getenv(config.api_key_env or "REGOLO_API_KEY")
-  if not key or key == "" then
+  local source = "env"
+  if not key or not key:find("[^,%s]") then
+    key = nil
+    source = "stored"
     if ctx and ctx.credentials then
       local saved, err = ctx.credentials:read("api_key")
-      if err and not config.api_key then
+      if err then
         return nil, err
       end
       if saved ~= nil then
         if type(saved) ~= "table" or type(saved.api_key) ~= "string" or saved.api_key == "" then
           return nil, { kind = "config", message = "Invalid Regolo credentials" }
         end
-        key = saved.api_key
+        return { saved.api_key }, nil, source
       end
     end
     if not key or key == "" then
       key = config.api_key
+      source = "config"
     end
   end
   if key ~= nil and type(key) ~= "string" then
@@ -72,7 +76,7 @@ local function credentials(ctx, config)
   if #keys == 0 then
     return nil, { kind = "config", message = "Regolo API key is not configured" }
   end
-  return keys
+  return keys, nil, source
 end
 
 local function base_url(config)
@@ -342,11 +346,14 @@ function M.login(ctx, ui)
 end
 
 function M.auth_status(ctx, config)
-  local keys, err = credentials(ctx, config or {})
-  if err and err.message ~= "Regolo API key is not configured" then
-    return nil, err
+  local keys, err, source = credentials(ctx, config or {})
+  if not keys then
+    if err and err.message ~= "Regolo API key is not configured" then
+      return nil, err
+    end
+    return { configured = false }
   end
-  return { configured = keys ~= nil, method = "api_key" }
+  return { configured = true, method = "api_key", source = source }
 end
 
 function M.logout(ctx)

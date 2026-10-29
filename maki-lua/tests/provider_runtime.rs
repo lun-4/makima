@@ -99,6 +99,63 @@ fn factory_auth_hooks_run_without_preparing_and_revoke_on_unload() {
 }
 
 #[test]
+fn logout_cancels_pending_login_without_existing_credentials() {
+    use maki_providers::provider::BoxFuture;
+    use maki_providers::provider_registry::{
+        InteractionRequest, InteractionResponse, InteractionService,
+    };
+
+    struct Pending(flume::Sender<()>);
+    impl InteractionService for Pending {
+        fn interact(
+            &self,
+            _: InteractionRequest,
+        ) -> BoxFuture<'_, Result<InteractionResponse, AgentError>> {
+            Box::pin(async move {
+                self.0.send(()).unwrap();
+                std::future::pending().await
+            })
+        }
+    }
+
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source(
+        "fixture",
+        r#"
+        local configured = false
+        maki.api.register_provider({ id = 'fixture', models = {{ id = 'offline' }},
+            auth = {{ id = 'key', label = 'Key', login = function(_, ui)
+                ui:input('Key', true, false)
+                configured = true
+                return true
+            end }},
+            logout = function() configured = false; return true end,
+            auth_status = function() return { configured = configured } end,
+            prepare = function() error('unused') end,
+        })
+    "#,
+    )
+    .unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let factory = snapshot.get("fixture").unwrap().factory.clone();
+    let (ready, received) = flume::bounded(1);
+    let login_factory = factory.clone();
+    let login = std::thread::spawn(move || {
+        smol::block_on(login_factory.login_interactive("key", Arc::new(Pending(ready))))
+    });
+    received.recv().unwrap();
+    assert_eq!(
+        smol::block_on(factory.logout(&json!({}))).unwrap(),
+        json!(true)
+    );
+    assert!(matches!(login.join().unwrap(), Err(AgentError::Cancelled)));
+    assert_eq!(
+        smol::block_on(factory.auth_status(&json!({}))).unwrap()["configured"],
+        false
+    );
+}
+
+#[test]
 fn interactive_login_dispatches_input_and_cancellation() {
     use maki_providers::provider::BoxFuture;
     use maki_providers::provider_registry::{
@@ -597,6 +654,98 @@ fn same_provider_id_prepares_against_its_own_host() {
             .message
             .first_text_content(),
         Some("second")
+    );
+}
+
+#[test]
+fn provider_endpoint_resolver_routes_request_without_changing_authority() {
+    use maki_lua::test_support::ProviderEndpointResolver;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    const HOST: &str = "provider.example.invalid";
+    const PORT: u16 = 8080;
+    const RESPONSE: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    let mut resolver = ProviderEndpointResolver::default();
+    resolver.add(HOST, PORT, vec![address]);
+    resolver.allow_private_host(HOST, PORT);
+    host.install_provider_resolver_for_tests(resolver).unwrap();
+    host.load_source("fixture", r#"
+        maki.api.register_provider({ id = 'fixture', models = {{ id = 'gpt-5.6-sol' }},
+            prepare = function(_, model)
+                return { model = model, stream = function(ctx)
+                    local response, err = ctx:send({ url = 'http://provider.example.invalid:8080/path?x=1' })
+                    assert(response, err and err.message)
+                    local body, read_err = response:read()
+                    assert(body == 'ok', read_err and read_err.message)
+                    return { message = { role = 'assistant', content = {{ type = 'text', text = body }} },
+                        usage = { input = 0, output = 0, cache_creation = 0, cache_read = 0 }, stop_reason = 'end_turn' }
+                end }
+            end,
+        })
+    "#).unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let (mut socket, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::yield_now()
+                }
+                Err(e) => panic!("accept failed: {e}"),
+            }
+        };
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut data = Vec::new();
+        let mut buf = [0; 1024];
+        while !data.windows(4).any(|part| part == b"\r\n\r\n") {
+            let n = socket.read(&mut buf).unwrap();
+            assert_ne!(n, 0);
+            data.extend_from_slice(&buf[..n]);
+        }
+        socket.write_all(RESPONSE.as_bytes()).unwrap();
+        String::from_utf8(data).unwrap()
+    });
+    let snapshot = host.provider_registry().snapshot();
+    let factory = &snapshot.get("fixture").unwrap().factory;
+    let mut model = Model::from_spec("openai/gpt-5.6-sol").unwrap();
+    model.provider = Arc::from("fixture");
+    let (model, provider) = smol::block_on(factory.prepare(&model, &json!({}))).unwrap();
+    let (events, _) = flume::unbounded();
+    let options = RequestOptions {
+        thinking: ThinkingConfig::Off,
+        fast: false,
+    };
+    let result = smol::block_on(provider.stream_message(
+        &model,
+        &[],
+        "",
+        &json!([]),
+        &events,
+        options,
+        None,
+    ));
+    let request = server.join().unwrap();
+    assert_eq!(result.unwrap().message.first_text_content(), Some("ok"));
+    assert!(
+        request.starts_with("GET /path?x=1 HTTP/1.1\r\n"),
+        "{request}"
+    );
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("\r\nhost: provider.example.invalid:8080\r\n"),
+        "{request}"
     );
 }
 

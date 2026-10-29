@@ -13,6 +13,8 @@ use maki_config::PluginsConfig;
 use maki_lua::{PluginHost, test_support::InMemoryFs, ui_sink::HostUi};
 use maki_providers::{
     AgentError, Message, Model, ProviderEvent, RequestOptions, StopReason, ThinkingConfig,
+    provider::BoxFuture,
+    provider_registry::{InteractionRequest, InteractionResponse, InteractionService},
 };
 use maki_storage::{
     StateDir,
@@ -138,6 +140,37 @@ fn synthetic_legacy_auth_discovery_and_logout() {
     assert_eq!(
         smol::block_on(factory.auth_status(&config)).unwrap()["source"],
         "config"
+    );
+    struct KeyInput;
+    impl InteractionService for KeyInput {
+        fn interact(
+            &self,
+            request: InteractionRequest,
+        ) -> BoxFuture<'_, Result<InteractionResponse, AgentError>> {
+            assert_eq!(
+                request,
+                InteractionRequest::Input {
+                    prompt: "Synthetic API key".into(),
+                    secret: true,
+                    optional: false,
+                }
+            );
+            Box::pin(async { Ok(InteractionResponse::Input(Some("new-key".into()))) })
+        }
+    }
+    assert_eq!(
+        smol::block_on(factory.login_interactive("api_key", Arc::new(KeyInput))).unwrap(),
+        json!(true)
+    );
+    assert_eq!(
+        load_provider_credentials(&state, "synthetic")
+            .unwrap()
+            .api_key,
+        "new-key"
+    );
+    assert_eq!(
+        smol::block_on(factory.auth_status(&config)).unwrap()["source"],
+        "stored"
     );
 }
 

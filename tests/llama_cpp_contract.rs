@@ -57,6 +57,26 @@ fn discovery_modes_reach_http(props: &str, models: &str, expected: Vec<(&str, u3
     }
 }
 
+#[test_case(r#"{"data":[42]}"# ; "non_object_entry")]
+#[test_case(r#"{"data":[{"meta":{"n_ctx":2048}}]}"# ; "missing_id")]
+fn discovery_rejects_invalid_model_entries(models: &str) {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let response = |body: &str| Response {
+        status: "200 OK".into(),
+        headers: vec![],
+        steps: vec![Step::Chunk(body.as_bytes().to_vec())],
+    };
+    let server = HttpContract::start(vec![response("{}"), response(models)]).unwrap();
+    maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
+    let _private_host_guard = PrivateHostGuard;
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("llama-cpp", include_str!("../plugins/llama-cpp/init.lua"))
+        .unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let config = json!({"base_url": format!("http://{}", server.addr), "api_key_env": "LLAMACPP_CONTRACT_UNUSED_KEY"});
+    assert!(smol::block_on(snapshot.get("llama-cpp").unwrap().factory.discover(&config)).is_err());
+}
+
 #[test]
 fn discovery_http_error_preserves_body() {
     let _guard = TEST_LOCK.lock().unwrap();

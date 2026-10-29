@@ -6,6 +6,119 @@ use maki_providers::{Model, RequestOptions, ThinkingConfig};
 use serde_json::json;
 
 #[test]
+fn openai_device_flow_uses_host_http_transport() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    maki_lua::set_allowed_private_hosts(&[address.to_string()]);
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for (status, body) in [
+            (
+                "200 OK",
+                r#"{"device_auth_id":"device","user_code":"user","interval":"5"}"#,
+            ),
+            ("403 Forbidden", "pending"),
+            (
+                "200 OK",
+                r#"{"authorization_code":"a+b","code_verifier":"x/y"}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"access_token":"access","refresh_token":"refresh","expires_in":20}"#,
+            ),
+        ] {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "device request not received");
+                        std::thread::yield_now();
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut data = Vec::new();
+            let mut buffer = [0; 4096];
+            loop {
+                let count = socket.read(&mut buffer).unwrap();
+                assert_ne!(count, 0);
+                data.extend_from_slice(&buffer[..count]);
+                if let Some(end) = data.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&data[..end]);
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    if data.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            requests.push(String::from_utf8(data).unwrap());
+            write!(
+                socket,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        }
+        requests
+    });
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("device_http_contract", r#"
+        local auth = require('maki.openai_auth')
+        maki.api.register_provider({ id = 'device_http_contract',
+          prepare = function(ctx, model, config)
+            local proxy = { send = function(_, request)
+              local path = assert(request.url:match('^https://auth.openai.com(/.*)$'))
+              request.url = config.url .. path
+              return ctx:send(request)
+            end }
+            local session = assert(auth.start(proxy))
+            assert(session.user_code == 'user' and session.interval == 8)
+            local value, err = auth.poll(proxy, session)
+            assert(value == nil and err.kind == 'pending' and err.status == 403)
+            local device = assert(auth.poll(proxy, session))
+            local tokens = assert(auth.exchange(proxy, device, 1000))
+            assert(tokens.access == 'access' and tokens.refresh == 'refresh' and tokens.expires == 21000)
+            return { model = model, stream = function() end }
+          end })
+    "#).unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let mut model = Model::from_spec("openai/gpt-5.6-sol").unwrap();
+    model.provider = Arc::from("device_http_contract");
+    let prepared = smol::block_on(
+        snapshot
+            .get("device_http_contract")
+            .unwrap()
+            .factory
+            .prepare(&model, &json!({"url": format!("http://{address}")})),
+    );
+    let requests = server.join().unwrap();
+    maki_lua::set_allowed_private_hosts(&[]);
+    prepared.unwrap();
+    assert!(requests[0].starts_with("POST /api/accounts/deviceauth/usercode "));
+    assert!(requests[0].contains("app_EMoamEEZ73f0CkXaXp7hrann"));
+    assert!(requests[1].starts_with("POST /api/accounts/deviceauth/token "));
+    assert!(requests[2].contains("\"device_auth_id\":\"device\""));
+    assert!(requests[3].starts_with("POST /oauth/token "));
+    assert!(requests[3].contains("code=a%2Bb") && requests[3].contains("code_verifier=x%2Fy"));
+}
+
+#[test]
 fn openai_legacy_credential_scopes_interoperate_and_preserve_other_kind() {
     use maki_storage::StateDir;
     use maki_storage::auth::{

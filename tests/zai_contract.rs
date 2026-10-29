@@ -92,6 +92,7 @@ fn zai_legacy_credentials_are_used_and_deleted() {
 #[test]
 fn zai_host_http_stream_quota_rotation_and_errors() {
     let server = HttpContract::start(vec![
+        response("200 OK", r#"{"data":[{"id":"glm-test","context_length":4096}]}"#, &[]),
         response("200 OK", STREAM, &[]),
         response("200 OK", concat!(
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"alpha\",\"arguments\":\"{\\\"value\\\":\"}}]}}]}\n\n",
@@ -101,8 +102,9 @@ fn zai_host_http_stream_quota_rotation_and_errors() {
         response("200 OK", r#"{"data":{"level":"Pro","limits":[{"type":"TOKENS_LIMIT","unit":3,"percentage":25,"nextResetTime":123},{"type":"TOKENS_LIMIT","unit":6,"percentage":50},{"type":"TIME_LIMIT","unit":1,"percentage":10},{"type":"X","unit":9,"percentage":5}]}}"#, &[]),
         response("429 Too Many Requests", "1113 insufficient balance", &[("Retry-After", "3")]),
         response("429 Too Many Requests", "rate limited", &[("Retry-After", "3")]),
-        response("503 Service Unavailable", "fixture-secret leaked", &[]),
+        response("503 Service Unavailable", "first, fixture-secret leaked", &[]),
         response("200 OK", r#"{"data":{"limits":[{"type":"TIME_LIMIT","unit":-1,"percentage":2}]}}"#, &[]),
+        response("429 Too Many Requests", "quota exceeded", &[("Retry-After", "7")]),
     ]).unwrap();
     maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
     let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
@@ -125,6 +127,18 @@ fn zai_host_http_stream_quota_rotation_and_errors() {
             .iter()
             .any(|model| model.id == "glm-5.3")
     );
+    let config = json!({"api_key_env": "MAKI_ZAI_CONTRACT_UNUSED_KEY", "api_key": "first, fixture-secret", "base_url": format!("http://{}/v4/", server.addr)});
+    let models = smol::block_on(registration.factory.discover(&config))
+        .unwrap()
+        .unwrap();
+    assert_eq!(models[0].id, "glm-test");
+    assert_eq!(models[0].context_window, Some(4096));
+    let request = server.requests.recv_timeout(TIMEOUT).unwrap().unwrap();
+    assert_eq!(request.target, "/v4/models");
+    assert_eq!(
+        request.header("authorization"),
+        Some("Bearer first, fixture-secret")
+    );
     let model = Model::from_spec("zai/glm-5.3").unwrap();
     let (model, provider) = smol::block_on(registration.factory.prepare(
         &model,
@@ -134,7 +148,7 @@ fn zai_host_http_stream_quota_rotation_and_errors() {
         }),
     ))
     .unwrap();
-    assert_eq!(provider.key_count(), 2);
+    assert_eq!(provider.key_count(), 1);
     let messages = [Message::user("prompt".into())];
     let options = RequestOptions {
         thinking: ThinkingConfig::Off,
@@ -160,7 +174,10 @@ fn zai_host_http_stream_quota_rotation_and_errors() {
     let request = server.requests.recv_timeout(TIMEOUT).unwrap().unwrap();
     assert_eq!(request.method, "POST");
     assert_eq!(request.target, "/v4/chat/completions");
-    assert_eq!(request.header("authorization"), Some("Bearer first"));
+    assert_eq!(
+        request.header("authorization"),
+        Some("Bearer first, fixture-secret")
+    );
     let body: Value = request.json().unwrap();
     assert_eq!(body["model"], "glm-5.3");
     assert_eq!(body["messages"][0]["content"], "system");
@@ -168,7 +185,7 @@ fn zai_host_http_stream_quota_rotation_and_errors() {
     assert_eq!(body["stream"], true);
     assert_eq!(body["reasoning_effort"], "none");
     assert!(body.get("stream_options").is_none());
-    assert!(smol::block_on(provider.rotate_key()).unwrap());
+    assert!(!smol::block_on(provider.rotate_key()).unwrap());
     let (events, received) = flume::unbounded();
     let result = smol::block_on(provider.stream_message(
         &model,
@@ -190,7 +207,7 @@ fn zai_host_http_stream_quota_rotation_and_errors() {
     let request = server.requests.recv_timeout(TIMEOUT).unwrap().unwrap();
     assert_eq!(
         request.header("authorization"),
-        Some("Bearer fixture-secret")
+        Some("Bearer first, fixture-secret")
     );
     let usage = smol::block_on(provider.fetch_usage()).unwrap().unwrap();
     assert_eq!(usage.plan.as_deref(), Some("Pro"));
@@ -206,7 +223,7 @@ fn zai_host_http_stream_quota_rotation_and_errors() {
     assert_eq!(request.target, "/api/monitor/usage/quota/limit");
     assert_eq!(
         request.header("authorization"),
-        Some("Bearer fixture-secret")
+        Some("Bearer first, fixture-secret")
     );
     for (status, message, retry) in [
         (402, "1113 insufficient balance", None),
@@ -231,7 +248,7 @@ fn zai_host_http_stream_quota_rotation_and_errors() {
         assert_eq!(request.target, "/v4/chat/completions");
         assert_eq!(
             request.header("authorization"),
-            Some("Bearer fixture-secret")
+            Some("Bearer first, fixture-secret")
         );
     }
     let error = smol::block_on(provider.fetch_usage()).unwrap_err();
@@ -247,6 +264,16 @@ fn zai_host_http_stream_quota_rotation_and_errors() {
             .unwrap()
             .method,
         "GET"
+    );
+    let error = smol::block_on(provider.fetch_usage()).unwrap_err();
+    assert!(
+        matches!(error, AgentError::Api { status: 429, ref message, retry_after: Some(delay), .. } if message == "quota exceeded" && delay == Duration::from_secs(7))
+    );
+    let request = server.requests.recv_timeout(TIMEOUT).unwrap().unwrap();
+    assert_eq!(request.target, "/api/monitor/usage/quota/limit");
+    assert_eq!(
+        request.header("authorization"),
+        Some("Bearer first, fixture-secret")
     );
     maki_lua::set_allowed_private_hosts(&[]);
 }
