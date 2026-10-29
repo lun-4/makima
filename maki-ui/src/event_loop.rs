@@ -63,6 +63,7 @@ use maki_lua::{
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, from_model};
+use maki_providers::provider_registry::ProviderRegistry;
 use maki_providers::{Message, Model};
 use maki_storage::StateDir;
 use maki_storage::StorageError;
@@ -168,6 +169,7 @@ pub struct EventLoopParams {
     pub status_content_reader: StatusContentReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
     pub lua_event_handle: EventHandle,
+    pub provider_registry: Arc<ProviderRegistry>,
     pub model_policy: Arc<ModelPolicy>,
     pub session_defaults: SessionDefaults,
     pub project_config: ProjectConfig,
@@ -645,6 +647,7 @@ fn observe_config_commits(
     model_slot: Arc<ProviderSlot>,
     coordinator: SessionCoordinatorHandle,
     prepare: PrepareProvider,
+    registry: Arc<ProviderRegistry>,
 ) -> Result<flume::Receiver<ConfigCommit>, ConfigChangeError> {
     let (manager, root) = handles.manager_and_root();
     let (ui_tx, ui_rx) = flume::unbounded();
@@ -658,7 +661,7 @@ fn observe_config_commits(
         let binding = target.map_err(ConfigChangeError::from).and_then(|target| {
             coordinator.bind_actor(
                 target,
-                model_preparer(prepare, timeouts),
+                model_preparer(prepare, timeouts, registry),
                 Arc::new(move |commit| {
                     model_slot.project(
                         commit.config.model.clone(),
@@ -779,6 +782,7 @@ struct PreparedSessionRuntime {
     coordinator: PreparedSessionCoordinator,
     checkpoint: Arc<CoordinatorCheckpointWriter>,
     prepare_provider: PrepareProvider,
+    provider_registry: Arc<ProviderRegistry>,
     provider: Option<PreparedProvider>,
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
@@ -829,6 +833,7 @@ impl PreparedSessionRuntime {
             seed_snapshot: _,
             checkpoint,
             prepare_provider,
+            provider_registry,
         } = self;
         checkpoint.bind(match &session_lock {
             Some(SessionLockState::Held(lock)) => Some(lock.publication_guard()),
@@ -856,6 +861,7 @@ impl PreparedSessionRuntime {
             Arc::clone(&model_slot),
             coordinator.clone(),
             prepare_provider,
+            provider_registry,
         ) {
             Ok(commits) => commits,
             Err(error) => {
@@ -906,6 +912,7 @@ impl PreparedSessionRuntime {
             seed_snapshot: _,
             checkpoint,
             prepare_provider,
+            provider_registry,
         } = self;
         checkpoint.bind(match &session_lock {
             Some(SessionLockState::Held(lock)) => Some(lock.publication_guard()),
@@ -934,6 +941,7 @@ impl PreparedSessionRuntime {
             Arc::clone(&model_slot),
             coordinator.clone(),
             prepare_provider,
+            provider_registry,
         ) {
             Ok(commits) => commits,
             Err(error) => {
@@ -1194,6 +1202,7 @@ impl SessionRuntime {
 /// Everything needed to bring up a new session runtime after startup.
 struct SpawnCtx {
     prepare_provider: PrepareProvider,
+    provider_registry: Arc<ProviderRegistry>,
     storage: StateDir,
     sessions_dir: PathBuf,
     config: AgentConfig,
@@ -1308,7 +1317,11 @@ impl SpawnCtx {
         {
             return Ok(None);
         }
-        let model = Model::from_spec(model_spec).map_err(|error| error.to_string())?;
+        let model = self
+            .provider_registry
+            .snapshot()
+            .resolve_model(model_spec, &self.model_policy)
+            .map_err(|error| error.to_string())?;
         let prepared =
             (self.prepare_provider)(model, self.timeouts).map_err(|error| error.to_string())?;
         Ok(Some(PreparedProvider {
@@ -1434,6 +1447,7 @@ impl SpawnCtx {
             self.mcp_handle.clone(),
             Arc::clone(&self.model_policy),
             self.system_prompt.clone(),
+            Arc::clone(&self.provider_registry),
         );
         let deps = self.coordinator_deps();
         let coordinator = prepare_coordinator(
@@ -1456,6 +1470,7 @@ impl SpawnCtx {
             coordinator,
             checkpoint: deps.checkpoint,
             prepare_provider: Arc::clone(&self.prepare_provider),
+            provider_registry: Arc::clone(&self.provider_registry),
             provider,
             shell_tx,
             shell_rx,
@@ -1649,10 +1664,11 @@ fn discover_models(
     catalog: &ModelCatalog,
     policy: Arc<ModelPolicy>,
     active: String,
+    registry: Arc<ProviderRegistry>,
     warn_tx: flume::Sender<String>,
     internal_tx: flume::Sender<InternalEvent>,
 ) -> Discovery {
-    catalog.discover(policy, active, move |warnings| {
+    catalog.discover(policy, active, registry, move |warnings| {
         for warning in warnings {
             let _ = warn_tx.try_send(warning);
         }
@@ -1688,6 +1704,7 @@ impl<'t> EventLoop<'t> {
             status_content_reader,
             ui_action_rx,
             lua_event_handle,
+            provider_registry,
             model_policy,
             session_defaults,
             project_config,
@@ -1729,13 +1746,20 @@ impl<'t> EventLoop<'t> {
                 &mut model, timeouts,
             ))
         } else {
-            Arc::from(from_model(&mut model, timeouts).context("create provider")?)
+            let prepared = prepare_provider(model, timeouts, &provider_registry)
+                .map_err(|error| eyre!(error.to_string()))
+                .context("create provider")?;
+            model = prepared.model;
+            prepared.provider
         };
         let (model_slot, provider_change_rx) = ProviderSlot::new(model.clone(), provider);
         let initial_provider = model_slot.load().provider.identity();
         let (internal_tx, internal_rx) = flume::unbounded();
         let (warn_tx, warn_rx) = flume::unbounded::<String>();
         let catalog = ModelCatalog::offline(&model_policy);
+        smol::block_on(
+            catalog.apply_provider_snapshot(&provider_registry.snapshot(), &model_policy),
+        );
         let storage_writer = Arc::new(StorageWriter::new(storage.clone(), warn_tx.clone()));
         let sessions_dir = storage.ensure_subdir(SESSIONS_DIR)?;
 
@@ -1753,8 +1777,12 @@ impl<'t> EventLoop<'t> {
         let command_runtime = Arc::new(command_runtime);
         let (mcp_handle, mcp_config_errors) =
             smol::block_on(mcp::start(&cwd, project_config.clone()));
+        let registry_for_preparation = Arc::clone(&provider_registry);
         let ctx = SpawnCtx {
-            prepare_provider: Arc::new(prepare_provider),
+            prepare_provider: Arc::new(move |model, timeouts| {
+                prepare_provider(model, timeouts, &registry_for_preparation)
+            }),
+            provider_registry,
             storage,
             sessions_dir: sessions_dir.clone(),
             config,
@@ -1838,6 +1866,7 @@ impl<'t> EventLoop<'t> {
             &ctx.catalog,
             Arc::clone(&ctx.model_policy),
             model.provider.to_string(),
+            Arc::clone(&ctx.provider_registry),
             warn_tx.clone(),
             internal_tx.clone(),
         );
@@ -4058,7 +4087,11 @@ impl<'t> EventLoop<'t> {
                 )
             });
         let policy = target_policy.unwrap_or_else(|| Arc::clone(&self.ctx.model_policy));
-        let prepare = model_preparer(Arc::clone(&self.ctx.prepare_provider), self.ctx.timeouts);
+        let prepare = model_preparer(
+            Arc::clone(&self.ctx.prepare_provider),
+            self.ctx.timeouts,
+            Arc::clone(&self.ctx.provider_registry),
+        );
         let internal_tx = self.internal_tx.clone();
         let session = self.sessions[idx].id();
         let runtime = self.sessions[idx].handles.identity();
@@ -4124,7 +4157,11 @@ impl<'t> EventLoop<'t> {
         let identity = self.sessions[idx].handles.identity();
         let internal_tx = self.internal_tx.clone();
         let policy = Arc::clone(&self.ctx.model_policy);
-        let prepare = model_preparer(Arc::clone(&self.ctx.prepare_provider), self.ctx.timeouts);
+        let prepare = model_preparer(
+            Arc::clone(&self.ctx.prepare_provider),
+            self.ctx.timeouts,
+            Arc::clone(&self.ctx.provider_registry),
+        );
         smol::spawn(async move {
             let result = match reserved {
                 Ok((ticket, expected)) => prepare_config_change(
@@ -4161,6 +4198,7 @@ impl<'t> EventLoop<'t> {
             &self.ctx.catalog,
             Arc::clone(&self.ctx.model_policy),
             self.focused_model_slot().load().model.provider.to_string(),
+            Arc::clone(&self.ctx.provider_registry),
             self.warn_tx.clone(),
             self.internal_tx.clone(),
         );
@@ -4422,10 +4460,21 @@ fn provider_usage_limit(limit: maki_providers::UsageLimit) -> ProviderUsageLimit
 }
 
 /// The TUI's provider preparation as the coordinator's async preparer.
-fn model_preparer(prepare: PrepareProvider, timeouts: Timeouts) -> ModelPreparer {
-    Arc::new(move |model| {
+fn model_preparer(
+    prepare: PrepareProvider,
+    timeouts: Timeouts,
+    registry: Arc<ProviderRegistry>,
+) -> ModelPreparer {
+    Arc::new(move |spec| {
         let prepare = Arc::clone(&prepare);
-        Box::pin(smol::unblock(move || prepare(model, timeouts)))
+        let registry = Arc::clone(&registry);
+        Box::pin(smol::unblock(move || {
+            let model = registry
+                .snapshot()
+                .resolve_model(&spec, &ModelPolicy::default())
+                .map_err(|error| Arc::from(error.to_string()))?;
+            prepare(model, timeouts)
+        }))
     })
 }
 
@@ -4555,7 +4604,29 @@ async fn prepare_config_change<T>(
     }
 }
 
-fn prepare_provider(mut model: Model, timeouts: Timeouts) -> Result<PreparedModel, Arc<str>> {
+fn prepare_provider(
+    mut model: Model,
+    timeouts: Timeouts,
+    registry: &ProviderRegistry,
+) -> Result<PreparedModel, Arc<str>> {
+    let snapshot = registry.snapshot();
+    if snapshot.get(&model.provider).is_some() {
+        let config = maki_config::providers::ProvidersConfig::load_or_default();
+        let config = config
+            .providers
+            .get(model.provider.as_ref())
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| Arc::from(error.to_string()))?
+            .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+        let (model, provider) = smol::block_on(snapshot.prepare(&model, &config))
+            .ok_or_else(|| Arc::from("provider registration disappeared"))?
+            .map_err(|error| Arc::from(error.user_message()))?;
+        return Ok(PreparedModel {
+            model,
+            provider: Arc::from(provider),
+        });
+    }
     let provider =
         from_model(&mut model, timeouts).map_err(|error| Arc::from(error.to_string()))?;
     Ok(PreparedModel {
@@ -4680,6 +4751,64 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
     use test_case::test_case;
+
+    #[test]
+    fn model_preparer_resolves_registered_only_models() {
+        use maki_providers::AgentError;
+        use maki_providers::model::ModelInfo;
+        use maki_providers::provider::BoxFuture;
+        use maki_providers::provider_registry::{ProviderFactory, ProviderRegistration};
+        use serde_json::Value;
+
+        const SPEC: &str = "tui-registry-test/model";
+        const WINDOW: u32 = 42_000;
+        struct Factory;
+        impl ProviderFactory for Factory {
+            fn prepare<'a>(
+                &'a self,
+                _: &'a Model,
+                _: &'a Value,
+            ) -> BoxFuture<'a, Result<(Model, Box<dyn Provider>), AgentError>> {
+                Box::pin(async { Err(AgentError::Cancelled) })
+            }
+        }
+        let registry = Arc::new(ProviderRegistry::default());
+        registry
+            .register(ProviderRegistration {
+                id: "tui-registry-test".into(),
+                display_name: "TUI test".into(),
+                models: vec![ModelInfo {
+                    context_window: Some(WINDOW),
+                    ..ModelInfo::id_only("model".into())
+                }],
+                factory: Arc::new(Factory),
+            })
+            .unwrap();
+        let prepare: PrepareProvider = Arc::new(|model, _| {
+            Ok(PreparedModel {
+                model,
+                provider: Arc::new(StubProvider),
+            })
+        });
+        let preparer = model_preparer(
+            Arc::clone(&prepare),
+            Timeouts::default(),
+            Arc::clone(&registry),
+        );
+        let prepared = smol::block_on(preparer(SPEC.into())).unwrap();
+        assert_eq!(prepared.model.spec(), SPEC);
+        assert_eq!(prepared.model.context_window, WINDOW);
+        assert!(smol::block_on(preparer("tui-registry-test/missing".into())).is_err());
+
+        let mut harness = RuntimeHarness::new();
+        let ctx = harness.ctx.as_mut().unwrap();
+        ctx.provider_registry = registry;
+        ctx.prepare_provider = prepare;
+        let session = AppSession::new(SPEC, "/tmp");
+        let replacement = ctx.prepare_replacement_provider(&session).unwrap().unwrap();
+        assert_eq!(replacement.model.spec(), SPEC);
+        assert_eq!(replacement.model.context_window, WINDOW);
+    }
 
     const OBSERVATION: &str = "failed";
     const PENDING_FAST_MODEL: &str = "pending-fast-model";
@@ -5503,6 +5632,7 @@ mod tests {
                     provider: Arc::new(StubProvider),
                 })
             }),
+            Arc::new(ProviderRegistry::default()),
         )
         .unwrap();
         SessionRuntime {
@@ -5825,7 +5955,10 @@ mod tests {
             let storage_writer =
                 Arc::new(StorageWriter::new(storage.clone(), flume::unbounded().0));
             let ctx = SpawnCtx {
-                prepare_provider: Arc::new(prepare_provider),
+                prepare_provider: Arc::new(move |model, timeouts| {
+                    prepare_provider(model, timeouts, &ProviderRegistry::default())
+                }),
+                provider_registry: Arc::new(ProviderRegistry::default()),
                 storage,
                 sessions_dir,
                 config: AgentConfig::default(),

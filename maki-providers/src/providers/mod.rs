@@ -12,7 +12,9 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use maki_storage::StateDir;
-use maki_storage::auth::{OAuthTokens, load_tokens, lock_tokens, save_tokens};
+use maki_storage::auth::{
+    OAuthTokens, delete_tokens_unlocked, load_tokens, lock_tokens, save_tokens_unlocked,
+};
 
 use crate::AgentError;
 
@@ -97,7 +99,9 @@ pub(crate) fn refreshed_tokens(
     provider: &str,
     refresh: impl FnOnce(&OAuthTokens) -> Result<OAuthTokens, AgentError>,
 ) -> Result<OAuthTokens, AgentError> {
-    let _lock = lock_tokens(dir, provider);
+    let _lock = lock_tokens(dir, provider).ok_or_else(|| AgentError::Config {
+        message: format!("could not acquire {provider} credential lock"),
+    })?;
     let current = load_tokens(dir, provider).ok_or_else(|| {
         AgentError::api(
             UNAUTHORIZED_STATUS,
@@ -107,12 +111,17 @@ pub(crate) fn refreshed_tokens(
     if !current.is_expired() {
         return Ok(current);
     }
-    let fresh = refresh(&current)?;
-    // Not `?`: every caller reads an error here as "these credentials are
-    // dead" and deletes the token file, so a full disk would log the user out
-    // over a refresh that actually succeeded. The run keeps the token it just
-    // got and the next start refreshes again.
-    if let Err(e) = save_tokens(dir, provider, &fresh) {
+    let fresh = match refresh(&current) {
+        Ok(fresh) => fresh,
+        Err(error) => {
+            if let Err(delete_error) = delete_tokens_unlocked(dir, provider) {
+                warn!(provider, error = %delete_error, "could not clear stale OAuth tokens");
+            }
+            return Err(error);
+        }
+    };
+    // Keep the successfully refreshed token for this run if persistence fails.
+    if let Err(e) = save_tokens_unlocked(dir, provider, &fresh) {
         warn!(provider, error = %e, "could not persist refreshed OAuth tokens");
     }
     Ok(fresh)
@@ -817,6 +826,61 @@ mod tests {
         assert!(msg.contains(TEST_SLUG), "got: {msg}");
         assert!(msg.contains(GATEWAY_HEADER), "got: {msg}");
         assert!(msg.contains(&var), "got: {msg}");
+    }
+
+    #[test]
+    fn providers_with_external_auth_do_not_rotate() {
+        use crate::provider::Provider;
+
+        let auth = Arc::new(Mutex::new(test_bearer("sk-1")));
+        let timeouts = Timeouts::default();
+        let providers: Vec<Box<dyn Provider>> = vec![
+            Box::new(deepseek::DeepSeek::with_auth(auth.clone(), timeouts)),
+            Box::new(google::Google::with_auth(auth.clone(), timeouts)),
+            Box::new(anthropic::Anthropic::with_auth(auth.clone(), timeouts)),
+            Box::new(local::LocalEndpoint::with_auth(
+                &local::OLLAMA,
+                auth.clone(),
+                timeouts,
+            )),
+        ];
+        for provider in providers {
+            assert_eq!(provider.key_count(), 1);
+            drop(provider.rotate_key());
+            assert!(!smol::block_on(provider.rotate_key()).unwrap());
+        }
+        assert_eq!(
+            header_value(&auth.lock().unwrap(), AUTHORIZATION_HEADER).as_deref(),
+            Some("Bearer sk-1")
+        );
+    }
+
+    #[test_case(KeyHeader::Bearer, AUTHORIZATION_HEADER, "Bearer sk-1", "Bearer sk-2" ; "bearer")]
+    #[test_case(KeyHeader::Raw("x-api-key"), "x-api-key", "sk-1", "sk-2" ; "raw")]
+    fn key_rotation_preserves_other_auth(
+        header: KeyHeader,
+        name: &str,
+        initial: &str,
+        expected: &str,
+    ) {
+        let pool = KeyPool::from_keys(vec!["sk-1".into(), "sk-2".into()]);
+        let mut auth = ResolvedAuth::for_test(
+            Some(GATEWAY_URL.into()),
+            vec![(name.into(), initial.into())],
+        );
+        auth.apply_config_headers(TEST_SLUG, &config_headers(&[(GATEWAY_HEADER, GATEWAY_ID)]))
+            .unwrap();
+        let auth = Mutex::new(auth);
+        let rotation = KeyRotation::new(&pool, &auth, header);
+        assert_eq!(rotation.key_count(), 2);
+        assert!(rotation.rotate());
+        let auth = auth.lock().unwrap();
+        assert_eq!(auth.base_url.as_deref(), Some(GATEWAY_URL));
+        assert_eq!(header_value(&auth, name).as_deref(), Some(expected));
+        assert_eq!(
+            header_value(&auth, GATEWAY_HEADER).as_deref(),
+            Some(GATEWAY_ID)
+        );
     }
 
     #[test]

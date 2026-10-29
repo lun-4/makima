@@ -21,7 +21,7 @@ use maki_storage::{StateDir, atomic_write};
 use tracing::warn;
 
 use crate::manifest::ManifestRegistry;
-use crate::model::{ModelInfo, ModelTier};
+use crate::model::{ModelDescriptorError, ModelInfo, ModelTier, validate_model_descriptors};
 
 const TIERS_FILE: &str = "model-tiers";
 
@@ -45,6 +45,10 @@ pub fn spec_for_tier(provider: &str, tier: ModelTier) -> Option<String> {
 
 pub fn spec_for_tier_any(tier: ModelTier) -> Option<String> {
     read().spec_for_tier_any(tier)
+}
+
+pub fn explicit_spec_for_tier(tier: ModelTier) -> Option<String> {
+    read().overrides.get(&tier).cloned()
 }
 
 pub fn discovered(provider: &str, model_id: &str) -> Option<ModelInfo> {
@@ -71,6 +75,19 @@ pub fn tier_for(spec: &str, provider: &str, static_tier: Option<ModelTier>) -> M
 
 pub fn set_known_models(provider: &str, models: Vec<ModelInfo>) {
     write().set_known_models(provider, models);
+}
+
+pub(crate) fn publish_discovered_models(
+    provider: &str,
+    models: Vec<ModelInfo>,
+) -> Result<Vec<String>, ModelDescriptorError> {
+    validate_model_descriptors(&models)?;
+    let specs = models
+        .iter()
+        .map(|model| format!("{provider}/{}", model.id))
+        .collect();
+    set_known_models(provider, models);
+    Ok(specs)
 }
 
 /// Tiers whose override points at `spec`, in descending tier order.
@@ -329,6 +346,42 @@ mod tests {
             );
         }
         reg
+    }
+
+    #[test]
+    fn rejected_discovery_preserves_published_registry_state() {
+        const PROVIDER: &str = "validation-atomic-publication-test";
+        let mut previous = ModelInfo::id_only("previous".into());
+        previous.context_window = Some(4096);
+        assert_eq!(
+            publish_discovered_models(PROVIDER, vec![previous]).unwrap(),
+            vec![format!("{PROVIDER}/previous")]
+        );
+
+        let mut invalid = ModelInfo::id_only("invalid".into());
+        invalid.max_output_tokens = Some(0);
+        let error =
+            publish_discovered_models(PROVIDER, vec![ModelInfo::id_only("new".into()), invalid])
+                .unwrap_err();
+        assert_eq!(error.index, 1);
+        assert_eq!(error.id, "invalid");
+        assert_eq!(error.field, "max_output_tokens");
+        assert_eq!(error.reason, "must be positive");
+        assert!(discovery_complete(PROVIDER));
+        assert_eq!(
+            discovered(PROVIDER, "previous").unwrap().context_window,
+            Some(4096)
+        );
+        assert!(discovered(PROVIDER, "new").is_none());
+        assert!(discovered(PROVIDER, "invalid").is_none());
+
+        assert_eq!(
+            publish_discovered_models(PROVIDER, vec![ModelInfo::id_only("replacement".into())])
+                .unwrap(),
+            vec![format!("{PROVIDER}/replacement")]
+        );
+        assert!(discovered(PROVIDER, "previous").is_none());
+        assert!(discovered(PROVIDER, "replacement").is_some());
     }
 
     #[test]

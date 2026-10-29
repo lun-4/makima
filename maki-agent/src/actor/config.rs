@@ -100,6 +100,9 @@ pub struct ConfigCommit {
 /// Re-resolves `model` against what discovery knows now. `None` when that
 /// changes nothing, so an already-correct agent is left alone.
 pub fn rediscovered_model(provider: &dyn Provider, model: &Model) -> Option<Model> {
+    if provider.is_registry_owned() {
+        return None;
+    }
     let mut refined = Model::from_spec(&model.spec()).ok()?;
     provider.adjust_model(&mut refined);
     (!same_model(&refined, model)).then_some(refined)

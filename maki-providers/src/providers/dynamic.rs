@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
@@ -16,7 +16,9 @@ use strum::IntoEnumIterator;
 use tracing::{debug, warn};
 
 use crate::manifest::ManifestRegistry;
-use crate::model::{Model, ModelPricing, ModelTier, ThinkingSupport};
+use crate::model::{
+    Model, ModelInfo, ModelPricing, ModelTier, ThinkingSupport, validate_model_descriptors,
+};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::types::ThinkingFields;
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
@@ -89,6 +91,19 @@ struct ScriptModel {
 }
 
 impl ScriptModel {
+    fn descriptor(&self) -> ModelInfo {
+        ModelInfo {
+            id: self.id.clone(),
+            context_window: Some(self.context_window),
+            max_output_tokens: Some(self.max_output_tokens),
+            pricing: self.pricing.clone(),
+            supports_thinking: None,
+            supports_vision: self.supports_vision,
+            tier: None,
+            provider_info: None,
+        }
+    }
+
     fn to_model(&self, slug: &str, base: ProviderKind, id: String, tier: ModelTier) -> Model {
         Model {
             id,
@@ -325,7 +340,7 @@ fn build_meta(
     };
 
     // Entry by entry, so one bad model never costs the whole list.
-    let models: Vec<ScriptModel> = match &described.models {
+    let mut models: Vec<ScriptModel> = match &described.models {
         Some(json) => serde_json::from_str::<Vec<Value>>(json)
             .unwrap_or_else(|e| {
                 warn!(slug, error = %e, "invalid models JSON, falling back to base models");
@@ -357,6 +372,19 @@ fn build_meta(
             .collect(),
         None => Vec::new(),
     };
+
+    let mut ids = HashSet::new();
+    models.retain(|model| {
+        if let Err(error) = validate_model_descriptors(&[model.descriptor()]) {
+            warn!(slug, model = model.id, %error, "invalid model descriptor, skipping");
+            return false;
+        }
+        if !ids.insert(model.id.clone()) {
+            warn!(slug, model = model.id, "duplicate model id, skipping");
+            return false;
+        }
+        true
+    });
 
     // Only the llama.cpp request path reads these, so anywhere else they would
     // vanish without a trace.
@@ -830,22 +858,7 @@ impl Provider for DynamicProvider {
         if self.models.is_empty() {
             return self.inner.list_models();
         }
-        Box::pin(async {
-            Ok(self
-                .models
-                .iter()
-                .map(|m| crate::model::ModelInfo {
-                    id: m.id.clone(),
-                    context_window: Some(m.context_window),
-                    max_output_tokens: Some(m.max_output_tokens),
-                    pricing: m.pricing.clone(),
-                    supports_thinking: None,
-                    supports_vision: m.supports_vision,
-                    tier: None,
-                    provider_info: None,
-                })
-                .collect())
-        })
+        Box::pin(async { Ok(self.models.iter().map(ScriptModel::descriptor).collect()) })
     }
 
     fn refresh_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
@@ -963,6 +976,26 @@ mod tests {
         assert_eq!(minimal.context_window, 128_000);
         assert!(minimal.pricing.is_none());
         assert!(minimal.thinking_fields.is_none());
+    }
+
+    #[test_case(r#"[{"id":"good"},{"id":"bad","context_window":0},{"id":"last"}]"#, &["good", "last"]; "zero_context")]
+    #[test_case(r#"[{"id":"bad","max_output_tokens":0}]"#, &[]; "all_invalid")]
+    #[test_case(r#"[{"id":" "},{"id":"good"}]"#, &["good"]; "empty_id")]
+    #[test_case(r#"[{"id":"bad","pricing":{"input":-1,"output":0,"cache_write":0,"cache_read":0}},{"id":"good"}]"#, &["good"]; "invalid_pricing")]
+    #[test_case(r#"[{"id":"same","context_window":0},{"id":"same"},{"id":"same","tier":"strong"},{"id":"other"}]"#, &["same", "other"]; "duplicates_keep_first_valid")]
+    fn invalid_descriptors_skip_entries(models: &str, expected: &[&str]) {
+        let described = ScriptDescription {
+            modified_ns: 0,
+            size: 0,
+            info: r#"{"display_name":"T","base":"llama-cpp","has_auth":false}"#.into(),
+            models: Some(models.into()),
+        };
+        let meta = build_meta("t".into(), PathBuf::new(), &described).unwrap();
+        let ids: Vec<&str> = meta.models.iter().map(|model| model.id.as_str()).collect();
+        assert_eq!(ids, expected);
+        if ids.contains(&"same") {
+            assert_eq!(meta.models[0].tier, ModelTier::Medium);
+        }
     }
 
     #[test]

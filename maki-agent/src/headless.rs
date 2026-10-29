@@ -101,6 +101,7 @@ pub struct InteractiveParams {
     pub append_system_prompt: Option<String>,
     pub defaults: SessionDefaults,
     pub model_policy: Arc<ModelPolicy>,
+    pub provider_registry: Option<Arc<maki_providers::provider_registry::ProviderRegistry>>,
     pub modes: Arc<crate::ModeRegistry>,
     pub question_mode: crate::tools::QuestionMode,
     pub plugin_rules: Arc<PluginRuleStore>,
@@ -438,8 +439,10 @@ pub fn default_preparation() -> ProviderPreparation {
 
 /// Prepares the provider for a model a session coordinator commits.
 pub fn default_model_preparer(timeouts: Timeouts) -> ModelPreparer {
-    Arc::new(move |mut model| {
+    Arc::new(move |spec| {
         Box::pin(async move {
+            let mut model =
+                Model::from_spec(&spec).map_err(|error| Arc::from(error.to_string()))?;
             let provider = provider::from_model_async(&mut model, timeouts)
                 .await
                 .map_err(|error| Arc::from(error.user_message()))?;
@@ -453,6 +456,7 @@ pub fn default_model_preparer(timeouts: Timeouts) -> ModelPreparer {
 
 struct HeadlessBackend {
     params: AgentParams,
+    provider_registry: Option<Arc<maki_providers::provider_registry::ProviderRegistry>>,
     excluded_tools: Vec<&'static str>,
     system_override: Option<String>,
     append_system: Option<String>,
@@ -585,9 +589,17 @@ impl HeadlessBackend {
             Err(error) => return ManualCompactionEvent::Failed(error),
         };
         let previous = history.snapshot().clone();
-        let result = agent::compact(
-            &*config.provider,
+        let (provider, model) = agent::resolve_registry_compaction_model(
+            self.provider_registry.as_deref(),
+            &config.provider,
             &config.model,
+            self.params.timeouts,
+            &self.params.model_policy,
+        )
+        .await;
+        let result = agent::compact(
+            &*provider,
+            &model,
             history,
             &self.event_sender(context),
             cancel,
@@ -679,6 +691,7 @@ impl ActorBackend for HeadlessBackend {
                 &context,
                 instructions.loaded,
             )
+            .with_provider_registry(self.provider_registry.clone())
             .with_user_response_rx(self.answer_rx.clone())
             .with_local_tools(Arc::clone(&self.local_tools))
             .with_mcp(self.mcp.clone());
@@ -1020,6 +1033,7 @@ pub fn spawn_interactive_with_binding(
                 .with_context(AgentContextSnapshot::new(params.initial_wd.clone()))
                 .with_mode_def(Some(params.modes.current(&AgentMode::Build)));
                 let backend = HeadlessBackend {
+                    provider_registry: params.provider_registry,
                     params: AgentParams {
                         agent_id: crate::AgentId::generate(),
                         provider,
@@ -1293,6 +1307,7 @@ pub(crate) mod tests {
             append_system_prompt: None,
             defaults: Default::default(),
             model_policy: Arc::default(),
+            provider_registry: None,
             modes: Arc::new(ModeRegistry::builtin()),
             question_mode: crate::tools::QuestionMode::Headless,
             plugin_rules: Arc::default(),
@@ -1328,9 +1343,13 @@ pub(crate) mod tests {
                 coordinator
                     .bind_actor(
                         root,
-                        Arc::new(move |model| {
+                        Arc::new(move |spec| {
                             let provider = Arc::clone(&provider);
-                            Box::pin(async move { Ok(PreparedModel { provider, model }) })
+                            Box::pin(async move {
+                                let model = Model::from_spec(&spec)
+                                    .map_err(|error| Arc::from(error.to_string()))?;
+                                Ok(PreparedModel { provider, model })
+                            })
                         }),
                         Arc::new(|_| {}),
                     )
@@ -1397,6 +1416,106 @@ pub(crate) mod tests {
             }),
             received,
         )
+    }
+
+    #[test_case(false ; "automatic")]
+    #[test_case(true ; "manual")]
+    fn headless_compaction_uses_registered_provider(manual: bool) {
+        use maki_providers::provider_registry::{
+            ProviderFactory, ProviderRegistration, ProviderRegistry,
+        };
+        use maki_providers::{ModelInfo, ModelTier};
+        use std::sync::atomic::AtomicUsize;
+
+        const COMPACT_PROVIDER: &str = "headless-compact-test";
+        const COMPACT_MODEL: &str = "summary";
+
+        struct TurnProvider(AtomicUsize);
+        impl Provider for TurnProvider {
+            fn stream_message<'a>(
+                &'a self,
+                _: &'a Model,
+                _: &'a [Message],
+                _: &'a str,
+                _: &'a Value,
+                _: &'a flume::Sender<maki_providers::ProviderEvent>,
+                _: RequestOptions,
+                _: Option<&'a SessionRef>,
+            ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
+                Box::pin(async move {
+                    let mut reply = response(FIRST);
+                    if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                        reply.usage.input = u32::MAX;
+                    }
+                    Ok(reply)
+                })
+            }
+            fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, crate::AgentError>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+        }
+        struct Factory(flume::Sender<RecordedRequest>);
+        impl ProviderFactory for Factory {
+            fn prepare<'a>(
+                &'a self,
+                model: &'a Model,
+                _: &'a Value,
+            ) -> BoxFuture<'a, maki_providers::provider_registry::PreparedProvider> {
+                Box::pin(async move {
+                    Ok((
+                        model.clone(),
+                        Box::new(RecordingProvider {
+                            name: SECOND,
+                            requests: self.0.clone(),
+                        }) as Box<dyn Provider>,
+                    ))
+                })
+            }
+        }
+        smol::block_on(async {
+            let (requests, received) = flume::unbounded();
+            let registry = Arc::new(ProviderRegistry::default());
+            registry
+                .register(ProviderRegistration {
+                    id: COMPACT_PROVIDER.into(),
+                    display_name: COMPACT_PROVIDER.into(),
+                    models: vec![ModelInfo {
+                        tier: Some(ModelTier::Compaction),
+                        ..ModelInfo::id_only(COMPACT_MODEL.into())
+                    }],
+                    factory: Arc::new(Factory(requests)),
+                })
+                .unwrap();
+            let provider: Arc<dyn Provider> = Arc::new(TurnProvider(AtomicUsize::new(0)));
+            let session_id = MakiId::generate();
+            let coordinator = coordinator(session_id, checkpoint());
+            let binding = coordinator_binding(coordinator.clone(), Arc::clone(&provider));
+            let mut params = interactive_params(session_id, Vec::new());
+            params.provider_registry = Some(registry);
+            let handle = spawn_interactive_with_binding(
+                params,
+                Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) })),
+                None,
+                Some(binding),
+            );
+            if manual {
+                bounded(handle.control_tx.compact(None, CancelToken::none()))
+                    .await
+                    .unwrap();
+            } else {
+                let ticket = handle.input_tx.admit(first_input()).await.unwrap();
+                let outcome = bounded(ticket.wait()).await;
+                assert!(
+                    matches!(outcome, TurnOutcome::Completed { .. }),
+                    "{outcome:?}"
+                );
+            }
+            let (name, spec, _, _) = bounded(received.recv_async()).await.unwrap();
+            assert_eq!(name, SECOND);
+            assert_eq!(spec, format!("{COMPACT_PROVIDER}/{COMPACT_MODEL}"));
+            handle.task.cancel().await;
+            coordinator.close().await.unwrap();
+        });
     }
 
     #[test]

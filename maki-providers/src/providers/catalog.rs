@@ -364,15 +364,20 @@ impl CatalogData {
     }
 
     pub(crate) fn all_models(&self) -> Vec<ModelInfo> {
-        let mut models: Vec<ModelInfo> = self
+        let mut providers: Vec<_> = self
             .providers
             .iter()
             .filter(|(slug, _)| self.opencode_slugs.contains(*slug))
+            .collect();
+        providers.sort_by(|a, b| a.0.cmp(b.0));
+        let mut models: Vec<ModelInfo> = providers
+            .into_iter()
             .flat_map(|(_, provider_data)| {
                 provider_data.available_models(&self.state_dir, self.enable_free_models)
             })
             .collect();
         models.sort_by(|a, b| a.id.cmp(&b.id));
+        models.dedup_by(|a, b| a.id == b.id);
         models
     }
 
@@ -1587,6 +1592,41 @@ mod tests {
         // No key filter — all models pass regardless of key status
         let vendor = result.providers.get("some-vendor").unwrap();
         assert_eq!(vendor.models.len(), 2, "all models included");
+    }
+
+    #[test]
+    fn all_models_deduplicates_overlapping_opencode_catalogs() {
+        let (_tmp, state_dir) = temp_state_dir();
+        let provider = |slug: &str, context| ProviderData {
+            slug: slug.into(),
+            display_name: slug.into(),
+            env_keys: vec![],
+            base_url: None,
+            npm: "@ai-sdk/openai-compatible".into(),
+            api_format: EndpointType::ChatCompletions,
+            models: HashMap::from([(
+                "shared".into(),
+                CatalogMeta {
+                    context: Some(context),
+                    ..CatalogMeta::default()
+                },
+            )]),
+        };
+        let data = CatalogData {
+            providers: HashMap::from([
+                ("opencode".into(), provider("opencode", 100)),
+                ("opencode-go".into(), provider("opencode-go", 200)),
+            ]),
+            builtin_models: HashMap::new(),
+            opencode_slugs: ["opencode".into(), "opencode-go".into()].into(),
+            enable_free_models: true,
+            state_dir,
+        };
+        let models = data.all_models();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "shared");
+        assert_eq!(models[0].context_window, Some(100));
+        assert!(crate::model::validate_model_descriptors(&models).is_ok());
     }
 
     #[test]

@@ -1,8 +1,12 @@
 //! `maki.model`: model catalog reads that address no agent. Reading or
 //! changing an agent's model goes through its `Agent` handle.
 
+use std::sync::Arc;
+
+use maki_config::ModelPolicy;
 use maki_lua_macro::{lua_fn, lua_table};
-use maki_providers::{Model, ThinkingConfig};
+use maki_providers::provider_registry::ProviderRegistry;
+use maki_providers::{Model, ModelError, ThinkingConfig};
 use mlua::{Lua, Result as LuaResult, Table};
 
 use crate::api::util::pair::{Pair, err_pair};
@@ -19,11 +23,22 @@ use crate::api::util::pair::{Pair, err_pair};
 /// local info = assert(maki.model.info("anthropic/claude-sonnet-4-20250514"))
 #[lua_fn]
 fn info(lua: &Lua, spec: String) -> LuaResult<Pair<Table>> {
-    let model = match Model::from_spec(&spec) {
+    let model = match resolve_spec(lua, &spec, &ModelPolicy::default()) {
         Ok(model) => model,
         Err(error) => return Ok(err_pair(error.to_string())),
     };
     Ok((Some(model_table(lua, &model)?), None))
+}
+
+pub(crate) fn resolve_spec(
+    lua: &Lua,
+    spec: &str,
+    policy: &ModelPolicy,
+) -> Result<Model, ModelError> {
+    match lua.app_data_ref::<Arc<ProviderRegistry>>() {
+        Some(registry) => registry.snapshot().resolve_model(spec, policy),
+        None => Model::from_spec_with_policy(spec, policy),
+    }
 }
 
 /// The one Lua shape of a model, shared by `maki.model.info` and

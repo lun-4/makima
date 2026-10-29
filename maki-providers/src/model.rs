@@ -5,6 +5,7 @@
 
 use std::any::Any;
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::fmt;
 use std::ops::AddAssign;
 use std::str::FromStr;
@@ -67,6 +68,61 @@ pub struct ModelInfo {
     pub tier: Option<ModelTier>,
     /// Store of additional metadata from the provider.
     pub provider_info: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("model descriptor {index} ({id:?}), field '{field}': {reason}")]
+pub struct ModelDescriptorError {
+    pub index: usize,
+    pub id: String,
+    pub field: &'static str,
+    pub reason: &'static str,
+}
+
+pub fn validate_model_descriptors(models: &[ModelInfo]) -> Result<(), ModelDescriptorError> {
+    let mut ids = HashSet::with_capacity(models.len());
+    for (index, model) in models.iter().enumerate() {
+        let invalid = |field, reason| ModelDescriptorError {
+            index,
+            id: model.id.clone(),
+            field,
+            reason,
+        };
+        if model.id.trim().is_empty() {
+            return Err(invalid("id", "must not be empty"));
+        }
+        if !ids.insert(&model.id) {
+            return Err(invalid("id", "duplicate model id"));
+        }
+        for (field, limit) in [
+            ("context_window", model.context_window),
+            ("max_output_tokens", model.max_output_tokens),
+        ] {
+            if limit == Some(0) {
+                return Err(invalid(field, "must be positive"));
+            }
+        }
+        if let Some(pricing) = &model.pricing {
+            let rates = [
+                ("pricing.input", pricing.input),
+                ("pricing.output", pricing.output),
+                ("pricing.cache_write", pricing.cache_write),
+                ("pricing.cache_read", pricing.cache_read),
+            ];
+            let fast_rates = pricing.fast.as_ref().into_iter().flat_map(|fast| {
+                [
+                    ("pricing.fast.input", fast.input),
+                    ("pricing.fast.output", fast.output),
+                ]
+            });
+            for (field, rate) in rates.into_iter().chain(fast_rates) {
+                if !rate.is_finite() || rate < 0.0 {
+                    return Err(invalid(field, "must be finite and nonnegative"));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 impl ModelInfo {
@@ -894,6 +950,140 @@ mod tests {
         cache_read: 44,
     };
     const RECORDED_COST: f64 = 0.25;
+
+    #[test_case(""; "empty")]
+    #[test_case("  \t\n"; "whitespace")]
+    fn descriptor_rejects_empty_id(id: &str) {
+        let error = validate_model_descriptors(&[
+            ModelInfo::id_only("valid".into()),
+            ModelInfo::id_only(id.into()),
+        ])
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ModelDescriptorError {
+                index: 1,
+                id: id.into(),
+                field: "id",
+                reason: "must not be empty",
+            }
+        );
+    }
+
+    #[test]
+    fn descriptor_accepts_empty_and_minimal_batches() {
+        assert!(validate_model_descriptors(&[]).is_ok());
+        let models = [
+            ModelInfo::id_only("model".into()),
+            ModelInfo::id_only("Model".into()),
+            ModelInfo::id_only(" model ".into()),
+        ];
+        assert!(validate_model_descriptors(&models).is_ok());
+    }
+
+    #[test]
+    fn descriptor_rejects_duplicate_ids_and_zero_limits() {
+        let model = ModelInfo::id_only("model".into());
+        let error = validate_model_descriptors(&[model.clone(), model.clone()]).unwrap_err();
+        assert_eq!(
+            error,
+            ModelDescriptorError {
+                index: 1,
+                id: "model".into(),
+                field: "id",
+                reason: "duplicate model id",
+            }
+        );
+        for field in ["context_window", "max_output_tokens"] {
+            let mut invalid = model.clone();
+            if field == "context_window" {
+                invalid.context_window = Some(0);
+            } else {
+                invalid.max_output_tokens = Some(0);
+            }
+            assert_eq!(
+                validate_model_descriptors(&[model.clone(), invalid]).unwrap_err(),
+                ModelDescriptorError {
+                    index: 1,
+                    id: "model".into(),
+                    field: "id",
+                    reason: "duplicate model id",
+                }
+            );
+            let mut invalid = model.clone();
+            invalid.id = "invalid".into();
+            if field == "context_window" {
+                invalid.context_window = Some(0);
+            } else {
+                invalid.max_output_tokens = Some(0);
+            }
+            assert_eq!(
+                validate_model_descriptors(&[model.clone(), invalid]).unwrap_err(),
+                ModelDescriptorError {
+                    index: 1,
+                    id: "invalid".into(),
+                    field,
+                    reason: "must be positive",
+                }
+            );
+        }
+        let mut valid = model;
+        valid.context_window = Some(1);
+        valid.max_output_tokens = Some(1);
+        valid.supports_thinking = Some(false);
+        valid.pricing = Some(ModelPricing {
+            input: -0.0,
+            output: f64::MIN_POSITIVE,
+            cache_write: f64::MAX,
+            cache_read: 0.0,
+            fast: Some(FastPricing {
+                input: 0.0,
+                output: f64::MAX,
+            }),
+        });
+        assert!(validate_model_descriptors(&[valid]).is_ok());
+    }
+
+    #[test_case(-f64::MIN_POSITIVE; "negative")]
+    #[test_case(f64::NAN; "nan")]
+    #[test_case(f64::INFINITY; "positive_infinity")]
+    #[test_case(f64::NEG_INFINITY; "negative_infinity")]
+    fn descriptor_rejects_invalid_rates(rate: f64) {
+        for field in [
+            "pricing.input",
+            "pricing.output",
+            "pricing.cache_write",
+            "pricing.cache_read",
+            "pricing.fast.input",
+            "pricing.fast.output",
+        ] {
+            let mut pricing = ModelPricing::ZERO;
+            pricing.fast = Some(FastPricing {
+                input: 0.0,
+                output: 0.0,
+            });
+            match field {
+                "pricing.input" => pricing.input = rate,
+                "pricing.output" => pricing.output = rate,
+                "pricing.cache_write" => pricing.cache_write = rate,
+                "pricing.cache_read" => pricing.cache_read = rate,
+                "pricing.fast.input" => pricing.fast.as_mut().unwrap().input = rate,
+                _ => pricing.fast.as_mut().unwrap().output = rate,
+            }
+            let mut model = ModelInfo::id_only("model".into());
+            model.pricing = Some(pricing);
+            assert_eq!(
+                validate_model_descriptors(&[ModelInfo::id_only("valid".into()), model])
+                    .unwrap_err(),
+                ModelDescriptorError {
+                    index: 1,
+                    id: "model".into(),
+                    field,
+                    reason: "must be finite and nonnegative",
+                }
+            );
+        }
+    }
 
     #[test_case(&["claude-sonnet-4-5"], "claude-sonnet-4-5"; "the id itself")]
     #[test_case(&["claude-sonnet-4-5"], "claude-sonnet-4-5-20250929"; "anthropic snapshot")]

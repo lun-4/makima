@@ -13,6 +13,7 @@ use maki_agent::{
     TurnOrigin, TurnProvenance,
 };
 use maki_lua_macro::{lua_class, lua_fn};
+use maki_providers::provider_registry::ProviderRegistry;
 use mlua::{Lua, Table, UserDataMethods, UserDataRef, Value as LuaValue};
 
 use super::authority::{authorize, destination_template, observe, retire_closed};
@@ -466,8 +467,11 @@ async fn agent_set_model(
                 .map(|prepare| Arc::clone(&prepare));
             let model = match spec {
                 Some(_) => {
+                    let registry = lua
+                        .app_data_ref::<Arc<ProviderRegistry>>()
+                        .map(|registry| Arc::clone(&registry));
                     let (model, provider) =
-                        build_session_provider(&spec, false, &template, prepare).await?;
+                        build_session_provider(&spec, false, &template, prepare, registry).await?;
                     Some(PreparedModel { model, provider })
                 }
                 None => None,

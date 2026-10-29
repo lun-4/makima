@@ -1,7 +1,12 @@
 use std::sync::Arc;
 
-use maki_providers::{Model, ModelInfo, model_registry};
+use maki_providers::provider::{BoxFuture, from_model_fallback};
+use maki_providers::provider_registry::{
+    PreparedProvider, ProviderFactory, ProviderRegistration, ProviderRegistry,
+};
+use maki_providers::{Model, ModelInfo, Timeouts, model_registry};
 use maki_storage::checkpoint::CheckpointPublication;
+use serde_json::Value;
 use test_case::test_case;
 
 use super::{ScriptedBackend, input, policy, spawn, until};
@@ -17,6 +22,9 @@ const DISCOVERED_MODEL_ID: &str = "rediscovered-config-known";
 const UNDISCOVERED_MODEL_ID: &str = "rediscovered-config-unknown";
 const COLD_PATCH_MODEL_ID: &str = "rediscovered-config-cold-patch";
 const DISCOVERED_WINDOW: u32 = 524_000;
+const REGISTRY_WINDOW: u32 = 64_000;
+const REGISTRY_MODEL_ID: &str = "registry-owned-discovery";
+const REGISTRY_PROVIDER: &str = "deepseek";
 
 #[test]
 fn admitted_prompt_dependencies_remain_pinned() {
@@ -1605,6 +1613,62 @@ fn patched_model_takes_discovery_that_lands_after_it_materialized() {
         );
         actor.close();
         task.await;
+    });
+}
+
+struct RegistryTestFactory;
+
+impl ProviderFactory for RegistryTestFactory {
+    fn prepare<'a>(
+        &'a self,
+        model: &'a Model,
+        _config: &'a Value,
+    ) -> BoxFuture<'a, PreparedProvider> {
+        Box::pin(async move {
+            let mut model = model.clone();
+            let provider = from_model_fallback(&mut model, Timeouts::default());
+            Ok((model, provider))
+        })
+    }
+}
+
+#[test]
+fn registry_owned_models_ignore_legacy_discovery() {
+    smol::block_on(async {
+        let registry = ProviderRegistry::default();
+        registry
+            .register(ProviderRegistration {
+                id: REGISTRY_PROVIDER.into(),
+                display_name: REGISTRY_PROVIDER.into(),
+                models: vec![ModelInfo::id_only(REGISTRY_MODEL_ID.into())],
+                factory: Arc::new(RegistryTestFactory),
+            })
+            .unwrap();
+        let mut settings = policy(false);
+        settings.model =
+            Model::from_spec(&format!("{REGISTRY_PROVIDER}/{REGISTRY_MODEL_ID}")).unwrap();
+        let (_, provider) = registry
+            .snapshot()
+            .prepare(&settings.model, &Value::Null)
+            .await
+            .unwrap()
+            .unwrap();
+        settings.model.context_window = REGISTRY_WINDOW;
+        model_registry::set_known_models(
+            REGISTRY_PROVIDER,
+            vec![ModelInfo {
+                context_window: Some(DISCOVERED_WINDOW),
+                ..ModelInfo::id_only(REGISTRY_MODEL_ID.into())
+            }],
+        );
+        let mut config = EffectiveAgentConfig::new(settings, AgentMode::Build);
+        config.settings.provider = Arc::from(provider);
+        assert!(super::super::rediscovered_model(&*config.provider, &config.model).is_none());
+        assert!(ConfigChange::rediscovered(&config).is_none());
+        let candidate = Arc::new(config);
+        let committed = super::super::config::with_discovery(None, &candidate);
+        assert!(Arc::ptr_eq(&candidate, &committed));
+        assert_eq!(committed.model.context_window, REGISTRY_WINDOW);
     });
 }
 

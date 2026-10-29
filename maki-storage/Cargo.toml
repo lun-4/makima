@@ -7,6 +7,7 @@ edition.workspace = true
 test-util = []
 
 [dependencies]
+async-io = { workspace = true }
 event-listener = { workspace = true }
 maki-domain = { workspace = true }
 getrandom = { workspace = true }

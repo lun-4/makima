@@ -98,10 +98,20 @@ pub enum AgentError {
         /// What the server's `Retry-After` header asked for, when it sent one.
         retry_after: Option<Duration>,
     },
+    #[error("{source}")]
+    StructuredOverflow {
+        source: Box<AgentError>,
+        overflow: Overflow,
+    },
     #[error("{message}")]
     Config { message: String },
     #[error("tool error in {tool}: {message}")]
     Tool { tool: String, message: String },
+    #[error("{message}")]
+    Network {
+        message: String,
+        retry_after: Option<Duration>,
+    },
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("http: {0}")]
@@ -143,9 +153,10 @@ impl AgentError {
             Self::Api { status, .. } if *status >= 500 => Some(RetryKind::Transient),
             Self::Http(e) if is_connect_failure(e) => Some(RetryKind::Connect),
             Self::Io(e) if e.kind() == io::ErrorKind::ConnectionRefused => Some(RetryKind::Connect),
-            Self::Io(_) | Self::Http(_) => Some(RetryKind::Transient),
+            Self::Network { .. } | Self::Io(_) | Self::Http(_) => Some(RetryKind::Transient),
             Self::Timeout { .. } => Some(RetryKind::Timeout),
-            Self::Api { .. }
+            Self::StructuredOverflow { .. }
+            | Self::Api { .. }
             | Self::Config { .. }
             | Self::Tool { .. }
             | Self::Channel
@@ -183,6 +194,9 @@ impl AgentError {
     /// - OpenRouter: 400 "endpoint's maximum context length is X tokens"  <https://openrouter.ai/docs/api/reference/errors-and-debugging.mdx>
     /// - Synthetic:  400 pass-through from upstream models (OpenAI-compatible)  <https://synthetic.new>
     pub fn overflow(&self) -> Option<Overflow> {
+        if let Self::StructuredOverflow { overflow, .. } = self {
+            return Some(*overflow);
+        }
         let Self::Api {
             status, message, ..
         } = self
@@ -224,15 +238,24 @@ impl AgentError {
     }
 
     pub fn is_auth_error(&self) -> bool {
-        matches!(self, Self::Api { status: 401, .. })
+        match self {
+            Self::StructuredOverflow { source, .. } => source.is_auth_error(),
+            _ => matches!(self, Self::Api { status: 401, .. }),
+        }
     }
 
     pub fn should_rotate_key(&self) -> bool {
-        matches!(self, Self::Api { status, .. } if *status == 429 || *status == 401 || *status == 403)
+        match self {
+            Self::StructuredOverflow { source, .. } => source.should_rotate_key(),
+            _ => {
+                matches!(self, Self::Api { status, .. } if *status == 429 || *status == 401 || *status == 403)
+            }
+        }
     }
 
     pub fn user_message(&self) -> String {
         match self {
+            Self::StructuredOverflow { source, .. } => source.user_message(),
             Self::Config { message } => message.clone(),
             Self::Api { status: 429, .. } => "rate limited, try again in a moment".into(),
             Self::Api { status: 529, .. } => "provider is overloaded, try again later".into(),
@@ -247,6 +270,7 @@ impl AgentError {
             Self::Io(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
                 CONNECT_FAILED_MESSAGE.into()
             }
+            Self::Network { message, .. } => format!("I/O error: {message}"),
             Self::Io(e) => format!("I/O error: {e}"),
             Self::Http(e) if is_connect_failure(e) => CONNECT_FAILED_MESSAGE.into(),
             Self::Http(_) => NETWORK_ERROR_MESSAGE.into(),
@@ -277,13 +301,11 @@ impl AgentError {
         }
     }
 
-    /// How long the server asked us to wait, when it bothered to say. Always a
-    /// positive duration: only [`Self::from_response`] ever reads headers, and
-    /// an error built any other way answers `None` and the caller falls back on
-    /// its own backoff.
+    /// How long the provider asked us to wait, when it supplied a hint.
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
-            Self::Api { retry_after, .. } => *retry_after,
+            Self::StructuredOverflow { source, .. } => source.retry_after(),
+            Self::Api { retry_after, .. } | Self::Network { retry_after, .. } => *retry_after,
             _ => None,
         }
     }
@@ -293,7 +315,7 @@ impl AgentError {
             Self::Api { status: 429, .. } => "Rate limited".into(),
             Self::Api { status: 529, .. } => "Provider is overloaded".into(),
             Self::Api { status, .. } if *status >= 500 => format!("Server error ({status})"),
-            Self::Io(_) | Self::Http(_) => "Connection error".into(),
+            Self::Network { .. } | Self::Io(_) | Self::Http(_) => "Connection error".into(),
             Self::Timeout { .. } => "Stream timed out".into(),
             _ => self.to_string(),
         }

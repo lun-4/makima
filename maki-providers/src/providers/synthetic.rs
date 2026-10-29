@@ -160,12 +160,17 @@ impl Provider for Synthetic {
         })
     }
 
-    fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Bearer,
-        ))
+    fn key_count(&self) -> usize {
+        self.key_pool.as_ref().map_or(1, KeyPool::len)
+    }
+
+    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
+        Box::pin(async move {
+            Ok(self
+                .key_pool
+                .as_ref()
+                .is_some_and(|pool| KeyRotation::new(pool, &self.auth, KeyHeader::Bearer).rotate()))
+        })
     }
 
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {

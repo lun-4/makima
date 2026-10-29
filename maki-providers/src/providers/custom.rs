@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
@@ -164,10 +165,21 @@ pub fn declared_model_specs() -> Vec<String> {
     declared_specs_from(&ProvidersConfig::load())
 }
 
+pub fn declared_model_specs_excluding(exclusions: &HashSet<String>) -> Vec<String> {
+    declared_specs_from_excluding(&ProvidersConfig::load(), exclusions)
+}
+
 fn declared_specs_from(config: &ProvidersConfig) -> Vec<String> {
+    declared_specs_from_excluding(config, &HashSet::new())
+}
+
+fn declared_specs_from_excluding(
+    config: &ProvidersConfig,
+    exclusions: &HashSet<String>,
+) -> Vec<String> {
     let mut specs = Vec::new();
     for (slug, def) in &config.providers {
-        if is_builtin_slug(slug) {
+        if exclusions.contains(slug) || is_builtin_slug(slug) {
             continue;
         }
         if resolve_protocol(slug, Some(def)).is_none() {
@@ -212,11 +224,15 @@ pub fn resolve_tier(slug: &str, tier: ModelTier) -> TierLookup {
 /// Skip definitions handled by [`declared_model_specs`]; only HTTP `/models`
 /// goes through here, so an empty `discover_models = false` provider returns
 /// nothing and never hits the network.
-pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
+pub fn discover_models_excluding(
+    timeouts: Timeouts,
+    exclusions: &HashSet<String>,
+) -> (Vec<String>, Vec<String>) {
     let config = ProvidersConfig::load();
     let mut all_specs = Vec::new();
+    let mut warnings = Vec::new();
     for slug in config.providers.keys() {
-        if is_builtin_slug(slug) {
+        if exclusions.contains(slug) || is_builtin_slug(slug) {
             continue;
         }
         let def = config.get(slug).unwrap();
@@ -229,26 +245,28 @@ pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
         match create(slug, timeouts) {
             Ok(provider) => {
                 let slug_c = slug.clone();
-                let result = smol::block_on(provider.list_models());
-                match result {
-                    Ok(mut models) => {
+                let result = smol::block_on(provider.list_models())
+                    .map_err(|e| e.to_string())
+                    .and_then(|mut models| {
                         overlay_declared_tiers(def, &mut models);
-                        crate::model_registry::set_known_models(&slug_c, models.clone());
-                        for m in models {
-                            all_specs.push(format!("{slug_c}/{}", m.id));
-                        }
-                    }
+                        crate::model_registry::publish_discovered_models(&slug_c, models)
+                            .map_err(|e| e.to_string())
+                    });
+                match result {
+                    Ok(specs) => all_specs.extend(specs),
                     Err(e) => {
                         tracing::warn!(slug, error = %e, "failed to list models for custom provider");
+                        warnings.push(format!("{slug}: {e}"));
                     }
                 }
             }
             Err(e) => {
                 tracing::warn!(slug, error = %e, "failed to create custom provider");
+                warnings.push(format!("{slug}: {e}"));
             }
         }
     }
-    all_specs
+    (all_specs, warnings)
 }
 
 /// Discovery via the openai compat layer never reports tiers, so stored models
@@ -353,6 +371,19 @@ mod tests {
         // Resolution owns the builtin slug regardless of the providers.toml entry.
         let model = Model::from_spec("opencode/shadow-model").unwrap();
         assert_eq!(model.provider.as_ref(), "opencode");
+    }
+
+    #[test]
+    fn declared_specs_exclude_registry_owned_slugs() {
+        let mut config = ProvidersConfig::default();
+        config.upsert("owned".to_string(), openai_def("hidden"));
+        config.upsert("other".to_string(), openai_def("visible"));
+        let exclusions = HashSet::from(["owned".to_string()]);
+
+        assert_eq!(
+            declared_specs_from_excluding(&config, &exclusions),
+            vec!["other/visible".to_string()]
+        );
     }
 
     // The exact regression this fixes: discovery parsed context_window but

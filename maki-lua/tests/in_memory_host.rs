@@ -37,6 +37,48 @@ fn exec(reg: &Arc<ToolRegistry>, tool: &str, input: serde_json::Value) -> String
 }
 
 #[test]
+fn model_info_reads_the_owning_host_registry() {
+    let first = maki_lua::PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    let second = maki_lua::PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    first
+        .load_source(
+            "provider",
+            "maki.api.register_provider({ id = 'isolated', models = {{ id = 'model', context_window = 12345 }} })",
+        )
+        .unwrap();
+    first
+        .load_source(
+            "probe",
+            "local model = assert(maki.model.info('isolated/model')); assert(model.context_window == 12345)",
+        )
+        .unwrap();
+    second
+        .load_source(
+            "provider",
+            "maki.api.register_provider({ id = 'isolated', models = {{ id = 'other' }} })",
+        )
+        .unwrap();
+    second
+        .load_source(
+            "probe",
+            "local model = maki.model.info('isolated/model'); assert(model == nil)",
+        )
+        .unwrap();
+    first
+        .load_source(
+            "provider",
+            "maki.api.register_provider({ id = 'isolated', models = {{ id = 'other' }} })",
+        )
+        .unwrap();
+    first
+        .load_source(
+            "probe",
+            "local model = maki.model.info('isolated/model'); assert(model == nil)",
+        )
+        .unwrap();
+}
+
+#[test]
 fn memory_write_read_roundtrip_stays_in_memory() {
     let state = std::path::Path::new(maki_lua::test_support::TEST_STATE_DIR);
     assert!(

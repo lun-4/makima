@@ -20,5 +20,5 @@ pub use instructions::{
 pub use run::{
     Agent, AgentParams, AgentRunParams, ModelSource, NO_ADMITTED_CWD_ERR, ResolvedPromptInputs,
     RunSettings, SharedModel, TurnAdmissionSnapshot, TurnPromptInputs, estimate_message_tokens,
-    resolve_compaction_model,
+    resolve_compaction_model, resolve_registry_compaction_model,
 };

@@ -133,7 +133,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
 
 /// Bundled but not enabled by default. Users opt in with
 /// `plugins.<name> = { enabled = true }` in `maki.setup`.
-pub const OPT_IN_BUILTINS: &[&str] = &[];
+pub const OPT_IN_BUILTINS: &[&str] = &["llama-cpp", "ollama"];
 
 /// These used to be their own `tools.<name>` tables and are now edit plugin
 /// options; the config layer uses this list to reject the old form with a
@@ -3447,6 +3447,36 @@ mod tests {
                 pair[1]
             );
         }
+    }
+
+    #[test]
+    fn ollama_lua_provider_is_opt_in() {
+        let plugins = PluginsConfig::from_plugins(HashMap::new());
+        assert!(!plugins.names.iter().any(|name| name == "ollama"));
+        let raw: RawConfig = toml::from_str("[plugins.ollama]\nenabled = true\n").unwrap();
+        let config = raw.into_config().unwrap();
+        assert!(config.plugins.names.iter().any(|name| name == "ollama"));
+    }
+
+    #[test]
+    fn deepseek_lua_provider_is_not_enabled_by_default() {
+        assert!(!DEFAULT_BUILTINS.contains(&"deepseek"));
+        let plugins = PluginsConfig::from_plugins(HashMap::new());
+        assert!(!plugins.names.iter().any(|name| name == "deepseek"));
+    }
+
+    #[test]
+    fn regolo_lua_provider_is_not_enabled_by_default() {
+        assert!(!DEFAULT_BUILTINS.contains(&"regolo"));
+        let plugins = PluginsConfig::from_plugins(HashMap::new());
+        assert!(!plugins.names.iter().any(|name| name == "regolo"));
+    }
+
+    #[test]
+    fn requesty_lua_provider_is_not_enabled_by_default() {
+        assert!(!DEFAULT_BUILTINS.contains(&"requesty"));
+        let plugins = PluginsConfig::from_plugins(HashMap::new());
+        assert!(!plugins.names.iter().any(|name| name == "requesty"));
     }
 
     #[test]

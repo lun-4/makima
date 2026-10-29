@@ -99,6 +99,7 @@ The rules:
 | [`maki.async.Semaphore`](#maki-async-Semaphore) | A counting semaphore for limiting how many tasks run at once. |
 | [`maki.async.Permit`](#maki-async-Permit) | One slot in a semaphore, obtained from `Semaphore:acquire()`. |
 | [`maki.base64`](#maki-base64) | Base64 encoding and decoding, modelled after `vim.base64`. |
+| [`maki.crypto`](#maki-crypto) | Binary-safe SHA-256 and HMAC-SHA-256 primitives. |
 | [`maki.env`](#maki-env) | Paths to makima's own directories (config, state, logs), and whether |
 | [`maki.fn`](#maki-fn) | Process and environment helpers, modeled after Neovim's `vim.fn` job |
 | [`maki.fs`](#maki-fs) | File-system utilities, modelled after `vim.fs` and `vim.uv`. |
@@ -460,6 +461,22 @@ maki.api.register_tool({
   end,
 })
 ```
+
+---
+
+### `maki.api.register_provider()` {#maki-api-register_provider}
+
+```lua
+maki.api.register_provider({spec})
+```
+
+Stage a provider table during plugin loading. The required `id` is unique across plugins.
+Staged tables are offline only: they do not register an executable provider or models.
+A successful reload replaces the plugin's staged tables; unload removes them.
+
+**Parameters:**
+
+- `{spec}` (`table`) Provider table with a non-empty string `id`.
 
 ---
 
@@ -2415,6 +2432,44 @@ maki.base64.decode("aGVsbG8=") -- "hello"
 ```
 
 
+## maki.crypto {#maki-crypto}
+
+Binary-safe SHA-256 and HMAC-SHA-256 primitives.
+
+---
+
+### `maki.crypto.sha256()` {#maki-crypto-sha256}
+
+```lua
+maki.crypto.sha256({data})
+```
+
+Hash {data} with SHA-256.
+
+**Parameters:**
+
+- `{data}` (`string`) Input bytes.
+
+**Returns:** (`string`) Raw 32-byte digest.
+
+---
+
+### `maki.crypto.hmac_sha256()` {#maki-crypto-hmac_sha256}
+
+```lua
+maki.crypto.hmac_sha256({key}, {data})
+```
+
+Compute HMAC-SHA-256 of {data} with {key}.
+
+**Parameters:**
+
+- `{key}` (`string`) Key bytes.
+- `{data}` (`string`) Input bytes.
+
+**Returns:** (`string`) Raw 32-byte digest.
+
+
 ## maki.env {#maki-env}
 
 Paths to makima's own directories (config, state, logs), and whether
@@ -3460,8 +3515,8 @@ maki.json.encode({value})
 ```
 
 Turn a Lua value into a JSON string. Tables, strings, numbers,
-booleans, and nil all work. Functions and userdata cannot be
-serialized.
+booleans, nil, and the JSON null sentinel all work. Functions and
+other userdata cannot be serialized.
 
 **Parameters:**
 
@@ -3481,17 +3536,20 @@ print(s) -- {"name":"maki","version":1}
 ### `maki.json.decode()` {#maki-json-decode}
 
 ```lua
-maki.json.decode({str})
+maki.json.decode({str}, {opts?})
 ```
 
 Parse a JSON string into a Lua value. Objects become tables and
-arrays become 1-indexed sequences.
+arrays become 1-indexed tables. By default null becomes nil, removing
+object fields and leaving holes in arrays. Set `preserve_null` to
+represent null as `maki.json.null()` instead.
 
 **Parameters:**
 
 - `{str}` (`string`) JSON string to decode.
+- `{opts?}` (`table?`) Optional settings: `preserve_null` (boolean, default false).
 
-**Returns:** (`any?`, `string?`) Decoded value, or nil plus an error.
+**Returns:** (`any?`, `string?`) Decoded value and nil, or nil plus an error. A root null decodes to nil by default.
 
 **Example:**
 
@@ -3499,6 +3557,20 @@ arrays become 1-indexed sequences.
 local t, err = maki.json.decode('{"x": 42}')
 print(t.x) -- 42
 ```
+
+---
+
+### `maki.json.null()` {#maki-json-null}
+
+```lua
+maki.json.null()
+```
+
+Return the JSON null sentinel. It compares equal to preserved nulls and
+encodes as JSON null. The sentinel is truthy; compare it explicitly
+rather than using a truthiness check. Assign nil to remove a field.
+
+**Returns:** any JSON null sentinel.
 
 ---
 
@@ -3949,11 +4021,11 @@ local levels = maki.model.thinking_levels()
 
 ## maki.net {#maki-net}
 
-HTTP client for fetching web content. All traffic goes over HTTPS
-(plain HTTP is upgraded). Private and metadata IP addresses are
-blocked to prevent SSRF, including after a redirect. Hosts listed in
-the `net.allowed_private_hosts` config option are exempt.
-Failed requests (5xx) are retried automatically.
+HTTP client for fetching web content. Plain HTTP is upgraded to HTTPS
+unless the host is listed in `net.allowed_private_hosts`. Private and
+metadata IP addresses are blocked to prevent SSRF, including after a
+redirect, unless allowed by that option.
+`request` retries 5xx responses automatically; `send` does not.
 
 ```lua
 local res, err = maki.net.request("https://example.com")
@@ -3969,9 +4041,9 @@ maki.net.request({url}, {opts?})
 ```
 
 Make an HTTP request and return the response body. Plain `http://`
-URLs are automatically upgraded to `https://`. Requests to private
-or metadata IP addresses are blocked for safety, unless the host is
-listed in `net.allowed_private_hosts`.
+URLs are upgraded to `https://` unless the host is listed in
+`net.allowed_private_hosts`. Requests to private or metadata IP addresses
+are blocked unless allowed by that option.
 
 {opts} fields:
   `method` (string) HTTP verb (default `"GET"`).
@@ -4003,6 +4075,39 @@ else
   print(res.status, res.body)
 end
 ```
+
+---
+
+### `maki.net.send()` {#maki-net-send}
+
+```lua
+maki.net.send({url}, {opts?})
+```
+
+Send an HTTP request and return before reading the response body.
+Uses the same URL and private-network policy as `request`, without retries.
+Cross-authority redirects are refused to protect request credentials.
+
+The response table contains `status` (integer), `headers` (table of
+lowercase names to binary string values), and `body` (response handle).
+Repeated header names retain one value. The caller must limit the total
+body size and close the handle when finished.
+
+`response.body:read()` returns a binary string of up to 64 KiB and nil,
+an empty string and nil at EOF, or nil and an error string. Only one read
+may be active at a time. A body read failure closes the handle; an error
+from a concurrent read does not.
+`response.body:close()` returns true and nil. It is idempotent and
+interrupts an active read. Reads after closing return an error.
+
+Requires the `net` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{url}` (`string`) URL starting with `http://` or `https://`.
+- `{opts?}` (`table?`) Request options as for `request` (retry and max_bytes are ignored).
+
+**Returns:** (`table?`, `string?`) Response table, or nil plus an error string.
 
 
 ## maki.session {#maki-session}
@@ -6880,6 +6985,34 @@ print(t.name) -- maki
 These ship inside makima; `require` them from any plugin. Small modules are
 shown as full source, larger ones as their public interface.
 
+### `require("maki.anthropic")`
+
+```lua
+function M.convert_messages(messages)
+function M.convert_tools(tools)
+function M.build_shared_body(request, options)
+function M.beta_header(request)
+function M.build_request(request, options)
+```
+
+### `require("maki.anthropic_direct")`
+
+```lua
+M.models = {}
+function M.stream(response, emit)
+function M.prepare(_, model, config)
+function M.register()
+```
+
+### `require("maki.chat_completions")`
+
+```lua
+function M.convert_messages(messages, system)
+function M.convert_tools(tools)
+function M.build_request(request, options)
+function M.stream(body, emit, max_event_bytes)
+```
+
 ### `require("maki.color")`
 
 ```lua
@@ -6934,6 +7067,28 @@ M.EMPTY_OLD_STRING = "old_string must not be empty"
 function M.replace(content, old_string, new_string, replace_all, max_line_bytes)
 ```
 
+### `require("maki.gemini")`
+
+```lua
+function M.convert_messages(messages)
+function M.convert_tools(tools)
+function M.build_request(request)
+function M.stream(body, emit, max_event_bytes)
+M.models = models
+function M.prepare(_, model, config)
+function M.discover(ctx, config)
+function M.register()
+```
+
+### `require("maki.json_response")`
+
+```lua
+-- The caller owns the response body and must close it, including on failure.
+-- By default JSON null decodes to nil; check the error rather than the value.
+-- Set opts.preserve_null to retain nulls as JsonNull values.
+function M.read(body, max_bytes, opts)
+```
+
 ### `require("maki.list_picker")`
 
 ```lua
@@ -6980,6 +7135,45 @@ function M.check_replace_lines(content, start_line, end_line, new_string, max_li
 --- Reject lines of `after` that end in a truncation marker unless an
 --- identical line is still available in `before`. Removing a marker passes.
 function M.check_markers(before, after)
+```
+
+### `require("maki.mistral")`
+
+```lua
+function M.convert_messages(messages)
+function M.build_request(request)
+function M.discover(ctx, config)
+function M.prepare(_, model, config)
+function M.register()
+```
+
+### `require("maki.openai")`
+
+```lua
+function M.parse_usage(response)
+function M.prepare(_, model, config)
+function M.discover(ctx, config)
+function M.register()
+```
+
+### `require("maki.openai_auth")`
+
+```lua
+M.verification_url = "https://auth.openai.com/codex/device"
+function M.account_id(token)
+function M.start(ctx)
+function M.poll(ctx, session)
+function M.exchange(ctx, device_token, now_ms)
+function M.refresh(ctx, current, now_ms)
+```
+
+### `require("maki.openai_models")`
+
+```lua
+function M.plan_context_window(id)
+function M.parse_codex(value, account_id)
+function M.parse_platform(value)
+function M.discover(ctx, auth)
 ```
 
 ### `require("maki.output_limits")`
@@ -7042,6 +7236,32 @@ function M.cut(view, out, reason, timeout_secs, limits)
 -- keep in sync with upstream.
 ```
 
+### `require("maki.provider_types")`
+
+```lua
+--!strict
+```
+
+### `require("maki.regolo")`
+
+```lua
+function M.join_models(ids, groups)
+function M.discover(ctx, config)
+function M.prepare(_, model, config)
+function M.register()
+```
+
+### `require("maki.responses")`
+
+```lua
+function M.convert_input(messages)
+function M.convert_tools(tools)
+
+-- options.reasoning contains the provider's already resolved effort and summary.
+function M.build_request(request, options)
+function M.stream(body, emit, max_event_bytes)
+```
+
 ### `require("maki.scroll")`
 
 ```lua
@@ -7102,6 +7322,24 @@ return shorten_path
 -- indices: 1-based codepoint offsets, ascending. No indices yields a single
 -- {text, base_style} span.
 function Spans.match_spans(text, indices, base_style, match_style)
+```
+
+### `require("maki.sse")`
+
+```lua
+-- Reads one event at a time. The caller owns and closes the response body.
+-- An incomplete event at EOF is discarded; an empty data field is an event.
+function M.new(body, max_event_bytes)
+```
+
+### `require("maki.synthetic")`
+
+```lua
+-- parse_timestamp is supplied by the host so malformed or pre-epoch dates can be ignored.
+function M.parse_quotas(response, parse_timestamp)
+function M.encode_thinking(body, intent, max_thinking_budget)
+function M.prepare(_, model, config)
+function M.register()
 ```
 
 ### `require("maki.test_helpers")`
@@ -7176,6 +7414,25 @@ function TextInput:handle_key(key)
 -- Wrap lines to {width} with {prefix} before the first row. Returns
 -- { lines = styled lines, cursor_row = 1-based row holding the cursor }.
 function TextInput:render(prefix, prefix_width, width)
+```
+
+### `require("maki.thinking")`
+
+```lua
+---@class ThinkingConstraints
+---@field parent? ThinkingPreference
+---@field max_tokens? number Conversion reference and ceiling.
+---@class ThinkingResolution
+---@field requested ThinkingPreference
+---@field effective ThinkingPreference
+---@field status 'exact'|'adjusted'|'unsupported'
+---@field approximate boolean
+---@param requested ThinkingPreference
+---@param profile ThinkingCapabilities|nil
+---@param constraints ThinkingConstraints|nil
+---@return ThinkingResolution|nil result
+---@return string|nil error
+function M.resolve(requested, profile, constraints)
 ```
 
 ### `require("maki.toast")`

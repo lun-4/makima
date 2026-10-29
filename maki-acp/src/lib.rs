@@ -30,6 +30,7 @@ pub struct AcpParams {
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
     pub lua_event_handle: maki_lua::EventHandle,
+    pub provider_registry: Arc<maki_providers::provider_registry::ProviderRegistry>,
     pub command_registry: CommandRegistry,
     pub trust_mode: TrustMode,
     pub trust_policy: Arc<TrustConfig>,

@@ -5,7 +5,6 @@ use std::path::Path;
 use std::sync::{Arc, MutexGuard};
 
 use maki_config::ModelPolicy;
-use maki_providers::Model;
 use maki_storage::StateDir;
 use maki_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
 use thiserror::Error;
@@ -20,7 +19,7 @@ use crate::session_coordinator::{
     ConfigMutation, ModelPreparer, SessionCoordinatorError, SessionCoordinatorHandle,
     publication_claim,
 };
-use crate::session_options::{MODEL_OPTION_ID, SessionOptionError};
+use crate::session_options::SessionOptionError;
 use crate::{ActorError, AgentActorHandle, AgentRef, ManagerError};
 
 #[derive(Debug, Clone, PartialEq, Error)]
@@ -310,13 +309,14 @@ pub async fn prepare_model(
     if !policy.allows(spec) {
         return Err(SessionOptionError::PolicyRejected(spec.into()).into());
     }
-    let model = Model::from_spec(spec).map_err(|_| SessionOptionError::InvalidValue {
-        id: MODEL_OPTION_ID.into(),
-        value: spec.into(),
-    })?;
-    prepare(model)
+    let prepared = prepare(Arc::from(spec))
         .await
-        .map_err(ConfigChangeError::ModelPreparation)
+        .map_err(ConfigChangeError::ModelPreparation)?;
+    let resolved_spec = prepared.model.spec();
+    if !policy.allows(&resolved_spec) {
+        return Err(SessionOptionError::PolicyRejected(resolved_spec.into()).into());
+    }
+    Ok(prepared)
 }
 
 /// Fills {patch}'s model from {spec}, when one is given.
@@ -342,6 +342,25 @@ mod tests {
 
     const ALLOWED_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
     const DISALLOWED_SPEC: &str = "openai/gpt-5";
+
+    #[test]
+    fn prepare_model_rejects_disallowed_factory_model() {
+        let policy = ModelPolicy::new(&[ALLOWED_SPEC.into()], &[]).unwrap();
+        let prepare: ModelPreparer = Arc::new(|_| {
+            Box::pin(async {
+                Ok(crate::actor::PreparedModel {
+                    model: maki_providers::Model::from_spec(DISALLOWED_SPEC).unwrap(),
+                    provider: Arc::new(crate::tools::NullProvider),
+                })
+            })
+        });
+        let result = smol::block_on(prepare_model(ALLOWED_SPEC, &policy, &prepare));
+        assert!(matches!(
+            result,
+            Err(ConfigChangeError::Option(SessionOptionError::PolicyRejected(spec)))
+                if *spec == *DISALLOWED_SPEC
+        ));
+    }
 
     #[test]
     fn prepare_model_rejects_disallowed_spec_before_preparing() {

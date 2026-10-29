@@ -53,6 +53,7 @@ pub(crate) struct TuiActorBackend {
     lua_handle: EventHandle,
     subagent_cancels: Arc<CancelMap<String>>,
     model_policy: Arc<ModelPolicy>,
+    provider_registry: Arc<maki_providers::provider_registry::ProviderRegistry>,
     system_prompt: SystemPromptOverride,
     file_write_locks: Arc<maki_agent::tools::FileWriteLocks>,
     offload: Option<Arc<OffloadStore>>,
@@ -85,6 +86,7 @@ pub(super) fn new_backend(
     lua_handle: EventHandle,
     subagent_cancels: Arc<CancelMap<String>>,
     model_policy: Arc<ModelPolicy>,
+    provider_registry: Arc<maki_providers::provider_registry::ProviderRegistry>,
     system_prompt: SystemPromptOverride,
     file_write_locks: Arc<maki_agent::tools::FileWriteLocks>,
     offload: Option<Arc<OffloadStore>>,
@@ -109,6 +111,7 @@ pub(super) fn new_backend(
         lua_handle,
         subagent_cancels,
         model_policy,
+        provider_registry,
         system_prompt,
         file_write_locks,
         offload,
@@ -157,6 +160,7 @@ impl TuiActorBackend {
                 tools,
             },
         )
+        .with_provider_registry(self.lua_handle.provider_registry())
         .with_user_response_rx(Some(Arc::clone(&self.answer_rx)))
         .with_mcp(self.mcp.clone());
         agent.tool_context_at((**self.cwd.load()).clone())
@@ -382,6 +386,7 @@ impl TuiActorBackend {
             context,
             self.instructions.loaded.clone(),
         )
+        .with_provider_registry(self.lua_handle.provider_registry())
         .with_user_response_rx(Some(Arc::clone(&self.answer_rx)))
         .with_mcp(self.mcp.clone());
 
@@ -567,12 +572,14 @@ impl ActorBackend for TuiActorBackend {
             };
             let (base_provider, base_model) = compaction_source(settings);
 
-            let (provider, model) = maki_agent::agent::resolve_compaction_model(
+            let (provider, model) = maki_agent::agent::resolve_registry_compaction_model(
+                Some(&self.provider_registry),
                 &base_provider,
                 &base_model,
                 self.timeouts,
                 &self.model_policy,
-            );
+            )
+            .await;
             let previous = history.snapshot().clone();
             let mut result = maki_agent::agent::compact(
                 &*provider,
@@ -2520,6 +2527,59 @@ mod tests {
     }
 
     #[test]
+    fn manual_compaction_selects_registered_provider_and_falls_back() {
+        use maki_providers::model::ModelInfo;
+        use maki_providers::provider::{BoxFuture, Provider};
+        use maki_providers::provider_registry::{
+            ProviderFactory, ProviderRegistration, ProviderRegistry,
+        };
+        use serde_json::Value;
+
+        const SPEC: &str = "compact-test/model";
+        struct Factory;
+        impl ProviderFactory for Factory {
+            fn prepare<'a>(
+                &'a self,
+                model: &'a Model,
+                _: &'a Value,
+            ) -> BoxFuture<'a, Result<(Model, Box<dyn Provider>), AgentError>> {
+                Box::pin(
+                    async move { Ok((model.clone(), Box::new(StubProvider) as Box<dyn Provider>)) },
+                )
+            }
+        }
+        let registry = ProviderRegistry::default();
+        registry
+            .register(ProviderRegistration {
+                id: "compact-test".into(),
+                display_name: "test".into(),
+                models: vec![ModelInfo {
+                    tier: Some(maki_providers::ModelTier::Compaction),
+                    ..ModelInfo::id_only("model".into())
+                }],
+                factory: Arc::new(Factory),
+            })
+            .unwrap();
+        let base: Arc<dyn Provider> = Arc::new(StubProvider);
+        let model = crate::components::test_model();
+        let select = |registry| {
+            smol::block_on(maki_agent::agent::resolve_registry_compaction_model(
+                registry,
+                &base,
+                &model,
+                Default::default(),
+                &ModelPolicy::default(),
+            ))
+        };
+        let (selected, selected_model) = select(Some(&registry));
+        assert_eq!(selected_model.spec(), SPEC);
+        assert!(!Arc::ptr_eq(&base, &selected));
+        let (fallback, fallback_model) = select(Some(&ProviderRegistry::default()));
+        assert!(Arc::ptr_eq(&base, &fallback));
+        assert_eq!(fallback_model.spec(), model.spec());
+    }
+
+    #[test]
     fn idle_compaction_source_uses_pinned_policy() {
         let mut pinned_model = crate::components::test_model();
         pinned_model.id = "pinned-model".into();
@@ -2568,6 +2628,7 @@ mod tests {
             EventHandle::disconnected_for_test(),
             Arc::new(CancelMap::new()),
             Arc::new(ModelPolicy::default()),
+            Arc::new(maki_providers::provider_registry::ProviderRegistry::default()),
             SystemPromptOverride::default(),
             Arc::new(maki_agent::tools::FileWriteLocks::new()),
             None,
@@ -2727,6 +2788,7 @@ mod tests {
             EventHandle::disconnected_for_test(),
             Arc::new(CancelMap::new()),
             Arc::new(ModelPolicy::default()),
+            Arc::new(maki_providers::provider_registry::ProviderRegistry::default()),
             SystemPromptOverride::default(),
             Arc::new(maki_agent::tools::FileWriteLocks::new()),
             None,

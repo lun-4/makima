@@ -13,7 +13,7 @@ use futures_lite::future;
 use isahc::HttpClient;
 use isahc::config::{Configurable, RedirectPolicy};
 use maki_storage::StateDir;
-use maki_storage::auth::{McpAuthData, load_mcp_auth, save_mcp_auth};
+use maki_storage::auth::{McpAuthData, load_mcp_auth, lock_credentials, save_mcp_auth_unlocked};
 use tracing::{info, warn};
 use url::Url;
 
@@ -228,7 +228,10 @@ pub async fn authenticate(
         token_endpoint: Some(auth_server.token_endpoint.clone()),
     };
 
-    save_mcp_auth(storage, server_name, &data)
+    let _lock = lock_credentials(storage, &format!("mcp-{server_name}"))
+        .await
+        .map_err(|e| wrap(OAuthError::Other(e.to_string())))?;
+    save_mcp_auth_unlocked(storage, server_name, &data)
         .map_err(|e| wrap(OAuthError::Other(e.to_string())))?;
     info!(server = server_name, "OAuth authentication complete");
     Ok(data)
@@ -241,6 +244,18 @@ pub async fn silent_refresh(
     server_name: &str,
     server_url: &str,
 ) -> Result<Option<McpAuthData>, OAuthError> {
+    silent_refresh_if_matches(storage, server_name, server_url, None).await
+}
+
+pub(crate) async fn silent_refresh_if_matches(
+    storage: &StateDir,
+    server_name: &str,
+    server_url: &str,
+    rejected_access: Option<&str>,
+) -> Result<Option<McpAuthData>, OAuthError> {
+    let _lock = lock_credentials(storage, &format!("mcp-{server_name}"))
+        .await
+        .map_err(|e| OAuthError::Other(e.to_string()))?;
     let Some(existing) = load_mcp_auth(storage, server_name, server_url) else {
         return Ok(None);
     };
@@ -248,6 +263,13 @@ pub async fn silent_refresh(
     let Some(ref tokens) = existing.tokens else {
         return Ok(None);
     };
+
+    if match rejected_access {
+        Some(rejected) => rejected != tokens.access,
+        None => !tokens.is_expired(),
+    } {
+        return Ok(Some(existing));
+    }
 
     if tokens.refresh.is_empty() {
         return Ok(None);
@@ -283,7 +305,8 @@ pub async fn silent_refresh(
         ..existing
     };
 
-    save_mcp_auth(storage, server_name, &data).map_err(|e| OAuthError::Other(e.to_string()))?;
+    save_mcp_auth_unlocked(storage, server_name, &data)
+        .map_err(|e| OAuthError::Other(e.to_string()))?;
     info!(server = server_name, "MCP OAuth tokens refreshed");
 
     Ok(Some(data))

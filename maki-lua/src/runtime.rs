@@ -26,6 +26,7 @@ use maki_agent::tools::{
 use maki_agent::{
     BufferSnapshot, CurrentManagedTurn, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle,
 };
+use maki_providers::provider_registry::{ProviderRegistration, ProviderRegistry};
 use maki_storage::checkpoint::CheckpointPublication;
 use mlua::{
     Chunk, ChunkMode, Compiler, Function, Lua, MultiValue, RegistryKey, Table, Value as LuaValue,
@@ -190,6 +191,155 @@ pub(crate) struct HookRun {
 #[derive(Clone)]
 pub(crate) struct RequestTx(pub(crate) flume::Sender<Request>);
 
+pub(crate) struct RuntimeProviderDispatch(
+    pub(crate) flume::Sender<Request>,
+    pub(crate) Option<u64>,
+);
+
+pub struct PreparedInstance {
+    id: Option<String>,
+    tx: flume::Sender<Request>,
+}
+
+impl Drop for PreparedInstance {
+    fn drop(&mut self) {
+        if let Some(instance) = self.id.take() {
+            let _ = self.tx.try_send(Request::ProviderRelease { instance });
+        }
+    }
+}
+
+impl crate::provider_adapter::ProviderDispatch for RuntimeProviderDispatch {
+    fn discover<'a>(
+        &'a self,
+        provider: &'a str,
+        config: &'a Value,
+        cancel: CancelToken,
+    ) -> maki_providers::provider::BoxFuture<
+        'a,
+        Result<Option<Vec<maki_providers::ModelInfo>>, maki_providers::AgentError>,
+    > {
+        Box::pin(async move {
+            let (reply, rx) = flume::bounded(1);
+            self.0
+                .send_async(Request::ProviderDiscover {
+                    provider: provider.to_owned(),
+                    generation: self.1,
+                    config: config.clone(),
+                    cancel: cancel.clone(),
+                    reply,
+                })
+                .await
+                .map_err(|_| maki_providers::AgentError::Channel)?;
+            cancel
+                .race(rx.recv_async())
+                .await
+                .map_err(|_| maki_providers::AgentError::Cancelled)?
+                .map_err(|_| maki_providers::AgentError::Channel)?
+        })
+    }
+
+    fn prepare<'a>(
+        &'a self,
+        provider: &'a str,
+        model: &'a maki_providers::Model,
+        config: &'a Value,
+        cancel: CancelToken,
+    ) -> maki_providers::provider::BoxFuture<
+        'a,
+        Result<(String, maki_providers::Model, usize), maki_providers::AgentError>,
+    > {
+        Box::pin(async move {
+            let (tx, rx) = flume::bounded(1);
+            self.0
+                .send_async(Request::ProviderPrepare {
+                    provider: provider.to_owned(),
+                    generation: self.1,
+                    model: model.clone(),
+                    config: config.clone(),
+                    cancel: cancel.clone(),
+                    reply: tx,
+                })
+                .await
+                .map_err(|_| maki_providers::AgentError::Channel)?;
+            cancel
+                .race(rx.recv_async())
+                .await
+                .map_err(|_| maki_providers::AgentError::Cancelled)?
+                .map_err(|_| maki_providers::AgentError::Channel)?
+                .map_err(|message| maki_providers::AgentError::Config { message })
+                .and_then(|(mut instance, model, key_count)| {
+                    instance
+                        .id
+                        .take()
+                        .map(|id| (id, model, key_count))
+                        .ok_or(maki_providers::AgentError::Channel)
+                })
+        })
+    }
+
+    fn release(&self, instance: &str) {
+        let _ = self.0.try_send(Request::ProviderRelease {
+            instance: instance.to_owned(),
+        });
+    }
+
+    fn hook<'a>(
+        &'a self,
+        instance: &'a str,
+        hook: &'static str,
+        cancel: CancelToken,
+    ) -> maki_providers::provider::BoxFuture<'a, Result<Value, maki_providers::AgentError>> {
+        Box::pin(async move {
+            let (tx, rx) = flume::bounded(1);
+            self.0
+                .send_async(Request::ProviderHook {
+                    instance: instance.to_owned(),
+                    hook,
+                    cancel: cancel.clone(),
+                    reply: tx,
+                })
+                .await
+                .map_err(|_| maki_providers::AgentError::Channel)?;
+            cancel
+                .race(rx.recv_async())
+                .await
+                .map_err(|_| maki_providers::AgentError::Cancelled)?
+                .map_err(|_| maki_providers::AgentError::Channel)?
+        })
+    }
+
+    fn stream<'a>(
+        &'a self,
+        instance: &'a str,
+        request: Value,
+        events: flume::Sender<maki_providers::ProviderEvent>,
+        cancel: CancelToken,
+    ) -> maki_providers::provider::BoxFuture<
+        'a,
+        Result<maki_providers::StreamResponse, maki_providers::AgentError>,
+    > {
+        Box::pin(async move {
+            let (tx, rx) = flume::bounded(1);
+            self.0
+                .send_async(Request::ProviderStream {
+                    instance: instance.to_owned(),
+                    request,
+                    events,
+                    cancel: cancel.clone(),
+                    reply: tx,
+                })
+                .await
+                .map_err(|_| maki_providers::AgentError::Channel)?;
+            cancel
+                .race(rx.recv_async())
+                .await
+                .map_err(|_| maki_providers::AgentError::Cancelled)?
+                .map_err(|_| maki_providers::AgentError::Channel)?
+        })
+    }
+}
+
 /// Names this host to the graphs it observes, so each graph feeds it once.
 pub(crate) struct HostId(pub(crate) u64);
 
@@ -200,6 +350,39 @@ pub enum Request {
     /// Plugins are loaded, so native codegen may start using idle time. Sent
     /// last so it never interleaves with the loads themselves.
     WarmJit,
+    ProviderDiscover {
+        provider: String,
+        generation: Option<u64>,
+        config: Value,
+        cancel: CancelToken,
+        reply: flume::Sender<
+            Result<Option<Vec<maki_providers::ModelInfo>>, maki_providers::AgentError>,
+        >,
+    },
+    ProviderPrepare {
+        provider: String,
+        generation: Option<u64>,
+        model: maki_providers::Model,
+        config: Value,
+        cancel: CancelToken,
+        reply: flume::Sender<Result<(PreparedInstance, maki_providers::Model, usize), String>>,
+    },
+    ProviderRelease {
+        instance: String,
+    },
+    ProviderHook {
+        instance: String,
+        hook: &'static str,
+        cancel: CancelToken,
+        reply: flume::Sender<Result<Value, maki_providers::AgentError>>,
+    },
+    ProviderStream {
+        instance: String,
+        request: Value,
+        events: flume::Sender<maki_providers::ProviderEvent>,
+        cancel: CancelToken,
+        reply: flume::Sender<Result<maki_providers::StreamResponse, maki_providers::AgentError>>,
+    },
     /// Install a `SessionSnapshotSlot` on the Lua thread. Headless drivers send
     /// one so `maki.session.read` works without a UI to ask.
     InstallSessionSnapshot {
@@ -217,6 +400,7 @@ pub enum Request {
         plugin_dir: Option<PathBuf>,
         permissions: PluginPermissions,
         opts: PluginOpts,
+        identity: crate::loader::SourceIdentity,
         reply: flume::Sender<LoadResult>,
     },
     CallTool {
@@ -1146,6 +1330,21 @@ impl TaskScope {
         scope
     }
 
+    pub(crate) fn fire_cancel_hooks(&self) {
+        let prev = self
+            .lua
+            .set_app_data::<TaskHandle>(Arc::clone(&self.handle));
+        fire_cancel_hooks(&self.lua, &self.handle, KillReason::Cancelled);
+        match prev {
+            Some(handle) => {
+                self.lua.set_app_data(handle);
+            }
+            None => {
+                self.lua.remove_app_data::<TaskHandle>();
+            }
+        }
+    }
+
     pub(crate) fn handle(&self) -> &TaskHandle {
         &self.handle
     }
@@ -1837,6 +2036,64 @@ impl<F: Future> Future for SlotCovered<F> {
 
 fn covered<F: Future>(slot: Option<GateGuard>, inner: F) -> SlotCovered<F> {
     SlotCovered { _slot: slot, inner }
+}
+
+// Provider calls keep their own concurrency budget but cannot be drained before
+// a transactional reload. Suspend their polls while candidate app data is live.
+pin_project_lite::pin_project! {
+    struct ProviderPoll<F> {
+        paused: Rc<Cell<bool>>,
+        event: Rc<Event>,
+        listener: Option<Pin<Box<event_listener::EventListener>>>,
+        #[pin]
+        inner: F,
+    }
+}
+
+impl<F: Future> Future for ProviderPoll<F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.project();
+        loop {
+            if !this.paused.get() {
+                *this.listener = None;
+                return this.inner.poll(cx);
+            }
+            let listener = this
+                .listener
+                .get_or_insert_with(|| Box::pin(this.event.listen()));
+            if listener.as_mut().poll(cx).is_pending() {
+                return std::task::Poll::Pending;
+            }
+            *this.listener = None;
+        }
+    }
+}
+
+struct ProviderPause {
+    paused: Rc<Cell<bool>>,
+    event: Rc<Event>,
+}
+
+impl ProviderPause {
+    fn new(paused: &Rc<Cell<bool>>, event: &Rc<Event>) -> Self {
+        paused.set(true);
+        Self {
+            paused: Rc::clone(paused),
+            event: Rc::clone(event),
+        }
+    }
+}
+
+impl Drop for ProviderPause {
+    fn drop(&mut self) {
+        self.paused.set(false);
+        self.event.notify(usize::MAX);
+    }
 }
 
 struct GateGuard(Rc<InflightGate>);
@@ -2670,12 +2927,32 @@ pub(crate) fn require_plugin_load(lua: &Lua, plugin: &str, api: &str) -> mlua::R
     }
 }
 
+type ProviderInstances = Rc<
+    RefCell<
+        HashMap<
+            String,
+            (
+                String,
+                Table,
+                CancelTrigger,
+                CancelToken,
+                crate::loader::SourceIdentity,
+                String,
+            ),
+        >,
+    >,
+>;
+
 struct LuaRuntime {
     /// Held for its Drop (joins the poker thread). Field order doesn't
     /// matter: the thread keeps its own `Lua` clone alive.
     _watchdog: Watchdog,
     lua: Lua,
     pending: PendingTools,
+    providers: crate::provider_staging::ProviderStaging,
+    provider_registry: Arc<ProviderRegistry>,
+    provider_instances: ProviderInstances,
+    provider_generations: HashMap<String, (CancelTrigger, CancelToken)>,
     plugin_rules: Arc<PluginRuleStore>,
     plugins: PluginMap,
     live_tasks: LiveTasks,
@@ -2708,6 +2985,7 @@ impl LuaRuntime {
     #[allow(clippy::too_many_arguments)]
     fn new(
         registry: Arc<ToolRegistry>,
+        provider_registry: Arc<ProviderRegistry>,
         modes: Arc<maki_agent::ModeRegistry>,
         tx: flume::Sender<Request>,
         shutdown: Arc<AtomicBool>,
@@ -2786,6 +3064,7 @@ impl LuaRuntime {
         lua.set_app_data(StatusContentStore::new());
         lua.set_app_data(status_content_writer);
         lua.set_app_data(Arc::clone(&registry));
+        lua.set_app_data(Arc::clone(&provider_registry));
         lua.set_app_data(Arc::clone(&modes));
         if let Some(state_dir) = state_dir {
             lua.set_app_data(crate::api::env::StateDirOverride(state_dir));
@@ -2828,6 +3107,10 @@ impl LuaRuntime {
             _watchdog: watchdog,
             lua,
             pending,
+            providers: crate::provider_staging::ProviderStaging::default(),
+            provider_registry,
+            provider_instances: Rc::new(RefCell::new(HashMap::new())),
+            provider_generations: HashMap::new(),
             plugin_rules,
             plugins,
             live_tasks: Rc::new(RefCell::new(HashMap::new())),
@@ -3479,14 +3762,14 @@ impl LuaRuntime {
 
     async fn load_source(
         &mut self,
-        identity: (Arc<str>, &str),
+        identity: (Arc<str>, &str, crate::loader::SourceIdentity),
         source: &str,
         plugin_dir: Option<PathBuf>,
         permissions: &PluginPermissions,
         opts: PluginOpts,
         config_store: Option<&ConfigStore>,
     ) -> LoadResult {
-        let (name, source_name) = identity;
+        let (name, source_name, source_identity) = identity;
         let map_err = |e: mlua::Error| PluginError::Lua {
             plugin: source_name.to_owned(),
             source: e,
@@ -3502,6 +3785,7 @@ impl LuaRuntime {
         // Scoped to this load so a failed load simply drops its rules; only a
         // successful load commits them to the store.
         let pending_rules: PendingRules = Arc::default();
+        let pending_providers = Arc::new(Mutex::new(Vec::new()));
         let pending_commands = Arc::new(Mutex::new(HashMap::new()));
         let pending_keymaps = Arc::new(Mutex::new(PendingKeymaps::new()));
         let pending_store = Arc::new(Mutex::new(Store::default()));
@@ -3539,6 +3823,7 @@ impl LuaRuntime {
         let context = PluginLoadContext {
             pending: Arc::clone(&self.pending),
             pending_rules: Arc::clone(&pending_rules),
+            pending_providers: Arc::clone(&pending_providers),
             pending_autocmds: Arc::clone(&pending_autocmds),
             pending_timers: Arc::clone(&pending_timers),
             pending_session_options: pending_session_options.clone(),
@@ -3588,8 +3873,43 @@ impl LuaRuntime {
         };
 
         self.lua.remove_app_data::<LoadingPlugin>();
-        let exec_result =
-            exec_result.and_then(|()| self.check_opts_consumed(&name, &opts, &pending_options));
+        let providers =
+            std::mem::take(&mut *pending_providers.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut provider_registrations = Vec::new();
+        let exec_result = exec_result
+            .and_then(|()| self.check_opts_consumed(&name, &opts, &pending_options))
+            .and_then(|()| {
+                self.providers
+                    .validate(&name, &providers)
+                    .map_err(mlua::Error::runtime)
+            })
+            .and_then(|()| {
+                for (id, table) in &providers {
+                    let models = crate::provider_staging::model_descriptors(table)
+                        .map_err(mlua::Error::runtime)?;
+                    let display_name: Option<String> = table.raw_get("display_name")?;
+                    let display_name = display_name.unwrap_or_else(|| id.clone());
+                    if display_name.trim().is_empty() {
+                        return Err(mlua::Error::runtime(
+                            "provider display_name must not be empty",
+                        ));
+                    }
+                    provider_registrations.push(ProviderRegistration {
+                        id: id.clone(),
+                        display_name,
+                        models: models.clone(),
+                        factory: Arc::new(crate::provider_adapter::LuaProviderFactory {
+                            provider: id.clone(),
+                            models,
+                            dispatch: Arc::new(RuntimeProviderDispatch(
+                                self.tx.clone(),
+                                Some(generation),
+                            )),
+                        }),
+                    });
+                }
+                Ok(())
+            });
         if let Err(e) = exec_result {
             self.abort_candidate_jobs(&name, generation);
             let stale = self.drain_pending();
@@ -3772,6 +4092,7 @@ impl LuaRuntime {
                 source: mlua::Error::runtime(format!("invalid command registration: {error}")),
             });
         }
+        let previous_tool_entries = self.registry.plugin_entries(&name);
         if let Err(error) = self.registry.replace_plugin(&name, registry_entries) {
             self.abort_candidate_jobs(&name, generation);
             if let Err(restore_error) = replace_command_producer(
@@ -3806,6 +4127,52 @@ impl LuaRuntime {
                 },
             });
         }
+        if let Err(error) = self
+            .provider_registry
+            .replace_owner(&name, provider_registrations)
+        {
+            self.abort_candidate_jobs(&name, generation);
+            if let Err(restore_error) = self.registry.replace_plugin(&name, previous_tool_entries) {
+                tracing::error!(plugin = %name, %restore_error, "failed to restore tools after provider publication");
+            }
+            if let Err(restore_error) = replace_command_producer(
+                &self.command_registry,
+                &self.command_producers,
+                &name,
+                previous_command_registrations,
+            ) {
+                tracing::error!(plugin = %name, %restore_error, "failed to restore commands after provider publication");
+            }
+            if let Err(restore_error) =
+                restore_session_options(&session_options, &name, previous_option_definitions).await
+            {
+                tracing::error!(plugin = %name, %restore_error, "failed to restore session options after provider publication");
+            }
+            self.discard_pending(pending);
+            self.discard_pending_commands(pending_commands);
+            self.discard_pending_keymaps(pending_keymaps);
+            self.discard_pending_completion(pending_sources, pending_expanders);
+            self.discard_pending_autocmds(pending_autocmds);
+            self.discard_pending_timers(pending_timers);
+            self.discard_pending_plugin_slice(pending_prompts);
+            self.lua
+                .remove_app_data::<crate::api::slot::PendingSlotStore>();
+            self.lua
+                .remove_app_data::<crate::api::ui::PendingHintStore>();
+            self.lua.remove_app_data::<PendingPromptHintCallbacks>();
+            return Err(PluginError::Lua {
+                plugin: name.to_string(),
+                source: mlua::Error::runtime(format!("invalid provider registration: {error}")),
+            });
+        }
+        self.provider_generations.remove(name.as_ref());
+        self.provider_instances
+            .borrow_mut()
+            .retain(|_, (owner, _, _, _, _, _)| owner != name.as_ref());
+        self.provider_generations
+            .insert(name.to_string(), CancelToken::new());
+        self.providers
+            .replace(&name, generation, source_identity, providers);
         crate::orchestration::revoke_plugin(&self.lua, &name);
         crate::orchestration::install_plugin_authority(&self.lua, Arc::clone(&name));
         activate_session_options(&self.lua, &pending_session_options);
@@ -3924,6 +4291,12 @@ impl LuaRuntime {
             store.invalidate(plugin);
         }
         self.registry.clear_plugin(plugin);
+        self.provider_generations.remove(plugin);
+        self.provider_instances
+            .borrow_mut()
+            .retain(|_, (owner, _, _, _, _, _)| owner != plugin);
+        self.providers.unload(plugin);
+        self.provider_registry.remove_owner(plugin);
         if let Some(generations) = self.lua.app_data_ref::<Arc<Mutex<CommandGenerationMap>>>() {
             generations
                 .lock()
@@ -4093,7 +4466,7 @@ impl LuaRuntime {
             })
             .unwrap_or_else(PluginPermissions::trusted);
         self.load_source(
-            (owner, source_name),
+            (owner, source_name, crate::loader::SourceIdentity::Other),
             source,
             plugin_dir,
             &perms,
@@ -4875,6 +5248,7 @@ async fn splash_frame(
 
 pub struct SpawnConfig {
     pub command_registry: CommandRegistry,
+    pub provider_registry: Arc<ProviderRegistry>,
     pub modes: Arc<maki_agent::ModeRegistry>,
     pub session_options: maki_agent::session_coordinator::SessionOptionCatalog,
     pub bundled_dirs: &'static [&'static Dir<'static>],
@@ -4891,6 +5265,7 @@ pub struct SpawnConfig {
 pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThread, PluginError> {
     let SpawnConfig {
         command_registry,
+        provider_registry,
         modes,
         session_options,
         bundled_dirs,
@@ -4942,6 +5317,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
         .spawn(move || {
             let mut rt = match LuaRuntime::new(
                 registry,
+                provider_registry,
                 modes_thread,
                 tx_clone,
                 shutdown_thread,
@@ -5002,6 +5378,9 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
             }
             let gate = Rc::new(InflightGate::new(rt.lua.clone()));
             let callbacks = Rc::new(InflightGate::new(rt.lua.clone()));
+            let provider_gate = Rc::new(InflightGate::new(rt.lua.clone()));
+            let provider_paused = Rc::new(Cell::new(false));
+            let provider_resume = Rc::new(Event::new());
             let restores = Rc::new(RestoreTracker::default());
             let spawn_rx = rt
                 .lua
@@ -5099,6 +5478,130 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                     match msg {
                         Request::Shutdown => break,
                         Request::WarmJit => codegen_armed = true,
+                        Request::ProviderDiscover { provider, generation, config, cancel, reply } => {
+                            let candidate = rt.providers.get(&provider)
+                                .filter(|(_, current, _, _)| generation.is_none_or(|generation| generation == *current))
+                                .and_then(|(owner, _, source, table)| rt.provider_generations.get(owner)
+                                    .map(|(_, cancel)| (source.clone(), table.clone(), cancel.clone(), rt.plugins.borrow().get(owner).map(|plugin| plugin.permissions.clone()).unwrap_or_else(PluginPermissions::denied))));
+                            let lua = rt.lua.clone();
+                            let provider_gate = Rc::clone(&provider_gate);
+                            let paused = Rc::clone(&provider_paused);
+                            let event = Rc::clone(&provider_resume);
+                            ex.spawn(async move {
+                                let result = ProviderPoll { paused, event, listener: None, inner: async {
+                                    let config_error = |message: String| maki_providers::AgentError::Config { message };
+                                    let (source, table, generation_cancel, permissions) = candidate.ok_or_else(|| config_error(format!("unknown provider: {provider}")))?;
+                                    let _slot = generation_cancel.race(provider_gate.acquire_before_abandoned(&cancel, None)).await.map_err(|_| config_error("provider generation revoked".into()))?.map_err(|_| maki_providers::AgentError::Cancelled)?;
+                                    let discover: Option<Function> = table.raw_get("discover").map_err(|e| config_error(format!("provider {provider} discover: {e}")))?;
+                                    let Some(discover) = discover else { return Ok(None) };
+                                    let config = crate::api::util::convert::json_to_lua_with_nulls(&lua, &config, true).map_err(|e| config_error(e.to_string()))?;
+                                    let scope = TaskScope::new(&lua, TaskCell::new(cancel.clone(), None, None));
+                                    let (context, _net_scope) = crate::api::net::provider_context(&lua, scope.handle().clone(), &permissions).map_err(|e| config_error(e.to_string()))?;
+                                    crate::provider_credentials::attach(&lua, &context, scope.handle().clone(), generation_cancel.clone(), source, provider.clone()).map_err(|e| config_error(e.to_string()))?;
+                                    let result = generation_cancel.race(cancel.race(scope.scope_future(discover.call_async::<MultiValue>((context, config))))).await;
+                                    let values = match result {
+                                        Err(_) => { scope.fire_cancel_hooks(); return Err(config_error("provider generation revoked".into())); }
+                                        Ok(Err(_)) => { scope.fire_cancel_hooks(); return Err(maki_providers::AgentError::Cancelled); }
+                                        Ok(Ok(result)) => result.map_err(|e| config_error(format!("provider {provider} discover failed: {e}")))?,
+                                    };
+                                    if generation_cancel.is_cancelled() { return Err(config_error("provider generation revoked".into())); }
+                                    if cancel.is_cancelled() { return Err(maki_providers::AgentError::Cancelled); }
+                                    let mut values = values.into_iter();
+                                    match (values.next().unwrap_or(LuaValue::Nil), values.next().unwrap_or(LuaValue::Nil)) {
+                                        (LuaValue::Table(models), LuaValue::Nil) => crate::provider_staging::parse_model_array(models).map(Some).map_err(|e| config_error(format!("provider {provider} discovery: {e}"))),
+                                        (LuaValue::Nil, LuaValue::Table(error)) => Err(crate::provider_stream::provider_error(error)),
+                                        _ => Err(config_error(format!("invalid provider {provider} discovery result"))),
+                                    }
+                                }}.await;
+                                let _ = reply.send(result);
+                            }).detach();
+                        }
+                        Request::ProviderPrepare { provider, generation, model, config, cancel, reply } => {
+                            let candidate = rt.providers.get(&provider)
+                                .filter(|(_, current, _, _)| generation.is_none_or(|generation| generation == *current))
+                                .and_then(|(owner, _, source, table)| rt.provider_generations.get(owner)
+                                    .map(|(_, cancel)| (owner.to_owned(), source.clone(), table.clone(), cancel.clone(), rt.plugins.borrow().get(owner).map(|plugin| plugin.permissions.clone()).unwrap_or_else(PluginPermissions::denied))));
+                            let lua = rt.lua.clone();
+                            let instances = Rc::clone(&rt.provider_instances);
+                            let tx = rt.tx.clone();
+                            let provider_gate = Rc::clone(&provider_gate);
+                            let paused = Rc::clone(&provider_paused);
+                            let event = Rc::clone(&provider_resume);
+                            ex.spawn(async move {
+                                let result = ProviderPoll { paused, event, listener: None, inner: async {
+                                    let (owner, source, table, generation_cancel, permissions) = candidate.ok_or_else(|| format!("unknown provider: {provider}"))?;
+                                    let _slot = generation_cancel.race(provider_gate.acquire_before_abandoned(&cancel, None)).await.map_err(|_| "provider generation revoked".to_owned())?.map_err(str::to_owned)?;
+                                    let prepare: Function = table.raw_get("prepare").map_err(|e| format!("provider {provider} prepare: {e}"))?;
+                                    let input = crate::provider_adapter::model_metadata(&model);
+                                    let input = crate::api::util::convert::json_to_lua(&lua, &input).map_err(|e| e.to_string())?;
+                                    let config = crate::api::util::convert::json_to_lua_with_nulls(&lua, &config, true).map_err(|e| e.to_string())?;
+                                    let scope = TaskScope::new(&lua, TaskCell::new(cancel.clone(), None, None));
+                                    let (context, _net_scope) = crate::api::net::provider_context(&lua, scope.handle().clone(), &permissions).map_err(|e| e.to_string())?;
+                                    crate::provider_credentials::attach(&lua, &context, scope.handle().clone(), generation_cancel.clone(), source.clone(), provider.clone()).map_err(|e| e.to_string())?;
+                                    let result = generation_cancel.race(cancel.race(scope.scope_future(prepare.call_async::<MultiValue>((context, input, config))))).await;
+                                    let values = match result {
+                                        Err(_) => { scope.fire_cancel_hooks(); return Err("provider generation revoked".to_owned()); }
+                                        Ok(Err(_)) => { scope.fire_cancel_hooks(); return Err("provider prepare cancelled".to_owned()); }
+                                        Ok(Ok(result)) => result.map_err(|e| format!("provider prepare failed: {e}"))?,
+                                    };
+                                    if generation_cancel.is_cancelled() { return Err("provider generation revoked".to_owned()); }
+                                    if cancel.is_cancelled() { return Err("provider prepare cancelled".to_owned()); }
+                                    let mut values = values.into_iter();
+                                    let instance = match (values.next().unwrap_or(LuaValue::Nil), values.next().unwrap_or(LuaValue::Nil)) {
+                                        (LuaValue::Table(instance), LuaValue::Nil) => instance,
+                                        (LuaValue::Nil, LuaValue::Table(error)) => return Err(error.raw_get::<String>("message").unwrap_or_else(|_| "invalid provider error".into())),
+                                        _ => return Err("invalid provider prepare result".into()),
+                                    };
+                                    let key_count: Option<usize> = instance.raw_get("key_count").map_err(|e| format!("provider instance key_count: {e}"))?;
+                                    let key_count = key_count.unwrap_or(1);
+                                    let _: Function = instance.raw_get("stream").map_err(|e| format!("provider instance stream: {e}"))?;
+                                    let prepared: Table = instance.raw_get("model").map_err(|e| format!("provider instance model: {e}"))?;
+                                    let id: String = prepared.raw_get("id").map_err(|e| format!("provider instance model id: {e}"))?;
+                                    if id != model.id { return Err("prepared model id does not match requested model".into()); }
+                                    let mut model = model;
+                                    crate::provider_adapter::apply_prepared_metadata(&lua, &prepared, &mut model)?;
+                                    let id = NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed).to_string();
+                                    let (trigger, generation_cancel) = CancelToken::new();
+                                    instances.borrow_mut().insert(id.clone(), (owner, instance, trigger, generation_cancel, source, provider));
+                                    Ok((PreparedInstance { id: Some(id), tx }, model, key_count))
+                                }}.await;
+                                let _ = reply.send(result);
+                            }).detach();
+                        }
+                        Request::ProviderRelease { instance } => {
+                            rt.provider_instances.borrow_mut().remove(&instance);
+                        }
+                        Request::ProviderHook { instance, hook, cancel, reply } => {
+                            let candidate = rt.provider_instances.borrow().get(&instance).map(|(owner, table, _, generation, source, provider)| (table.clone(), generation.clone(), source.clone(), provider.clone(), rt.plugins.borrow().get(owner.as_str()).map(|plugin| plugin.permissions.clone()).unwrap_or_else(PluginPermissions::denied)));
+                            let lua = rt.lua.clone();
+                            let provider_gate = Rc::clone(&provider_gate);
+                            let paused = Rc::clone(&provider_paused);
+                            let event = Rc::clone(&provider_resume);
+                            ex.spawn(async move {
+                                let result = ProviderPoll { paused, event, listener: None, inner: async {
+                                    let (instance, generation, source, provider, permissions) = candidate.ok_or_else(|| maki_providers::AgentError::Config { message: "provider instance is unavailable".to_owned() })?;
+                                    let _slot = generation.race(provider_gate.acquire_before_abandoned(&cancel, None)).await.map_err(|_| maki_providers::AgentError::Config { message: "provider generation revoked".to_owned() })?.map_err(|_| maki_providers::AgentError::Cancelled)?;
+                                    crate::provider_stream::run_hook(&lua, &instance, hook, cancel, generation, &permissions, source, provider).await
+                                }}.await;
+                                let _ = reply.send(result);
+                            }).detach();
+                        }
+                        Request::ProviderStream { instance, request, events, cancel, reply } => {
+                            let candidate = rt.provider_instances.borrow().get(&instance).map(|(owner, table, _, generation, _, _)| (table.clone(), generation.clone(), rt.plugins.borrow().get(owner.as_str()).map(|plugin| plugin.permissions.clone()).unwrap_or_else(PluginPermissions::denied)));
+                            let lua = rt.lua.clone();
+                            let provider_gate = Rc::clone(&provider_gate);
+                            let paused = Rc::clone(&provider_paused);
+                            let event = Rc::clone(&provider_resume);
+                            ex.spawn(async move {
+                                let result = ProviderPoll { paused, event, listener: None, inner: async {
+                                    let (instance, generation, permissions) = candidate.ok_or_else(|| maki_providers::AgentError::Config { message: "provider instance is unavailable".to_owned() })?;
+                                    let _slot = generation.race(provider_gate.acquire_before_abandoned(&cancel, None)).await.map_err(|_| maki_providers::AgentError::Config { message: "provider generation revoked".to_owned() })?.map_err(|_| maki_providers::AgentError::Cancelled)?;
+                                    let stream: Function = instance.raw_get("stream").map_err(|e| maki_providers::AgentError::Config { message: e.to_string() })?;
+                                    crate::provider_stream::run_stream(&lua, stream, request, events, cancel, generation, &permissions).await
+                                }}.await;
+                                let _ = reply.send(result);
+                            }).detach();
+                        }
                         Request::InstallOrchestrationServices(services) => {
                             rt.lua.set_app_data(services);
                         }
@@ -5118,12 +5621,14 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             plugin_dir,
                             permissions,
                             opts,
+                            identity,
                             reply,
                         } => {
+                            let _pause = ProviderPause::new(&provider_paused, &provider_resume);
                             drain_barrier(&rt.lua, &ex, &gate, &callbacks, &spawn_rx).await;
                             let res = rt
                                 .load_source(
-                                    (Arc::clone(&name), &name),
+                                    (Arc::clone(&name), &name, identity),
                                     &source,
                                     plugin_dir,
                                     &permissions,
@@ -5186,6 +5691,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             .detach();
                         }
                         Request::ClearPlugin { plugin, reply } => {
+                            let _pause = ProviderPause::new(&provider_paused, &provider_resume);
                             crate::orchestration::revoke_plugin(&rt.lua, &plugin);
                             drain_barrier(&rt.lua, &ex, &gate, &callbacks, &spawn_rx).await;
                             let result = rt.clear_plugin(&plugin).await;
@@ -5345,6 +5851,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             plugin_dir,
                             reply,
                         } => {
+                            let _pause = ProviderPause::new(&provider_paused, &provider_resume);
                             drain_barrier(&rt.lua, &ex, &gate, &callbacks, &spawn_rx).await;
                             let res = rt
                                 .run_init_lua(&source, &source_name, Arc::clone(&owner), plugin_dir)
@@ -5722,6 +6229,89 @@ mod tests {
     use std::task::Poll;
     use test_case::test_case;
 
+    #[test_case(false; "failed_reload_resumes")]
+    #[test_case(true; "successful_reload_revokes")]
+    fn provider_poll_waits_for_transaction_and_observes_revocation(revoke: bool) {
+        let paused = Rc::new(Cell::new(false));
+        let event = Rc::new(Event::new());
+        let (trigger, cancel) = CancelToken::new();
+        let polls = Rc::new(Cell::new(0));
+        let seen = Rc::clone(&polls);
+        let future = ProviderPoll {
+            paused: Rc::clone(&paused),
+            event: Rc::clone(&event),
+            listener: None,
+            inner: cancel.race(poll_fn(move |_| {
+                seen.set(seen.get() + 1);
+                Poll::<()>::Pending
+            })),
+        };
+        let mut future = std::pin::pin!(future);
+        assert!(smol::block_on(poll_once(future.as_mut())).is_none());
+        assert_eq!(polls.get(), 1);
+        let pause = ProviderPause::new(&paused, &event);
+        if revoke {
+            trigger.cancel();
+        }
+        assert!(smol::block_on(poll_once(future.as_mut())).is_none());
+        assert_eq!(polls.get(), 1);
+        drop(pause);
+        if revoke {
+            assert!(smol::block_on(future).is_err());
+            assert_eq!(polls.get(), 1);
+        } else {
+            assert!(smol::block_on(poll_once(future.as_mut())).is_none());
+            assert_eq!(polls.get(), 2);
+        }
+    }
+
+    #[test_case(false; "receiver_dropped_before_send")]
+    #[test_case(true; "receiver_dropped_after_send")]
+    fn undelivered_provider_lease_releases_instance(send_first: bool) {
+        let (tx, rx) = flume::unbounded();
+        let (reply, receiver) = flume::bounded(1);
+        let lease = PreparedInstance {
+            id: Some("instance".into()),
+            tx,
+        };
+        if send_first {
+            assert!(reply.send(lease).is_ok());
+            drop(receiver);
+            drop(reply);
+        } else {
+            drop(receiver);
+            let _ = reply.send(lease);
+        }
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::ProviderRelease { instance }) if instance == "instance")
+        );
+    }
+
+    #[test]
+    fn claimed_provider_lease_does_not_release_instance() {
+        let (tx, rx) = flume::unbounded();
+        let mut lease = PreparedInstance {
+            id: Some("instance".into()),
+            tx,
+        };
+        assert_eq!(lease.id.take().as_deref(), Some("instance"));
+        drop(lease);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn provider_release_does_not_block_on_full_channel() {
+        use crate::provider_adapter::ProviderDispatch;
+
+        let (tx, _rx) = flume::bounded(1);
+        assert!(tx.try_send(Request::WarmJit).is_ok());
+        RuntimeProviderDispatch(tx.clone(), None).release("instance");
+        drop(PreparedInstance {
+            id: Some("instance".into()),
+            tx,
+        });
+    }
+
     #[test_case(false; "normal_exit")]
     #[test_case(true; "cancelled_exit")]
     fn scope_cleanup_expires_retained_handle(cancelled: bool) {
@@ -6074,6 +6664,22 @@ mod tests {
             g.decrement();
             waiter.await;
         }));
+    }
+
+    #[test]
+    fn cancelled_gate_waiter_does_not_take_a_slot() {
+        smol::block_on(async {
+            let g = Rc::new(gate());
+            for _ in 0..MAX_INFLIGHT_TOOLS {
+                g.increment();
+            }
+            let (trigger, cancel) = CancelToken::new();
+            let mut waiter = Box::pin(g.acquire_before_abandoned(&cancel, None));
+            assert!(futures_lite::future::poll_once(&mut waiter).await.is_none());
+            drop(trigger);
+            assert!(matches!(waiter.await, Err(CANCELLED_MSG)));
+            assert_eq!(g.count.get(), MAX_INFLIGHT_TOOLS);
+        });
     }
 
     #[test]
@@ -6771,6 +7377,22 @@ mod tests {
             trigger,
             TaskScope::new(lua, TaskCell::new(token, None, None)),
         )
+    }
+
+    #[test]
+    fn scoped_cancellation_race_fires_hooks_before_returning() {
+        let lua = Lua::new();
+        let (trigger, scope) = live_scope(&lua);
+        let cancel = lock_cell(scope.handle()).cancel.clone();
+        let (tx, rx) = flume::unbounded();
+        recording_hook(&lua, &tx, HOOK_GOOD_MARK);
+        smol::block_on(async {
+            let mut work = Box::pin(scope.scope_future(cancel.race(std::future::pending::<()>())));
+            assert!(poll_once(&mut work).await.is_none());
+            drop(trigger);
+            assert!(work.await.is_err());
+        });
+        assert_eq!(rx.try_recv().unwrap(), HOOK_GOOD_MARK);
     }
 
     /// The token is already tripped, so the cancel branch is ready on the

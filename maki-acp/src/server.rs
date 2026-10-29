@@ -309,9 +309,14 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         dispatch: None,
     };
 
+    server
+        .catalog
+        .apply_provider_snapshot(&params.provider_registry.snapshot(), &params.model_policy)
+        .await;
     let _discovery = server.catalog.discover(
         Arc::clone(&params.model_policy),
         params.model.provider.to_string(),
+        Arc::clone(&params.provider_registry),
         |_| {},
     );
     let (in_tx, in_rx) = flume::unbounded::<String>();
@@ -574,7 +579,11 @@ async fn load_session(
     .await;
     let sid = SessionId::from(session_ref.to_string());
     let home = maki_storage::paths::home();
-    let recorded_model = match Model::from_spec(&restored.model) {
+    let recorded_model = match params
+        .provider_registry
+        .snapshot()
+        .resolve_model(&restored.model, &params.model_policy)
+    {
         Ok(model) if params.model_policy.allows(&model.spec()) => model,
         _ => params.model.clone(),
     };
@@ -656,6 +665,53 @@ async fn load_session(
     Ok(AgentResponse::LoadSessionResponse(resp))
 }
 
+fn registry_preparation(
+    registry: Arc<maki_providers::provider_registry::ProviderRegistry>,
+) -> headless::ProviderPreparation {
+    Box::new(move |mut model, timeouts| {
+        Box::pin(async move {
+            let snapshot = registry.snapshot();
+            let config = maki_config::providers::ProvidersConfig::load_or_default();
+            let config = config
+                .providers
+                .get(model.provider.as_ref())
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|error| maki_providers::AgentError::Config {
+                    message: error.to_string(),
+                })?
+                .unwrap_or_else(|| Value::Object(Default::default()));
+            if let Some(result) = snapshot.prepare(&model, &config).await {
+                let (model, provider) = result?;
+                return Ok((model, Arc::from(provider)));
+            }
+            let provider = maki_providers::provider::from_model_async(&mut model, timeouts).await?;
+            Ok((model, Arc::from(provider)))
+        })
+    })
+}
+
+fn registry_model_preparer(
+    registry: Arc<maki_providers::provider_registry::ProviderRegistry>,
+    timeouts: maki_providers::Timeouts,
+    policy: Arc<maki_config::ModelPolicy>,
+) -> ModelPreparer {
+    Arc::new(move |spec| {
+        let registry = Arc::clone(&registry);
+        let policy = Arc::clone(&policy);
+        Box::pin(async move {
+            let model = registry
+                .snapshot()
+                .resolve_model(&spec, &policy)
+                .map_err(|error| Arc::from(error.to_string()))?;
+            let (model, provider) = registry_preparation(registry)(model, timeouts)
+                .await
+                .map_err(|error| Arc::from(error.user_message()))?;
+            Ok(maki_agent::actor::PreparedModel { model, provider })
+        })
+    })
+}
+
 fn spawn_session(
     params: &AcpParams,
     session: SpawnSession,
@@ -697,6 +753,7 @@ fn spawn_session_with_history(
         append_system_prompt: params.append_system_prompt.clone(),
         defaults,
         model_policy: Arc::clone(&params.model_policy),
+        provider_registry: Some(Arc::clone(&params.provider_registry)),
         question_mode: if elicitation {
             QuestionMode::Elicitation
         } else {
@@ -711,7 +768,7 @@ fn spawn_session_with_history(
     let (binding, root_target) = maki_lua::orchestration::root_binding();
     let handle = headless::spawn_interactive_with_binding(
         interactive,
-        headless::default_preparation(),
+        registry_preparation(Arc::clone(&params.provider_registry)),
         snapshot,
         Some(binding),
     );
@@ -984,7 +1041,11 @@ async fn install_session_with_lock(
         &handle,
         &coordinator,
         &root_target,
-        headless::default_model_preparer(params.timeouts),
+        registry_model_preparer(
+            Arc::clone(&params.provider_registry),
+            params.timeouts,
+            Arc::clone(&params.model_policy),
+        ),
     )
     .await
     {
@@ -1028,7 +1089,11 @@ async fn install_session_with_lock(
         &coordinator,
         &trusted_root,
         &orchestration,
-        headless::default_model_preparer(params.timeouts),
+        registry_model_preparer(
+            Arc::clone(&params.provider_registry),
+            params.timeouts,
+            Arc::clone(&params.model_policy),
+        ),
     );
     orchestration.bind_commands(
         &trusted_root.target,
@@ -2449,6 +2514,45 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn registry_model_preparer_uses_registered_factory() {
+        use maki_providers::model::ModelInfo;
+        use maki_providers::provider_registry::{
+            ProviderFactory, ProviderRegistration, ProviderRegistry,
+        };
+        const SPEC: &str = "acp-test/model";
+        const ERROR: &str = "acp factory invoked";
+        struct Factory;
+        impl ProviderFactory for Factory {
+            fn prepare<'a>(
+                &'a self,
+                _: &'a Model,
+                _: &'a Value,
+            ) -> maki_providers::provider::BoxFuture<
+                'a,
+                maki_providers::provider_registry::PreparedProvider,
+            > {
+                Box::pin(async {
+                    Err(maki_providers::AgentError::Config {
+                        message: ERROR.into(),
+                    })
+                })
+            }
+        }
+        let registry = Arc::new(ProviderRegistry::default());
+        registry
+            .register(ProviderRegistration {
+                id: "acp-test".into(),
+                display_name: "ACP test".into(),
+                models: vec![ModelInfo::id_only("model".into())],
+                factory: Arc::new(Factory),
+            })
+            .unwrap();
+        let prepare = registry_model_preparer(registry, Default::default(), Arc::default());
+        let error = smol::block_on(prepare(Arc::from(SPEC))).err().unwrap();
+        assert!(error.contains(ERROR));
+    }
+
     const ANSWERED_ID: i64 = 1001;
     const UNKNOWN_ID: i64 = 1002;
     const DISCOVERED_SPEC: &str = "openrouter/discovered-model";
@@ -2755,6 +2859,7 @@ mod tests {
                 append_system_prompt: None,
                 defaults: Default::default(),
                 model_policy: Arc::default(),
+                provider_registry: None,
                 modes: Arc::new(maki_agent::ModeRegistry::builtin()),
                 question_mode: QuestionMode::Headless,
                 plugin_rules: Arc::default(),
@@ -2784,9 +2889,13 @@ mod tests {
             &handle,
             &coordinator,
             &root_target,
-            Arc::new(move |model| {
+            Arc::new(move |spec| {
                 let provider = Arc::clone(&replacement);
-                Box::pin(async move { Ok(maki_agent::actor::PreparedModel { provider, model }) })
+                Box::pin(async move {
+                    let model =
+                        Model::from_spec(&spec).map_err(|error| Arc::from(error.to_string()))?;
+                    Ok(maki_agent::actor::PreparedModel { provider, model })
+                })
             }),
         )
         .await
@@ -3107,6 +3216,7 @@ mod tests {
             model_policy: Arc::default(),
             plugin_rules: Arc::default(),
             lua_event_handle: maki_lua::EventHandle::disconnected_for_test(),
+            provider_registry: Arc::default(),
             command_registry: test_registry(&[]),
             trust_mode: TrustMode::Consult,
             trust_policy: Arc::default(),
@@ -3281,6 +3391,7 @@ mod tests {
                 append_system_prompt: None,
                 defaults: Default::default(),
                 model_policy: Arc::default(),
+                provider_registry: None,
                 question_mode: QuestionMode::Headless,
                 plugin_rules: Arc::default(),
                 project_config: ProjectConfig::for_project(Path::new("/project")),
@@ -3308,11 +3419,13 @@ mod tests {
         coordinator
             .bind_actor(
                 root.clone(),
-                Arc::new(move |model| {
+                Arc::new(move |spec| {
                     let provider = Arc::clone(&provider);
-                    Box::pin(
-                        async move { Ok(maki_agent::actor::PreparedModel { model, provider }) },
-                    )
+                    Box::pin(async move {
+                        let model = Model::from_spec(&spec)
+                            .map_err(|error| Arc::from(error.to_string()))?;
+                        Ok(maki_agent::actor::PreparedModel { model, provider })
+                    })
                 }),
                 Arc::new({
                     let model = handle.model.clone();
@@ -3989,6 +4102,97 @@ mod tests {
             answer_rx.is_empty(),
             "a replayed answer cannot land on the next request"
         );
+    }
+
+    #[test]
+    fn lua_provider_model_selection_uses_session_preparer_and_policy() {
+        const INITIAL: &str = "fixture/initial";
+        const SELECTED: &str = "fixture/selected";
+        const BLOCKED: &str = "fixture/blocked";
+        smol::block_on(async {
+            let cwd = TempDir::new().unwrap();
+            let host = maki_lua::PluginHost::new(Arc::new(maki_agent::tools::ToolRegistry::new()))
+                .unwrap();
+            host.load_source(
+                "fixture",
+                r#"
+                maki.api.register_provider({
+                    id = 'fixture',
+                    models = {{ id = 'initial' }, { id = 'selected' }, { id = 'blocked' }},
+                    prepare = function(_, model)
+                        return { model = model, stream = function() end }
+                    end,
+                })
+            "#,
+            )
+            .unwrap();
+            let mut params = test_params(
+                Model::from_spec(SPAWN_TEST_SPEC).unwrap(),
+                cwd.path().to_path_buf(),
+            );
+            params.lua_event_handle = host.event_handle();
+            params.provider_registry = host.provider_registry();
+            params.model_policy =
+                Arc::new(maki_config::ModelPolicy::new(&[], &[BLOCKED.into()]).unwrap());
+            params.model = params
+                .provider_registry
+                .snapshot()
+                .resolve_model(INITIAL, &params.model_policy)
+                .unwrap();
+            let catalog = ModelCatalog::default();
+            catalog
+                .apply_provider_snapshot(&params.provider_registry.snapshot(), &params.model_policy)
+                .await;
+            let (out_tx, _out_rx) = flume::unbounded();
+            let mut srv = Server {
+                out_tx,
+                catalog,
+                session: None,
+                elicitation: false,
+                supports_boolean: false,
+                lua_event_handle: host.event_handle(),
+                dispatch: None,
+            };
+            new_session(
+                &mut srv,
+                &serde_json::json!({ "params": { "cwd": cwd.path(), "mcpServers": [] } }),
+                &params,
+            )
+            .await
+            .unwrap();
+            dispatch_prompt(
+                &mut srv,
+                &format!("/model {SELECTED}"),
+                false,
+                &RequestId::Number(1),
+            )
+            .await
+            .unwrap();
+            let options = srv
+                .session
+                .as_ref()
+                .unwrap()
+                .coordinator
+                .as_ref()
+                .unwrap()
+                .read()
+                .options();
+            let model = options
+                .options
+                .iter()
+                .find(|option| {
+                    option.definition.id.as_ref() == maki_agent::session_options::MODEL_OPTION_ID
+                })
+                .unwrap();
+            assert_eq!(model.current_value.as_ref(), SELECTED);
+            let prepare = registry_model_preparer(
+                Arc::clone(&params.provider_registry),
+                params.timeouts,
+                Arc::clone(&params.model_policy),
+            );
+            assert!(prepare(Arc::from(BLOCKED)).await.is_err());
+            close_session(&mut srv).await;
+        });
     }
 
     const GHOST_MODE: &str = "ghost";
@@ -5969,6 +6173,7 @@ mod tests {
                     model_policy: Arc::default(),
                     plugin_rules: Arc::default(),
                     lua_event_handle: maki_lua::EventHandle::disconnected_for_test(),
+                    provider_registry: Arc::default(),
                     command_registry: test_registry(&[]),
                     trust_mode: TrustMode::Consult,
                     trust_policy: Arc::default(),
@@ -6809,7 +7014,7 @@ mod tests {
         .unwrap_err();
         let second = smol::block_on(dispatch_prompt(
             &mut srv,
-            "/model codex/gpt-5.6-sol",
+            "/model another-definitely-invalid-provider/test",
             false,
             &RequestId::Number(4),
         ))
@@ -6821,7 +7026,7 @@ mod tests {
         );
         assert_eq!(
             second.message,
-            "command failed: unsupported provider 'codex'"
+            "command failed: unsupported provider 'another-definitely-invalid-provider'"
         );
         turns.assert_untouched();
     }

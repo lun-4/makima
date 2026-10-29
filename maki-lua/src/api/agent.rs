@@ -30,6 +30,7 @@ use maki_agent::cancel::CancelMap;
 use maki_agent::config_change::prepare_model;
 use maki_agent::headless::default_model_preparer;
 use maki_agent::session_coordinator::ModelPreparer;
+use maki_agent::session_options::SessionOptionError;
 use maki_agent::template::env_vars_for;
 use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::offload::OffloadStore;
@@ -50,6 +51,7 @@ use maki_config::ToolKey;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::model::ModelTier;
 use maki_providers::provider;
+use maki_providers::provider_registry::ProviderRegistry;
 use maki_providers::{Model, ModelError, ModelSelection, RequestOptions, TokenUsage, add_cost};
 use maki_storage::id::MakiId;
 use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table, Value as LuaValue};
@@ -99,6 +101,7 @@ async fn build_session_provider(
     inherit_provider: bool,
     agent_ctx: &AgentContext,
     prepare: Option<SessionProviderPreparer>,
+    registry: Option<Arc<ProviderRegistry>>,
 ) -> Result<(Model, Arc<dyn provider::Provider>), String> {
     let Some(spec) = model_spec.as_deref().filter(|_| !inherit_provider) else {
         return Ok((
@@ -106,11 +109,37 @@ async fn build_session_provider(
             Arc::clone(&agent_ctx.provider),
         ));
     };
+    if !agent_ctx.model_policy.allows(spec) {
+        return Err(SessionOptionError::PolicyRejected(spec.into()).to_string());
+    }
+    if let Some(registry) = registry {
+        let snapshot = registry.snapshot();
+        let model = snapshot
+            .resolve_model(spec, &agent_ctx.model_policy)
+            .map_err(|error| error.to_string())?;
+        if snapshot.get(&model.provider).is_some() {
+            let config = maki_config::providers::ProvidersConfig::load_or_default();
+            let config = config
+                .providers
+                .get(model.provider.as_ref())
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|error| error.to_string())?
+                .unwrap_or_else(|| JsonValue::Object(Default::default()));
+            let (model, provider) = snapshot
+                .prepare(&model, &config)
+                .await
+                .ok_or_else(|| "provider registration disappeared".to_string())?
+                .map_err(|error| error.user_message())?;
+            return Ok((model, Arc::from(provider)));
+        }
+    }
     let preparer: ModelPreparer = match prepare {
-        Some(prepare) => Arc::new(move |model| {
-            let prepared = prepare(model)
-                .map(|(model, provider)| PreparedModel { model, provider })
-                .map_err(Arc::from);
+        Some(prepare) => Arc::new(move |spec| {
+            let prepared = Model::from_spec(&spec)
+                .map_err(|error| Arc::from(error.to_string()))
+                .and_then(|model| prepare(model).map_err(Arc::from))
+                .map(|(model, provider)| PreparedModel { model, provider });
             Box::pin(async move { prepared })
         }),
         None => default_model_preparer(agent_ctx.timeouts),
@@ -119,6 +148,56 @@ async fn build_session_provider(
         .await
         .map_err(|error| error.to_string())?;
     Ok((prepared.model, prepared.provider))
+}
+
+fn registry_compaction_spec(
+    snapshot: &maki_providers::provider_registry::ProviderSnapshot,
+    policy: &maki_config::ModelPolicy,
+    legacy: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    snapshot
+        .providers()
+        .find_map(|registration| {
+            registration
+                .models
+                .iter()
+                .filter(|candidate| candidate.tier == Some(ModelTier::Compaction))
+                .map(|candidate| format!("{}/{}", registration.id, candidate.id))
+                .filter(|spec| policy.allows(spec))
+                .min()
+        })
+        .or_else(legacy)
+}
+
+async fn resolve_lua_compaction_model(
+    registry: Option<&ProviderRegistry>,
+    provider: &Arc<dyn provider::Provider>,
+    model: &Model,
+    timeouts: maki_providers::Timeouts,
+    policy: &maki_config::ModelPolicy,
+) -> (Arc<dyn provider::Provider>, Model) {
+    if let Some(registry) = registry {
+        let snapshot = registry.snapshot();
+        let spec = registry_compaction_spec(&snapshot, policy, || {
+            maki_providers::model_registry::spec_for_tier_any(ModelTier::Compaction)
+        });
+        if let Some(spec) = spec
+            && let Ok(selected) = snapshot.resolve_model(&spec, policy)
+            && snapshot.get(&selected.provider).is_some()
+        {
+            let config = maki_config::providers::ProvidersConfig::load_or_default();
+            let config = config
+                .providers
+                .get(selected.provider.as_ref())
+                .and_then(|config| serde_json::to_value(config).ok())
+                .unwrap_or_else(|| JsonValue::Object(Default::default()));
+            if let Some(Ok((selected, prepared))) = snapshot.prepare(&selected, &config).await {
+                return (Arc::from(prepared), selected);
+            }
+            return (Arc::clone(provider), model.clone());
+        }
+    }
+    maki_agent::agent::resolve_compaction_model(provider, model, timeouts, policy)
 }
 
 /// Shared backend state, owned by the adapter and cloned into the actor's
@@ -131,6 +210,7 @@ async fn build_session_provider(
 /// a `Mutex`/`Sender`/`OnceLock` the borrowed shell can touch. `prompt` and
 /// `status` never read through this struct; they speak to the actor handle.
 struct LuaActorState {
+    provider_registry: Option<Arc<ProviderRegistry>>,
     template: OnceLock<ToolContext>,
     params: OnceLock<AgentParams>,
     prompt_slots: PromptSlotSource,
@@ -438,6 +518,7 @@ impl ActorBackend for LuaActorBackend {
                 &context,
                 loaded,
             )
+            .with_provider_registry(state.provider_registry.clone())
             .with_user_response_rx(state.answer_rx.clone())
             .with_mcp(state.mcp.clone())
             .with_local_tools(Arc::clone(&state.local_tools))
@@ -529,12 +610,14 @@ impl ActorBackend for LuaActorBackend {
                 });
                 return BackendResult::ControlFailed;
             };
-            let (provider, model) = maki_agent::agent::resolve_compaction_model(
+            let (provider, model) = resolve_lua_compaction_model(
+                state.provider_registry.as_deref(),
                 &settings.provider,
                 &settings.model,
                 params.timeouts,
                 &params.model_policy,
-            );
+            )
+            .await;
             match maki_agent::agent::compact(
                 &*provider,
                 &model,
@@ -563,7 +646,11 @@ impl ActorBackend for LuaActorBackend {
     }
 }
 
-fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Model, String> {
+fn resolve_model_from_ctx(
+    lua: &Lua,
+    ctx: &AgentContext,
+    tier: Option<&str>,
+) -> Result<Model, String> {
     let Some(tier_str) = tier else {
         return Ok(Model::clone(&ctx.model));
     };
@@ -573,6 +660,23 @@ fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Mode
         return Ok(Model::clone(&ctx.model));
     }
     let slug = &ctx.model.provider;
+    if let Some(registry) = lua.app_data_ref::<Arc<ProviderRegistry>>() {
+        let snapshot = registry.snapshot();
+        if let Some(registration) = snapshot.get(slug) {
+            let candidate = registration
+                .models
+                .iter()
+                .filter(|model| model.tier == Some(effective))
+                .filter(|model| ctx.model_policy.allows(&format!("{slug}/{}", model.id)))
+                .min_by(|a, b| a.id.cmp(&b.id));
+            if let Some(model) = candidate {
+                return snapshot
+                    .resolve_model(&format!("{slug}/{}", model.id), &ctx.model_policy)
+                    .map_err(|error| error.to_string());
+            }
+            return Err(format!("no allowed {effective} model for provider {slug}"));
+        }
+    }
     maki_providers::model_registry::spec_for_tier(slug, effective)
         .or_else(|| maki_providers::model_registry::spec_for_tier_any(effective))
         .filter(|spec| ctx.model_policy.allows(spec))
@@ -663,8 +767,12 @@ async fn resolve_model(
         .and_then(|t| t.get::<Option<String>>("spec").ok().flatten());
 
     let model = match spec_str {
-        Some(ref spec) => try_pair!(Model::from_spec_with_policy(spec, &agent.model_policy)),
-        None => try_pair!(resolve_model_from_ctx(agent, tier_str.as_deref())),
+        Some(ref spec) => try_pair!(crate::api::model::resolve_spec(
+            &lua,
+            spec,
+            &agent.model_policy
+        )),
+        None => try_pair!(resolve_model_from_ctx(&lua, agent, tier_str.as_deref())),
     };
     Ok((Some(crate::api::model::model_table(&lua, &model)?), None))
 }
@@ -762,7 +870,7 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
 
     let parsed = spec_str
         .as_deref()
-        .and_then(|spec| Model::from_spec_with_policy(spec, &agent.model_policy).ok());
+        .and_then(|spec| crate::api::model::resolve_spec(&lua, spec, &agent.model_policy).ok());
     let model = parsed.as_ref().unwrap_or(&agent.model);
 
     let base = match (only, except) {
@@ -1662,13 +1770,17 @@ async fn build_session(
     let prepare = lua
         .app_data_ref::<SessionProviderPreparer>()
         .map(|p| Arc::clone(&p));
+    let registry = lua
+        .app_data_ref::<Arc<ProviderRegistry>>()
+        .map(|registry| Arc::clone(&registry));
     let model_spec = options.selection.spec.as_deref().map(str::to_owned);
     let (model, provider) = try_pair!(
         build_session_provider(
             &model_spec,
             options.inherit_provider,
             &parent.context,
-            prepare
+            prepare,
+            registry.clone()
         )
         .await
     );
@@ -1712,6 +1824,7 @@ async fn build_session(
         }
     });
     let state = Arc::new(LuaActorState {
+        provider_registry: registry,
         template: OnceLock::new(),
         params: OnceLock::new(),
         prompt_slots: lua
@@ -2142,6 +2255,7 @@ mod tests {
             true,
             &agent,
             None,
+            None,
         ))
         .unwrap();
 
@@ -2153,13 +2267,99 @@ mod tests {
     }
 
     #[test]
+    fn registered_provider_is_resolved_before_preparation() {
+        use maki_providers::provider_registry::{ProviderFactory, ProviderRegistration};
+
+        struct Factory;
+        impl ProviderFactory for Factory {
+            fn prepare<'a>(
+                &'a self,
+                model: &'a Model,
+                _: &'a Value,
+            ) -> BoxFuture<'a, Result<(Model, Box<dyn Provider>), AgentError>> {
+                Box::pin(async move {
+                    Ok((
+                        model.clone(),
+                        Box::new(HangingProvider) as Box<dyn Provider>,
+                    ))
+                })
+            }
+        }
+
+        let registry = Arc::new(ProviderRegistry::default());
+        registry
+            .register(ProviderRegistration {
+                id: "lua-test-provider".into(),
+                display_name: "Lua test".into(),
+                models: vec![
+                    ModelInfo {
+                        context_window: Some(42_000),
+                        tier: Some(ModelTier::Strong),
+                        ..ModelInfo::id_only("model".into())
+                    },
+                    ModelInfo {
+                        context_window: Some(21_000),
+                        tier: Some(ModelTier::Weak),
+                        ..ModelInfo::id_only("weak".into())
+                    },
+                ],
+                factory: Arc::new(Factory),
+            })
+            .unwrap();
+        let ctx = stub_ctx(&AgentMode::Build);
+        let agent = AgentContext::from(&ctx);
+        const SPEC: &str = "lua-test-provider/model";
+        let lua = Lua::new();
+        lua.set_app_data(Arc::clone(&registry));
+        let resolved = crate::api::model::resolve_spec(&lua, SPEC, &agent.model_policy).unwrap();
+        assert_eq!(resolved.context_window, 42_000);
+        let mut tier_context = ctx.clone();
+        tier_context.model = Arc::new(resolved);
+        let tier_agent = AgentContext::from(&tier_context);
+        let weak = resolve_model_from_ctx(&lua, &tier_agent, Some("weak")).unwrap();
+        assert_eq!(weak.spec(), "lua-test-provider/weak");
+        assert_eq!(weak.context_window, 21_000);
+        assert_eq!(
+            resolve_model_from_ctx(&lua, &tier_agent, Some("strong"))
+                .unwrap()
+                .spec(),
+            SPEC
+        );
+        assert!(resolve_model_from_ctx(&lua, &tier_agent, Some("medium")).is_err());
+        let other_lua = Lua::new();
+        other_lua.set_app_data(Arc::new(ProviderRegistry::default()));
+        assert!(crate::api::model::resolve_spec(&other_lua, SPEC, &agent.model_policy).is_err());
+        let spec = Some(SPEC.into());
+        let (model, _) = smol::block_on(build_session_provider(
+            &spec,
+            false,
+            &agent,
+            None,
+            Some(Arc::clone(&registry)),
+        ))
+        .unwrap();
+        assert_eq!(model.spec(), SPEC);
+        assert_eq!(model.context_window, 42_000);
+        assert!(
+            smol::block_on(build_session_provider(
+                &Some("lua-test-provider/missing".into()),
+                false,
+                &agent,
+                None,
+                Some(registry),
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn absent_model_spec_reuses_parent_provider() {
         let ctx = stub_ctx(&AgentMode::Build);
         let parent_provider = Arc::clone(&ctx.provider);
         let agent = AgentContext::from(&ctx);
 
         let (_, provider) =
-            smol::block_on(build_session_provider(&None, false, &agent, None)).unwrap();
+            smol::block_on(build_session_provider(&None, false, &agent, None, None)).unwrap();
         assert!(Arc::ptr_eq(&provider, &parent_provider));
     }
 
@@ -2224,6 +2424,89 @@ mod tests {
             context_size: None,
             context_window: 0,
         }))
+    }
+
+    #[test]
+    fn lua_compaction_prepares_registered_tier_and_falls_back_on_failure() {
+        use maki_providers::provider_registry::{ProviderFactory, ProviderRegistration};
+
+        struct Factory(bool);
+        impl ProviderFactory for Factory {
+            fn prepare<'a>(
+                &'a self,
+                model: &'a Model,
+                _: &'a Value,
+            ) -> BoxFuture<'a, Result<(Model, Box<dyn Provider>), AgentError>> {
+                Box::pin(async move {
+                    if self.0 {
+                        Ok((
+                            model.clone(),
+                            Box::new(HangingProvider) as Box<dyn Provider>,
+                        ))
+                    } else {
+                        Err(AgentError::EmptySummary)
+                    }
+                })
+            }
+        }
+        smol::block_on(async {
+            let ctx = stub_ctx(&AgentMode::Build);
+            for succeeds in [true, false] {
+                let registry = ProviderRegistry::default();
+                registry
+                    .register(ProviderRegistration {
+                        id: "lua-compact-test".into(),
+                        display_name: "Compaction test".into(),
+                        models: vec![ModelInfo {
+                            tier: Some(ModelTier::Compaction),
+                            ..ModelInfo::id_only("summary".into())
+                        }],
+                        factory: Arc::new(Factory(succeeds)),
+                    })
+                    .unwrap();
+                let snapshot = registry.snapshot();
+                let legacy = || Some("legacy/summary".to_string());
+                assert_eq!(
+                    registry_compaction_spec(&snapshot, &ctx.model_policy, legacy).as_deref(),
+                    Some("lua-compact-test/summary")
+                );
+                let denied =
+                    maki_config::ModelPolicy::new(&[], &["lua-compact-test/*".into()]).unwrap();
+                assert_eq!(
+                    registry_compaction_spec(&snapshot, &denied, legacy).as_deref(),
+                    Some("legacy/summary")
+                );
+                let (provider, model) = resolve_lua_compaction_model(
+                    Some(&registry),
+                    &ctx.provider,
+                    &ctx.model,
+                    ctx.timeouts,
+                    &ctx.model_policy,
+                )
+                .await;
+                let (turn_provider, turn_model) =
+                    maki_agent::agent::resolve_registry_compaction_model(
+                        Some(&registry),
+                        &ctx.provider,
+                        &ctx.model,
+                        ctx.timeouts,
+                        &ctx.model_policy,
+                    )
+                    .await;
+                assert_eq!(turn_model.spec(), model.spec());
+                assert_eq!(
+                    turn_provider.is_registry_owned(),
+                    provider.is_registry_owned()
+                );
+                if succeeds {
+                    assert_eq!(model.spec(), "lua-compact-test/summary");
+                    assert!(provider.is_registry_owned());
+                } else {
+                    assert_eq!(model.spec(), ctx.model.spec());
+                    assert!(Arc::ptr_eq(&provider, &ctx.provider));
+                }
+            }
+        });
     }
 
     #[test_case::test_case(false; "missing_policy_rejected")]
@@ -2472,6 +2755,7 @@ mod tests {
             managed_turn: None,
         };
         let state = Arc::new(LuaActorState {
+            provider_registry: None,
             template: OnceLock::from(stub_ctx(&AgentMode::Build)),
             params: OnceLock::from(params),
             prompt_slots: PromptSlotSource::default(),

@@ -48,6 +48,7 @@ use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::orchestration::ModelCatalog;
 use maki_lua::session_snapshot::HeadlessObserver;
 use maki_providers::model::Model;
+use maki_providers::provider_registry::{ProviderRegistry, ProviderSnapshot};
 use maki_providers::{ImageSource, Message, StopReason, Timeouts, TokenUsage, add_cost};
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
@@ -529,6 +530,7 @@ pub struct SdkParams {
     /// same way they do in the TUI.
     pub session_options: maki_agent::session_coordinator::SessionOptionCatalog,
     pub lua_handle: maki_lua::EventHandle,
+    pub provider_registry: Arc<ProviderRegistry>,
 }
 
 struct Shared {
@@ -638,6 +640,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         command_registry,
         session_options,
         lua_handle,
+        provider_registry,
     } = params;
     cli.warn_ignored_flags();
     if let Some(max) = cli.max_turns {
@@ -654,7 +657,13 @@ pub fn run(params: SdkParams) -> Result<()> {
     let storage = StateDir::resolve().context("resolve state dir")?;
     let mut restored = resolve_session(&cli, &working_dir, &storage)?;
     let restored_state = restored.model.is_some();
-    let model = startup_model(model, &restored, explicit_model, &model_policy);
+    let model = startup_model(
+        model,
+        &restored,
+        explicit_model,
+        &model_policy,
+        &provider_registry.snapshot(),
+    );
     let permission_mode = restored_permission_mode(
         restored_state,
         restored.meta.yolo,
@@ -687,6 +696,9 @@ pub fn run(params: SdkParams) -> Result<()> {
 
     let startup_model = model.clone();
     let catalog = ModelCatalog::offline(&model_policy);
+    smol::block_on(catalog.apply_provider_snapshot(&provider_registry.snapshot(), &model_policy));
+    let prepare_model =
+        crate::print::print_model_preparer(Arc::clone(&provider_registry), timeouts);
     let (binding, root_target) = maki_lua::orchestration::root_binding();
     let handle = headless::spawn_interactive_with_binding(
         InteractiveParams {
@@ -707,13 +719,38 @@ pub fn run(params: SdkParams) -> Result<()> {
             defaults,
             modes: lua_handle.mode_registry(),
             model_policy: Arc::clone(&model_policy),
+            provider_registry: Some(Arc::clone(&provider_registry)),
             plugin_rules,
             project_config,
             local_tools: Default::default(),
             state_dir: Some(storage.path().to_path_buf()),
             answers: true,
         },
-        headless::default_preparation(),
+        Box::new({
+            let provider_registry = Arc::clone(&provider_registry);
+            move |mut model, timeouts| {
+                Box::pin(async move {
+                    let snapshot = provider_registry.snapshot();
+                    let config = maki_config::providers::ProvidersConfig::load_or_default();
+                    let config = config
+                        .providers
+                        .get(model.provider.as_ref())
+                        .map(serde_json::to_value)
+                        .transpose()
+                        .map_err(|error| maki_providers::AgentError::Config {
+                            message: error.to_string(),
+                        })?
+                        .unwrap_or_else(|| Value::Object(Default::default()));
+                    if let Some(result) = snapshot.prepare(&model, &config).await {
+                        let (model, provider) = result?;
+                        return Ok((model, Arc::from(provider)));
+                    }
+                    let provider =
+                        maki_providers::provider::from_model_async(&mut model, timeouts).await?;
+                    Ok((model, Arc::from(provider)))
+                })
+            }
+        }),
         Some(initial_history),
         Some(binding),
     );
@@ -760,7 +797,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         &handle,
         &coordinator,
         &root_target,
-        headless::default_model_preparer(timeouts),
+        Arc::clone(&prepare_model),
     ))
     .map_err(|error| eyre!("bind session actor: {error}"))?;
     let root = trusted_root.target.clone();
@@ -778,7 +815,7 @@ pub fn run(params: SdkParams) -> Result<()> {
             SessionCommandHost::new(handle.control_tx.clone(), coordinator.clone()),
             trusted_root,
             &orchestration,
-            headless::default_model_preparer(timeouts),
+            Arc::clone(&prepare_model),
         ),
     )?);
     orchestration.bind_commands(
@@ -885,6 +922,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     let model_discovery = catalog.discover(
         Arc::clone(&model_policy),
         startup_model.provider.to_string(),
+        Arc::clone(&provider_registry),
         |_| {},
     );
 
@@ -1258,6 +1296,7 @@ fn startup_model(
     restored: &ResolvedSession,
     explicit_model: bool,
     model_policy: &ModelPolicy,
+    providers: &ProviderSnapshot,
 ) -> Model {
     if explicit_model {
         return startup;
@@ -1265,8 +1304,7 @@ fn startup_model(
     restored
         .model
         .as_deref()
-        .and_then(|spec| Model::from_spec(spec).ok())
-        .filter(|candidate| model_policy.allows(&candidate.spec()))
+        .and_then(|spec| providers.resolve_model(spec, model_policy).ok())
         .unwrap_or(startup)
 }
 
@@ -2094,9 +2132,59 @@ mod tests {
             &restored,
             explicit_model,
             &ModelPolicy::default(),
+            &ProviderRegistry::default().snapshot(),
         );
 
         assert_eq!(resolved.spec(), expected);
+    }
+
+    #[test]
+    fn sdk_restores_model_from_provider_registry() {
+        use maki_providers::AgentError;
+        use maki_providers::model::ModelInfo;
+        use maki_providers::provider::{BoxFuture, Provider};
+        use maki_providers::provider_registry::{ProviderFactory, ProviderRegistration};
+
+        const SPEC: &str = "sdk-test-provider/model";
+        const WINDOW: u32 = 42_000;
+        struct Factory;
+        impl ProviderFactory for Factory {
+            fn prepare<'a>(
+                &'a self,
+                _: &'a Model,
+                _: &'a Value,
+            ) -> BoxFuture<'a, Result<(Model, Box<dyn Provider>), AgentError>> {
+                Box::pin(async { Err(AgentError::Cancelled) })
+            }
+        }
+
+        let providers = ProviderRegistry::default();
+        providers
+            .register(ProviderRegistration {
+                id: "sdk-test-provider".into(),
+                display_name: "SDK test".into(),
+                models: vec![ModelInfo {
+                    context_window: Some(WINDOW),
+                    ..ModelInfo::id_only("model".into())
+                }],
+                factory: Arc::new(Factory),
+            })
+            .unwrap();
+        let restored = ResolvedSession {
+            id: None,
+            history: Default::default(),
+            model: Some(SPEC.into()),
+            meta: SessionMeta::default(),
+        };
+        let resolved = startup_model(
+            Model::from_spec(STARTUP_MODEL).unwrap(),
+            &restored,
+            false,
+            &ModelPolicy::default(),
+            &providers.snapshot(),
+        );
+        assert_eq!(resolved.spec(), SPEC);
+        assert_eq!(resolved.context_window, WINDOW);
     }
 
     struct OutcomeBehavior(CommandOutcome);
@@ -2206,6 +2294,7 @@ mod tests {
             append_system_prompt: None,
             defaults: SessionDefaults::default(),
             model_policy: Arc::default(),
+            provider_registry: None,
             modes: Arc::new(maki_agent::ModeRegistry::builtin()),
             question_mode: QuestionMode::Headless,
             plugin_rules: Arc::default(),
@@ -2592,19 +2681,31 @@ mod tests {
     #[test]
     fn refused_message_is_an_error_not_the_end() {
         let session = pending_sdk_session();
-        let input = AgentInput::new(
-            "a".repeat(maki_agent::actor::MAX_PENDING_INSTRUCTION_BYTES + 1),
-            Vec::new(),
-        );
+        let (out_tx, out_rx) = flume::unbounded();
+        let dispatch = UserDispatch {
+            commands: Arc::new(sdk_commands(CommandRegistry::new())),
+            input_tx: session.handle.input_tx.clone(),
+            control_tx: session.handle.control_tx.clone(),
+            writer: SdkWriter {
+                session_id: session.handle.session_id.clone(),
+                out_tx,
+            },
+            shared: Arc::clone(&session.shared),
+        };
+        let running = tracked_turns(&session.shared);
+        let prompt = "a".repeat(maki_agent::actor::MAX_PENDING_INSTRUCTION_BYTES + 1);
+        assert!(smol::block_on(dispatch.dispatch(&prompt, &[])).unwrap());
+        smol::block_on(end_dispatch(&session.shared, false));
+        let error: Value =
+            serde_json::from_str(&out_rx.recv_timeout(SDK_GATE_TIMEOUT).unwrap()).unwrap();
+        assert_eq!(error["type"], "result");
+        assert_eq!(error["is_error"], true);
         assert_eq!(
-            smol::block_on(admit_sdk_turn(
-                &session.shared,
-                &session.handle.input_tx,
-                input
-            )),
-            Err(maki_agent::ActorError::InstructionOverflow.to_string())
+            error["result"],
+            maki_agent::ActorError::InstructionOverflow.to_string()
         );
-        session.release.send(()).unwrap();
+        assert_eq!(tracked_turns(&session.shared), running);
+        drop(dispatch);
         let results = session.end_input();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["is_error"], false);
@@ -3090,6 +3191,7 @@ mod tests {
                 append_system_prompt: None,
                 defaults,
                 model_policy: Arc::default(),
+                provider_registry: lua_handle.provider_registry(),
                 modes: lua_handle.mode_registry(),
                 question_mode: QuestionMode::Headless,
                 plugin_rules: Arc::default(),
@@ -3159,7 +3261,11 @@ mod tests {
                 let provider = Arc::clone(&provider);
                 move |model| {
                     let provider = Arc::clone(&provider);
-                    Box::pin(async move { Ok(PreparedModel { model, provider }) })
+                    Box::pin(async move {
+                        let model = Model::from_spec(&model)
+                            .map_err(|error| Arc::from(error.to_string()))?;
+                        Ok(PreparedModel { model, provider })
+                    })
                 }
             }),
         ))

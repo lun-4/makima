@@ -836,6 +836,27 @@ fn register_tool(lua: &Lua, #[ctx] pending: PendingTools, spec: Table) -> LuaRes
     register_tool_from_lua(lua, &spec, pending)
 }
 
+/// Stage a provider table during plugin loading. The required `id` is unique across plugins.
+/// Staged tables are offline only: they do not register an executable provider or models.
+/// A successful reload replaces the plugin's staged tables; unload removes them.
+/// @param spec table Provider table with a non-empty string `id`.
+/// @return
+#[lua_fn]
+fn register_provider(
+    lua: &Lua,
+    #[ctx] pending: Arc<Mutex<Vec<(String, Table)>>>,
+    #[ctx] plugin: Arc<str>,
+    spec: Table,
+) -> LuaResult<()> {
+    crate::runtime::require_plugin_load(lua, &plugin, "register_provider")?;
+    let id: String = spec.raw_get("id")?;
+    pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((id, spec));
+    Ok(())
+}
+
 /// Declare an agent permission rule for a native tool. Use it to pre-allow
 /// (or pre-deny) tool calls on paths your plugin owns, like a storage
 /// directory outside the working dir, so the user is not prompted for them.
@@ -1380,8 +1401,8 @@ lua_table! {
     /// maki.api.register_tool({ name = "greet", ... })
     /// maki.api.register_prompt_hint({ slot = "tool_usage", content = "..." })
     /// ```
-    extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, pending_commands: PendingCommandMap, pending_options: crate::api::options::PendingPluginOptionSpecs, pending_prompts: crate::runtime::PendingPromptHintCallbacks, plugin: Arc<str>, opts: PluginOpts), DOCS [
-        register_tool(pending), register_permission_rule(pending_rules), register_command(pending_commands, plugin),
+    extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, pending_commands: PendingCommandMap, pending_options: crate::api::options::PendingPluginOptionSpecs, pending_prompts: crate::runtime::PendingPromptHintCallbacks, pending_providers: Arc<Mutex<Vec<(String, Table)>>>, plugin: Arc<str>, opts: PluginOpts), DOCS [
+        register_tool(pending), register_provider(pending_providers, plugin), register_permission_rule(pending_rules), register_command(pending_commands, plugin),
         register_prompt_hint(pending_prompts, plugin), register_options(pending_options, plugin, opts), set_prompt(pending_prompts, plugin),
         get_tools, get_tool,
         manual run_command,
@@ -1403,6 +1424,7 @@ pub(crate) fn create_api_table(
         context.pending_commands.clone(),
         context.pending_options.clone(),
         context.pending_prompts.clone(),
+        context.pending_providers.clone(),
         Arc::clone(&plugin),
         opts,
     )?;

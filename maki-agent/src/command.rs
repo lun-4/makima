@@ -18,6 +18,7 @@ use maki_config::ProjectConfig;
 use maki_match::{MatchCandidate, Resolution, fuzzy_resolve, fuzzy_resolve_candidates};
 use maki_providers::{ImageMediaType, ImageSource, Model};
 
+use crate::config_change::ConfigChangeError;
 use crate::headless::{InteractiveControl, InteractiveControlSender};
 use crate::session_coordinator::SessionCoordinatorHandle;
 use crate::session_options::{FAST_OPTION_ID, MODEL_OPTION_ID, WORKFLOW_OPTION_ID, YOLO_OPTION_ID};
@@ -228,14 +229,14 @@ impl maki_commands::CommandHost for SessionCommandHost {
                 coordinator
                     .set_model(selection.spec, selection.fast, selection.thinking)
                     .await
-                    .map_err(producer_error)?;
+                    .map_err(model_command_error)?;
                 Ok(HostResponse::Completed)
             }),
             BuiltinOperation::SetModel { spec } => Box::pin(async move {
                 coordinator
                     .set_option(MODEL_OPTION_ID, spec)
                     .await
-                    .map_err(producer_error)?;
+                    .map_err(model_command_error)?;
                 Ok(HostResponse::Completed)
             }),
             BuiltinOperation::QuickQuestion {
@@ -255,6 +256,13 @@ impl maki_commands::CommandHost for SessionCommandHost {
                 ))))
             }),
         }
+    }
+}
+
+fn model_command_error(error: ConfigChangeError) -> CommandError {
+    match error {
+        ConfigChangeError::ModelPreparation(message) => CommandError::Producer(message),
+        error => producer_error(error),
     }
 }
 
@@ -394,7 +402,7 @@ fn parsed_directory_argument(
 
 fn resolve_model(argument: &str, specs: &[Arc<str>]) -> Result<Arc<str>, CommandError> {
     if argument.contains('/') {
-        Model::from_spec(argument)
+        Model::parse_spec(argument)
             .map_err(|error| CommandError::Producer(Arc::from(error.to_string())))?;
         return Ok(Arc::from(argument));
     }
@@ -1176,6 +1184,35 @@ mod tests {
             maki_commands::InputDispatch::Dispatched(CommandOutcome::Completed)
         ));
         assert_eq!(operations, vec![BuiltinOperation::SelectModel(expected)]);
+    }
+
+    #[test_case("/model anthropic/" ; "missing_model")]
+    #[test_case("/model /model fast=true" ; "missing_provider_with_options")]
+    fn malformed_qualified_model_reports_format_error(input: &str) {
+        let (dispatched, operations) = dispatch_model_input(input);
+        assert!(matches!(
+            dispatched,
+            maki_commands::InputDispatch::Dispatched(CommandOutcome::Failed(
+                CommandError::Producer(message)
+            )) if message.as_ref() == maki_providers::ModelError::InvalidFormat.to_string()
+        ));
+        assert!(operations.is_empty());
+    }
+
+    #[test]
+    fn qualified_custom_model_passes_through() {
+        const SPEC: &str = "custom-provider/arbitrary/nested-model";
+        let (dispatched, operations) = dispatch_model_input(&format!("/model {SPEC}"));
+        assert!(matches!(
+            dispatched,
+            maki_commands::InputDispatch::Dispatched(CommandOutcome::Completed)
+        ));
+        assert_eq!(
+            operations,
+            vec![BuiltinOperation::SetModel {
+                spec: Arc::from(SPEC)
+            }]
+        );
     }
 
     #[test_case("/model fast=true fast=false" ; "duplicate_fast")]

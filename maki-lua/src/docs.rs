@@ -101,6 +101,7 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
         &api::r#async::SEMAPHORE_DOCS,
         &api::r#async::PERMIT_DOCS,
         &api::base64::DOCS,
+        &api::crypto::DOCS,
         &api::env::DOCS,
         &api::r#fn::DOCS,
         &api::fs::DOCS,
@@ -176,6 +177,7 @@ mod tests {
             crate::api::PluginLoadContext {
                 pending: Arc::default(),
                 pending_rules: Arc::default(),
+                pending_providers: Arc::default(),
                 pending_autocmds: Arc::default(),
                 pending_timers: Arc::new(std::sync::Mutex::new(
                     crate::api::timer::TimerStore::new(),

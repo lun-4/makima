@@ -1,0 +1,2 @@
+# Luau annotations require a StyLua build with Luau support.
+plugins/lib/maki/provider_types.lua

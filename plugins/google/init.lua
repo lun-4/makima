@@ -1,0 +1,1 @@
+require("maki.gemini").register()

@@ -18,8 +18,8 @@ use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    AgentError, KeyRotation, Message, Model, ModelInfo, ProviderEvent, ProviderUsage,
-    RequestOptions, StreamResponse,
+    AgentError, Message, Model, ModelInfo, ProviderEvent, ProviderUsage, RequestOptions,
+    StreamResponse,
 };
 use maki_storage::id::SessionRef;
 use tracing::{info, warn};
@@ -119,8 +119,12 @@ impl Provider for TrackedProvider {
         })
     }
 
-    fn keys(&self) -> Option<KeyRotation<'_>> {
-        self.inner.keys()
+    fn key_count(&self) -> usize {
+        self.inner.key_count()
+    }
+
+    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
+        self.inner.rotate_key()
     }
 
     fn adjust_model(&self, model: &mut Model) {
@@ -350,6 +354,7 @@ impl AgentHandles {
             mcp_handle,
             model_policy,
             system_prompt,
+            Arc::new(maki_providers::provider_registry::ProviderRegistry::default()),
         )
         .activate();
         handles.release_runner();
@@ -372,6 +377,7 @@ impl AgentHandles {
         mcp_handle: Option<McpHandle>,
         model_policy: Arc<ModelPolicy>,
         system_prompt: SystemPromptOverride,
+        provider_registry: Arc<maki_providers::provider_registry::ProviderRegistry>,
     ) -> PreparedAgentHandles {
         spawn_agent_internal(
             model_slot,
@@ -388,6 +394,7 @@ impl AgentHandles {
             lua_handle,
             model_policy,
             system_prompt,
+            provider_registry,
         )
     }
 
@@ -512,6 +519,7 @@ fn spawn_agent_internal(
     lua_handle: EventHandle,
     model_policy: Arc<ModelPolicy>,
     system_prompt: SystemPromptOverride,
+    provider_registry: Arc<maki_providers::provider_registry::ProviderRegistry>,
 ) -> PreparedAgentHandles {
     let (agent_tx, agent_rx) = flume::unbounded::<Envelope>();
     let (cmd_tx, cmd_rx) = flume::unbounded::<AgentCommand>();
@@ -568,6 +576,7 @@ fn spawn_agent_internal(
                     lua_handle,
                     Arc::clone(&subagent_cancels),
                     Arc::clone(&model_policy),
+                    provider_registry,
                     system_prompt.clone(),
                     Arc::new(maki_agent::tools::FileWriteLocks::new()),
                     offload.clone(),

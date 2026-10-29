@@ -41,7 +41,16 @@ pub(crate) fn lua_tool_result(values: mlua::MultiValue) -> Result<String, String
 /// end up with a Lua table where they asked for a number. We walk the tree
 /// ourselves to keep numbers as numbers.
 pub(crate) fn json_to_lua(lua: &Lua, value: &JsonValue) -> LuaResult<Value> {
+    json_to_lua_with_nulls(lua, value, false)
+}
+
+pub(crate) fn json_to_lua_with_nulls(
+    lua: &Lua,
+    value: &JsonValue,
+    preserve_null: bool,
+) -> LuaResult<Value> {
     Ok(match value {
+        JsonValue::Null if preserve_null => lua.null(),
         JsonValue::Null => Value::Nil,
         JsonValue::Bool(b) => Value::Boolean(*b),
         JsonValue::Number(n) => match (n.as_i64(), n.as_f64()) {
@@ -53,7 +62,7 @@ pub(crate) fn json_to_lua(lua: &Lua, value: &JsonValue) -> LuaResult<Value> {
         JsonValue::Array(items) => {
             let table = lua.create_table_with_capacity(items.len(), 0)?;
             for (idx, item) in items.iter().enumerate() {
-                table.set(idx + 1, json_to_lua(lua, item)?)?;
+                table.set(idx + 1, json_to_lua_with_nulls(lua, item, preserve_null)?)?;
             }
             table.set_metatable(Some(lua.array_metatable()))?;
             Value::Table(table)
@@ -61,7 +70,10 @@ pub(crate) fn json_to_lua(lua: &Lua, value: &JsonValue) -> LuaResult<Value> {
         JsonValue::Object(map) => {
             let table = lua.create_table_with_capacity(0, map.len())?;
             for (key, val) in map {
-                table.set(key.as_str(), json_to_lua(lua, val)?)?;
+                table.set(
+                    key.as_str(),
+                    json_to_lua_with_nulls(lua, val, preserve_null)?,
+                )?;
             }
             Value::Table(table)
         }
@@ -95,6 +107,7 @@ pub(crate) fn lua_to_json_within(
 fn within_template(lua: &Lua, val: &Value, template: Option<&JsonValue>) -> LuaResult<JsonValue> {
     Ok(match val {
         Value::Nil => JsonValue::Null,
+        Value::LightUserData(data) if data.0.is_null() => JsonValue::Null,
         Value::Boolean(b) => JsonValue::Bool(*b),
         Value::Integer(n) => JsonValue::Number((*n).into()),
         Value::Number(n) => serde_json::Number::from_f64(*n)
@@ -182,11 +195,11 @@ fn within_template(lua: &Lua, val: &Value, template: Option<&JsonValue>) -> LuaR
 
 #[cfg(test)]
 mod tests {
-    use mlua::{Lua, Value};
+    use mlua::{Lua, LuaSerdeExt, Value};
     use serde_json::Value as JsonValue;
     use test_case::test_case;
 
-    use super::{json_to_lua, lua_to_json, opt_bool};
+    use super::{json_to_lua, json_to_lua_with_nulls, lua_to_json, opt_bool};
 
     const FLAG_KEY: &str = "flag";
 
@@ -211,6 +224,24 @@ mod tests {
         let lua = Lua::new();
         let result = lua_to_json(&lua, &input).unwrap();
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn preserved_nulls_roundtrip_through_provider_conversion() {
+        let lua = Lua::new();
+        let original = serde_json::json!({"input": [null, {"value": null}, null], "empty": []});
+        let value = json_to_lua_with_nulls(&lua, &original, true).unwrap();
+        assert_eq!(lua_to_json(&lua, &value).unwrap(), original);
+
+        let Value::Table(table) = value else {
+            panic!("expected object");
+        };
+        table.set("input", Value::Nil).unwrap();
+        assert_eq!(
+            lua_to_json(&lua, &Value::Table(table)).unwrap(),
+            serde_json::json!({"empty": []})
+        );
+        assert_eq!(lua_to_json(&lua, &lua.null()).unwrap(), JsonValue::Null);
     }
 
     #[test_case(f64::NAN ; "nan")]

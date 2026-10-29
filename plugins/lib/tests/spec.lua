@@ -15,6 +15,177 @@ local function eq(actual, expected, msg)
   end
 end
 
+local SSE = require("maki.sse")
+
+local function sse_body(chunks, failure)
+  local index = 0
+  return {
+    read = function()
+      index = index + 1
+      if chunks[index] then
+        return chunks[index]
+      end
+      if failure then
+        return nil, failure
+      end
+      return ""
+    end,
+  }
+end
+
+case("sse_chunk_boundaries_and_multiline", function()
+  local wire = ": comment\r\nevent: delta\r\ndata: café\r\ndata:  two\r\n\r\ndata\n\n"
+  for split = 1, #wire do
+    local next_event = SSE.new(sse_body({ wire:sub(1, split), wire:sub(split + 1) }), 256)
+    local first = next_event()
+    eq(first.event, "delta")
+    eq(first.data, "café\n two")
+    local second = next_event()
+    eq(second.event, "message")
+    eq(second.data, "")
+    eq(next_event(), nil)
+  end
+end)
+
+case("sse_eof_and_field_rules", function()
+  local next_event = SSE.new(sse_body({ "event: ignored\n\n: comment\rdata: one\rdata:two\revent: custom\r\r" }), 256)
+  local event = next_event()
+  eq(event.event, "custom")
+  eq(event.data, "one\ntwo")
+  eq(next_event(), nil)
+  eq(next_event(), nil)
+end)
+
+case("sse_incomplete_events_are_discarded", function()
+  for _, wire in ipairs({ "data: partial", "data: partial\n", "data: partial\r" }) do
+    local next_event = SSE.new(sse_body({ wire }), 256)
+    eq(next_event(), nil)
+    eq(next_event(), nil)
+  end
+end)
+
+case("sse_bom_and_cr_boundaries", function()
+  local wire = "\239\187\191data: hello\r\r"
+  for split = 1, #wire do
+    local next_event = SSE.new(sse_body({ wire:sub(1, split), wire:sub(split + 1) }, "unexpected read"), 256)
+    local event, err = next_event()
+    eq(err, nil)
+    eq(event.data, "hello")
+  end
+end)
+
+case("sse_heartbeat_and_line_limit", function()
+  local next_event = SSE.new(sse_body({ string.rep(": ping\n", 100) .. "data: ok\n\n" }), 16)
+  eq(next_event().data, "ok")
+  next_event = SSE.new(sse_body({ "\r", string.rep("x", 20) }), 16)
+  local event, err = next_event()
+  eq(event, nil)
+  eq(err, "SSE event exceeds max_event_bytes")
+end)
+
+case("sse_rejects_invalid_size_limits", function()
+  for _, limit in ipairs({ 0, -1, 0.5, math.huge, 0 / 0 }) do
+    eq(pcall(SSE.new, sse_body({}), limit), false)
+  end
+end)
+
+case("sse_error_and_size_limit", function()
+  local next_event = SSE.new(sse_body({ "data: incomplete" }, "connection lost"), 256)
+  local event, err = next_event()
+  eq(event, nil)
+  eq(err, "connection lost")
+  event, err = next_event()
+  eq(event, nil)
+  eq(err, "connection lost")
+  next_event = SSE.new(sse_body({ "data: ", "123456789" }), 10)
+  event, err = next_event()
+  eq(event, nil)
+  eq(err, "SSE event exceeds max_event_bytes")
+end)
+
+local JsonResponse = require("maki.json_response")
+
+case("json_response_chunked_and_exact_limit", function()
+  local value, err = JsonResponse.read(sse_body({ '{"value":', "false}" }), 15)
+  eq(err, nil)
+  eq(value.value, false)
+  value, err = JsonResponse.read(sse_body({ "false" }), 5)
+  eq(err, nil)
+  eq(value, false)
+end)
+
+case("json_response_null_and_zero_limit", function()
+  local value, err = JsonResponse.read(sse_body({ "null" }), 4)
+  eq(value, nil)
+  eq(err, nil)
+  value, err = JsonResponse.read(sse_body({ "null" }), 0)
+  eq(value, nil)
+  eq(err.kind, "api")
+  eq(err.message, "JSON response exceeds max_bytes")
+  value, err = JsonResponse.read(sse_body({}), 0)
+  eq(value, nil)
+  eq(err.kind, "api")
+  assert(err.message:find("invalid JSON response:", 1, true))
+end)
+
+case("json_response_preserves_null_when_requested", function()
+  local value, err =
+    JsonResponse.read(sse_body({ '{"items":[null,', 'false,null],"missing":null}' }), 100, { preserve_null = true })
+  eq(err, nil)
+  eq(value.items[1], maki.json.null())
+  eq(value.items[2], false)
+  eq(value.items[3], maki.json.null())
+  eq(value.missing, maki.json.null())
+  value, err = JsonResponse.read(sse_body({ "null" }), 4, { preserve_null = true })
+  eq(err, nil)
+  eq(value, maki.json.null())
+end)
+
+case("json_response_rejects_invalid_limits", function()
+  for _, limit in ipairs({ -1, 0.5, math.huge, 0 / 0, "1" }) do
+    local ok = pcall(JsonResponse.read, sse_body({}), limit)
+    eq(ok, false)
+  end
+end)
+
+case("json_response_rejects_oversize_before_next_read", function()
+  local reads = 0
+  local body = {
+    read = function()
+      reads = reads + 1
+      return "1234"
+    end,
+  }
+  local value, err = JsonResponse.read(body, 3)
+  eq(value, nil)
+  eq(err.kind, "api")
+  eq(err.message, "JSON response exceeds max_bytes")
+  eq(reads, 1)
+end)
+
+case("json_response_read_and_decode_errors", function()
+  local value, err = JsonResponse.read(sse_body({ "{" }, "connection lost"), 20)
+  eq(value, nil)
+  eq(err.kind, "network")
+  eq(err.message, "connection lost")
+  value, err = JsonResponse.read(sse_body({ "{" }), 20)
+  eq(value, nil)
+  eq(err.kind, "api")
+  assert(err.message:find("invalid JSON response:", 1, true))
+  local original = { kind = "closed", message = "closed" }
+  value, err = JsonResponse.read(sse_body({}, original), 0)
+  eq(value, nil)
+  eq(err, original)
+  value, err = JsonResponse.read({
+    read = function()
+      return nil
+    end,
+  }, 20)
+  eq(value, nil)
+  eq(err.kind, "network")
+  eq(err.message, "response body read failed")
+end)
+
 -- Mock buf that records set_lines calls
 local function mock_buf()
   local b = { lines = nil, call_count = 0 }
@@ -1541,6 +1712,308 @@ end)
 
 case("check_write_other_long_line_unaffected", function()
   eq(long_lines.check_write(LONG .. "\n" .. OTHER_LONG, OTHER_LONG .. "\n" .. LONG, LL_MAX), nil)
+end)
+
+case("synthetic_quota_priority_and_clamping", function()
+  local synthetic = require("maki.synthetic")
+  local usage = assert(
+    synthetic.parse_quotas(
+      [[{"subscription":{"requests":1,"limit":10},"rollingFiveHourLimit":{"remaining":25,"max":100,"nextTickAt":"reset"},"weeklyTokenLimit":{"percentRemaining":-10}}]],
+      function(value)
+        return value == "reset" and 123 or nil
+      end
+    )
+  )
+  eq(usage.limits[1].percentage, 75)
+  eq(usage.limits[1].reset_at, 123)
+  eq(usage.limits[2].percentage, 100)
+  local legacy = assert(synthetic.parse_quotas([[{"subscription":{"requests":1,"limit":4}}]]))
+  eq(legacy.limits[1].percentage, 25)
+  local invalid = assert(synthetic.parse_quotas([[{"subscription":{"requests":1,"limit":0}}]]))
+  eq(invalid.limits[1].percentage, nil)
+  local result, err = synthetic.parse_quotas([[{}]])
+  eq(result, nil)
+  eq(err.kind, "config")
+end)
+
+case("synthetic_rejects_malformed_lanes", function()
+  local synthetic = require("maki.synthetic")
+  for _, body in ipairs({
+    [[{"rollingFiveHourLimit":{"remaining":1}}]],
+    [[{"subscription":{"requests":"1","limit":4}}]],
+    [[{"weeklyTokenLimit":{"percentRemaining":false}}]],
+    [[{"rollingFiveHourLimit":{"remaining":1,"max":4},"subscription":{"requests":1}}]],
+    [[{"weeklyTokenLimit":{"percentRemaining":10,"nextRegenAt":42}}]],
+    [[{"rollingFiveHourLimit":false}]],
+  }) do
+    local result, err = synthetic.parse_quotas(body)
+    eq(result, nil)
+    eq(err.kind, "api")
+  end
+end)
+
+case("synthetic_quota_boundaries_and_resets", function()
+  local synthetic = require("maki.synthetic")
+  local usage = assert(
+    synthetic.parse_quotas(
+      [[{"rollingFiveHourLimit":{"remaining":200,"max":100,"nextTickAt":"bad"},"weeklyTokenLimit":{"percentRemaining":33.5,"nextRegenAt":"week"}}]],
+      function(value)
+        return value == "week" and 456 or nil
+      end
+    )
+  )
+  eq(#usage.limits, 2)
+  eq(usage.limits[1].kind.type, "hours")
+  eq(usage.limits[1].kind.hours, 5)
+  eq(usage.limits[1].percentage, 0)
+  eq(usage.limits[1].reset_at, nil)
+  eq(usage.limits[2].kind.type, "weekly")
+  eq(usage.limits[2].percentage, 67)
+  eq(usage.limits[2].reset_at, 456)
+  eq(#usage.by_model_today, 0)
+
+  local weekly = assert(synthetic.parse_quotas([[{"weeklyTokenLimit":{"percentRemaining":150}}]]))
+  eq(#weekly.limits, 1)
+  eq(weekly.limits[1].percentage, 0)
+  local legacy =
+    assert(synthetic.parse_quotas([[{"subscription":{"requests":3,"limit":2,"renewsAt":"reset"}}]], function()
+      return 789
+    end))
+  eq(legacy.limits[1].percentage, 100)
+  eq(legacy.limits[1].reset_at, 789)
+end)
+
+case("synthetic_quota_invalid_json_and_shapes", function()
+  local synthetic = require("maki.synthetic")
+  for _, body in ipairs({
+    "{",
+    "true",
+    "42",
+    [[{"subscription":[]}]],
+    [[{"weeklyTokenLimit":{"percentRemaining":1,"nextRegenAt":false}}]],
+  }) do
+    local result, err = synthetic.parse_quotas(body)
+    eq(result, nil)
+    eq(err.kind, "api")
+    assert(type(err.message) == "string" and #err.message > 0)
+  end
+end)
+
+case("synthetic_effort_policy", function()
+  local synthetic = require("maki.synthetic")
+  for _, test in ipairs({
+    { { mode = "off" }, nil },
+    { { mode = "adaptive" }, "medium" },
+    { { mode = "effort", level = "xhigh" }, "high" },
+    { { mode = "effort", level = "max" }, "high" },
+    { { mode = "budget", tokens = 6554 }, "low" },
+    { { mode = "budget", tokens = 65536 }, "high" },
+  }) do
+    local body = {}
+    assert(synthetic.encode_thinking(body, test[1], 65536))
+    eq(body.reasoning_effort, test[2])
+  end
+end)
+
+case("synthetic_key_rotation_and_header_override", function()
+  local synthetic = require("maki.synthetic")
+  local instance = assert(synthetic.prepare(nil, { id = "fixture" }, {
+    api_key_env = "MAKI_TEST_SYNTHETIC_MISSING_KEY",
+    api_key = " first, , second ",
+    headers = { authorization = "gateway" },
+  }))
+  eq(instance.key_count, 2)
+  local captured = {}
+  local ctx = {
+    send = function(_, request)
+      captured[#captured + 1] = request.headers
+      return nil, { kind = "network", message = "fixture" }
+    end,
+  }
+  local request = {
+    model = { id = "fixture", max_output_tokens = 100 },
+    messages = {},
+    tools = {},
+    system = "",
+    thinking = { mode = "off" },
+  }
+  instance.stream(ctx, request, function() end)
+  assert(instance.rotate_key())
+  instance.stream(ctx, request, function() end)
+  eq(captured[1].authorization, "gateway")
+  eq(captured[2].authorization, "gateway")
+  eq(captured[1].Authorization, nil)
+  local direct = assert(synthetic.prepare(nil, { id = "fixture" }, {
+    api_key_env = "MAKI_TEST_SYNTHETIC_MISSING_KEY",
+    api_key = "first, second",
+  }))
+  direct.stream(ctx, request, function() end)
+  assert(direct.rotate_key())
+  direct.stream(ctx, request, function() end)
+  eq(captured[3].Authorization, "Bearer first")
+  eq(captured[4].Authorization, "Bearer second")
+end)
+
+case("synthetic_fetch_usage_closes_response", function()
+  local synthetic = require("maki.synthetic")
+  local instance = assert(synthetic.prepare(nil, { id = "fixture" }, {
+    api_key_env = "MAKI_TEST_SYNTHETIC_MISSING_KEY",
+    api_key = "fixture-key",
+  }))
+  local sent, closed = nil, false
+  local chunks = { [[{"subscription":{"requests":1,"limit":4}}]], "" }
+  local usage = assert(instance.fetch_usage({
+    send = function(_, request)
+      sent = request
+      return {
+        status = 200,
+        read = function()
+          return table.remove(chunks, 1)
+        end,
+        close = function()
+          closed = true
+        end,
+      }
+    end,
+  }))
+  eq(sent.method, "GET")
+  eq(sent.url, "https://api.synthetic.new/v2/quotas")
+  eq(sent.headers.Authorization, "Bearer fixture-key")
+  eq(usage.limits[1].percentage, 25)
+  assert(closed)
+end)
+
+case("synthetic_stream_uses_provider_context", function()
+  local synthetic = require("maki.synthetic")
+  local instance = assert(synthetic.prepare(nil, { id = "fixture" }, {
+    api_key_env = "MAKI_TEST_SYNTHETIC_MISSING_KEY",
+    api_key = "fixture-key",
+    base_url = "https://fixture.invalid/v1/",
+  }))
+  local sent, closed, events = nil, false, {}
+  local chunks = {
+    'data: {"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]}\n\n',
+    "data: [DONE]\n\n",
+    "",
+  }
+  local ctx = {
+    send = function(_, request)
+      sent = request
+      return {
+        status = 200,
+        read = function()
+          return table.remove(chunks, 1)
+        end,
+        close = function()
+          closed = true
+          return true
+        end,
+      }
+    end,
+  }
+  local result = assert(instance.stream(ctx, {
+    model = { id = "fixture", max_output_tokens = 1000 },
+    messages = {},
+    tools = {},
+    system = "system",
+    thinking = { mode = "off" },
+  }, function(event)
+    events[#events + 1] = event
+    return true
+  end))
+  eq(sent.url, "https://fixture.invalid/v1/chat/completions")
+  eq(sent.headers.Authorization, "Bearer fixture-key")
+  eq(assert(maki.json.decode(sent.body)).max_completion_tokens, 1000)
+  eq(events[1].text, "answer")
+  eq(result.message.content[1].text, "answer")
+  assert(closed)
+end)
+
+case("synthetic_api_error_does_not_expose_response_body", function()
+  local synthetic = require("maki.synthetic")
+  local instance = assert(synthetic.prepare(nil, { id = "fixture" }, {
+    api_key_env = "MAKI_TEST_SYNTHETIC_MISSING_KEY",
+    api_key = "fixture-key",
+  }))
+  local closed = false
+  local result, err = instance.stream({
+    send = function()
+      return {
+        status = 401,
+        read = function()
+          return "fixture-key"
+        end,
+        close = function()
+          closed = true
+        end,
+      }
+    end,
+  }, {
+    model = { id = "fixture" },
+    messages = {},
+    tools = {},
+    thinking = { mode = "off" },
+  }, function()
+    return true
+  end)
+  eq(result, nil)
+  eq(err.kind, "api")
+  eq(err.status, 401)
+  eq(err.message, "Synthetic request failed")
+  assert(closed)
+end)
+
+case("synthetic_stream_error_does_not_expose_response_body", function()
+  local synthetic = require("maki.synthetic")
+  local instance = assert(synthetic.prepare(nil, { id = "fixture" }, {
+    api_key_env = "MAKI_TEST_SYNTHETIC_MISSING_KEY",
+    api_key = "fixture-key",
+  }))
+  local result, err = instance.stream({
+    send = function()
+      return {
+        status = 200,
+        read = function()
+          return 'data: {"error":{"code":401,"message":"fixture-key"}}\n\n'
+        end,
+        close = function() end,
+      }
+    end,
+  }, {
+    model = { id = "fixture" },
+    messages = {},
+    tools = {},
+    thinking = { mode = "off" },
+  }, function()
+    return true
+  end)
+  eq(result, nil)
+  eq(err.kind, "api")
+  eq(err.status, 401)
+  eq(err.message, "Synthetic request failed")
+end)
+
+case("synthetic_stream_preserves_transport_errors", function()
+  local synthetic = require("maki.synthetic")
+  local instance = assert(synthetic.prepare(nil, { id = "fixture" }, {
+    api_key_env = "MAKI_TEST_SYNTHETIC_MISSING_KEY",
+    api_key = "fixture-key",
+  }))
+  local failure = { kind = "network", message = "transport failed" }
+  local result, err = instance.stream({
+    send = function()
+      return nil, failure
+    end,
+  }, {
+    model = { id = "fixture" },
+    messages = {},
+    tools = {},
+    thinking = { mode = "off" },
+  }, function()
+    return true
+  end)
+  eq(result, nil)
+  eq(err, failure)
 end)
 
 if #failures > 0 then

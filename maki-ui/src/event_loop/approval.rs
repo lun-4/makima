@@ -491,7 +491,11 @@ impl EventLoop<'_> {
         } else {
             source.config.config.context.cwd().join(&request.path)
         };
-        let prepare = model_preparer(Arc::clone(&self.ctx.prepare_provider), template.timeouts);
+        let prepare = model_preparer(
+            Arc::clone(&self.ctx.prepare_provider),
+            template.timeouts,
+            Arc::clone(&self.ctx.provider_registry),
+        );
         self.spawn_approval_step(idx, target.id(), publication, async move {
             let parallel = request.parallel;
             let plan = smol::unblock(move || read_plan(absolute, parallel)).await?;

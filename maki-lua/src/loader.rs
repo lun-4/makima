@@ -69,6 +69,12 @@ impl InitFiles {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SourceIdentity {
+    Embedded(&'static str),
+    Other,
+}
+
 struct BundledPlugin {
     name: &'static str,
     dir: Dir<'static>,
@@ -77,6 +83,30 @@ struct BundledPlugin {
 /// `lib` is not a default builtin; it exists so plugins can
 /// `require()` shared modules across boundaries.
 static BUNDLED_PLUGINS: &[BundledPlugin] = &[
+    BundledPlugin {
+        name: "llama-cpp",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/llama-cpp"),
+    },
+    BundledPlugin {
+        name: "ollama",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/ollama"),
+    },
+    BundledPlugin {
+        name: "regolo",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/regolo"),
+    },
+    BundledPlugin {
+        name: "requesty",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/requesty"),
+    },
+    BundledPlugin {
+        name: "tensorx",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/tensorx"),
+    },
+    BundledPlugin {
+        name: "deepseek",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/deepseek"),
+    },
     BundledPlugin {
         name: "sessions",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/sessions"),
@@ -215,6 +245,7 @@ pub struct PluginHost {
     plugin_rules: Arc<PluginRuleStore>,
     registry: Arc<ToolRegistry>,
     command_registry: CommandRegistry,
+    provider_registry: Arc<maki_providers::provider_registry::ProviderRegistry>,
 }
 
 impl Drop for PluginHost {
@@ -238,6 +269,17 @@ impl Drop for PluginHost {
 }
 
 impl PluginHost {
+    pub fn provider_registry(&self) -> Arc<maki_providers::provider_registry::ProviderRegistry> {
+        Arc::clone(&self.provider_registry)
+    }
+
+    pub fn provider_dispatch(&self) -> Arc<dyn crate::provider_adapter::ProviderDispatch> {
+        Arc::new(crate::runtime::RuntimeProviderDispatch(
+            self.inner.tx.clone(),
+            None,
+        ))
+    }
+
     /// A host whose UI actions the caller drains itself, for tests and
     /// tools that never show them.
     pub fn new(registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
@@ -324,10 +366,13 @@ impl PluginHost {
         let modes = Arc::new(maki_agent::ModeRegistry::builtin());
         let plugin_rules = Arc::new(PluginRuleStore::default());
         let session_options = SessionOptionCatalog::default();
+        let provider_registry =
+            Arc::new(maki_providers::provider_registry::ProviderRegistry::default());
         let lua = runtime::spawn(
             Arc::clone(&registry),
             runtime::SpawnConfig {
                 command_registry: command_registry.clone(),
+                provider_registry: Arc::clone(&provider_registry),
                 modes,
                 bundled_dirs: *BUNDLED_DIRS,
                 jit,
@@ -348,6 +393,7 @@ impl PluginHost {
             plugin_rules,
             registry,
             command_registry,
+            provider_registry,
         })
     }
 
@@ -511,15 +557,16 @@ impl PluginHost {
             }
         }
         for builtin in &config.names {
-            let dir = match BUNDLED_PLUGINS.iter().find(|p| p.name == builtin.as_str()) {
-                Some(p) => &p.dir,
+            let bundled = match BUNDLED_PLUGINS.iter().find(|p| p.name == builtin.as_str()) {
+                Some(p) => p,
                 None => {
                     return Err(PluginError::UnknownPlugin {
                         plugin: builtin.clone(),
                     });
                 }
             };
-            let init = dir
+            let init = bundled
+                .dir
                 .get_file("init.lua")
                 .and_then(|f| f.contents_utf8())
                 .ok_or_else(|| PluginError::Lua {
@@ -539,6 +586,7 @@ impl PluginHost {
                 None,
                 PluginPermissions::trusted(),
                 opts,
+                SourceIdentity::Embedded(bundled.name),
             )?;
         }
         Ok(())
@@ -551,6 +599,7 @@ impl PluginHost {
         plugin_dir: Option<PathBuf>,
         permissions: PluginPermissions,
         opts: PluginOpts,
+        identity: SourceIdentity,
     ) -> Result<(), PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner
@@ -561,6 +610,7 @@ impl PluginHost {
                 plugin_dir,
                 permissions,
                 opts,
+                identity,
                 reply: reply_tx,
             })
             .map_err(|_| PluginError::HostDead)?;
@@ -597,6 +647,7 @@ impl PluginHost {
                 plugin_dir: None,
                 permissions: PluginPermissions::trusted(),
                 opts: PluginOpts::default(),
+                identity: SourceIdentity::Other,
                 reply: reply_tx,
             })
             .map_err(|_| PluginError::HostDead)?;
@@ -711,6 +762,7 @@ impl PluginHost {
             None,
             PluginPermissions::trusted(),
             Arc::new(opts),
+            SourceIdentity::Other,
         )
     }
 
@@ -726,6 +778,7 @@ impl PluginHost {
             None,
             permissions,
             PluginOpts::default(),
+            SourceIdentity::Other,
         )
     }
 
@@ -746,6 +799,7 @@ impl PluginHost {
             plugin_dir,
             permissions,
             PluginOpts::default(),
+            SourceIdentity::Other,
         )
     }
 
@@ -776,6 +830,7 @@ impl PluginHost {
             shutdown: Arc::clone(&self.inner.shutdown),
             prio_tx: self.inner.prio_tx.clone(),
             modes: Arc::clone(&self.inner.modes),
+            provider_registry: Some(Arc::clone(&self.provider_registry)),
             session_options: self.inner.session_options.clone(),
             completion: None,
             command_generations: Some(Arc::clone(&self.inner.command_generations)),
@@ -823,6 +878,7 @@ pub struct EventHandle {
     /// Shared mode registry; `None`-less so plugins and the Rust agent see
     /// the same definitions. Test handles use an empty builtin set.
     modes: Arc<maki_agent::ModeRegistry>,
+    provider_registry: Option<Arc<maki_providers::provider_registry::ProviderRegistry>>,
     session_options: SessionOptionCatalog,
     /// In-memory stand-in for the Lua completion/expander stores, used only by
     /// tests that build an `App` without a running plugin host. `None` in
@@ -905,6 +961,7 @@ impl TestCompletionBackend {
 impl EventHandle {
     pub(crate) fn from_tx(tx: flume::Sender<Request>) -> Self {
         Self {
+            provider_registry: None,
             tx: tx.clone(),
             shutdown: Arc::default(),
             prio_tx: flume::unbounded().0,
@@ -931,6 +988,12 @@ impl EventHandle {
 
     pub fn mode_registry(&self) -> Arc<maki_agent::ModeRegistry> {
         Arc::clone(&self.modes)
+    }
+
+    pub fn provider_registry(
+        &self,
+    ) -> Option<Arc<maki_providers::provider_registry::ProviderRegistry>> {
+        self.provider_registry.clone()
     }
 
     pub fn session_option_catalog(&self) -> SessionOptionCatalog {
@@ -1019,6 +1082,7 @@ impl EventHandle {
     #[doc(hidden)]
     pub fn disconnected_for_test_with_modes(modes: Arc<maki_agent::ModeRegistry>) -> Self {
         Self {
+            provider_registry: None,
             tx: flume::unbounded().0,
             shutdown: Arc::default(),
             prio_tx: flume::unbounded().0,
@@ -1037,6 +1101,7 @@ impl EventHandle {
     #[doc(hidden)]
     pub fn with_completion_for_test(backend: Arc<TestCompletionBackend>) -> Self {
         Self {
+            provider_registry: None,
             shutdown: Arc::default(),
             tx: flume::unbounded().0,
             prio_tx: flume::unbounded().0,
@@ -1066,6 +1131,7 @@ impl EventHandle {
     #[cfg(feature = "test-support")]
     pub(crate) fn probed_for_test(shared: flume::Sender<Request>) -> Self {
         Self {
+            provider_registry: None,
             shutdown: Arc::default(),
             tx: shared.clone(),
             prio_tx: shared.clone(),
@@ -1405,6 +1471,116 @@ mod tests {
     use std::thread;
     use std::time::Instant;
     use test_case::test_case;
+
+    #[test]
+    fn provider_staging_follows_plugin_transactions() {
+        let reg = Arc::new(ToolRegistry::new());
+        const MINIMAL_SCHEMA: &str = "{ type = 'object', properties = {} }";
+        let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+        let provider = |id: &str| format!("maki.api.register_provider({{ id = '{id}' }})");
+        host.load_source("owner", &provider("one")).unwrap();
+        host.load_source("other", &provider("two")).unwrap();
+
+        let conflicting = format!(
+            "{}\nmaki.api.register_tool({{ name = 'provider_candidate_tool', description = 'candidate', schema = {MINIMAL_SCHEMA}, handler = function() return 'ok' end }})",
+            provider("two")
+        );
+        assert!(host.load_source("owner", &conflicting).is_err());
+        assert!(!reg.has("provider_candidate_tool"));
+        assert!(host.load_source("probe", &provider("one")).is_err());
+        assert!(
+            host.load_source(
+                "probe",
+                &format!("{}\n{}", provider("dup"), provider("dup"))
+            )
+            .is_err()
+        );
+        assert!(
+            host.load_source("owner", &format!("{}\nerror('failed')", provider("three")))
+                .is_err()
+        );
+        assert!(host.load_source("probe", &provider("one")).is_err());
+
+        let tool_conflict = format!(
+            "{}\nmaki.api.register_tool({{ name = 'provider_blocker', description = 'blocker', schema = {MINIMAL_SCHEMA}, handler = function() return 'ok' end }})",
+            provider("three")
+        );
+        host.load_source("blocker", &format!("maki.api.register_tool({{ name = 'provider_blocker', description = 'blocker', schema = {MINIMAL_SCHEMA}, handler = function() return 'ok' end }})")).unwrap();
+        assert!(host.load_source("owner", &tool_conflict).is_err());
+        host.load_source("probe", &provider("three")).unwrap();
+        host.unload("probe").unwrap();
+        host.load_source("owner", &provider("three")).unwrap();
+        host.load_source("probe", &provider("one")).unwrap();
+        host.unload("owner").unwrap();
+        host.load_source("next", &provider("three")).unwrap();
+        assert!(host.load_source("next", &provider("two")).is_err());
+    }
+
+    #[test]
+    fn invalid_provider_model_rolls_back_plugin_replacement() {
+        let registry = Arc::new(ToolRegistry::new());
+        let host = PluginHost::new(Arc::clone(&registry)).unwrap();
+        host.load_source(
+            "owner",
+            r#"
+            maki.api.register_provider({ id = "old_provider", models = { { id = "old_model" } } })
+            maki.api.register_tool({ name = "old_tool", description = "old", schema = { type = "object", properties = {} }, handler = function() return "old" end })
+            "#,
+        )
+        .unwrap();
+
+        let result = host.load_source(
+            "owner",
+            r#"
+            maki.api.register_provider({ id = "candidate_provider", models = { { id = "valid" }, { id = "" } } })
+            maki.api.register_tool({ name = "candidate_tool", description = "candidate", schema = { type = "object", properties = {} }, handler = function() return "candidate" end })
+            "#,
+        );
+        assert!(result.is_err());
+        assert!(registry.has("old_tool"));
+        assert!(!registry.has("candidate_tool"));
+        assert!(
+            host.load_source(
+                "probe",
+                "maki.api.register_provider({ id = 'old_provider' })"
+            )
+            .is_err()
+        );
+        host.load_source(
+            "probe",
+            "maki.api.register_provider({ id = 'candidate_provider' })",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn valid_provider_models_commit_with_plugin_registration() {
+        let registry = Arc::new(ToolRegistry::new());
+        let host = PluginHost::new(Arc::clone(&registry)).unwrap();
+        host.load_source(
+            "owner",
+            r#"
+            maki.api.register_provider({ id = "valid_provider", models = { { id = "first", context_window = 8192, max_output_tokens = 1024, pricing = { input = 1, output = 2, cache_write = 0.5, cache_read = 0.1, fast = { input = 3, output = 4 } } }, { id = "second" } } })
+            maki.api.register_tool({ name = "valid_tool", description = "valid", schema = { type = "object", properties = {} }, handler = function() return "ok" end })
+            "#,
+        )
+        .unwrap();
+        assert!(registry.has("valid_tool"));
+        assert!(
+            host.load_source(
+                "probe",
+                "maki.api.register_provider({ id = 'valid_provider' })"
+            )
+            .is_err()
+        );
+        host.unload("owner").unwrap();
+        host.load_source(
+            "probe",
+            "maki.api.register_provider({ id = 'valid_provider' })",
+        )
+        .unwrap();
+        assert!(!registry.has("valid_tool"));
+    }
 
     struct FakeCommandHost;
 

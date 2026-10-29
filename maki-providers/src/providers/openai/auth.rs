@@ -288,8 +288,7 @@ pub fn resolve(dir: &StateDir) -> Result<ResolvedAuth, AgentError> {
                 return build_oauth_resolved(&fresh);
             }
             Err(e) => {
-                warn!(error = %e, "OpenAI OAuth refresh failed, clearing stale tokens");
-                delete_tokens(dir, PROVIDER).ok();
+                warn!(error = %e, "OpenAI OAuth refresh failed");
             }
         }
     }

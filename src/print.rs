@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use clap::ValueEnum;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
+use maki_agent::actor::PreparedModel;
 use maki_agent::cancel::CancelToken;
 use maki_agent::command::{
     self, SessionCommandHost, StandardCommands, StandardCompletions, session_capabilities,
@@ -24,7 +25,7 @@ use maki_agent::command::{
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams, ProviderPreparation};
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::session_coordinator::{
-    SessionCoordinatorHandle, SessionCoordinatorParams, SessionOptionCatalog,
+    ModelPreparer, SessionCoordinatorHandle, SessionCoordinatorParams, SessionOptionCatalog,
     builtin_option_definitions,
 };
 use maki_agent::session_defaults;
@@ -44,6 +45,7 @@ use maki_lua::orchestration::{
 };
 use maki_lua::session_snapshot::HeadlessObserver;
 use maki_providers::model::Model;
+use maki_providers::provider_registry::ProviderRegistry;
 use maki_providers::{TokenUsage, add_cost};
 use maki_storage::StateDir;
 use maki_storage::checkpoint::ClaimingWriter;
@@ -314,15 +316,53 @@ struct PrintSession {
     _discovery: Discovery,
 }
 
+pub(crate) fn print_model_preparer(
+    registry: Arc<ProviderRegistry>,
+    timeouts: maki_providers::Timeouts,
+) -> ModelPreparer {
+    Arc::new(move |spec| {
+        let registry = Arc::clone(&registry);
+        Box::pin(async move {
+            let snapshot = registry.snapshot();
+            let mut model = snapshot
+                .resolve_model(&spec, &ModelPolicy::default())
+                .map_err(|error| Arc::from(error.to_string()))?;
+            let config = maki_config::providers::ProvidersConfig::load_or_default();
+            let config = config
+                .providers
+                .get(model.provider.as_ref())
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|error| Arc::from(error.to_string()))?
+                .unwrap_or_else(|| Value::Object(Default::default()));
+            let (model, provider) = match snapshot.prepare(&model, &config).await {
+                Some(result) => result.map_err(|error| Arc::from(error.user_message()))?,
+                None => {
+                    let provider = maki_providers::provider::from_model_async(&mut model, timeouts)
+                        .await
+                        .map_err(|error| Arc::from(error.user_message()))?;
+                    (model, provider)
+                }
+            };
+            Ok(PreparedModel {
+                model,
+                provider: Arc::from(provider),
+            })
+        })
+    })
+}
+
 fn start_print_session(
     params: InteractiveParams,
     prepare: ProviderPreparation,
+    prepare_model: ModelPreparer,
     session_options: SessionOptionCatalog,
     lua_handle: &EventHandle,
     registry: &CommandRegistry,
     discover: impl FnOnce(&ModelCatalog, String) -> Discovery,
 ) -> Result<PrintSession> {
     let catalog = ModelCatalog::offline(&params.model_policy);
+    smol::block_on(catalog.apply(vec![params.model.spec()]));
     let active_provider = params.model.provider.to_string();
     let definitions = builtin_option_definitions(
         Arc::from(params.model.spec()),
@@ -333,7 +373,6 @@ fn start_print_session(
         params.defaults.thinking.into(),
     );
     let model_policy = Arc::clone(&params.model_policy);
-    let timeouts = params.timeouts;
     let (binding, root_target) = orchestration::root_binding();
     let handle = headless::spawn_interactive_with_binding(params, prepare, None, Some(binding));
     smol::block_on(handle.initialized_root()).map_err(|error| eyre!(error))?;
@@ -351,7 +390,7 @@ fn start_print_session(
         &handle,
         &coordinator,
         &root_target,
-        headless::default_model_preparer(timeouts),
+        Arc::clone(&prepare_model),
     ))
     .map_err(|error| eyre!("bind print root: {error}"))?;
     let orchestration = Arc::new(orchestration::frontend_root(
@@ -369,7 +408,7 @@ fn start_print_session(
             SessionCommandHost::new(handle.control_tx.clone(), coordinator.clone()),
             root.clone(),
             &orchestration,
-            headless::default_model_preparer(timeouts),
+            Arc::clone(&prepare_model),
         )),
     );
     orchestration.bind_commands(
@@ -465,6 +504,7 @@ pub fn run(
     permissions_config: PermissionsConfig,
     timeouts: maki_providers::Timeouts,
     lua_handle: EventHandle,
+    provider_registry: Arc<maki_providers::provider_registry::ProviderRegistry>,
     defaults: SessionDefaults,
     model_policy: Arc<ModelPolicy>,
     system_prompt_override: Option<String>,
@@ -512,6 +552,9 @@ pub fn run(
     let terminal_result_emitted = std::cell::Cell::new(false);
     let state_dir = maki_storage::paths::state_dir().ok();
     let outcome = (|| {
+        let catalog_providers = provider_registry.snapshot();
+        let discovery_registry = Arc::clone(&provider_registry);
+        let prepare_model = print_model_preparer(Arc::clone(&provider_registry), timeouts);
         let session = start_print_session(
             InteractiveParams {
                 model: model.clone(),
@@ -529,6 +572,7 @@ pub fn run(
                 append_system_prompt,
                 defaults,
                 model_policy: Arc::clone(&model_policy),
+                provider_registry: Some(Arc::clone(&provider_registry)),
                 modes: lua_handle.mode_registry(),
                 question_mode: QuestionMode::Headless,
                 plugin_rules: Arc::clone(&plugin_rules),
@@ -537,11 +581,41 @@ pub fn run(
                 state_dir,
                 answers: false,
             },
-            headless::default_preparation(),
+            Box::new(move |mut model, timeouts| {
+                Box::pin(async move {
+                    let snapshot = provider_registry.snapshot();
+                    let config = maki_config::providers::ProvidersConfig::load_or_default();
+                    let config = config
+                        .providers
+                        .get(model.provider.as_ref())
+                        .map(serde_json::to_value)
+                        .transpose()
+                        .map_err(|error| maki_providers::AgentError::Config {
+                            message: error.to_string(),
+                        })?
+                        .unwrap_or_else(|| Value::Object(Default::default()));
+                    if let Some(result) = snapshot.prepare(&model, &config).await {
+                        let (model, provider) = result?;
+                        return Ok((model, Arc::from(provider)));
+                    }
+                    let provider =
+                        maki_providers::provider::from_model_async(&mut model, timeouts).await?;
+                    Ok((model, Arc::from(provider)))
+                })
+            }),
+            prepare_model,
             session_options,
             &lua_handle,
             &command_registry,
-            |catalog, active| catalog.discover(Arc::clone(&model_policy), active, |_| {}),
+            |catalog, active| {
+                smol::block_on(catalog.apply_provider_snapshot(&catalog_providers, &model_policy));
+                catalog.discover(
+                    Arc::clone(&model_policy),
+                    active,
+                    discovery_registry,
+                    |_| {},
+                )
+            },
         )?;
 
         with_print_session(session, |session| {
@@ -1066,6 +1140,7 @@ mod tests {
             append_system_prompt: None,
             defaults: Default::default(),
             model_policy: Arc::default(),
+            provider_registry: None,
             modes: EventHandle::disconnected_for_test().mode_registry(),
             question_mode: QuestionMode::Headless,
             plugin_rules: Arc::default(),
@@ -1089,6 +1164,7 @@ mod tests {
         let session = start_print_session(
             params,
             provided(provider),
+            headless::default_model_preparer(Default::default()),
             Default::default(),
             &EventHandle::disconnected_for_test(),
             &CommandRegistry::new(),
@@ -1378,6 +1454,72 @@ mod tests {
         assert!(execution.try_recv().is_err());
     }
 
+    #[test]
+    fn print_coordinator_switches_to_registered_provider() {
+        use maki_providers::provider_registry::{ProviderFactory, ProviderRegistration};
+
+        const SPEC: &str = "print-test-provider/model";
+        const WINDOW: u32 = 42_000;
+        struct Factory;
+        impl ProviderFactory for Factory {
+            fn prepare<'a>(
+                &'a self,
+                model: &'a Model,
+                _: &'a Value,
+            ) -> BoxFuture<'a, Result<(Model, Box<dyn Provider>), AgentError>> {
+                Box::pin(async move {
+                    Ok((
+                        model.clone(),
+                        Box::new(RecordingPrintProvider {
+                            requests: flume::unbounded().0,
+                            nested: None,
+                        }) as Box<dyn Provider>,
+                    ))
+                })
+            }
+        }
+
+        let providers = Arc::new(ProviderRegistry::default());
+        providers
+            .register(ProviderRegistration {
+                id: "print-test-provider".into(),
+                display_name: "Print test".into(),
+                models: vec![ModelInfo {
+                    context_window: Some(WINDOW),
+                    ..ModelInfo::id_only("model".into())
+                }],
+                factory: Arc::new(Factory),
+            })
+            .unwrap();
+        let handle = EventHandle::disconnected_for_test();
+        let session = start_print_session(
+            print_params(&std::env::temp_dir(), None),
+            provided(Arc::new(RecordingPrintProvider {
+                requests: flume::unbounded().0,
+                nested: None,
+            })),
+            print_model_preparer(providers, Default::default()),
+            Default::default(),
+            &handle,
+            &CommandRegistry::new(),
+            |_, _| Discovery::idle(),
+        )
+        .unwrap();
+        with_print_session(session, |session| {
+            smol::block_on(
+                session
+                    .coordinator
+                    .set_model(Some(Arc::from(SPEC)), None, None),
+            )
+            .unwrap();
+            let config = session.root.target.effective_config().unwrap().unwrap();
+            assert_eq!(config.model.spec(), SPEC);
+            assert_eq!(config.model.context_window, WINDOW);
+            Ok(())
+        })
+        .unwrap();
+    }
+
     /// The run's own provider is discovered before the session is handed
     /// over, so the root starts on the discovered metadata and the catalog
     /// plugins read already has the provider's models.
@@ -1426,6 +1568,7 @@ mod tests {
                 requests,
                 nested: None,
             })),
+            headless::default_model_preparer(Default::default()),
             lua_handle.session_option_catalog(),
             &lua_handle,
             &registry,
@@ -1440,7 +1583,7 @@ mod tests {
                             }],
                         );
                         on_ready(ModelBatch {
-                            provider: Some(DISCOVERY_PROVIDER),
+                            provider: Some(DISCOVERY_PROVIDER.to_owned()),
                             models: vec![spec],
                             warnings: Vec::new(),
                         });
@@ -1679,6 +1822,7 @@ mod tests {
         let session = start_print_session(
             params,
             provided(provider),
+            headless::default_model_preparer(Default::default()),
             lua_handle.session_option_catalog(),
             &lua_handle,
             &registry,
@@ -1854,6 +1998,7 @@ mod tests {
                 requests: flume::unbounded().0,
                 nested: None,
             })),
+            headless::default_model_preparer(Default::default()),
             Default::default(),
             &EventHandle::disconnected_for_test(),
             registry,

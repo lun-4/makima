@@ -44,6 +44,8 @@ event-listener = { workspace = true }
 open = { workspace = true }
 
 [dev-dependencies]
+flate2 = { workspace = true }
+zstd = { workspace = true }
 maki-storage = { workspace = true, features = ["test-util"] }
 maki-config = { workspace = true, features = ["test-util"] }
 maki-lua = { workspace = true, features = ["test-support"] }
@@ -81,6 +83,8 @@ repository = "https://github.com/lun-4/makima"
 rust-version = "1.88"
 
 [workspace.dependencies]
+flate2 = "1"
+zstd = "0.13"
 maki-agent = { path = "maki-agent" }
 maki-domain = { path = "maki-domain" }
 maki-acp = { path = "maki-acp" }

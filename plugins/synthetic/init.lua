@@ -1,0 +1,1 @@
+require("maki.synthetic").register()

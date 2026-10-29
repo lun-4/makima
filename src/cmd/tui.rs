@@ -188,13 +188,20 @@ fn build_stack(
 
     let commands = discover_commands(cli.no_commands, cwd, &trust.project_config);
 
-    let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, storage);
+    let provider_snapshot = plugin_host.provider_registry().snapshot();
+    let model_result = setup::resolve_model_with_registry(
+        cli.model.as_deref(),
+        &config.provider,
+        storage,
+        Some(provider_snapshot.as_ref()),
+    );
     let (model, needs_login) = match (model_result, fallback_model) {
         (Ok(m), _) => (m, false),
         (Err(e), Some(last_model)) => {
             warnings.push(format!("{MODEL_FALLBACK_WARNING}: {e:#}"));
             (last_model, false)
         }
+        (Err(e), None) if !cli.print && cli.model.is_some() => return Err(e),
         (Err(_), None) if !cli.print => {
             let placeholder = Model::from_spec(FALLBACK_MODEL_SPEC).expect("fallback model");
             (placeholder, true)
@@ -219,11 +226,14 @@ fn restored_session_model(
     session: &AppSession,
     explicit_model: bool,
     model_policy: &ModelPolicy,
+    providers: &maki_providers::provider_registry::ProviderSnapshot,
 ) -> Model {
     if explicit_model || !model_policy.allows(&session.model) {
         return startup.clone();
     }
-    Model::from_spec(&session.model).unwrap_or_else(|_| startup.clone())
+    providers
+        .resolve_model(&session.model, model_policy)
+        .unwrap_or_else(|_| startup.clone())
 }
 
 fn resolve_session(
@@ -380,6 +390,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
             command_registry: stack.plugin_host.command_registry(),
             session_options: stack.plugin_host.event_handle().session_option_catalog(),
             lua_handle: stack.plugin_host.event_handle().clone(),
+            provider_registry: stack.plugin_host.provider_registry(),
         })
         .context("run sdk mode")?;
         return Ok(());
@@ -399,6 +410,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
             stack.config.permissions,
             timeouts,
             stack.plugin_host.event_handle(),
+            stack.plugin_host.provider_registry(),
             stack.config.session_defaults,
             Arc::new(stack.config.provider.model_policy.clone()),
             cli.system_prompt,
@@ -432,6 +444,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
             focused_tab,
             apply_explicit_model,
             &stack.config.provider.model_policy,
+            &stack.plugin_host.provider_registry().snapshot(),
         );
 
         let outcome = maki_ui::run(
@@ -463,6 +476,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
                 status_content_reader: stack.plugin_host.status_content_reader(),
                 ui_action_rx: stack.plugin_host.ui_action_rx(),
                 lua_event_handle: stack.plugin_host.event_handle(),
+                provider_registry: stack.plugin_host.provider_registry(),
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),
                 session_defaults: stack.config.session_defaults,
                 system_prompt_override: cli.system_prompt.clone(),
@@ -631,10 +645,60 @@ mod tests {
         let startup = Model::from_spec("openai/gpt-5").unwrap();
         let session = AppSession::new("anthropic/claude-opus-4-6", "/tmp");
 
-        let resolved =
-            restored_session_model(&startup, &session, explicit_model, &ModelPolicy::default());
+        let providers = maki_providers::provider_registry::ProviderRegistry::default();
+        let resolved = restored_session_model(
+            &startup,
+            &session,
+            explicit_model,
+            &ModelPolicy::default(),
+            &providers.snapshot(),
+        );
 
         assert_eq!(resolved.spec(), expected);
+    }
+
+    #[test]
+    fn tui_restores_model_from_host_registry() {
+        use maki_providers::AgentError;
+        use maki_providers::model::ModelInfo;
+        use maki_providers::provider::{BoxFuture, Provider};
+        use maki_providers::provider_registry::{
+            ProviderFactory, ProviderRegistration, ProviderRegistry,
+        };
+        use serde_json::Value;
+
+        struct Factory;
+        impl ProviderFactory for Factory {
+            fn prepare<'a>(
+                &'a self,
+                _: &'a Model,
+                _: &'a Value,
+            ) -> BoxFuture<'a, Result<(Model, Box<dyn Provider>), AgentError>> {
+                Box::pin(async { Err(AgentError::Cancelled) })
+            }
+        }
+        let registry = ProviderRegistry::default();
+        let mut info = ModelInfo::id_only("model".into());
+        info.context_window = Some(12345);
+        registry
+            .register(ProviderRegistration {
+                id: "lua-test".into(),
+                display_name: "Lua test".into(),
+                models: vec![info],
+                factory: Arc::new(Factory),
+            })
+            .unwrap();
+        let startup = Model::from_spec("openai/gpt-5").unwrap();
+        let session = AppSession::new("lua-test/model", "/tmp");
+        let restored = restored_session_model(
+            &startup,
+            &session,
+            false,
+            &ModelPolicy::default(),
+            &registry.snapshot(),
+        );
+        assert_eq!(restored.spec(), "lua-test/model");
+        assert_eq!(restored.context_window, 12345);
     }
 
     #[test]

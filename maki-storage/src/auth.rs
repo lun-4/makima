@@ -1,8 +1,11 @@
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, File, OpenOptions};
+use std::future::Future;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use fs4::{FileExt, TryLockError};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
@@ -72,12 +75,12 @@ impl ProviderCredentials {
     }
 }
 
-/// Refresh tokens rotate and a rotated one is single use, so two processes
-/// refreshing at once leave the loser replaying a spent token, which providers
-/// answer by revoking the whole family instead of failing the one call. Waiting
-/// forever would be worse than the race though, since this runs on the ui
-/// thread too, so a lock that does not arrive in time is given up and the
-/// caller carries on as before.
+#[cfg(test)]
+thread_local! {
+    static LOCK_BLOCKED: std::cell::RefCell<Option<std::sync::mpsc::Sender<bool>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Acquire the cross-process lock with a bounded wait.
 pub fn lock_exclusive(path: &Path) -> Option<File> {
     let file = match File::open(path) {
         Ok(file) => file,
@@ -93,9 +96,17 @@ pub fn lock_exclusive(path: &Path) -> Option<File> {
     };
     let deadline = Instant::now() + LOCK_WAIT;
     loop {
-        match file.try_lock() {
+        match FileExt::try_lock(&file) {
             Ok(()) => return Some(file),
-            Err(TryLockError::WouldBlock) if Instant::now() < deadline => sleep(LOCK_POLL),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                #[cfg(test)]
+                LOCK_BLOCKED.with(|sender| {
+                    if let Some(sender) = sender.borrow_mut().take() {
+                        let _ = sender.send(true);
+                    }
+                });
+                sleep(LOCK_POLL);
+            }
             Err(_) => return None,
         }
     }
@@ -104,7 +115,151 @@ pub fn lock_exclusive(path: &Path) -> Option<File> {
 /// Every write replaces the token file, so the lock sits beside it under a name
 /// no loader reads.
 pub fn lock_tokens(dir: &StateDir, provider: &str) -> Option<File> {
-    lock_exclusive(&auth_path(dir, &format!("{provider}{LOCK_SUFFIX}")))
+    lock_exclusive(&token_lock_path(dir, provider))
+}
+
+fn token_lock_path(dir: &StateDir, provider: &str) -> PathBuf {
+    auth_path(dir, &format!("{provider}{LOCK_SUFFIX}"))
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CredentialError {
+    #[error("invalid credential scope")]
+    InvalidScope,
+    #[error("credential lock timed out")]
+    LockTimeout,
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error("credential refresh failed: {0}")]
+    Refresh(String),
+    #[error("credentials revoked")]
+    Revoked,
+}
+
+/// A storage namespace, not an authorization capability. Callers must bind it to
+/// a host-verified provider identity before exposing it to a plugin.
+#[derive(Clone)]
+pub struct CredentialScope {
+    dir: StateDir,
+    name: String,
+}
+
+pub enum RefreshOutcome {
+    Unchanged,
+    Updated(serde_json::Value),
+    Deleted,
+    Revoked,
+}
+
+impl CredentialScope {
+    pub fn new(dir: StateDir, name: &str) -> Result<Self, CredentialError> {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+        {
+            return Err(CredentialError::InvalidScope);
+        }
+        Ok(Self {
+            dir,
+            name: name.to_owned(),
+        })
+    }
+
+    fn path(&self) -> PathBuf {
+        auth_path(&self.dir, &self.name)
+    }
+
+    pub fn read(&self) -> Result<Option<serde_json::Value>, CredentialError> {
+        match fs::read(self.path()) {
+            Ok(data) => Ok(Some(
+                serde_json::from_slice(&data).map_err(StorageError::from)?,
+            )),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(StorageError::from(error).into()),
+        }
+    }
+
+    pub async fn write(&self, value: &serde_json::Value) -> Result<(), CredentialError> {
+        let _lock = self.lock().await?;
+        self.write_unlocked(value)
+    }
+
+    fn write_unlocked(&self, value: &serde_json::Value) -> Result<(), CredentialError> {
+        save_auth(&self.path(), value)?;
+        Ok(())
+    }
+
+    pub async fn delete(&self) -> Result<bool, CredentialError> {
+        let _lock = self.lock().await?;
+        self.delete_unlocked()
+    }
+
+    fn delete_unlocked(&self) -> Result<bool, CredentialError> {
+        match fs::remove_file(self.path()) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(StorageError::from(error).into()),
+        }
+    }
+
+    async fn lock(&self) -> Result<File, CredentialError> {
+        lock_credentials(&self.dir, &self.name).await
+    }
+
+    /// The callback receives the state reloaded under the cross-process lock.
+    /// Dropping the future releases the lock without committing its result.
+    pub async fn refresh<F, Fut>(
+        &self,
+        refresh: F,
+    ) -> Result<Option<serde_json::Value>, CredentialError>
+    where
+        F: FnOnce(Option<serde_json::Value>) -> Fut,
+        Fut: Future<Output = Result<RefreshOutcome, CredentialError>>,
+    {
+        let _lock = self.lock().await?;
+        let current = self.read()?;
+        match refresh(current.clone()).await? {
+            RefreshOutcome::Unchanged => Ok(current),
+            RefreshOutcome::Updated(value) => {
+                self.write_unlocked(&value)?;
+                Ok(Some(value))
+            }
+            RefreshOutcome::Deleted => {
+                self.delete_unlocked()?;
+                Ok(None)
+            }
+            RefreshOutcome::Revoked => Err(CredentialError::Revoked),
+        }
+    }
+}
+
+pub async fn lock_credentials(dir: &StateDir, name: &str) -> Result<File, CredentialError> {
+    let path = token_lock_path(dir, name);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(StorageError::from)?;
+    }
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(StorageError::from)?,
+        Err(error) => return Err(StorageError::from(error).into()),
+    };
+    let deadline = Instant::now() + LOCK_WAIT;
+    loop {
+        match FileExt::try_lock(&file) {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                async_io::Timer::after(LOCK_POLL).await;
+            }
+            Err(TryLockError::WouldBlock) => return Err(CredentialError::LockTimeout),
+            Err(TryLockError::Error(error)) => return Err(StorageError::from(error).into()),
+        }
+    }
 }
 
 pub fn now_millis() -> u64 {
@@ -151,10 +306,31 @@ pub fn save_tokens(
     provider: &str,
     tokens: &OAuthTokens,
 ) -> Result<(), StorageError> {
+    let _lock = require_token_lock(dir, provider)?;
+    save_tokens_unlocked(dir, provider, tokens)
+}
+
+/// Caller must hold the lock returned by `lock_tokens`.
+pub fn save_tokens_unlocked(
+    dir: &StateDir,
+    provider: &str,
+    tokens: &OAuthTokens,
+) -> Result<(), StorageError> {
     save_auth(&auth_path(dir, provider), tokens)
 }
 
+fn require_token_lock(dir: &StateDir, name: &str) -> Result<File, StorageError> {
+    lock_tokens(dir, name)
+        .ok_or_else(|| std::io::Error::other("credential lock unavailable").into())
+}
+
 pub fn delete_tokens(dir: &StateDir, provider: &str) -> Result<bool, StorageError> {
+    let _lock = require_token_lock(dir, provider)?;
+    delete_tokens_unlocked(dir, provider)
+}
+
+/// Caller must hold the lock returned by `lock_tokens`.
+pub fn delete_tokens_unlocked(dir: &StateDir, provider: &str) -> Result<bool, StorageError> {
     delete_auth(&auth_path(dir, provider))
 }
 
@@ -176,10 +352,21 @@ pub fn save_mcp_auth(
     server_name: &str,
     data: &McpAuthData,
 ) -> Result<(), StorageError> {
+    let _lock = require_token_lock(dir, &format!("mcp-{server_name}"))?;
+    save_mcp_auth_unlocked(dir, server_name, data)
+}
+
+/// Caller must hold the lock for the MCP credential name.
+pub fn save_mcp_auth_unlocked(
+    dir: &StateDir,
+    server_name: &str,
+    data: &McpAuthData,
+) -> Result<(), StorageError> {
     save_auth(&auth_path(dir, &format!("mcp-{server_name}")), data)
 }
 
 pub fn delete_mcp_auth(dir: &StateDir, server_name: &str) -> Result<bool, StorageError> {
+    let _lock = require_token_lock(dir, &format!("mcp-{server_name}"))?;
     delete_auth(&auth_path(dir, &format!("mcp-{server_name}")))
 }
 
@@ -192,10 +379,12 @@ pub fn save_provider_credentials(
     slug: &str,
     creds: &ProviderCredentials,
 ) -> Result<(), StorageError> {
+    let _lock = require_token_lock(dir, slug)?;
     save_auth(&auth_path(dir, slug), creds)
 }
 
 pub fn delete_provider_credentials(dir: &StateDir, slug: &str) -> Result<bool, StorageError> {
+    let _lock = require_token_lock(dir, slug)?;
     delete_auth(&auth_path(dir, slug))
 }
 
@@ -208,6 +397,199 @@ mod tests {
     use test_case::test_case;
 
     const TEST_URL: &str = "https://mcp.example.com";
+
+    #[test_case("../escape"; "traversal")]
+    #[test_case(""; "empty")]
+    #[test_case("a/b"; "separator")]
+    fn credential_scope_rejects_invalid_names(name: &str) {
+        let tmp = TempDir::new().unwrap();
+        assert!(matches!(
+            CredentialScope::new(StateDir::from_path(tmp.path().into()), name),
+            Err(CredentialError::InvalidScope)
+        ));
+    }
+
+    #[test]
+    fn credential_refresh_reloads_and_preserves_on_failure() {
+        let tmp = TempDir::new().unwrap();
+        let scope =
+            CredentialScope::new(StateDir::from_path(tmp.path().into()), "provider").unwrap();
+        let value = serde_json::json!({"access": "original"});
+        smol::block_on(async {
+            scope.write(&value).await.unwrap();
+            let result = scope
+                .refresh(|current| async move {
+                    assert_eq!(current, Some(value));
+                    Err(CredentialError::Refresh("temporary".into()))
+                })
+                .await;
+            assert!(matches!(result, Err(CredentialError::Refresh(_))));
+            assert_eq!(scope.read().unwrap().unwrap()["access"], "original");
+            let result = scope
+                .refresh(|_| async {
+                    Ok(RefreshOutcome::Updated(
+                        serde_json::json!({"access": "rotated"}),
+                    ))
+                })
+                .await
+                .unwrap();
+            assert_eq!(result.unwrap()["access"], "rotated");
+        });
+    }
+
+    #[test]
+    fn credential_refresh_deletes_under_lock() {
+        let tmp = TempDir::new().unwrap();
+        let scope =
+            CredentialScope::new(StateDir::from_path(tmp.path().into()), "provider").unwrap();
+        smol::block_on(async {
+            scope
+                .write(&serde_json::json!({"access": "secret"}))
+                .await
+                .unwrap();
+            assert!(
+                scope
+                    .refresh(|current| async move {
+                        assert!(current.is_some());
+                        Ok(RefreshOutcome::Deleted)
+                    })
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        assert!(scope.read().unwrap().is_none());
+        assert!(!scope.path().exists());
+    }
+
+    #[test]
+    fn cancelled_credential_refresh_does_not_commit() {
+        let tmp = TempDir::new().unwrap();
+        let scope =
+            CredentialScope::new(StateDir::from_path(tmp.path().into()), "provider").unwrap();
+        smol::block_on(async {
+            scope
+                .write(&serde_json::json!({"access": "original"}))
+                .await
+                .unwrap();
+            let future = scope.refresh(|_| async {
+                std::future::pending::<()>().await;
+                Ok(RefreshOutcome::Updated(
+                    serde_json::json!({"access": "new"}),
+                ))
+            });
+            let mut future = Box::pin(future);
+            assert!(futures_poll_once(future.as_mut()).await.is_none());
+            drop(future);
+        });
+        assert_eq!(scope.read().unwrap().unwrap()["access"], "original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_mutations_accept_read_only_legacy_lock_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().into());
+        drop(lock_tokens(&dir, "provider").unwrap());
+        fs::set_permissions(
+            token_lock_path(&dir, "provider"),
+            fs::Permissions::from_mode(0o400),
+        )
+        .unwrap();
+        let scope = CredentialScope::new(dir, "provider").unwrap();
+        smol::block_on(scope.write(&serde_json::json!({"access": "token"}))).unwrap();
+    }
+
+    #[test]
+    fn credential_mutations_wait_for_legacy_lock() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().into());
+        let scope = CredentialScope::new(dir.clone(), "provider").unwrap();
+        let legacy_lock = lock_tokens(&dir, "provider").unwrap();
+        smol::block_on(async {
+            let value = serde_json::json!({"access": "new"});
+            let mut write = Box::pin(scope.write(&value));
+            let mut delete = Box::pin(scope.delete());
+            assert!(futures_poll_once(write.as_mut()).await.is_none());
+            assert!(futures_poll_once(delete.as_mut()).await.is_none());
+            assert!(scope.read().unwrap().is_none());
+            drop(legacy_lock);
+            write.await.unwrap();
+            assert_eq!(scope.read().unwrap(), Some(value));
+            assert!(delete.await.unwrap());
+            assert!(scope.read().unwrap().is_none());
+        });
+    }
+
+    #[test_case("provider", false; "token_save")]
+    #[test_case("provider", true; "provider_delete")]
+    #[test_case("mcp-server", false; "mcp_save")]
+    #[test_case("mcp-server", true; "mcp_delete")]
+    fn legacy_mutations_serialize_with_scoped_refresh(name: &str, delete: bool) {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().into());
+        let scope = CredentialScope::new(dir.clone(), name).unwrap();
+        let original = serde_json::json!({"access": "original"});
+        smol::block_on(scope.write(&original)).unwrap();
+        let lock = lock_tokens(&dir, name).unwrap();
+        let name = name.to_owned();
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            LOCK_BLOCKED.with(|sender| *sender.borrow_mut() = Some(event_tx.clone()));
+            if name == "mcp-server" {
+                if delete {
+                    delete_mcp_auth(&dir, "server").unwrap();
+                } else {
+                    save_mcp_auth(&dir, "server", &test_mcp_data()).unwrap();
+                }
+            } else if delete {
+                delete_provider_credentials(&dir, &name).unwrap();
+            } else {
+                save_tokens(
+                    &dir,
+                    &name,
+                    &OAuthTokens {
+                        access: "legacy".into(),
+                        refresh: "refresh".into(),
+                        expires: 0,
+                        account_id: None,
+                    },
+                )
+                .unwrap();
+            }
+            event_tx.send(false).unwrap();
+        });
+        assert!(
+            event_rx.recv().unwrap(),
+            "mutation completed without waiting for the lock"
+        );
+        assert_eq!(scope.read().unwrap(), Some(original));
+        scope
+            .write_unlocked(&serde_json::json!({"access": "rotated"}))
+            .unwrap();
+        drop(lock);
+        worker.join().unwrap();
+        let result = scope.read().unwrap();
+        if delete {
+            assert!(result.is_none());
+        } else if scope.name == "mcp-server" {
+            assert_eq!(result.unwrap()["client_id"], "client-123");
+        } else {
+            assert_eq!(result.unwrap()["access"], "legacy");
+        }
+    }
+
+    async fn futures_poll_once<F: Future>(mut future: std::pin::Pin<&mut F>) -> Option<F::Output> {
+        std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(match future.as_mut().poll(cx) {
+                std::task::Poll::Ready(value) => Some(value),
+                std::task::Poll::Pending => None,
+            })
+        })
+        .await
+    }
 
     fn test_mcp_data() -> McpAuthData {
         McpAuthData {

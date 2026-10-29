@@ -74,7 +74,14 @@ pub fn run(
 
     let timeouts = maki_providers::Timeouts::from(&config.provider);
 
-    let model = setup::resolve_model(model_arg.as_deref(), &config.provider, &storage)?;
+    let provider_registry = plugin_host.provider_registry();
+    let snapshot = provider_registry.snapshot();
+    let model = setup::resolve_model_with_registry(
+        model_arg.as_deref(),
+        &config.provider,
+        &storage,
+        Some(&snapshot),
+    )?;
 
     setup::init_logging(&config.storage);
     setup::install_panic_log_hook();
@@ -101,6 +108,7 @@ pub fn run(
         model_policy: Arc::new(config.provider.model_policy.clone()),
         plugin_rules: plugin_host.plugin_rules(),
         lua_event_handle,
+        provider_registry,
         command_registry,
         trust_mode,
         trust_policy: Arc::new(config.trust),

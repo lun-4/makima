@@ -3,6 +3,7 @@ pub(crate) mod r#async;
 pub(crate) mod autocmd;
 pub(crate) mod base64;
 pub(crate) mod completion;
+pub(crate) mod crypto;
 pub(crate) mod env;
 pub(crate) mod r#fn;
 pub(crate) mod fs;
@@ -50,6 +51,7 @@ use crate::plugin_permissions::PluginPermissions;
 pub(crate) struct PluginLoadContext {
     pub(crate) pending: PendingTools,
     pub(crate) pending_rules: PendingRules,
+    pub(crate) pending_providers: Arc<Mutex<Vec<(String, Table)>>>,
     pub(crate) pending_autocmds: crate::api::autocmd::PendingAutocmdStore,
     pub(crate) pending_timers: crate::api::timer::PendingTimerStore,
     pub(crate) pending_session_options: PendingSessionOptions,
@@ -93,6 +95,7 @@ pub(crate) fn create_maki_global(
     maki.set("treesitter", treesitter::create_treesitter_table(lua)?)?;
     maki.set("uv", uv::create_uv_table(lua, permissions)?)?;
     maki.set("base64", base64::create_base64_table(lua)?)?;
+    maki.set("crypto", crypto::create_crypto_table(lua)?)?;
     maki.set("image", image::create_image_table(lua)?)?;
     maki.set("json", json::create_json_table(lua)?)?;
     maki.set("yaml", yaml::create_yaml_table(lua)?)?;

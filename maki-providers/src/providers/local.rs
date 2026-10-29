@@ -186,12 +186,17 @@ impl Provider for LocalEndpoint {
         })
     }
 
-    fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Bearer,
-        ))
+    fn key_count(&self) -> usize {
+        self.key_pool.as_ref().map_or(1, KeyPool::len)
+    }
+
+    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
+        Box::pin(async move {
+            Ok(self
+                .key_pool
+                .as_ref()
+                .is_some_and(|pool| KeyRotation::new(pool, &self.auth, KeyHeader::Bearer).rotate()))
+        })
     }
 }
 
@@ -363,7 +368,7 @@ fn llamacpp_extract_ctx_from_model(
 
 fn llamacpp_extract_ctx_arg(args: &[String], flag: &str) -> Option<u32> {
     let idx = args.iter().position(|a| a == flag)?;
-    args.get(idx + 1)?.parse().ok()
+    args.get(idx + 1)?.parse().ok().filter(|&ctx| ctx > 0)
 }
 
 fn llamacpp_props_vision(props: &Value, mode: &ServerMode) -> Option<bool> {
@@ -777,6 +782,31 @@ mod tests {
             assert_eq!(
                 llamacpp_extract_ctx_from_model(&model, &ServerMode::Router, 0),
                 24000
+            );
+        }
+
+        #[test]
+        fn router_mode_ignores_zero_context_args() {
+            let model = model_with_status(vec![
+                "--ctx-size".into(),
+                "0".into(),
+                "--fit-ctx".into(),
+                "16384".into(),
+            ]);
+            assert_eq!(
+                llamacpp_extract_ctx_from_model(&model, &ServerMode::Router, 0),
+                16384
+            );
+
+            let model = model_with_status(vec![
+                "--ctx-size".into(),
+                "0".into(),
+                "--fit-ctx".into(),
+                "0".into(),
+            ]);
+            assert_eq!(
+                llamacpp_extract_ctx_from_model(&model, &ServerMode::Router, 0),
+                LLAMACPP_DEFAULT_CTX
             );
         }
 

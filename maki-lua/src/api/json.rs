@@ -1,7 +1,9 @@
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{AnyUserData, Lua, LuaSerdeExt, Result as LuaResult, UserData, UserDataMethods, Value};
+use mlua::{
+    AnyUserData, Lua, LuaSerdeExt, Result as LuaResult, Table, UserData, UserDataMethods, Value,
+};
 
-use super::util::convert::{json_to_lua, lua_to_json};
+use super::util::convert::{json_to_lua_with_nulls, lua_to_json};
 use super::util::pair::{Pair, pair, try_pair};
 
 pub(crate) const VALIDATOR_DOCS: crate::docs::ModuleDoc = crate::docs::ModuleDoc {
@@ -64,8 +66,8 @@ impl UserData for LuaSchemaValidator {
 }
 
 /// Turn a Lua value into a JSON string. Tables, strings, numbers,
-/// booleans, and nil all work. Functions and userdata cannot be
-/// serialized.
+/// booleans, nil, and the JSON null sentinel all work. Functions and
+/// other userdata cannot be serialized.
 ///
 /// @param value any Lua value to encode.
 /// @return (string?, string?) JSON string, or nil plus an error.
@@ -78,18 +80,38 @@ fn encode(lua: &Lua, value: Value) -> LuaResult<Pair<String>> {
     Ok(pair(serde_json::to_string(&serde_val)))
 }
 
+/// Return the JSON null sentinel. It compares equal to preserved nulls and
+/// encodes as JSON null. The sentinel is truthy; compare it explicitly
+/// rather than using a truthiness check. Assign nil to remove a field.
+///
+/// @return any JSON null sentinel.
+#[lua_fn]
+fn null(lua: &Lua) -> LuaResult<Value> {
+    Ok(lua.null())
+}
+
 /// Parse a JSON string into a Lua value. Objects become tables and
-/// arrays become 1-indexed sequences.
+/// arrays become 1-indexed tables. By default null becomes nil, removing
+/// object fields and leaving holes in arrays. Set `preserve_null` to
+/// represent null as `maki.json.null()` instead.
 ///
 /// @param str string JSON string to decode.
-/// @return (any?, string?) Decoded value, or nil plus an error.
+/// @param opts table? Optional settings: `preserve_null` (boolean, default false).
+/// @return (any?, string?) Decoded value and nil, or nil plus an error. A root null decodes to nil by default.
 /// @example
 /// local t, err = maki.json.decode('{"x": 42}')
 /// print(t.x) -- 42
 #[lua_fn]
-fn decode(lua: &Lua, str: String) -> LuaResult<Pair<Value>> {
+fn decode(lua: &Lua, str: String, opts: Option<Table>) -> LuaResult<Pair<Value>> {
+    let preserve_null = match opts {
+        Some(opts) => opts.get::<Option<bool>>("preserve_null")?.unwrap_or(false),
+        None => false,
+    };
     let value = try_pair!(serde_json::from_str::<serde_json::Value>(&str));
-    Ok((Some(json_to_lua(lua, &value)?), None))
+    Ok((
+        Some(json_to_lua_with_nulls(lua, &value, preserve_null)?),
+        None,
+    ))
 }
 
 /// Compile a JSON Schema into a reusable validator object. Supports
@@ -126,7 +148,7 @@ lua_table! {
     /// local t = maki.json.decode(s)
     /// ```
     "maki.json" => pub(crate) fn create_json_table(), DOCS [
-        encode, decode, schema_validator,
+        encode, decode, null, schema_validator,
     ]
 }
 
@@ -212,6 +234,45 @@ mod tests {
     }
 
     #[test]
+    fn chat_request_encodes_empty_history_and_fallback_schema() {
+        let lua = lua_with_json();
+        let empty: String = lua.load("return assert(json.encode({}))").eval().unwrap();
+        assert_eq!(empty, "{}");
+        let chat: mlua::Table = lua
+            .load(include_str!(
+                "../../../plugins/lib/maki/chat_completions.lua"
+            ))
+            .eval()
+            .unwrap();
+        let maki = lua.create_table().unwrap();
+        maki.set("json", lua.globals().get::<mlua::Table>("json").unwrap())
+            .unwrap();
+        lua.globals().set("maki", maki).unwrap();
+        lua.globals().set("chat", chat).unwrap();
+        let encoded: String = lua
+            .load(
+                r#"
+                local request = {model = {id = 'model'}, messages = {}, tools = {
+                    {name = 'f', description = 'test', input_schema = json.decode('[]')}
+                }}
+                local body = assert(chat.build_request(request, {max_tokens_field = 'max_tokens'}))
+                return assert(json.encode(body))
+                "#,
+            )
+            .eval()
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            body["messages"],
+            serde_json::json!([{ "role": "system", "content": "" }])
+        );
+        assert_eq!(
+            body["tools"][0]["function"]["parameters"],
+            serde_json::json!({"type": "object", "properties": {}})
+        );
+    }
+
+    #[test]
     fn encode_decode_empty_array_roundtrips() {
         let lua = lua_with_json();
         let result: String = lua
@@ -219,6 +280,37 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!(result, "[]");
+    }
+
+    #[test]
+    fn decode_preserves_null_when_requested() {
+        let lua = lua_with_json();
+        lua.load(
+            r#"
+            local value, err = json.decode('{"a":null,"nested":[null,{"x":null},null]}', { preserve_null = true })
+            local null = json.null()
+            assert(err == nil and value.a == null)
+            assert(#value.nested == 3 and value.nested[1] == null)
+            assert(value.nested[2].x == null and value.nested[3] == null)
+            local root, root_err = json.decode('null', { preserve_null = true })
+            assert(root_err == nil and root == null)
+            assert(json.encode(root) == 'null')
+            local encoded = assert(json.encode(value))
+            local again = assert(json.decode(encoded, { preserve_null = true }))
+            assert(again.a == null and again.nested[3] == null)
+            local collision = assert(json.decode('{"__json_null":true}', { preserve_null = true }))
+            assert(collision ~= null and collision.__json_null == true)
+            assert(json.encode(collision) == '{"__json_null":true}')
+            local validator = assert(json.schema_validator({type = 'null'}))
+            assert(validator:validate(root) == nil and validator:validate(collision) ~= nil)
+            local legacy = json.decode('{"a":null}', { preserve_null = false })
+            assert(legacy.a == nil and json.decode('null') == nil)
+            local invalid, invalid_err = json.decode('{', { preserve_null = true })
+            assert(invalid == nil and invalid_err ~= nil)
+            "#,
+        )
+        .exec()
+        .unwrap();
     }
 
     #[test]

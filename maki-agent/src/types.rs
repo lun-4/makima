@@ -614,13 +614,16 @@ impl TurnFailure {
     /// [`TurnOutcome::Cancelled`] instead.
     pub fn from_agent_error(error: &AgentError) -> Self {
         let kind = match error {
-            AgentError::Api { status: 401, .. } => TurnFailureKind::Authentication,
-            AgentError::Api { .. } => TurnFailureKind::Provider,
+            error if error.is_auth_error() => TurnFailureKind::Authentication,
+            AgentError::Api { .. } | AgentError::StructuredOverflow { .. } => {
+                TurnFailureKind::Provider
+            }
             AgentError::Timeout { .. } => TurnFailureKind::Timeout,
             AgentError::Tool { .. } => TurnFailureKind::Tool,
-            AgentError::Io(_) | AgentError::Http(_) | AgentError::HttpRequest(_) => {
-                TurnFailureKind::Transport
-            }
+            AgentError::Network { .. }
+            | AgentError::Io(_)
+            | AgentError::Http(_)
+            | AgentError::HttpRequest(_) => TurnFailureKind::Transport,
             AgentError::Json(_) | AgentError::Config { .. } => TurnFailureKind::InvalidResponse,
             AgentError::Channel => TurnFailureKind::Internal,
             AgentError::EmptySummary => TurnFailureKind::Compaction,

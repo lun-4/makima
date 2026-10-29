@@ -27,23 +27,33 @@ const PROVIDER_PRIORITY: &[&str] = &[
     "regolo",
 ];
 
-pub fn resolve_model(
+pub fn resolve_model_with_registry(
     explicit: Option<&str>,
     provider_config: &maki_config::ProviderConfig,
     storage: &StateDir,
+    registry: Option<&maki_providers::provider_registry::ProviderSnapshot>,
 ) -> Result<Model> {
     let policy = &provider_config.model_policy;
+    let resolve = |spec: &str| {
+        if let Some(registry) = registry
+            && let Ok((slug, _)) = Model::parse_spec(spec)
+            && registry.get(slug).is_some()
+        {
+            return registry.resolve_model(spec, policy);
+        }
+        from_spec_or_warm_catalog(spec)
+    };
     if let Some(spec) = explicit {
         if !policy.allows(spec) {
             return Err(eyre!(
                 "model {spec:?} is not allowed by provider model policy"
             ));
         }
-        return from_spec_or_warm_catalog(spec).context("invalid --model spec");
+        return resolve(spec).context("invalid --model spec");
     }
     if let Some(spec) = read_model(storage) {
         if policy.allows(&spec)
-            && let Ok(m) = from_spec_or_warm_catalog(&spec)
+            && let Ok(m) = resolve(&spec)
         {
             return Ok(m);
         }
@@ -58,9 +68,9 @@ pub fn resolve_model(
                 "default model {spec:?} is not allowed by provider model policy"
             ));
         }
-        return from_spec_or_warm_catalog(spec).context("invalid default_model in config");
+        return resolve(spec).context("invalid default_model in config");
     }
-    auto_detect_model(policy).ok_or_else(|| {
+    auto_detect_model(policy, registry).ok_or_else(|| {
         let policy_note = if policy.is_restrictive() {
             "\nnote: an allowed_models/excluded_models policy is active and may exclude every candidate"
         } else {
@@ -85,18 +95,36 @@ fn from_spec_or_warm_catalog(spec: &str) -> Result<Model, ModelError> {
     }
 }
 
-fn auto_detect_model(policy: &maki_config::ModelPolicy) -> Option<Model> {
+fn auto_detect_model(
+    policy: &maki_config::ModelPolicy,
+    registry: Option<&maki_providers::provider_registry::ProviderSnapshot>,
+) -> Option<Model> {
     for tier in [ModelTier::Strong, ModelTier::Medium] {
         for &slug in PROVIDER_PRIORITY {
             if maki_providers::provider::provider_available(slug)
                 && let Ok(model) = Model::from_tier(slug, tier)
-                && policy.allows(&model.spec())
+                && let Some(model) = resolve_auto_detected_model(model, policy, registry)
             {
                 return Some(model);
             }
         }
     }
     None
+}
+
+fn resolve_auto_detected_model(
+    model: Model,
+    policy: &maki_config::ModelPolicy,
+    registry: Option<&maki_providers::provider_registry::ProviderSnapshot>,
+) -> Option<Model> {
+    let spec = model.spec();
+    if !policy.allows(&spec) {
+        return None;
+    }
+    match registry.and_then(|registry| registry.get(&model.provider).map(|_| registry)) {
+        Some(registry) => registry.resolve_model(&spec, policy).ok(),
+        None => Some(model),
+    }
 }
 
 /// Built-in slugs keep their compiled protocol, model catalog and auth wiring,
@@ -233,9 +261,51 @@ pub fn init_logging(storage_config: &maki_config::StorageConfig) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use maki_providers::AgentError;
+    use maki_providers::model::{Model, ModelInfo};
+    use maki_providers::provider::{BoxFuture, Provider};
+    use maki_providers::provider_registry::{
+        ProviderFactory, ProviderRegistration, ProviderRegistry,
+    };
+    use serde_json::Value;
     use test_case::test_case;
 
-    use super::{DEFAULT_LOG_LEVEL, build_log_filter};
+    use super::{DEFAULT_LOG_LEVEL, build_log_filter, resolve_auto_detected_model};
+
+    struct Factory;
+
+    impl ProviderFactory for Factory {
+        fn prepare<'a>(
+            &'a self,
+            _model: &'a Model,
+            _config: &'a Value,
+        ) -> BoxFuture<'a, Result<(Model, Box<dyn Provider>), AgentError>> {
+            Box::pin(async { Err(AgentError::Cancelled) })
+        }
+    }
+
+    #[test]
+    fn auto_detect_respects_registered_provider_catalog() {
+        let model =
+            Model::from_tier("anthropic", maki_providers::model::ModelTier::Strong).unwrap();
+        let registry = ProviderRegistry::default();
+        registry
+            .register(ProviderRegistration {
+                id: "anthropic".into(),
+                display_name: "Anthropic".into(),
+                models: vec![ModelInfo::id_only("different-model".into())],
+                factory: Arc::new(Factory),
+            })
+            .unwrap();
+        let policy = maki_config::ModelPolicy::default();
+        assert!(
+            resolve_auto_detected_model(model.clone(), &policy, Some(&registry.snapshot()))
+                .is_none()
+        );
+        assert!(resolve_auto_detected_model(model, &policy, None).is_some());
+    }
 
     const FOREIGN: &str = "other_crate=debug";
     const FOREIGN_EMPTY_PIECES: &str = ",other_crate=debug,,";

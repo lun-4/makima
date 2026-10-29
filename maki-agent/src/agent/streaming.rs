@@ -102,10 +102,7 @@ pub(crate) async fn stream_with_retry(
     let opts = opts.clamped(model);
     let messages = maki_providers::adapt_images_for_model(model, messages).await;
     let messages = &*messages;
-    let mut retry = RetryState::new(
-        retry_policy,
-        provider.keys().map_or(1, |keys| keys.key_count()),
-    );
+    let mut retry = RetryState::new(retry_policy, provider.key_count());
     let mut attempt = 0;
     if let Some(output) = event_tx.output() {
         output.begin_text_attempt();
@@ -146,9 +143,22 @@ pub(crate) async fn stream_with_retry(
             Err(AgentError::Cancelled) => return Err(StreamError::Cancelled { streamed }),
             Err(e) => {
                 attempt += 1;
-                let rotated = e.should_rotate_key()
-                    && retry.book_rotation()
-                    && provider.keys().is_some_and(|keys| keys.rotate());
+                let rotated = if e.should_rotate_key() && retry.book_rotation() {
+                    match futures_lite::future::race(provider.rotate_key(), async {
+                        cancel.cancelled().await;
+                        Err(AgentError::Cancelled)
+                    })
+                    .await
+                    {
+                        Ok(rotated) => rotated,
+                        Err(AgentError::Cancelled) => {
+                            return Err(StreamError::Cancelled { streamed });
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                } else {
+                    false
+                };
                 let (message, delay) = if rotated {
                     (e.retry_message(), Duration::ZERO)
                 } else if let Some(kind) = e.retry_kind() {
@@ -456,12 +466,19 @@ mod tests {
             Box::pin(async { unimplemented!() })
         }
 
-        fn keys(&self) -> Option<maki_providers::KeyRotation<'_>> {
-            Some(maki_providers::KeyRotation::new(
-                &self.pool,
-                &self.auth,
-                maki_providers::KeyHeader::Bearer,
-            ))
+        fn key_count(&self) -> usize {
+            self.pool.len()
+        }
+
+        fn rotate_key(&self) -> maki_providers::provider::BoxFuture<'_, Result<bool, AgentError>> {
+            Box::pin(async {
+                Ok(maki_providers::KeyRotation::new(
+                    &self.pool,
+                    &self.auth,
+                    maki_providers::KeyHeader::Bearer,
+                )
+                .rotate())
+            })
         }
     }
 
@@ -481,6 +498,84 @@ mod tests {
             no_budget(),
         )
         .await
+    }
+
+    struct PendingRotation {
+        server: PooledServer,
+        started: flume::Sender<()>,
+    }
+
+    impl Provider for PendingRotation {
+        fn stream_message<'a>(
+            &'a self,
+            model: &'a Model,
+            messages: &'a [Message],
+            system: &'a str,
+            tools: &'a Value,
+            events: &'a flume::Sender<ProviderEvent>,
+            opts: RequestOptions,
+            session_id: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            self.server
+                .stream_message(model, messages, system, tools, events, opts, session_id)
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, AgentError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn key_count(&self) -> usize {
+            FULL_POOL
+        }
+
+        fn rotate_key(&self) -> maki_providers::provider::BoxFuture<'_, Result<bool, AgentError>> {
+            Box::pin(async {
+                self.started.send(()).unwrap();
+                std::future::pending().await
+            })
+        }
+    }
+
+    #[test]
+    fn cancellation_interrupts_pending_rotation() {
+        smol::block_on(async {
+            let (started, waiting) = flume::bounded(1);
+            let provider = PendingRotation {
+                server: PooledServer::new(FULL_POOL, RATE_LIMITED, None),
+                started,
+            };
+            let (trigger, cancel) = CancelToken::new();
+            let (tx, _rx) = flume::unbounded();
+            let model = Model::from_spec("ollama/qwen3").unwrap();
+            let sender = EventSender::new(tx);
+            let tools = json!([]);
+            let (result, ()) = futures_lite::future::zip(
+                stream_with_retry(
+                    &provider,
+                    &model,
+                    &[],
+                    "",
+                    &tools,
+                    &sender,
+                    &cancel,
+                    RequestOptions::default(),
+                    None,
+                    no_budget(),
+                ),
+                async {
+                    waiting.recv_async().await.unwrap();
+                    trigger.cancel();
+                },
+            )
+            .await;
+            assert!(matches!(result, Err(StreamError::Cancelled { .. })));
+            assert_eq!(provider.server.keys_seen().len(), 1);
+        });
     }
 
     #[test]

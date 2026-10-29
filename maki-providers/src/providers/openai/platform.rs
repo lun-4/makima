@@ -343,8 +343,7 @@ impl OpenAi {
             match refreshed_tokens(&storage, auth::PROVIDER, auth::refresh_tokens) {
                 Ok(fresh) => auth::build_oauth_resolved(&fresh),
                 Err(e) => {
-                    warn!(error = %e, "OpenAI OAuth refresh failed, clearing stale tokens");
-                    let _ = maki_storage::auth::delete_tokens(&storage, auth::PROVIDER);
+                    warn!(error = %e, "OpenAI OAuth refresh failed");
                     Err(e)
                 }
             }

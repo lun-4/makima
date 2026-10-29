@@ -76,6 +76,74 @@ pub fn resolve_compaction_model(
     (Arc::clone(provider), model.clone())
 }
 
+pub async fn resolve_registry_compaction_model(
+    registry: Option<&maki_providers::provider_registry::ProviderRegistry>,
+    provider: &Arc<dyn Provider>,
+    model: &Model,
+    timeouts: maki_providers::Timeouts,
+    policy: &ModelPolicy,
+) -> (Arc<dyn Provider>, Model) {
+    resolve_registry_compaction_model_with_assignment(
+        registry,
+        provider,
+        model,
+        timeouts,
+        policy,
+        maki_providers::model_registry::explicit_spec_for_tier(
+            maki_providers::ModelTier::Compaction,
+        ),
+    )
+    .await
+}
+
+async fn resolve_registry_compaction_model_with_assignment(
+    registry: Option<&maki_providers::provider_registry::ProviderRegistry>,
+    provider: &Arc<dyn Provider>,
+    model: &Model,
+    timeouts: maki_providers::Timeouts,
+    policy: &ModelPolicy,
+    assignment: Option<String>,
+) -> (Arc<dyn Provider>, Model) {
+    if let Some(registry) = registry {
+        let snapshot = registry.snapshot();
+        let spec = assignment
+            .or_else(|| {
+                snapshot.providers().find_map(|registration| {
+                    registration
+                        .models
+                        .iter()
+                        .filter(|candidate| {
+                            candidate.tier == Some(maki_providers::ModelTier::Compaction)
+                        })
+                        .map(|candidate| format!("{}/{}", registration.id, candidate.id))
+                        .filter(|spec| policy.allows(spec))
+                        .min()
+                })
+            })
+            .or_else(|| {
+                maki_providers::model_registry::spec_for_tier_any(
+                    maki_providers::ModelTier::Compaction,
+                )
+            });
+        if let Some(spec) = spec
+            && let Ok(selected) = snapshot.resolve_model(&spec, policy)
+            && snapshot.get(&selected.provider).is_some()
+        {
+            let configs = maki_config::providers::ProvidersConfig::load_or_default();
+            let config = configs
+                .providers
+                .get(selected.provider.as_ref())
+                .and_then(|config| serde_json::to_value(config).ok())
+                .unwrap_or_else(|| Value::Object(Default::default()));
+            if let Some(Ok((selected, prepared))) = snapshot.prepare(&selected, &config).await {
+                return (Arc::from(prepared), selected);
+            }
+            return (Arc::clone(provider), model.clone());
+        }
+    }
+    resolve_compaction_model(provider, model, timeouts, policy)
+}
+
 enum TurnProgress {
     Continue,
     Done(DoneReason),
@@ -241,6 +309,7 @@ pub struct Agent<'h> {
     local_tool_capture: Option<Arc<Mutex<Option<Value>>>>,
     turn_bindings: Arc<TurnToolBindings>,
     model_policy: Arc<ModelPolicy>,
+    provider_registry: Option<Arc<maki_providers::provider_registry::ProviderRegistry>>,
     file_write_locks: Arc<crate::tools::FileWriteLocks>,
     offload: Option<Arc<OffloadStore>>,
     managed_turn: Option<crate::CurrentManagedTurn>,
@@ -332,6 +401,7 @@ impl<'h> Agent<'h> {
             local_tool_capture: None,
             turn_bindings: Arc::new(TurnToolBindings::default()),
             model_policy: params.model_policy,
+            provider_registry: None,
             file_write_locks: params.file_write_locks,
             offload: params.offload,
             managed_turn: params.managed_turn,
@@ -340,6 +410,14 @@ impl<'h> Agent<'h> {
             completion_exhausted: None,
             defer_outcome: false,
         }
+    }
+
+    pub fn with_provider_registry(
+        mut self,
+        registry: Option<Arc<maki_providers::provider_registry::ProviderRegistry>>,
+    ) -> Self {
+        self.provider_registry = registry;
+        self
     }
 
     pub fn with_mcp(mut self, mcp: Option<McpSession>) -> Self {
@@ -982,12 +1060,14 @@ impl<'h> Agent<'h> {
 
     async fn do_compact(&mut self, instructions: Option<&str>) -> Result<(), AgentError> {
         let context_size_before = self.context_size;
-        let (compact_provider, compact_model) = resolve_compaction_model(
+        let (compact_provider, compact_model) = resolve_registry_compaction_model(
+            self.provider_registry.as_deref(),
             &self.provider,
             &self.model,
             self.timeouts,
             &self.model_policy,
-        );
+        )
+        .await;
         let compaction_usage = compaction::compact_history(
             &*compact_provider,
             &compact_model,
@@ -1185,6 +1265,59 @@ mod tests {
     const TEST_CWD: &str = "/tmp";
     const TEST_PLAN_PATH: &str = "/tmp/plan.md";
     const TEST_THINKING_BUDGET: u32 = 8192;
+
+    struct CompactionFactory(bool);
+
+    impl maki_providers::provider_registry::ProviderFactory for CompactionFactory {
+        fn prepare<'a>(
+            &'a self,
+            model: &'a Model,
+            _: &'a Value,
+        ) -> BoxFuture<'a, maki_providers::provider_registry::PreparedProvider> {
+            Box::pin(async move {
+                if self.0 {
+                    Ok((
+                        model.clone(),
+                        Box::new(MockProvider::new(vec![])) as Box<dyn Provider>,
+                    ))
+                } else {
+                    Err(AgentError::Cancelled)
+                }
+            })
+        }
+    }
+
+    #[test_case(true, "chosen" ; "assignment_wins")]
+    #[test_case(false, "claude-sonnet-4-20250514" ; "preparation_failure_uses_current")]
+    fn compaction_assignment_precedes_registry_metadata(prepare: bool, expected: &str) {
+        let registry = maki_providers::provider_registry::ProviderRegistry::default();
+        let mut advertised = maki_providers::ModelInfo::id_only("advertised".into());
+        advertised.tier = Some(maki_providers::ModelTier::Compaction);
+        registry
+            .register(maki_providers::provider_registry::ProviderRegistration {
+                id: "test".into(),
+                display_name: "test".into(),
+                models: vec![
+                    advertised,
+                    maki_providers::ModelInfo::id_only("chosen".into()),
+                ],
+                factory: Arc::new(CompactionFactory(prepare)),
+            })
+            .unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider::new(vec![]));
+        let current = default_model();
+        let (selected_provider, selected) =
+            smol::block_on(resolve_registry_compaction_model_with_assignment(
+                Some(&registry),
+                &provider,
+                &current,
+                Default::default(),
+                &ModelPolicy::default(),
+                Some("test/chosen".into()),
+            ));
+        assert_eq!(selected.id, expected);
+        assert_eq!(Arc::ptr_eq(&selected_provider, &provider), !prepare);
+    }
 
     struct MockInterruptSource {
         commands: Mutex<VecDeque<ExtractedCommand>>,

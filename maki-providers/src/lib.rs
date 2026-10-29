@@ -5,6 +5,7 @@ pub mod model;
 pub mod model_registry;
 pub mod pricing;
 pub mod provider;
+pub mod provider_registry;
 pub(crate) mod providers;
 pub mod retry;
 pub mod selection;

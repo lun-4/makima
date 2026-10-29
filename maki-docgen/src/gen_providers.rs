@@ -1,6 +1,7 @@
 use maki_providers::Effort;
 use maki_providers::manifest::ManifestRegistry;
 use maki_providers::model::{ModelEntry, ModelTier};
+use maki_providers::pricing::PricingSchedule;
 use maki_providers::provider::ProviderKind;
 use std::fmt::Write;
 use strum::IntoEnumIterator;
@@ -374,6 +375,7 @@ struct ProviderSection {
     urls: Vec<&'static str>,
     features: Option<&'static str>,
     entries: &'static [ModelEntry],
+    pricing_schedule: Option<&'static PricingSchedule>,
 }
 
 fn format_auth(kind: ProviderKind) -> String {
@@ -408,6 +410,7 @@ fn build_sections() -> Vec<ProviderSection> {
                     ],
                     features: ProviderKind::Zai.features(),
                     entries: ManifestRegistry::get("zai").unwrap().models,
+                    pricing_schedule: ManifestRegistry::get("zai").unwrap().pricing_schedule,
                 });
             }
             ProviderKind::OpenAi => {
@@ -418,6 +421,9 @@ fn build_sections() -> Vec<ProviderSection> {
                     urls: vec![kind.base_url()],
                     features: kind.features(),
                     entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
+                    pricing_schedule: ManifestRegistry::get(&kind.to_string())
+                        .unwrap()
+                        .pricing_schedule,
                 });
             }
             ProviderKind::Copilot => {
@@ -431,6 +437,9 @@ fn build_sections() -> Vec<ProviderSection> {
                     urls: vec![kind.base_url()],
                     features: kind.features(),
                     entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
+                    pricing_schedule: ManifestRegistry::get(&kind.to_string())
+                        .unwrap()
+                        .pricing_schedule,
                 });
             }
             _ => {
@@ -441,6 +450,9 @@ fn build_sections() -> Vec<ProviderSection> {
                     urls: vec![kind.base_url()],
                     features: kind.features(),
                     entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
+                    pricing_schedule: ManifestRegistry::get(&kind.to_string())
+                        .unwrap()
+                        .pricing_schedule,
                 });
             }
         }
@@ -548,9 +560,7 @@ fn write_section(out: &mut String, section: &ProviderSection) {
     }
 
     // Rendered from the schedule, so the docs cannot drift from what we bill.
-    if let Some(schedule) = ManifestRegistry::get(&section.kind.to_string())
-        .and_then(|manifest| manifest.pricing_schedule)
-    {
+    if let Some(schedule) = section.pricing_schedule {
         let _ = writeln!(
             out,
             "- **Peak pricing**: the prices below are off-peak; each turn is billed as it happens, at {schedule}"
@@ -611,4 +621,35 @@ pub fn generate() -> String {
     let _ = writeln!(out, "{}", dynamic_providers_section());
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProviderSection, build_sections, write_section};
+
+    #[test]
+    fn section_renders_its_supplied_pricing_schedule() {
+        let sections = build_sections();
+        let scheduled = sections
+            .iter()
+            .find(|section| section.pricing_schedule.is_some())
+            .unwrap();
+        let mut section = ProviderSection {
+            kind: scheduled.kind,
+            name: scheduled.name,
+            auth_line: scheduled.auth_line.clone(),
+            urls: scheduled.urls.clone(),
+            features: scheduled.features,
+            entries: scheduled.entries,
+            pricing_schedule: None,
+        };
+        let mut output = String::new();
+        write_section(&mut output, &section);
+        assert!(!output.contains("- **Peak pricing**:"));
+
+        section.pricing_schedule = scheduled.pricing_schedule;
+        output.clear();
+        write_section(&mut output, &section);
+        assert!(output.contains(&format!("at {}", scheduled.pricing_schedule.unwrap())));
+    }
 }

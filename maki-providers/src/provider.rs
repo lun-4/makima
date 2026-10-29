@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -12,7 +13,6 @@ use maki_config::ModelPolicy;
 use maki_storage::id::SessionRef;
 
 use crate::model::{Model, ModelFamily, ModelInfo};
-use crate::providers::KeyRotation;
 use crate::providers::Timeouts;
 use crate::providers::anthropic::Anthropic;
 use crate::providers::anthropic::bedrock;
@@ -301,16 +301,19 @@ pub trait Provider: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
-    /// The keys this provider rotates through, and where the current one lives.
-    /// `None` is one fixed credential that never changes. This is the only hook
-    /// for rotation: both the count and the swap come off it, so they can never
-    /// describe different pools, which is what a per-provider `rotate_key` let
-    /// happen before.
-    fn keys(&self) -> Option<KeyRotation<'_>> {
-        None
+    fn key_count(&self) -> usize {
+        1
+    }
+
+    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
+        Box::pin(async { Ok(false) })
     }
 
     fn adjust_model(&self, _model: &mut Model) {}
+
+    fn is_registry_owned(&self) -> bool {
+        false
+    }
 }
 
 pub fn provider_for_slug(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
@@ -424,7 +427,7 @@ pub async fn from_model_async(
 
 pub struct ModelBatch {
     /// The one builtin or dynamic provider this batch lists, if it lists one.
-    pub provider: Option<&'static str>,
+    pub provider: Option<String>,
     pub models: Vec<String>,
     pub warnings: Vec<String>,
 }
@@ -481,12 +484,23 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
     specs
 }
 
-pub async fn fetch_all_models(policy: &ModelPolicy, mut on_ready: impl FnMut(ModelBatch)) {
+pub async fn fetch_all_models(policy: &ModelPolicy, on_ready: impl FnMut(ModelBatch)) {
+    fetch_all_models_excluding(policy, &HashSet::new(), on_ready).await;
+}
+
+pub async fn fetch_all_models_excluding(
+    policy: &ModelPolicy,
+    exclusions: &HashSet<String>,
+    mut on_ready: impl FnMut(ModelBatch),
+) {
     let (tx, rx) = flume::unbounded();
     let timeouts = Timeouts::default();
 
     for manifest in crate::manifest::ManifestRegistry::builtins() {
         let slug = manifest.slug;
+        if exclusions.contains(slug) {
+            continue;
+        }
         let Ok(provider) = smol::unblock(move || provider_for_slug(slug, timeouts)).await else {
             warn!(provider = slug, "failed to create provider, skipping");
             continue;
@@ -494,11 +508,12 @@ pub async fn fetch_all_models(policy: &ModelPolicy, mut on_ready: impl FnMut(Mod
         let display_name = manifest.display_name;
         let tx = tx.clone();
         smol::spawn(async move {
-            let batch = match provider.list_models().await {
-                Ok(models) => {
-                    let mut specs: Vec<String> =
-                        models.iter().map(|m| format!("{slug}/{}", m.id)).collect();
-                    crate::model_registry::set_known_models(slug, models);
+            let result = provider.list_models().await.map_err(|e| e.to_string()).and_then(|models| {
+                crate::model_registry::publish_discovered_models(slug, models)
+                    .map_err(|e| e.to_string())
+            });
+            let batch = match result {
+                Ok(mut specs) => {
                     for entry in manifest.models {
                         for prefix in entry.prefixes {
                             let spec = format!("{slug}/{prefix}");
@@ -508,7 +523,7 @@ pub async fn fetch_all_models(policy: &ModelPolicy, mut on_ready: impl FnMut(Mod
                         }
                     }
                     ModelBatch {
-                        provider: Some(slug),
+                        provider: Some(slug.to_owned()),
                         models: specs,
                         warnings: Vec::new(),
                     }
@@ -522,7 +537,7 @@ pub async fn fetch_all_models(policy: &ModelPolicy, mut on_ready: impl FnMut(Mod
                         .map(|p| format!("{slug}/{p}"))
                         .collect();
                     ModelBatch {
-                        provider: Some(slug),
+                        provider: Some(slug.to_owned()),
                         models: fallback,
                         warnings: vec![format!(
                             "{display_name}: {e} (using static fallback)"
@@ -536,6 +551,9 @@ pub async fn fetch_all_models(policy: &ModelPolicy, mut on_ready: impl FnMut(Mod
     }
 
     for listed in dynamic::discovered_slugs() {
+        if exclusions.contains(listed) {
+            continue;
+        }
         let tx = tx.clone();
         let slug = listed.to_string();
         smol::spawn(async move {
@@ -546,18 +564,23 @@ pub async fn fetch_all_models(policy: &ModelPolicy, mut on_ready: impl FnMut(Mod
                     "dynamic model listing failed, using static fallback"
                 );
                 ModelBatch {
-                    provider: Some(listed),
+                    provider: Some(slug.clone()),
                     models: dynamic::dynamic_model_specs_for(&slug),
                     warnings: vec![format!("{slug}: {reason} (using static fallback)")],
                 }
             };
             let batch = match dynamic::create(&slug, timeouts) {
                 Ok(provider) => match provider.list_models().await {
-                    Ok(models) => ModelBatch {
-                        provider: Some(listed),
-                        models: models.iter().map(|m| format!("{slug}/{}", m.id)).collect(),
-                        warnings: Vec::new(),
-                    },
+                    Ok(models) => {
+                        match crate::model_registry::publish_discovered_models(&slug, models) {
+                            Ok(models) => ModelBatch {
+                                provider: Some(slug.clone()),
+                                models,
+                                warnings: Vec::new(),
+                            },
+                            Err(e) => static_fallback(e.to_string()),
+                        }
+                    }
                     Err(e) => static_fallback(e.to_string()),
                 },
                 Err(e) => static_fallback(e.to_string()),
@@ -568,10 +591,12 @@ pub async fn fetch_all_models(policy: &ModelPolicy, mut on_ready: impl FnMut(Mod
     }
 
     let tx_catalog = tx.clone();
+    let catalog_exclusions = exclusions.clone();
     smol::spawn(async move {
         let catalog = smol::unblock(catalog_providers).await;
         for cat in catalog {
-            if ProviderKind::from_str(&cat.slug).is_ok()
+            if catalog_exclusions.contains(&cat.slug)
+                || ProviderKind::from_str(&cat.slug).is_ok()
                 || dynamic::base_for_slug(&cat.slug).is_some()
                 || OPENCODE_FAMILY_SLUGS.contains(&cat.slug.as_str())
             {
@@ -595,8 +620,9 @@ pub async fn fetch_all_models(policy: &ModelPolicy, mut on_ready: impl FnMut(Mod
 
     let custom_timeouts = timeouts;
     let tx_custom = tx.clone();
+    let custom_exclusions = exclusions.clone();
     smol::spawn(async move {
-        let declared = crate::providers::custom::declared_model_specs();
+        let declared = crate::providers::custom::declared_model_specs_excluding(&custom_exclusions);
         if !declared.is_empty() {
             let _ = tx_custom
                 .send_async(ModelBatch {
@@ -606,14 +632,16 @@ pub async fn fetch_all_models(policy: &ModelPolicy, mut on_ready: impl FnMut(Mod
                 })
                 .await;
         }
-        let custom_specs =
-            smol::unblock(move || crate::providers::custom::discover_models(custom_timeouts)).await;
-        if !custom_specs.is_empty() {
+        let (custom_specs, warnings) = smol::unblock(move || {
+            crate::providers::custom::discover_models_excluding(custom_timeouts, &custom_exclusions)
+        })
+        .await;
+        if !custom_specs.is_empty() || !warnings.is_empty() {
             let _ = tx_custom
                 .send_async(ModelBatch {
                     provider: None,
                     models: custom_specs,
-                    warnings: Vec::new(),
+                    warnings,
                 })
                 .await;
         }

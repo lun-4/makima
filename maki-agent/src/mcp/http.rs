@@ -189,7 +189,10 @@ impl HttpTransport {
             return guard.clone();
         }
 
-        match oauth::silent_refresh(storage, &self.name, &self.url).await {
+        let rejected_access = used.and_then(|header| header.strip_prefix("Bearer "));
+        match oauth::silent_refresh_if_matches(storage, &self.name, &self.url, rejected_access)
+            .await
+        {
             Ok(Some(data)) => {
                 let header = format!("Bearer {}", data.tokens?.access);
                 *guard = Some(header.clone());
@@ -739,6 +742,47 @@ mod tests {
         let tokens = saved.tokens.unwrap();
         assert_eq!(tokens.access, "new-token");
         assert_eq!(tokens.refresh, "r1");
+    }
+
+    #[test]
+    fn refresh_reuses_credentials_changed_by_another_transport() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        let url = "https://mcp.example.com/mcp";
+        save_mcp_auth(&storage, "srv", &stored_auth(url, "old-token", "r1")).unwrap();
+        let transport = transport_with(url, HashMap::new(), Some(storage.clone()));
+        save_mcp_auth(&storage, "srv", &stored_auth(url, "new-token", "r2")).unwrap();
+
+        let header = smol::block_on(transport.refreshed_auth(Some(OLD_BEARER)));
+        assert_eq!(header.as_deref(), Some(NEW_BEARER));
+    }
+
+    #[test]
+    fn proactive_refresh_reloads_credentials_after_waiting_for_lock() {
+        use maki_storage::auth::{lock_credentials, save_mcp_auth_unlocked};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        let url = "https://mcp.example.com/mcp";
+        save_mcp_auth(&storage, "srv", &stored_auth(url, "old-token", "r1")).unwrap();
+
+        smol::block_on(async {
+            let lock = lock_credentials(&storage, "mcp-srv").await.unwrap();
+            let mut refresh = Box::pin(oauth::silent_refresh(&storage, "srv", url));
+            assert!(
+                futures_lite::future::poll_once(refresh.as_mut())
+                    .await
+                    .is_none()
+            );
+            let mut rotated = stored_auth(url, "new-token", "r2");
+            rotated.tokens.as_mut().unwrap().expires = u64::MAX;
+            save_mcp_auth_unlocked(&storage, "srv", &rotated).unwrap();
+            drop(lock);
+
+            let result = refresh.await.unwrap().unwrap().tokens.unwrap();
+            assert_eq!(result.access, "new-token");
+            assert_eq!(result.refresh, "r2");
+        });
     }
 
     #[test]

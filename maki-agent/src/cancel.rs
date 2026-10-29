@@ -185,8 +185,8 @@ impl ReasonedCancelToken {
         if let Some(reason) = self.reason() {
             return Err(reason);
         }
-        futures_lite::future::race(async { Ok(future.await) }, async {
-            Err(self.cancelled().await)
+        futures_lite::future::or(async { Err(self.cancelled().await) }, async {
+            Ok(future.await)
         })
         .await
     }
@@ -234,10 +234,13 @@ impl CancelToken {
         if self.is_cancelled() {
             return Err("cancelled".into());
         }
-        futures_lite::future::race(async { Ok(future.await) }, async {
-            self.cancelled().await;
-            Err("cancelled".into())
-        })
+        futures_lite::future::or(
+            async {
+                self.cancelled().await;
+                Err("cancelled".into())
+            },
+            async { Ok(future.await) },
+        )
         .await
     }
 
@@ -527,6 +530,29 @@ mod tests {
             let result = token.race(std::future::pending::<()>()).await;
             assert!(result.unwrap_err().contains("cancelled"));
         });
+    }
+
+    #[test]
+    fn race_does_not_poll_work_after_cancellation() {
+        use std::cell::Cell;
+        use std::future::poll_fn;
+        use std::task::Poll;
+
+        let (trigger, token) = CancelToken::new();
+        let polls = Cell::new(0);
+        let future = token.race(poll_fn(|_| {
+            polls.set(polls.get() + 1);
+            if polls.get() == 1 {
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        }));
+        let mut future = std::pin::pin!(future);
+        assert!(smol::block_on(futures_lite::future::poll_once(future.as_mut())).is_none());
+        trigger.cancel();
+        assert!(smol::block_on(future).is_err());
+        assert_eq!(polls.get(), 1);
     }
 
     #[test]

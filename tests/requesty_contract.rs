@@ -1,0 +1,133 @@
+#[path = "support/http_contract.rs"]
+mod http_contract;
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use http_contract::{HttpContract, Response, Step};
+use maki_agent::tools::ToolRegistry;
+use maki_lua::PluginHost;
+use maki_providers::{Message, Model, RequestOptions, ThinkingConfig};
+use serde_json::{Value, json};
+
+fn response(status: &str, body: &str) -> Response {
+    Response {
+        status: status.into(),
+        headers: vec![],
+        steps: vec![Step::Chunk(body.as_bytes().to_vec())],
+    }
+}
+
+#[test]
+fn requesty_discovery_filters_and_merges_catalogs() {
+    const CATALOG: &str = r#"{"data":[{"id":"vendor/chat","api":"chat","context_window":0,"max_output_tokens":4096,"input_price":0.000002,"output_price":0.000004,"cached_price":0.000001,"supports_reasoning":true,"supports_vision":true},{"id":"vendor/embed","api":"embedding"},{"id":"unknown","input_price":1}]}"#;
+    let server = HttpContract::start(vec![
+        response("200 OK", CATALOG),
+        response("200 OK", CATALOG),
+    ])
+    .unwrap();
+    maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("requesty", include_str!("../plugins/requesty/init.lua"))
+        .unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let models = smol::block_on(snapshot.get("requesty").unwrap().factory.discover(&json!({
+        "api_key": "fixture-key", "api_key_env": "REQUESTY_CONTRACT_UNUSED_KEY",
+        "base_url": format!("http://{}/v1/", server.addr)
+    })))
+    .unwrap()
+    .unwrap();
+    assert_eq!(models.len(), 2);
+    let chat = models.iter().find(|m| m.id == "vendor/chat").unwrap();
+    assert_eq!(chat.context_window, None);
+    assert_eq!(chat.max_output_tokens, Some(4096));
+    assert_eq!(chat.supports_thinking, Some(true));
+    assert_eq!(chat.supports_vision, Some(true));
+    let pricing = chat.pricing.as_ref().unwrap();
+    assert_eq!(
+        (
+            pricing.input,
+            pricing.output,
+            pricing.cache_read,
+            pricing.cache_write
+        ),
+        (2.0, 4.0, 1.0, 0.0)
+    );
+    assert!(
+        models
+            .iter()
+            .find(|m| m.id == "unknown")
+            .unwrap()
+            .pricing
+            .is_none()
+    );
+    let mut paths = Vec::new();
+    for _ in 0..2 {
+        let request = server
+            .requests
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.header("authorization"), Some("Bearer fixture-key"));
+        paths.push(request.target);
+    }
+    paths.sort();
+    assert_eq!(paths, ["/v1/models", "/v1/models/managed"]);
+}
+
+#[test]
+fn requesty_stream_sets_auto_cache_and_rotates_keys() {
+    const SSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    let server =
+        HttpContract::start(vec![response("200 OK", SSE), response("200 OK", SSE)]).unwrap();
+    maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("requesty", include_str!("../plugins/requesty/init.lua"))
+        .unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let model = Model::from_spec("requesty/openai/gpt-5.5").unwrap();
+    let (model, provider) = smol::block_on(snapshot.get("requesty").unwrap().factory.prepare(
+        &model,
+        &json!({
+            "api_key": " first, second ", "api_key_env": "REQUESTY_CONTRACT_UNUSED_KEY",
+            "base_url": format!("http://{}/v1", server.addr)
+        }),
+    ))
+    .unwrap();
+    assert_eq!(provider.key_count(), 2);
+    for key in ["first", "second"] {
+        let (events, _receiver) = flume::unbounded();
+        let result = smol::block_on(provider.stream_message(
+            &model,
+            &[Message::user("prompt".into())],
+            "system",
+            &json!([]),
+            &events,
+            RequestOptions {
+                thinking: ThinkingConfig::Off,
+                fast: false,
+            },
+            None,
+        ))
+        .unwrap();
+        assert_eq!(result.message.first_text_content(), Some("hello"));
+        let request = server
+            .requests
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.target, "/v1/chat/completions");
+        assert_eq!(
+            request.header("authorization"),
+            Some(format!("Bearer {key}").as_str())
+        );
+        assert_eq!(request.header("x-title"), Some("Makima"));
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["requesty"]["auto_cache"], true);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+        if key == "first" {
+            assert!(smol::block_on(provider.rotate_key()).unwrap());
+        }
+    }
+}

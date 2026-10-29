@@ -810,6 +810,51 @@ fn content_text(content: &Value) -> String {
     }
 }
 
+#[test]
+fn print_uses_provider_registered_during_init() {
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let config = home.path().join(".config").join(APP_DIR);
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("init.lua"), r#"
+        maki.api.register_provider({
+            id = 'lua-fixture', models = {{ id = 'model', context_window = 32768 }},
+            prepare = function(_, model, config)
+                assert(model.context_window == 32768)
+                return { model = model, stream = function(_, request, emit)
+                    assert(request.model.provider == 'lua-fixture')
+                    emit({ type = 'text_delta', text = 'lua answer' })
+                    return { message = { role = 'assistant', content = {{ type = 'text', text = 'lua answer' }} },
+                             usage = { input = 0, output = 0, cache_creation = 0, cache_read = 0 }, stop_reason = 'end_turn' }
+                end }
+            end,
+        })
+    "#).unwrap();
+    let args = [
+        "--print",
+        "--yolo",
+        "--max-turns",
+        "1",
+        "-m",
+        "lua-fixture/model",
+        "-p",
+        "hello",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let output = spawn_makima(home.path(), work.path(), args)
+        .wait_with_output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("lua answer"));
+}
+
 fn print_args(prompt: &str) -> Vec<String> {
     let spec = format!("{PROVIDER}/{MODEL}");
     [
@@ -1057,6 +1102,86 @@ fn reply_to(body: &Value) -> &'static str {
     }
 }
 
+#[derive(Debug)]
+struct CapturedRequest {
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl CapturedRequest {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+fn capture_request(reader: &mut impl BufRead) -> std::io::Result<CapturedRequest> {
+    let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid HTTP request");
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let mut parts = line.split_whitespace();
+    let method = parts.next().ok_or_else(invalid)?.to_owned();
+    let path = parts.next().ok_or_else(invalid)?.to_owned();
+    let mut headers = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            return Err(invalid());
+        }
+        if line == "\r\n" {
+            break;
+        }
+        let (name, value) = line.split_once(':').ok_or_else(invalid)?;
+        headers.push((name.to_owned(), value.trim().to_owned()));
+    }
+    let length = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .map(|(_, value)| value.parse::<usize>().map_err(|_| invalid()))
+        .transpose()?
+        .unwrap_or(0);
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body)?;
+    Ok(CapturedRequest {
+        method,
+        path,
+        headers,
+        body,
+    })
+}
+
+#[test]
+fn captures_empty_and_malformed_http_bodies() {
+    for body in [b"".as_slice(), b"not json".as_slice()] {
+        let request = format!(
+            "POST /unknown HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut bytes = request.into_bytes();
+        bytes.extend_from_slice(body);
+        let captured = capture_request(&mut bytes.as_slice()).unwrap();
+        assert_eq!(captured.path, "/unknown");
+        assert_eq!(captured.body, body);
+    }
+}
+
+#[test]
+fn captures_http_request_semantically() {
+    let request = b"POST /v1/chat/completions?mode=test HTTP/1.1\r\nX-Session: abc\r\ncontent-LENGTH: 19\r\n\r\n{\"b\":2,\"a\":[1,3]}  ";
+    let captured = capture_request(&mut &request[..]).unwrap();
+    assert_eq!(captured.method, "POST");
+    assert_eq!(captured.path, "/v1/chat/completions?mode=test");
+    assert_eq!(captured.header("x-session"), Some("abc"));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&captured.body).unwrap(),
+        json!({"a": [1, 3], "b": 2})
+    );
+}
+
 /// Serves chat completions on loopback and forwards each request body.
 fn mock_server() -> (String, Receiver<Value>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1066,28 +1191,19 @@ fn mock_server() -> (String, Receiver<Value>) {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut request_line = String::new();
-            if reader.read_line(&mut request_line).is_err() {
+            let Ok(request) = capture_request(&mut reader) else {
                 continue;
-            }
-            let mut length = 0;
-            loop {
-                let mut header = String::new();
-                if reader.read_line(&mut header).unwrap_or(0) == 0 || header == "\r\n" {
-                    break;
-                }
-                if let Some((name, value)) = header.split_once(':')
-                    && name.eq_ignore_ascii_case("content-length")
-                {
-                    length = value.trim().parse().unwrap_or(0);
-                }
-            }
-            let mut body = vec![0; length];
-            let _ = reader.read_exact(&mut body);
-            if request_line.contains("/chat/completions") {
-                let json: Value = serde_json::from_slice(&body).unwrap_or_default();
-                let reply = reply_to(&json);
-                let _ = tx.send(json);
+            };
+            if request.method == "POST" && request.path.contains("/chat/completions") {
+                let Ok(body) = serde_json::from_slice::<Value>(&request.body) else {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    continue;
+                };
+                let reply = reply_to(&body);
+                let _ = tx.send(body);
                 let _ = write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{reply}"

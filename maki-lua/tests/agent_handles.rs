@@ -220,11 +220,13 @@ fn gated_config_mutations(
             *committed.lock().unwrap() = Some(Arc::clone(&config));
             handle.bind_actor(
                 target.clone(),
-                Arc::new(move |model| {
+                Arc::new(move |spec| {
                     let provider = Arc::clone(&provider);
-                    Box::pin(
-                        async move { Ok(maki_agent::actor::PreparedModel { model, provider }) },
-                    )
+                    Box::pin(async move {
+                        let model = Model::from_spec(&spec)
+                            .map_err(|error| Arc::from(error.to_string()))?;
+                        Ok(maki_agent::actor::PreparedModel { model, provider })
+                    })
                 }),
                 Arc::new(move |commit| {
                     *committed.lock().unwrap() = Some(Arc::clone(&commit.config))
@@ -599,6 +601,7 @@ struct Fixture {
     _host: PluginHost,
     _state_dir: tempfile::TempDir,
     manager: AgentManagerHandle,
+    registry: Arc<ToolRegistry>,
     requests: flume::Receiver<CapturedRequest>,
     completed: flume::Receiver<Result<(), String>>,
     observations: flume::Receiver<(TurnId, TurnProvenance, Vec<Message>)>,
@@ -638,7 +641,7 @@ impl Fixture {
             sibling,
         } = options;
         let mode = mode.unwrap_or(AgentMode::Build);
-        let registry = Arc::clone(ToolRegistry::global_arc());
+        let registry = Arc::new(ToolRegistry::new());
         let (requests_tx, requests) = flume::unbounded();
         let provider = Arc::new(ScriptedProvider {
             requests: requests_tx,
@@ -820,7 +823,7 @@ impl Fixture {
         let root = manager
             .create_root_with_config(Some(policy), Vec::new(), None, |_| {
                 Ok::<_, String>(Box::new(LuaInvocationBackend {
-                    registry,
+                    registry: Arc::clone(&registry),
                     context,
                     tool,
                     completed: completed_tx,
@@ -857,6 +860,7 @@ impl Fixture {
             _host: host,
             _state_dir: state_dir,
             manager,
+            registry,
             requests,
             completed,
             observations,
@@ -2362,6 +2366,79 @@ fn trusted_mode_changes_preserve_registered_target_model_policy() {
 }
 
 #[test]
+fn set_model_uses_host_registry_and_preserves_failed_switch() {
+    smol::block_on(async {
+        const SPEC: &str = "host_fixture/working";
+        const FAILED_SPEC: &str = "host_fixture/failing";
+        let first = Fixture::start("host_registry_first", "");
+        let second = Fixture::start("host_registry_second", "");
+        for (fixture, window) in [(&first, 8192), (&second, 16384)] {
+            assert_eq!(
+                bounded(fixture.completed.recv_async(), "initial turn")
+                    .await
+                    .unwrap(),
+                Ok(())
+            );
+            fixture._host.load_source("host_registry_provider", &format!(r#"
+                maki.api.register_provider({{
+                    id = "host_fixture",
+                    models = {{{{ id = "working", context_window = {window} }}, {{ id = "failing" }}}},
+                    prepare = function(_, model)
+                        if model.id == "failing" then error("fixture preparation failed") end
+                        return {{ model = model, stream = function() end }}
+                    end,
+                }})
+                maki.api.register_command({{
+                    name = "/host_registry_switch", tui_only = false,
+                    handler = function(_, ctx)
+                        assert(assert(ctx:agent()):set_model(ctx, "{SPEC}"))
+                    end,
+                }})
+                maki.api.register_command({{
+                    name = "/host_registry_fail", tui_only = false,
+                    handler = function(_, ctx)
+                        local changed, err = assert(ctx:agent()):set_model(ctx, "{FAILED_SPEC}")
+                        assert(changed == nil and err and err:find("fixture preparation failed", 1, true), err)
+                    end,
+                }})
+            "#)).unwrap();
+            assert_eq!(
+                run_command(
+                    &fixture._host.command_registry(),
+                    "/host_registry_switch",
+                    0,
+                    None
+                )
+                .recv_timeout(TEST_TIMEOUT)
+                .unwrap(),
+                Ok(())
+            );
+            let actor = fixture.manager.root().unwrap().actor().unwrap();
+            let before = actor.effective_config().unwrap();
+            assert_eq!(before.model.spec(), SPEC);
+            assert_eq!(before.model.context_window, window);
+            assert_eq!(
+                run_command(
+                    &fixture._host.command_registry(),
+                    "/host_registry_fail",
+                    0,
+                    None
+                )
+                .recv_timeout(TEST_TIMEOUT)
+                .unwrap(),
+                Ok(())
+            );
+            let after = actor.effective_config().unwrap();
+            assert_eq!(after.model.spec(), SPEC);
+            assert_eq!(after.model.context_window, window);
+            assert!(Arc::ptr_eq(&before.provider, &after.provider));
+        }
+        shutdown_manager(&first.manager).await;
+        shutdown_manager(&second.manager).await;
+    });
+}
+
+#[test]
 fn focus_reads_and_keybind_targets_ignore_later_focus_changes() {
     smol::block_on(async {
         const PLUGIN: &str = "pr5_focus_pinning";
@@ -2512,9 +2589,22 @@ fn tool_ctx_reads_the_admitted_model_after_the_agent_commits_a_change(
                 keep_authority = revoke_plugin.is_none(),
             ),
         );
-        bounded(entries.recv_async(), "admitted model checkpoint claim gate")
-            .await
-            .unwrap();
+        bounded(
+            futures_lite::future::race(
+                async {
+                    entries
+                        .recv_async()
+                        .await
+                        .expect("checkpoint gate disconnected")
+                },
+                async {
+                    let result = fixture.completed.recv_async().await;
+                    panic!("invocation finished before checkpoint claim gate: {result:?}");
+                },
+            ),
+            "admitted model checkpoint claim gate",
+        )
+        .await;
         assert!(fixture.root_ticket.peek_result().is_none());
         let root = fixture.manager.root().unwrap();
         let actor = root.actor().unwrap();
@@ -3284,7 +3374,7 @@ fn trusted_spawn_restores_host_bindings_without_expanding_capabilities(explicit:
         );
         bounded(fixture.root_ticket.wait(), "root settlement").await;
         let (mut template, _events, _cancel) = common::ctx_with_canned_provider();
-        template.registry = Arc::clone(ToolRegistry::global_arc());
+        template.registry = Arc::clone(&fixture.registry);
         template.turn_bindings = Arc::new(maki_agent::tools::TurnToolBindings::default());
         let definitions = json!([
             { "name": "pr5_audience_ceiling", "description": "exact parent snapshot", "input_schema": { "type": "object", "properties": {} } },
@@ -3723,7 +3813,8 @@ fn managed_sibling_tool_call_cannot_use_another_calls_ctx() {
         let context = bounded(sibling_context.recv_async(), "managed tool context")
             .await
             .unwrap();
-        let sibling = ToolRegistry::global()
+        let sibling = fixture
+            .registry
             .get(TOOL)
             .unwrap()
             .tool
@@ -4160,7 +4251,7 @@ fn saturated_event_callbacks_can_dispatch_a_child_lua_tool() {
                 end,
             }})
         "#)).unwrap();
-        template.registry = Arc::clone(ToolRegistry::global_arc());
+        template.registry = Arc::clone(&fixture.registry);
         assert!(
             template.registry.get(TOOL).is_some(),
             "saturation tool must be in parent registry"
@@ -4599,9 +4690,12 @@ fn managed_capacity_one_delivers_child_once_unless_waited(bundled_tasks: bool, w
         );
         let root = fixture.manager.root().unwrap().actor().unwrap();
         let events = root.subscribe_events();
-        let request = bounded(fixture.requests.recv_async(), "capacity-one child request")
-            .await
-            .unwrap();
+        let request = request_with_command_diagnostics(
+            &fixture.requests,
+            &fixture.completed,
+            "capacity-one child request",
+        )
+        .await;
         if wait {
             assert!(fixture.root_ticket.peek().is_none());
             assert!(fixture.completed.is_empty());

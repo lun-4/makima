@@ -1,21 +1,25 @@
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
-use std::sync::{Arc, LazyLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use futures_lite::io::AsyncReadExt;
+use event_listener::Event;
+use futures_lite::io::{AsyncRead, AsyncReadExt};
 use isahc::config::{Configurable, RedirectPolicy, ResolveMap, VersionNegotiation};
 use isahc::{AsyncBody, HttpClient, Request, Response};
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{Lua, Result as LuaResult, Table};
+use mlua::{AnyUserData, Lua, ObjectLike, Result as LuaResult, Table, UserData, UserDataMethods};
 use smol::{Timer, unblock};
 use url::Url;
 
 use crate::api::util::pair::{Pair, try_pair};
 
-use crate::plugin_permissions::PluginPermissions;
+use crate::plugin_permissions::{Permission, PluginPermissions};
+use crate::runtime::{TaskHandle, same_invocation};
 
+const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_MAX_BYTES: usize = 5 * 1024 * 1024;
@@ -41,15 +45,6 @@ const RESERVED_V4_NETS: [(Ipv4Addr, u8); 4] = [
     (Ipv4Addr::new(192, 0, 0, 0), 24),
     (Ipv4Addr::new(198, 18, 0, 0), 15),
     (Ipv4Addr::new(240, 0, 0, 0), 4),
-];
-/// Credentials handed to one authority are not for whoever it redirects us to.
-/// The same set isahc scrubbed before redirects were followed by hand.
-const CROSS_AUTHORITY_HEADERS: [&str; 5] = [
-    "authorization",
-    "cookie",
-    "cookie2",
-    "proxy-authorization",
-    "www-authenticate",
 ];
 
 /// Hosts the user marked as safe to reach on a private address, from
@@ -203,10 +198,142 @@ struct ResponseData {
     content_type: String,
 }
 
+struct StreamState {
+    body: Option<AsyncBody>,
+    reading: bool,
+    closed: bool,
+    eof: bool,
+    remaining: Option<usize>,
+}
+
+#[derive(Clone)]
+struct StreamResponse {
+    state: Arc<Mutex<StreamState>>,
+    close_event: Arc<Event>,
+}
+
+struct ReadGuard {
+    state: Arc<Mutex<StreamState>>,
+    active: bool,
+}
+
+impl Drop for ReadGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let mut state = self.state.lock().unwrap();
+            state.reading = false;
+            state.closed = true;
+            state.body = None;
+        }
+    }
+}
+
+impl StreamResponse {
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.closed = true;
+        state.body = None;
+        self.close_event.notify(usize::MAX);
+    }
+}
+
+impl UserData for StreamResponse {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_async_function("read", |lua, (ud, ()): (AnyUserData, ())| async move {
+            let this = ud.borrow::<StreamResponse>()?.clone();
+            {
+                let mut state = this.state.lock().unwrap();
+                if state.reading {
+                    return Ok((
+                        None,
+                        Some("response already has an active reader".to_string()),
+                    ));
+                }
+                if state.closed {
+                    return Ok((None, Some("response is closed".to_string())));
+                }
+                if state.eof {
+                    return Ok((Some(lua.create_string(b"")?), None));
+                }
+                if state.body.is_none() {
+                    return Ok((None, Some("response has no body".to_string())));
+                }
+                state.reading = true;
+            }
+            let mut guard = ReadGuard {
+                state: this.state.clone(),
+                active: true,
+            };
+            let listener = this.close_event.listen();
+            if this.state.lock().unwrap().closed {
+                return Ok((None, Some("response is closed".to_string())));
+            }
+            let mut bytes = vec![0; STREAM_CHUNK_BYTES];
+            let result = futures_lite::future::race(
+                async {
+                    std::future::poll_fn(|cx| {
+                        let mut state = this.state.lock().unwrap();
+                        match state.body.as_mut() {
+                            Some(body) => std::pin::Pin::new(body).poll_read(cx, &mut bytes),
+                            None => std::task::Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "response is closed",
+                            ))),
+                        }
+                    })
+                    .await
+                    .map_err(|e| format!("read error: {e}"))
+                },
+                async {
+                    listener.await;
+                    Err("response is closed".to_string())
+                },
+            )
+            .await;
+            let mut state = this.state.lock().unwrap();
+            state.reading = false;
+            guard.active = false;
+            if state.closed {
+                return Ok((None, Some("response is closed".to_string())));
+            }
+            match result {
+                Ok(n) => {
+                    if let Some(remaining) = state.remaining.as_mut() {
+                        if n > *remaining {
+                            state.closed = true;
+                            state.body = None;
+                            return Ok((
+                                None,
+                                Some("response body exceeds byte limit".to_string()),
+                            ));
+                        }
+                        *remaining -= n;
+                    }
+                    bytes.truncate(n);
+                    if n == 0 {
+                        state.eof = true;
+                        state.body = None;
+                    }
+                    Ok((Some(lua.create_string(&bytes)?), None))
+                }
+                Err(err) => {
+                    state.closed = true;
+                    state.body = None;
+                    Ok((None, Some(err)))
+                }
+            }
+        });
+        methods.add_method("close", |_, this, ()| {
+            this.close();
+            Ok((Some(true), None::<String>))
+        });
+    }
+}
+
 /// Make an HTTP request and return the response body. Plain `http://`
-/// URLs are automatically upgraded to `https://`. Requests to private
-/// or metadata IP addresses are blocked for safety, unless the host is
-/// listed in `net.allowed_private_hosts`.
+/// URLs are upgraded to `https://` unless the host is listed in
+/// `net.allowed_private_hosts`. Requests to private or metadata IP addresses
+/// are blocked unless allowed by that option.
 ///
 /// {opts} fields:
 ///   `method` (string) HTTP verb (default `"GET"`).
@@ -240,12 +367,222 @@ async fn request(lua: Lua, url: String, opts: Option<Table>) -> LuaResult<Pair<T
     Ok((Some(tbl), None))
 }
 
+/// Send an HTTP request and return before reading the response body.
+/// Uses the same URL and private-network policy as `request`, without retries.
+/// Cross-authority redirects are refused to protect request credentials.
+///
+/// The response table contains `status` (integer), `headers` (table of
+/// lowercase names to binary string values), and `body` (response handle).
+/// Repeated header names retain one value. The caller must limit the total
+/// body size and close the handle when finished.
+///
+/// `response.body:read()` returns a binary string of up to 64 KiB and nil,
+/// an empty string and nil at EOF, or nil and an error string. Only one read
+/// may be active at a time. A body read failure closes the handle; an error
+/// from a concurrent read does not.
+/// `response.body:close()` returns true and nil. It is idempotent and
+/// interrupts an active read. Reads after closing return an error.
+///
+/// @param url string URL starting with `http://` or `https://`.
+/// @param opts table? Request options as for `request` (retry and max_bytes are ignored).
+/// @return (table?, string?) Response table, or nil plus an error string.
+#[lua_fn(guard = Net)]
+async fn send(lua: Lua, url: String, opts: Option<Table>) -> LuaResult<Pair<Table>> {
+    let params = try_pair!(extract_request_params(&url, opts.as_ref()).await);
+    let response = try_pair!(send_redirects(params, false).await);
+    Ok((Some(response_table(&lua, response, None)?), None))
+}
+
+fn response_table(
+    lua: &Lua,
+    response: Response<AsyncBody>,
+    limit: Option<usize>,
+) -> LuaResult<Table> {
+    let table = lua.create_table()?;
+    table.set("status", response.status().as_u16())?;
+    let headers = lua.create_table()?;
+    for (name, value) in response.headers() {
+        headers.set(name.as_str(), lua.create_string(value.as_bytes())?)?;
+    }
+    table.set("headers", headers)?;
+    table.set(
+        "body",
+        StreamResponse {
+            state: Arc::new(Mutex::new(StreamState {
+                body: Some(response.into_body()),
+                reading: false,
+                closed: false,
+                eof: false,
+                remaining: limit,
+            })),
+            close_event: Arc::new(Event::new()),
+        },
+    )?;
+    Ok(table)
+}
+
+pub(crate) struct ProviderNetScope {
+    alive: Arc<AtomicBool>,
+    expiry: Arc<Event>,
+    bodies: Arc<Mutex<Vec<StreamResponse>>>,
+}
+
+impl Drop for ProviderNetScope {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
+        self.expiry.notify(usize::MAX);
+        for body in self.bodies.lock().unwrap().drain(..) {
+            body.close();
+        }
+    }
+}
+
+fn provider_net_error(lua: &Lua, message: &str) -> LuaResult<Table> {
+    let error = lua.create_table()?;
+    error.set("kind", "network")?;
+    error.set("message", message)?;
+    Ok(error)
+}
+
+pub(crate) fn provider_context(
+    lua: &Lua,
+    task: TaskHandle,
+    permissions: &PluginPermissions,
+) -> LuaResult<(Table, ProviderNetScope)> {
+    let alive = Arc::new(AtomicBool::new(true));
+    let expiry = Arc::new(Event::new());
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let scope = ProviderNetScope {
+        alive: alive.clone(),
+        expiry: expiry.clone(),
+        bodies: bodies.clone(),
+    };
+    let allowed = permissions.is_allowed(Permission::Net);
+    let context = lua.create_table()?;
+    context.set(
+        "send",
+        lua.create_async_function(move |lua, (_ctx, request): (Table, Table)| {
+            let alive = alive.clone();
+            let expiry = expiry.clone();
+            let bodies = bodies.clone();
+            let task = task.clone();
+            async move {
+                if !allowed || !alive.load(Ordering::Acquire) || !same_invocation(&lua, &task) {
+                    return Ok((
+                        None,
+                        Some(provider_net_error(
+                            &lua,
+                            "provider network access denied or expired",
+                        )?),
+                    ));
+                }
+                let url: String = request.get("url")?;
+                let allowed_hosts = ALLOWED_PRIVATE_HOSTS.load_full();
+                match validate_and_upgrade_url(&url, &allowed_hosts) {
+                    Ok(validated)
+                        if Url::parse(&url).is_ok_and(|parsed| validated != parsed.as_str()) =>
+                    {
+                        return Ok((
+                            None,
+                            Some(provider_net_error(
+                                &lua,
+                                "provider HTTP endpoint is not allowed",
+                            )?),
+                        ));
+                    }
+                    Err(error) => return Ok((None, Some(provider_net_error(&lua, &error)?))),
+                    _ => {}
+                }
+                let listener = expiry.listen();
+                if !alive.load(Ordering::Acquire) {
+                    return Ok((
+                        None,
+                        Some(provider_net_error(&lua, "provider context expired")?),
+                    ));
+                }
+                let response = match futures_lite::future::or(
+                    async {
+                        listener.await;
+                        Err("provider context expired".to_string())
+                    },
+                    async {
+                        if !alive.load(Ordering::Acquire) {
+                            return Err("provider context expired".to_string());
+                        }
+                        let params = extract_request_params(&url, Some(&request)).await?;
+                        if !alive.load(Ordering::Acquire) {
+                            return Err("provider context expired".to_string());
+                        }
+                        send_redirects(params, false).await
+                    },
+                )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(error) => return Ok((None, Some(provider_net_error(&lua, &error)?))),
+                };
+                if !alive.load(Ordering::Acquire) {
+                    return Ok((
+                        None,
+                        Some(provider_net_error(&lua, "provider context expired")?),
+                    ));
+                }
+                let table = response_table(&lua, response, Some(DEFAULT_MAX_BYTES))?;
+                let body: AnyUserData = table.get("body")?;
+                {
+                    let mut bodies = bodies.lock().unwrap();
+                    if !alive.load(Ordering::Acquire) {
+                        return Ok((
+                            None,
+                            Some(provider_net_error(&lua, "provider context expired")?),
+                        ));
+                    }
+                    bodies.push(body.borrow::<StreamResponse>()?.clone());
+                }
+                for name in ["read", "close"] {
+                    let body = body.clone();
+                    let alive = alive.clone();
+                    let task = task.clone();
+                    table.set(
+                        name,
+                        lua.create_async_function(move |lua, _: Table| {
+                            let body = body.clone();
+                            let alive = alive.clone();
+                            let task = task.clone();
+                            async move {
+                                if !alive.load(Ordering::Acquire) || !same_invocation(&lua, &task) {
+                                    return Ok((
+                                        None,
+                                        Some(provider_net_error(&lua, "provider context expired")?),
+                                    ));
+                                }
+                                let method: mlua::Function = body.get(name)?;
+                                let (value, error): (Option<mlua::Value>, Option<String>) =
+                                    method.call_async(body).await?;
+                                Ok((
+                                    value,
+                                    error
+                                        .map(|error| provider_net_error(&lua, &error))
+                                        .transpose()?,
+                                ))
+                            }
+                        })?,
+                    )?;
+                }
+                table.set("body", mlua::Value::Nil)?;
+                Ok((Some(table), None))
+            }
+        })?,
+    )?;
+    Ok((context, scope))
+}
+
 lua_table! {
-    /// HTTP client for fetching web content. All traffic goes over HTTPS
-    /// (plain HTTP is upgraded). Private and metadata IP addresses are
-    /// blocked to prevent SSRF, including after a redirect. Hosts listed in
-    /// the `net.allowed_private_hosts` config option are exempt.
-    /// Failed requests (5xx) are retried automatically.
+    /// HTTP client for fetching web content. Plain HTTP is upgraded to HTTPS
+    /// unless the host is listed in `net.allowed_private_hosts`. Private and
+    /// metadata IP addresses are blocked to prevent SSRF, including after a
+    /// redirect, unless allowed by that option.
+    /// `request` retries 5xx responses automatically; `send` does not.
     ///
     /// ```lua
     /// local res, err = maki.net.request("https://example.com")
@@ -253,6 +590,7 @@ lua_table! {
     /// ```
     "maki.net" => pub(crate) fn create_net_table(perms: &PluginPermissions), DOCS [
         request(perms),
+        send(perms),
     ]
 }
 
@@ -277,8 +615,8 @@ async fn extract_request_params(url: &str, opts: Option<&Table>) -> Result<Reque
     };
 
     let body = opts
-        .and_then(|o| o.get::<String>("body").ok())
-        .map(|s| s.into_bytes())
+        .and_then(|o| o.get::<mlua::String>("body").ok())
+        .map(|s| s.as_bytes().to_vec())
         .unwrap_or_default();
 
     let timeout = Duration::from_secs(
@@ -314,10 +652,13 @@ fn build_request(
     headers: &[(String, String)],
     body: Vec<u8>,
 ) -> Result<Request<AsyncBody>, String> {
-    let mut builder = Request::builder()
-        .method(method)
-        .uri(url)
-        .header("User-Agent", user_agent);
+    let mut builder = Request::builder().method(method).uri(url);
+    if !headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+    {
+        builder = builder.header("User-Agent", user_agent);
+    }
 
     for (k, v) in headers {
         builder = builder.header(k.as_str(), v.as_str());
@@ -425,23 +766,51 @@ fn build_client(params: &RequestParams) -> Result<HttpClient, String> {
     builder.build().map_err(|e| format!("client error: {e}"))
 }
 
-async fn do_request(mut params: RequestParams) -> Result<ResponseData, String> {
+async fn send_once(params: &RequestParams, retries: bool) -> Result<Response<AsyncBody>, String> {
+    let client = build_client(params)?;
+    if retries {
+        send_with_retries(&client, params).await
+    } else {
+        let request = build_request(
+            &params.url,
+            USER_AGENT,
+            &params.method,
+            &params.headers,
+            params.body.clone(),
+        )?;
+        client
+            .send_async(request)
+            .await
+            .map_err(|e| format!("request failed: {e}"))
+    }
+}
+
+async fn send_redirects(
+    mut params: RequestParams,
+    retries: bool,
+) -> Result<Response<AsyncBody>, String> {
     let allowed = ALLOWED_PRIVATE_HOSTS.load_full();
-    let mut response = send_with_retries(&build_client(&params)?, &params).await?;
+    let mut response = send_once(&params, retries).await?;
 
     for _ in 0..MAX_REDIRECTS {
         let Some(location) = redirect_location(&response) else {
             break;
         };
         params
-            .follow_redirect(response.status().as_u16(), &location, &allowed)
+            .follow_redirect(response.status().as_u16(), &location, &allowed, retries)
             .await?;
-        response = send_with_retries(&build_client(&params)?, &params).await?;
+        response = send_once(&params, retries).await?;
     }
     if redirect_location(&response).is_some() {
         return Err(format!("gave up after {MAX_REDIRECTS} redirects"));
     }
 
+    Ok(response)
+}
+
+async fn do_request(params: RequestParams) -> Result<ResponseData, String> {
+    let max_bytes = params.max_bytes;
+    let mut response = send_redirects(params, true).await?;
     let status = response.status().as_u16();
 
     let content_type = response
@@ -456,7 +825,7 @@ async fn do_request(mut params: RequestParams) -> Result<ResponseData, String> {
         .get("content-length")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<usize>().ok())
-        && len > params.max_bytes
+        && len > max_bytes
     {
         return Err(format!("response too large: {len} bytes"));
     }
@@ -464,12 +833,12 @@ async fn do_request(mut params: RequestParams) -> Result<ResponseData, String> {
     let mut bytes = Vec::new();
     response
         .body_mut()
-        .take((params.max_bytes + 1) as u64)
+        .take((max_bytes.saturating_add(1)) as u64)
         .read_to_end(&mut bytes)
         .await
         .map_err(|e| format!("read error: {e}"))?;
 
-    if bytes.len() > params.max_bytes {
+    if bytes.len() > max_bytes {
         return Err(format!("response too large: {} bytes", bytes.len()));
     }
 
@@ -489,23 +858,28 @@ impl RequestParams {
         status: u16,
         location: &str,
         allowed: &HostAllowlist,
+        allow_cross_authority: bool,
     ) -> Result<(), String> {
-        let base = Url::parse(&self.url).map_err(|e| format!("invalid URL {}: {e}", self.url))?;
+        let base = Url::parse(&self.url).map_err(|e| format!("invalid URL: {e}"))?;
         let target = base
             .join(location)
-            .map_err(|e| format!("invalid redirect to {location}: {e}"))?;
+            .map_err(|e| format!("invalid redirect: {e}"))?;
         let target = validate_and_upgrade_url(target.as_str(), allowed)?;
-        let pin = check_ssrf(&target, allowed).await?;
-
-        let landed =
-            Url::parse(&target).map_err(|e| format!("invalid redirect to {location}: {e}"))?;
+        let landed = Url::parse(&target).map_err(|e| format!("invalid redirect: {e}"))?;
         if authority(&base) != authority(&landed) {
-            self.headers.retain(|(name, _)| {
-                !CROSS_AUTHORITY_HEADERS
-                    .iter()
-                    .any(|sensitive| name.eq_ignore_ascii_case(sensitive))
-            });
+            if !allow_cross_authority {
+                return Err("cross-authority redirect refused".to_string());
+            }
+            let rewrites_body = matches!(status, 301..=303)
+                && !self.method.eq_ignore_ascii_case("GET")
+                && !self.method.eq_ignore_ascii_case("HEAD");
+            if !self.body.is_empty() && !rewrites_body {
+                return Err("cross-authority redirect with body refused".to_string());
+            }
+            self.headers.clear();
         }
+
+        let pin = check_ssrf(&target, allowed).await?;
 
         // 301, 302 and 303 turn anything that is not a read into a `GET`, the
         // way browsers and curl do it. 307 and 308 keep method and body.
@@ -658,7 +1032,7 @@ fn is_reserved_v4(v4: Ipv4Addr) -> bool {
 /// host curl will dial: a trailing dot, an empty port and a percent encoded
 /// zone id all survive a hand split of the authority but not this.
 fn validate_and_upgrade_url(url: &str, allowed: &HostAllowlist) -> Result<String, String> {
-    let parsed = Url::parse(url).map_err(|e| format!("invalid URL {url}: {e}"))?;
+    let parsed = Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
     let url = parsed.as_str();
     if let Some(rest) = url.strip_prefix(HTTP_SCHEME) {
         if extract_host_port(url).is_some_and(|(host, port)| allowed.allows_host(host, port)) {
@@ -669,9 +1043,7 @@ fn validate_and_upgrade_url(url: &str, allowed: &HostAllowlist) -> Result<String
     if url.starts_with(HTTPS_SCHEME) {
         return Ok(url.to_string());
     }
-    Err(format!(
-        "URL must start with http:// or https://, got: {url}"
-    ))
+    Err("URL must start with http:// or https://".to_string())
 }
 
 #[cfg(test)]
@@ -710,6 +1082,314 @@ mod tests {
     const ACCEPT_HEADER: &str = "Accept";
     const ACCEPT_VALUE: &str = "text/html";
 
+    #[test_case(Some(STREAM_CHUNK_BYTES), STREAM_CHUNK_BYTES, false ; "exact_limit")]
+    #[test_case(Some(STREAM_CHUNK_BYTES), STREAM_CHUNK_BYTES + 1, true ; "over_limit")]
+    #[test_case(Some(0), 1, true ; "zero_limit")]
+    #[test_case(None, STREAM_CHUNK_BYTES * 2 + 1, false ; "unlimited")]
+    fn stream_cumulative_limit(limit: Option<usize>, size: usize, exceeds: bool) {
+        smol::block_on(async {
+            let lua = Lua::new();
+            let response = Response::new(AsyncBody::from(vec![b'x'; size]));
+            let table = response_table(&lua, response, limit).unwrap();
+            lua.globals()
+                .set("body", table.get::<AnyUserData>("body").unwrap())
+                .unwrap();
+            let read: mlua::Function = lua
+                .load("return function() return body:read() end")
+                .eval()
+                .unwrap();
+            let mut total = 0;
+            loop {
+                let (chunk, error): (Option<mlua::String>, Option<String>) =
+                    read.call_async(()).await.unwrap();
+                if let Some(error) = error {
+                    assert!(exceeds);
+                    assert_eq!(error, "response body exceeds byte limit");
+                    let (_, closed): (Option<mlua::String>, Option<String>) =
+                        read.call_async(()).await.unwrap();
+                    assert_eq!(closed.as_deref(), Some("response is closed"));
+                    break;
+                }
+                let chunk = chunk.unwrap();
+                if chunk.as_bytes().is_empty() {
+                    assert!(!exceeds);
+                    assert_eq!(total, size);
+                    break;
+                }
+                total += chunk.as_bytes().len();
+            }
+        });
+    }
+
+    #[test]
+    fn in_flight_provider_send_expires_without_response() {
+        use crate::runtime::TaskScope;
+        use smol::net::TcpListener;
+
+        const ISOLATED: &str = "MAKI_NET_EXPIRY_TEST_ISOLATED";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "api::net::tests::in_flight_provider_send_expires_without_response",
+                ])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        const EXPIRED: &str = "provider context expired";
+        const TIMEOUT: Duration = Duration::from_secs(5);
+
+        smol::block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            set_allowed_private_hosts(&[address.to_string()]);
+            let lua = Lua::new();
+            let task_scope = TaskScope::detached(&lua);
+            let (context, net_scope) = provider_context(
+                &lua,
+                task_scope.handle().clone(),
+                &PluginPermissions::trusted(),
+            )
+            .unwrap();
+            let request = lua.create_table().unwrap();
+            request.set("url", format!("http://{address}/")).unwrap();
+            let send: mlua::Function = context.get("send").unwrap();
+            let client = task_scope.scope_future(
+                send.call_async::<(Option<Table>, Option<Table>)>((context, request)),
+            );
+            let server = async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(read, 0);
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                drop(net_scope);
+                socket
+            };
+            let (result, _socket) = smol::future::or(smol::future::zip(client, server), async {
+                Timer::after(TIMEOUT).await;
+                panic!("provider send did not expire")
+            })
+            .await;
+            set_allowed_private_hosts(&[]);
+            let (response, error) = result.unwrap();
+            assert!(response.is_none());
+            let error = error.unwrap();
+            assert_eq!(error.get::<String>("kind").unwrap(), "network");
+            assert_eq!(error.get::<String>("message").unwrap(), EXPIRED);
+        });
+    }
+
+    #[test]
+    fn completed_read_guard_does_not_close_next_reader() {
+        let state = Arc::new(Mutex::new(StreamState {
+            body: None,
+            reading: true,
+            closed: false,
+            eof: false,
+            remaining: None,
+        }));
+        let guard = ReadGuard {
+            state: state.clone(),
+            active: false,
+        };
+        drop(guard);
+        let state = state.lock().unwrap();
+        assert!(state.reading);
+        assert!(!state.closed);
+    }
+
+    #[test_case(b"\0\xffhello".as_slice() ; "binary")]
+    #[test_case(b"".as_slice() ; "empty")]
+    fn stream_response_reads_bytes_and_closes(input: &[u8]) {
+        smol::block_on(async {
+            let lua = Lua::new();
+            let handle = StreamResponse {
+                state: Arc::new(Mutex::new(StreamState {
+                    body: Some(AsyncBody::from(input.to_vec())),
+                    reading: false,
+                    closed: false,
+                    eof: false,
+                    remaining: None,
+                })),
+                close_event: Arc::new(Event::new()),
+            };
+            lua.globals().set("response", handle).unwrap();
+            let function: mlua::Function = lua
+                .load(
+                    r#"
+                return function()
+                    local parts = {}
+                    while true do
+                        local chunk, err = response:read()
+                        assert(not err, err)
+                        if chunk == "" then break end
+                        table.insert(parts, chunk)
+                    end
+                    assert(response:read() == "")
+                    assert(response:close())
+                    assert(response:close())
+                    return table.concat(parts)
+                end
+            "#,
+                )
+                .eval()
+                .unwrap();
+            let output: mlua::String = function.call_async(()).await.unwrap();
+            assert_eq!(output.as_bytes().as_ref(), input);
+        });
+    }
+
+    #[test]
+    fn stream_reads_are_bounded_and_preserve_large_binary_body() {
+        smol::block_on(async {
+            let lua = Lua::new();
+            let input: Vec<u8> = (0..STREAM_CHUNK_BYTES * 2 + 17)
+                .map(|i| (i % 256) as u8)
+                .collect();
+            lua.globals()
+                .set(
+                    "response",
+                    StreamResponse {
+                        state: Arc::new(Mutex::new(StreamState {
+                            body: Some(AsyncBody::from(input.clone())),
+                            reading: false,
+                            closed: false,
+                            eof: false,
+                            remaining: None,
+                        })),
+                        close_event: Arc::new(Event::new()),
+                    },
+                )
+                .unwrap();
+            let read: mlua::Function = lua
+                .load("return function() return response:read() end")
+                .eval()
+                .unwrap();
+            let mut output = Vec::new();
+            loop {
+                let (chunk, err): (Option<mlua::String>, Option<String>) =
+                    read.call_async(()).await.unwrap();
+                assert!(err.is_none());
+                let chunk = chunk.unwrap();
+                let bytes = chunk.as_bytes();
+                assert!(bytes.len() <= STREAM_CHUNK_BYTES);
+                if bytes.is_empty() {
+                    break;
+                }
+                output.extend_from_slice(&bytes);
+            }
+            assert_eq!(output, input);
+        });
+    }
+
+    #[test_case(false ; "close")]
+    #[test_case(true ; "cancel")]
+    fn pending_stream_read_is_closed(cancel: bool) {
+        use futures_lite::future::poll_once;
+        use futures_lite::io::AsyncRead;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        struct PendingBody(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for PendingBody {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        impl AsyncRead for PendingBody {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                _: &mut [u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Pending
+            }
+        }
+
+        const CLOSED: &str = "response is closed";
+        const ACTIVE: &str = "response already has an active reader";
+
+        smol::block_on(async {
+            let lua = Lua::new();
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            lua.globals()
+                .set(
+                    "response",
+                    StreamResponse {
+                        state: Arc::new(Mutex::new(StreamState {
+                            body: Some(AsyncBody::from_reader(PendingBody(dropped.clone()))),
+                            reading: false,
+                            closed: false,
+                            eof: false,
+                            remaining: None,
+                        })),
+                        close_event: Arc::new(Event::new()),
+                    },
+                )
+                .unwrap();
+            let read: mlua::Function = lua
+                .load("return function() return response:read() end")
+                .eval()
+                .unwrap();
+            let mut pending =
+                Box::pin(read.call_async::<(Option<mlua::String>, Option<String>)>(()));
+            assert!(poll_once(&mut pending).await.is_none());
+            let (chunk, err): (Option<mlua::String>, Option<String>) =
+                read.call_async(()).await.unwrap();
+            assert!(chunk.is_none());
+            assert_eq!(err.as_deref(), Some(ACTIVE));
+            if cancel {
+                drop(pending);
+            } else {
+                lua.load("assert(response:close())").exec().unwrap();
+                assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+                let (chunk, err) = poll_once(&mut pending)
+                    .await
+                    .expect("close must wake read")
+                    .unwrap();
+                assert!(chunk.is_none());
+                assert_eq!(err.as_deref(), Some(CLOSED));
+            }
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+            let (chunk, err): (Option<mlua::String>, Option<String>) =
+                read.call_async(()).await.unwrap();
+            assert!(chunk.is_none());
+            assert_eq!(err.as_deref(), Some(CLOSED));
+            lua.load("assert(response:close())").exec().unwrap();
+        });
+    }
+
+    #[test]
+    fn stream_redirect_refuses_cross_authority() {
+        let allowed = allowlist(&["127.0.0.1"]);
+        let mut params = RequestParams {
+            url: "http://127.0.0.1:1000/".into(),
+            method: "POST".into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            max_bytes: DEFAULT_MAX_BYTES,
+            retries: 0,
+            pin: None,
+        };
+        params.headers.push(("x-api-key".into(), "secret".into()));
+        let error =
+            smol::block_on(params.follow_redirect(307, "http://127.0.0.1:2000/", &allowed, false))
+                .unwrap_err();
+        assert_eq!(error, "cross-authority redirect refused");
+        assert_eq!(params.url, "http://127.0.0.1:1000/");
+        smol::block_on(params.follow_redirect(307, "/next", &allowed, false)).unwrap();
+        assert_eq!(params.headers[0].1, "secret");
+    }
+
     fn allowlist(entries: &[&str]) -> HostAllowlist {
         HostAllowlist::parse(&entries.iter().map(|e| (*e).to_string()).collect::<Vec<_>>())
     }
@@ -726,7 +1406,7 @@ mod tests {
         location: &str,
         allowed: &HostAllowlist,
     ) -> Result<(), String> {
-        smol::block_on(params.follow_redirect(status, location, allowed))
+        smol::block_on(params.follow_redirect(status, location, allowed, true))
     }
 
     fn request_params(url: &str, opts: Option<&Table>) -> Result<RequestParams, String> {
@@ -899,6 +1579,7 @@ mod tests {
         let mut params = redirect_params(PUBLIC_URL);
         params.headers = vec![
             (AUTH_HEADER.to_string(), AUTH_VALUE.to_string()),
+            ("x-api-key".to_string(), AUTH_VALUE.to_string()),
             (ACCEPT_HEADER.to_string(), ACCEPT_VALUE.to_string()),
         ];
         redirect(&mut params, 302, location, &HostAllowlist::default()).unwrap();
@@ -908,7 +1589,31 @@ mod tests {
             "{location}: {:?}",
             params.headers
         );
-        assert!(params.headers.iter().any(|(k, _)| k == ACCEPT_HEADER));
+        assert_eq!(params.headers.iter().any(|(k, _)| k == ACCEPT_HEADER), kept);
+    }
+
+    #[test_case(307 ; "temporary")]
+    #[test_case(308 ; "permanent")]
+    fn cross_authority_redirect_refuses_body(status: u16) {
+        let mut params = redirect_params(PUBLIC_URL);
+        params.method = "POST".to_string();
+        params.body = PAYLOAD.into();
+        let error = redirect(
+            &mut params,
+            status,
+            OTHER_PUBLIC_URL,
+            &HostAllowlist::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error, "cross-authority redirect with body refused");
+        assert_eq!(params.url, PUBLIC_URL);
+    }
+
+    #[test_case("https://user:secret@" ; "invalid_url")]
+    #[test_case("ftp://user:secret@example.com/?key=secret" ; "unsupported_scheme")]
+    fn url_errors_do_not_include_secrets(url: &str) {
+        let error = validate_and_upgrade_url(url, &HostAllowlist::default()).unwrap_err();
+        assert!(!error.contains("secret"));
     }
 
     #[test_case(303, "GET", "" ; "303_rewrites_a_post_into_a_get")]
@@ -995,6 +1700,16 @@ mod tests {
         assert_eq!(req.headers()["User-Agent"], "agent");
     }
 
+    #[test_case("User-Agent" ; "canonical")]
+    #[test_case("user-agent" ; "lowercase")]
+    fn build_request_respects_custom_user_agent(name: &str) {
+        let headers = vec![(name.to_string(), "custom".to_string())];
+        let req = build_request("https://example.com", "agent", "GET", &headers, vec![]).unwrap();
+        let values: Vec<_> = req.headers().get_all("user-agent").iter().collect();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0], "custom");
+    }
+
     #[test]
     fn build_request_post_with_body_and_headers() {
         let headers = vec![("Content-Type".to_string(), "application/json".to_string())];
@@ -1030,6 +1745,8 @@ mod tests {
 
     #[test_case(r#"net.request("https://127.0.0.1")"# ; "ssrf_blocked")]
     #[test_case(r#"net.request("ftp://x")"# ; "invalid_url")]
+    #[test_case(r#"net.send("https://127.0.0.1")"# ; "stream_ssrf_blocked")]
+    #[test_case(r#"net.send("ftp://x")"# ; "stream_invalid_url")]
     fn lua_request_error_returns_nil_and_message(expr: &str) {
         let lua = Lua::new();
         let net = create_net_table(&lua, &PluginPermissions::trusted()).unwrap();
@@ -1054,6 +1771,16 @@ mod tests {
         assert_eq!(params.timeout, Duration::from_secs(DEFAULT_TIMEOUT_SECS));
         assert_eq!(params.max_bytes, DEFAULT_MAX_BYTES);
         assert_eq!(params.retries, MAX_RETRIES);
+    }
+
+    #[test]
+    fn extract_params_preserves_binary_request_body() {
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+        let body = b"\0\xffpayload";
+        opts.set("body", lua.create_string(body).unwrap()).unwrap();
+        let params = request_params(PUBLIC_URL, Some(&opts)).unwrap();
+        assert_eq!(params.body, body);
     }
 
     #[test]
