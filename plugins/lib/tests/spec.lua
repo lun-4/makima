@@ -1989,6 +1989,40 @@ case("synthetic_fetch_usage_closes_response", function()
   assert(closed)
 end)
 
+case("synthetic_quota_failures_close_response", function()
+  local synthetic = require("maki.synthetic")
+  local instance = assert(synthetic.prepare(nil, { id = "fixture" }, {
+    api_key_env = "MAKI_TEST_SYNTHETIC_MISSING_KEY",
+    api_key = "fixture-key",
+  }))
+  for _, fixture in ipairs({
+    { status = 403, expected = "api" },
+    { status = 200, expected = "network", read_error = true },
+    { status = 200, expected = "api", oversized = true },
+  }) do
+    local closed = false
+    local usage, err = instance.fetch_usage({
+      send = function()
+        return {
+          status = fixture.status,
+          read = function()
+            if fixture.read_error then
+              return nil, { kind = "network", message = "fixture" }
+            end
+            return fixture.oversized and string.rep("x", 65537) or ""
+          end,
+          close = function()
+            closed = true
+          end,
+        }
+      end,
+    })
+    eq(usage, nil)
+    eq(err.kind, fixture.expected)
+    assert(closed)
+  end
+end)
+
 case("synthetic_stream_uses_provider_context", function()
   local synthetic = require("maki.synthetic")
   local instance = assert(synthetic.prepare(nil, { id = "fixture" }, {

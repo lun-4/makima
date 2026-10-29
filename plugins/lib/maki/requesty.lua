@@ -121,14 +121,23 @@ local function parse_model(entry)
   }
 end
 
+local function api_error(response, message)
+  local value = response.headers and response.headers["retry-after"]
+  local seconds = type(value) == "string" and value:match("^%s*(%d+)%s*$")
+  seconds = seconds and tonumber(seconds)
+  local retry_after_ms = seconds and seconds > 0 and seconds <= 9007199254740 and seconds * 1000 or nil
+  local status = response.status
+  response:close()
+  return { kind = "api", status = status, message = message, retry_after_ms = retry_after_ms }
+end
+
 local function fetch_models(ctx, url, request_headers)
   local response, err = ctx:send({ url = url, method = "GET", headers = request_headers })
   if not response then
     return nil, err
   end
   if response.status < 200 or response.status >= 300 then
-    response:close()
-    return nil, { kind = "api", status = response.status, message = "Requesty models request failed" }
+    return nil, api_error(response, "Requesty models request failed")
   end
   local chunks, size = {}, 0
   while true do
@@ -153,7 +162,7 @@ local function fetch_models(ctx, url, request_headers)
     return nil, { kind = "api", message = tostring(decode_err) }
   end
   local models = {}
-  for _, entry in ipairs(type(data.data) == "table" and data.data or {}) do
+  for _, entry in ipairs(type(data) == "table" and type(data.data) == "table" and data.data or {}) do
     local model = parse_model(entry)
     if model then
       models[#models + 1] = model
@@ -262,8 +271,7 @@ local function prepare(ctx, model, config)
         return nil, send_err
       end
       if response.status < 200 or response.status >= 300 then
-        response:close()
-        return nil, { kind = "api", status = response.status, message = "Requesty request failed" }
+        return nil, api_error(response, "Requesty request failed")
       end
       local result, stream_err = chat.stream(response, emit)
       response:close()

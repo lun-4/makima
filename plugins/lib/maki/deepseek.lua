@@ -265,7 +265,7 @@ local function prepare(ctx, model, config)
         body.thinking = { type = "disabled" }
       else
         body.thinking = { type = "enabled" }
-        if intent.mode == "effort" then
+        if intent.mode == "effort" or intent.mode == "budget" then
           body.reasoning_effort = "max"
         end
         if body.tools and not request.model.id:find("^deepseek%-reasoner") then

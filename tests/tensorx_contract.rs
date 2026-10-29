@@ -6,9 +6,14 @@ use std::time::Duration;
 
 use http_contract::{HttpContract, Response, Step};
 use maki_agent::tools::ToolRegistry;
+use maki_commands::CommandRegistry;
 use maki_config::PluginsConfig;
-use maki_lua::PluginHost;
+use maki_lua::{PluginHost, test_support::InMemoryFs, ui_sink::HostUi};
 use maki_providers::{Message, Model, ProviderEvent, RequestOptions, ThinkingConfig};
+use maki_storage::{
+    StateDir,
+    auth::{ProviderCredentials, load_provider_credentials, save_provider_credentials},
+};
 use serde_json::{Value, json};
 
 #[test]
@@ -26,6 +31,77 @@ fn tensorx_is_embedded_but_not_loaded_by_default() {
     };
     host.load_builtins(&explicit).unwrap();
     assert!(host.provider_registry().snapshot().get("tensorx").is_some());
+}
+
+#[test]
+fn tensorx_legacy_credentials_are_used_for_stream_and_logout() {
+    let server = HttpContract::start(vec![Response {
+        status: "200 OK".into(), headers: vec![],
+        steps: vec![Step::Chunk(b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_vec())],
+    }]).unwrap();
+    maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
+    let temp = tempfile::tempdir().unwrap();
+    let state = StateDir::from_path(temp.path().to_path_buf());
+    save_provider_credentials(
+        &state,
+        "tensorx",
+        &ProviderCredentials {
+            api_key: "saved-key".into(),
+            host: None,
+        },
+    )
+    .unwrap();
+    let mut host = PluginHost::with_session_provider_preparer(
+        Arc::new(ToolRegistry::new()),
+        CommandRegistry::new(),
+        true,
+        Arc::new(InMemoryFs::new()),
+        Some(temp.path().to_path_buf()),
+        None,
+        HostUi::Frontend,
+    )
+    .unwrap();
+    host.load_builtins(&PluginsConfig {
+        enabled: true,
+        names: vec!["tensorx".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let factory = &snapshot.get("tensorx").unwrap().factory;
+    let config = json!({"api_key_env": "TENSORX_CONTRACT_UNUSED_KEY", "api_key": "config-key", "base_url": format!("http://{}", server.addr)});
+    assert_eq!(
+        smol::block_on(factory.auth_status(&config)).unwrap()["source"],
+        "stored"
+    );
+    let model = Model::from_spec("tensorx/vendor/chat").unwrap();
+    let (model, provider) = smol::block_on(factory.prepare(&model, &config)).unwrap();
+    let (events, _received) = flume::unbounded();
+    smol::block_on(provider.stream_message(
+        &model,
+        &[Message::user("prompt".into())],
+        "system",
+        &json!([]),
+        &events,
+        RequestOptions {
+            thinking: ThinkingConfig::Off,
+            fast: false,
+        },
+        None,
+    ))
+    .unwrap();
+    let request = server
+        .requests
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.header("authorization"), Some("Bearer saved-key"));
+    smol::block_on(factory.logout(&config)).unwrap();
+    assert!(load_provider_credentials(&state, "tensorx").is_none());
+    assert_eq!(
+        smol::block_on(factory.auth_status(&config)).unwrap()["source"],
+        "config"
+    );
 }
 
 #[test]

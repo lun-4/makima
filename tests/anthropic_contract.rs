@@ -104,6 +104,7 @@ fn anthropic_direct_streams_through_plugin_host_and_http() {
         Response { status: "200 OK".into(), headers: vec![], steps: vec![Step::Chunk(br#"{"data":[{"id":"model-a","max_input_tokens":1000000}],"has_more":true,"last_id":"model-a"}"#.to_vec())] },
         Response { status: "200 OK".into(), headers: vec![], steps: vec![Step::Chunk(br#"{"data":[{"id":"model-b","max_input_tokens":200000}],"has_more":false}"#.to_vec())] },
         Response { status: "200 OK".into(), headers: vec![], steps: vec![Step::Chunk(br#"{"five_hour":{"utilization":42,"resets_at":"2024-01-01T00:00:00Z"}}"#.to_vec())] },
+        Response { status: "200 OK".into(), headers: vec![], steps: vec![Step::Chunk(b"event: error\ndata: {\"error\":{\"type\":\"overloaded_error\",\"message\":\"temporarily overloaded\"}}\n\n".to_vec())] },
     ]).unwrap();
     maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
     let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
@@ -251,6 +252,28 @@ fn anthropic_direct_streams_through_plugin_host_and_http() {
     assert_eq!(
         usage_request.header("anthropic-beta"),
         Some("oauth-2025-04-20")
+    );
+    let stream_error = smol::block_on(provider.stream_message(
+        &model,
+        &messages,
+        "system prompt",
+        &tools,
+        &events,
+        options,
+        None,
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(stream_error, AgentError::Api { status: 529, ref message, .. } if message == "temporarily overloaded")
+    );
+    assert_eq!(
+        server
+            .requests
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap()
+            .target,
+        "/v1/messages"
     );
     maki_lua::set_allowed_private_hosts(&[]);
 }

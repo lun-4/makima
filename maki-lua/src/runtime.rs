@@ -3120,6 +3120,7 @@ type ProviderInstances = Rc<
                 CancelToken,
                 crate::loader::SourceIdentity,
                 String,
+                Option<crate::api::net::ConfiguredEndpoint>,
             ),
         >,
     >,
@@ -4352,7 +4353,7 @@ impl LuaRuntime {
         self.provider_generations.remove(name.as_ref());
         self.provider_instances
             .borrow_mut()
-            .retain(|_, (owner, _, _, _, _, _)| owner != name.as_ref());
+            .retain(|_, (owner, _, _, _, _, _, _)| owner != name.as_ref());
         self.provider_generations
             .insert(name.to_string(), CancelToken::new());
         self.providers
@@ -4478,7 +4479,7 @@ impl LuaRuntime {
         self.provider_generations.remove(plugin);
         self.provider_instances
             .borrow_mut()
-            .retain(|_, (owner, _, _, _, _, _)| owner != plugin);
+            .retain(|_, (owner, _, _, _, _, _, _)| owner != plugin);
         self.providers.unload(plugin);
         self.provider_registry.remove_owner(plugin);
         if let Some(generations) = self.lua.app_data_ref::<Arc<Mutex<CommandGenerationMap>>>() {
@@ -5675,6 +5676,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                     .map(|(_, cancel)| (source.clone(), table.clone(), cancel.clone(), rt.plugins.borrow().get(owner).map(|plugin| plugin.permissions.clone()).unwrap_or_else(PluginPermissions::denied))));
                             if hook == "logout" && candidate.is_some() && !cancel.is_cancelled() {
                                 provider_auth_epochs.insert(provider.clone(), CancelToken::new());
+                                rt.provider_instances.borrow_mut().retain(|_, (_, _, _, _, _, instance_provider, _)| instance_provider != &provider);
                             }
                             let auth_epoch = provider_auth_epochs.entry(provider.clone()).or_insert_with(CancelToken::new).1.clone();
                             let lua = rt.lua.clone();
@@ -5706,9 +5708,12 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                         crate::api::util::convert::json_to_lua_with_nulls(&lua, &input, true).map_err(|e| config_error(e.to_string()))?
                                     };
                                     let scope = TaskScope::new(&lua, TaskCell::new(cancel.clone(), None, None));
-                                    let (context, _net_scope) = crate::api::net::provider_context(&lua, scope.handle().clone(), &permissions).map_err(|e| config_error(e.to_string()))?;
+                                    let (context, _net_scope) = crate::api::net::provider_context(&lua, scope.handle().clone(), &permissions, crate::api::net::ConfiguredEndpoint::from_host_config(&source, &provider)).map_err(|e| config_error(e.to_string()))?;
                                     crate::provider_credentials::attach(&lua, &context, scope.handle().clone(), generation_cancel.clone(), source, provider.clone()).map_err(|e| config_error(e.to_string()))?;
-                                    let result = auth_epoch.race(generation_cancel.race(cancel.race(scope.scope_future(function.call_async::<MultiValue>((context, input)))))).await.map_err(|_| maki_providers::AgentError::Cancelled)?;
+                                    let result = match auth_epoch.race(generation_cancel.race(cancel.race(scope.scope_future(function.call_async::<MultiValue>((context, input)))))).await {
+                                        Ok(result) => result,
+                                        Err(_) => { scope.fire_cancel_hooks(); return Err(maki_providers::AgentError::Cancelled); }
+                                    };
                                     let values = match result {
                                         Err(_) => { scope.fire_cancel_hooks(); return Err(config_error("provider generation revoked".into())); }
                                         Ok(Err(_)) => { scope.fire_cancel_hooks(); return Err(maki_providers::AgentError::Cancelled); }
@@ -5763,7 +5768,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                     let Some(discover) = discover else { return Ok(None) };
                                     let config = crate::api::util::convert::json_to_lua_with_nulls(&lua, &config, true).map_err(|e| config_error(e.to_string()))?;
                                     let scope = TaskScope::new(&lua, TaskCell::new(cancel.clone(), None, None));
-                                    let (context, _net_scope) = crate::api::net::provider_context(&lua, scope.handle().clone(), &permissions).map_err(|e| config_error(e.to_string()))?;
+                                    let (context, _net_scope) = crate::api::net::provider_context(&lua, scope.handle().clone(), &permissions, crate::api::net::ConfiguredEndpoint::from_host_config(&source, &provider)).map_err(|e| config_error(e.to_string()))?;
                                     crate::provider_credentials::attach(&lua, &context, scope.handle().clone(), generation_cancel.clone(), source, provider.clone()).map_err(|e| config_error(e.to_string()))?;
                                     let result = generation_cancel.race(cancel.race(scope.scope_future(discover.call_async::<MultiValue>((context, config))))).await;
                                     let values = match result {
@@ -5803,7 +5808,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                     let input = crate::api::util::convert::json_to_lua(&lua, &input).map_err(|e| e.to_string())?;
                                     let config = crate::api::util::convert::json_to_lua_with_nulls(&lua, &config, true).map_err(|e| e.to_string())?;
                                     let scope = TaskScope::new(&lua, TaskCell::new(cancel.clone(), None, None));
-                                    let (context, _net_scope) = crate::api::net::provider_context(&lua, scope.handle().clone(), &permissions).map_err(|e| e.to_string())?;
+                                    let (context, _net_scope) = crate::api::net::provider_context(&lua, scope.handle().clone(), &permissions, crate::api::net::ConfiguredEndpoint::from_host_config(&source, &provider)).map_err(|e| e.to_string())?;
                                     crate::provider_credentials::attach(&lua, &context, scope.handle().clone(), generation_cancel.clone(), source.clone(), provider.clone()).map_err(|e| e.to_string())?;
                                     let result = generation_cancel.race(cancel.race(scope.scope_future(prepare.call_async::<MultiValue>((context, input, config))))).await;
                                     let values = match result {
@@ -5829,7 +5834,8 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                     crate::provider_adapter::apply_prepared_metadata(&lua, &prepared, &mut model)?;
                                     let id = NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed).to_string();
                                     let (trigger, generation_cancel) = CancelToken::new();
-                                    instances.borrow_mut().insert(id.clone(), (owner, instance, trigger, generation_cancel, source, provider));
+                                    let endpoint = crate::api::net::ConfiguredEndpoint::from_host_config(&source, &provider);
+                                    instances.borrow_mut().insert(id.clone(), (owner, instance, trigger, generation_cancel, source, provider, endpoint));
                                     Ok((PreparedInstance { id: Some(id), tx }, model, key_count))
                                 }}.await;
                                 let _ = reply.send(result);
@@ -5839,34 +5845,34 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             rt.provider_instances.borrow_mut().remove(&instance);
                         }
                         Request::ProviderHook { instance, hook, cancel, reply } => {
-                            let candidate = rt.provider_instances.borrow().get(&instance).map(|(owner, table, _, generation, source, provider)| (table.clone(), generation.clone(), source.clone(), provider.clone(), rt.plugins.borrow().get(owner.as_str()).map(|plugin| plugin.permissions.clone()).unwrap_or_else(PluginPermissions::denied)));
-                            let auth_epoch = candidate.as_ref().map(|(_, _, _, provider, _)| provider_auth_epochs.entry(provider.clone()).or_insert_with(CancelToken::new).1.clone());
+                            let candidate = rt.provider_instances.borrow().get(&instance).map(|(owner, table, _, generation, source, provider, endpoint)| (table.clone(), generation.clone(), source.clone(), provider.clone(), endpoint.clone(), rt.plugins.borrow().get(owner.as_str()).map(|plugin| plugin.permissions.clone()).unwrap_or_else(PluginPermissions::denied)));
+                            let auth_epoch = candidate.as_ref().map(|(_, _, _, provider, _, _)| provider_auth_epochs.entry(provider.clone()).or_insert_with(CancelToken::new).1.clone());
                             let lua = rt.lua.clone();
                             let provider_gate = Rc::clone(&provider_gate);
                             let paused = Rc::clone(&provider_paused);
                             let event = Rc::clone(&provider_resume);
                             ex.spawn(async move {
                                 let result = ProviderPoll { paused, event, listener: None, inner: async {
-                                    let (instance, generation, source, provider, permissions) = candidate.ok_or_else(|| maki_providers::AgentError::Config { message: "provider instance is unavailable".to_owned() })?;
+                                    let (instance, generation, source, provider, endpoint, permissions) = candidate.ok_or_else(|| maki_providers::AgentError::Config { message: "provider instance is unavailable".to_owned() })?;
                                     let _slot = generation.race(provider_gate.acquire_before_abandoned(&cancel, None)).await.map_err(|_| maki_providers::AgentError::Config { message: "provider generation revoked".to_owned() })?.map_err(|_| maki_providers::AgentError::Cancelled)?;
                                     let auth_epoch = auth_epoch.ok_or_else(|| maki_providers::AgentError::Config { message: "provider instance is unavailable".to_owned() })?;
-                                    auth_epoch.race(crate::provider_stream::run_hook(&lua, &instance, hook, cancel, generation, &permissions, source, provider)).await.map_err(|_| maki_providers::AgentError::Cancelled)?
+                                    auth_epoch.race(crate::provider_stream::run_hook(&lua, &instance, hook, cancel, generation, &permissions, source, provider, endpoint)).await.map_err(|_| maki_providers::AgentError::Cancelled)?
                                 }}.await;
                                 let _ = reply.send(result);
                             }).detach();
                         }
                         Request::ProviderStream { instance, request, events, cancel, reply } => {
-                            let candidate = rt.provider_instances.borrow().get(&instance).map(|(owner, table, _, generation, _, _)| (table.clone(), generation.clone(), rt.plugins.borrow().get(owner.as_str()).map(|plugin| plugin.permissions.clone()).unwrap_or_else(PluginPermissions::denied)));
+                            let candidate = rt.provider_instances.borrow().get(&instance).map(|(owner, table, _, generation, _, _, endpoint)| (table.clone(), generation.clone(), endpoint.clone(), rt.plugins.borrow().get(owner.as_str()).map(|plugin| plugin.permissions.clone()).unwrap_or_else(PluginPermissions::denied)));
                             let lua = rt.lua.clone();
                             let provider_gate = Rc::clone(&provider_gate);
                             let paused = Rc::clone(&provider_paused);
                             let event = Rc::clone(&provider_resume);
                             ex.spawn(async move {
                                 let result = ProviderPoll { paused, event, listener: None, inner: async {
-                                    let (instance, generation, permissions) = candidate.ok_or_else(|| maki_providers::AgentError::Config { message: "provider instance is unavailable".to_owned() })?;
+                                    let (instance, generation, endpoint, permissions) = candidate.ok_or_else(|| maki_providers::AgentError::Config { message: "provider instance is unavailable".to_owned() })?;
                                     let _slot = generation.race(provider_gate.acquire_before_abandoned(&cancel, None)).await.map_err(|_| maki_providers::AgentError::Config { message: "provider generation revoked".to_owned() })?.map_err(|_| maki_providers::AgentError::Cancelled)?;
                                     let stream: Function = instance.raw_get("stream").map_err(|e| maki_providers::AgentError::Config { message: e.to_string() })?;
-                                    crate::provider_stream::run_stream(&lua, stream, request, events, cancel, generation, &permissions).await
+                                    crate::provider_stream::run_stream(&lua, stream, request, events, cancel, generation, (&permissions, endpoint)).await
                                 }}.await;
                                 let _ = reply.send(result);
                             }).detach();

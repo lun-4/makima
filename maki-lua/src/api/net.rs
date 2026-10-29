@@ -173,7 +173,7 @@ fn split_host_port(authority: &str) -> (&str, Option<u16>) {
 /// Without it the name is looked up twice, once by the guard and once by curl
 /// at connect time, and a record with a zero TTL can answer public to the
 /// first and 169.254.169.254 to the second.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct DnsPin {
     host: String,
     port: u16,
@@ -205,6 +205,45 @@ impl ProviderEndpointResolver {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ConfiguredEndpoint {
+    url: Url,
+}
+
+impl ConfiguredEndpoint {
+    pub(crate) fn from_host_config(
+        source: &crate::loader::SourceIdentity,
+        provider: &str,
+    ) -> Option<Self> {
+        if !matches!(source, crate::loader::SourceIdentity::CoreProviders)
+            || provider != "synthetic"
+        {
+            return None;
+        }
+        let config = maki_config::providers::ProvidersConfig::load_or_default();
+        let endpoint = maki_config::providers::configured_base_url(provider, config.get(provider))?;
+        Self::parse(&endpoint)
+    }
+
+    fn parse(endpoint: &str) -> Option<Self> {
+        let url = Url::parse(endpoint).ok()?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return None;
+        }
+        Some(Self { url })
+    }
+
+    fn matches(&self, url: &Url) -> bool {
+        self.url.scheme() == url.scheme() && authority(&self.url) == authority(url)
+    }
+}
+
 struct RequestParams {
     url: String,
     method: String,
@@ -216,6 +255,7 @@ struct RequestParams {
     /// `None` when the guard reached its verdict without DNS.
     pin: Option<DnsPin>,
     resolver: Option<ProviderEndpointResolver>,
+    endpoint: Option<ConfiguredEndpoint>,
 }
 
 struct ResponseData {
@@ -474,6 +514,7 @@ pub(crate) fn provider_context(
     lua: &Lua,
     task: TaskHandle,
     permissions: &PluginPermissions,
+    endpoint: Option<ConfiguredEndpoint>,
 ) -> LuaResult<(Table, ProviderNetScope)> {
     let alive = Arc::new(AtomicBool::new(true));
     let expiry = Arc::new(Event::new());
@@ -492,6 +533,7 @@ pub(crate) fn provider_context(
             let expiry = expiry.clone();
             let bodies = bodies.clone();
             let task = task.clone();
+            let endpoint = endpoint.clone();
             async move {
                 if !allowed || !alive.load(Ordering::Acquire) || !same_invocation(&lua, &task) {
                     return Ok((
@@ -507,7 +549,7 @@ pub(crate) fn provider_context(
                     .app_data_ref::<ProviderEndpointResolver>()
                     .map(|r| r.clone());
                 let allowed_hosts = allowed_for_resolver(resolver.as_ref());
-                match validate_and_upgrade_url(&url, &allowed_hosts) {
+                match validate_provider_url(&url, &allowed_hosts, endpoint.as_ref()) {
                     Ok(validated)
                         if Url::parse(&url).is_ok_and(|parsed| validated != parsed.as_str()) =>
                     {
@@ -538,9 +580,13 @@ pub(crate) fn provider_context(
                         if !alive.load(Ordering::Acquire) {
                             return Err("provider context expired".to_string());
                         }
-                        let params =
-                            extract_request_params_with_resolver(&url, Some(&request), resolver)
-                                .await?;
+                        let params = extract_request_params_with_endpoint(
+                            &url,
+                            Some(&request),
+                            resolver,
+                            endpoint,
+                        )
+                        .await?;
                         if !alive.load(Ordering::Acquire) {
                             return Err("provider context expired".to_string());
                         }
@@ -634,9 +680,18 @@ async fn extract_request_params_with_resolver(
     opts: Option<&Table>,
     resolver: Option<ProviderEndpointResolver>,
 ) -> Result<RequestParams, String> {
+    extract_request_params_with_endpoint(url, opts, resolver, None).await
+}
+
+async fn extract_request_params_with_endpoint(
+    url: &str,
+    opts: Option<&Table>,
+    resolver: Option<ProviderEndpointResolver>,
+    endpoint: Option<ConfiguredEndpoint>,
+) -> Result<RequestParams, String> {
     let allowed = allowed_for_resolver(resolver.as_ref());
-    let url = validate_and_upgrade_url(url, &allowed)?;
-    let pin = check_ssrf_with_resolver(&url, &allowed, resolver.as_ref()).await?;
+    let url = validate_provider_url(url, &allowed, endpoint.as_ref())?;
+    let pin = check_provider_ssrf(&url, &allowed, resolver.as_ref(), endpoint.as_ref()).await?;
 
     let method = opts
         .and_then(|o| o.get::<String>("method").ok())
@@ -682,6 +737,7 @@ async fn extract_request_params_with_resolver(
         retries,
         pin,
         resolver,
+        endpoint,
     })
 }
 
@@ -913,7 +969,7 @@ impl RequestParams {
         let target = base
             .join(location)
             .map_err(|e| format!("invalid redirect: {e}"))?;
-        let target = validate_and_upgrade_url(target.as_str(), allowed)?;
+        let target = validate_provider_url(target.as_str(), allowed, self.endpoint.as_ref())?;
         let landed = Url::parse(&target).map_err(|e| format!("invalid redirect: {e}"))?;
         if authority(&base) != authority(&landed) {
             if !allow_cross_authority {
@@ -928,7 +984,23 @@ impl RequestParams {
             self.headers.clear();
         }
 
-        let pin = check_ssrf_with_resolver(&target, allowed, self.resolver.as_ref()).await?;
+        let pin = if authority(&base) == authority(&landed)
+            && self
+                .endpoint
+                .as_ref()
+                .is_some_and(|endpoint| endpoint.matches(&landed))
+            && self.pin.is_some()
+        {
+            self.pin.clone()
+        } else {
+            check_provider_ssrf(
+                &target,
+                allowed,
+                self.resolver.as_ref(),
+                self.endpoint.as_ref(),
+            )
+            .await?
+        };
 
         // 301, 302 and 303 turn anything that is not a read into a `GET`, the
         // way browsers and curl do it. 307 and 308 keep method and body.
@@ -991,6 +1063,55 @@ async fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
 #[cfg(test)]
 async fn check_ssrf(url: &str, allowed: &HostAllowlist) -> Result<Option<DnsPin>, String> {
     check_ssrf_with_resolver(url, allowed, None).await
+}
+
+fn validate_provider_url(
+    url: &str,
+    allowed: &HostAllowlist,
+    endpoint: Option<&ConfiguredEndpoint>,
+) -> Result<String, String> {
+    let parsed = Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+    if endpoint.is_some_and(|endpoint| endpoint.matches(&parsed)) {
+        return Ok(parsed.to_string());
+    }
+    validate_and_upgrade_url(url, allowed)
+}
+
+async fn check_provider_ssrf(
+    url: &str,
+    allowed: &HostAllowlist,
+    resolver: Option<&ProviderEndpointResolver>,
+    endpoint: Option<&ConfiguredEndpoint>,
+) -> Result<Option<DnsPin>, String> {
+    let parsed = Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+    if !endpoint.is_some_and(|endpoint| endpoint.matches(&parsed)) {
+        return check_ssrf_with_resolver(url, allowed, resolver).await;
+    }
+    let (host, port) = extract_host_port(url).ok_or("cannot extract host from URL")?;
+    if host.parse::<IpAddr>().is_ok() {
+        return Ok(None);
+    }
+    let addresses = match resolver.and_then(|resolver| resolver.addresses(host, port)) {
+        Some(addresses) => addresses.to_vec(),
+        None => resolve(host, port)
+            .await
+            .map_err(|e| format!("cannot resolve {host}: {e}"))?,
+    };
+    let address = addresses
+        .first()
+        .ok_or("endpoint resolves to no addresses")?;
+    if addresses
+        .iter()
+        .any(|addr| addr.ip().is_unspecified() || addr.ip().is_multicast())
+    {
+        return Err("endpoint resolves to invalid address".into());
+    }
+    Ok(Some(DnsPin {
+        host: host.to_string(),
+        port,
+        addr: address.ip(),
+        connect_port: address.port(),
+    }))
 }
 
 fn allowed_for_resolver(resolver: Option<&ProviderEndpointResolver>) -> HostAllowlist {
@@ -1244,6 +1365,7 @@ mod tests {
                 &lua,
                 task_scope.handle().clone(),
                 &PluginPermissions::trusted(),
+                None,
             )
             .unwrap();
             let request = lua.create_table().unwrap();
@@ -1459,6 +1581,77 @@ mod tests {
     }
 
     #[test]
+    fn configured_endpoint_is_exact_authority_and_pins_dns() {
+        let endpoint = ConfiguredEndpoint::parse("http://provider.test:8080/v1").unwrap();
+        let allowed = HostAllowlist::default();
+        let mut resolver = ProviderEndpointResolver::default();
+        resolver.add(
+            "provider.test",
+            8080,
+            vec!["127.0.0.1:8080".parse().unwrap()],
+        );
+        let url = "http://provider.test:8080/v1/models";
+        assert_eq!(
+            validate_provider_url(url, &allowed, Some(&endpoint)).unwrap(),
+            url
+        );
+        let pin = smol::block_on(check_provider_ssrf(
+            url,
+            &allowed,
+            Some(&resolver),
+            Some(&endpoint),
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(pin.addr, "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert!(
+            smol::block_on(check_provider_ssrf(
+                "http://provider.test:8081/",
+                &allowed,
+                Some(&resolver),
+                Some(&endpoint)
+            ))
+            .is_err()
+        );
+        assert_ne!(
+            validate_provider_url("http://provider.test:8081/", &allowed, Some(&endpoint)).unwrap(),
+            "http://provider.test:8081/"
+        );
+        assert!(ConfiguredEndpoint::parse("http://user:password@provider.test/").is_none());
+    }
+
+    #[test]
+    fn configured_endpoint_redirect_preserves_pin_and_rejects_other_authority() {
+        let mut params = redirect_params("http://provider.test:8080/v1");
+        params.endpoint = ConfiguredEndpoint::parse(&params.url);
+        params.pin = Some(DnsPin {
+            host: "provider.test".into(),
+            port: 8080,
+            addr: "127.0.0.1".parse().unwrap(),
+            connect_port: 8080,
+        });
+        let mut resolver = ProviderEndpointResolver::default();
+        resolver.add(
+            "provider.test",
+            8080,
+            vec!["169.254.169.254:8080".parse().unwrap()],
+        );
+        params.resolver = Some(resolver);
+        let allowed = HostAllowlist::default();
+        smol::block_on(params.follow_redirect(307, "/next", &allowed, false)).unwrap();
+        assert_eq!(
+            params.pin.unwrap().addr,
+            "127.0.0.1".parse::<IpAddr>().unwrap()
+        );
+        let mut params = redirect_params("http://provider.test:8080/v1");
+        params.endpoint = ConfiguredEndpoint::parse(&params.url);
+        assert!(
+            smol::block_on(params.follow_redirect(307, "http://127.0.0.1:8081/", &allowed, false))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn provider_resolver_is_host_scoped_and_checked() {
         let mut resolver = ProviderEndpointResolver::default();
         let public: IpAddr = "8.8.8.8".parse().unwrap();
@@ -1506,6 +1699,7 @@ mod tests {
             retries: 0,
             pin: None,
             resolver: None,
+            endpoint: None,
         };
         params.headers.push(("x-api-key".into(), "secret".into()));
         let error =
@@ -1625,6 +1819,7 @@ mod tests {
             retries: 0,
             pin: None,
             resolver: None,
+            endpoint: None,
         }
     }
 

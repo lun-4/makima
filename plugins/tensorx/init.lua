@@ -179,8 +179,18 @@ local function prepare(ctx, model, config)
           body.reasoning_effort = "none"
         elseif intent.mode == "adaptive" then
           body.reasoning_effort = "high"
-        elseif intent.mode == "effort" then
-          body.reasoning_effort = ({ minimal = "low", low = "low", medium = "medium", high = "high", max = "high" })[intent.level]
+        else
+          local maximum = request.model.max_output_tokens
+            and math.max(1024, math.floor(request.model.max_output_tokens / 2))
+          local resolution, resolve_err = require("maki.thinking").resolve(
+            intent,
+            { mode = "effort", levels = { "low", "medium", "high" } },
+            maximum and { max_tokens = maximum } or nil
+          )
+          if not resolution then
+            return nil, { kind = "config", message = tostring(resolve_err) }
+          end
+          body.reasoning_effort = resolution.effective.level
         end
       elseif
         not flags.thinking

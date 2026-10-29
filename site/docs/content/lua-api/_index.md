@@ -7145,6 +7145,11 @@ ListPicker.matches = matches
 ListPicker.highlight_spans = highlight_spans
 ```
 
+### `require("maki.llama_cpp")`
+
+```lua
+```
+
 ### `require("maki.long_lines")`
 
 ```lua

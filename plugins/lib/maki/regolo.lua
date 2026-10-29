@@ -118,6 +118,17 @@ local function get(ctx, url, request_headers)
   return value, read_err
 end
 
+local function token_count(value)
+  if type(value) ~= "number" then
+    return nil
+  end
+  value = math.max(0, math.floor(value))
+  if value > 4294967295 then
+    return nil
+  end
+  return value
+end
+
 function M.join_models(ids, groups)
   local by_id = {}
   for _, group in ipairs(groups) do
@@ -140,8 +151,8 @@ function M.join_models(ids, groups)
       end
       models[#models + 1] = {
         id = id,
-        context_window = group.max_input_tokens or group.max_tokens,
-        max_output_tokens = group.max_output_tokens,
+        context_window = token_count(group.max_input_tokens or group.max_tokens),
+        max_output_tokens = token_count(group.max_output_tokens),
         pricing = pricing,
         supports_thinking = group.supports_reasoning == true,
         supports_vision = group.supports_vision == true,
@@ -177,6 +188,11 @@ function M.discover(ctx, config)
     for _, group in ipairs(groups.data) do
       if
         type(group) ~= "table"
+        or (group.input_cost_per_token ~= nil and type(group.input_cost_per_token) ~= "number")
+        or (group.output_cost_per_token ~= nil and type(group.output_cost_per_token) ~= "number")
+        or (group.max_input_tokens ~= nil and type(group.max_input_tokens) ~= "number")
+        or (group.max_output_tokens ~= nil and type(group.max_output_tokens) ~= "number")
+        or (group.max_tokens ~= nil and type(group.max_tokens) ~= "number")
         or type(group.model_group) ~= "string"
         or type(group.mode) ~= "string"
         or type(group.supports_reasoning) ~= "boolean"
@@ -208,6 +224,14 @@ function M.prepare(ctx, model, config)
   return {
     model = model,
     key_count = #keys,
+    reload_auth = function(reload_ctx)
+      local refreshed, reload_err = credentials(reload_ctx, config)
+      if not refreshed then
+        return nil, reload_err
+      end
+      keys, index = refreshed, 1
+      return true
+    end,
     rotate_key = function()
       if #keys < 2 then
         return false
@@ -222,7 +246,13 @@ function M.prepare(ctx, model, config)
       if not key then
         return nil, key_err
       end
-      if type(key.info) ~= "table" or type(key.info.spend) ~= "number" then
+      if
+        type(key) ~= "table"
+        or type(key.info) ~= "table"
+        or type(key.info.spend) ~= "number"
+        or (key.info.max_budget ~= nil and type(key.info.max_budget) ~= "number")
+        or (key.info.budget_reset_at ~= nil and type(key.info.budget_reset_at) ~= "string")
+      then
         return nil, { kind = "api", message = "Invalid Regolo key info response" }
       end
       local info = key.info
@@ -256,10 +286,17 @@ function M.prepare(ctx, model, config)
       if type(logs) == "table" and type(logs.data) == "table" then
         for _, entry in ipairs(logs.data) do
           if
-            type(entry.model_group) == "string"
+            type(entry) == "table"
+            and type(entry.model_group) == "string"
             and type(entry.prompt_tokens) == "number"
+            and entry.prompt_tokens >= 0
+            and entry.prompt_tokens % 1 == 0
             and type(entry.completion_tokens) == "number"
+            and entry.completion_tokens >= 0
+            and entry.completion_tokens % 1 == 0
             and type(entry.total_tokens) == "number"
+            and entry.total_tokens >= 0
+            and entry.total_tokens % 1 == 0
             and type(entry.spend) == "number"
           then
             local row = by_model[entry.model_group]
@@ -364,6 +401,11 @@ function M.register()
   maki.api.register_provider({
     id = "regolo",
     display_name = "Regolo",
+    docs = {
+      auth_line = "`REGOLO_API_KEY`",
+      urls = { "https://api.regolo.ai/v1" },
+      features = "EU-hosted open-weight models with tool calling. The catalogue and prices are listed live from the API",
+    },
     models = M.models,
     discover = M.discover,
     prepare = M.prepare,

@@ -10,7 +10,9 @@ use maki_commands::CommandRegistry;
 use maki_config::PluginsConfig;
 use maki_lua::PluginHost;
 use maki_lua::{test_support::InMemoryFs, ui_sink::HostUi};
-use maki_providers::{Message, Model, ProviderEvent, RequestOptions, ThinkingConfig, UsageWindow};
+use maki_providers::{
+    ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, ThinkingConfig, UsageWindow,
+};
 use maki_storage::{
     StateDir,
     auth::{ProviderCredentials, load_provider_credentials, save_provider_credentials},
@@ -90,6 +92,8 @@ fn deepseek_discovery_rotation_stream_and_balance() {
     let server = HttpContract::start(vec![
         response(r#"{"data":[{"id":"z","max_model_len":12345,"max_output_length":4321,"input_modalities":["text","image"],"pricing":{"prompt":"0.5","completion":"1","cache_read":"0.1"}},{"id":"a"},{}]}"#),
         response(STREAM),
+        response(STREAM),
+        response(STREAM),
         response(r#"{"balance_infos":[{"currency":"USD","total_balance":"12","topped_up_balance":"10","granted_balance":"2"},{"currency":"CNY","total_balance":"3","topped_up_balance":"1","granted_balance":"2"},{"currency":"EUR","total_balance":"4","topped_up_balance":"3","granted_balance":"1"}]}"#),
     ]).unwrap();
     maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
@@ -149,6 +153,36 @@ fn deepseek_discovery_rotation_stream_and_balance() {
     let body: Value = serde_json::from_slice(&request.body).unwrap();
     assert_eq!(body["thinking"]["type"], "disabled");
     assert_eq!(body["stream_options"]["include_usage"], true);
+    let messages = [Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::Text {
+            text: "earlier".into(),
+        }],
+        ..Default::default()
+    }];
+    let tools = json!([{ "name": "lookup", "description": "lookup", "input_schema": {"type":"object", "properties":{}} }]);
+    let options = RequestOptions {
+        thinking: ThinkingConfig::Budget(2048),
+        fast: false,
+    };
+    smol::block_on(
+        provider.stream_message(&model, &messages, "system", &tools, &events, options, None),
+    )
+    .unwrap();
+    let request = server.requests.recv_timeout(TIMEOUT).unwrap().unwrap();
+    let body: Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(body["thinking"]["type"], "enabled");
+    assert_eq!(body["reasoning_effort"], "max");
+    assert_eq!(body["messages"][1]["reasoning_content"], "");
+    let mut reasoner = model.clone();
+    reasoner.id = "deepseek-reasoner".into();
+    smol::block_on(provider.stream_message(
+        &reasoner, &messages, "system", &tools, &events, options, None,
+    ))
+    .unwrap();
+    let request = server.requests.recv_timeout(TIMEOUT).unwrap().unwrap();
+    let body: Value = serde_json::from_slice(&request.body).unwrap();
+    assert!(body["messages"][1].get("reasoning_content").is_none());
     let usage = smol::block_on(provider.fetch_usage()).unwrap().unwrap();
     assert_eq!(usage.limits.len(), 3);
     assert!(matches!(usage.limits[0].kind, UsageWindow::Credits));

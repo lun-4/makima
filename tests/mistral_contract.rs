@@ -91,11 +91,26 @@ fn mistral_discovery_and_rotated_stream() {
     let server = HttpContract::start(vec![
         response(r#"{"data":[{"id":"chat","max_context_length":12345,"capabilities":{"completion_chat":true,"reasoning":false,"vision":true}},{"id":"other","capabilities":{"completion_chat":false}},{"id":"unknown","max_context_length":0,"capabilities":{"completion_chat":true}}]}"#),
         response(STREAM),
+        Response { status: "429 Too Many Requests".into(), headers: vec![("Retry-After".into(), "3".into())], steps: vec![Step::Chunk(b"rate limited".to_vec())] },
     ]).unwrap();
     maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
-    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-    host.load_source("mistral", include_str!("../plugins/mistral/init.lua"))
-        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut host = PluginHost::with_session_provider_preparer(
+        Arc::new(ToolRegistry::new()),
+        CommandRegistry::new(),
+        true,
+        Arc::new(InMemoryFs::new()),
+        Some(temp.path().to_path_buf()),
+        None,
+        HostUi::Frontend,
+    )
+    .unwrap();
+    host.load_builtins(&PluginsConfig {
+        enabled: true,
+        names: vec!["mistral".into()],
+        ..Default::default()
+    })
+    .unwrap();
     let snapshot = host.provider_registry().snapshot();
     let registration = snapshot.get("mistral").unwrap();
     let config = json!({"api_key_env": "MAKI_MISTRAL_TEST_MISSING_KEY", "api_key": "first, second", "base_url": format!("http://{}/v1/", server.addr)});
@@ -148,5 +163,24 @@ fn mistral_discovery_and_rotated_stream() {
     let body: Value = serde_json::from_slice(&request.body).unwrap();
     assert_eq!(body["reasoning_effort"], "high");
     assert_eq!(body["stream_options"]["include_usage"], true);
+    let err = smol::block_on(provider.stream_message(
+        &model,
+        &[Message::user("hello".into())],
+        "system",
+        &json!([]),
+        &events,
+        RequestOptions {
+            thinking: ThinkingConfig::Off,
+            fast: false,
+        },
+        None,
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, maki_providers::AgentError::Api { status: 429, message, retry_after: Some(delay) } if message == "rate limited" && *delay == Duration::from_secs(3)),
+        "unexpected error: {err:?}"
+    );
+    let request = server.requests.recv_timeout(TIMEOUT).unwrap().unwrap();
+    assert_eq!(request.header("x-affinity"), None);
     maki_lua::set_allowed_private_hosts(&[]);
 }

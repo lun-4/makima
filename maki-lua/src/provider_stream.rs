@@ -243,6 +243,7 @@ pub(crate) async fn run_hook(
     permissions: &PluginPermissions,
     source: crate::loader::SourceIdentity,
     provider: String,
+    endpoint: Option<crate::api::net::ConfiguredEndpoint>,
 ) -> Result<JsonValue, AgentError> {
     let config_error = |message: String| AgentError::Config { message };
     if generation.is_cancelled() {
@@ -259,7 +260,7 @@ pub(crate) async fn run_hook(
     };
     let scope = TaskScope::new(lua, TaskCell::new(cancel.clone(), None, None));
     let (context, _net_scope) =
-        crate::api::net::provider_context(lua, scope.handle().clone(), permissions)
+        crate::api::net::provider_context(lua, scope.handle().clone(), permissions, endpoint)
             .map_err(|e| config_error(e.to_string()))?;
     crate::provider_credentials::attach(
         lua,
@@ -312,15 +313,19 @@ pub(crate) async fn run_hook(
 
 /// Runs a stream callback on the Lua executor. Dropping this future closes its
 /// emitter immediately; cancellation also interrupts a suspended callback.
-pub async fn run_stream(
+pub(crate) async fn run_stream(
     lua: &Lua,
     stream: Function,
     request: JsonValue,
     sender: flume::Sender<ProviderEvent>,
     cancel: CancelToken,
     generation: CancelToken,
-    permissions: &PluginPermissions,
+    network: (
+        &PluginPermissions,
+        Option<crate::api::net::ConfiguredEndpoint>,
+    ),
 ) -> Result<StreamResponse, AgentError> {
+    let (permissions, endpoint) = network;
     let config_error = |message: String| AgentError::Config { message };
     let gate = Arc::new(Mutex::new(Gate {
         sender: Some(sender),
@@ -331,7 +336,7 @@ pub async fn run_stream(
         json_to_lua_with_nulls(lua, &request, true).map_err(|e| config_error(e.to_string()))?;
     let scope = TaskScope::new(lua, TaskCell::new(cancel.clone(), None, None));
     let (context, _net_scope) =
-        crate::api::net::provider_context(lua, scope.handle().clone(), permissions)
+        crate::api::net::provider_context(lua, scope.handle().clone(), permissions, endpoint)
             .map_err(|e| config_error(e.to_string()))?;
     let call = scope.scope_future(stream.call_async::<MultiValue>((context, request, emit)));
     let result = generation.race(cancel.race(call)).await;
@@ -410,7 +415,7 @@ mod tests {
             sender,
             cancel,
             CancelToken::none(),
-            &PluginPermissions::denied(),
+            (&PluginPermissions::denied(), None),
         ));
         assert!(result.is_ok(), "{result:?}");
         assert!(
@@ -452,7 +457,7 @@ mod tests {
                 sender,
                 CancelToken::none(),
                 CancelToken::none(),
-                &PluginPermissions::denied(),
+                (&PluginPermissions::denied(), None),
             ))
             .unwrap_err();
             assert_eq!(result.is_retryable(), retryable, "{error}");
@@ -566,7 +571,7 @@ mod tests {
                 sender,
                 CancelToken::none(),
                 CancelToken::none(),
-                &PluginPermissions::denied(),
+                (&PluginPermissions::denied(), None),
             ))
             .unwrap_err();
             assert_eq!(error.overflow(), expected, "{overflow}");
@@ -635,7 +640,7 @@ mod tests {
             sender,
             cancel,
             CancelToken::none(),
-            &PluginPermissions::denied(),
+            (&PluginPermissions::denied(), None),
         ));
         assert!(matches!(
             result.unwrap_err(),
@@ -670,7 +675,7 @@ mod tests {
             sender,
             CancelToken::none(),
             generation,
-            &permissions,
+            (&permissions, None),
         );
         let mut future = std::pin::pin!(future);
         assert!(smol::block_on(futures_lite::future::poll_once(future.as_mut())).is_none());

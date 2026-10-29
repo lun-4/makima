@@ -163,13 +163,22 @@ local function now_ms()
   return now.secs * MILLIS_PER_SECOND + math.floor(now.nanosecs / 1000000)
 end
 
-local function wait(ms)
+local function wait(ms, state)
   return maki.async.await(1, function(done)
     local timer, err = maki.defer_fn(function()
-      done(true)
+      state.timer = nil
+      if not state.cancelled then
+        done(true)
+      end
     end, math.ceil(ms))
     if not timer then
       done(nil, err)
+    else
+      state.timer = timer
+      if state.cancelled then
+        timer:stop()
+        state.timer = nil
+      end
     end
   end)
 end
@@ -178,6 +187,14 @@ function M.login(ctx, ui)
   if type(ui) ~= "table" or type(ui.device_challenge) ~= "function" then
     return nil, { kind = "config", message = "OpenAI device login requires interactive authentication" }
   end
+  local state = { cancelled = false }
+  maki.async.on_cancel(function()
+    state.cancelled = true
+    if state.timer then
+      state.timer:stop()
+      state.timer = nil
+    end
+  end)
   local session, err = M.start(ctx)
   if not session then
     return nil, err
@@ -187,12 +204,15 @@ function M.login(ctx, ui)
     return nil, challenge_err or { kind = "config", message = "OpenAI device authorization was not acknowledged" }
   end
   local deadline = now_ms() + POLL_TIMEOUT_MS
-  while now_ms() < deadline do
+  while not state.cancelled and now_ms() < deadline do
     local device, poll_err = M.poll(ctx, session)
     if device then
       local result, exchange_err = M.exchange(ctx, device, now_ms())
       if not result then
         return nil, exchange_err
+      end
+      if state.cancelled then
+        return nil, { kind = "config", message = "OpenAI device authorization cancelled" }
       end
       return ctx.credentials:write("chatgpt", result)
     end
@@ -203,12 +223,16 @@ function M.login(ctx, ui)
     if remaining <= 0 then
       break
     end
-    local ok, wait_err = wait(math.min(session.interval * MILLIS_PER_SECOND, remaining))
+    local ok, wait_err = wait(math.min(session.interval * MILLIS_PER_SECOND, remaining), state)
     if not ok then
       return nil, { kind = "config", message = "OpenAI device polling timer failed: " .. tostring(wait_err) }
     end
   end
-  return nil, { kind = "config", message = "OpenAI device authorization timed out" }
+  return nil,
+    {
+      kind = "config",
+      message = state.cancelled and "OpenAI device authorization cancelled" or "OpenAI device authorization timed out",
+    }
 end
 
 function M.refresh(ctx, current, now_ms)

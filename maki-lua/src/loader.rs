@@ -1552,6 +1552,66 @@ mod tests {
     }
 
     #[test]
+    fn google_trusted_core_uses_legacy_credentials() {
+        use maki_storage::auth::{ProviderCredentials, save_provider_credentials};
+        let state = tempfile::tempdir().unwrap();
+        let dir = maki_storage::StateDir::from_path(state.path().to_owned());
+        save_provider_credentials(
+            &dir,
+            "google",
+            &ProviderCredentials {
+                api_key: "first".into(),
+                host: None,
+            },
+        )
+        .unwrap();
+        let host = PluginHost::spawn(
+            Arc::new(ToolRegistry::new()),
+            CommandRegistry::new(),
+            true,
+            Arc::new(RealFs),
+            Some(state.path().to_owned()),
+            None,
+            HostUi::Frontend,
+        )
+        .unwrap();
+        host.send_load(
+            Arc::from("providers"),
+            "require('maki.gemini').register()".into(),
+            None,
+            PluginPermissions::trusted(),
+            PluginOpts::default(),
+            SourceIdentity::CoreProviders,
+        )
+        .unwrap();
+        let snapshot = host.provider_registry().snapshot();
+        let factory = &snapshot.get("google").unwrap().factory;
+        let config =
+            serde_json::json!({"api_key_env": "MAKI_GOOGLE_TEST_UNSET", "api_key": "fallback"});
+        assert_eq!(
+            smol::block_on(factory.auth_status(&config)).unwrap()["source"],
+            "stored"
+        );
+        let model = maki_providers::Model::from_spec("google/gemini-2.5-pro").unwrap();
+        let (_, provider) = smol::block_on(factory.prepare(&model, &config)).unwrap();
+        save_provider_credentials(
+            &dir,
+            "google",
+            &ProviderCredentials {
+                api_key: "second".into(),
+                host: None,
+            },
+        )
+        .unwrap();
+        smol::block_on(provider.reload_auth()).unwrap();
+        smol::block_on(factory.logout(&config)).unwrap();
+        assert_eq!(
+            smol::block_on(factory.auth_status(&config)).unwrap()["source"],
+            "config"
+        );
+    }
+
+    #[test]
     fn provider_staging_follows_plugin_transactions() {
         let reg = Arc::new(ToolRegistry::new());
         const MINIMAL_SCHEMA: &str = "{ type = 'object', properties = {} }";

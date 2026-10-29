@@ -93,6 +93,19 @@ fn regolo_registration_discovery_usage_and_stream() {
         smol::block_on(registration.factory.auth_status(&saved_config)).unwrap()["source"],
         "stored"
     );
+    let saved_model = Model::from_spec("regolo/qwen3-coder-next").unwrap();
+    let (_, saved_provider) =
+        smol::block_on(registration.factory.prepare(&saved_model, &saved_config)).unwrap();
+    save_provider_credentials(
+        &state,
+        "regolo",
+        &ProviderCredentials {
+            api_key: "new-saved-key".into(),
+            host: None,
+        },
+    )
+    .unwrap();
+    smol::block_on(saved_provider.reload_auth()).unwrap();
     smol::block_on(registration.factory.logout(&saved_config)).unwrap();
     assert!(load_provider_credentials(&state, "regolo").is_none());
     assert_eq!(

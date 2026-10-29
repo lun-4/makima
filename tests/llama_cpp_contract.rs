@@ -22,6 +22,8 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 #[test_case(r#"{"role":"router","modalities":{"vision":true}}"#, r#"{"data":[{"id":"z","status":{"args":["--fit-ctx","4096"]}},{"id":"a","meta":{"n_ctx":8192},"architecture":{"input_modalities":["text","image"],"output_modalities":["text"]}},{"id":"excluded","architecture":{"input_modalities":["image"],"output_modalities":["text"]}}]}"#, vec![("a", 8192, Some(true)), ("z", 4096, None)] ; "router")]
 #[test_case(r#"{"n_ctx":9999,"modalities":{"vision":false}}"#, r#"{"data":[{"id":"single","meta":{"n_ctx":2048}}]}"#, vec![("single", 2048, Some(false))] ; "single")]
 #[test_case(r#"{"n_ctx":6000,"modalities":{"vision":true}}"#, r#"{"data":[{"id":"legacy","max_model_len":0}]}"#, vec![("legacy", 6000, Some(true))] ; "legacy")]
+#[test_case(r#"{"role":"router","n_ctx":9000}"#, r#"{"data":[{"id":"fallback","status":{"args":["--ctx-size","0","--fit-ctx","4096"]}},{"id":"meta","meta":{"n_ctx":8192},"status":{"args":["--ctx-size","2048"]}},{"id":"unknown"}]}"#, vec![("fallback", 4096, None), ("meta", 8192, None), ("unknown", 128000, None)] ; "router_context_precedence")]
+#[test_case(r#"{"n_ctx":9000}"#, r#"{"data":[{"id":"single","meta":{"n_ctx":0}}]}"#, vec![("single", 128000, None)] ; "single_does_not_use_props_context")]
 fn discovery_modes_reach_http(props: &str, models: &str, expected: Vec<(&str, u32, Option<bool>)>) {
     let _guard = TEST_LOCK.lock().unwrap();
     let response = |body: &str| Response {

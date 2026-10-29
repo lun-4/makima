@@ -32,12 +32,14 @@ M.models = {
 }
 
 function M.supports_thinking(id)
-  local major, minor = id:match("^glm%-(%d+)%.(%d+)")
-  if not major then
-    major = id:match("^glm%-(%d+)")
-    minor = 0
+  local version = id:match("^glm%-(.+)$")
+  if not version then
+    return false
   end
-  major, minor = tonumber(major), tonumber(minor)
+  local major_text, minor_text = version:match("^([^.%-]+)[.%-]([^ .%-]+)")
+  major_text = major_text or version:match("^([^.%-]+)")
+  local major = major_text and major_text:match("^%d+$") and tonumber(major_text)
+  local minor = minor_text and minor_text:match("^%d+$") and tonumber(minor_text) or 0
   return major ~= nil and (major > 5 or (major == 5 and minor >= 2))
 end
 
@@ -53,7 +55,10 @@ function M.build_request(request)
     elseif intent.mode == "adaptive" then
       body.reasoning_effort = "high"
     else
-      local result, resolve_err = require("maki.thinking").resolve(intent, thinking)
+      local maximum = request.model.max_output_tokens
+        and math.max(1024, math.floor(request.model.max_output_tokens / 2))
+      local result, resolve_err =
+        require("maki.thinking").resolve(intent, thinking, maximum and { max_tokens = maximum } or nil)
       if not result then
         return nil, resolve_err
       end
@@ -335,7 +340,16 @@ function M.prepare(ctx, model_value, config)
       local result, stream_err = chat.stream(response, emit)
       response:close()
       if stream_err and stream_err.kind == "api" then
-        return nil, { kind = "api", status = stream_err.status, message = "Z.AI request failed" }
+        local status = stream_err.status
+        local message = stream_err.message or "Z.AI request failed"
+        local retry = stream_err.retry_after_ms
+        if
+          (status == 429 or status and status >= 500)
+          and (message:find("1113", 1, true) or message:find("nsufficien", 1, true))
+        then
+          status, retry = 402, nil
+        end
+        return nil, { kind = "api", status = status, message = safe_message(message), retry_after_ms = retry }
       end
       return result, stream_err
     end,
@@ -346,6 +360,10 @@ function M.register()
   maki.api.register_provider({
     id = "zai",
     display_name = "Z.AI",
+    docs = {
+      auth_line = "`ZHIPU_API_KEY` (shared across both endpoints)",
+      urls = { "https://api.z.ai/api/paas/v4", "https://api.z.ai/api/coding/paas/v4" },
+    },
     models = M.models,
     prepare = M.prepare,
     discover = M.discover,

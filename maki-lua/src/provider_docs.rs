@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use maki_providers::model::{ModelInfo, ModelTier};
 use mlua::{Error, Lua, Result, Table, Value, VmState};
 
+use crate::api::util::convert::json_to_lua_with_nulls;
 use crate::provider_staging::model_descriptors;
 
 const MEMORY_LIMIT: usize = 32 * 1024 * 1024;
@@ -47,6 +48,7 @@ fn module_source(name: &str) -> Option<&'static str> {
         "maki.regolo" => Some(include_str!("../../plugins/lib/maki/regolo.lua")),
         "maki.zai" => Some(include_str!("../../plugins/lib/maki/zai.lua")),
         "maki.deepseek" => Some(include_str!("../../plugins/lib/maki/deepseek.lua")),
+        "maki.llama_cpp" => Some(include_str!("../../plugins/lib/maki/llama_cpp.lua")),
         "maki.openai" => Some(include_str!("../../plugins/lib/maki/openai.lua")),
         "maki.openai_auth" => Some(include_str!("../../plugins/lib/maki/openai_auth.lua")),
         "maki.json_response" => Some(include_str!("../../plugins/lib/maki/json_response.lua")),
@@ -218,8 +220,26 @@ fn load_sources(sources: &[(&str, &str)]) -> Result<Vec<OfflineProvider>> {
             Ok(())
         })?,
     )?;
+    let json = lua.create_table()?;
+    json.set(
+        "decode",
+        lua.create_function(|lua, (input, opts): (String, Option<Table>)| {
+            let preserve_null = match opts {
+                Some(opts) => opts.get::<Option<bool>>("preserve_null")?.unwrap_or(false),
+                None => false,
+            };
+            match serde_json::from_str::<serde_json::Value>(&input) {
+                Ok(value) => Ok((
+                    Some(json_to_lua_with_nulls(lua, &value, preserve_null)?),
+                    None,
+                )),
+                Err(err) => Ok((None, Some(err.to_string()))),
+            }
+        })?,
+    )?;
     let maki = lua.create_table()?;
     maki.set("api", api)?;
+    maki.set("json", json)?;
     globals.set("maki", maki)?;
     lua.sandbox(true)?;
     for (name, source) in sources {
@@ -239,6 +259,7 @@ pub fn load_bundled_providers() -> Result<Vec<OfflineProvider>> {
         ("google", include_str!("../../plugins/google/init.lua")),
         ("mistral", include_str!("../../plugins/mistral/init.lua")),
         ("openai", include_str!("../../plugins/openai/init.lua")),
+        ("ollama", include_str!("../../plugins/ollama/init.lua")),
         ("requesty", include_str!("../../plugins/requesty/init.lua")),
         (
             "llama-cpp",
@@ -367,12 +388,29 @@ mod tests {
                 "{id}"
             );
         }
-        for id in ["openai", "requesty", "llama-cpp", "tensorx"] {
+        for id in ["openai", "ollama", "requesty", "llama-cpp", "tensorx"] {
             assert!(
                 providers.iter().any(|p| p.id == id && p.models.is_empty()),
                 "{id}"
             );
         }
+    }
+
+    #[test]
+    fn offline_json_decode_is_restricted_and_preserves_values() {
+        let source = r#"
+            local array = assert(maki.json.decode('[]'))
+            local value = assert(maki.json.decode('{"items":[null,2],"n":null}', {preserve_null=true}))
+            local null = assert(maki.json.decode('null', {preserve_null=true}))
+            assert(getmetatable(array) == getmetatable(value.items))
+            assert(value.items[1] == null and value.n == null and value.items[2] == 2)
+            assert(maki.json.decode('null') == nil)
+            local invalid, err = maki.json.decode('{')
+            assert(invalid == nil and type(err) == 'string')
+            assert(maki.json.encode == nil and maki.json.null == nil)
+            maki.api.register_provider({id='test'})
+        "#;
+        assert_eq!(load_sources(&[("test", source)]).unwrap()[0].id, "test");
     }
 
     #[test]

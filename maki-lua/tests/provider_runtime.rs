@@ -156,6 +156,33 @@ fn logout_cancels_pending_login_without_existing_credentials() {
 }
 
 #[test]
+fn logout_revokes_prepared_instance() {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source(
+        "fixture",
+        r#"
+        maki.api.register_provider({ id = 'fixture', models = {{ id = 'model' }},
+            logout = function() return true end,
+            prepare = function(_, model) return {
+                model = model, stream = function() end,
+                refresh_auth = function() return true end,
+            } end,
+        })
+    "#,
+    )
+    .unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let factory = &snapshot.get("fixture").unwrap().factory;
+    let model = snapshot
+        .resolve_model("fixture/model", &ModelPolicy::default())
+        .unwrap();
+    let (_, provider) = smol::block_on(factory.prepare(&model, &json!({}))).unwrap();
+    smol::block_on(provider.refresh_auth()).unwrap();
+    smol::block_on(factory.logout(&json!({}))).unwrap();
+    assert!(smol::block_on(provider.refresh_auth()).is_err());
+}
+
+#[test]
 fn interactive_login_dispatches_input_and_cancellation() {
     use maki_providers::provider::BoxFuture;
     use maki_providers::provider_registry::{

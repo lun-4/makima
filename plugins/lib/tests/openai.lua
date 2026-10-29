@@ -321,8 +321,12 @@ do
 end
 
 do
-  local previous_now, previous_await, previous_defer = maki.time.now, maki.async.await, maki.defer_fn
-  local millis, waits, written = 0, {}, nil
+  local previous_now, previous_await, previous_defer, previous_cancel =
+    maki.time.now, maki.async.await, maki.defer_fn, maki.async.on_cancel
+  local millis, waits, written, cancel = 0, {}, nil, nil
+  maki.async.on_cancel = function(callback)
+    cancel = callback
+  end
   maki.time.now = function()
     return { secs = math.floor(millis / 1000), nanosecs = (millis % 1000) * 1000000 }
   end
@@ -383,7 +387,28 @@ do
   end
   local ok, err = auth.login(ctx, ui)
   assert(not ok and err.kind == "config" and written == nil)
-  maki.time.now, maki.async.await, maki.defer_fn = previous_now, previous_await, previous_defer
+  ui.device_challenge = function()
+    return true
+  end
+  replies = {
+    { status = 200, body = [[{"device_auth_id":"device","user_code":"user"}]] },
+    { status = 403 },
+  }
+  local stopped = false
+  maki.defer_fn = function(callback)
+    local timer = {
+      stop = function()
+        stopped = true
+      end,
+    }
+    cancel()
+    callback()
+    return timer
+  end
+  ok = auth.login(ctx, ui)
+  assert(not ok and stopped and written == nil and #replies == 0)
+  maki.time.now, maki.async.await, maki.defer_fn, maki.async.on_cancel =
+    previous_now, previous_await, previous_defer, previous_cancel
 end
 
 local usage = assert(

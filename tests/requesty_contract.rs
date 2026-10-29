@@ -9,7 +9,7 @@ use maki_agent::tools::ToolRegistry;
 use maki_commands::CommandRegistry;
 use maki_config::PluginsConfig;
 use maki_lua::{PluginHost, test_support::InMemoryFs, ui_sink::HostUi};
-use maki_providers::{Message, Model, RequestOptions, ThinkingConfig};
+use maki_providers::{AgentError, Message, Model, RequestOptions, ThinkingConfig};
 use maki_storage::{
     StateDir,
     auth::{ProviderCredentials, load_provider_credentials, save_provider_credentials},
@@ -86,13 +86,16 @@ fn requesty_discovery_filters_and_merges_catalogs() {
         response("200 OK", CATALOG),
     ])
     .unwrap();
-    maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
     let state = tempfile::tempdir().unwrap();
     let host = requesty_host(state.path());
+    let mut resolver = maki_lua::test_support::ProviderEndpointResolver::default();
+    resolver.add("requesty.fixture.invalid", 8080, vec![server.addr]);
+    resolver.allow_private_host("requesty.fixture.invalid", 8080);
+    host.install_provider_resolver_for_tests(resolver).unwrap();
     let snapshot = host.provider_registry().snapshot();
     let models = smol::block_on(snapshot.get("requesty").unwrap().factory.discover(&json!({
         "api_key": "fixture-key", "api_key_env": "REQUESTY_CONTRACT_UNUSED_KEY",
-        "base_url": format!("http://{}/v1/", server.addr)
+        "base_url": "http://requesty.fixture.invalid:8080/v1/"
     })))
     .unwrap()
     .unwrap();
@@ -129,6 +132,10 @@ fn requesty_discovery_filters_and_merges_catalogs() {
             .unwrap();
         assert_eq!(request.method, "GET");
         assert_eq!(request.header("authorization"), Some("Bearer fixture-key"));
+        assert_eq!(
+            request.header("host"),
+            Some("requesty.fixture.invalid:8080")
+        );
         paths.push(request.target);
     }
     paths.sort();
@@ -174,6 +181,41 @@ fn requesty_discovery_tolerates_one_failure_and_rejects_two() {
             assert_eq!(request.header("authorization"), Some("Bearer fixture-key"));
         }
     }
+}
+
+#[test]
+fn requesty_stream_preserves_retry_after_without_leaking_body() {
+    let server = HttpContract::start(vec![Response {
+        status: "429 Too Many Requests".into(),
+        headers: vec![("Retry-After".into(), "3".into())],
+        steps: vec![Step::Chunk(b"private upstream detail".to_vec())],
+    }])
+    .unwrap();
+    maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
+    let state = tempfile::tempdir().unwrap();
+    let host = requesty_host(state.path());
+    let snapshot = host.provider_registry().snapshot();
+    let model = Model::from_spec("requesty/openai/gpt-5.5").unwrap();
+    let (model, provider) = smol::block_on(snapshot.get("requesty").unwrap().factory.prepare(&model, &json!({
+        "api_key": "fixture-key", "api_key_env": "REQUESTY_CONTRACT_UNUSED_KEY", "base_url": format!("http://{}/v1", server.addr)
+    }))).unwrap();
+    let (events, _receiver) = flume::unbounded();
+    let error = smol::block_on(provider.stream_message(
+        &model,
+        &[Message::user("prompt".into())],
+        "system",
+        &json!([]),
+        &events,
+        RequestOptions {
+            thinking: ThinkingConfig::Off,
+            fast: false,
+        },
+        None,
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(error, AgentError::Api { status: 429, message, retry_after: Some(delay) } if message == "Requesty request failed" && delay == Duration::from_secs(3))
+    );
 }
 
 #[test]

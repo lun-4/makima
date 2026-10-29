@@ -96,7 +96,7 @@ local function credentials(ctx, config)
   if not key or key == "" then
     if ctx and ctx.credentials then
       local saved, err = ctx.credentials:read("api_key")
-      if err and not config.api_key then
+      if err then
         return nil, err
       end
       if saved ~= nil then
@@ -193,6 +193,9 @@ function M.discover(ctx, config)
       end
     end
   end
+  table.sort(models, function(a, b)
+    return a.id < b.id
+  end)
   return models
 end
 
@@ -203,6 +206,22 @@ function M.prepare(ctx, model, config)
     return nil, err
   end
   local index = 1
+  local function safe_message(message)
+    if type(message) ~= "string" or message == "" then
+      return "Mistral request failed"
+    end
+    for _, key in ipairs(keys) do
+      if message:find(key, 1, true) then
+        return "Mistral request failed"
+      end
+    end
+    for _, value in pairs(config.headers or {}) do
+      if type(value) == "string" and value ~= "" and message:find(value, 1, true) then
+        return "Mistral request failed"
+      end
+    end
+    return message
+  end
   return {
     model = model,
     key_count = #keys,
@@ -223,7 +242,10 @@ function M.prepare(ctx, model, config)
         return nil, { kind = "config", message = tostring(encode_err) }
       end
       local request_headers = headers(config, keys[index])
-      if request.session_id then
+      if request.session_id ~= nil and request.session_id ~= maki.json.null() then
+        if type(request.session_id) ~= "string" then
+          return nil, { kind = "config", message = "Invalid Mistral session ID" }
+        end
         request_headers["x-affinity"] = request.session_id
       end
       local response, send_err = ctx:send({
@@ -235,9 +257,30 @@ function M.prepare(ctx, model, config)
       if not response then
         return nil, send_err
       end
-      if response.status < 200 or response.status >= 300 then
+      if response.status ~= 200 then
+        local chunks, size = {}, 0
+        while size < 65536 do
+          local chunk = response:read()
+          if not chunk or chunk == "" then
+            break
+          end
+          size = size + #chunk
+          if size > 65536 then
+            chunks = {}
+            break
+          end
+          chunks[#chunks + 1] = chunk
+        end
+        local retry = response.headers and response.headers["retry-after"]
+        local seconds = type(retry) == "string" and tonumber(retry:match("^%s*(%d+)%s*$"))
         response:close()
-        return nil, { kind = "api", status = response.status, message = "Mistral request failed" }
+        return nil,
+          {
+            kind = "api",
+            status = response.status,
+            message = safe_message(table.concat(chunks)),
+            retry_after_ms = seconds and seconds > 0 and seconds <= 9007199254740 and seconds * 1000 or nil,
+          }
       end
       local result, stream_err = require("maki.chat_completions").stream(response, emit)
       response:close()
