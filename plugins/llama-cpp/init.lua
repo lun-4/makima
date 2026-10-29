@@ -49,14 +49,32 @@ local function headers(settings, index)
   return result
 end
 
+local function api_error(response)
+  local chunks, size = {}, 0
+  local limit = 4 * 1024 * 1024
+  while size < limit do
+    local chunk = response:read()
+    if not chunk then
+      chunks = { "unable to read error body" }
+      break
+    end
+    if chunk == "" then
+      break
+    end
+    chunks[#chunks + 1] = chunk:sub(1, limit - size)
+    size = size + #chunk
+  end
+  response:close()
+  return { kind = "api", status = response.status, message = table.concat(chunks) }
+end
+
 local function get_json(ctx, settings, path)
   local response, err = ctx:send({ url = settings.root .. path, method = "GET", headers = headers(settings, 1) })
   if not response then
     return nil, err
   end
   if response.status < 200 or response.status >= 300 then
-    response:close()
-    return nil, { kind = "api", status = response.status, message = "LlamaCpp request failed" }
+    return nil, api_error(response)
   end
   local chunks, size = {}, 0
   while true do
@@ -158,25 +176,6 @@ local function discover(ctx, config)
     return a.id < b.id
   end)
   return models
-end
-
-local function api_error(response)
-  local chunks, size = {}, 0
-  local limit = 4 * 1024 * 1024
-  while size < limit do
-    local chunk = response:read()
-    if not chunk then
-      chunks = { "unable to read error body" }
-      break
-    end
-    if chunk == "" then
-      break
-    end
-    chunks[#chunks + 1] = chunk:sub(1, limit - size)
-    size = size + #chunk
-  end
-  response:close()
-  return { kind = "api", status = response.status, message = table.concat(chunks) }
 end
 
 local function merge_body(target, fragment)

@@ -49,6 +49,7 @@ assert(mistral.login(ctx, {
 assert(mistral.auth_status(ctx, config).configured)
 local instance = assert(mistral.prepare(ctx, request.model, config))
 assert(instance.key_count == 1)
+assert(saved.api_key == "saved-key")
 assert(mistral.logout(ctx) and saved == nil)
 local empty, err = mistral.login(ctx, {
   input = function()
@@ -56,3 +57,28 @@ local empty, err = mistral.login(ctx, {
   end,
 })
 assert(not empty and err.kind == "config")
+assert(mistral.auth_status(ctx, config).source == "config")
+
+local response_closed = false
+local response = {
+  status = 200,
+  read = function(self)
+    if self.done then
+      return ""
+    end
+    self.done = true
+    return [[{"data":[{"id":"yes","max_context_length":8192,"capabilities":{"completion_chat":true,"reasoning":false,"vision":true}},{"id":"no","capabilities":{"completion_chat":false}},{"id":"unknown","capabilities":{"completion_chat":true}}]}]]
+  end,
+  close = function()
+    response_closed = true
+  end,
+}
+ctx.send = function(_, req)
+  assert(req.url:match("/models$") and req.headers.Authorization == "Bearer config-key")
+  return response
+end
+local models = assert(mistral.discover(ctx, config))
+assert(response_closed and #models == 2)
+assert(models[1].id == "yes" and models[1].context_window == 8192)
+assert(models[1].supports_thinking == false and models[1].supports_vision == true)
+assert(models[2].supports_thinking == nil and models[2].supports_vision == false)

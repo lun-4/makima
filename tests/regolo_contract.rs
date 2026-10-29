@@ -34,6 +34,9 @@ fn regolo_registration_discovery_usage_and_stream() {
         response("200 OK", r#"{"info":{"spend":2.5,"max_budget":10,"budget_reset_at":"2025-01-02T03:04:05Z"}}"#),
         response("200 OK", r#"{"sum_api_requests":3,"sum_total_tokens":42}"#),
         response("200 OK", r#"{"data":[{"model_group":"chat","prompt_tokens":10,"completion_tokens":3,"total_tokens":13,"spend":0.02},{"model_group":"chat","prompt_tokens":5,"completion_tokens":2,"total_tokens":7,"spend":0.01}]}"#),
+        response("200 OK", r#"{"info":{"spend":1,"max_budget":0,"budget_reset_at":"invalid"}}"#),
+        response("503 Service Unavailable", "unavailable"),
+        response("200 OK", r#"{"data":[{"model_group":"chat","prompt_tokens":1,"completion_tokens":2,"total_tokens":3,"spend":1},{"model_group":"broken"}]}"#),
         response("200 OK", concat!(
             "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":4}}}\n\n",
@@ -140,6 +143,16 @@ fn regolo_registration_discovery_usage_and_stream() {
                     .starts_with("start_date=")
             );
         }
+        assert_eq!(request.header("authorization"), Some("Bearer second"));
+    }
+    let partial = smol::block_on(provider.fetch_usage()).unwrap().unwrap();
+    assert_eq!(partial.limits.len(), 1);
+    assert_eq!(partial.limits[0].percentage, None);
+    assert_eq!(partial.limits[0].reset_at, None);
+    assert!(partial.by_model_today.is_empty());
+    for path in ["/key/info", "/global/activity", "/spend/logs/v2"] {
+        let request = server.requests.recv_timeout(TIMEOUT).unwrap().unwrap();
+        assert_eq!(request.path_and_query().0, path);
         assert_eq!(request.header("authorization"), Some("Bearer second"));
     }
     let (events, received) = flume::unbounded();

@@ -99,6 +99,62 @@ fn factory_auth_hooks_run_without_preparing_and_revoke_on_unload() {
 }
 
 #[test]
+fn interactive_login_dispatches_input_and_cancellation() {
+    use maki_providers::provider::BoxFuture;
+    use maki_providers::provider_registry::{
+        InteractionRequest, InteractionResponse, InteractionService,
+    };
+
+    struct Service(bool);
+    impl InteractionService for Service {
+        fn interact(
+            &self,
+            request: InteractionRequest,
+        ) -> BoxFuture<'_, Result<InteractionResponse, AgentError>> {
+            assert_eq!(
+                request,
+                InteractionRequest::Input {
+                    prompt: "Key".into(),
+                    secret: true,
+                    optional: false
+                }
+            );
+            Box::pin(async move {
+                Ok(if self.0 {
+                    InteractionResponse::Cancelled
+                } else {
+                    InteractionResponse::Input(Some("key".into()))
+                })
+            })
+        }
+    }
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source(
+        "fixture",
+        r#"
+        maki.api.register_provider({ id = 'fixture', models = {{ id = 'offline' }},
+            auth = {{ id = 'key', label = 'Key', login = function(_, ui)
+                assert(ui:input('Key', true, false) == 'key')
+                return true
+            end }},
+            prepare = function() error('unused') end,
+        })
+    "#,
+    )
+    .unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let factory = &snapshot.get("fixture").unwrap().factory;
+    assert_eq!(
+        smol::block_on(factory.login_interactive("key", Arc::new(Service(false)))).unwrap(),
+        json!(true)
+    );
+    assert!(matches!(
+        smol::block_on(factory.login_interactive("key", Arc::new(Service(true)))),
+        Err(AgentError::Cancelled)
+    ));
+}
+
+#[test]
 fn factory_rejects_malformed_auth_status() {
     let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
     host.load_source(

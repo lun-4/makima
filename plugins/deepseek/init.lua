@@ -27,11 +27,7 @@ local models = {
   },
 }
 
-local function credentials(config)
-  local key = maki.uv.os_getenv(config.api_key_env or "DEEPSEEK_API_KEY")
-  if not key or key == "" then
-    key = config.api_key
-  end
+local function split_keys(key)
   local keys = {}
   for part in (key or ""):gmatch("[^,]+") do
     local trimmed = part:match("^%s*(.-)%s*$")
@@ -39,10 +35,55 @@ local function credentials(config)
       keys[#keys + 1] = trimmed
     end
   end
+  return keys
+end
+
+local function credentials(ctx, config)
+  local keys = split_keys(maki.uv.os_getenv(config.api_key_env or "DEEPSEEK_API_KEY"))
+  if #keys > 0 then
+    return keys, nil, "env"
+  end
+  local saved, err = ctx.credentials:read("api_key")
+  if err then
+    return nil, err
+  end
+  if saved ~= nil then
+    if type(saved) ~= "table" or type(saved.api_key) ~= "string" or saved.api_key == "" then
+      return nil, { kind = "config", message = "Invalid DeepSeek credentials" }
+    end
+    return { saved.api_key }, nil, "stored"
+  end
+  keys = split_keys(config.api_key)
   if #keys == 0 then
     return nil, { kind = "config", message = "DeepSeek API key is not configured" }
   end
-  return keys
+  return keys, nil, "config"
+end
+
+local function auth_status(ctx, config)
+  local keys, err, source = credentials(ctx, config or {})
+  if not keys then
+    if err and err.message ~= "DeepSeek API key is not configured" then
+      return nil, err
+    end
+    return { configured = false }
+  end
+  return { configured = true, source = source, method = "api_key" }
+end
+
+local function login(ctx, ui)
+  local key, err = ui:input("DeepSeek API key", true, false)
+  if err then
+    return nil, err
+  end
+  if not key then
+    return false
+  end
+  key = key:match("^%s*(.-)%s*$")
+  if key == "" then
+    return nil, { kind = "config", message = "DeepSeek API key is not configured" }
+  end
+  return ctx.credentials:write("api_key", { api_key = key })
 end
 
 local function headers(config, key)
@@ -59,7 +100,8 @@ local function headers(config, key)
 end
 
 local function base_url(config)
-  return (config.base_url or "https://api.deepseek.com"):gsub("/+$", "")
+  local override = maki.uv.os_getenv("DEEPSEEK_BASE_URL")
+  return ((override and override ~= "" and override) or config.base_url or "https://api.deepseek.com"):gsub("/+$", "")
 end
 
 local function get_json(ctx, url, request_headers)
@@ -78,7 +120,7 @@ end
 
 local function discover(ctx, config)
   config = config or {}
-  local keys, err = credentials(config)
+  local keys, err = credentials(ctx, config)
   if not keys then
     return nil, err
   end
@@ -126,9 +168,9 @@ local function discover(ctx, config)
   return result, nil
 end
 
-local function prepare(_, model, config)
+local function prepare(ctx, model, config)
   config = config or {}
-  local keys, err = credentials(config)
+  local keys, err = credentials(ctx, config)
   if not keys then
     return nil, err
   end
@@ -278,6 +320,11 @@ maki.api.register_provider({
     features = "Thinking mode toggle (on/off), open-weight models",
   },
   models = models,
+  auth = { { id = "api_key", label = "API key", login = login } },
+  auth_status = auth_status,
+  logout = function(ctx)
+    return ctx.credentials:delete("api_key")
+  end,
   discover = discover,
   prepare = prepare,
 })

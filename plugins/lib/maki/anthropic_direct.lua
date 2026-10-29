@@ -208,6 +208,19 @@ local function base_url(config)
   return base:match("^[^?#]*"):gsub("/+$", ""):gsub("/v1/messages$", "")
 end
 
+local function auth_headers(config, key)
+  local headers = { ["x-api-key"] = key, ["anthropic-version"] = "2023-06-01" }
+  for name, value in pairs(config.headers or {}) do
+    for existing in pairs(headers) do
+      if existing:lower() == name:lower() then
+        headers[existing] = nil
+      end
+    end
+    headers[name] = value
+  end
+  return headers
+end
+
 function M.discover(ctx, config)
   config = config or {}
   local keys, err = credentials(ctx, config)
@@ -223,7 +236,7 @@ function M.discover(ctx, config)
     local response, send_err = ctx:send({
       url = base_url(config) .. path,
       method = "GET",
-      headers = { ["x-api-key"] = keys[1], ["anthropic-version"] = "2023-06-01" },
+      headers = auth_headers(config, keys[1]),
     })
     if not response then
       return nil, send_err
@@ -286,18 +299,6 @@ function M.prepare(ctx, model, config)
     return message
   end
   local base = base_url(config)
-  local function auth_headers()
-    local headers = { ["x-api-key"] = keys[index], ["anthropic-version"] = "2023-06-01" }
-    for name, value in pairs(config.headers or {}) do
-      for existing in pairs(headers) do
-        if existing:lower() == name:lower() then
-          headers[existing] = nil
-        end
-      end
-      headers[name] = value
-    end
-    return headers
-  end
   return {
     model = model,
     key_count = #keys,
@@ -317,7 +318,7 @@ function M.prepare(ctx, model, config)
       return true
     end,
     fetch_usage = function(usage_ctx)
-      return M.fetch_usage(usage_ctx, base, auth_headers(), base)
+      return M.fetch_usage(usage_ctx, base, auth_headers(config, keys[index]), base)
     end,
     stream = function(ctx, request, emit)
       local body, err = messages.build_request(request)
@@ -328,7 +329,7 @@ function M.prepare(ctx, model, config)
       if not encoded then
         return nil, { kind = "config", message = tostring(encode_err) }
       end
-      local headers = auth_headers()
+      local headers = auth_headers(config, keys[index])
       headers["content-type"] = "application/json"
       headers["anthropic-beta"] = messages.beta_header(request)
       local response, send_err =

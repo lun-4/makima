@@ -6,8 +6,15 @@ use std::time::Duration;
 
 use http_contract::{HttpContract, Response, Step};
 use maki_agent::tools::ToolRegistry;
+use maki_commands::CommandRegistry;
+use maki_config::PluginsConfig;
 use maki_lua::PluginHost;
+use maki_lua::{test_support::InMemoryFs, ui_sink::HostUi};
 use maki_providers::{Message, Model, ProviderEvent, RequestOptions, ThinkingConfig, UsageWindow};
+use maki_storage::{
+    StateDir,
+    auth::{ProviderCredentials, load_provider_credentials, save_provider_credentials},
+};
 use serde_json::{Value, json};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -25,8 +32,61 @@ fn response(body: &str) -> Response {
     }
 }
 
+fn deepseek_legacy_credentials_discovery_and_logout() {
+    let server = HttpContract::start(vec![response(r#"{"data":[{"id":"discovered"}]}"#)]).unwrap();
+    maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
+    let temp = tempfile::tempdir().unwrap();
+    let state = StateDir::from_path(temp.path().to_path_buf());
+    save_provider_credentials(
+        &state,
+        "deepseek",
+        &ProviderCredentials {
+            api_key: "saved-key".into(),
+            host: None,
+        },
+    )
+    .unwrap();
+    let mut host = PluginHost::with_session_provider_preparer(
+        Arc::new(ToolRegistry::new()),
+        CommandRegistry::new(),
+        true,
+        Arc::new(InMemoryFs::new()),
+        Some(temp.path().to_path_buf()),
+        None,
+        HostUi::Frontend,
+    )
+    .unwrap();
+    host.load_builtins(&PluginsConfig {
+        enabled: true,
+        names: vec!["deepseek".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let factory = &snapshot.get("deepseek").unwrap().factory;
+    let config = json!({"api_key_env":"MISSING_DEEPSEEK_CONTRACT_KEY", "api_key":"config-key", "base_url":format!("http://{}", server.addr)});
+    assert_eq!(
+        smol::block_on(factory.auth_status(&config)).unwrap()["source"],
+        "stored"
+    );
+    assert_eq!(
+        smol::block_on(factory.discover(&config)).unwrap().unwrap()[0].id,
+        "discovered"
+    );
+    let request = server.requests.recv_timeout(TIMEOUT).unwrap().unwrap();
+    assert_eq!(request.header("authorization"), Some("Bearer saved-key"));
+    smol::block_on(factory.logout(&config)).unwrap();
+    assert!(load_provider_credentials(&state, "deepseek").is_none());
+    assert_eq!(
+        smol::block_on(factory.auth_status(&config)).unwrap()["source"],
+        "config"
+    );
+    maki_lua::set_allowed_private_hosts(&[]);
+}
+
 #[test]
 fn deepseek_discovery_rotation_stream_and_balance() {
+    deepseek_legacy_credentials_discovery_and_logout();
     let server = HttpContract::start(vec![
         response(r#"{"data":[{"id":"z","max_model_len":12345,"max_output_length":4321,"input_modalities":["text","image"],"pricing":{"prompt":"0.5","completion":"1","cache_read":"0.1"}},{"id":"a"},{}]}"#),
         response(STREAM),
@@ -34,10 +94,12 @@ fn deepseek_discovery_rotation_stream_and_balance() {
     ]).unwrap();
     maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
     let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-    let source = include_str!("../plugins/deepseek/init.lua").replace(
-        "https://api.deepseek.com/user/balance",
-        &format!("http://{}/user/balance", server.addr),
-    );
+    let source = include_str!("../plugins/deepseek/init.lua")
+        .replace("ctx.credentials:read(\"api_key\")", "nil, nil")
+        .replace(
+            "https://api.deepseek.com/user/balance",
+            &format!("http://{}/user/balance", server.addr),
+        );
     host.load_source("deepseek", &source).unwrap();
     let snapshot = host.provider_registry().snapshot();
     let registration = snapshot.get("deepseek").unwrap();

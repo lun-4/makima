@@ -101,6 +101,9 @@ fn anthropic_direct_streams_through_plugin_host_and_http() {
             ).as_bytes().chunks(7).map(|chunk| Step::Chunk(chunk.to_vec())).collect(),
         },
         Response { status: "429 Too Many Requests".into(), headers: vec![], steps: vec![Step::Chunk(ERROR_MESSAGE.as_bytes().to_vec())] },
+        Response { status: "200 OK".into(), headers: vec![], steps: vec![Step::Chunk(br#"{"data":[{"id":"model-a","max_input_tokens":1000000}],"has_more":true,"last_id":"model-a"}"#.to_vec())] },
+        Response { status: "200 OK".into(), headers: vec![], steps: vec![Step::Chunk(br#"{"data":[{"id":"model-b","max_input_tokens":200000}],"has_more":false}"#.to_vec())] },
+        Response { status: "200 OK".into(), headers: vec![], steps: vec![Step::Chunk(br#"{"five_hour":{"utilization":42,"resets_at":"2024-01-01T00:00:00Z"}}"#.to_vec())] },
     ]).unwrap();
     maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
     let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
@@ -206,6 +209,48 @@ fn anthropic_direct_streams_through_plugin_host_and_http() {
             .unwrap()
             .target,
         "/v1/messages"
+    );
+    let config = json!({"api_key": "fixture-key", "base_url": format!("http://{}", server.addr), "headers": {"authorization": "Bearer fixture-token", "x-fixture": "custom"}});
+    let models = smol::block_on(registration.factory.discover(&config))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        ["model-a", "model-a-1m", "model-b"]
+    );
+    for target in [
+        "/v1/models?limit=1000",
+        "/v1/models?limit=1000&after_id=model-a",
+    ] {
+        let request = server
+            .requests
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.target, target);
+        assert_eq!(request.header("x-api-key"), Some("fixture-key"));
+        assert_eq!(request.header("x-fixture"), Some("custom"));
+    }
+    let (_, usage_provider) =
+        smol::block_on(registration.factory.prepare(&model, &config)).unwrap();
+    let usage = smol::block_on(usage_provider.fetch_usage())
+        .unwrap()
+        .unwrap();
+    assert_eq!(usage.limits[0].percentage, Some(42));
+    assert_eq!(usage.limits[0].reset_at, Some(1_704_067_200_000));
+    let usage_request = server
+        .requests
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(usage_request.target, "/api/oauth/usage");
+    assert_eq!(
+        usage_request.header("authorization"),
+        Some("Bearer fixture-token")
+    );
+    assert_eq!(
+        usage_request.header("anthropic-beta"),
+        Some("oauth-2025-04-20")
     );
     maki_lua::set_allowed_private_hosts(&[]);
 }

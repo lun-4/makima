@@ -24,7 +24,7 @@ fn scope(
     key: &str,
 ) -> Result<CredentialScope, String> {
     let trusted = matches!(source, SourceIdentity::CoreProviders)
-        || matches!(source, SourceIdentity::Embedded(name) if *name == provider && matches!(provider, "ollama" | "llama-cpp" | "synthetic") && key == "api_key");
+        || matches!(source, SourceIdentity::Embedded(name) if *name == provider && matches!(provider, "ollama" | "llama-cpp" | "synthetic" | "zai" | "deepseek" | "regolo" | "requesty") && key == "api_key");
     if !trusted
         || key.is_empty()
         || !key
@@ -44,7 +44,12 @@ fn scope(
             return CredentialScope::legacy(dir, "openai", kind).map_err(|e| e.to_string());
         }
     }
-    if matches!(provider, "ollama" | "llama-cpp" | "synthetic") && key == "api_key" {
+    if (matches!(
+        provider,
+        "ollama" | "llama-cpp" | "synthetic" | "zai" | "deepseek" | "regolo" | "requesty"
+    ) || matches!(source, SourceIdentity::CoreProviders) && provider == "anthropic")
+        && key == "api_key"
+    {
         return CredentialScope::legacy(dir, provider, LegacyCredentialKind::ApiKey)
             .map_err(|e| e.to_string());
     }
@@ -274,6 +279,116 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_legacy_key_requires_core_provider() {
+        use super::scope;
+        use maki_storage::StateDir;
+        use maki_storage::auth::{ProviderCredentials, save_provider_credentials};
+
+        let tmp = TempDir::new().unwrap();
+        let lua = Lua::new();
+        lua.set_app_data(StateDirOverride(tmp.path().to_owned()));
+        let dir = StateDir::from_path(tmp.path().to_owned());
+        save_provider_credentials(
+            &dir,
+            "anthropic",
+            &ProviderCredentials {
+                api_key: "legacy-key".into(),
+                host: None,
+            },
+        )
+        .unwrap();
+        let key = scope(&lua, &SourceIdentity::CoreProviders, "anthropic", "api_key").unwrap();
+        assert_eq!(key.read().unwrap().unwrap()["api_key"], "legacy-key");
+        assert!(scope(&lua, &SourceIdentity::Other, "anthropic", "api_key").is_err());
+        assert!(
+            scope(
+                &lua,
+                &SourceIdentity::Embedded("synthetic"),
+                "anthropic",
+                "api_key"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn zai_legacy_key_scope_is_restricted() {
+        use super::scope;
+        use maki_storage::StateDir;
+        use maki_storage::auth::{ProviderCredentials, save_provider_credentials};
+
+        let tmp = TempDir::new().unwrap();
+        let lua = Lua::new();
+        lua.set_app_data(StateDirOverride(tmp.path().to_owned()));
+        let dir = StateDir::from_path(tmp.path().to_owned());
+        save_provider_credentials(
+            &dir,
+            "zai",
+            &ProviderCredentials {
+                api_key: "saved-key".into(),
+                host: None,
+            },
+        )
+        .unwrap();
+        let trusted = SourceIdentity::Embedded("zai");
+        assert_eq!(
+            scope(&lua, &trusted, "zai", "api_key")
+                .unwrap()
+                .read()
+                .unwrap()
+                .unwrap()["api_key"],
+            "saved-key"
+        );
+        assert!(scope(&lua, &trusted, "zai", "other").is_err());
+        assert!(scope(&lua, &SourceIdentity::Other, "zai", "api_key").is_err());
+    }
+
+    #[test]
+    fn requesty_legacy_key_scope_is_restricted() {
+        use super::scope;
+        use maki_storage::StateDir;
+        use maki_storage::auth::{
+            ProviderCredentials, load_provider_credentials, save_provider_credentials,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let lua = Lua::new();
+        lua.set_app_data(StateDirOverride(tmp.path().to_owned()));
+        let dir = StateDir::from_path(tmp.path().to_owned());
+        save_provider_credentials(
+            &dir,
+            "requesty",
+            &ProviderCredentials {
+                api_key: "saved-key".into(),
+                host: None,
+            },
+        )
+        .unwrap();
+        let trusted = SourceIdentity::Embedded("requesty");
+        let key = scope(&lua, &trusted, "requesty", "api_key").unwrap();
+        assert_eq!(key.read().unwrap().unwrap()["api_key"], "saved-key");
+        smol::block_on(key.write(&serde_json::json!({"api_key": "updated-key"}))).unwrap();
+        assert_eq!(
+            load_provider_credentials(&dir, "requesty").unwrap().api_key,
+            "updated-key"
+        );
+        assert!(scope(&lua, &trusted, "requesty", "other").is_err());
+        assert!(scope(&lua, &trusted, "synthetic", "api_key").is_err());
+        assert!(
+            scope(
+                &lua,
+                &SourceIdentity::Embedded("synthetic"),
+                "requesty",
+                "api_key"
+            )
+            .is_err()
+        );
+        assert!(scope(&lua, &SourceIdentity::Other, "requesty", "api_key").is_err());
+        smol::block_on(key.delete()).unwrap();
+        assert!(load_provider_credentials(&dir, "requesty").is_none());
+    }
+
+    #[test]
     fn synthetic_legacy_key_scope_is_restricted() {
         use super::scope;
         use maki_storage::StateDir;
@@ -298,6 +413,72 @@ mod tests {
         assert!(scope(&lua, &trusted, "synthetic", "other").is_err());
         assert!(scope(&lua, &trusted, "openai", "api_key").is_err());
         assert!(scope(&lua, &SourceIdentity::Other, "synthetic", "api_key").is_err());
+    }
+
+    #[test]
+    fn deepseek_legacy_key_is_restricted_to_bundled_provider() {
+        use super::scope;
+        use maki_storage::StateDir;
+        use maki_storage::auth::{ProviderCredentials, save_provider_credentials};
+
+        let tmp = TempDir::new().unwrap();
+        let lua = Lua::new();
+        lua.set_app_data(StateDirOverride(tmp.path().to_owned()));
+        let dir = StateDir::from_path(tmp.path().to_owned());
+        save_provider_credentials(
+            &dir,
+            "deepseek",
+            &ProviderCredentials {
+                api_key: "saved-key".into(),
+                host: None,
+            },
+        )
+        .unwrap();
+        let source = SourceIdentity::Embedded("deepseek");
+        assert_eq!(
+            scope(&lua, &source, "deepseek", "api_key")
+                .unwrap()
+                .read()
+                .unwrap()
+                .unwrap()["api_key"],
+            "saved-key"
+        );
+        assert!(scope(&lua, &source, "deepseek", "other").is_err());
+        assert!(scope(&lua, &source, "zai", "api_key").is_err());
+        assert!(scope(&lua, &SourceIdentity::Other, "deepseek", "api_key").is_err());
+    }
+
+    #[test]
+    fn regolo_legacy_key_is_restricted_to_bundled_provider() {
+        use super::scope;
+        use maki_storage::StateDir;
+        use maki_storage::auth::{ProviderCredentials, save_provider_credentials};
+
+        let tmp = TempDir::new().unwrap();
+        let lua = Lua::new();
+        lua.set_app_data(StateDirOverride(tmp.path().to_owned()));
+        let dir = StateDir::from_path(tmp.path().to_owned());
+        save_provider_credentials(
+            &dir,
+            "regolo",
+            &ProviderCredentials {
+                api_key: "saved-key".into(),
+                host: None,
+            },
+        )
+        .unwrap();
+        let source = SourceIdentity::Embedded("regolo");
+        assert_eq!(
+            scope(&lua, &source, "regolo", "api_key")
+                .unwrap()
+                .read()
+                .unwrap()
+                .unwrap()["api_key"],
+            "saved-key"
+        );
+        assert!(scope(&lua, &source, "regolo", "other").is_err());
+        assert!(scope(&lua, &source, "zai", "api_key").is_err());
+        assert!(scope(&lua, &SourceIdentity::Other, "regolo", "api_key").is_err());
     }
 
     #[test]

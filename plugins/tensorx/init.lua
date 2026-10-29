@@ -72,9 +72,10 @@ local function discover(ctx, config)
   end
   local models, flags = {}, {}
   for _, entry in ipairs(type(data.data) == "table" and data.data or {}) do
-    local info = entry.model_info
+    local info = type(entry) == "table" and entry.model_info
     if
-      type(entry.model_name) == "string"
+      type(entry) == "table"
+      and type(entry.model_name) == "string"
       and type(info) == "table"
       and (type(info.mode) ~= "string" or info.mode == "chat")
     then
@@ -88,10 +89,13 @@ local function discover(ctx, config)
       local pricing
       if type(info.input_cost_per_token) == "number" or type(info.output_cost_per_token) == "number" then
         pricing = {
-          input = (info.input_cost_per_token or 0) * 1000000,
-          output = (info.output_cost_per_token or 0) * 1000000,
-          cache_write = (info.cache_creation_input_token_cost or 0) * 1000000,
-          cache_read = (info.cache_read_input_token_cost or 0) * 1000000,
+          input = (type(info.input_cost_per_token) == "number" and info.input_cost_per_token or 0) * 1000000,
+          output = (type(info.output_cost_per_token) == "number" and info.output_cost_per_token or 0) * 1000000,
+          cache_write = (
+            type(info.cache_creation_input_token_cost) == "number" and info.cache_creation_input_token_cost or 0
+          ) * 1000000,
+          cache_read = (type(info.cache_read_input_token_cost) == "number" and info.cache_read_input_token_cost or 0)
+            * 1000000,
         }
       end
       local model = {

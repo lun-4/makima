@@ -6,7 +6,7 @@ use maki_providers::{
     AgentError, Message, Model, ModelInfo, ProviderEvent, ProviderUsage, RequestOptions,
     StreamResponse, ThinkingConfig, ThinkingConfigExt,
     provider::{BoxFuture, Provider},
-    provider_registry::{PreparedProvider, ProviderFactory},
+    provider_registry::{InteractionService, PreparedProvider, ProviderFactory},
 };
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
@@ -22,6 +22,20 @@ pub trait ProviderDispatch: Send + Sync {
         _cancel: CancelToken,
     ) -> BoxFuture<'a, Result<Value, AgentError>> {
         Box::pin(async { Ok(Value::Null) })
+    }
+
+    fn login_interactive<'a>(
+        &'a self,
+        _provider: &'a str,
+        _method: &'a str,
+        _interaction: Arc<dyn InteractionService>,
+        _cancel: CancelToken,
+    ) -> BoxFuture<'a, Result<Value, AgentError>> {
+        Box::pin(async {
+            Err(AgentError::Config {
+                message: "interactive login unavailable".into(),
+            })
+        })
     }
 
     fn discover<'a>(
@@ -68,6 +82,19 @@ pub struct LuaProviderFactory {
 }
 
 impl ProviderFactory for LuaProviderFactory {
+    fn login_interactive<'a>(
+        &'a self,
+        method: &'a str,
+        interaction: Arc<dyn InteractionService>,
+    ) -> BoxFuture<'a, Result<Value, AgentError>> {
+        Box::pin(async move {
+            let (_trigger, cancel) = CancelToken::new();
+            self.dispatch
+                .login_interactive(&self.provider, method, interaction, cancel)
+                .await
+        })
+    }
+
     fn auth_status<'a>(&'a self, config: &'a Value) -> BoxFuture<'a, Result<Value, AgentError>> {
         Box::pin(async move {
             let (_trigger, cancel) = CancelToken::new();

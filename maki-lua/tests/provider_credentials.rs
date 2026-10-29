@@ -6,6 +6,65 @@ use maki_providers::{Model, RequestOptions, ThinkingConfig};
 use serde_json::json;
 
 #[test]
+fn openai_legacy_credential_scopes_interoperate_and_preserve_other_kind() {
+    use maki_storage::StateDir;
+    use maki_storage::auth::{
+        CredentialScope, LegacyCredentialKind, OAuthTokens, ProviderCredentials,
+        load_provider_credentials, load_tokens, save_provider_credentials, save_tokens,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let dir = StateDir::from_path(temp.path().to_path_buf());
+    let oauth =
+        CredentialScope::legacy(dir.clone(), "openai", LegacyCredentialKind::OAuth).unwrap();
+    let key = CredentialScope::legacy(dir.clone(), "openai", LegacyCredentialKind::ApiKey).unwrap();
+    save_tokens(
+        &dir,
+        "openai",
+        &OAuthTokens {
+            access: "old".into(),
+            refresh: "refresh".into(),
+            expires: 1234,
+            account_id: Some("account".into()),
+        },
+    )
+    .unwrap();
+    assert_eq!(oauth.read().unwrap().unwrap()["access"], "old");
+    assert!(key.read().unwrap().is_none());
+    assert!(!smol::block_on(key.delete()).unwrap());
+    assert!(smol::block_on(key.write(&json!({"api_key": "key"}))).is_err());
+    assert_eq!(load_tokens(&dir, "openai").unwrap().access, "old");
+    smol::block_on(oauth.write(
+        &json!({"access":"new", "refresh":"rotated", "expires":4567, "account_id":"account"}),
+    ))
+    .unwrap();
+    assert_eq!(load_tokens(&dir, "openai").unwrap().refresh, "rotated");
+    assert!(smol::block_on(oauth.delete()).unwrap());
+    save_provider_credentials(
+        &dir,
+        "openai",
+        &ProviderCredentials {
+            api_key: "saved-key".into(),
+            host: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(key.read().unwrap().unwrap()["api_key"], "saved-key");
+    assert!(oauth.read().unwrap().is_none());
+    assert!(!smol::block_on(oauth.delete()).unwrap());
+    assert!(
+        smol::block_on(
+            oauth.write(&json!({"access":"other", "refresh":"refresh", "expires":1234}))
+        )
+        .is_err()
+    );
+    assert_eq!(
+        load_provider_credentials(&dir, "openai").unwrap().api_key,
+        "saved-key"
+    );
+}
+
+#[test]
 fn openai_oauth_provider_contract_through_host() {
     let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
     host.load_source(
@@ -145,7 +204,9 @@ fn provider_auth_hooks_are_isolated_per_prepared_instance() {
 }
 
 #[test_case::test_case("synthetic", "synthetic" ; "spoofed_synthetic")]
+#[test_case::test_case("requesty", "requesty" ; "spoofed_requesty")]
 #[test_case::test_case("external", "providers" ; "spoofed_providers")]
+#[test_case::test_case("external", "openai" ; "spoofed_openai")]
 fn external_provider_cannot_access_credentials(owner: &str, id: &str) {
     const SOURCE: &str = r#"
         maki.api.register_provider({
@@ -155,6 +216,8 @@ fn external_provider_cannot_access_credentials(owner: &str, id: &str) {
                     local callback_called = false
                     local operations = {
                         function() return store:read('token') end,
+                        function() return store:read('chatgpt') end,
+                        function() return store:read('api_key') end,
                         function() return store:write('token', { secret = 'fixture-secret' }) end,
                         function() return store:delete('token') end,
                         function() return store:refresh('token', function()

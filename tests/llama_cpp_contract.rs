@@ -19,6 +19,106 @@ use test_case::test_case;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
+#[test_case(r#"{"role":"router","modalities":{"vision":true}}"#, r#"{"data":[{"id":"z","status":{"args":["--fit-ctx","4096"]}},{"id":"a","meta":{"n_ctx":8192},"architecture":{"input_modalities":["text","image"],"output_modalities":["text"]}},{"id":"excluded","architecture":{"input_modalities":["image"],"output_modalities":["text"]}}]}"#, vec![("a", 8192, Some(true)), ("z", 4096, None)] ; "router")]
+#[test_case(r#"{"n_ctx":9999,"modalities":{"vision":false}}"#, r#"{"data":[{"id":"single","meta":{"n_ctx":2048}}]}"#, vec![("single", 2048, Some(false))] ; "single")]
+#[test_case(r#"{"n_ctx":6000,"modalities":{"vision":true}}"#, r#"{"data":[{"id":"legacy","max_model_len":0}]}"#, vec![("legacy", 6000, Some(true))] ; "legacy")]
+fn discovery_modes_reach_http(props: &str, models: &str, expected: Vec<(&str, u32, Option<bool>)>) {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let response = |body: &str| Response {
+        status: "200 OK".into(),
+        headers: vec![],
+        steps: vec![Step::Chunk(body.as_bytes().to_vec())],
+    };
+    let server = HttpContract::start(vec![response(props), response(models)]).unwrap();
+    maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
+    let _private_host_guard = PrivateHostGuard;
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("llama-cpp", include_str!("../plugins/llama-cpp/init.lua"))
+        .unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let config = json!({"base_url": format!("http://{}", server.addr), "api_key_env": "LLAMACPP_CONTRACT_UNUSED_KEY", "api_key": "test-key"});
+    let found = smol::block_on(snapshot.get("llama-cpp").unwrap().factory.discover(&config))
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.len(), expected.len());
+    for (model, (id, context, vision)) in found.iter().zip(expected) {
+        assert_eq!(model.id, id);
+        assert_eq!(model.context_window, Some(context));
+        assert_eq!(model.supports_vision, vision);
+    }
+    for target in ["/props?autoload=false", "/v1/models"] {
+        let request = server
+            .requests
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.target, target);
+        assert_eq!(request.header("authorization"), Some("Bearer test-key"));
+    }
+}
+
+#[test]
+fn discovery_http_error_preserves_body() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    const ERROR_BODY: &str = "discovery unavailable";
+    let server = HttpContract::start(vec![Response {
+        status: "503 Service Unavailable".into(),
+        headers: vec![],
+        steps: vec![Step::Chunk(ERROR_BODY.as_bytes().to_vec())],
+    }])
+    .unwrap();
+    maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
+    let _private_host_guard = PrivateHostGuard;
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("llama-cpp", include_str!("../plugins/llama-cpp/init.lua"))
+        .unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let error = smol::block_on(snapshot.get("llama-cpp").unwrap().factory.discover(&json!({"base_url": format!("http://{}", server.addr), "api_key_env": "LLAMACPP_CONTRACT_UNUSED_KEY"}))).unwrap_err();
+    assert!(
+        matches!(error, maki_providers::AgentError::Api { status: 503, ref message, .. } if message == ERROR_BODY)
+    );
+}
+
+#[test]
+fn responses_protocol_streams_progress() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let server = HttpContract::start(vec![Response { status: "200 OK".into(), headers: vec![], steps: vec![Step::Chunk(b"event: response.output_text.delta\ndata: {\"delta\":\"hello\"}\n\nevent: response.completed\ndata: {\"response\":{\"status\":\"completed\"}}\n\n".to_vec())] }]).unwrap();
+    maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
+    let _private_host_guard = PrivateHostGuard;
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("llama-cpp", include_str!("../plugins/llama-cpp/init.lua"))
+        .unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let model = Model::from_spec("llama-cpp/test").unwrap();
+    let (model, provider) = smol::block_on(snapshot.get("llama-cpp").unwrap().factory.prepare(&model, &json!({"base_url": format!("http://{}", server.addr), "api_key_env": "LLAMACPP_CONTRACT_UNUSED_KEY", "protocol": "openai-responses"}))).unwrap();
+    let (events, receiver) = flume::unbounded();
+    let result = smol::block_on(provider.stream_message(
+        &model,
+        &[Message::user("prompt".into())],
+        "system",
+        &json!([]),
+        &events,
+        RequestOptions {
+            thinking: ThinkingConfig::Adaptive,
+            fast: false,
+        },
+        None,
+    ))
+    .unwrap();
+    assert_eq!(result.message.first_text_content(), Some("hello"));
+    assert!(receiver.try_recv().is_ok());
+    let request = server
+        .requests
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.target, "/v1/responses");
+    let body: Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(body["return_progress"], true);
+    assert_eq!(body["reasoning"]["summary"], "auto");
+    assert!(body.get("thinking_budget_tokens").is_none());
+}
+
 struct PrivateHostGuard;
 
 impl Drop for PrivateHostGuard {

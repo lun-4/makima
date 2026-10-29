@@ -44,6 +44,8 @@ fn module_source(name: &str) -> Option<&'static str> {
         }
         "maki.gemini" => Some(include_str!("../../plugins/lib/maki/gemini.lua")),
         "maki.mistral" => Some(include_str!("../../plugins/lib/maki/mistral.lua")),
+        "maki.regolo" => Some(include_str!("../../plugins/lib/maki/regolo.lua")),
+        "maki.zai" => Some(include_str!("../../plugins/lib/maki/zai.lua")),
         "maki.synthetic" => Some(include_str!("../../plugins/lib/maki/synthetic.lua")),
         "maki.provider_types" => Some(include_str!("../../plugins/lib/maki/provider_types.lua")),
         _ => None,
@@ -230,6 +232,8 @@ pub fn load_bundled_providers() -> Result<Vec<OfflineProvider>> {
         ("deepseek", include_str!("../../plugins/deepseek/init.lua")),
         ("google", include_str!("../../plugins/google/init.lua")),
         ("mistral", include_str!("../../plugins/mistral/init.lua")),
+        ("regolo", include_str!("../../plugins/regolo/init.lua")),
+        ("zai", include_str!("../../plugins/zai/init.lua")),
         (
             "synthetic",
             include_str!("../../plugins/synthetic/init.lua"),
@@ -344,11 +348,12 @@ mod tests {
                 .iter()
                 .any(|p| p.id == "deepseek" && !p.models.is_empty())
         );
-        assert!(
-            providers
-                .iter()
-                .any(|p| p.id == "synthetic" && !p.models.is_empty())
-        );
+        for id in ["synthetic", "regolo", "zai"] {
+            assert!(
+                providers.iter().any(|p| p.id == id && !p.models.is_empty()),
+                "{id}"
+            );
+        }
     }
 
     #[test]

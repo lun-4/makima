@@ -23,7 +23,63 @@ pub struct ProviderAuthMethod {
     pub label: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthChoice {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InteractionRequest {
+    Input {
+        prompt: String,
+        secret: bool,
+        optional: bool,
+    },
+    Choice {
+        prompt: String,
+        choices: Vec<AuthChoice>,
+    },
+    Instructions {
+        text: String,
+    },
+    DeviceChallenge {
+        url: String,
+        code: String,
+    },
+    OpenBrowser {
+        url: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InteractionResponse {
+    Input(Option<String>),
+    Choice(String),
+    Acknowledged(bool),
+    Cancelled,
+}
+
+pub trait InteractionService: Send + Sync {
+    fn interact(
+        &self,
+        request: InteractionRequest,
+    ) -> BoxFuture<'_, Result<InteractionResponse, AgentError>>;
+}
+
 pub trait ProviderFactory: Send + Sync {
+    fn login_interactive<'a>(
+        &'a self,
+        _method: &'a str,
+        _interaction: Arc<dyn InteractionService>,
+    ) -> BoxFuture<'a, Result<Value, AgentError>> {
+        Box::pin(async {
+            Err(AgentError::Config {
+                message: "provider does not support interactive login".into(),
+            })
+        })
+    }
+
     fn auth_status<'a>(&'a self, _config: &'a Value) -> BoxFuture<'a, Result<Value, AgentError>> {
         Box::pin(async { Ok(Value::Null) })
     }

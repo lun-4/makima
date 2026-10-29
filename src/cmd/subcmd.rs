@@ -17,7 +17,12 @@ use maki_config::providers::{
 use maki_config::{Config, load_env_files, load_permissions};
 use maki_lua::PluginHost;
 use maki_lua::ui_sink::{HeadlessUi, HostUi};
-use maki_providers::provider::fetch_all_models;
+use maki_providers::AgentError;
+use maki_providers::provider::{BoxFuture, fetch_all_models};
+use maki_providers::provider_registry::{
+    AuthChoice, InteractionRequest, InteractionResponse, InteractionService, ProviderRegistration,
+    ProviderSnapshot,
+};
 use maki_providers::{ProviderData, catalog_providers};
 use maki_providers::{copilot_auth, dynamic, openai_auth};
 use maki_storage::StateDir;
@@ -36,8 +41,174 @@ fn headless() -> HostUi {
     HostUi::Sink(Box::new(HeadlessUi))
 }
 
-pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
+pub fn auth_host(
+    cwd: &Path,
+    no_plugins: bool,
+    no_jit: bool,
+    trust_mode: TrustMode,
+) -> Result<PluginHost> {
+    let trust = project::resolve_noninteractive(cwd, trust_mode);
+    load_env_files(&trust.project_config);
+    let mut host =
+        PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit, headless())
+            .context("initialize lua plugin host")?;
+    let mut warnings: Vec<String> = trust.warning.into_iter().collect();
+    let config = load_effective_config(&host, no_plugins, &trust.project_config, &mut warnings)?;
+    host.load_builtins(&config.plugins)
+        .context("load builtin plugins")?;
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
+    Ok(host)
+}
+
+struct CliInteraction;
+
+impl InteractionService for CliInteraction {
+    fn interact(
+        &self,
+        request: InteractionRequest,
+    ) -> BoxFuture<'_, Result<InteractionResponse, AgentError>> {
+        Box::pin(async move {
+            match request {
+                InteractionRequest::Input {
+                    prompt,
+                    secret,
+                    optional,
+                } => {
+                    print!("  {prompt}{}: ", if optional { " (optional)" } else { "" });
+                    io::stdout().flush()?;
+                    let mut input = String::new();
+                    if secret && std::io::IsTerminal::is_terminal(&io::stdin()) {
+                        crossterm::terminal::enable_raw_mode()?;
+                        let result = (|| -> io::Result<()> {
+                            loop {
+                                if let crossterm::event::Event::Key(key) = crossterm::event::read()?
+                                {
+                                    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+                                    if key.kind != KeyEventKind::Press {
+                                        continue;
+                                    }
+                                    match key.code {
+                                        KeyCode::Enter => break,
+                                        KeyCode::Char('c')
+                                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                        {
+                                            return Err(io::Error::new(
+                                                io::ErrorKind::Interrupted,
+                                                "cancelled",
+                                            ));
+                                        }
+                                        KeyCode::Char(c) => input.push(c),
+                                        KeyCode::Backspace => {
+                                            input.pop();
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            Ok(())
+                        })();
+                        crossterm::terminal::disable_raw_mode()?;
+                        println!();
+                        result?;
+                    } else if io::stdin().read_line(&mut input)? == 0 {
+                        return Ok(InteractionResponse::Cancelled);
+                    }
+                    let input = input.trim().to_owned();
+                    if input.is_empty() && !optional {
+                        return Ok(InteractionResponse::Cancelled);
+                    }
+                    Ok(InteractionResponse::Input(if input.is_empty() {
+                        None
+                    } else {
+                        Some(input)
+                    }))
+                }
+                InteractionRequest::Choice { prompt, choices } => {
+                    Ok(select_auth_choice(&prompt, &choices)?
+                        .map_or(InteractionResponse::Cancelled, InteractionResponse::Choice))
+                }
+                InteractionRequest::Instructions { text } => {
+                    println!("{text}");
+                    Ok(InteractionResponse::Acknowledged(true))
+                }
+                InteractionRequest::DeviceChallenge { url, code } => {
+                    println!("  Visit {url} and enter code {code}");
+                    Ok(InteractionResponse::Acknowledged(true))
+                }
+                InteractionRequest::OpenBrowser { url } => {
+                    println!("  Open: {url}");
+                    Ok(InteractionResponse::Acknowledged(open::that(&url).is_ok()))
+                }
+            }
+        })
+    }
+}
+
+fn select_auth_choice(prompt: &str, choices: &[AuthChoice]) -> Result<Option<String>, AgentError> {
+    println!("  {prompt}");
+    for (i, choice) in choices.iter().enumerate() {
+        println!("  {}. {}", i + 1, choice.label);
+    }
+    print!("  Select: ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input)? == 0 || input.trim().is_empty() {
+        return Ok(None);
+    }
+    let index = input
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .and_then(|n| n.checked_sub(1));
+    let choice = index
+        .and_then(|n| choices.get(n))
+        .ok_or_else(|| AgentError::Config {
+            message: "invalid selection".into(),
+        })?;
+    Ok(Some(choice.id.clone()))
+}
+
+fn registry_login(provider: &ProviderRegistration) -> Result<()> {
+    let method = if provider.auth_methods.len() == 1 {
+        provider.auth_methods[0].id.clone()
+    } else {
+        let choices: Vec<_> = provider
+            .auth_methods
+            .iter()
+            .map(|m| AuthChoice {
+                id: m.id.clone(),
+                label: m.label.clone(),
+            })
+            .collect();
+        select_auth_choice("Authentication method:", &choices)?.ok_or(AgentError::Cancelled)?
+    };
+    let result = smol::block_on(
+        provider
+            .factory
+            .login_interactive(&method, Arc::new(CliInteraction)),
+    )?;
+    if result == serde_json::Value::Bool(false)
+        || result.get("type").and_then(|v| v.as_str()) == Some("cancelled")
+    {
+        bail!("login cancelled");
+    }
+    println!("  Configured: {}", provider.display_name);
+    Ok(())
+}
+
+pub fn auth_login(
+    provider: Option<&str>,
+    storage: &StateDir,
+    providers: &ProviderSnapshot,
+) -> Result<()> {
     let provider = provider.map(slugify);
+    if let Some(registration) = provider.as_deref().and_then(|slug| providers.get(slug))
+        && !registration.auth_methods.is_empty()
+    {
+        return registry_login(registration);
+    }
     match provider.as_deref() {
         Some("openai") => openai_auth::login(storage)?,
         Some("copilot") => copilot_auth::login(storage)?,
@@ -53,7 +224,7 @@ pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
                 login_provider(slug, storage)?;
             }
         }
-        None => login_interactive(storage)?,
+        None => login_interactive(storage, providers)?,
     }
     Ok(())
 }
@@ -147,7 +318,7 @@ fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
-fn login_interactive(storage: &StateDir) -> Result<()> {
+fn login_interactive(storage: &StateDir, providers: &ProviderSnapshot) -> Result<()> {
     let builtins = all_builtins();
     let config = ProvidersConfig::load();
     let custom_slugs: Vec<&String> = config
@@ -184,7 +355,22 @@ fn login_interactive(storage: &StateDir) -> Result<()> {
         println!("  {} {}. {:<14} {}", status, idx, slug, display);
     }
 
-    let catalog_entries = catalog_providers();
+    let registry_entries: Vec<_> = providers
+        .providers()
+        .filter(|p| {
+            !p.auth_methods.is_empty()
+                && builtin_provider(&p.id).is_none()
+                && !custom_slugs.iter().any(|s| s.as_str() == p.id)
+        })
+        .collect();
+    for provider in &registry_entries {
+        idx += 1;
+        println!("    {}. {:<14} {}", idx, provider.id, provider.display_name);
+    }
+    let catalog_entries: Vec<_> = catalog_providers()
+        .into_iter()
+        .filter(|p| !registry_entries.iter().any(|r| r.id == p.slug))
+        .collect();
     for cat in &catalog_entries {
         idx += 1;
         let status = if load_provider_credentials(storage, &cat.slug).is_some() {
@@ -216,13 +402,17 @@ fn login_interactive(storage: &StateDir) -> Result<()> {
         login_custom(storage)?;
     } else if choice <= builtins.len() {
         let slug = builtins[choice - 1].slug;
-        login_provider(slug, storage)?;
+        auth_login(Some(slug), storage, providers)?;
     } else if choice <= builtins.len() + custom_slugs.len() {
         let slug = custom_slugs[choice - builtins.len() - 1];
-        login_provider(slug, storage)?;
+        auth_login(Some(slug), storage, providers)?;
+    } else if choice <= builtins.len() + custom_slugs.len() + registry_entries.len() {
+        let provider = registry_entries[choice - builtins.len() - custom_slugs.len() - 1];
+        registry_login(provider)?;
     } else {
-        let provider = &catalog_entries[choice - builtins.len() - custom_slugs.len() - 1];
-        login_catalog_provider(provider, storage)?;
+        let provider = &catalog_entries
+            [choice - builtins.len() - custom_slugs.len() - registry_entries.len() - 1];
+        auth_login(Some(&provider.slug), storage, providers)?;
     }
 
     Ok(())
@@ -420,8 +610,17 @@ fn prompt_api_key(url: Option<&str>, display_name: &str, optional: bool) -> Resu
     Ok(api_key)
 }
 
-pub fn auth_logout(provider: &str, storage: &StateDir) -> Result<()> {
+pub fn auth_logout(provider: &str, storage: &StateDir, providers: &ProviderSnapshot) -> Result<()> {
     let slug = slugify(provider);
+    if let Some(registration) = providers.get(&slug)
+        && !registration.auth_methods.is_empty()
+    {
+        let config = ProvidersConfig::load();
+        let config = serde_json::to_value(config.get(&slug).cloned().unwrap_or_default())?;
+        smol::block_on(registration.factory.logout(&config))?;
+        println!("Removed credentials for '{slug}'.");
+        return Ok(());
+    }
     match provider {
         "openai" => openai_auth::logout(storage)?,
         "copilot" => copilot_auth::logout(storage)?,
@@ -443,12 +642,18 @@ pub fn auth_logout(provider: &str, storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
-pub fn auth_status(storage: &StateDir) -> Result<()> {
+pub fn auth_status(storage: &StateDir, providers: &ProviderSnapshot) -> Result<()> {
     let config = ProvidersConfig::load();
     let builtins = all_builtins();
 
     println!();
     for b in &builtins {
+        if providers
+            .get(b.slug)
+            .is_some_and(|p| !p.auth_methods.is_empty())
+        {
+            continue;
+        }
         let def = config.get(b.slug);
         let display = resolve_display_name(b.slug, def);
 
@@ -490,6 +695,9 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
     for (slug, def) in &config.providers {
         // 'opencode' could show up here, when the user configured free models on that provider.
         if builtin_provider(slug).is_some()
+            || providers
+                .get(slug)
+                .is_some_and(|p| !p.auth_methods.is_empty())
             || (slug == "opencode" && def.enable_free_models.is_some())
         {
             continue;
@@ -518,11 +726,33 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
             }
         }
     }
+    for provider in providers.providers().filter(|p| !p.auth_methods.is_empty()) {
+        let provider_config =
+            serde_json::to_value(config.get(&provider.id).cloned().unwrap_or_default())?;
+        let status = smol::block_on(provider.factory.auth_status(&provider_config))
+            .wrap_err_with(|| format!("auth status for {}", provider.id))?;
+        let configured = status
+            .get("configured")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let marker = if configured {
+            "\x1b[32m✓\x1b[0m"
+        } else {
+            "\x1b[31m✗\x1b[0m"
+        };
+        println!("  {marker} {:<14} {}", provider.id, provider.display_name);
+    }
     // Catalog providers from models.dev
     let catalog_entries = catalog_providers();
     if !catalog_entries.is_empty() {
         println!("  \x1b[1mCatalog Providers (models.dev):\x1b[0m");
         for entry in &catalog_entries {
+            if providers
+                .get(&entry.slug)
+                .is_some_and(|p| !p.auth_methods.is_empty())
+            {
+                continue;
+            }
             if let Some(creds) = load_provider_credentials(storage, &entry.slug) {
                 println!(
                     "  \x1b[32m✓\x1b[0m {:<14} {} (key: {})",

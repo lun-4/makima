@@ -221,6 +221,15 @@ assert(saved.stream(ctx, request, function()
   return true
 end))
 assert(sent.headers["x-goog-api-key"] == "saved-key")
+maki.fs.read = function(path)
+  assert(path == "/test-state/auth/google.json")
+  return '{"api_key":"changed-key"}'
+end
+assert(saved.reload_auth())
+assert(saved.stream(ctx, request, function()
+  return true
+end))
+assert(sent.headers["x-goog-api-key"] == "changed-key")
 maki.fs.read = function()
   return nil
 end

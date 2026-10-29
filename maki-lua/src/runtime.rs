@@ -228,6 +228,36 @@ impl crate::provider_adapter::ProviderDispatch for RuntimeProviderDispatch {
         self.auth_request(provider, hook, method, argument, cancel)
     }
 
+    fn login_interactive<'a>(
+        &'a self,
+        provider: &'a str,
+        method: &'a str,
+        interaction: Arc<dyn maki_providers::provider_registry::InteractionService>,
+        cancel: CancelToken,
+    ) -> maki_providers::provider::BoxFuture<'a, Result<Value, maki_providers::AgentError>> {
+        Box::pin(async move {
+            let (reply, rx) = flume::bounded(1);
+            self.0
+                .send_async(Request::ProviderAuth {
+                    provider: provider.to_owned(),
+                    generation: self.1,
+                    hook: "login",
+                    method: Some(method.to_owned()),
+                    input: Value::Null,
+                    interaction: Some(interaction),
+                    cancel: cancel.clone(),
+                    reply,
+                })
+                .await
+                .map_err(|_| maki_providers::AgentError::Channel)?;
+            cancel
+                .race(rx.recv_async())
+                .await
+                .map_err(|_| maki_providers::AgentError::Cancelled)?
+                .map_err(|_| maki_providers::AgentError::Channel)?
+        })
+    }
+
     fn discover<'a>(
         &'a self,
         provider: &'a str,
@@ -358,6 +388,92 @@ impl crate::provider_adapter::ProviderDispatch for RuntimeProviderDispatch {
     }
 }
 
+fn auth_interaction(
+    lua: &Lua,
+    service: Arc<dyn maki_providers::provider_registry::InteractionService>,
+    cancelled: Arc<AtomicBool>,
+) -> mlua::Result<Table> {
+    use maki_providers::provider_registry::{AuthChoice, InteractionRequest, InteractionResponse};
+    let table = lua.create_table()?;
+    for name in [
+        "input",
+        "choice",
+        "instructions",
+        "device_challenge",
+        "open_browser",
+    ] {
+        let service = Arc::clone(&service);
+        let cancelled = Arc::clone(&cancelled);
+        table.set(
+            name,
+            lua.create_async_function(move |lua, args: MultiValue| {
+                let service = Arc::clone(&service);
+                let cancelled = Arc::clone(&cancelled);
+                async move {
+                    let mut args = args.into_iter();
+                    let _self = args.next();
+                    let string = |value: Option<LuaValue>| -> mlua::Result<String> {
+                        match value {
+                            Some(LuaValue::String(s)) => Ok(s.to_str()?.to_owned()),
+                            _ => Err(mlua::Error::runtime("expected string")),
+                        }
+                    };
+                    let first = string(args.next())?;
+                    let request = match name {
+                        "input" => InteractionRequest::Input {
+                            prompt: first,
+                            secret: matches!(args.next(), Some(LuaValue::Boolean(true))),
+                            optional: matches!(args.next(), Some(LuaValue::Boolean(true))),
+                        },
+                        "choice" => {
+                            let Some(LuaValue::Table(choices)) = args.next() else {
+                                return Err(mlua::Error::runtime("expected choices"));
+                            };
+                            let choices = choices
+                                .sequence_values::<Table>()
+                                .map(|choice| {
+                                    let choice = choice?;
+                                    Ok(AuthChoice {
+                                        id: choice.get("id")?,
+                                        label: choice.get("label")?,
+                                    })
+                                })
+                                .collect::<mlua::Result<Vec<_>>>()?;
+                            InteractionRequest::Choice {
+                                prompt: first,
+                                choices,
+                            }
+                        }
+                        "instructions" => InteractionRequest::Instructions { text: first },
+                        "device_challenge" => InteractionRequest::DeviceChallenge {
+                            url: first,
+                            code: string(args.next())?,
+                        },
+                        _ => InteractionRequest::OpenBrowser { url: first },
+                    };
+                    match service.interact(request).await {
+                        Ok(
+                            InteractionResponse::Input(Some(value))
+                            | InteractionResponse::Choice(value),
+                        ) => Ok(LuaValue::String(lua.create_string(&value)?)),
+                        Ok(InteractionResponse::Input(None)) => Ok(LuaValue::Nil),
+                        Ok(InteractionResponse::Acknowledged(value)) => {
+                            Ok(LuaValue::Boolean(value))
+                        }
+                        Ok(InteractionResponse::Cancelled)
+                        | Err(maki_providers::AgentError::Cancelled) => {
+                            cancelled.store(true, Ordering::Release);
+                            Err(mlua::Error::runtime("interaction cancelled"))
+                        }
+                        Err(error) => Err(mlua::Error::runtime(error.to_string())),
+                    }
+                }
+            })?,
+        )?;
+    }
+    Ok(table)
+}
+
 impl RuntimeProviderDispatch {
     fn auth_request<'a>(
         &'a self,
@@ -376,6 +492,7 @@ impl RuntimeProviderDispatch {
                     hook,
                     method: method.map(str::to_owned),
                     input: input.clone(),
+                    interaction: None,
                     cancel: cancel.clone(),
                     reply,
                 })
@@ -406,6 +523,7 @@ pub enum Request {
         hook: &'static str,
         method: Option<String>,
         input: Value,
+        interaction: Option<Arc<dyn maki_providers::provider_registry::InteractionService>>,
         cancel: CancelToken,
         reply: flume::Sender<Result<Value, maki_providers::AgentError>>,
     },
@@ -5539,7 +5657,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                     match msg {
                         Request::Shutdown => break,
                         Request::WarmJit => codegen_armed = true,
-                        Request::ProviderAuth { provider, generation, hook, method, input, cancel, reply } => {
+                        Request::ProviderAuth { provider, generation, hook, method, input, interaction, cancel, reply } => {
                             let candidate = rt.providers.get(&provider)
                                 .filter(|(_, current, _, _)| generation.is_none_or(|generation| generation == *current))
                                 .and_then(|(owner, _, source, table)| rt.provider_generations.get(owner)
@@ -5566,7 +5684,12 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                         Some(found.ok_or_else(|| config_error(format!("unknown auth method for provider {provider}")))?)
                                     } else { table.raw_get(hook).map_err(|e| config_error(format!("provider {provider} {hook}: {e}")))? };
                                     let Some(function) = function else { return Ok(Value::Null) };
-                                    let input = crate::api::util::convert::json_to_lua_with_nulls(&lua, &input, true).map_err(|e| config_error(e.to_string()))?;
+                                    let interaction_cancelled = Arc::new(AtomicBool::new(false));
+                                    let input = if let Some(service) = interaction {
+                                        LuaValue::Table(auth_interaction(&lua, service, Arc::clone(&interaction_cancelled)).map_err(|e| config_error(e.to_string()))?)
+                                    } else {
+                                        crate::api::util::convert::json_to_lua_with_nulls(&lua, &input, true).map_err(|e| config_error(e.to_string()))?
+                                    };
                                     let scope = TaskScope::new(&lua, TaskCell::new(cancel.clone(), None, None));
                                     let (context, _net_scope) = crate::api::net::provider_context(&lua, scope.handle().clone(), &permissions).map_err(|e| config_error(e.to_string()))?;
                                     crate::provider_credentials::attach(&lua, &context, scope.handle().clone(), generation_cancel.clone(), source, provider.clone()).map_err(|e| config_error(e.to_string()))?;
@@ -5574,10 +5697,14 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                     let values = match result {
                                         Err(_) => { scope.fire_cancel_hooks(); return Err(config_error("provider generation revoked".into())); }
                                         Ok(Err(_)) => { scope.fire_cancel_hooks(); return Err(maki_providers::AgentError::Cancelled); }
-                                        Ok(Ok(result)) => result.map_err(|e| config_error(format!("provider {provider} {hook} failed: {e}")))?,
+                                        Ok(Ok(result)) => {
+                                            if interaction_cancelled.load(Ordering::Acquire) { return Err(maki_providers::AgentError::Cancelled); }
+                                            result.map_err(|e| config_error(format!("provider {provider} {hook} failed: {e}")))?
+                                        },
                                     };
                                     if generation_cancel.is_cancelled() { return Err(config_error("provider generation revoked".into())); }
                                     if cancel.is_cancelled() { return Err(maki_providers::AgentError::Cancelled); }
+                                    if interaction_cancelled.load(Ordering::Acquire) { return Err(maki_providers::AgentError::Cancelled); }
                                     let mut values = values.into_iter();
                                     match (values.next().unwrap_or(LuaValue::Nil), values.next().unwrap_or(LuaValue::Nil)) {
                                         (LuaValue::Nil, LuaValue::Table(error)) => Err(crate::provider_stream::provider_error(error)),

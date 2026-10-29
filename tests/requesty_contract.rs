@@ -6,8 +6,14 @@ use std::time::Duration;
 
 use http_contract::{HttpContract, Response, Step};
 use maki_agent::tools::ToolRegistry;
-use maki_lua::PluginHost;
+use maki_commands::CommandRegistry;
+use maki_config::PluginsConfig;
+use maki_lua::{PluginHost, test_support::InMemoryFs, ui_sink::HostUi};
 use maki_providers::{Message, Model, RequestOptions, ThinkingConfig};
+use maki_storage::{
+    StateDir,
+    auth::{ProviderCredentials, load_provider_credentials, save_provider_credentials},
+};
 use serde_json::{Value, json};
 
 fn response(status: &str, body: &str) -> Response {
@@ -16,6 +22,60 @@ fn response(status: &str, body: &str) -> Response {
         headers: vec![],
         steps: vec![Step::Chunk(body.as_bytes().to_vec())],
     }
+}
+
+fn requesty_host(state: &std::path::Path) -> PluginHost {
+    let mut host = PluginHost::with_session_provider_preparer(
+        Arc::new(ToolRegistry::new()),
+        CommandRegistry::new(),
+        true,
+        Arc::new(InMemoryFs::new()),
+        Some(state.to_path_buf()),
+        None,
+        HostUi::Frontend,
+    )
+    .unwrap();
+    host.load_builtins(&PluginsConfig {
+        enabled: true,
+        names: vec!["requesty".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    host
+}
+
+#[test]
+fn requesty_saved_credentials_take_precedence_and_logout() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = StateDir::from_path(temp.path().to_path_buf());
+    save_provider_credentials(
+        &state,
+        "requesty",
+        &ProviderCredentials {
+            api_key: "saved-key".into(),
+            host: None,
+        },
+    )
+    .unwrap();
+    let host = requesty_host(temp.path());
+    let snapshot = host.provider_registry().snapshot();
+    let factory = &snapshot.get("requesty").unwrap().factory;
+    let config = json!({"api_key_env":"REQUESTY_CONTRACT_UNUSED_KEY", "api_key":"config-key"});
+    assert_eq!(
+        smol::block_on(factory.auth_status(&config)).unwrap()["source"],
+        "stored"
+    );
+    smol::block_on(factory.logout(&config)).unwrap();
+    assert!(load_provider_credentials(&state, "requesty").is_none());
+    assert_eq!(
+        smol::block_on(factory.auth_status(&config)).unwrap()["source"],
+        "config"
+    );
+    assert_eq!(
+        smol::block_on(factory.auth_status(&json!({"api_key_env":"REQUESTY_CONTRACT_UNUSED_KEY"})))
+            .unwrap()["configured"],
+        false
+    );
 }
 
 #[test]
@@ -27,9 +87,8 @@ fn requesty_discovery_filters_and_merges_catalogs() {
     ])
     .unwrap();
     maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
-    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-    host.load_source("requesty", include_str!("../plugins/requesty/init.lua"))
-        .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let host = requesty_host(state.path());
     let snapshot = host.provider_registry().snapshot();
     let models = smol::block_on(snapshot.get("requesty").unwrap().factory.discover(&json!({
         "api_key": "fixture-key", "api_key_env": "REQUESTY_CONTRACT_UNUSED_KEY",
@@ -91,9 +150,8 @@ fn requesty_discovery_tolerates_one_failure_and_rejects_two() {
         )
         .unwrap();
         maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-        host.load_source("requesty", include_str!("../plugins/requesty/init.lua"))
-            .unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let host = requesty_host(state.path());
         let snapshot = host.provider_registry().snapshot();
         let result = smol::block_on(snapshot.get("requesty").unwrap().factory.discover(&json!({
             "api_key": "fixture-key", "api_key_env": "REQUESTY_CONTRACT_UNUSED_KEY",
@@ -123,9 +181,8 @@ fn requesty_stream_sets_auto_cache_and_rotates_keys() {
     let server =
         HttpContract::start(vec![response("200 OK", SSE), response("200 OK", SSE)]).unwrap();
     maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
-    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-    host.load_source("requesty", include_str!("../plugins/requesty/init.lua"))
-        .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let host = requesty_host(state.path());
     let snapshot = host.provider_registry().snapshot();
     let model = Model::from_spec("requesty/openai/gpt-5.5").unwrap();
     let (model, provider) = smol::block_on(snapshot.get("requesty").unwrap().factory.prepare(

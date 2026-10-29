@@ -6,10 +6,16 @@ use std::time::Duration;
 
 use http_contract::{HttpContract, Response, Step};
 use maki_agent::tools::ToolRegistry;
-use maki_lua::PluginHost;
+use maki_commands::CommandRegistry;
+use maki_config::PluginsConfig;
+use maki_lua::{PluginHost, test_support::InMemoryFs, ui_sink::HostUi};
 use maki_providers::{
     AgentError, Message, Model, ProviderEvent, RequestOptions, StopReason, ThinkingConfig,
     UsageWindow,
+};
+use maki_storage::{
+    StateDir,
+    auth::{ProviderCredentials, load_provider_credentials, save_provider_credentials},
 };
 use serde_json::{Value, json};
 
@@ -37,6 +43,53 @@ fn response(status: &str, body: &str, headers: &[(&str, &str)]) -> Response {
 }
 
 #[test]
+fn zai_legacy_credentials_are_used_and_deleted() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = StateDir::from_path(temp.path().to_path_buf());
+    save_provider_credentials(
+        &state,
+        "zai",
+        &ProviderCredentials {
+            api_key: "saved-key".into(),
+            host: None,
+        },
+    )
+    .unwrap();
+    let mut host = PluginHost::with_session_provider_preparer(
+        Arc::new(ToolRegistry::new()),
+        CommandRegistry::new(),
+        true,
+        Arc::new(InMemoryFs::new()),
+        Some(temp.path().to_path_buf()),
+        None,
+        HostUi::Frontend,
+    )
+    .unwrap();
+    host.load_builtins(&PluginsConfig {
+        enabled: true,
+        names: vec!["zai".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let factory = &snapshot.get("zai").unwrap().factory;
+    let config = json!({"api_key_env":"MAKI_ZAI_CONTRACT_UNUSED_KEY", "api_key":"config-key"});
+    assert_eq!(
+        smol::block_on(factory.auth_status(&config)).unwrap()["source"],
+        "stored"
+    );
+    let model = Model::from_spec("zai/glm-5.3").unwrap();
+    let (_, provider) = smol::block_on(factory.prepare(&model, &config)).unwrap();
+    assert_eq!(provider.key_count(), 1);
+    smol::block_on(factory.logout(&config)).unwrap();
+    assert!(load_provider_credentials(&state, "zai").is_none());
+    assert_eq!(
+        smol::block_on(factory.auth_status(&config)).unwrap()["source"],
+        "config"
+    );
+}
+
+#[test]
 fn zai_host_http_stream_quota_rotation_and_errors() {
     let server = HttpContract::start(vec![
         response("200 OK", STREAM, &[]),
@@ -53,10 +106,12 @@ fn zai_host_http_stream_quota_rotation_and_errors() {
     ]).unwrap();
     maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
     let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-    let module = include_str!("../plugins/lib/maki/zai.lua").replace(
-        QUOTA_URL,
-        &format!("http://{}/api/monitor/usage/quota/limit", server.addr),
-    );
+    let module = include_str!("../plugins/lib/maki/zai.lua")
+        .replace(
+            QUOTA_URL,
+            &format!("http://{}/api/monitor/usage/quota/limit", server.addr),
+        )
+        .replace("if ctx and ctx.credentials then", "if false then");
     host.load_source(
         "zai",
         &format!("local provider = (function()\n{module}\nend)()\nprovider.register()"),

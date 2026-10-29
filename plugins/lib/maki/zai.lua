@@ -109,21 +109,79 @@ function M.parse_quotas(body)
   return { plan = data.level, limits = limits, by_model_today = {} }
 end
 
-function M.prepare(_, model_value, config)
-  config = config or {}
-  local key = maki.uv.os_getenv(config.api_key_env or "ZHIPU_API_KEY")
-  if not key or key == "" then
-    key = config.api_key
-  end
+local CREDENTIAL_KEY = "api_key"
+local MISSING_KEY = "Z.AI API key is not configured"
+
+local function split_keys(value)
   local keys = {}
-  for part in (key or ""):gmatch("[^,]+") do
+  for part in (value or ""):gmatch("[^,]+") do
     local trimmed = part:match("^%s*(.-)%s*$")
     if trimmed ~= "" then
       keys[#keys + 1] = trimmed
     end
   end
+  return keys
+end
+
+local function credentials(ctx, config)
+  local keys = split_keys(maki.uv.os_getenv(config.api_key_env or "ZHIPU_API_KEY"))
+  if #keys > 0 then
+    return keys, nil, "env"
+  end
+  if ctx and ctx.credentials then
+    local saved, err = ctx.credentials:read(CREDENTIAL_KEY)
+    if err then
+      return nil, err
+    end
+    if saved ~= nil then
+      if type(saved) ~= "table" or type(saved.api_key) ~= "string" or saved.api_key == "" then
+        return nil, { kind = "config", message = "Invalid Z.AI credentials" }
+      end
+      return { saved.api_key }, nil, "stored"
+    end
+  end
+  keys = split_keys(config.api_key)
   if #keys == 0 then
-    return nil, { kind = "config", message = "Z.AI API key is not configured" }
+    return nil, { kind = "config", message = MISSING_KEY }
+  end
+  return keys, nil, "config"
+end
+
+function M.login(ctx, ui)
+  local key, err = ui:input("Z.AI API key", true, false)
+  if err then
+    return nil, err
+  end
+  if not key then
+    return false
+  end
+  key = key:match("^%s*(.-)%s*$")
+  if key == "" then
+    return nil, { kind = "config", message = MISSING_KEY }
+  end
+  return ctx.credentials:write(CREDENTIAL_KEY, { api_key = key })
+end
+
+function M.auth_status(ctx, config)
+  local keys, err, source = credentials(ctx, config or {})
+  if not keys then
+    if err and err.message ~= MISSING_KEY then
+      return nil, err
+    end
+    return { configured = false }
+  end
+  return { configured = true, source = source, method = "api_key" }
+end
+
+function M.logout(ctx)
+  return ctx.credentials:delete(CREDENTIAL_KEY)
+end
+
+function M.prepare(ctx, model_value, config)
+  config = config or {}
+  local keys, err = credentials(ctx, config)
+  if not keys then
+    return nil, err
   end
   local index = 1
   if type(model_value.id) == "string" and M.supports_thinking(model_value.id) then
@@ -254,7 +312,15 @@ function M.prepare(_, model_value, config)
 end
 
 function M.register()
-  maki.api.register_provider({ id = "zai", display_name = "Z.AI", models = M.models, prepare = M.prepare })
+  maki.api.register_provider({
+    id = "zai",
+    display_name = "Z.AI",
+    models = M.models,
+    prepare = M.prepare,
+    auth = { { id = "api_key", label = "API key", login = M.login } },
+    auth_status = M.auth_status,
+    logout = M.logout,
+  })
 end
 
 return M

@@ -190,6 +190,35 @@ fn scripted_clock_advances_in_response_order() {
     assert_eq!(clock.now(), Duration::from_secs(5));
 }
 
+#[test_case(false; "virtual_deadline")]
+#[test_case(true; "cancellation")]
+fn virtual_deadline_or_cancellation_disconnects_response(cancel: bool) {
+    let clock = Clock::default();
+    let (reached, observed) = mpsc::channel();
+    let server = HttpContract::start(vec![Response {
+        status: "200 OK".into(),
+        headers: vec![("Content-Length".into(), "4".into())],
+        steps: vec![
+            Step::Chunk(b"x".to_vec()),
+            Step::Signal(reached),
+            Step::WaitUntil(clock.clone(), Duration::from_secs(10)),
+        ],
+    }])
+    .unwrap();
+    let mut stream = TcpStream::connect(server.addr).unwrap();
+    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+    stream.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+    observed.recv_timeout(TIMEOUT).unwrap();
+    if cancel {
+        clock.cancel();
+    } else {
+        clock.advance(Duration::from_secs(10));
+    }
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    assert!(response.ends_with(b"\r\n\r\nx"));
+}
+
 #[test]
 fn shutdown_interrupts_a_gated_response() {
     let (reached_tx, reached_rx) = mpsc::channel();

@@ -1,5 +1,16 @@
 local chat = require("maki.chat_completions")
 
+local array_metatable = getmetatable(assert(maki.json.decode("[]")))
+local json_null = assert(maki.json.decode("null", { preserve_null = true }))
+
+local function is_array(value)
+  return type(value) == "table" and getmetatable(value) == array_metatable
+end
+
+local function is_object(value)
+  return type(value) == "table" and not is_array(value)
+end
+
 local function settings(ctx, config)
   local key = maki.uv.os_getenv(config.api_key_env or "OLLAMA_API_KEY")
   if not key or key == "" then
@@ -98,7 +109,7 @@ local function json_request(ctx, url, method, request_headers, body)
     chunks[#chunks + 1] = chunk
   end
   response:close()
-  local data, decode_err = maki.json.decode(table.concat(chunks))
+  local data, decode_err = maki.json.decode(table.concat(chunks), { preserve_null = true })
   if not data then
     return nil, { kind = "api", message = tostring(decode_err) }
   end
@@ -112,8 +123,22 @@ local function u32(value)
 end
 
 local function details(show)
-  if type(show) ~= "table" then
+  if not is_object(show) then
     return nil, nil
+  end
+  if
+    (show.model_info ~= nil and show.model_info ~= json_null and not is_object(show.model_info))
+    or (show.parameters ~= nil and show.parameters ~= json_null and type(show.parameters) ~= "string")
+    or (show.capabilities ~= nil and show.capabilities ~= json_null and not is_array(show.capabilities))
+  then
+    return nil, nil
+  end
+  if is_array(show.capabilities) then
+    for _, capability in ipairs(show.capabilities) do
+      if type(capability) ~= "string" then
+        return nil, nil
+      end
+    end
   end
   local context
   if type(show.model_info) == "table" then
@@ -144,7 +169,7 @@ local function details(show)
     end
   end
   local vision
-  if type(show.capabilities) == "table" then
+  if is_array(show.capabilities) then
     vision = false
     for _, capability in ipairs(show.capabilities) do
       if capability == "vision" then
@@ -167,13 +192,13 @@ local function discover(ctx, config)
   if not data then
     return nil, fetch_err
   end
-  if type(data) ~= "table" or type(data.data) ~= "table" then
+  if not is_object(data) or (data.data ~= nil and not is_array(data.data)) then
     return nil, { kind = "api", message = "Invalid Ollama models response" }
   end
   local models = {}
   local root = base:gsub("/v1$", "")
-  for _, entry in ipairs(data.data) do
-    if type(entry.id) ~= "string" then
+  for _, entry in ipairs(data.data or {}) do
+    if not is_object(entry) or type(entry.id) ~= "string" then
       return nil, { kind = "api", message = "Invalid Ollama model id" }
     end
     local body, encode_err = maki.json.encode({ model = entry.id })
@@ -216,7 +241,15 @@ local function prepare(ctx, model, config)
       local responses = config.protocol == "openai-responses" and require("maki.responses") or nil
       local body, build_err
       if responses then
-        body, build_err = responses.build_request(request)
+        local intent = request.thinking or { mode = "off" }
+        local reasoning
+        if intent.mode == "adaptive" then
+          reasoning = { effort = "medium", summary = "auto" }
+        elseif intent.mode == "effort" then
+          local effort = ({ xhigh = "high", max = "high" })[intent.level] or intent.level
+          reasoning = { effort = effort, summary = "auto" }
+        end
+        body, build_err = responses.build_request(request, { reasoning = reasoning })
         if body then
           body.return_progress = true
         end

@@ -182,7 +182,15 @@ export type ConfigField = {
   required: boolean?,
   default: JsonValue?,
 }
-export type ProviderDocs = { description: string?, login_url: string?, config: { ConfigField }? }
+export type ProviderDocs = {
+  description: string?,
+  login_url: string?,
+  config: { ConfigField }?,
+  auth_line: string?,
+  urls: { string }?,
+  features: string?,
+  no_catalog_note: string?,
+}
 
 export type HttpRequest = { method: string, url: string, headers: { [string]: string }?, body: string? }
 -- read returns an empty string at EOF; nil with an error indicates failure.

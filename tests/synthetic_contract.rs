@@ -14,6 +14,10 @@ use maki_lua::{PluginHost, test_support::InMemoryFs, ui_sink::HostUi};
 use maki_providers::{
     AgentError, Message, Model, ProviderEvent, RequestOptions, StopReason, ThinkingConfig,
 };
+use maki_storage::{
+    StateDir,
+    auth::{ProviderCredentials, load_provider_credentials, save_provider_credentials},
+};
 use serde_json::{Value, json};
 
 struct ChildGuard(Option<Child>);
@@ -51,6 +55,90 @@ fn wait_output(
         stdout: out,
         stderr: err,
     }
+}
+
+#[test]
+fn synthetic_legacy_auth_discovery_and_logout() {
+    const CHILD: &str = "SYNTHETIC_AUTH_CONTRACT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let stdout = tempfile::tempfile().unwrap();
+        let stderr = tempfile::tempfile().unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "synthetic_legacy_auth_discovery_and_logout",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env(CHILD, "1")
+            .stdout(stdout.try_clone().unwrap())
+            .stderr(stderr.try_clone().unwrap())
+            .spawn()
+            .unwrap();
+        let output = wait_output(ChildGuard(Some(child)), stdout, stderr);
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let server = HttpContract::start(vec![Response {
+        status: "200 OK".into(),
+        headers: vec![],
+        steps: vec![Step::Chunk(br#"{"data":[{"id":"z"},{"id":"a","context_length":4096,"input_modalities":["image"]}]}"#.to_vec())],
+    }]).unwrap();
+    maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
+    let temp = tempfile::tempdir().unwrap();
+    let state = StateDir::from_path(temp.path().to_path_buf());
+    save_provider_credentials(
+        &state,
+        "synthetic",
+        &ProviderCredentials {
+            api_key: "saved-key".into(),
+            host: None,
+        },
+    )
+    .unwrap();
+    let mut host = PluginHost::with_session_provider_preparer(
+        Arc::new(ToolRegistry::new()),
+        CommandRegistry::new(),
+        true,
+        Arc::new(InMemoryFs::new()),
+        Some(temp.path().to_path_buf()),
+        None,
+        HostUi::Frontend,
+    )
+    .unwrap();
+    host.load_builtins(&PluginsConfig {
+        enabled: true,
+        names: vec!["synthetic".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let factory = &snapshot.get("synthetic").unwrap().factory;
+    let config = json!({"api_key_env":"MISSING_SYNTHETIC_CONTRACT_KEY", "api_key":"config-key", "base_url":format!("http://{}/v1", server.addr)});
+    let status = smol::block_on(factory.auth_status(&config)).unwrap();
+    assert_eq!(status["source"], "stored");
+    let models = smol::block_on(factory.discover(&config)).unwrap().unwrap();
+    assert_eq!(models[0].id, "a");
+    assert_eq!(models[0].context_window, Some(4096));
+    assert_eq!(models[0].supports_vision, Some(true));
+    let request = server
+        .requests
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.target, "/v1/models");
+    assert_eq!(request.header("authorization"), Some("Bearer saved-key"));
+    smol::block_on(factory.logout(&config)).unwrap();
+    assert!(load_provider_credentials(&state, "synthetic").is_none());
+    assert_eq!(
+        smol::block_on(factory.auth_status(&config)).unwrap()["source"],
+        "config"
+    );
 }
 
 #[test]

@@ -284,6 +284,42 @@ do
   maki.uv.os_getenv = previous
 end
 
+do
+  local previous = maki.uv.os_getenv
+  maki.uv.os_getenv = function()
+    return nil
+  end
+  local values = { chatgpt = { access = "access", expires = 12345 }, api_key = { api_key = "saved" } }
+  local fail
+  local ctx = {
+    credentials = {
+      read = function(_, key)
+        return values[key]
+      end,
+      delete = function(_, key)
+        if fail == key then
+          return nil, { kind = "config", message = "delete failed" }
+        end
+        values[key] = nil
+        return true
+      end,
+    },
+  }
+  local status = assert(openai.auth_status(ctx, {}))
+  assert(status.configured and status.source == "stored" and status.method == "chatgpt" and status.expires_at == 12345)
+  assert(not status.access)
+  values.chatgpt = nil
+  assert(openai.auth_status(ctx, {}).method == "api_key")
+  assert(openai.auth_status(ctx, { api_key = "configured" }).source == "config")
+  fail = "api_key"
+  local ok, err = openai.logout(ctx)
+  assert(not ok and err.message == "delete failed" and values.api_key)
+  fail = nil
+  assert(openai.logout(ctx) and not values.api_key)
+  assert(not openai.auth_status(ctx, {}).configured)
+  maki.uv.os_getenv = previous
+end
+
 local usage = assert(
   openai.parse_usage(
     [[{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":12.5,"limit_window_seconds":18000,"reset_at":1760000000},"secondary_window":{"used_percent":150,"limit_window_seconds":604800}}}]]

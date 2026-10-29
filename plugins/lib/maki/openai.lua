@@ -413,8 +413,46 @@ function M.discover(ctx, config)
   return require("maki.openai_models").discover(ctx, { kind = "platform", base_url = base, headers = headers })
 end
 
+function M.auth_status(ctx, config)
+  config = config or {}
+  local tokens, err = read_tokens(ctx)
+  if err then
+    return nil, err
+  end
+  if tokens then
+    return { configured = true, source = "stored", method = "chatgpt", expires_at = tokens.expires }
+  end
+  local key = maki.uv.os_getenv(config.api_key_env or "OPENAI_API_KEY")
+  if key and key ~= "" then
+    return { configured = true, source = "env", method = "api_key" }
+  end
+  if type(config.api_key) == "string" and config.api_key ~= "" then
+    return { configured = true, source = "config", method = "api_key" }
+  end
+  local keys, key_err = api_keys(ctx, config)
+  if not keys then
+    return nil, key_err
+  end
+  return { configured = #keys > 0, source = #keys > 0 and "stored" or nil, method = #keys > 0 and "api_key" or nil }
+end
+
+function M.logout(ctx)
+  local ok, err = ctx.credentials:delete(TOKEN_KEY)
+  if not ok then
+    return nil, err
+  end
+  return ctx.credentials:delete("api_key")
+end
+
 function M.register()
-  maki.api.register_provider({ id = "openai", display_name = "OpenAI", prepare = M.prepare, discover = M.discover })
+  maki.api.register_provider({
+    id = "openai",
+    display_name = "OpenAI",
+    prepare = M.prepare,
+    discover = M.discover,
+    auth_status = M.auth_status,
+    logout = M.logout,
+  })
 end
 
 return M

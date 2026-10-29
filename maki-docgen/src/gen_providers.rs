@@ -771,6 +771,23 @@ mod tests {
     }
 
     #[test]
+    fn offline_model_metadata_controls_rendering() {
+        let mut providers = maki_lua::provider_docs::load_bundled_providers().unwrap();
+        let provider = providers
+            .iter_mut()
+            .find(|provider| provider.id == "synthetic")
+            .unwrap();
+        let model = &mut provider.models[0];
+        model.prefixes = vec!["fixture-alias".into()];
+        model.info.pricing.as_mut().unwrap().input = 42.25;
+        let mut output = String::new();
+        super::write_offline_section(&mut output, provider);
+        assert!(output.contains("fixture-alias"));
+        assert!(output.contains("$42.25"));
+        assert!(!output.contains("hf:moonshotai/Kimi-K2.5"));
+    }
+
+    #[test]
     fn section_renders_its_supplied_pricing_schedule() {
         let sections = build_sections(&[]);
         let scheduled = sections

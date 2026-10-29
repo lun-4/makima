@@ -3,22 +3,74 @@ local endpoint = "https://router.requesty.ai/v1"
 local max_response_bytes = 4194304
 local per_million = 1000000
 
-local function credentials(config)
-  local key = maki.uv.os_getenv(config.api_key_env or "REQUESTY_API_KEY")
-  if not key or key == "" then
-    key = config.api_key
-  end
+local credential_key = "api_key"
+local missing_key = "Requesty API key is not configured"
+
+local function split_keys(value)
   local keys = {}
-  for part in (key or ""):gmatch("[^,]+") do
+  for part in (value or ""):gmatch("[^,]+") do
     local trimmed = part:match("^%s*(.-)%s*$")
     if trimmed ~= "" then
       keys[#keys + 1] = trimmed
     end
   end
-  if #keys == 0 then
-    return nil, { kind = "config", message = "Requesty API key is not configured" }
-  end
   return keys
+end
+
+local function credentials(ctx, config)
+  local keys = split_keys(maki.uv.os_getenv(config.api_key_env or "REQUESTY_API_KEY"))
+  if #keys > 0 then
+    return keys, nil, "env"
+  end
+  if ctx and ctx.credentials then
+    local saved, err = ctx.credentials:read(credential_key)
+    if err then
+      return nil, err
+    end
+    if saved ~= nil then
+      if type(saved) ~= "table" or type(saved.api_key) ~= "string" or saved.api_key == "" then
+        return nil, { kind = "config", message = "Invalid Requesty credentials" }
+      end
+      return { saved.api_key }, nil, "stored"
+    end
+  end
+  if type(config.api_key) == "string" and config.api_key ~= "" then
+    keys = split_keys(config.api_key)
+    if #keys > 0 then
+      return keys, nil, "config"
+    end
+  end
+  return nil, { kind = "config", message = missing_key }
+end
+
+local function login(ctx, ui)
+  local key, err = ui:input("Requesty API key", true, false)
+  if err then
+    return nil, err
+  end
+  if not key then
+    return false
+  end
+  key = key:match("^%s*(.-)%s*$")
+  if key == "" then
+    return nil, { kind = "config", message = missing_key }
+  end
+  return ctx.credentials:write(credential_key, { api_key = key })
+end
+
+local function auth_status(ctx, config)
+  local keys, err, source = credentials(ctx, config or {})
+  if not keys then
+    if err and err.message ~= missing_key then
+      return nil, err
+    end
+    return { configured = false }
+  end
+  return { configured = true, source = source, method = "api_key" }
+end
+
+local function logout(ctx)
+  return ctx.credentials:delete(credential_key)
 end
 
 local function headers(config, key, attribution)
@@ -115,7 +167,7 @@ end
 
 local function discover(ctx, config)
   config = config or {}
-  local keys, err = credentials(config)
+  local keys, err = credentials(ctx, config)
   if not keys then
     return nil, err
   end
@@ -156,9 +208,9 @@ local function discover(ctx, config)
   return models
 end
 
-local function prepare(_, model, config)
+local function prepare(ctx, model, config)
   config = config or {}
-  local keys, err = credentials(config)
+  local keys, err = credentials(ctx, config)
   if not keys then
     return nil, err
   end
@@ -219,6 +271,9 @@ maki.api.register_provider({
   models = {},
   discover = discover,
   prepare = prepare,
+  auth = { { id = "api_key", label = "API key", login = login } },
+  auth_status = auth_status,
+  logout = logout,
   supports_thinking = true,
   accepts_arbitrary_models = true,
   fallback_context_window = 128000,

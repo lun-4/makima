@@ -267,7 +267,7 @@ mod tests {
     use mlua::Lua;
     use test_case::test_case;
 
-    use super::{ProviderStaging, SourceIdentity, model_descriptors};
+    use super::{ProviderStaging, SourceIdentity, auth_methods, model_descriptors};
 
     #[test_case("{ models = { named = { id = 'model' } } }", "models: expected an array with consecutive integer keys"; "non_integer_key")]
     #[test_case("{ models = { [0] = { id = 'model' } } }", "models: expected an array with consecutive integer keys"; "zero_index")]
@@ -318,6 +318,21 @@ mod tests {
                 .unwrap_err();
             assert!(error.contains("plugin plugin, provider provider: models"));
             assert_eq!(staging.get("provider").unwrap().3.get::<i32>("marker")?, 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn auth_metadata_rejects_invalid_or_duplicate_methods() -> mlua::Result<()> {
+        let lua = Lua::new();
+        for source in [
+            "{ auth = {{ id = 'key', label = 'Key', login = function() end }, { id = 'key', label = 'Other', login = function() end }} }",
+            "{ auth = {{ id = 'key', label = 'Key' }} }",
+            "{ auth = { [2] = { id = 'key', label = 'Key', login = function() end } } }",
+            "{ auth_status = true }",
+        ] {
+            let provider = lua.load(format!("return {source}")).eval()?;
+            assert!(auth_methods(&provider).is_err(), "{source}");
         }
         Ok(())
     }

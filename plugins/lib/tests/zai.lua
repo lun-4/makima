@@ -55,3 +55,46 @@ local ctx = {
 local _, err = provider.stream(ctx, request, function() end)
 assert(sent.url == "https://example.test/chat/completions" and sent.headers.Authorization == "Bearer second")
 assert(err.status == 402 and err.message == "1113 insufficient balance" and err.retry_after_ms == nil)
+
+local saved
+local credentials = {
+  read = function()
+    return saved
+  end,
+  write = function(_, key, value)
+    assert(key == "api_key")
+    saved = value
+    return true
+  end,
+  delete = function(_, key)
+    assert(key == "api_key")
+    saved = nil
+    return true
+  end,
+}
+local auth_ctx = { credentials = credentials }
+local config = { api_key_env = "MAKI_TEST_NO_ZAI_KEY", api_key = "fallback" }
+assert(zai.auth_status(auth_ctx, config).source == "config")
+assert(zai.login(auth_ctx, {
+  input = function()
+    return "  saved-key  "
+  end,
+}))
+assert(saved.api_key == "saved-key" and zai.auth_status(auth_ctx, config).source == "stored")
+assert(zai.prepare(auth_ctx, {}, config).key_count == 1)
+assert(zai.logout(auth_ctx) and not saved)
+assert(zai.auth_status(auth_ctx, { api_key_env = "MAKI_TEST_NO_ZAI_KEY" }).configured == false)
+assert(zai.login(auth_ctx, {
+  input = function()
+    return nil
+  end,
+}) == false)
+local _, blank = zai.login(auth_ctx, {
+  input = function()
+    return "   "
+  end,
+})
+assert(blank.kind == "config")
+saved = { api_key = false }
+local _, invalid = zai.auth_status(auth_ctx, config)
+assert(invalid.message == "Invalid Z.AI credentials")

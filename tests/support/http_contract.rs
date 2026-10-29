@@ -3,7 +3,7 @@
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -42,23 +42,51 @@ impl Request {
     }
 }
 
+#[derive(Default)]
+struct ClockState {
+    now: Duration,
+    cancelled: bool,
+}
+
 #[derive(Clone, Default)]
-pub struct Clock(Arc<Mutex<Duration>>);
+pub struct Clock(Arc<(Mutex<ClockState>, Condvar)>);
 
 impl Clock {
     pub fn now(&self) -> Duration {
-        *self.0.lock().expect("clock lock poisoned")
+        self.0.0.lock().expect("clock lock poisoned").now
     }
 
     pub fn advance(&self, duration: Duration) {
-        let mut now = self.0.lock().expect("clock lock poisoned");
-        *now = now.checked_add(duration).expect("clock overflow");
+        let mut state = self.0.0.lock().expect("clock lock poisoned");
+        state.now = state.now.checked_add(duration).expect("clock overflow");
+        self.0.1.notify_all();
+    }
+
+    pub fn cancel(&self) {
+        self.0.0.lock().expect("clock lock poisoned").cancelled = true;
+        self.0.1.notify_all();
+    }
+
+    fn wait_until(&self, deadline: Duration, stop: &Receiver<()>) {
+        let mut state = self.0.0.lock().expect("clock lock poisoned");
+        while state.now < deadline && !state.cancelled {
+            if stop.try_recv().is_ok() {
+                return;
+            }
+            state = self
+                .0
+                .1
+                .wait_timeout(state, POLL_INTERVAL)
+                .expect("clock lock poisoned")
+                .0;
+        }
     }
 }
 
 pub enum Step {
     Chunk(Vec<u8>),
     AdvanceClock(Clock, Duration),
+    WaitUntil(Clock, Duration),
     Signal(Sender<()>),
     Wait(Receiver<()>),
     Disconnect,
@@ -271,6 +299,10 @@ fn write_response(
         match step {
             Step::Chunk(bytes) => stream.write_all(&bytes)?,
             Step::AdvanceClock(clock, duration) => clock.advance(duration),
+            Step::WaitUntil(clock, deadline) => {
+                clock.wait_until(deadline, stop);
+                return Ok(());
+            }
             Step::Signal(reached) => {
                 let _ = reached.send(());
             }

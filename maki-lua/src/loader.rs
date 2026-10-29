@@ -85,6 +85,10 @@ struct BundledPlugin {
 /// `require()` shared modules across boundaries.
 static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
+        name: "zai",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/zai"),
+    },
+    BundledPlugin {
         name: "synthetic",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/synthetic"),
     },

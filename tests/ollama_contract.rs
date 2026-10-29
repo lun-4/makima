@@ -9,12 +9,13 @@ use maki_agent::tools::ToolRegistry;
 use maki_commands::CommandRegistry;
 use maki_config::PluginsConfig;
 use maki_lua::{PluginHost, test_support::InMemoryFs, ui_sink::HostUi};
-use maki_providers::{Message, Model, ProviderEvent, RequestOptions, ThinkingConfig};
+use maki_providers::{Effort, Message, Model, ProviderEvent, RequestOptions, ThinkingConfig};
 use maki_storage::{
     StateDir,
     auth::{ProviderCredentials, save_provider_credentials},
 };
 use serde_json::{Value, json};
+use test_case::test_case;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -167,6 +168,249 @@ fn ollama_registration_streams_without_credentials() {
     let body: Value = serde_json::from_slice(&request.body).unwrap();
     assert_eq!(body["stream_options"]["include_usage"], true);
     assert!(body.get("thinking").is_none());
+}
+
+#[test]
+fn ollama_discovery_sends_model_names_and_extracts_fallback_details() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let response = |body: &str| Response {
+        status: "200 OK".into(),
+        headers: vec![],
+        steps: vec![Step::Chunk(body.as_bytes().to_vec())],
+    };
+    let server = HttpContract::start(vec![
+        response(r#"{"data":[{"id":"z"},{"id":"a"}]}"#),
+        response(r#"{"model_info":{"context_length":2048},"capabilities":["completion"]}"#),
+        response(r#"{"parameters":"temperature 0.7\nnum_ctx 8192\n","capabilities":["vision"]}"#),
+    ])
+    .unwrap();
+    maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
+    let _private_host_guard = PrivateHostGuard;
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("ollama", include_str!("../plugins/ollama/init.lua"))
+        .unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let models = smol::block_on(snapshot.get("ollama").unwrap().factory.discover(&json!({
+        "base_url": format!("http://{}/", server.addr),
+        "api_key_env": "OLLAMA_CONTRACT_UNUSED_KEY",
+        "api_key": " first, second "
+    })))
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "z"]
+    );
+    assert_eq!(models[0].context_window, Some(8192));
+    assert_eq!(models[0].supports_vision, Some(true));
+    assert_eq!(models[1].context_window, Some(2048));
+    assert_eq!(models[1].supports_vision, Some(false));
+    for (method, target, model) in [
+        ("GET", "/v1/models", None),
+        ("POST", "/api/show", Some("z")),
+        ("POST", "/api/show", Some("a")),
+    ] {
+        let request = server
+            .requests
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.method, method);
+        assert_eq!(request.target, target);
+        assert_eq!(request.header("authorization"), Some("Bearer first"));
+        if let Some(model) = model {
+            assert_eq!(request.json().unwrap(), json!({"model": model}));
+        }
+    }
+}
+
+#[test]
+fn ollama_responses_protocol_rotates_credentials() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let server = HttpContract::start(vec![Response {
+        status: "200 OK".into(),
+        headers: vec![("Content-Type".into(), "text/event-stream".into())],
+        steps: vec![Step::Chunk(b"event: response.output_text.delta\ndata: {\"delta\":\"hello\"}\n\nevent: response.completed\ndata: {\"response\":{\"status\":\"completed\"}}\n\n".to_vec())],
+    }]).unwrap();
+    maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
+    let _private_host_guard = PrivateHostGuard;
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("ollama", include_str!("../plugins/ollama/init.lua"))
+        .unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let model = Model::from_spec("ollama/qwen3").unwrap();
+    let (model, provider) = smol::block_on(snapshot.get("ollama").unwrap().factory.prepare(
+        &model,
+        &json!({
+            "base_url": format!("http://{}", server.addr),
+            "api_key_env": "OLLAMA_CONTRACT_UNUSED_KEY",
+            "api_key": " first, second ",
+            "protocol": "openai-responses"
+        }),
+    ))
+    .unwrap();
+    assert_eq!(provider.key_count(), 2);
+    assert!(smol::block_on(provider.rotate_key()).unwrap());
+    let (events, received) = flume::unbounded();
+    let result = smol::block_on(provider.stream_message(
+        &model,
+        &[Message::user("prompt".into())],
+        "system",
+        &json!([]),
+        &events,
+        RequestOptions {
+            thinking: ThinkingConfig::Off,
+            fast: false,
+        },
+        None,
+    ))
+    .unwrap();
+    assert_eq!(result.message.first_text_content(), Some("hello"));
+    assert!(
+        matches!(received.try_recv(), Ok(ProviderEvent::TextDelta { text }) if text == "hello")
+    );
+    let request = server
+        .requests
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.target, "/v1/responses");
+    assert_eq!(request.header("authorization"), Some("Bearer second"));
+    let body = request.json().unwrap();
+    assert_eq!(body["model"], "qwen3");
+    assert_eq!(body["return_progress"], true);
+    assert_eq!(body["stream"], true);
+}
+
+#[test]
+fn ollama_discovery_missing_data_returns_empty_catalog() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let server = HttpContract::start(vec![Response {
+        status: "200 OK".into(),
+        headers: vec![],
+        steps: vec![Step::Chunk(b"{}".to_vec())],
+    }])
+    .unwrap();
+    maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
+    let _private_host_guard = PrivateHostGuard;
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("ollama", include_str!("../plugins/ollama/init.lua"))
+        .unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let models = smol::block_on(snapshot.get("ollama").unwrap().factory.discover(&json!({
+        "base_url": format!("http://{}", server.addr), "api_key_env": "OLLAMA_CONTRACT_UNUSED_KEY"
+    })))
+    .unwrap()
+    .unwrap();
+    assert!(models.is_empty());
+    let request = server
+        .requests
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.target, "/v1/models");
+}
+
+#[test_case(r#"{"model_info":"bad","parameters":"num_ctx 8192","capabilities":["vision"]}"# ; "invalid_model_info")]
+#[test_case(r#"{"model_info":{"context_length":4096},"parameters":42,"capabilities":["vision"]}"# ; "invalid_parameters")]
+#[test_case(r#"{"model_info":{"context_length":4096},"capabilities":"vision"}"# ; "invalid_capabilities")]
+#[test_case(r#"{"model_info":{"context_length":4096},"capabilities":["vision",42]}"# ; "invalid_capability_element")]
+fn ollama_discovery_ignores_invalid_show_fields(show: &str) {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let response = |body: &str| Response {
+        status: "200 OK".into(),
+        headers: vec![],
+        steps: vec![Step::Chunk(body.as_bytes().to_vec())],
+    };
+    let server = HttpContract::start(vec![
+        response(r#"{"data":[{"id":"test"}]}"#),
+        response(show),
+    ])
+    .unwrap();
+    maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
+    let _private_host_guard = PrivateHostGuard;
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("ollama", include_str!("../plugins/ollama/init.lua"))
+        .unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let models = smol::block_on(snapshot.get("ollama").unwrap().factory.discover(&json!({
+        "base_url": format!("http://{}", server.addr), "api_key_env": "OLLAMA_CONTRACT_UNUSED_KEY"
+    })))
+    .unwrap()
+    .unwrap();
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].id, "test");
+    assert_eq!(models[0].context_window, None);
+    assert_eq!(models[0].supports_vision, None);
+    let _ = server
+        .requests
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    let request = server
+        .requests
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.target, "/api/show");
+    assert_eq!(request.json().unwrap(), json!({"model": "test"}));
+}
+
+#[test_case(ThinkingConfig::Off, None ; "off")]
+#[test_case(ThinkingConfig::Adaptive, Some("medium") ; "adaptive")]
+#[test_case(ThinkingConfig::Effort(Effort::Low), Some("low") ; "low")]
+#[test_case(ThinkingConfig::Effort(Effort::XHigh), Some("high") ; "xhigh")]
+#[test_case(ThinkingConfig::Effort(Effort::Max), Some("high") ; "max")]
+#[test_case(ThinkingConfig::Budget(3000), None ; "budget")]
+fn ollama_responses_reasoning_modes(thinking: ThinkingConfig, effort: Option<&str>) {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let server = HttpContract::start(vec![Response {
+        status: "200 OK".into(),
+        headers: vec![("Content-Type".into(), "text/event-stream".into())],
+        steps: vec![Step::Chunk(b"event: response.output_text.delta\ndata: {\"delta\":\"hello\"}\n\nevent: response.completed\ndata: {\"response\":{\"status\":\"completed\"}}\n\n".to_vec())],
+    }]).unwrap();
+    maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
+    let _private_host_guard = PrivateHostGuard;
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("ollama", include_str!("../plugins/ollama/init.lua"))
+        .unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let model = Model::from_spec("ollama/qwen3").unwrap();
+    let (model, provider) = smol::block_on(snapshot.get("ollama").unwrap().factory.prepare(&model, &json!({
+        "base_url": format!("http://{}", server.addr), "api_key_env": "OLLAMA_CONTRACT_UNUSED_KEY", "protocol": "openai-responses"
+    }))).unwrap();
+    let (events, _received) = flume::unbounded();
+    let result = smol::block_on(provider.stream_message(
+        &model,
+        &[Message::user("prompt".into())],
+        "system",
+        &json!([]),
+        &events,
+        RequestOptions {
+            thinking,
+            fast: false,
+        },
+        None,
+    ))
+    .unwrap();
+    assert_eq!(result.message.first_text_content(), Some("hello"));
+    let request = server
+        .requests
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.target, "/v1/responses");
+    let body = request.json().unwrap();
+    assert_eq!(
+        body.get("reasoning"),
+        effort
+            .map(|effort| json!({"effort": effort, "summary": "auto"}))
+            .as_ref()
+    );
 }
 
 #[test]

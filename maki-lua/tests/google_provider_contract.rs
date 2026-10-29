@@ -10,6 +10,40 @@ use serde_json::{Value, json};
 
 #[test]
 fn google_direct_host_stream_and_discovery_use_http_contract() {
+    const CHILD: &str = "MAKI_GOOGLE_CONTRACT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let state = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "google_direct_host_stream_and_discovery_use_http_contract",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env(CHILD, "1")
+            .env("HOME", state.path())
+            .env("XDG_STATE_HOME", state.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    maki_storage::paths::init().unwrap();
+    let state = maki_storage::StateDir::resolve().unwrap();
+    maki_storage::auth::save_provider_credentials(
+        &state,
+        "google",
+        &maki_storage::auth::ProviderCredentials {
+            api_key: "saved-first".into(),
+            host: None,
+        },
+    )
+    .unwrap();
     assert!(
         std::env::var("GOOGLE_BASE_URL")
             .unwrap_or_default()
@@ -145,6 +179,15 @@ fn google_direct_host_stream_and_discovery_use_http_contract() {
     assert!(
         matches!(error, maki_providers::AgentError::Api { status: 429, ref message, retry_after: Some(delay) } if message == "too many tokens" && delay == Duration::from_secs(3))
     );
+    maki_storage::auth::save_provider_credentials(
+        &state,
+        "google",
+        &maki_storage::auth::ProviderCredentials {
+            api_key: "saved-second".into(),
+            host: None,
+        },
+    )
+    .unwrap();
     smol::block_on(provider.reload_auth()).unwrap();
     smol::block_on(provider.stream_message(
         &model,
@@ -166,15 +209,20 @@ fn google_direct_host_stream_and_discovery_use_http_contract() {
     assert!(
         headers
             .to_ascii_lowercase()
-            .contains("x-goog-api-key: fixture key\r\n")
+            .contains("x-goog-api-key: saved-first\r\n")
     );
     let body: Value = serde_json::from_str(body).unwrap();
     assert_eq!(body["systemInstruction"]["parts"][0]["text"], "system");
     assert_eq!(body["contents"][0]["parts"][0]["text"], "question");
-    assert!(requests[1].starts_with("GET /v1/models?key=fixture%20key&pageSize=1000 "));
+    assert!(requests[1].starts_with("GET /v1/models?key=saved-first&pageSize=1000 "));
     assert!(
         requests[1]
             .to_ascii_lowercase()
-            .contains("x-goog-api-key: fixture key\r\n")
+            .contains("x-goog-api-key: saved-first\r\n")
+    );
+    assert!(
+        requests[3]
+            .to_ascii_lowercase()
+            .contains("x-goog-api-key: saved-second\r\n")
     );
 }

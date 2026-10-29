@@ -7177,6 +7177,8 @@ function M.register()
 function M.parse_usage(response)
 function M.prepare(ctx, model, config)
 function M.discover(ctx, config)
+function M.auth_status(ctx, config)
+function M.logout(ctx)
 function M.register()
 ```
 
@@ -7538,7 +7540,10 @@ function ToolView.restore_markdown(output, is_error, opts)
 function M.supports_thinking(id)
 function M.build_request(request)
 function M.parse_quotas(body)
-function M.prepare(_, model_value, config)
+function M.login(ctx, ui)
+function M.auth_status(ctx, config)
+function M.logout(ctx)
+function M.prepare(ctx, model_value, config)
 function M.register()
 ```
 

@@ -268,6 +268,9 @@ function M.prepare(ctx, model, config)
             row.output_tokens = row.output_tokens + entry.completion_tokens
             row.total_tokens = row.total_tokens + entry.total_tokens
             row.spend = row.spend + entry.spend
+          else
+            rows = {}
+            break
           end
         end
       end

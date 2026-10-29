@@ -82,8 +82,7 @@ function M.build_request(request)
   if
     request.thinking
     and request.thinking.mode ~= "off"
-    and request.model.thinking
-    and request.model.thinking.mode ~= "none"
+    and (not request.model.thinking or request.model.thinking.mode ~= "none")
     and not request.model.id:match("^ministral%-")
   then
     body.reasoning_effort = "high"
@@ -93,16 +92,24 @@ end
 
 local function credentials(ctx, config)
   local key = maki.uv.os_getenv(config.api_key_env or "MISTRAL_API_KEY")
+  local source = key and key ~= "" and "env" or nil
   if not key or key == "" then
     if ctx and ctx.credentials then
       local saved, err = ctx.credentials:read("api_key")
       if err and not config.api_key then
         return nil, err
       end
-      key = saved
+      if saved ~= nil then
+        if type(saved) ~= "table" or type(saved.api_key) ~= "string" or saved.api_key == "" then
+          return nil, { kind = "config", message = "Invalid Mistral credentials" }
+        end
+        key = saved.api_key
+        source = "stored"
+      end
     end
     if not key or key == "" then
       key = config.api_key
+      source = "config"
     end
   end
   if key ~= nil and type(key) ~= "string" then
@@ -118,7 +125,7 @@ local function credentials(ctx, config)
   if #keys == 0 then
     return nil, { kind = "config", message = "Mistral API key is not configured" }
   end
-  return keys
+  return keys, nil, source
 end
 
 local function headers(config, key)
@@ -250,15 +257,15 @@ function M.login(ctx, ui)
   if key:match("^%s*$") then
     return nil, { kind = "config", message = "Mistral API key is empty" }
   end
-  return ctx.credentials:write("api_key", key)
+  return ctx.credentials:write("api_key", { api_key = key:match("^%s*(.-)%s*$") })
 end
 
 function M.auth_status(ctx, config)
-  local keys, err = credentials(ctx, config or {})
+  local keys, err, source = credentials(ctx, config or {})
   if err and err.message ~= "Mistral API key is not configured" then
     return nil, err
   end
-  return { configured = keys ~= nil, method = "api_key" }
+  return { configured = keys ~= nil, source = source, method = keys and "api_key" or nil }
 end
 
 function M.logout(ctx)
