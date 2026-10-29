@@ -191,6 +191,70 @@ pub struct HistorySnapshot<M> {
     pub messages: Arc<Vec<M>>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HistoryState {
+    pub baseline: BTreeMap<String, serde_json::Value>,
+    pub updates: Vec<HistoryStateUpdate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistoryStateUpdate {
+    pub boundary: usize,
+    pub namespace: String,
+    pub value: Option<serde_json::Value>,
+}
+
+impl HistoryState {
+    pub fn get(&self, namespace: &str) -> Option<&serde_json::Value> {
+        self.updates
+            .iter()
+            .rev()
+            .find(|update| update.namespace == namespace)
+            .map_or_else(
+                || self.baseline.get(namespace),
+                |update| update.value.as_ref(),
+            )
+    }
+
+    pub fn set(&mut self, boundary: usize, namespace: String, value: serde_json::Value) {
+        self.updates.push(HistoryStateUpdate {
+            boundary,
+            namespace,
+            value: Some(value),
+        });
+    }
+
+    pub fn delete(&mut self, boundary: usize, namespace: String) {
+        self.updates.push(HistoryStateUpdate {
+            boundary,
+            namespace,
+            value: None,
+        });
+    }
+
+    pub fn truncate(&mut self, boundary: usize) {
+        self.updates.retain(|update| update.boundary <= boundary);
+    }
+
+    pub fn remap_boundaries(&mut self, retained_prefix_counts: &[usize]) {
+        for update in &mut self.updates {
+            if let Some(boundary) = retained_prefix_counts.get(update.boundary) {
+                update.boundary = *boundary;
+            }
+        }
+    }
+
+    pub fn compact(&mut self) {
+        for update in self.updates.drain(..) {
+            if let Some(value) = update.value {
+                self.baseline.insert(update.namespace, value);
+            } else {
+                self.baseline.remove(&update.namespace);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HistoryIdentity {
     epoch: u64,
@@ -1852,6 +1916,26 @@ mod tests {
     use test_case::test_case;
 
     type TestSession = Session<Value, Value, Value>;
+
+    #[test]
+    fn history_state_timeline_boundaries() {
+        let mut state = super::HistoryState::default();
+        state.set(1, "a".into(), serde_json::json!(1));
+        state.delete(2, "a".into());
+        state.set(2, "a".into(), serde_json::json!(null));
+        state.set(3, "b".into(), serde_json::json!(true));
+        state.truncate(2);
+        assert_eq!(state.get("a"), Some(&serde_json::Value::Null));
+        assert_eq!(state.get("b"), None);
+        state.remap_boundaries(&[0, 1, 1]);
+        state.truncate(1);
+        assert_eq!(state.get("a"), Some(&serde_json::Value::Null));
+        state.compact();
+        state.delete(0, "a".into());
+        assert_eq!(state.get("a"), None);
+        state.truncate(0);
+        assert_eq!(state.get("a"), None);
+    }
 
     #[cfg(any(unix, windows))]
     const OFFLOAD_SENTINEL: &str = "external offload sentinel";
