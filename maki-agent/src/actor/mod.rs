@@ -137,6 +137,9 @@ pub enum ActorEvent {
         settled: Option<ActorWorkIdentity>,
     },
     Config(ConfigCommit),
+    HistoryStateChanged {
+        namespace: Option<String>,
+    },
     /// An idle compaction ended. Compaction inside a turn ends with the turn.
     CompactionEnd(CompactionStatus),
     Close {
@@ -165,6 +168,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
 use event_listener::Event;
+use serde_json::Value;
 
 use maki_providers::TokenUsage;
 use tracing::info;
@@ -237,6 +241,7 @@ pub(crate) struct ActorInner {
     retained_tickets: Mutex<HashMap<TurnId, TurnTicket>>,
     latest_admitted: Mutex<Option<TurnId>>,
     history: SharedMessages,
+    history_owner: History,
     coverage: Mutex<HashMap<TurnId, Option<(u64, usize)>>>,
     pub(crate) managed_admission: Option<ManagedTurnAdmission>,
     mode_ceiling: Option<config::ModeCeiling>,
@@ -1327,6 +1332,7 @@ impl AgentActorHandle {
             retained_tickets: Mutex::new(HashMap::new()),
             latest_admitted: Mutex::new(None),
             history: mirror,
+            history_owner: history.clone(),
             coverage: Mutex::new(HashMap::new()),
             completion_policy: if managed_admission
                 .as_ref()
@@ -1353,6 +1359,16 @@ impl AgentActorHandle {
             before_snapshot_state: Mutex::new(None),
             #[cfg(test)]
             stale_preparation: Mutex::new(None),
+        });
+        let observer = Arc::downgrade(&inner);
+        history.set_change_listener(move |namespace| {
+            if let Some(inner) = observer.upgrade() {
+                inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .emit(ActorEvent::HistoryStateChanged { namespace });
+            }
         });
         let wake = Arc::new(runner::WakeFlag::new());
         let handle = Self {
@@ -1411,6 +1427,15 @@ impl AgentActorHandle {
 
     pub fn agent_id(&self) -> AgentId {
         self.inner.agent_id
+    }
+
+    pub fn history_state(&self, namespace: &str) -> Option<Value> {
+        self.inner
+            .history_owner
+            .snapshot()
+            .state
+            .get(namespace)
+            .cloned()
     }
 
     /// Any admitted turn whose ticket has not resolved, including one retired

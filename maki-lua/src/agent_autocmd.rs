@@ -22,6 +22,7 @@ pub const TURN_END_EVENT: &str = "TurnEnd";
 pub const AGENT_IDLE_EVENT: &str = "AgentIdle";
 pub const AGENT_CLOSED_EVENT: &str = "AgentClosed";
 pub const CONFIG_CHANGED_EVENT: &str = "ConfigChanged";
+pub const HISTORY_STATE_CHANGED_EVENT: &str = "HistoryStateChanged";
 pub const COMPACTION_DONE_EVENT: &str = "CompactionDone";
 
 /// Fires the autocmd for one envelope a frontend read from {root}'s graph.
@@ -160,6 +161,10 @@ fn actor_autocmd(event: ActorEvent) -> Option<(&'static str, Value)> {
                 "mode": commit.config.mode.id().key(),
             }),
         )),
+        ActorEvent::HistoryStateChanged { namespace } => Some((
+            HISTORY_STATE_CHANGED_EVENT,
+            json!({ "namespace": namespace }),
+        )),
         ActorEvent::CompactionEnd(status) => Some((
             COMPACTION_DONE_EVENT,
             json!({ "status": compaction_status(status) }),
@@ -245,6 +250,18 @@ mod tests {
         let (event, data) = actor_autocmd(ActorEvent::CompactionEnd(status)).unwrap();
         assert_eq!(event, COMPACTION_DONE_EVENT);
         assert_eq!(data["status"], expected);
+    }
+
+    #[test_case(Some("plugin.state"); "namespace_commit")]
+    #[test_case(None; "history_replacement")]
+    fn history_state_change_reports_namespace_or_full_refresh(namespace: Option<&str>) {
+        let event = ActorEvent::HistoryStateChanged {
+            namespace: namespace.map(str::to_owned),
+        };
+        assert!(IdleFilter::default().passes(&event));
+        let (name, data) = actor_autocmd(event).unwrap();
+        assert_eq!(name, HISTORY_STATE_CHANGED_EVENT);
+        assert_eq!(data, json!({ "namespace": namespace }));
     }
 
     /// Idle after a config-only commit settles no new work, so only the idle

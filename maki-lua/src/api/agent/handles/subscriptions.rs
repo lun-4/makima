@@ -6,7 +6,8 @@ use mlua::{Function, Lua, UserDataRef};
 use super::LuaAgent;
 use super::authority::authorize;
 use crate::agent_autocmd::{
-    AGENT_CLOSED_EVENT, AGENT_IDLE_EVENT, CONFIG_CHANGED_EVENT, TURN_END_EVENT, TURN_START_EVENT,
+    AGENT_CLOSED_EVENT, AGENT_IDLE_EVENT, CONFIG_CHANGED_EVENT, HISTORY_STATE_CHANGED_EVENT,
+    TURN_END_EVENT, TURN_START_EVENT,
 };
 use crate::agent_errors::TRUSTED_SUBSCRIPTION_REQUIRED;
 use crate::api::autocmd::{AutocmdEntry, AutocmdStore, next_autocmd_id};
@@ -100,6 +101,23 @@ fn on_config_change(
     handler: Function,
 ) -> mlua::Result<Pair<LuaAgentSubscription>> {
     subscribe(lua, this, &ctx, handler, CONFIG_CHANGED_EVENT)
+}
+
+/// Alias for `create_autocmd("HistoryStateChanged", { agent = self, callback = handler })`.
+/// Fires after a committed namespace replacement or deletion, and after history
+/// replacement. `ev.agent` is the changed agent. `ev.data.namespace` is the changed
+/// namespace, or nil when history replacement requires a full refresh.
+/// @param ctx LuaCtx Trusted invocation context.
+/// @param handler function Called as handler(ev, ctx). Read current values with ev.agent:history_get(ctx, namespace).
+/// @return (AgentSubscription?, string?) Revocable subscription.
+#[lua_fn(name = "on_history_state_change")]
+fn on_history_state_change(
+    lua: &Lua,
+    this: &LuaAgent,
+    ctx: UserDataRef<LuaCtx>,
+    handler: Function,
+) -> mlua::Result<Pair<LuaAgentSubscription>> {
+    subscribe(lua, this, &ctx, handler, HISTORY_STATE_CHANGED_EVENT)
 }
 
 /// Alias for `create_autocmd("AgentClosed", { agent = self, callback = handler })`.

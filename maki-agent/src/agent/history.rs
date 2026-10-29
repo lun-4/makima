@@ -1,9 +1,13 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use maki_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, Role};
 use maki_storage::sessions::next_epoch;
+use serde_json::Value;
+use thiserror::Error;
 use tracing::warn;
+
+use crate::cancel::CancelToken;
 
 const CANCEL_MARKER: &str = "[Cancelled by user]";
 pub const UNAVAILABLE_RESULT: &str = "[Tool result not available]";
@@ -11,58 +15,203 @@ pub const UNAVAILABLE_RESULT: &str = "[Tool result not available]";
 pub type HistorySnapshot = maki_storage::sessions::HistorySnapshot<Message>;
 pub type SharedMessages = Arc<ArcSwap<HistorySnapshot>>;
 
-pub struct History {
-    /// The value the mirror publishes, held whole so the two can never
-    /// disagree and so a new run can never inherit the last one's epoch.
+type ChangeListener = Arc<dyn Fn(Option<String>) + Send + Sync>;
+
+struct HistoryOwner {
     snapshot: HistorySnapshot,
+    generation: u64,
     mirror: Option<SharedMessages>,
+    listener: Option<ChangeListener>,
+}
+
+impl HistoryOwner {
+    fn publish(&self) {
+        if let Some(mirror) = &self.mirror {
+            mirror.store(Arc::new(self.snapshot.clone()));
+        }
+    }
+
+    fn invalidate_handles(&mut self) {
+        self.generation = next_epoch();
+    }
+}
+
+/// Clones share one synchronized history. Snapshots remain frozen after later commits.
+#[derive(Clone)]
+pub struct History {
+    owner: Arc<Mutex<HistoryOwner>>,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum HistoryStateError {
+    #[error("history state handle belongs to a replaced history")]
+    Stale,
+    #[error("history state operation was cancelled")]
+    Cancelled,
+    #[error("history state boundary is outside the current history")]
+    InvalidBoundary,
+}
+
+/// Commits namespace values at one tool-call boundary in owner-lock acquisition order.
+/// Replacement invalidates the handle, including replacement with an earlier snapshot.
+#[derive(Clone)]
+pub struct HistoryStateHandle {
+    history: History,
+    generation: u64,
+    boundary: usize,
+    cancel: CancelToken,
+}
+
+impl HistoryStateHandle {
+    fn validate(&self, owner: &HistoryOwner) -> Result<(), HistoryStateError> {
+        if owner.generation != self.generation {
+            return Err(HistoryStateError::Stale);
+        }
+        if self.boundary > owner.snapshot.messages.len() {
+            return Err(HistoryStateError::InvalidBoundary);
+        }
+        Ok(())
+    }
+
+    pub fn get(&self, namespace: &str) -> Result<Option<Value>, HistoryStateError> {
+        let owner = self
+            .history
+            .owner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.validate(&owner)?;
+        self.cancel
+            .commit_if_active(|| owner.snapshot.state.get(namespace).cloned())
+            .ok_or(HistoryStateError::Cancelled)
+    }
+
+    pub fn set(&self, namespace: String, value: Value) -> Result<(), HistoryStateError> {
+        self.commit(namespace, Some(value))
+    }
+
+    pub fn delete(&self, namespace: String) -> Result<(), HistoryStateError> {
+        self.commit(namespace, None)
+    }
+
+    fn commit(&self, namespace: String, value: Option<Value>) -> Result<(), HistoryStateError> {
+        let listener = {
+            let mut owner = self
+                .history
+                .owner
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            self.validate(&owner)?;
+            self.cancel
+                .commit_if_active(|| {
+                    let state = Arc::make_mut(&mut owner.snapshot.state);
+                    match value {
+                        Some(value) => state.set(self.boundary, namespace.clone(), value),
+                        None => state.delete(self.boundary, namespace.clone()),
+                    }
+                    owner.publish();
+                })
+                .ok_or(HistoryStateError::Cancelled)?;
+            owner.listener.clone()
+        };
+        if let Some(listener) = listener {
+            listener(Some(namespace));
+        }
+        Ok(())
+    }
 }
 
 impl History {
     pub fn new(messages: Vec<Message>) -> Self {
+        Self::from_snapshot(HistorySnapshot::new(messages))
+    }
+
+    fn from_snapshot(snapshot: HistorySnapshot) -> Self {
         Self {
-            snapshot: HistorySnapshot::new(messages),
-            mirror: None,
+            owner: Arc::new(Mutex::new(HistoryOwner {
+                snapshot,
+                generation: next_epoch(),
+                mirror: None,
+                listener: None,
+            })),
         }
     }
 
     pub fn restored_snapshot(mut snapshot: HistorySnapshot) -> Self {
         sanitize_restored(&mut snapshot);
         snapshot.epoch = next_epoch();
-        Self {
-            snapshot,
-            mirror: None,
-        }
+        Self::from_snapshot(snapshot)
     }
 
     pub fn restored(messages: Vec<Message>) -> Self {
         Self::restored_snapshot(HistorySnapshot::new(messages))
     }
 
-    pub fn with_mirror(mut self, mirror: SharedMessages) -> Self {
-        self.mirror = Some(mirror);
-        self.publish();
+    pub fn with_mirror(self, mirror: SharedMessages) -> Self {
+        {
+            let mut owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
+            owner.mirror = Some(mirror);
+            owner.publish();
+        }
         self
     }
 
-    pub fn snapshot(&self) -> &HistorySnapshot {
-        &self.snapshot
+    /// Runs after publication and outside the owner lock. `None` denotes replacement.
+    /// The callback must not retain a strong reference to this history's owner.
+    pub fn set_change_listener(&self, listener: impl Fn(Option<String>) + Send + Sync + 'static) {
+        self.owner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .listener = Some(Arc::new(listener));
     }
 
-    pub fn as_slice(&self) -> &[Message] {
-        &self.snapshot.messages
+    pub fn state_handle(&self, boundary: usize, cancel: CancelToken) -> HistoryStateHandle {
+        let owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
+        HistoryStateHandle {
+            history: self.clone(),
+            generation: owner.generation,
+            boundary,
+            cancel,
+        }
+    }
+
+    pub fn snapshot(&self) -> HistorySnapshot {
+        self.owner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .snapshot
+            .clone()
+    }
+
+    pub fn as_slice(&self) -> Arc<Vec<Message>> {
+        self.snapshot().messages
     }
 
     pub fn push(&mut self, msg: Message) {
         self.edit(|msgs| msgs.push(msg));
     }
 
+    pub(crate) fn push_tool_call(
+        &mut self,
+        message: Message,
+        cancel: CancelToken,
+    ) -> HistoryStateHandle {
+        let mut owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
+        Arc::make_mut(&mut owner.snapshot.messages).push(message);
+        owner.publish();
+        HistoryStateHandle {
+            history: self.clone(),
+            generation: owner.generation,
+            boundary: owner.snapshot.messages.len(),
+            cancel,
+        }
+    }
+
     pub fn len(&self) -> usize {
-        self.snapshot.messages.len()
+        self.as_slice().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.snapshot.messages.is_empty()
+        self.as_slice().is_empty()
     }
 
     /// Skips system padding so repeated nudges cannot push tool results
@@ -96,44 +245,47 @@ impl History {
     }
 
     pub fn replace_snapshot(&mut self, snapshot: HistorySnapshot) {
-        self.snapshot = snapshot;
-        self.publish();
+        self.replace_with(|current| *current = snapshot);
     }
 
     pub fn replace_compacted(&mut self, messages: Vec<Message>) {
-        Arc::make_mut(&mut self.snapshot.state).compact();
-        self.snapshot.compacted = true;
-        self.rewrite(|msgs| *msgs = messages);
+        self.replace_with(|snapshot| {
+            Arc::make_mut(&mut snapshot.state).compact();
+            snapshot.compacted = true;
+            snapshot.epoch = next_epoch();
+            snapshot.messages = Arc::new(messages);
+        });
     }
 
     pub fn truncate(&mut self, len: usize) {
-        Arc::make_mut(&mut self.snapshot.state).truncate(len);
-        self.rewrite(|msgs| msgs.truncate(len));
+        self.replace_with(|snapshot| {
+            Arc::make_mut(&mut snapshot.state).truncate(len);
+            Arc::make_mut(&mut snapshot.messages).truncate(len);
+            snapshot.epoch = next_epoch();
+        });
     }
 
     pub fn into_vec(self) -> Vec<Message> {
-        Arc::unwrap_or_clone(self.snapshot.messages)
+        Arc::unwrap_or_clone(self.as_slice())
     }
 
-    /// An append: whatever a consumer already holds of the list stays good.
     fn edit(&mut self, f: impl FnOnce(&mut Vec<Message>)) {
-        f(Arc::make_mut(&mut self.snapshot.messages));
-        self.publish();
+        let mut owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
+        f(Arc::make_mut(&mut owner.snapshot.messages));
+        owner.publish();
     }
 
-    /// Any other change, so a consumer has to start the list over.
-    fn rewrite(&mut self, f: impl FnOnce(&mut Vec<Message>)) {
-        self.snapshot.epoch = next_epoch();
-        self.edit(f);
-    }
-
-    /// The mirror gets the messages as they are. Closing dangling tool calls
-    /// here used to make the snapshot as long as the real results that came
-    /// next, so the log never saw them. Callers that need an API-valid list
-    /// close the dangling calls on their own copy.
-    fn publish(&self) {
-        let Some(mirror) = &self.mirror else { return };
-        mirror.store(Arc::new(self.snapshot.clone()));
+    fn replace_with(&mut self, f: impl FnOnce(&mut HistorySnapshot)) {
+        let listener = {
+            let mut owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
+            owner.invalidate_handles();
+            f(&mut owner.snapshot);
+            owner.publish();
+            owner.listener.clone()
+        };
+        if let Some(listener) = listener {
+            listener(None);
+        }
     }
 }
 
@@ -280,6 +432,177 @@ mod tests {
     const OTHER_NAMESPACE: &str = "test.other";
 
     #[test]
+    fn history_state_concurrent_ordering_and_result_append() {
+        let mirror = make_mirror();
+        let mut history = History::new(vec![Message::user(GO.into()), make_tool_use_msg(&["t1"])])
+            .with_mirror(Arc::clone(&mirror));
+        let before = history.snapshot();
+        let first = history.state_handle(history.len(), CancelToken::none());
+        let second = first.clone();
+        let (committed_tx, committed_rx) = flume::bounded(1);
+        let (continue_tx, continue_rx) = flume::bounded(1);
+        let writer = std::thread::spawn(move || {
+            first
+                .set(STATE_NAMESPACE.into(), Value::String(FIRST.into()))
+                .unwrap();
+            committed_tx.send(()).unwrap();
+            continue_rx.recv().unwrap();
+            second
+                .set(STATE_NAMESPACE.into(), Value::String(SECOND.into()))
+                .unwrap();
+        });
+        committed_rx.recv().unwrap();
+        let first_commit = mirror.load_full();
+        assert_eq!(first_commit.messages.len(), 2);
+        assert_eq!(
+            first_commit.state.get(STATE_NAMESPACE),
+            Some(&Value::String(FIRST.into()))
+        );
+        history.push(make_tool_result_msg(&["t1"]));
+        continue_tx.send(()).unwrap();
+        writer.join().unwrap();
+        let after = history.snapshot();
+        assert_eq!(after.messages.len(), 3);
+        assert_eq!(after.epoch, before.epoch);
+        assert_eq!(
+            after.state.get(STATE_NAMESPACE),
+            Some(&Value::String(SECOND.into()))
+        );
+        assert_eq!(
+            after
+                .state
+                .updates
+                .iter()
+                .map(|update| update.boundary)
+                .collect::<Vec<_>>(),
+            [2, 2]
+        );
+        assert!(before.state.is_empty());
+        assert_eq!(
+            first_commit.state.get(STATE_NAMESPACE),
+            Some(&Value::String(FIRST.into()))
+        );
+        let published = mirror.load_full();
+        assert!(Arc::ptr_eq(&after.state, &published.state));
+        assert!(Arc::ptr_eq(&after.messages, &published.messages));
+        history.truncate(1);
+        assert_eq!(history.snapshot().state.get(STATE_NAMESPACE), None);
+    }
+
+    #[test_case("rewind" ; "rewind")]
+    #[test_case("compact" ; "compaction")]
+    #[test_case("reset" ; "reset")]
+    #[test_case("rollback" ; "rollback")]
+    fn history_state_stale_handle_rejected(replacement: &str) {
+        let mut history = History::new(vec![Message::user(GO.into())]);
+        let handle = history.state_handle(history.len(), CancelToken::none());
+        handle
+            .set(STATE_NAMESPACE.into(), Value::String(FIRST.into()))
+            .unwrap();
+        let original = history.snapshot();
+        match replacement {
+            "rewind" => history.truncate(0),
+            "compact" => history.replace_compacted(vec![Message::user(SECOND.into())]),
+            "reset" => history.replace(Vec::new()),
+            "rollback" => {
+                history.replace_compacted(vec![Message::user(SECOND.into())]);
+                history.replace_snapshot(original.clone());
+            }
+            _ => unreachable!(),
+        }
+        let before = history.snapshot();
+        assert_eq!(handle.get(STATE_NAMESPACE), Err(HistoryStateError::Stale));
+        assert_eq!(
+            handle.set(STATE_NAMESPACE.into(), Value::Null),
+            Err(HistoryStateError::Stale)
+        );
+        assert_eq!(
+            handle.delete(STATE_NAMESPACE.into()),
+            Err(HistoryStateError::Stale)
+        );
+        assert!(Arc::ptr_eq(&before.state, &history.snapshot().state));
+        let fresh = history.state_handle(history.len(), CancelToken::none());
+        fresh
+            .set(STATE_NAMESPACE.into(), Value::String(SECOND.into()))
+            .unwrap();
+        assert_eq!(
+            fresh.get(STATE_NAMESPACE).unwrap(),
+            Some(Value::String(SECOND.into()))
+        );
+    }
+
+    #[test]
+    fn history_state_cancelled_before_lock_does_not_commit() {
+        let history = History::new(vec![Message::user(GO.into())]);
+        let (trigger, cancel) = CancelToken::new();
+        let handle = history.state_handle(history.len(), cancel);
+        handle
+            .set(STATE_NAMESPACE.into(), Value::String(FIRST.into()))
+            .unwrap();
+        let owner = history.owner.lock().unwrap();
+        let (started_tx, started_rx) = flume::bounded(1);
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            handle.set(STATE_NAMESPACE.into(), Value::String(SECOND.into()))
+        });
+        started_rx.recv().unwrap();
+        trigger.cancel();
+        drop(owner);
+        assert_eq!(writer.join().unwrap(), Err(HistoryStateError::Cancelled));
+        assert_eq!(
+            history.snapshot().state.get(STATE_NAMESPACE),
+            Some(&Value::String(FIRST.into()))
+        );
+        assert_eq!(history.snapshot().state.updates.len(), 1);
+    }
+
+    #[test]
+    fn history_state_listener_queries_published_owner_and_isolation() {
+        let mirror = make_mirror();
+        let mut history =
+            History::new(vec![Message::user(GO.into())]).with_mirror(Arc::clone(&mirror));
+        let child = History::new(vec![Message::user(GO.into())]);
+        let (events_tx, events_rx) = flume::unbounded();
+        let observed = Arc::downgrade(&history.owner);
+        history.set_change_listener(move |namespace| {
+            let history = History {
+                owner: observed.upgrade().unwrap(),
+            };
+            let snapshot = history.snapshot();
+            let published = mirror.load_full();
+            assert!(Arc::ptr_eq(&snapshot.state, &published.state));
+            assert!(Arc::ptr_eq(&snapshot.messages, &published.messages));
+            events_tx.send(namespace).unwrap();
+        });
+        let handle = history.state_handle(history.len(), CancelToken::none());
+        handle.set(STATE_NAMESPACE.into(), Value::Null).unwrap();
+        assert_eq!(handle.get(STATE_NAMESPACE).unwrap(), Some(Value::Null));
+        assert_eq!(child.snapshot().state.get(STATE_NAMESPACE), None);
+        handle.delete(STATE_NAMESPACE.into()).unwrap();
+        assert_eq!(handle.get(STATE_NAMESPACE).unwrap(), None);
+        history.replace(Vec::new());
+        assert_eq!(
+            events_rx.try_iter().collect::<Vec<_>>(),
+            [
+                Some(STATE_NAMESPACE.into()),
+                Some(STATE_NAMESPACE.into()),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn history_state_invalid_boundary_does_not_mutate() {
+        let history = History::new(Vec::new());
+        let handle = history.state_handle(1, CancelToken::none());
+        assert_eq!(
+            handle.set(STATE_NAMESPACE.into(), Value::Null),
+            Err(HistoryStateError::InvalidBoundary)
+        );
+        assert!(history.snapshot().state.is_empty());
+    }
+
+    #[test]
     fn history_state_sanitized_interrupted_resume_and_rewind() {
         let mut snapshot = HistorySnapshot::new(vec![
             make_tool_result_msg(&["orphan"]),
@@ -377,13 +700,14 @@ mod tests {
         history.push(Message::user(GO.into()));
         assert!(mirror.load().compacted);
         let restored = History::restored_snapshot((*mirror.load_full()).clone());
-        assert!(restored.snapshot.compacted);
+        assert!(restored.snapshot().compacted);
         assert_eq!(restored.len(), 2);
     }
 
     #[track_caller]
     fn assert_ends_with_cancel_marker(history: &History) {
-        let last = history.as_slice().last().unwrap();
+        let messages = history.as_slice();
+        let last = messages.last().unwrap();
         assert!(matches!(last.role, Role::User));
         assert!(matches!(&last.content[0], ContentBlock::Text { text } if text == CANCEL_MARKER));
     }
@@ -685,7 +1009,8 @@ mod tests {
             make_tool_use_msg(&["t1"]),
             make_tool_result_msg(&["t1", "t2"]),
         ]);
-        let results: Vec<&str> = history.as_slice()[2]
+        let messages = history.as_slice();
+        let results: Vec<&str> = messages[2]
             .content
             .iter()
             .filter_map(|b| match b {
@@ -833,7 +1158,7 @@ mod tests {
         let snap = mirror.load();
         assert_ne!(snap.epoch, seed_epoch);
         assert!(
-            Arc::ptr_eq(&snap.messages, &history.snapshot.messages),
+            Arc::ptr_eq(&snap.messages, &history.snapshot().messages),
             "mirror shares the sanitized buffer verbatim"
         );
         assert_eq!(snap.messages.len(), 3);

@@ -1123,7 +1123,7 @@ pub(super) async fn process_tool_calls(
         .map(|(id, name, input)| (id.to_owned(), name.to_owned(), input.clone()))
         .collect();
 
-    history.push(response.message);
+    let history_state = history.push_tool_call(response.message, ctx.cancel.clone());
 
     let mut immediate_errors: Vec<ToolDoneEvent> = Vec::new();
     let mut runnable: Vec<(String, String, Value)> = Vec::new();
@@ -1155,6 +1155,7 @@ pub(super) async fn process_tool_calls(
         let event_tx_clone = ctx.event_tx.clone();
         let tool_ctx = ToolContext {
             tool_use_id: Some(id.clone()),
+            history_state: Some(history_state.clone()),
             ..ctx.clone()
         };
         set.spawn(async move {
@@ -1271,6 +1272,108 @@ mod tests {
             .collect();
         let input = serde_json::json!({"path": "/a"});
         assert_eq!(recent_calls(&entries).is_doom_loop(name, &input), expected);
+    }
+
+    #[test]
+    fn history_state_nested_pre_join_commit_survives_outer_failure() {
+        const OUTER_TOOL: &str = "state_outer";
+        const INNER_TOOL: &str = "state_inner";
+        const NAMESPACE: &str = "test.dispatch";
+        const COMMITTED: &str = "committed";
+        const OUTER_ERROR: &str = "outer failed";
+        smol::block_on(async {
+            let mut ctx = stub_ctx(&AgentMode::Build);
+            let (committed_tx, committed_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            let (raw_tx, _raw_rx) = flume::unbounded();
+            ctx.event_tx = crate::EventSender::new(raw_tx);
+            ctx.local_tools = Arc::new(HashMap::from([
+                (
+                    INNER_TOOL.into(),
+                    local_tool(ToolAudience::all(), move |_, ctx| {
+                        let committed_tx = committed_tx.clone();
+                        let release_rx = release_rx.clone();
+                        Box::pin(async move {
+                            ctx.history_state
+                                .as_ref()
+                                .unwrap()
+                                .set(NAMESPACE.into(), Value::String(COMMITTED.into()))
+                                .unwrap();
+                            committed_tx.send_async(()).await.unwrap();
+                            release_rx.recv_async().await.unwrap();
+                            Ok(COMMITTED.into())
+                        })
+                    }),
+                ),
+                (
+                    OUTER_TOOL.into(),
+                    local_tool(ToolAudience::all(), |_, ctx| {
+                        Box::pin(async move {
+                            let done = run(
+                                TEST_ID.into(),
+                                INNER_TOOL,
+                                &Value::Null,
+                                &ctx,
+                                CallOrigin::Nested,
+                            )
+                            .await;
+                            assert!(!done.is_error);
+                            Err(OUTER_ERROR.into())
+                        })
+                    }),
+                ),
+            ]));
+            pin(&mut ctx);
+            let mut history =
+                crate::History::new(vec![maki_providers::Message::user(COMMITTED.into())]);
+            let observed = history.clone();
+            let response = maki_providers::StreamResponse {
+                message: maki_providers::Message {
+                    role: maki_providers::Role::Assistant,
+                    content: vec![maki_providers::ContentBlock::ToolUse {
+                        id: TEST_ID.into(),
+                        name: OUTER_TOOL.into(),
+                        input: Value::Null,
+                        thought_signature: None,
+                    }],
+                    ..Default::default()
+                },
+                usage: Default::default(),
+                stop_reason: None,
+            };
+            let execution = smol::spawn(async move {
+                let mut recent_calls = RecentCalls::new();
+                process_tool_calls(
+                    response,
+                    &mut recent_calls,
+                    &mut history,
+                    &ctx.event_tx,
+                    &ctx,
+                )
+                .await
+                .unwrap();
+                history
+            });
+            committed_rx.recv_async().await.unwrap();
+            let pre_join = observed.snapshot();
+            assert_eq!(pre_join.messages.len(), 2);
+            assert_eq!(
+                pre_join.state.get(NAMESPACE),
+                Some(&Value::String(COMMITTED.into()))
+            );
+            assert_eq!(pre_join.state.updates[0].boundary, 2);
+            release_tx.send_async(()).await.unwrap();
+            let history = execution.await;
+            let after = history.snapshot();
+            assert_eq!(after.messages.len(), 3);
+            assert_eq!(
+                after.state.get(NAMESPACE),
+                Some(&Value::String(COMMITTED.into()))
+            );
+            assert!(
+                matches!(&after.messages[2].content[0], maki_providers::ContentBlock::ToolResult { content, is_error: true, .. } if content == OUTER_ERROR)
+            );
+        });
     }
 
     fn local_ctx(

@@ -573,6 +573,106 @@ mod tests {
         });
     }
 
+    #[test]
+    fn checkpoint_harness_child_round_trip_smoke() {
+        smol::block_on(async {
+            let tmp = TempDir::new().unwrap();
+            let dir = StateDir::from_path(tmp.path().to_path_buf());
+            let id = MakiId::generate();
+            let options = SessionOptions::new(
+                builtin_option_definitions(
+                    MODEL,
+                    [Arc::from(MODEL)],
+                    false,
+                    false,
+                    false,
+                    ThinkingConfig::Off,
+                ),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            let writer = SessionLogCheckpoint::open(dir.clone(), id, MODEL, CWD, None).unwrap();
+
+            let mut root = HistorySnapshot::default();
+            Arc::make_mut(&mut root.state).set(
+                0,
+                STATE_NAMESPACE.into(),
+                serde_json::json!("root state"),
+            );
+            let mut root_checkpoint = request(id, 1, MODEL, &options);
+            let candidate = Arc::make_mut(&mut root_checkpoint.snapshot);
+            candidate.kind = SessionCheckpointKind::Config;
+            candidate.history_revision = Some(1);
+            candidate.history = Some(root.clone());
+            writer.checkpoint(root_checkpoint).await.unwrap();
+
+            let mut live_child = HistorySnapshot::default();
+            Arc::make_mut(&mut live_child.state).set(
+                0,
+                STATE_NAMESPACE.into(),
+                serde_json::json!("before"),
+            );
+            writer
+                .checkpoint_child(child(CHILD_KEY), live_child.clone())
+                .await
+                .unwrap();
+            Arc::make_mut(&mut live_child.state).set(
+                0,
+                STATE_NAMESPACE.into(),
+                serde_json::json!("after"),
+            );
+            writer
+                .checkpoint_child(child(CHILD_KEY), live_child.clone())
+                .await
+                .unwrap();
+
+            let mut orphan = HistorySnapshot::default();
+            Arc::make_mut(&mut orphan.state).set(
+                0,
+                STATE_NAMESPACE.into(),
+                serde_json::json!("orphan"),
+            );
+            writer
+                .checkpoint_child(child(SIBLING_KEY), orphan)
+                .await
+                .unwrap();
+            drop(writer);
+
+            let mut loaded = StoredSession::load(id, &dir).unwrap();
+            assert_eq!(loaded.history_snapshot().state, root.state);
+            assert_eq!(
+                loaded
+                    .subagent_history_snapshot(CHILD_KEY)
+                    .unwrap()
+                    .state
+                    .get(STATE_NAMESPACE),
+                Some(&serde_json::json!("after"))
+            );
+            assert_eq!(
+                loaded
+                    .subagent_history_snapshot(SIBLING_KEY)
+                    .unwrap()
+                    .state
+                    .get(STATE_NAMESPACE),
+                Some(&serde_json::json!("orphan"))
+            );
+
+            loaded.prune_orphans_preserving(|_| Vec::new(), &[CHILD_KEY.into()]);
+            loaded.save(&dir).unwrap();
+            let resumed = StoredSession::load(id, &dir).unwrap();
+            assert_eq!(resumed.history_snapshot().state, root.state);
+            assert_eq!(
+                resumed
+                    .subagent_history_snapshot(CHILD_KEY)
+                    .unwrap()
+                    .state
+                    .get(STATE_NAMESPACE),
+                Some(&serde_json::json!("after"))
+            );
+            assert!(resumed.subagent_history_snapshot(SIBLING_KEY).is_none());
+        });
+    }
+
     fn child(key: &str) -> StoredSubagent {
         StoredSubagent {
             tool_use_id: key.into(),

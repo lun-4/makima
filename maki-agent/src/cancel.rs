@@ -294,6 +294,15 @@ impl CancelToken {
         publication.try_publish()
     }
 
+    pub(crate) fn commit_if_active<T>(&self, commit: impl FnOnce() -> T) -> Option<T> {
+        let _gate = self
+            .0
+            .publication_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        (!self.is_cancelled()).then(commit)
+    }
+
     pub fn child(&self) -> (CancelTrigger, Self) {
         let _gate = self
             .0

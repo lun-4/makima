@@ -1,3 +1,5 @@
+use std::{collections::HashSet, ffi::c_void};
+
 use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 use serde_json::Value as JsonValue;
 
@@ -9,6 +11,179 @@ pub(crate) const NIL_TOOL_RESULT_ERR: &str = "tool returned nil without an error
 /// Past this the table is a sparse map, not an array, and the object encoding
 /// keeps every key while allocating per entry.
 const MAX_ARRAY_HOLES: usize = 4096;
+// Leave room for session/history wrappers within serde_json's default nesting limit.
+const MAX_HISTORY_STATE_DEPTH: usize = 64;
+
+/// Converts Lua values to JSON for history state without discarding values or
+/// changing the table being inspected.
+pub(crate) fn history_state_from_lua(lua: &Lua, value: &Value) -> LuaResult<JsonValue> {
+    let mut path = HashSet::new();
+    history_state_from_lua_inner(lua, value, &lua.array_metatable(), &mut path, 0)
+}
+
+fn history_state_from_lua_inner(
+    lua: &Lua,
+    value: &Value,
+    array_metatable: &Table,
+    path: &mut HashSet<*const c_void>,
+    depth: usize,
+) -> LuaResult<JsonValue> {
+    if depth > MAX_HISTORY_STATE_DEPTH {
+        return Err(mlua::Error::runtime(
+            "history state exceeds maximum nesting depth",
+        ));
+    }
+
+    match value {
+        Value::Nil => Ok(JsonValue::Null),
+        Value::LightUserData(value) if value.0.is_null() => Ok(JsonValue::Null),
+        Value::Boolean(value) => Ok(JsonValue::Bool(*value)),
+        Value::Integer(value) => Ok(JsonValue::Number((*value).into())),
+        Value::Number(value) => serde_json::Number::from_f64(*value)
+            .map(JsonValue::Number)
+            .ok_or_else(|| mlua::Error::runtime("history state numbers must be finite")),
+        Value::String(value) => Ok(JsonValue::String(value.to_str()?.to_owned())),
+        Value::Table(table) => {
+            let pointer = table.to_pointer();
+            if !path.insert(pointer) {
+                return Err(mlua::Error::runtime("history state contains a table cycle"));
+            }
+            let result = history_state_table_to_json(lua, table, array_metatable, path, depth);
+            path.remove(&pointer);
+            result
+        }
+        _ => Err(mlua::Error::runtime(format!(
+            "history state does not support Lua {} values",
+            value.type_name()
+        ))),
+    }
+}
+
+fn history_state_table_to_json(
+    lua: &Lua,
+    table: &Table,
+    array_metatable: &Table,
+    path: &mut HashSet<*const c_void>,
+    depth: usize,
+) -> LuaResult<JsonValue> {
+    let tagged_array = table.metatable().as_ref() == Some(array_metatable);
+    let mut integer_entries = Vec::new();
+    let mut object_entries = Vec::new();
+    let mut saw_integer = false;
+    let mut saw_string = false;
+    let mut max_index = 0usize;
+
+    for pair in table.pairs::<Value, Value>() {
+        let (key, value) = pair?;
+        match key {
+            Value::Integer(index) if index > 0 => {
+                if saw_string {
+                    return Err(mlua::Error::runtime(
+                        "history state tables cannot mix array and object keys",
+                    ));
+                }
+                saw_integer = true;
+                let index = usize::try_from(index)
+                    .map_err(|_| mlua::Error::runtime("history state array index is too large"))?;
+                max_index = max_index.max(index);
+                integer_entries.push((index, value));
+            }
+            Value::String(key) => {
+                if saw_integer {
+                    return Err(mlua::Error::runtime(
+                        "history state tables cannot mix array and object keys",
+                    ));
+                }
+                saw_string = true;
+                object_entries.push((key.to_str()?.to_owned(), value));
+            }
+            _ => {
+                return Err(mlua::Error::runtime(
+                    "history state table keys must be strings or positive integers",
+                ));
+            }
+        }
+    }
+
+    if tagged_array || saw_integer {
+        if saw_string || integer_entries.len() != max_index {
+            return Err(mlua::Error::runtime(
+                "history state arrays must have dense positive integer keys",
+            ));
+        }
+        let mut items = vec![JsonValue::Null; integer_entries.len()];
+        for (index, value) in integer_entries {
+            items[index - 1] =
+                history_state_from_lua_inner(lua, &value, array_metatable, path, depth + 1)?;
+        }
+        return Ok(JsonValue::Array(items));
+    }
+
+    let mut object = serde_json::Map::new();
+    for (key, value) in object_entries {
+        object.insert(
+            key,
+            history_state_from_lua_inner(lua, &value, array_metatable, path, depth + 1)?,
+        );
+    }
+    Ok(JsonValue::Object(object))
+}
+
+/// Converts JSON history state to Lua, using mlua's null lightuserdata so null
+/// remains present in tables and tagging arrays so empty arrays stay distinct.
+pub(crate) fn history_state_to_lua(lua: &Lua, value: &JsonValue) -> LuaResult<Value> {
+    history_state_to_lua_inner(lua, value, 0)
+}
+
+fn history_state_to_lua_inner(lua: &Lua, value: &JsonValue, depth: usize) -> LuaResult<Value> {
+    if depth > MAX_HISTORY_STATE_DEPTH {
+        return Err(mlua::Error::runtime(
+            "history state exceeds maximum nesting depth",
+        ));
+    }
+
+    Ok(match value {
+        JsonValue::Null => Value::NULL,
+        JsonValue::Bool(value) => Value::Boolean(*value),
+        JsonValue::Number(json_number) => {
+            if let Some(integer) = json_number.as_i64() {
+                Value::Integer(integer)
+            } else {
+                let number = json_number.as_f64().ok_or_else(|| {
+                    mlua::Error::runtime("history state number cannot be represented in Lua")
+                })?;
+                let roundtrip = serde_json::Number::from_f64(number).ok_or_else(|| {
+                    mlua::Error::runtime("history state number cannot be represented in Lua")
+                })?;
+                if roundtrip != *json_number {
+                    return Err(mlua::Error::runtime(
+                        "history state number cannot be represented losslessly in Lua",
+                    ));
+                }
+                Value::Number(number)
+            }
+        }
+        JsonValue::String(value) => Value::String(lua.create_string(value)?),
+        JsonValue::Array(items) => {
+            let table = lua.create_table_with_capacity(items.len(), 0)?;
+            for (index, item) in items.iter().enumerate() {
+                table.set(index + 1, history_state_to_lua_inner(lua, item, depth + 1)?)?;
+            }
+            table.set_metatable(Some(lua.array_metatable()))?;
+            Value::Table(table)
+        }
+        JsonValue::Object(items) => {
+            let table = lua.create_table_with_capacity(0, items.len())?;
+            for (key, item) in items {
+                table.set(
+                    key.as_str(),
+                    history_state_to_lua_inner(lua, item, depth + 1)?,
+                )?;
+            }
+            Value::Table(table)
+        }
+    })
+}
 
 /// mlua reads `bool` by Lua truthiness and never fails, so `get::<bool>`
 /// answers `Ok(false)` for a missing key and quietly kills whatever
@@ -182,11 +357,16 @@ fn within_template(lua: &Lua, val: &Value, template: Option<&JsonValue>) -> LuaR
 
 #[cfg(test)]
 mod tests {
-    use mlua::{Lua, Value};
+    use std::ffi::c_void;
+
+    use mlua::{Lua, LuaSerdeExt, UserData, Value};
     use serde_json::Value as JsonValue;
     use test_case::test_case;
 
-    use super::{json_to_lua, lua_to_json, opt_bool};
+    use super::{
+        MAX_HISTORY_STATE_DEPTH, history_state_from_lua, history_state_to_lua, json_to_lua,
+        lua_to_json, opt_bool,
+    };
 
     const FLAG_KEY: &str = "flag";
 
@@ -366,5 +546,146 @@ mod tests {
         let lua_val = json_to_lua(&lua, &original).unwrap();
         let back = lua_to_json(&lua, &lua_val).unwrap();
         assert_eq!(back, original);
+    }
+
+    const HISTORY_STATE_CASES: &[&str] = &[
+        "null",
+        "true",
+        "42",
+        "3.14",
+        r#""hello""#,
+        "[]",
+        "[null,1,null]",
+        "{}",
+        r#"{"a":null,"b":[true,"x"]}"#,
+    ];
+
+    #[test_case(0 ; "null")]
+    #[test_case(1 ; "bool")]
+    #[test_case(2 ; "integer")]
+    #[test_case(3 ; "float")]
+    #[test_case(4 ; "string")]
+    #[test_case(5 ; "empty_array")]
+    #[test_case(6 ; "array_with_nulls")]
+    #[test_case(7 ; "empty_object")]
+    #[test_case(8 ; "nested_object_with_nulls")]
+    fn history_state_roundtrip(idx: usize) {
+        let original: JsonValue = serde_json::from_str(HISTORY_STATE_CASES[idx]).unwrap();
+        let lua = Lua::new();
+        let lua_value = history_state_to_lua(&lua, &original).unwrap();
+        let back = history_state_from_lua(&lua, &lua_value).unwrap();
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn history_state_rejects_function_and_thread() {
+        let lua = Lua::new();
+        let function = lua.create_function(|_, ()| Ok(())).unwrap();
+        let thread = lua.create_thread(function.clone()).unwrap();
+        assert!(history_state_from_lua(&lua, &Value::Function(function)).is_err());
+        assert!(history_state_from_lua(&lua, &Value::Thread(thread)).is_err());
+    }
+
+    struct TestUserData;
+
+    impl UserData for TestUserData {}
+
+    #[test]
+    fn history_state_rejects_userdata_and_non_null_lightuserdata() {
+        let lua = Lua::new();
+        let userdata = Value::UserData(lua.create_userdata(TestUserData).unwrap());
+        let mut byte = 0;
+        let pointer = std::ptr::addr_of_mut!(byte).cast::<c_void>();
+        let light_userdata = Value::LightUserData(mlua::LightUserData(pointer));
+        assert!(history_state_from_lua(&lua, &userdata).is_err());
+        assert!(history_state_from_lua(&lua, &light_userdata).is_err());
+    }
+
+    #[test_case(f64::NAN ; "nan")]
+    #[test_case(f64::INFINITY ; "positive_infinity")]
+    #[test_case(f64::NEG_INFINITY ; "negative_infinity")]
+    fn history_state_rejects_non_finite_numbers(number: f64) {
+        let lua = Lua::new();
+        assert!(history_state_from_lua(&lua, &Value::Number(number)).is_err());
+    }
+
+    #[test]
+    fn history_state_accepts_explicit_null_and_preserves_shared_tables() {
+        let lua = Lua::new();
+        let shared = lua.create_table().unwrap();
+        shared.set("value", Value::NULL).unwrap();
+        let root = lua.create_table().unwrap();
+        root.set("left", shared.clone()).unwrap();
+        root.set("right", shared).unwrap();
+        assert_eq!(
+            history_state_from_lua(&lua, &Value::Table(root)).unwrap(),
+            serde_json::json!({"left": {"value": null}, "right": {"value": null}})
+        );
+    }
+
+    #[test]
+    fn history_state_rejects_cycles_without_mutating_table() {
+        let lua = Lua::new();
+        let table = lua.create_table().unwrap();
+        table.set("self", table.clone()).unwrap();
+        assert!(history_state_from_lua(&lua, &Value::Table(table.clone())).is_err());
+        assert_eq!(table.get::<Value>("self").unwrap().as_table(), Some(&table));
+    }
+
+    #[test]
+    fn history_state_rejects_mixed_and_invalid_object_keys_without_mutation() {
+        let lua = Lua::new();
+        let mixed = lua.create_table().unwrap();
+        mixed.set(1, "first").unwrap();
+        mixed.set("second", "value").unwrap();
+        assert!(history_state_from_lua(&lua, &Value::Table(mixed.clone())).is_err());
+        assert_eq!(mixed.get::<String>("second").unwrap(), "value");
+
+        let invalid = lua.create_table().unwrap();
+        invalid.set(false, "value").unwrap();
+        assert!(history_state_from_lua(&lua, &Value::Table(invalid)).is_err());
+    }
+
+    #[test]
+    fn history_state_rejects_sparse_and_malformed_tagged_arrays() {
+        let lua = Lua::new();
+        let sparse = lua.create_table().unwrap();
+        sparse.set(1, "first").unwrap();
+        sparse.set(3, "third").unwrap();
+        assert!(history_state_from_lua(&lua, &Value::Table(sparse)).is_err());
+
+        let tagged = lua.create_table().unwrap();
+        tagged.set(1, "first").unwrap();
+        tagged.set("extra", "value").unwrap();
+        tagged.set_metatable(Some(lua.array_metatable())).unwrap();
+        assert!(history_state_from_lua(&lua, &Value::Table(tagged)).is_err());
+    }
+
+    #[test]
+    fn history_state_at_depth_limit_fits_stored_session_json() {
+        let lua = Lua::new();
+        let mut value = Value::Boolean(false);
+        for _ in 0..MAX_HISTORY_STATE_DEPTH {
+            let table = lua.create_table().unwrap();
+            table.set("nested", value).unwrap();
+            value = Value::Table(table);
+        }
+        let state = history_state_from_lua(&lua, &value).unwrap();
+        let stored = serde_json::json!({"history": {"state": state}});
+        let encoded = serde_json::to_string(&stored).unwrap();
+        let decoded: JsonValue = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, stored);
+    }
+
+    #[test]
+    fn history_state_rejects_excessive_depth() {
+        let lua = Lua::new();
+        let mut value = Value::Boolean(false);
+        for _ in 0..=MAX_HISTORY_STATE_DEPTH {
+            let table = lua.create_table().unwrap();
+            table.set("nested", value).unwrap();
+            value = Value::Table(table);
+        }
+        assert!(history_state_from_lua(&lua, &value).is_err());
     }
 }

@@ -524,6 +524,7 @@ impl HeadlessBackend {
         let tools = self.tools(config);
         ToolContext {
             execution_agent_id: Some(self.params.agent_id),
+            history_state: None,
             provider: Arc::clone(&config.provider),
             model: Arc::new(config.model.clone()),
             event_tx: EventSender::new(self.raw_tx.clone()),

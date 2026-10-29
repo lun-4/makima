@@ -10,6 +10,8 @@ pub mod language;
 mod loader;
 pub mod orchestration;
 pub use runtime::current_managed_turn;
+#[cfg(test)]
+mod history_state_regression;
 pub(crate) mod plugin_permissions;
 mod runtime;
 pub mod session_snapshot;

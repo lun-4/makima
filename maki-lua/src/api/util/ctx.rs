@@ -15,7 +15,7 @@ use mlua::{LuaSerdeExt, MultiValue, UserData, UserDataMethods, Value as LuaValue
 use crate::agent_errors::INVOCATION_EXPIRED;
 use crate::api::tool::ToolCallReply;
 use crate::api::ui::buf::BufHandle;
-use crate::api::util::convert::json_to_lua;
+use crate::api::util::convert::{history_state_from_lua, history_state_to_lua, json_to_lua};
 use crate::api::util::pair::{Pair, try_pair};
 use crate::runtime::{active_task, lock_cell};
 
@@ -80,6 +80,19 @@ impl AgentContext {
 /// capabilities live in its `Caps` variant, so a capability exists exactly
 /// when its data does. Methods a kind lacks return `(nil, err)` instead of
 /// not existing, so callers can probe without pcall.
+///
+/// `history_get(namespace)`, `history_set(namespace, value)` and
+/// `history_delete(namespace)` operate on the tool handler's execution agent,
+/// independently of its inherited session ID. Namespaces hold independent whole
+/// JSON values. Missing values return `(nil, nil)`; JSON null uses the Lua JSON
+/// null sentinel. Unsupported values fail without changing history.
+///
+/// Nested tool calls inherit the same history boundary. Commits take effect
+/// immediately in lock-acquisition order and survive an enclosing tool failure.
+/// Rewind restores the retained boundary; compaction preserves current values.
+/// History replacement invalidates retained handles, and cancelled operations
+/// cannot commit. Start, restore and trusted callback contexts have no direct
+/// history capability. Callbacks read through `Agent:history_get(ctx, namespace)`.
 pub(crate) struct LuaCtx {
     caps: Caps,
     origin: Option<crate::runtime::TaskHandle>,
@@ -396,6 +409,44 @@ impl UserData for LuaCtx {
         });
         methods.add_method("cancelled", |_, this, ()| Ok(this.cancel.is_cancelled()));
 
+        methods.add_method("history_get", |lua, this, namespace: String| {
+            try_pair!(this.validate_origin(lua));
+            let Some(handle) = this.agent().and_then(|agent| agent.history_state.as_ref()) else {
+                return Ok(this.cap_err_pair("history_get"));
+            };
+            let value = try_pair!(handle.get(&namespace));
+            let value = try_pair!(
+                value
+                    .as_ref()
+                    .map(|value| history_state_to_lua(lua, value))
+                    .transpose()
+            );
+            Ok((value, None))
+        });
+
+        methods.add_method(
+            "history_set",
+            |lua, this, (namespace, value): (String, LuaValue)| {
+                try_pair!(this.validate_origin(lua));
+                let Some(handle) = this.agent().and_then(|agent| agent.history_state.as_ref())
+                else {
+                    return Ok(this.cap_err_pair("history_set"));
+                };
+                let value = try_pair!(history_state_from_lua(lua, &value));
+                try_pair!(handle.set(namespace, value));
+                Ok((Some(true), None))
+            },
+        );
+
+        methods.add_method("history_delete", |lua, this, namespace: String| {
+            try_pair!(this.validate_origin(lua));
+            let Some(handle) = this.agent().and_then(|agent| agent.history_state.as_ref()) else {
+                return Ok(this.cap_err_pair("history_delete"));
+            };
+            try_pair!(handle.delete(namespace));
+            Ok((Some(true), None))
+        });
+
         methods.add_method("workflow", |lua, this, ()| {
             let Some(workflow) = this.workflow() else {
                 return Ok(this.cap_err_pair("workflow"));
@@ -684,10 +735,10 @@ mod tests {
 
     use std::thread;
 
-    use maki_agent::AgentMode;
     use maki_agent::tools::Deadline;
     use maki_agent::tools::test_support::stub_ctx_with;
     use maki_agent::tools::{LocalTool, ToolAudience};
+    use maki_agent::{AgentMode, History, HistoryStateError};
 
     use super::*;
 
@@ -845,6 +896,9 @@ mod tests {
                         function() return ctx:capture_read(read_path) end,
                         function() return ctx:record_read(read_path) end,
                         function() return ctx:question_mode() end,
+                        function() return ctx:history_get('scope') end,
+                        function() return ctx:history_set('scope', function() end) end,
+                        function() return ctx:history_delete('scope') end,
                         commit,
                     }) do
                         local value, err = call()
@@ -862,6 +916,204 @@ mod tests {
         lua.load("assert(commit())").exec().unwrap();
         drop(scope);
         methods.call::<()>(EXPIRED_CONTEXT_MSG).unwrap();
+    }
+
+    const HISTORY_NAMESPACE: &str = "plugin.first";
+    const OTHER_HISTORY_NAMESPACE: &str = "plugin.second";
+    const INITIAL_HISTORY_VALUE: &str = "unchanged";
+    const HISTORY_METHODS: [&str; 3] = ["history_get", "history_set", "history_delete"];
+
+    fn history_context(history: &History, cancel: CancelToken) -> ToolContext {
+        let mut context = populated_ctx();
+        context.cancel = cancel.clone();
+        context.history_state = Some(history.state_handle(history.len(), cancel));
+        context
+    }
+
+    fn history_handler(lua: &mlua::Lua, context: &ToolContext) -> LuaCtx {
+        let mut ctx = LuaCtx::handler(context);
+        ctx.bind_origin(&active_task(lua));
+        ctx
+    }
+
+    #[test]
+    fn history_state_namespaces_and_json_validation() {
+        let lua = mlua::Lua::new();
+        let _scope = crate::runtime::TaskScope::detached(&lua);
+        let history = History::new(Vec::new());
+        let context = history_context(&history, CancelToken::none());
+        lua.globals()
+            .set("ctx", history_handler(&lua, &context))
+            .unwrap();
+        lua.globals().set("first", HISTORY_NAMESPACE).unwrap();
+        lua.globals()
+            .set("second", OTHER_HISTORY_NAMESPACE)
+            .unwrap();
+        lua.globals().set("initial", INITIAL_HISTORY_VALUE).unwrap();
+        lua.globals().set("null", lua.null()).unwrap();
+        lua.load(
+            r#"
+            local missing, err = ctx:history_get(first)
+            assert(missing == nil and err == nil)
+            assert(ctx:history_set(first, { value = initial, items = {1, null, 3} }))
+            assert(ctx:history_set(second, false))
+            assert(ctx:history_get(first).items[2] == null)
+            local value, read_err = ctx:history_get(second)
+            assert(value == false and read_err == nil)
+            local cycle = {}; cycle.self = cycle
+            local too_deep = true
+            for _ = 1, 65 do too_deep = { nested = too_deep } end
+            for _, invalid in ipairs({
+                function() end, cycle, too_deep, math.huge, -math.huge, 0/0,
+                { nested = function() end }, { nested = math.huge },
+            }) do
+                local ok, set_err = ctx:history_set(first, invalid)
+                assert(ok == nil and type(set_err) == 'string')
+                assert(ctx:history_get(first).value == initial)
+                assert(ctx:history_get(second) == false)
+            end
+            assert(ctx:history_set(first, null))
+            assert(ctx:history_get(first) == null)
+            assert(ctx:history_delete(first))
+            missing, err = ctx:history_get(first)
+            assert(missing == nil and err == nil)
+            assert(ctx:history_get(second) == false)
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let state = history.snapshot().state;
+        assert!(state.get(HISTORY_NAMESPACE).is_none());
+        assert_eq!(
+            state.get(OTHER_HISTORY_NAMESPACE),
+            Some(&serde_json::json!(false))
+        );
+    }
+
+    #[test]
+    fn history_state_read_conversion_failure_returns_error_pair() {
+        let lua = mlua::Lua::new();
+        let _scope = crate::runtime::TaskScope::detached(&lua);
+        let history = History::new(Vec::new());
+        let context = history_context(&history, CancelToken::none());
+        let value = serde_json::json!(u64::MAX);
+        context
+            .history_state
+            .as_ref()
+            .unwrap()
+            .set(HISTORY_NAMESPACE.into(), value.clone())
+            .unwrap();
+        lua.globals()
+            .set("ctx", history_handler(&lua, &context))
+            .unwrap();
+        let (result, error): Pair<LuaValue> = lua
+            .load(format!("return ctx:history_get('{HISTORY_NAMESPACE}')"))
+            .eval()
+            .unwrap();
+        assert!(result.is_none());
+        assert!(error.is_some());
+        assert_eq!(
+            history.snapshot().state.get(HISTORY_NAMESPACE),
+            Some(&value)
+        );
+    }
+
+    #[test_case::test_case("handler"; "handler_without_handle")]
+    #[test_case::test_case("start"; "start_without_authority")]
+    #[test_case::test_case("restore"; "restore_without_authority")]
+    fn history_state_requires_handler_capability(kind: &str) {
+        let lua = mlua::Lua::new();
+        let _scope = crate::runtime::TaskScope::detached(&lua);
+        let mut context = populated_ctx();
+        context.history_state = None;
+        let mut ctx = match kind {
+            "handler" => LuaCtx::handler(&context),
+            "start" => LuaCtx::start(&context),
+            "restore" => LuaCtx::restore(ToolOutputLines::default(), None),
+            _ => unreachable!(),
+        };
+        ctx.bind_origin(&active_task(&lua));
+        lua.globals().set("ctx", ctx).unwrap();
+        for method in HISTORY_METHODS {
+            let (value, error): Pair<LuaValue> = lua
+                .load(format!("return ctx:{method}('scope', true)"))
+                .eval()
+                .unwrap();
+            assert!(value.is_none());
+            assert_eq!(error, Some(format!("{method} not available in {kind} ctx")));
+        }
+    }
+
+    #[test_case::test_case(false; "replaced_history")]
+    #[test_case::test_case(true; "cancelled_history")]
+    fn history_state_rejects_stale_or_cancelled_handles(cancelled: bool) {
+        let lua = mlua::Lua::new();
+        let _scope = crate::runtime::TaskScope::detached(&lua);
+        let mut history = History::new(Vec::new());
+        let (trigger, cancel) = CancelToken::new();
+        let context = history_context(&history, cancel);
+        let handle = context.history_state.as_ref().unwrap();
+        handle
+            .set(
+                HISTORY_NAMESPACE.into(),
+                serde_json::json!(INITIAL_HISTORY_VALUE),
+            )
+            .unwrap();
+        lua.globals()
+            .set("ctx", history_handler(&lua, &context))
+            .unwrap();
+        let expected = if cancelled {
+            trigger.cancel();
+            HistoryStateError::Cancelled
+        } else {
+            history.replace_snapshot(history.snapshot());
+            HistoryStateError::Stale
+        };
+        for method in HISTORY_METHODS {
+            let (value, error): Pair<LuaValue> = lua
+                .load(format!("return ctx:{method}('{HISTORY_NAMESPACE}', true)"))
+                .eval()
+                .unwrap();
+            assert!(value.is_none());
+            assert_eq!(error, Some(expected.to_string()));
+        }
+        assert_eq!(
+            history.snapshot().state.get(HISTORY_NAMESPACE),
+            Some(&serde_json::json!(INITIAL_HISTORY_VALUE))
+        );
+    }
+
+    #[test]
+    fn history_state_nested_context_keeps_execution_history() {
+        let lua = mlua::Lua::new();
+        let _scope = crate::runtime::TaskScope::detached(&lua);
+        let parent_history = History::new(Vec::new());
+        let child_history = History::new(Vec::new());
+        let parent = history_context(&parent_history, CancelToken::none());
+        let child = history_context(&child_history, CancelToken::none());
+        let nested = AgentContext::from(&parent).to_tool_context();
+        lua.globals()
+            .set("parent", history_handler(&lua, &parent))
+            .unwrap();
+        lua.globals()
+            .set("nested", history_handler(&lua, &nested))
+            .unwrap();
+        lua.globals()
+            .set("child", history_handler(&lua, &child))
+            .unwrap();
+        lua.load(
+            r#"
+            assert(parent:session_id() == child:session_id())
+            assert(parent:history_set('scope', 'parent'))
+            assert(child:history_set('scope', 'child'))
+            assert(nested:history_get('scope') == 'parent')
+            assert(nested:history_set('scope', 'nested'))
+            assert(parent:history_get('scope') == 'nested')
+            assert(child:history_get('scope') == 'child')
+            "#,
+        )
+        .exec()
+        .unwrap();
     }
 
     #[test]

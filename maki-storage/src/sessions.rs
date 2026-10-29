@@ -42,6 +42,7 @@ const EPOCH_CHANGED: &str = "messages were rewritten";
 const FILE_CHANGED_UNDERNEATH: &str = "file changed underneath";
 const CURSOR_AHEAD: &str = "cursor ahead of session";
 const LOG_BLOATED: &str = "too many stale meta records";
+const JSON_RECURSION_LIMIT_EXCEEDED: &str = "recursion limit exceeded";
 /// Every append leaves a whole meta record behind and only the last one is ever
 /// read. Past this many, the log is rewritten and they all go away at once.
 const MAX_APPENDS: usize = 512;
@@ -961,6 +962,16 @@ where
             meta: Box::new(session.meta.clone()),
         },
     )?;
+    if !session.history_state.is_empty()
+        || session
+            .subagent_history_meta
+            .values()
+            .any(|meta| !meta.state.is_empty())
+    {
+        // Serialization has no depth limit. Parse the complete record to include
+        // the wrappers around state values in the reader's recursion budget.
+        serde_json::from_slice::<serde_json::Value>(&buf).map_err(StorageError::from)?;
+    }
     Ok(buf)
 }
 
@@ -1056,9 +1067,16 @@ where
         // skipped, and so is a bad header, which leaves the log headerless.
         // Whole JSON after the header that does not decode came from another
         // version; skipping it would let the next save drop it from disk.
+        // serde_json classifies its recursion limit as syntax and exposes no
+        // public error code. It must also refuse the load rather than lose state.
         let record: LogRecord<M, U, T> = match serde_json::from_slice(line) {
             Ok(r) => r,
-            Err(e) if e.is_data() && id.is_some() => {
+            Err(e)
+                if id.is_some()
+                    && (e.is_data()
+                        || (e.is_syntax()
+                            && e.to_string().starts_with(JSON_RECURSION_LIMIT_EXCEEDED))) =>
+            {
                 return Err(SessionError::UnreadableRecord {
                     path: display_path.to_owned(),
                     line: line_count,
@@ -2009,10 +2027,10 @@ mod tests {
     use super::StoredThinking;
     use super::ThinkingParseError;
     use super::{
-        ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE, LOG_BLOATED,
-        MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSIONS_DIR, StoredSubagent, TAIL_BUF,
-        generate_title, jsonl_path, load_cwd_index, next_epoch, offload_dir, update_cwd_index,
-        write_full_session,
+        ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE,
+        JSON_RECURSION_LIMIT_EXCEEDED, LOG_BLOATED, MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX,
+        SESSIONS_DIR, StoredSubagent, TAIL_BUF, generate_title, jsonl_path, load_cwd_index,
+        next_epoch, offload_dir, update_cwd_index, write_full_session,
     };
     use super::{
         HistorySnapshot, HistoryState, SCAN_CACHE_FILE, Session, SessionError, SessionLog,
@@ -2040,6 +2058,156 @@ mod tests {
 
     const STATE_NAMESPACE: &str = "plugin.state";
     const OTHER_NAMESPACE: &str = "plugin.other";
+    const MAX_JSON_CONTAINER_DEPTH: usize = 127;
+    const ROOT_BASELINE_CONTAINERS: usize = 3;
+    const ROOT_UPDATE_CONTAINERS: usize = 4;
+    const CHILD_BASELINE_CONTAINERS: usize = 5;
+    const CHILD_UPDATE_CONTAINERS: usize = 6;
+
+    fn nested_state_value(depth: usize) -> Value {
+        (0..depth).fold(Value::Null, |value, level| {
+            if level.is_multiple_of(2) {
+                Value::Array(vec![value])
+            } else {
+                serde_json::json!({STATE_NAMESPACE: value})
+            }
+        })
+    }
+
+    fn set_nested_history_state(
+        session: &mut TestSession,
+        child: bool,
+        baseline: bool,
+        depth: usize,
+    ) {
+        let mut history = if child {
+            session
+                .subagent_history_snapshot(LIVE_CHILD)
+                .unwrap_or_default()
+        } else {
+            session.history_snapshot()
+        };
+        let state = Arc::make_mut(&mut history.state);
+        let value = nested_state_value(depth);
+        if baseline {
+            state.baseline.insert(STATE_NAMESPACE.into(), value);
+        } else {
+            state.set(0, STATE_NAMESPACE.into(), value);
+        }
+        if child {
+            assert!(session.adopt_subagent_history(LIVE_CHILD.into(), &history));
+        } else {
+            session.adopt_history(&history);
+        }
+    }
+
+    #[test_case(false, true, ROOT_BASELINE_CONTAINERS; "root_baseline")]
+    #[test_case(false, false, ROOT_UPDATE_CONTAINERS; "root_update")]
+    #[test_case(true, true, CHILD_BASELINE_CONTAINERS; "child_baseline")]
+    #[test_case(true, false, CHILD_UPDATE_CONTAINERS; "child_update")]
+    fn history_state_maximum_depth_round_trips(child: bool, baseline: bool, containers: usize) {
+        let tmp = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/project");
+        let depth = MAX_JSON_CONTAINER_DEPTH - containers;
+        set_nested_history_state(&mut session, child, baseline, depth);
+        let mut log = SessionLog::rewrite(tmp.path(), &session).unwrap();
+        let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert_same_session(&loaded, &session);
+
+        session.push_message(user_message("appended"));
+        log.append(&session).unwrap();
+        let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert_same_session(&loaded, &session);
+        let snapshot = if child {
+            loaded.subagent_history_snapshot(LIVE_CHILD).unwrap()
+        } else {
+            loaded.history_snapshot()
+        };
+        assert_eq!(
+            snapshot.state.get(STATE_NAMESPACE),
+            Some(&nested_state_value(depth))
+        );
+    }
+
+    #[test_case(false, true, ROOT_BASELINE_CONTAINERS; "root_baseline")]
+    #[test_case(false, false, ROOT_UPDATE_CONTAINERS; "root_update")]
+    #[test_case(true, true, CHILD_BASELINE_CONTAINERS; "child_baseline")]
+    #[test_case(true, false, CHILD_UPDATE_CONTAINERS; "child_update")]
+    fn history_state_excess_depth_save_preserves_file(
+        child: bool,
+        baseline: bool,
+        containers: usize,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/project");
+        session.push_message(user_message("saved"));
+        let mut log = SessionLog::rewrite(tmp.path(), &session).unwrap();
+        let path = jsonl_path(tmp.path(), session.id);
+        let before = fs::read(&path).unwrap();
+        set_nested_history_state(
+            &mut session,
+            child,
+            baseline,
+            MAX_JSON_CONTAINER_DEPTH - containers + 1,
+        );
+        session.push_message(user_message("pending"));
+
+        for append in [true, false] {
+            let error = if append {
+                log.append(&session).unwrap_err()
+            } else {
+                SessionLog::rewrite(tmp.path(), &session).err().unwrap()
+            };
+            let SessionError::Storage(StorageError::Json(error)) = error else {
+                panic!("{error}");
+            };
+            assert!(error.is_syntax());
+            assert!(error.to_string().starts_with(JSON_RECURSION_LIMIT_EXCEEDED));
+            assert_eq!(fs::read(&path).unwrap(), before);
+            let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+            assert_eq!(loaded.messages().len(), 1);
+            assert!(loaded.history_state.is_empty());
+            assert!(loaded.subagent_history_meta.is_empty());
+        }
+
+        session.history_state = Arc::default();
+        session.subagent_history_meta.clear();
+        session.subagent_messages.clear();
+        log.append(&session).unwrap();
+        let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert_same_session(&loaded, &session);
+    }
+
+    #[test_case(false, true; "root_baseline")]
+    #[test_case(false, false; "root_update")]
+    #[test_case(true, true; "child_baseline")]
+    #[test_case(true, false; "child_update")]
+    fn history_state_excess_depth_load_refuses_and_preserves_file(child: bool, baseline: bool) {
+        let tmp = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/project");
+        session.push_message(user_message("saved"));
+        SessionLog::rewrite(tmp.path(), &session).unwrap();
+        let path = jsonl_path(tmp.path(), session.id);
+        set_nested_history_state(&mut session, child, baseline, MAX_JSON_CONTAINER_DEPTH + 1);
+        let record = serde_json::json!({
+            "t": "meta", "title": DEFAULT_TITLE, "token_usage": null, "updated_at": 0,
+            "history_state": session.history_state,
+            "subagent_history_meta": session.subagent_history_meta,
+        });
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        serde_json::to_writer(&mut file, &record).unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
+        let before = fs::read(&path).unwrap();
+
+        let error = TestSession::load_from(session.id, tmp.path()).unwrap_err();
+        let SessionError::UnreadableRecord { line, reason, .. } = error else {
+            panic!("{error}");
+        };
+        assert_eq!(line, 4);
+        assert!(reason.starts_with(JSON_RECURSION_LIMIT_EXCEEDED));
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
 
     #[test_case(0, Some(Value::Bool(false)), false; "baseline_and_zero_boundary")]
     #[test_case(1, Some(Value::Bool(true)), false; "first_message")]

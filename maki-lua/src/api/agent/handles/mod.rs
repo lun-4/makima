@@ -180,22 +180,24 @@ mod tests {
     use std::time::Duration;
 
     use futures_lite::future::race;
+    use maki_agent::cancel::CancelToken;
     use maki_agent::tools::test_support::{stub_ctx, stub_ctx_with};
     use maki_agent::tools::{DescriptionContext, RequestTools, ToolContext, TurnToolBindings};
     use maki_agent::{
-        AgentEvent, AgentLimits, AgentMode, EffectiveAgentConfig, EventSender, Post, PostLevel,
-        RunSettings,
+        AgentEvent, AgentLimits, AgentMode, EffectiveAgentConfig, EventSender, History,
+        HistorySnapshot, Post, PostLevel, RunSettings,
     };
     use maki_commands::{
         CommandError, CommandFuture, CommandHost, HostRequest, HostResponse, TargetCapabilities,
     };
     use maki_providers::TokenUsage;
-    use mlua::{AnyUserData, Table};
+    use mlua::{AnyUserData, LuaSerdeExt, Table, Value};
     use smol::Timer;
     use test_case::test_case;
 
     use super::*;
     use crate::UiAction;
+    use crate::agent_autocmd::HISTORY_STATE_CHANGED_EVENT;
     use crate::agent_errors::{
         BLANK_POST, SHOW_SILENT_AGENT, SHOW_TOOL_AGENT, UNKNOWN_POST_LEVEL, UNKNOWN_POST_OPTION,
     };
@@ -205,6 +207,7 @@ mod tests {
         session_with_provider_for_agent,
     };
     use crate::api::agent::{LuaActorBackend, create_agent_table};
+    use crate::api::autocmd::AutocmdStore;
     use crate::api::ui::create_ui_table;
     use crate::api::util::ctx::LuaCtx;
     use crate::orchestration::{
@@ -662,13 +665,22 @@ mod tests {
         context: &ToolContext,
         limits: AgentLimits,
     ) -> ManagedRoot {
+        install_managed_root_with_history(lua, context, limits, HistorySnapshot::default())
+    }
+
+    fn install_managed_root_with_history(
+        lua: &Lua,
+        context: &ToolContext,
+        limits: AgentLimits,
+        history: HistorySnapshot,
+    ) -> ManagedRoot {
         let (event_tx, event_rx) = flume::unbounded();
         let mut rooted = context.clone();
         rooted.event_tx = EventSender::new(event_tx);
         let manager = AgentManagerHandle::new(limits).unwrap();
         let mut fixture = None;
         let root = manager
-            .create_root_with_config(None, Vec::new(), None, |id| {
+            .create_root_with_config(None, history, None, |id| {
                 let (_, state, session, _) =
                     session_with_provider_for_agent(Arc::clone(&rooted.provider), id);
                 fixture = Some(session);
@@ -690,6 +702,92 @@ mod tests {
             fixture,
             events: event_rx,
         }
+    }
+
+    const HISTORY_NAMESPACE: &str = "plugin.state";
+    const NULL_HISTORY_NAMESPACE: &str = "plugin.null";
+    const LARGE_INTEGER_HISTORY_NAMESPACE: &str = "plugin.large_integer";
+
+    #[test]
+    fn history_get_observes_actor_state_without_trusted_mutation_authority() {
+        let lua = Lua::new();
+        let scope = plugin_scope(&lua, PLUGIN);
+        let history = History::new(Vec::new());
+        let state = history.state_handle(0, CancelToken::none());
+        state
+            .set(
+                HISTORY_NAMESPACE.into(),
+                serde_json::json!({ "value": "committed" }),
+            )
+            .unwrap();
+        state
+            .set(NULL_HISTORY_NAMESPACE.into(), serde_json::Value::Null)
+            .unwrap();
+        state
+            .set(
+                LARGE_INTEGER_HISTORY_NAMESPACE.into(),
+                serde_json::json!(u64::MAX),
+            )
+            .unwrap();
+        let mut context = stub_ctx(&AgentMode::Build);
+        context.history_state = Some(state);
+        let root = install_managed_root_with_history(
+            &lua,
+            &context,
+            AgentLimits::default(),
+            history.snapshot(),
+        );
+        lua.set_app_data(AutocmdStore::default());
+        lua.globals().set("namespace", HISTORY_NAMESPACE).unwrap();
+        lua.globals()
+            .set("null_namespace", NULL_HISTORY_NAMESPACE)
+            .unwrap();
+        lua.globals().set("null", lua.null()).unwrap();
+        lua.globals()
+            .set("large_integer_namespace", LARGE_INTEGER_HISTORY_NAMESPACE)
+            .unwrap();
+        lua.load(
+            r#"
+            agent = assert(ctx:agent())
+            assert(agent:history_get(ctx, namespace).value == 'committed')
+            assert(agent:history_get(ctx, null_namespace) == null)
+            local invalid, conversion_err = agent:history_get(ctx, large_integer_namespace)
+            assert(invalid == nil and type(conversion_err) == 'string')
+            local missing, err = agent:history_get(ctx, 'missing')
+            assert(missing == nil and err == nil)
+            for _, method in ipairs({'history_get', 'history_set', 'history_delete'}) do
+                local value, cap_err = ctx[method](ctx, namespace, 'overwritten')
+                assert(value == nil and cap_err == method .. ' not available in trusted ctx')
+            end
+            subscription = assert(agent:on_history_state_change(ctx, function() end))
+            "#,
+        )
+        .exec()
+        .unwrap();
+        assert_eq!(
+            history.snapshot().state.get(HISTORY_NAMESPACE),
+            Some(&serde_json::json!({ "value": "committed" }))
+        );
+        assert_eq!(
+            lua.app_data_ref::<AutocmdStore>().unwrap().listeners[HISTORY_STATE_CHANGED_EVENT]
+                .len(),
+            1
+        );
+        lua.load("assert(subscription:close())").exec().unwrap();
+        assert!(
+            lua.app_data_ref::<AutocmdStore>()
+                .unwrap()
+                .listeners
+                .is_empty()
+        );
+        drop(scope);
+        let (value, error): Pair<Value> = lua
+            .load("return agent:history_get(ctx, namespace)")
+            .eval()
+            .unwrap();
+        assert!(value.is_none());
+        assert!(error.is_some());
+        root.shutdown();
     }
 
     /// Runs {chunk} with `ctx` pinned to a trusted root and `agent_api` and

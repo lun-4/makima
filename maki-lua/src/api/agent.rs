@@ -534,27 +534,39 @@ impl ActorBackend for LuaActorBackend {
                 params.timeouts,
                 &params.model_policy,
             );
-            match maki_agent::agent::compact(
-                &*provider,
-                &model,
-                history,
-                &event_tx,
-                &context.cancel,
-                &params.config,
-                instructions,
-                params.session_id.as_ref(),
-            )
-            .await
-            {
-                Ok(()) => {
+            let mut compacted = History::new(Vec::new());
+            compacted.replace_snapshot(history.snapshot().clone());
+            let result = async {
+                let usage = maki_agent::agent::compact_without_completion(
+                    &*provider,
+                    &model,
+                    &mut compacted,
+                    &event_tx,
+                    &context.cancel,
+                    &params.config,
+                    instructions,
+                    params.session_id.as_ref(),
+                )
+                .await
+                .map_err(|error| error.user_message())?;
+                if let Some(completion) = &self.completion {
+                    completion
+                        .complete_history(context.agent_id, compacted.snapshot().clone())
+                        .await?;
+                }
+                Ok::<_, String>(usage)
+            }
+            .await;
+            match result {
+                Ok(usage) => {
+                    history.replace_snapshot(compacted.snapshot().clone());
                     state.relay_history(history);
+                    let _ = event_tx.send(AgentEvent::ControlComplete { usage });
                     BackendResult::CompactDone
                 }
                 Err(error) => {
-                    warn!(error = %error, "Lua agent compaction failed");
-                    let _ = event_tx.send(AgentEvent::ControlError {
-                        message: error.user_message(),
-                    });
+                    warn!(%error, "Lua agent compaction failed");
+                    let _ = event_tx.send(AgentEvent::ControlError { message: error });
                     BackendResult::ControlFailed
                 }
             }
@@ -2078,8 +2090,10 @@ fn call_local_tool(
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use arc_swap::ArcSwap;
     use maki_agent::actor::ActorLifecycle;
     use maki_agent::cancel::CancelToken;
+    use maki_agent::session_checkpoint::SessionLogCheckpoint;
     use maki_agent::tools::test_support::stub_ctx;
     use maki_agent::{
         AgentId, AgentParams, DoneReason, TurnCompleteEvent, TurnId, TurnOutcome, TurnResult,
@@ -2090,8 +2104,14 @@ mod tests {
         AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
         StopReason, StreamResponse, ThinkingConfig, TokenUsage,
     };
+    use maki_storage::checkpoint::CheckpointError;
     use maki_storage::id::SessionRef;
+    use maki_storage::sessions::{Session, StoredSubagent};
+    use maki_storage::{StateDir, session_lock};
     use serde_json::{Value, json};
+    use tempfile::TempDir;
+
+    use crate::orchestration::{AgentOrchestration, TrustedTarget, TurnCompletion};
 
     use super::*;
 
@@ -2293,6 +2313,262 @@ mod tests {
             }
             actor.close();
             drop(session);
+        });
+    }
+
+    #[test_case::test_case(false; "checkpoint_success")]
+    #[test_case::test_case(true; "checkpoint_failure")]
+    fn lua_compaction_checkpoint_preserves_state_and_waits_for_save(fail: bool) {
+        const SUMMARY: &str = "persisted child summary";
+        const ORIGINAL: &str = "original child prompt";
+        const CHILD_KEY: &str = "task/compacted-child";
+        const STATE_NAMESPACE: &str = "test.work";
+        const DELETED_NAMESPACE: &str = "test.removed";
+        const NULL_NAMESPACE: &str = "test.null";
+        const CHECKPOINT_ERROR: &str = "child checkpoint unavailable";
+        const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(5);
+        const CHECKPOINT_TIMEOUT_ERROR: &str = "compaction never reached the checkpoint";
+        smol::block_on(async {
+            let provider = Arc::new(StreamOnceProvider::new_replies(vec![canned_reply(SUMMARY)]));
+            let (unused_actor, state, session, events) = session_with_provider(provider, None);
+            let params = state.params.get().unwrap();
+            let config = EffectiveAgentConfig::new(
+                RunSettings {
+                    provider: Arc::clone(&params.provider),
+                    model: params.model.clone(),
+                    fast: false,
+                    workflow: false,
+                    thinking: Default::default(),
+                },
+                AgentMode::Build,
+            );
+            let manager = maki_agent::AgentManagerHandle::new(Default::default()).unwrap();
+            let root = manager
+                .create_root(
+                    Vec::new(),
+                    None,
+                    Box::new(LuaActorBackend::new(Arc::clone(&state))),
+                )
+                .unwrap();
+            let child = manager
+                .spawn_child_trusted_with_config(
+                    &root,
+                    config.clone(),
+                    Default::default(),
+                    Vec::new(),
+                    None,
+                    |_| {
+                        Ok::<_, String>(Box::new(LuaActorBackend::new(Arc::clone(&state)))
+                            as Box<dyn ActorBackend>)
+                    },
+                )
+                .unwrap();
+            let mut original = HistorySnapshot::new(vec![Message::user(ORIGINAL.into())]);
+            let timeline = Arc::make_mut(&mut original.state);
+            timeline
+                .baseline
+                .insert(DELETED_NAMESPACE.into(), json!(ORIGINAL));
+            timeline.set(0, STATE_NAMESPACE.into(), json!(ORIGINAL));
+            timeline.set(1, STATE_NAMESPACE.into(), json!({ "status": "current" }));
+            timeline.set(1, NULL_NAMESPACE.into(), JsonValue::Null);
+            timeline.delete(1, DELETED_NAMESPACE.into());
+            let mut expected_state = original.state.as_ref().clone();
+            expected_state.compact();
+            let mirror = Arc::new(ArcSwap::from_pointee(original.clone()));
+            let mut history = History::new(Vec::new()).with_mirror(Arc::clone(&mirror));
+            history.replace_snapshot(original.clone());
+            let tmp = TempDir::new().unwrap();
+            let dir = StateDir::from_path(tmp.path().to_path_buf());
+            let session_id = MakiId::generate();
+            let sessions = dir
+                .ensure_subdir(maki_storage::sessions::SESSIONS_DIR)
+                .unwrap();
+            let owner = session_lock::claim(&sessions, &session_id)
+                .unwrap()
+                .unwrap();
+            let writer = Arc::new(
+                SessionLogCheckpoint::open(
+                    dir.clone(),
+                    session_id,
+                    &params.model.spec(),
+                    "",
+                    Some(owner.publication_guard()),
+                )
+                .unwrap(),
+            );
+            let metadata = StoredSubagent {
+                tool_use_id: CHILD_KEY.into(),
+                name: CHILD_KEY.into(),
+                model: None,
+                thinking: None,
+                fast: false,
+            };
+            writer
+                .checkpoint_child(metadata.clone(), original.clone())
+                .await
+                .unwrap();
+            type StoredSession = Session<Message, TokenUsage, maki_agent::ToolOutput>;
+            let before = StoredSession::load(session_id, &dir).unwrap();
+            let before_json =
+                serde_json::to_value(before.subagent_history_snapshot(CHILD_KEY).unwrap()).unwrap();
+            let (entered, entries) = flume::bounded(1);
+            let (release, released) = flume::bounded(1);
+            let expected_id = child.id();
+            let completion: TurnCompletion = Arc::new(move |target, snapshot| {
+                assert_eq!(target.id(), expected_id);
+                assert!(snapshot.compacted);
+                assert_eq!(snapshot.state.as_ref(), &expected_state);
+                assert!(snapshot.state.updates.is_empty());
+                let entered = entered.clone();
+                let released = released.clone();
+                let writer = Arc::clone(&writer);
+                let metadata = metadata.clone();
+                Box::pin(async move {
+                    entered.send_async(snapshot.clone()).await.unwrap();
+                    released.recv_async().await.unwrap();
+                    let result = writer.checkpoint_child(metadata, snapshot).await;
+                    if fail {
+                        assert!(
+                            matches!(result, Err(CheckpointError::Closed(id)) if id == session_id)
+                        );
+                        Err(CHECKPOINT_ERROR.into())
+                    } else {
+                        result.map_err(|error| error.to_string())
+                    }
+                })
+            });
+            let services = Arc::new(
+                AgentOrchestration::bind_root(
+                    Arc::default(),
+                    TrustedTarget {
+                        target: root,
+                        template: stub_ctx(&AgentMode::Build),
+                    },
+                )
+                .with_completion(completion),
+            );
+            services
+                .register_child_target(
+                    TrustedTarget {
+                        target: child,
+                        template: stub_ctx(&AgentMode::Build),
+                    },
+                    CHILD_KEY.into(),
+                )
+                .unwrap();
+            let (_, cancel_reason) = maki_agent::ReasonedCancelToken::new();
+            let context = TurnContext {
+                agent_id: expected_id,
+                turn_id: None,
+                output: Default::default(),
+                provenance: Default::default(),
+                cancel: CancelToken::none(),
+                cancel_reason,
+                work: maki_agent::ActorWorkIdentity::new(
+                    expected_id,
+                    maki_agent::ActorWorkKind::Compact { operation_id: 0 },
+                    0,
+                ),
+                generation: 0,
+                policy: Some(Arc::new(config)),
+                interrupt: None,
+                inbox: None,
+                managed_turn: None,
+                admission: None,
+            };
+            let mut backend = LuaActorBackend::new(Arc::clone(&state));
+            backend.completion = Some(services);
+            let pending = smol::spawn(async move {
+                let result = backend.run_compact(&mut history, context, None).await;
+                (result, history)
+            });
+            let compacted =
+                futures_lite::future::race(async { entries.recv_async().await.unwrap() }, async {
+                    smol::Timer::after(CHECKPOINT_TIMEOUT).await;
+                    panic!("{CHECKPOINT_TIMEOUT_ERROR}");
+                })
+                .await;
+            assert!(!pending.is_finished());
+            assert!(events.drain().all(|event| !matches!(
+                event.event,
+                AgentEvent::ControlComplete { .. }
+                    | AgentEvent::ControlError { .. }
+                    | AgentEvent::SubagentHistory { .. }
+            )));
+            assert!(Arc::ptr_eq(&mirror.load().messages, &original.messages));
+            assert!(Arc::ptr_eq(&mirror.load().state, &original.state));
+            assert_eq!(mirror.load().epoch, original.epoch);
+            assert_eq!(mirror.load().compacted, original.compacted);
+            assert_eq!(
+                serde_json::to_value(
+                    StoredSession::load(session_id, &dir)
+                        .unwrap()
+                        .subagent_history_snapshot(CHILD_KEY)
+                        .unwrap()
+                )
+                .unwrap(),
+                before_json
+            );
+            let owner = if fail {
+                owner.release().unwrap();
+                None
+            } else {
+                Some(owner)
+            };
+            release.send(()).unwrap();
+            let (result, mut history) = pending.await;
+            let saved = StoredSession::load(session_id, &dir).unwrap();
+            let terminal = events.drain().map(|event| event.event).collect::<Vec<_>>();
+            if fail {
+                assert!(matches!(result, BackendResult::ControlFailed));
+                assert!(Arc::ptr_eq(
+                    &history.snapshot().messages,
+                    &original.messages
+                ));
+                assert!(Arc::ptr_eq(&history.snapshot().state, &original.state));
+                assert_eq!(history.snapshot().epoch, original.epoch);
+                assert_eq!(history.snapshot().compacted, original.compacted);
+                assert_eq!(
+                    serde_json::to_value(saved.subagent_history_snapshot(CHILD_KEY).unwrap())
+                        .unwrap(),
+                    before_json
+                );
+                assert!(
+                    matches!(terminal.as_slice(), [AgentEvent::ControlError { message }] if message == CHECKPOINT_ERROR)
+                );
+            } else {
+                assert!(matches!(result, BackendResult::CompactDone));
+                assert_eq!(
+                    serde_json::to_value(history.snapshot()).unwrap(),
+                    serde_json::to_value(&compacted).unwrap()
+                );
+                assert_ne!(history.snapshot().epoch, original.epoch);
+                assert_eq!(
+                    compacted.state.get(STATE_NAMESPACE),
+                    original.state.get(STATE_NAMESPACE)
+                );
+                assert_eq!(compacted.state.get(NULL_NAMESPACE), Some(&JsonValue::Null));
+                assert!(compacted.state.get(DELETED_NAMESPACE).is_none());
+                let saved_child = saved.subagent_history_snapshot(CHILD_KEY).unwrap();
+                assert!(saved_child.compacted);
+                assert_eq!(saved_child.state, compacted.state);
+                assert_eq!(
+                    serde_json::to_value(saved_child.messages).unwrap(),
+                    serde_json::to_value(&compacted.messages).unwrap()
+                );
+                assert!(
+                    matches!(terminal.as_slice(), [AgentEvent::SubagentHistory { history, .. }, AgentEvent::ControlComplete { .. }]
+                    if Arc::ptr_eq(&history.state, &compacted.state))
+                );
+                history.truncate(0);
+                assert_eq!(history.snapshot().state, compacted.state);
+            }
+            manager.shutdown(Duration::from_secs(1)).await;
+            unused_actor.close();
+            drop(session);
+            if let Some(owner) = owner {
+                owner.release().unwrap();
+            }
         });
     }
 

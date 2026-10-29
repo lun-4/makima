@@ -701,10 +701,11 @@ impl<'h> Agent<'h> {
         if let Some(inbox) = &self.turn_inbox {
             inbox.instructions_submitted();
         }
+        let messages = self.history.as_slice();
         let response = match stream_with_retry(
             &*self.provider,
             &self.model,
-            self.history.as_slice(),
+            &messages,
             &self.system,
             tools.as_ref(),
             &self.event_tx,
@@ -916,6 +917,10 @@ impl<'h> Agent<'h> {
     pub fn tool_context_at(&self, cwd: PathBuf) -> ToolContext {
         ToolContext {
             execution_agent_id: Some(self.agent_id),
+            history_state: Some(
+                self.history
+                    .state_handle(self.history.len(), self.cancel.clone()),
+            ),
             provider: Arc::clone(&self.provider),
             model: Arc::clone(&self.model),
             event_tx: self.event_tx.clone(),
@@ -2292,7 +2297,8 @@ mod tests {
             agent.run(TurnId::generate(), default_input()).await;
             drop(agent);
 
-            let message = history.as_slice().first().unwrap();
+            let messages = history.as_slice();
+            let message = messages.first().unwrap();
             assert_eq!(
                 message.user_text(),
                 Some(
@@ -2380,11 +2386,8 @@ mod tests {
             assert!(agent.handle_queued_command().await.unwrap());
             drop(agent);
 
-            let text = history
-                .as_slice()
-                .iter()
-                .map(Message::user_text)
-                .collect::<Vec<_>>();
+            let messages = history.as_slice();
+            let text = messages.iter().map(Message::user_text).collect::<Vec<_>>();
             assert_eq!(text, [Some("preamble"), Some("mailbox"), Some("hello")]);
             assert!(history.as_slice()[0].is_observation());
             assert!(history.as_slice()[1].is_observation());
@@ -2713,7 +2716,8 @@ mod tests {
 
     #[track_caller]
     fn assert_ends_with_cancel_marker(history: &History) {
-        let last = history.as_slice().last().unwrap();
+        let messages = history.as_slice();
+        let last = messages.last().unwrap();
         assert!(matches!(last.role, Role::User));
         assert!(
             matches!(&last.content[0], ContentBlock::Text { text } if text == "[Cancelled by user]")
@@ -2783,7 +2787,7 @@ mod tests {
                 expect_consumed,
             );
             assert_eq!(
-                has_interrupt_in_history(history.as_slice()),
+                has_interrupt_in_history(&history.as_slice()),
                 expect_injected
             );
         });
@@ -2816,6 +2820,9 @@ mod tests {
     #[test_case(true,  150_000, false ; "enabled_but_below_threshold")]
     #[test_case(false, 170_000, false ; "disabled_even_over_threshold")]
     fn try_auto_compact_behavior(enabled: bool, context_size: u32, expected: bool) {
+        const STATE_NAMESPACE: &str = "test.auto_compaction";
+        const NULL_NAMESPACE: &str = "test.auto_compaction_null";
+        const DELETED_NAMESPACE: &str = "test.auto_compaction_deleted";
         smol::block_on(async {
             let responses = if expected {
                 vec![text_response(StopReason::EndTurn)]
@@ -2823,6 +2830,13 @@ mod tests {
                 vec![]
             };
             let mut history = History::new(vec![Message::user("go".into())]);
+            let value = serde_json::json!({ "items": ["first", "second"], "done": false });
+            let handle = history.state_handle(history.len(), CancelToken::none());
+            handle.set(STATE_NAMESPACE.into(), value.clone()).unwrap();
+            handle.set(NULL_NAMESPACE.into(), Value::Null).unwrap();
+            handle.set(DELETED_NAMESPACE.into(), value.clone()).unwrap();
+            handle.delete(DELETED_NAMESPACE.into()).unwrap();
+            let before = history.snapshot();
             let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
             agent.model = Arc::new(small_context_model(200_000, 8_192));
             agent.auto_compact = enabled;
@@ -2831,6 +2845,18 @@ mod tests {
 
             assert_eq!(result, expected);
             drop(agent);
+            let after = history.snapshot();
+            assert_eq!(after.state.get(STATE_NAMESPACE), Some(&value));
+            assert_eq!(after.state.get(NULL_NAMESPACE), Some(&Value::Null));
+            assert_eq!(after.state.get(DELETED_NAMESPACE), None);
+            if expected {
+                assert!(after.compacted);
+                assert!(after.state.updates.is_empty());
+                assert_eq!(after.state.baseline.len(), 2);
+            } else {
+                assert_eq!(after.state, before.state);
+                assert_eq!(after.epoch, before.epoch);
+            }
             assert_eq!(
                 has_event(&drain_events(&event_rx), |e| matches!(
                     e,
@@ -2854,7 +2880,8 @@ mod tests {
             agent.do_compact(None).await.unwrap();
             drop(agent);
 
-            let last = history.as_slice().last().unwrap();
+            let messages = history.as_slice();
+            let last = messages.last().unwrap();
             assert!(matches!(
                 &last.content[0],
                 ContentBlock::Text { text } if text.ends_with(POST) && text != POST

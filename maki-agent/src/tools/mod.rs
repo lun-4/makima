@@ -41,7 +41,8 @@ use crate::mcp::{
 };
 use crate::permissions::PermissionManager;
 use crate::{
-    AgentConfig, AgentId, AgentMode, CurrentManagedTurn, EventSender, RunLedger, SharedBuf,
+    AgentConfig, AgentId, AgentMode, CurrentManagedTurn, EventSender, HistoryStateHandle,
+    RunLedger, SharedBuf,
 };
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_providers::Model;
@@ -453,6 +454,7 @@ pub struct OutputFinalization {
 #[derive(Clone)]
 pub struct ToolContext {
     pub execution_agent_id: Option<AgentId>,
+    pub history_state: Option<HistoryStateHandle>,
     pub provider: Arc<dyn Provider>,
     pub model: Arc<Model>,
     pub event_tx: EventSender,
@@ -859,6 +861,7 @@ pub fn interpreter_ctx(
     let modes = Arc::new(crate::ModeRegistry::builtin());
     ToolContext {
         execution_agent_id: None,
+        history_state: None,
         provider: Arc::clone(&PROVIDER),
         model: Arc::clone(&MODEL),
         event_tx: event_tx.clone(),

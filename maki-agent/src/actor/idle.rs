@@ -69,7 +69,7 @@ impl ActorIdleGuard {
                 generation: state.policy_generation,
                 config,
             },
-            history: self.actor.inner.history.load_full().as_ref().clone(),
+            history: self.actor.inner.history_owner.snapshot(),
         })
     }
 

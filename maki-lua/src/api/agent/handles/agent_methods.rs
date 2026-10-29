@@ -19,7 +19,8 @@ use super::authority::{authorize, destination_template, observe, retire_closed};
 use super::projection::selection_table;
 use super::subscriptions::{
     on_close__doc, on_close__register, on_config_change__doc, on_config_change__register,
-    on_idle__doc, on_idle__register, on_turn_end__doc, on_turn_end__register, on_turn_start__doc,
+    on_history_state_change__doc, on_history_state_change__register, on_idle__doc,
+    on_idle__register, on_turn_end__doc, on_turn_end__register, on_turn_start__doc,
     on_turn_start__register,
 };
 use super::{AgentOwners, LuaAgent, LuaAgentRef, LuaAgentTurn};
@@ -32,7 +33,7 @@ use crate::api::agent::{
 };
 use crate::api::env::host_state_dir;
 use crate::api::session_option::{ensure_validation_not_in_progress, validate_option_value};
-use crate::api::util::convert::json_to_lua;
+use crate::api::util::convert::{history_state_to_lua, json_to_lua};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::api::util::selection::selection_from_lua;
@@ -86,6 +87,33 @@ fn agent_status(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::R
     table.set("input_tokens", snapshot.cumulative_usage.total_input())?;
     table.set("output_tokens", snapshot.cumulative_usage.output)?;
     Ok((Some(table), None))
+}
+
+/// Read one namespace from this agent's committed history state without changing
+/// focus or granting mutation authority. Child agents have separate namespaces.
+/// Rewind restores values at the retained history boundary; compaction keeps
+/// current values. Reads observe successful tool commits before the turn ends.
+/// @param ctx LuaCtx Invocation context authorized to observe this agent.
+/// @param namespace string Independent history-state namespace.
+/// @return (any?, string?) JSON value, or nil without an error when absent. JSON null uses the Lua JSON null sentinel rather than nil.
+#[lua_fn(name = "history_get")]
+fn agent_history_get(
+    lua: &Lua,
+    this: &LuaAgent,
+    ctx: UserDataRef<LuaCtx>,
+    namespace: String,
+) -> mlua::Result<Pair<LuaValue>> {
+    try_pair!(ctx.validate_origin(lua));
+    try_pair!(observe(lua, &ctx, this));
+    let actor = try_pair!(this.manager.actor(this.id));
+    let value = actor.history_state(&namespace);
+    let value = try_pair!(
+        value
+            .as_ref()
+            .map(|value| history_state_to_lua(lua, value))
+            .transpose()
+    );
+    Ok((value, None))
 }
 
 /// The coordinator of the session {agent} works in; a child shares its
@@ -641,10 +669,10 @@ lua_class! {
     /// Reads and effects require current invocation authority; identity is context-free.
     /// A held managed handle retains authorized closed-status reads, not mutation rights.
     "maki.agent.Agent" => LuaAgent, AGENT_DOCS [
-        agent_id, agent_latest_turn, agent_status, agent_config, agent_available_models,
+        agent_id, agent_latest_turn, agent_status, agent_history_get, agent_config, agent_available_models,
         agent_transcript, agent_ref, agent_send, agent_set_model,
         agent_set_mode, agent_set_option, agent_cancel, agent_cancel_subtree, agent_close, agent_defer_close,
-        on_turn_start, on_turn_end, on_idle, on_config_change, on_close,
+        on_turn_start, on_turn_end, on_idle, on_config_change, on_history_state_change, on_close,
     ]
     extra agent_internal_methods
 }

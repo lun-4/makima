@@ -2,7 +2,7 @@ use arc_swap::ArcSwapOption;
 use maki_agent::config_change::ConfigChangeError;
 use maki_agent::session_coordinator::ConfigMutation;
 use maki_agent::{
-    AgentRef,
+    AgentId, AgentRef,
     agent::LoadedInstructions,
     cancel::CancelToken,
     tools::{Deadline, ToolContext, TurnToolBindings},
@@ -275,6 +275,23 @@ impl OrchestrationServices for AgentOrchestration {
             return completion(target, history);
         }
         Box::pin(async { Ok(()) })
+    }
+
+    fn complete_history(
+        &self,
+        agent_id: AgentId,
+        history: HistorySnapshot<Message>,
+    ) -> TurnCompletionFuture {
+        let target = self
+            .lock()
+            .children
+            .iter()
+            .find(|entry| entry.target.target.id() == agent_id)
+            .map(|entry| entry.target.target.clone());
+        match target {
+            Some(target) => self.complete_turn(&target, history),
+            None => Box::pin(async { Err(CHILD_HISTORY_KEY_UNAVAILABLE.into()) }),
+        }
     }
 
     fn command_runner(&self, target: &AgentRef) -> Result<CommandRunner, String> {

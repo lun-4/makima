@@ -14,7 +14,7 @@ use maki_agent::session_coordinator::{
 };
 use maki_agent::session_options::YOLO_OPTION_ID;
 use maki_agent::{
-    AgentRef, ModeRegistry, TurnAdmissionOptions, TurnOrigin, TurnProvenance, modes,
+    AgentId, AgentRef, ModeRegistry, TurnAdmissionOptions, TurnOrigin, TurnProvenance, modes,
     tools::ToolContext,
 };
 use maki_commands::{
@@ -573,6 +573,16 @@ pub trait OrchestrationServices: Send + Sync + 'static {
         _history: HistorySnapshot<Message>,
     ) -> TurnCompletionFuture {
         Box::pin(async { Ok(()) })
+    }
+
+    /// Persists history for an already registered child without retaining a manager.
+    /// The callback must not await work on the child's occupied runner.
+    fn complete_history(
+        &self,
+        _agent_id: AgentId,
+        _history: HistorySnapshot<Message>,
+    ) -> TurnCompletionFuture {
+        Box::pin(async { Err("child history target resolution is unavailable".into()) })
     }
 
     fn register_child_target(

@@ -13,7 +13,7 @@ use super::streaming::{StreamError, stream_with_retry};
 use crate::cancel::CancelToken;
 use crate::{AgentError, AgentEvent, EventSender, TurnCompleteEvent};
 
-const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
+const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If you learned important project context during this session, consider saving it to memory before it's lost.";
 
 const MAX_RESERVED_PERCENT: u32 = 50;
 
@@ -158,6 +158,34 @@ pub async fn compact(
     instructions: Option<&str>,
     session_id: Option<&SessionRef>,
 ) -> Result<(), AgentError> {
+    let usage = compact_without_completion(
+        provider,
+        model,
+        history,
+        event_tx,
+        cancel,
+        config,
+        instructions,
+        session_id,
+    )
+    .await?;
+    event_tx.send(AgentEvent::ControlComplete { usage })?;
+    Ok(())
+}
+
+/// Prepares manual compaction without publishing `ControlComplete`.
+/// The caller emits completion after its persistence attempt succeeds.
+#[allow(clippy::too_many_arguments)]
+pub async fn compact_without_completion(
+    provider: &dyn maki_providers::provider::Provider,
+    model: &Model,
+    history: &mut History,
+    event_tx: &EventSender,
+    cancel: &CancelToken,
+    config: &AgentConfig,
+    instructions: Option<&str>,
+    session_id: Option<&SessionRef>,
+) -> Result<TokenUsage, AgentError> {
     let usage = compact_history(
         provider,
         model,
@@ -173,9 +201,7 @@ pub async fn compact(
         history.push(Message::synthetic(post.to_string()));
     }
 
-    event_tx.send(AgentEvent::ControlComplete { usage })?;
-
-    Ok(())
+    Ok(usage)
 }
 
 const MIN_OUTPUT_TOKENS: u32 = 4096;

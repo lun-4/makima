@@ -406,7 +406,7 @@ impl PreparedOperationTicket {
             let snapshot = operation.transaction_snapshot(
                 &self.inner,
                 &state,
-                (*self.inner.history.load_full()).clone(),
+                self.inner.history_owner.snapshot(),
             );
             state.begin_prepared_publication(&operation, transaction.publication.clone());
             let inner = Arc::clone(&self.inner);

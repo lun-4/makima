@@ -63,8 +63,14 @@ impl AgentActorHandle {
         &self,
         boundary: &HistoryBoundary,
     ) -> Result<(Message, HistorySnapshot<Message>), ActorError> {
-        let draft = self.history_boundary_message(boundary)?;
-        let history = self.inner.history.load_full();
+        let history = self.inner.history_owner.snapshot();
+        if boundary.agent_id != self.agent_id()
+            || boundary.epoch != history.epoch
+            || !valid_boundary(&history.messages, boundary.offset)
+        {
+            return Err(ActorError::StaleHistoryBoundary);
+        }
+        let draft = history.messages[boundary.offset].clone();
         let mut replacement = HistorySnapshot::new(history.messages[..boundary.offset].to_vec());
         replacement.compacted = history.compacted;
         replacement.state = Arc::clone(&history.state);
@@ -213,9 +219,7 @@ impl HistoryEditWork {
             transaction,
             completion,
         } = self.action;
-        let snapshot = replacement
-            .clone()
-            .unwrap_or_else(|| (*actor.inner.history.load_full()).clone());
+        let snapshot = replacement.clone().unwrap_or_else(|| history.snapshot());
         let snapshot = {
             let state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
             operation.transaction_snapshot(&actor.inner, &state, snapshot)
@@ -231,7 +235,6 @@ impl HistoryEditWork {
                 Err(error)
             }
             Ok(finalize) => {
-                let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
                 let change = replacement.map(|snapshot| {
                     history.replace_snapshot(snapshot.clone());
                     HistoryChange {
@@ -240,6 +243,7 @@ impl HistoryEditWork {
                         draft: Message::user(String::new()),
                     }
                 });
+                let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
                 let committed = (*operation).commit_locked(&actor.inner, &mut state, finalize);
                 state.end_prepared_publication(id);
                 if let Some(reservation) = state.owned_idle(&self.owner) {
@@ -358,6 +362,41 @@ mod tests {
     const STATE_NAMESPACE: &str = "test.work";
     const ORIGINAL_WORK: &str = "original";
     const LATER_WORK: &str = "later";
+
+    #[test]
+    fn history_state_notifications_and_read_only_query() {
+        smol::block_on(async {
+            let (actor, runner) = idle_actor(vec![Message::user(ORIGINAL_WORK.into())]);
+            let events = actor.subscribe_events();
+            let handle = actor
+                .inner
+                .history_owner
+                .state_handle(1, crate::CancelToken::none());
+            handle
+                .set(STATE_NAMESPACE.into(), serde_json::json!(ORIGINAL_WORK))
+                .unwrap();
+            assert!(
+                matches!(events.recv().unwrap(), crate::actor::ActorEvent::HistoryStateChanged { namespace: Some(namespace) } if namespace == STATE_NAMESPACE)
+            );
+            assert_eq!(
+                actor.history_state(STATE_NAMESPACE),
+                Some(serde_json::json!(ORIGINAL_WORK))
+            );
+            let mut history = actor.inner.history_owner.clone();
+            history.replace(Vec::new());
+            assert!(matches!(
+                events.recv().unwrap(),
+                crate::actor::ActorEvent::HistoryStateChanged { namespace: None }
+            ));
+            assert_eq!(actor.history_state(STATE_NAMESPACE), None);
+            assert_eq!(
+                handle.delete(STATE_NAMESPACE.into()),
+                Err(crate::HistoryStateError::Stale)
+            );
+            actor.close();
+            runner.await;
+        });
+    }
 
     #[test_case(false; "publication_success")]
     #[test_case(true; "publication_failure")]
