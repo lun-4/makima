@@ -797,7 +797,7 @@ mod tests {
     fn local_provider_docs_use_offline_metadata() {
         let providers = maki_lua::provider_docs::load_bundled_providers().unwrap();
         let sections = build_sections(&providers);
-        for id in ["ollama", "llama-cpp"] {
+        for id in ["ollama", "llama-cpp", "requesty"] {
             let provider = providers.iter().find(|provider| provider.id == id).unwrap();
             assert!(
                 !sections

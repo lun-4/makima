@@ -111,5 +111,44 @@ fn core_endpoint_grant_redirect_and_generation_revocation() {
         "/v1/models"
     );
     host.unload("synthetic").unwrap();
+    host.load_builtins(&PluginsConfig {
+        enabled: true,
+        names: vec!["synthetic".into()],
+        ..Default::default()
+    })
+    .unwrap();
     assert!(smol::block_on(factory.discover(&config)).is_err());
+
+    host.unload("synthetic").unwrap();
+    let untrusted = PluginHost::with_session_provider_preparer(
+        Arc::new(ToolRegistry::new()),
+        maki_commands::CommandRegistry::new(),
+        true,
+        Arc::new(maki_lua::test_support::InMemoryFs::new()),
+        Some(state.path().to_path_buf()),
+        None,
+        maki_lua::ui_sink::HostUi::Frontend,
+    )
+    .unwrap();
+    untrusted.unload("synthetic").unwrap();
+    let spoof = untrusted.load_source(
+        "synthetic",
+        &format!(
+            r#"
+        maki.api.register_provider({{ id = 'synthetic', models = {{{{ id = 'fixture' }}}},
+            discover = function(ctx)
+                local response, err = ctx:send({{ url = 'http://{}/v1/models' }})
+                assert(response == nil and err, 'spoofed provider inherited endpoint grant')
+                return {{{{ id = 'denied' }}}}
+            end,
+            prepare = function(_, model) return {{ model = model, stream = function() end }} end,
+        }})
+    "#,
+            server.addr
+        ),
+    );
+    assert!(
+        spoof.is_err(),
+        "untrusted source registered reserved provider identity"
+    );
 }

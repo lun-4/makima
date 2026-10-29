@@ -1,5 +1,8 @@
 use maki_agent::cancel::CancelToken;
-use maki_storage::auth::{CredentialError, CredentialScope, LegacyCredentialKind, RefreshOutcome};
+use maki_storage::auth::{
+    CredentialError, CredentialGeneration, CredentialLifecycle, CredentialScope,
+    LegacyCredentialKind, RefreshOutcome,
+};
 use mlua::{Function, Lua, MultiValue, Table, Value};
 
 use crate::api::util::convert::{json_to_lua_with_nulls, lua_to_json};
@@ -74,12 +77,45 @@ pub(crate) fn attach(
     source: SourceIdentity,
     provider: String,
 ) -> mlua::Result<()> {
+    attach_inner(lua, context, task, generation, source, provider, None)
+}
+
+pub(crate) fn attach_fenced(
+    lua: &Lua,
+    context: &Table,
+    task: TaskHandle,
+    generation: CancelToken,
+    source: SourceIdentity,
+    provider: String,
+    fence: (CredentialLifecycle, CredentialGeneration),
+) -> mlua::Result<()> {
+    attach_inner(
+        lua,
+        context,
+        task,
+        generation,
+        source,
+        provider,
+        Some(fence),
+    )
+}
+
+fn attach_inner(
+    lua: &Lua,
+    context: &Table,
+    task: TaskHandle,
+    generation: CancelToken,
+    source: SourceIdentity,
+    provider: String,
+    fence: Option<(CredentialLifecycle, CredentialGeneration)>,
+) -> mlua::Result<()> {
     let store = lua.create_table()?;
     for operation in ["read", "write", "delete", "refresh"] {
         let task = task.clone();
         let generation = generation.clone();
         let source = source.clone();
         let provider = provider.clone();
+        let fence = fence.clone();
         store.set(
             operation,
             lua.create_async_function(
@@ -88,6 +124,7 @@ pub(crate) fn attach(
                     let generation = generation.clone();
                     let source = source.clone();
                     let provider = provider.clone();
+                    let fence = fence.clone();
                     async move {
                         if !authorized(&lua, &task, &generation) {
                             return Ok((
@@ -111,44 +148,50 @@ pub(crate) fn attach(
                                     })
                             }
                             "write" => match lua_to_json(&lua, &argument) {
-                                Ok(value) => scope
-                                    .refresh(|_| async {
-                                        if !authorized(&lua, &task, &generation) {
-                                            return Err(CredentialError::Refresh(
-                                                "credential context expired".into(),
-                                            ));
-                                        }
-                                        Ok(RefreshOutcome::Updated(value))
-                                    })
-                                    .await
-                                    .map(|_| Value::Boolean(true))
-                                    .map_err(|e| e.to_string()),
-                                Err(e) => Err(e.to_string()),
-                            },
-                            "delete" => scope
-                                .refresh(|current| {
-                                    let lua = &lua;
-                                    let task = &task;
-                                    let generation = &generation;
-                                    async move {
-                                        if !authorized(lua, task, generation) {
-                                            return Err(CredentialError::Refresh(
-                                                "credential context expired".into(),
-                                            ));
-                                        }
-                                        Ok(if current.is_some() {
-                                            RefreshOutcome::Deleted
-                                        } else {
-                                            RefreshOutcome::Unchanged
-                                        })
+                                Ok(value) => fenced_refresh(&scope, fence.as_ref(), |_| async {
+                                    if !authorized(&lua, &task, &generation) {
+                                        return Err(CredentialError::Refresh(
+                                            "credential context expired".into(),
+                                        ));
                                     }
+                                    Ok(RefreshOutcome::Updated(value))
                                 })
                                 .await
                                 .map(|_| Value::Boolean(true))
                                 .map_err(|e| e.to_string()),
+                                Err(e) => Err(e.to_string()),
+                            },
+                            "delete" => fenced_refresh(&scope, fence.as_ref(), |current| {
+                                let lua = &lua;
+                                let task = &task;
+                                let generation = &generation;
+                                async move {
+                                    if !authorized(lua, task, generation) {
+                                        return Err(CredentialError::Refresh(
+                                            "credential context expired".into(),
+                                        ));
+                                    }
+                                    Ok(if current.is_some() {
+                                        RefreshOutcome::Deleted
+                                    } else {
+                                        RefreshOutcome::Unchanged
+                                    })
+                                }
+                            })
+                            .await
+                            .map(|_| Value::Boolean(true))
+                            .map_err(|e| e.to_string()),
                             "refresh" => match argument {
                                 Value::Function(callback) => {
-                                    refresh(&lua, &scope, callback, &task, &generation).await
+                                    refresh(
+                                        &lua,
+                                        &scope,
+                                        callback,
+                                        &task,
+                                        &generation,
+                                        fence.as_ref(),
+                                    )
+                                    .await
                                 }
                                 _ => {
                                     return Err(mlua::Error::runtime(
@@ -170,49 +213,64 @@ pub(crate) fn attach(
     context.set("credentials", store)
 }
 
+async fn fenced_refresh<F, Fut>(
+    scope: &CredentialScope,
+    fence: Option<&(CredentialLifecycle, CredentialGeneration)>,
+    callback: F,
+) -> Result<Option<serde_json::Value>, CredentialError>
+where
+    F: FnOnce(Option<serde_json::Value>) -> Fut,
+    Fut: std::future::Future<Output = Result<RefreshOutcome, CredentialError>>,
+{
+    match fence {
+        Some((lifecycle, generation)) => lifecycle.refresh(generation, scope, callback).await,
+        None => scope.refresh(callback).await,
+    }
+}
+
 async fn refresh(
     lua: &Lua,
     scope: &CredentialScope,
     callback: Function,
     task: &TaskHandle,
     generation: &CancelToken,
+    fence: Option<&(CredentialLifecycle, CredentialGeneration)>,
 ) -> Result<Value, String> {
-    let value = scope
-        .refresh(|current| async {
-            if !authorized(lua, task, generation) {
-                return Err(CredentialError::Refresh(
-                    "credential context expired".into(),
-                ));
-            }
-            let input = match current {
-                Some(value) => json_to_lua_with_nulls(lua, &value, true)
-                    .map_err(|_| CredentialError::Refresh("invalid credential value".into()))?,
-                None => Value::Nil,
-            };
-            let values = callback
-                .call_async::<MultiValue>(input)
-                .await
-                .map_err(|_| CredentialError::Refresh("callback failed".into()))?;
-            if !authorized(lua, task, generation) {
-                return Err(CredentialError::Refresh(
-                    "credential context expired".into(),
-                ));
-            }
-            let mut values = values.into_iter();
-            let value = values.next().unwrap_or(Value::Nil);
-            let err = values.next().unwrap_or(Value::Nil);
-            if !matches!(err, Value::Nil) {
-                return Err(CredentialError::Refresh("callback failed".into()));
-            }
-            if matches!(value, Value::Nil) {
-                return Ok(RefreshOutcome::Unchanged);
-            }
-            lua_to_json(lua, &value)
-                .map(RefreshOutcome::Updated)
-                .map_err(|_| CredentialError::Refresh("invalid callback value".into()))
-        })
-        .await
-        .map_err(|e| e.to_string())?;
+    let value = fenced_refresh(scope, fence, |current| async {
+        if !authorized(lua, task, generation) {
+            return Err(CredentialError::Refresh(
+                "credential context expired".into(),
+            ));
+        }
+        let input = match current {
+            Some(value) => json_to_lua_with_nulls(lua, &value, true)
+                .map_err(|_| CredentialError::Refresh("invalid credential value".into()))?,
+            None => Value::Nil,
+        };
+        let values = callback
+            .call_async::<MultiValue>(input)
+            .await
+            .map_err(|_| CredentialError::Refresh("callback failed".into()))?;
+        if !authorized(lua, task, generation) {
+            return Err(CredentialError::Refresh(
+                "credential context expired".into(),
+            ));
+        }
+        let mut values = values.into_iter();
+        let value = values.next().unwrap_or(Value::Nil);
+        let err = values.next().unwrap_or(Value::Nil);
+        if !matches!(err, Value::Nil) {
+            return Err(CredentialError::Refresh("callback failed".into()));
+        }
+        if matches!(value, Value::Nil) {
+            return Ok(RefreshOutcome::Unchanged);
+        }
+        lua_to_json(lua, &value)
+            .map(RefreshOutcome::Updated)
+            .map_err(|_| CredentialError::Refresh("invalid callback value".into()))
+    })
+    .await
+    .map_err(|e| e.to_string())?;
     match value {
         Some(value) => json_to_lua_with_nulls(lua, &value, true).map_err(|e| e.to_string()),
         None => Ok(Value::Nil),

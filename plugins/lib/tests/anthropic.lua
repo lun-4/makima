@@ -6,6 +6,7 @@ local frames = {
   'event: content_block_start\ndata: {"index":0,"content_block":{"type":"thinking"}}\n\n',
   'event: content_block_delta\ndata: {"index":0,"delta":{"type":"thinking_delta","thinking":"reason"}}\n\n',
   'event: content_block_delta\ndata: {"index":0,"delta":{"type":"signature_delta","signature":"sig"}}\n\n',
+  'event: content_block_stop\ndata: {"index":0}\n\n',
   'event: content_block_start\ndata: {"index":1,"content_block":{"type":"tool_use","id":"id","name":"tool"}}\n\n',
   'event: content_block_delta\ndata: {"index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"x\\":1}"}}\n\n',
   'event: content_block_stop\ndata: {"index":1}\n\n',
@@ -24,7 +25,7 @@ local result = assert(direct.stream(response, function(event)
   return true
 end))
 assert(result.message.content[1].thinking == "reason" and result.message.content[1].signature == "sig")
-assert(result.message.content[2].input.x == 1 and emitted[2].type == "tool_use_start")
+assert(result.message.content[2].input.x == 1 and emitted[2].type == "thinking_block_end" and emitted[3].type == "tool_use_start")
 assert(result.usage.input == 12 and result.usage.cache_read == 3 and result.usage.output == 7)
 assert(result.stop_reason == "tool_use")
 local skipped = {

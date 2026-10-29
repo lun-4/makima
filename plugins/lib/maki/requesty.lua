@@ -209,13 +209,18 @@ local function secret_values(config, keys)
   return secrets
 end
 
+local function base_url(config)
+  local override = maki.uv.os_getenv("REQUESTY_BASE_URL")
+  return ((override and override ~= "" and override) or config.base_url or endpoint):gsub("/+$", "")
+end
+
 local function discover(ctx, config)
   config = config or {}
   local keys, err = credentials(ctx, config)
   if not keys then
     return nil, err
   end
-  local base = (config.base_url or endpoint):gsub("/+$", "")
+  local base = base_url(config)
   local request_headers = headers(config, keys[1], false)
   local secrets = secret_values(config, keys)
   local results = maki.async.gather({
@@ -261,7 +266,7 @@ local function prepare(ctx, model, config)
   end
   local index = 1
   local secrets = secret_values(config, keys)
-  local base = (config.base_url or endpoint):gsub("/+$", "")
+  local base = base_url(config)
   return {
     model = model,
     key_count = #keys,
@@ -321,6 +326,12 @@ local function register()
   maki.api.register_provider({
     id = "requesty",
     display_name = "Requesty",
+    docs = {
+      auth_line = "`REQUESTY_API_KEY`",
+      urls = { "https://router.requesty.ai/v1" },
+      features = "700+ models behind one key, curated managed routing policies, EU region via `REQUESTY_BASE_URL`",
+      no_catalog_note = "Requesty routes across 700+ models with one key, including managed routing policies (e.g. `requesty/claude-sonnet-4-5`) and the full `<vendor>/<model>` catalog (e.g. `requesty/openai/gpt-4o-mini`). Get a key at [app.requesty.ai/api-keys](https://app.requesty.ai/api-keys). Set `REQUESTY_BASE_URL=https://router.eu.requesty.ai/v1` to keep all traffic in the EU.",
+    },
     models = {},
     discover = discover,
     prepare = prepare,

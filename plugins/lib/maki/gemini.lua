@@ -347,7 +347,7 @@ local function response_error(response, opts)
   local seconds = type(retry) == "string" and retry:match("^%s*(%d+)%s*$")
   seconds = seconds and tonumber(seconds)
   local chunks, size = {}, 0
-  while size < 65536 do
+  while true do
     local chunk, err = response:read()
     if err or not chunk then
       chunks = { "unable to read error body" }

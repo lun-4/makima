@@ -595,7 +595,7 @@ impl PluginHost {
             }
         }
         for builtin in &config.names {
-            if builtin == "synthetic" {
+            if matches!(builtin.as_str(), "synthetic" | "mistral") {
                 continue;
             }
             let bundled = match BUNDLED_PLUGINS.iter().find(|p| p.name == builtin.as_str()) {
@@ -1546,11 +1546,12 @@ mod tests {
                 .get("synthetic")
                 .is_some()
         );
+        assert!(host.provider_registry().snapshot().get("mistral").is_some());
         assert!(host.load_source("providers", "return nil").is_err());
         assert!(host.unload("providers").is_err());
         host.load_builtins(&PluginsConfig {
             enabled: true,
-            names: vec!["synthetic".into()],
+            names: vec!["synthetic".into(), "mistral".into()],
             opts: HashMap::new(),
         })
         .unwrap();
@@ -1560,6 +1561,7 @@ mod tests {
                 .get("synthetic")
                 .is_some()
         );
+        assert!(host.provider_registry().snapshot().get("mistral").is_some());
         host.load_source(
             "module_probe",
             "assert(type(require('providers.core')) == 'function')",

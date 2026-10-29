@@ -5,7 +5,10 @@ use std::{env, thread};
 use isahc::ReadResponseExt;
 use isahc::config::Configurable;
 use maki_storage::StateDir;
-use maki_storage::auth::{OAuthTokens, delete_tokens, load_tokens, now_millis, save_tokens};
+use maki_storage::auth::{
+    CredentialLifecycle, CredentialScope, LegacyCredentialKind, OAuthTokens, RefreshOutcome,
+    delete_tokens, load_tokens, now_millis,
+};
 use serde::Deserialize;
 use tracing::{debug, error, warn};
 
@@ -327,6 +330,13 @@ pub fn wait_device_login(
     if abort.is_some_and(|a| a.load(Ordering::Relaxed)) {
         return Ok(());
     }
+    let lifecycle =
+        CredentialLifecycle::new(dir.clone(), PROVIDER).map_err(|e| AgentError::Config {
+            message: e.to_string(),
+        })?;
+    let generation = smol::block_on(lifecycle.snapshot()).map_err(|e| AgentError::Config {
+        message: e.to_string(),
+    })?;
     let device = DeviceCodeResponse {
         device_auth_id: session.device_auth_id.clone(),
         user_code: session.user_code.clone(),
@@ -348,7 +358,22 @@ pub fn wait_device_login(
     })?;
 
     let tokens = into_oauth_tokens(token_resp);
-    save_tokens(dir, PROVIDER, &tokens)?;
+    if abort.is_some_and(|a| a.load(Ordering::Relaxed)) {
+        return Err(AgentError::Cancelled);
+    }
+    let scope = CredentialScope::legacy(dir.clone(), PROVIDER, LegacyCredentialKind::OAuth)
+        .map_err(|e| AgentError::Config {
+            message: e.to_string(),
+        })?;
+    let value = serde_json::to_value(tokens).map_err(|e| AgentError::Config {
+        message: e.to_string(),
+    })?;
+    smol::block_on(lifecycle.refresh(&generation, &scope, |_| async {
+        Ok(RefreshOutcome::Updated(value))
+    }))
+    .map_err(|e| AgentError::Config {
+        message: e.to_string(),
+    })?;
     Ok(())
 }
 
@@ -365,6 +390,13 @@ pub fn login(dir: &StateDir) -> Result<(), AgentError> {
 }
 
 pub fn logout(dir: &StateDir) -> Result<(), AgentError> {
+    let lifecycle =
+        CredentialLifecycle::new(dir.clone(), PROVIDER).map_err(|e| AgentError::Config {
+            message: e.to_string(),
+        })?;
+    smol::block_on(lifecycle.invalidate()).map_err(|e| AgentError::Config {
+        message: e.to_string(),
+    })?;
     if delete_tokens(dir, PROVIDER)? {
         println!("Logged out of OpenAI.");
     } else {

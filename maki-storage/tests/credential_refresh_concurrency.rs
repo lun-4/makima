@@ -87,6 +87,38 @@ fn invalidation_fences_stale_generation_across_instances() {
 }
 
 #[test]
+fn logout_fences_refresh_paused_in_callback() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = StateDir::from_path(dir.path().to_owned());
+    let lifecycle = CredentialLifecycle::new(state.clone(), SCOPE).unwrap();
+    let scope = CredentialScope::new(state, SCOPE).unwrap();
+    smol::block_on(scope.write(&json!({"token": "old"}))).unwrap();
+    let generation = smol::block_on(lifecycle.snapshot()).unwrap();
+    let (ready, started) = flume::bounded(1);
+    let (release, resumed) = flume::bounded(1);
+    let worker_lifecycle = lifecycle.clone();
+    let worker_scope = scope.clone();
+    let worker = thread::spawn(move || {
+        smol::block_on(
+            worker_lifecycle.refresh(&generation, &worker_scope, |_| async {
+                ready.send(()).unwrap();
+                resumed.recv_async().await.unwrap();
+                Ok(RefreshOutcome::Updated(json!({"token": "stale"})))
+            }),
+        )
+    });
+    started.recv().unwrap();
+    smol::block_on(lifecycle.invalidate()).unwrap();
+    smol::block_on(scope.delete()).unwrap();
+    release.send(()).unwrap();
+    assert!(matches!(
+        worker.join().unwrap(),
+        Err(CredentialError::StaleGeneration)
+    ));
+    assert!(scope.read().unwrap().is_none());
+}
+
+#[test]
 fn lifecycle_stale_child() {
     let Some(path) = std::env::var_os(LIFECYCLE_CHILD_DIR) else {
         return;

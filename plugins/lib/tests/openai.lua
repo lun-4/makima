@@ -434,6 +434,11 @@ do
 end
 
 do
+  local previous_cancel = maki.async.on_cancel
+  local cancel
+  maki.async.on_cancel = function(callback)
+    cancel = callback
+  end
   local saved, writes = { access = "existing" }, 0
   local conflict = { kind = "config", message = "credential file contains a different credential type" }
   local ctx = {
@@ -455,12 +460,6 @@ do
       return "  new-key  "
     end,
   }
-  local ui = {
-    input = function(_, prompt, secret, optional)
-      assert(prompt == "OpenAI API key" and secret and not optional)
-      return "  new-key  "
-    end,
-  }
   local ok, err = openai.login_api_key(ctx, ui)
   assert(not ok and err == conflict and saved.access == "existing")
   saved = {}
@@ -470,6 +469,13 @@ do
   end
   ok, err = openai.login_api_key(ctx, ui)
   assert(not ok and err.kind == "config" and writes == 2 and saved.api_key == "new-key")
+  ui.input = function()
+    cancel()
+    return "new-key"
+  end
+  ok, err = openai.login_api_key(ctx, ui)
+  assert(not ok and err.kind == "cancelled" and writes == 2)
+  maki.async.on_cancel = previous_cancel
 end
 
 local usage = assert(

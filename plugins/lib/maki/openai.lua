@@ -183,6 +183,9 @@ function M.prepare(ctx, model, config)
   end
   if tokens then
     tokens, token_err = usable_tokens(ctx, tokens)
+    if token_err and token_err.kind == "cancelled" then
+      return nil, token_err
+    end
   end
   local keys, key_err
   if tokens then
@@ -275,6 +278,9 @@ function M.prepare(ctx, model, config)
       if tokens then
         local current, token_err = usable_tokens(ctx, tokens)
         if not current then
+          if token_err and token_err.kind == "cancelled" then
+            return nil, token_err
+          end
           local fallback, key_err = api_keys(ctx, config)
           if not fallback then
             return nil, key_err
@@ -386,6 +392,9 @@ function M.discover(ctx, config)
   end
   if tokens then
     tokens, token_err = usable_tokens(ctx, tokens)
+    if token_err and token_err.kind == "cancelled" then
+      return nil, token_err
+    end
   end
   if tokens then
     return require("maki.openai_models").discover(ctx, {
@@ -421,7 +430,17 @@ function M.login_api_key(ctx, ui)
   if type(ui) ~= "table" or type(ui.input) ~= "function" then
     return nil, { kind = "config", message = "OpenAI API key login requires interactive authentication" }
   end
+  local cancelled = false
+  maki.async.on_cancel(function()
+    cancelled = true
+  end)
+  if cancelled then
+    return nil, { kind = "cancelled", message = "OpenAI login cancelled" }
+  end
   local key, err = ui:input("OpenAI API key", true, false)
+  if cancelled then
+    return nil, { kind = "cancelled", message = "OpenAI login cancelled" }
+  end
   if err then
     return nil, err
   end

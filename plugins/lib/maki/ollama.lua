@@ -253,6 +253,13 @@ local function prepare(ctx, model, config)
         elseif intent.mode == "effort" then
           local effort = ({ xhigh = "high", max = "high" })[intent.level] or intent.level
           reasoning = { effort = effort, summary = "auto" }
+        elseif intent.mode == "budget" then
+          local maximum = request.model.max_output_tokens
+              and math.max(1024, math.floor(request.model.max_output_tokens / 2))
+            or 32768
+          local percent = math.floor(intent.tokens * 100 / maximum)
+          local effort = percent <= 10 and "minimal" or percent <= 20 and "low" or percent <= 40 and "medium" or "high"
+          reasoning = { effort = effort, summary = "auto" }
         end
         body, build_err = responses.build_request(request, { reasoning = reasoning })
         if body then

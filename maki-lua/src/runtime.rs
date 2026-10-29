@@ -5709,7 +5709,9 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                     };
                                     let scope = TaskScope::new(&lua, TaskCell::new(cancel.clone(), None, None));
                                     let (context, _net_scope) = crate::api::net::provider_context(&lua, scope.handle().clone(), &permissions, crate::api::net::ConfiguredEndpoint::from_host_config(&source, &provider)).map_err(|e| config_error(e.to_string()))?;
-                                    crate::provider_credentials::attach(&lua, &context, scope.handle().clone(), generation_cancel.clone(), source, provider.clone()).map_err(|e| config_error(e.to_string()))?;
+                                    let lifecycle = maki_storage::auth::CredentialLifecycle::new(crate::api::env::host_state_dir(&lua).map_err(config_error)?, &provider).map_err(|e| config_error(e.to_string()))?;
+                                    let durable_generation = if hook == "logout" { lifecycle.invalidate().await } else { lifecycle.snapshot().await }.map_err(|e| config_error(e.to_string()))?;
+                                    crate::provider_credentials::attach_fenced(&lua, &context, scope.handle().clone(), generation_cancel.clone(), source, provider.clone(), (lifecycle, durable_generation)).map_err(|e| config_error(e.to_string()))?;
                                     let result = match auth_epoch.race(generation_cancel.race(cancel.race(scope.scope_future(function.call_async::<MultiValue>((context, input)))))).await {
                                         Ok(result) => result,
                                         Err(_) => { scope.fire_cancel_hooks(); return Err(maki_providers::AgentError::Cancelled); }

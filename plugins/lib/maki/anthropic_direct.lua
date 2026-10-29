@@ -145,6 +145,11 @@ function M.stream(response, emit)
       local b = blocks[value.index]
       if b and b.type == "tool_use" then
         b.input = maki.json.decode(table.concat(arguments[value.index] or {}), { preserve_null = true }) or {}
+      elseif b and b.type == "thinking" then
+        local ok, emit_err = emit({ type = "thinking_block_end" })
+        if not ok then
+          return nil, emit_err
+        end
       end
     elseif kind == "message_delta" then
       if type(value.usage) == "table" then

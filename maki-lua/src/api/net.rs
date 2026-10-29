@@ -216,7 +216,7 @@ impl ConfiguredEndpoint {
         provider: &str,
     ) -> Option<Self> {
         if !matches!(source, crate::loader::SourceIdentity::CoreProviders)
-            || provider != "synthetic"
+            || !matches!(provider, "synthetic" | "mistral")
         {
             return None;
         }

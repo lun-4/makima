@@ -88,6 +88,9 @@ local function discover(ctx, config)
   if not data then
     return nil, { kind = "api", message = tostring(decode_err) }
   end
+  if type(data) ~= "table" then
+    return {}, nil
+  end
   local models, flags = {}, {}
   for _, entry in ipairs(type(data.data) == "table" and data.data or {}) do
     local info = type(entry) == "table" and entry.model_info
@@ -155,6 +158,14 @@ local function prepare(ctx, model, config)
   return {
     model = model,
     key_count = #keys,
+    reload_auth = function(reload_ctx)
+      local refreshed, reload_err = credentials(reload_ctx, config)
+      if not refreshed then
+        return nil, reload_err
+      end
+      keys, index = refreshed, 1
+      return true
+    end,
     rotate_key = function()
       if #keys < 2 then
         return false

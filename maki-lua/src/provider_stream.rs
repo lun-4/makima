@@ -262,13 +262,23 @@ pub(crate) async fn run_hook(
     let (context, _net_scope) =
         crate::api::net::provider_context(lua, scope.handle().clone(), permissions, endpoint)
             .map_err(|e| config_error(e.to_string()))?;
-    crate::provider_credentials::attach(
+    let lifecycle = maki_storage::auth::CredentialLifecycle::new(
+        crate::api::env::host_state_dir(lua).map_err(config_error)?,
+        &provider,
+    )
+    .map_err(|e| config_error(e.to_string()))?;
+    let durable_generation = lifecycle
+        .snapshot()
+        .await
+        .map_err(|e| config_error(e.to_string()))?;
+    crate::provider_credentials::attach_fenced(
         lua,
         &context,
         scope.handle().clone(),
         generation.clone(),
         source,
         provider,
+        (lifecycle, durable_generation),
     )
     .map_err(|e| config_error(e.to_string()))?;
     let result = generation

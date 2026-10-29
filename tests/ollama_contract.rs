@@ -483,7 +483,7 @@ fn ollama_discovery_ignores_invalid_show_fields(show: &str) {
 #[test_case(ThinkingConfig::Effort(Effort::Low), Some("low") ; "low")]
 #[test_case(ThinkingConfig::Effort(Effort::XHigh), Some("high") ; "xhigh")]
 #[test_case(ThinkingConfig::Effort(Effort::Max), Some("high") ; "max")]
-#[test_case(ThinkingConfig::Budget(3000), None ; "budget")]
+#[test_case(ThinkingConfig::Budget(3000), Some("minimal") ; "budget")]
 fn ollama_responses_reasoning_modes(thinking: ThinkingConfig, effort: Option<&str>) {
     let _guard = TEST_LOCK.lock().unwrap();
     let server = HttpContract::start(vec![Response {

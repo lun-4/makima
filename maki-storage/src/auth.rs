@@ -229,9 +229,8 @@ impl CredentialLifecycle {
         })
     }
 
-    /// The lifecycle lock precedes the credential lock and remains held until
-    /// the callback and commit finish. Logout therefore waits for in-flight
-    /// refreshes, while operations admitted before logout cannot commit after it.
+    /// Runs the callback without locks, then checks the generation and original
+    /// credential under lifecycle-then-credential locks before committing.
     pub async fn refresh<F, Fut>(
         &self,
         generation: &CredentialGeneration,
@@ -249,11 +248,37 @@ impl CredentialLifecycle {
         {
             return Err(CredentialError::InvalidScope);
         }
-        let _lock = lock_credentials(&self.dir, &self.name).await?;
+        let single_flight = format!("refresh_{}_{}", scope.name.len(), scope.name);
+        let _single_flight = lock_credentials(&self.dir, &single_flight).await?;
+        let current = {
+            let _lifecycle = lock_credentials(&self.dir, &self.name).await?;
+            if self.read_generation()? != generation.value {
+                return Err(CredentialError::StaleGeneration);
+            }
+            let _credential = scope.lock().await?;
+            scope.read()?
+        };
+        let outcome = refresh(current.clone()).await?;
+        let _lifecycle = lock_credentials(&self.dir, &self.name).await?;
         if self.read_generation()? != generation.value {
             return Err(CredentialError::StaleGeneration);
         }
-        scope.refresh(refresh).await
+        let _credential = scope.lock().await?;
+        if scope.read()? != current {
+            return Err(CredentialError::Conflict);
+        }
+        match outcome {
+            RefreshOutcome::Unchanged => Ok(current),
+            RefreshOutcome::Updated(value) => {
+                scope.write_unlocked(&value)?;
+                Ok(Some(value))
+            }
+            RefreshOutcome::Deleted => {
+                scope.delete_unlocked()?;
+                Ok(None)
+            }
+            RefreshOutcome::Revoked => Err(CredentialError::Revoked),
+        }
     }
 }
 

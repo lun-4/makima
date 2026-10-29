@@ -91,6 +91,7 @@ fn anthropic_direct_streams_through_plugin_host_and_http() {
                 "event: content_block_start\ndata: {\"index\":1,\"content_block\":{\"type\":\"thinking\"}}\n\n",
                 "event: content_block_delta\ndata: {\"index\":1,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"reason\"}}\n\n",
                 "event: content_block_delta\ndata: {\"index\":1,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"signed\"}}\n\n",
+                "event: content_block_stop\ndata: {\"index\":1}\n\n",
                 "event: content_block_start\ndata: {\"index\":2,\"content_block\":{\"type\":\"text\"}}\n\n",
                 "event: content_block_delta\ndata: {\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
                 "event: content_block_start\ndata: {\"index\":3,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"lookup\"}}\n\n",
@@ -164,6 +165,10 @@ fn anthropic_direct_streams_through_plugin_host_and_http() {
     assert!(
         matches!(received.try_recv(), Ok(ProviderEvent::ThinkingDelta { text }) if text == "reason")
     );
+    assert!(matches!(
+        received.try_recv(),
+        Ok(ProviderEvent::ThinkingBlockEnd)
+    ));
     assert!(
         matches!(received.try_recv(), Ok(ProviderEvent::TextDelta { text }) if text == "hello")
     );

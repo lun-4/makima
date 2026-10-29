@@ -296,6 +296,22 @@ local function prepare(ctx, model, config)
         return nil, { kind = "network", message = "DeepSeek request failed" }
       end
       if response.status < 200 or response.status >= 300 then
+        local chunks, size = {}, 0
+        while size < 65536 do
+          local chunk, read_err = response:read()
+          if read_err or not chunk or chunk == "" then break end
+          size = size + #chunk
+          if size > 65536 then chunks = {}; break end
+          chunks[#chunks + 1] = chunk
+        end
+        local message = table.concat(chunks)
+        for _, secret in ipairs(keys) do
+          if message:find(secret, 1, true) then message = ""; break end
+        end
+        for _, secret in pairs(config.headers or {}) do
+          if type(secret) == "string" and secret ~= "" and message:find(secret, 1, true) then message = ""; break end
+        end
+        if message == "" then message = "DeepSeek request failed" end
         local value = response.headers and response.headers["retry-after"]
         local seconds = type(value) == "string" and tonumber(value:match("^%s*(%d+)%s*$"))
         response:close()
@@ -303,7 +319,7 @@ local function prepare(ctx, model, config)
           {
             kind = "api",
             status = response.status,
-            message = "DeepSeek request failed",
+            message = message,
             retry_after_ms = seconds and seconds > 0 and seconds <= 9007199254740 and seconds * 1000 or nil,
           }
       end

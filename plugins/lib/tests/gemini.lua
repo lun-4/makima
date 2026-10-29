@@ -202,6 +202,21 @@ local failed_request, api_err = instance.stream(error_ctx, request, function()
 end)
 assert(not failed_request and api_err.status == 429 and api_err.retry_after_ms == 3000)
 assert(api_err.message == '{"error":{"message":"too many tokens"}}' and closed)
+local oversized_ctx = {
+  send = function()
+    local result = body_for({ string.rep("x", 65536), "y" })
+    result.status = 400
+    result.close = function()
+      closed = true
+    end
+    return result
+  end,
+}
+closed = false
+local _, oversized = instance.stream(oversized_ctx, request, function()
+  return true
+end)
+assert(oversized.message == "Google error response too large" and closed)
 
 maki.uv.os_getenv = function(name)
   if name == "GEMINI_API_KEY" then

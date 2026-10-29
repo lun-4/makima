@@ -210,6 +210,9 @@ function M.prepare(ctx, model, config)
     return nil, err
   end
   local index = 1
+  if model.id:match("^ministral%-") then
+    model.thinking = none
+  end
   local function safe_message(message)
     if type(message) ~= "string" or message == "" then
       return "Mistral request failed"

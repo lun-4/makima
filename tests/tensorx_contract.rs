@@ -35,10 +35,17 @@ fn tensorx_is_embedded_but_not_loaded_by_default() {
 
 #[test]
 fn tensorx_legacy_credentials_are_used_for_stream_and_logout() {
-    let server = HttpContract::start(vec![Response {
-        status: "200 OK".into(), headers: vec![],
-        steps: vec![Step::Chunk(b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_vec())],
-    }]).unwrap();
+    let stream = b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    let server = HttpContract::start(
+        (0..2)
+            .map(|_| Response {
+                status: "200 OK".into(),
+                headers: vec![],
+                steps: vec![Step::Chunk(stream.to_vec())],
+            })
+            .collect(),
+    )
+    .unwrap();
     maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
     let temp = tempfile::tempdir().unwrap();
     let state = StateDir::from_path(temp.path().to_path_buf());
@@ -96,6 +103,38 @@ fn tensorx_legacy_credentials_are_used_for_stream_and_logout() {
         .unwrap()
         .unwrap();
     assert_eq!(request.header("authorization"), Some("Bearer saved-key"));
+    save_provider_credentials(
+        &state,
+        "tensorx",
+        &ProviderCredentials {
+            api_key: "refreshed-key".into(),
+            host: None,
+        },
+    )
+    .unwrap();
+    smol::block_on(provider.reload_auth()).unwrap();
+    smol::block_on(provider.stream_message(
+        &model,
+        &[Message::user("prompt".into())],
+        "system",
+        &json!([]),
+        &events,
+        RequestOptions {
+            thinking: ThinkingConfig::Off,
+            fast: false,
+        },
+        None,
+    ))
+    .unwrap();
+    let request = server
+        .requests
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        request.header("authorization"),
+        Some("Bearer refreshed-key")
+    );
     smol::block_on(factory.logout(&config)).unwrap();
     assert!(load_provider_credentials(&state, "tensorx").is_none());
     assert_eq!(

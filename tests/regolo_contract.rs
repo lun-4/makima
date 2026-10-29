@@ -36,6 +36,7 @@ fn regolo_registration_discovery_usage_and_stream() {
         response("200 OK", r#"{"data":[{"id":"z"},{"id":"a"}]}"#),
         response("503 Service Unavailable", "unavailable"),
         response("401 Unauthorized", "unauthorized"),
+        response("401 Unauthorized", "secret first"),
         response("200 OK", r#"{"info":{"spend":2.5,"max_budget":10,"budget_reset_at":"2025-01-02T03:04:05Z"}}"#),
         response("200 OK", r#"{"sum_api_requests":3,"sum_total_tokens":42}"#),
         response("200 OK", r#"{"data":[{"model_group":"chat","prompt_tokens":10,"completion_tokens":3,"total_tokens":13,"spend":0.02},{"model_group":"chat","prompt_tokens":5,"completion_tokens":2,"total_tokens":7,"spend":0.01}]}"#),
@@ -109,6 +110,20 @@ fn regolo_registration_discovery_usage_and_stream() {
     smol::block_on(registration.factory.logout(&saved_config)).unwrap();
     assert!(load_provider_credentials(&state, "regolo").is_none());
     assert_eq!(
+        smol::block_on(
+            registration
+                .factory
+                .login("api_key", &json!({"value": "login-key"}))
+        )
+        .unwrap(),
+        json!(true)
+    );
+    assert_eq!(
+        load_provider_credentials(&state, "regolo").unwrap().api_key,
+        "login-key"
+    );
+    smol::block_on(registration.factory.logout(&saved_config)).unwrap();
+    assert_eq!(
         smol::block_on(registration.factory.auth_status(&config)).unwrap()["source"],
         "config"
     );
@@ -149,6 +164,12 @@ fn regolo_registration_discovery_usage_and_stream() {
     let request = server.requests.recv_timeout(TIMEOUT).unwrap().unwrap();
     assert_eq!(request.target, "/v1/models");
     assert_eq!(request.header("authorization"), Some("Bearer first"));
+    let redacted = smol::block_on(registration.factory.discover(&config)).unwrap_err();
+    assert!(
+        matches!(redacted, AgentError::Api { status: 401, ref message, .. } if message == "Regolo request failed")
+    );
+    let request = server.requests.recv_timeout(TIMEOUT).unwrap().unwrap();
+    assert_eq!(request.target, "/v1/models");
     let model = Model::from_spec("regolo/qwen3-coder-next").unwrap();
     let (model, provider) = smol::block_on(registration.factory.prepare(&model, &config)).unwrap();
     assert_eq!(provider.key_count(), 2);

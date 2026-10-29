@@ -1,6 +1,7 @@
 #[path = "support/http_contract.rs"]
 mod http_contract;
 
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -76,6 +77,84 @@ fn requesty_saved_credentials_take_precedence_and_logout() {
             .unwrap()["configured"],
         false
     );
+}
+
+#[test]
+fn requesty_environment_overrides_base_url_and_saved_credentials() {
+    const CHILD: &str = "REQUESTY_ENV_CONTRACT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "requesty_environment_overrides_base_url_and_saved_credentials",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env(CHILD, "1")
+            .env(
+                "REQUESTY_BASE_URL",
+                "http://requesty.fixture.invalid:8080/env/",
+            )
+            .env("REQUESTY_CONTRACT_KEY", " env-first, env-second ")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    const SSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    let server = HttpContract::start(vec![response("200 OK", SSE)]).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let dir = StateDir::from_path(state.path().to_path_buf());
+    save_provider_credentials(
+        &dir,
+        "requesty",
+        &ProviderCredentials {
+            api_key: "stored-key".into(),
+            host: None,
+        },
+    )
+    .unwrap();
+    let host = requesty_host(state.path());
+    let mut resolver = maki_lua::test_support::ProviderEndpointResolver::default();
+    resolver.add("requesty.fixture.invalid", 8080, vec![server.addr]);
+    resolver.allow_private_host("requesty.fixture.invalid", 8080);
+    host.install_provider_resolver_for_tests(resolver).unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let factory = &snapshot.get("requesty").unwrap().factory;
+    let config = json!({"api_key_env": "REQUESTY_CONTRACT_KEY", "api_key": "config-key", "base_url": "http://requesty.fixture.invalid:8080/config"});
+    assert_eq!(
+        smol::block_on(factory.auth_status(&config)).unwrap()["source"],
+        "env"
+    );
+    let model = Model::from_spec("requesty/openai/gpt-5.5").unwrap();
+    let (model, provider) = smol::block_on(factory.prepare(&model, &config)).unwrap();
+    assert_eq!(provider.key_count(), 2);
+    let (events, _receiver) = flume::unbounded();
+    smol::block_on(provider.stream_message(
+        &model,
+        &[Message::user("prompt".into())],
+        "system",
+        &json!([]),
+        &events,
+        RequestOptions {
+            thinking: ThinkingConfig::Off,
+            fast: false,
+        },
+        None,
+    ))
+    .unwrap();
+    let request = server
+        .requests
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.target, "/env/chat/completions");
+    assert_eq!(request.header("authorization"), Some("Bearer env-first"));
 }
 
 #[test]

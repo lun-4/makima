@@ -13,6 +13,7 @@ use maki_config::PluginsConfig;
 use maki_lua::{PluginHost, test_support::InMemoryFs, ui_sink::HostUi};
 use maki_providers::{
     AgentError, Message, Model, ProviderEvent, RequestOptions, StopReason, ThinkingConfig,
+    UsageWindow,
     provider::BoxFuture,
     provider_registry::{InteractionRequest, InteractionResponse, InteractionService},
 };
@@ -124,6 +125,7 @@ fn synthetic_legacy_auth_discovery_and_logout() {
     let config = json!({"api_key_env":"MISSING_SYNTHETIC_CONTRACT_KEY", "api_key":"config-key", "base_url":format!("http://{}/v1", server.addr)});
     let status = smol::block_on(factory.auth_status(&config)).unwrap();
     assert_eq!(status["source"], "stored");
+    assert_eq!(status["method"], "api_key");
     let models = smol::block_on(factory.discover(&config)).unwrap().unwrap();
     assert_eq!(models[0].id, "a");
     assert_eq!(models[0].context_window, Some(4096));
@@ -222,8 +224,10 @@ fn synthetic_quota_through_provider_host() {
     assert!(smol::block_on(provider.rotate_key()).unwrap());
     let usage = smol::block_on(provider.fetch_usage()).unwrap().unwrap();
     assert_eq!(usage.limits.len(), 2);
+    assert_eq!(usage.limits[0].kind, UsageWindow::Hours(5));
     assert_eq!(usage.limits[0].percentage, Some(75));
     assert_eq!(usage.limits[0].reset_at, Some(1735689600000));
+    assert_eq!(usage.limits[1].kind, UsageWindow::Weekly { model: None });
     assert_eq!(usage.limits[1].percentage, Some(40));
     assert_eq!(usage.limits[1].reset_at, None);
     let request = server

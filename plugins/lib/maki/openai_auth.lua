@@ -196,11 +196,11 @@ function M.login(ctx, ui)
     end
   end)
   if state.cancelled then
-    return nil, { kind = "config", message = "OpenAI device authorization cancelled" }
+    return nil, { kind = "cancelled", message = "OpenAI device authorization cancelled" }
   end
   local session, err = M.start(ctx)
   if state.cancelled then
-    return nil, { kind = "config", message = "OpenAI device authorization cancelled" }
+    return nil, { kind = "cancelled", message = "OpenAI device authorization cancelled" }
   end
   if not session then
     return nil, err
@@ -224,15 +224,15 @@ function M.login(ctx, ui)
     end
     local device, poll_err = M.poll(ctx, session)
     if state.cancelled then
-      return nil, { kind = "config", message = "OpenAI device authorization cancelled" }
+      return nil, { kind = "cancelled", message = "OpenAI device authorization cancelled" }
     end
     if device then
       local result, exchange_err = M.exchange(ctx, device, now_ms())
+      if state.cancelled then
+        return nil, { kind = "cancelled", message = "OpenAI device authorization cancelled" }
+      end
       if not result then
         return nil, exchange_err
-      end
-      if state.cancelled then
-        return nil, { kind = "config", message = "OpenAI device authorization cancelled" }
       end
       return ctx.credentials:write("chatgpt", result)
     end
@@ -240,11 +240,10 @@ function M.login(ctx, ui)
       return nil, poll_err or { kind = "api", message = "OpenAI device authorization failed" }
     end
   end
-  return nil,
-    {
-      kind = "config",
-      message = state.cancelled and "OpenAI device authorization cancelled" or "OpenAI device authorization timed out",
-    }
+  if state.cancelled then
+    return nil, { kind = "cancelled", message = "OpenAI device authorization cancelled" }
+  end
+  return nil, { kind = "config", message = "OpenAI device authorization timed out" }
 end
 
 function M.refresh(ctx, current, now_ms)

@@ -127,6 +127,193 @@ fn openai_device_login_host_http_and_cancelled_challenge() {
 }
 
 #[test]
+fn openai_logout_cancels_pending_device_challenge() {
+    use maki_providers::AgentError;
+    use maki_providers::provider::BoxFuture;
+    use maki_providers::provider_registry::{
+        InteractionRequest, InteractionResponse, InteractionService,
+    };
+
+    struct Pending(flume::Sender<()>);
+    impl InteractionService for Pending {
+        fn interact(
+            &self,
+            request: InteractionRequest,
+        ) -> BoxFuture<'_, Result<InteractionResponse, AgentError>> {
+            assert!(
+                matches!(request, InteractionRequest::DeviceChallenge { code, .. } if code == "user")
+            );
+            Box::pin(async move {
+                self.0.send(()).unwrap();
+                std::future::pending().await
+            })
+        }
+    }
+    let _guard = PRIVATE_HOST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let server = HttpContract::start(vec![Response {
+        status: "200 OK".into(),
+        headers: vec![],
+        steps: vec![Step::Chunk(
+            br#"{"device_auth_id":"device","user_code":"user","interval":"5"}"#.to_vec(),
+        )],
+    }])
+    .unwrap();
+    maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("device_cancel_contract", &format!(r#"
+        local auth = require('maki.openai_auth')
+        local written = false
+        maki.api.register_provider({{ id = 'device_cancel_contract',
+            auth = {{{{ id = 'chatgpt', label = 'ChatGPT', login = function(ctx, ui)
+                return auth.login({{ credentials = {{ write = function() written = true; return true end }},
+                    send = function(_, request)
+                        request.url = 'http://{address}' .. assert(request.url:match('^https://auth.openai.com(/.*)$'))
+                        return ctx:send(request)
+                    end }}, ui)
+            end }}}},
+            logout = function() return true end,
+            auth_status = function() return {{ configured = written }} end,
+            prepare = function() error('unused') end,
+        }})
+    "#, address = server.addr)).unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let factory = snapshot
+        .get("device_cancel_contract")
+        .unwrap()
+        .factory
+        .clone();
+    let (ready, received) = flume::bounded(1);
+    let login_factory = factory.clone();
+    let login = std::thread::spawn(move || {
+        smol::block_on(login_factory.login_interactive("chatgpt", Arc::new(Pending(ready))))
+    });
+    received.recv_timeout(TIMEOUT).unwrap();
+    assert_eq!(
+        server
+            .requests
+            .recv_timeout(TIMEOUT)
+            .unwrap()
+            .unwrap()
+            .target,
+        "/api/accounts/deviceauth/usercode"
+    );
+    assert_eq!(
+        smol::block_on(factory.logout(&json!({}))).unwrap(),
+        json!(true)
+    );
+    assert!(matches!(login.join().unwrap(), Err(AgentError::Cancelled)));
+    assert_eq!(
+        smol::block_on(factory.auth_status(&json!({}))).unwrap()["configured"],
+        false
+    );
+    assert!(server.requests.try_recv().is_err());
+    maki_lua::set_allowed_private_hosts(&[]);
+}
+
+#[test]
+fn openai_logout_cancels_inflight_device_poll() {
+    use maki_providers::AgentError;
+    use maki_providers::provider::BoxFuture;
+    use maki_providers::provider_registry::{
+        InteractionRequest, InteractionResponse, InteractionService,
+    };
+
+    struct Acknowledge;
+    impl InteractionService for Acknowledge {
+        fn interact(
+            &self,
+            request: InteractionRequest,
+        ) -> BoxFuture<'_, Result<InteractionResponse, AgentError>> {
+            assert!(matches!(
+                request,
+                InteractionRequest::DeviceChallenge { .. }
+            ));
+            Box::pin(async { Ok(InteractionResponse::Acknowledged(true)) })
+        }
+    }
+    let _guard = PRIVATE_HOST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let (release, blocked) = std::sync::mpsc::channel();
+    let server = HttpContract::start(vec![
+        Response {
+            status: "200 OK".into(),
+            headers: vec![],
+            steps: vec![Step::Chunk(
+                br#"{"device_auth_id":"device","user_code":"user","interval":"1"}"#.to_vec(),
+            )],
+        },
+        Response {
+            status: "200 OK".into(),
+            headers: vec![],
+            steps: vec![
+                Step::Wait(blocked),
+                Step::Chunk(
+                    br#"{"authorization_code":"code","code_verifier":"verifier"}"#.to_vec(),
+                ),
+            ],
+        },
+    ])
+    .unwrap();
+    maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("device_poll_cancel", &format!(r#"
+        local auth = require('maki.openai_auth')
+        local written = false
+        maki.api.register_provider({{ id = 'device_poll_cancel',
+          auth = {{{{ id = 'chatgpt', label = 'ChatGPT', login = function(ctx, ui)
+            return auth.login({{ credentials = {{ write = function() written = true; return true end }},
+              send = function(_, request)
+                request.url = 'http://{address}' .. assert(request.url:match('^https://auth.openai.com(/.*)$'))
+                return ctx:send(request)
+              end }}, ui)
+          end }}}},
+          logout = function() return true end,
+          auth_status = function() return {{ configured = written }} end,
+          prepare = function() error('unused') end,
+        }})
+    "#, address = server.addr)).unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let factory = snapshot.get("device_poll_cancel").unwrap().factory.clone();
+    let login_factory = factory.clone();
+    let login = std::thread::spawn(move || {
+        smol::block_on(login_factory.login_interactive("chatgpt", Arc::new(Acknowledge)))
+    });
+    assert_eq!(
+        server
+            .requests
+            .recv_timeout(TIMEOUT)
+            .unwrap()
+            .unwrap()
+            .target,
+        "/api/accounts/deviceauth/usercode"
+    );
+    assert_eq!(
+        server
+            .requests
+            .recv_timeout(TIMEOUT)
+            .unwrap()
+            .unwrap()
+            .target,
+        "/api/accounts/deviceauth/token"
+    );
+    assert_eq!(
+        smol::block_on(factory.logout(&json!({}))).unwrap(),
+        json!(true)
+    );
+    assert!(matches!(login.join().unwrap(), Err(AgentError::Cancelled)));
+    let _ = release.send(());
+    assert_eq!(
+        smol::block_on(factory.auth_status(&json!({}))).unwrap()["configured"],
+        false
+    );
+    assert!(server.requests.try_recv().is_err());
+    maki_lua::set_allowed_private_hosts(&[]);
+}
+
+#[test]
 fn openai_lua_host_discovery_and_stream_use_http_transport() {
     let _guard = PRIVATE_HOST_LOCK
         .lock()

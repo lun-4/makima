@@ -11,7 +11,8 @@ use maki_config::PluginsConfig;
 use maki_lua::PluginHost;
 use maki_lua::{test_support::InMemoryFs, ui_sink::HostUi};
 use maki_providers::{
-    ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, ThinkingConfig, UsageWindow,
+    AgentError, ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, ThinkingConfig,
+    UsageWindow,
 };
 use maki_storage::{
     StateDir,
@@ -95,6 +96,8 @@ fn deepseek_discovery_rotation_stream_and_balance() {
         response(STREAM),
         response(STREAM),
         response(r#"{"balance_infos":[{"currency":"USD","total_balance":"12","topped_up_balance":"10","granted_balance":"2"},{"currency":"CNY","total_balance":"3","topped_up_balance":"1","granted_balance":"2"},{"currency":"EUR","total_balance":"4","topped_up_balance":"3","granted_balance":"1"}]}"#),
+        Response { status: "429 Too Many Requests".into(), headers: vec![("Retry-After".into(), "3".into())], steps: vec![Step::Chunk(b"rate limited".to_vec())] },
+        Response { status: "400 Bad Request".into(), headers: vec![], steps: vec![Step::Chunk(b"second leaked".to_vec())] },
     ]).unwrap();
     maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
     let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
@@ -202,5 +205,15 @@ fn deepseek_discovery_rotation_stream_and_balance() {
     let request = server.requests.recv_timeout(TIMEOUT).unwrap().unwrap();
     assert_eq!(request.target, "/user/balance");
     assert_eq!(request.header("authorization"), Some("Bearer second"));
+    for (status, expected) in [(429, "rate limited"), (400, "DeepSeek request failed")] {
+        let error = smol::block_on(
+            provider.stream_message(&model, &messages, "system", &tools, &events, options, None),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, AgentError::Api { status: actual, ref message, retry_after } if actual == status && message == expected && retry_after == (status == 429).then_some(Duration::from_secs(3)))
+        );
+        server.requests.recv_timeout(TIMEOUT).unwrap().unwrap();
+    }
     maki_lua::set_allowed_private_hosts(&[]);
 }

@@ -49,6 +49,7 @@ assert(mistral.login(ctx, {
 assert(mistral.auth_status(ctx, config).configured)
 local instance = assert(mistral.prepare(ctx, request.model, config))
 assert(instance.key_count == 1)
+assert(instance.model.thinking.mode == "none")
 assert(saved.api_key == "saved-key")
 assert(mistral.logout(ctx) and saved == nil)
 local empty, err = mistral.login(ctx, {
