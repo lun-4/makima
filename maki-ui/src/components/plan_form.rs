@@ -13,11 +13,7 @@ use ratatui::text::{Line, Span};
 
 const FORM_LABEL: &str = " Plan complete ";
 
-const DISMISS_KEYS: &str = if cfg!(target_os = "macos") {
-    "⌃T/Esc"
-} else {
-    "Ctrl+T/Esc"
-};
+const DISMISS_KEYS: &str = "Alt+P/Esc";
 const HINT_PAIRS: &[(&str, &str)] = &[
     ("↑↓", "select"),
     ("Space", "toggle parallel"),
@@ -509,7 +505,7 @@ mod tests {
 
     #[test_case(key(KeyCode::Esc)              ; "esc")]
     #[test_case(key::QUIT.to_key_event()      ; "ctrl_c")]
-    #[test_case(key::PLAN_TOGGLE.to_key_event(); "ctrl_t")]
+    #[test_case(key::PLAN_TOGGLE.to_key_event(); "alt_p")]
     fn dismiss(k: KeyEvent) {
         let mut form = PlanForm::new();
         form.on_plan_ready();

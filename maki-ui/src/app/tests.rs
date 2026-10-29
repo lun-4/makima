@@ -7174,7 +7174,9 @@ fn rewrite_does_not_reopen_after_dismiss() {
 }
 
 #[test]
-fn ctrl_t_toggles_plan_form_in_plan_mode() {
+fn alt_p_toggles_plan_form_in_plan_mode() {
+    assert!(kb::PLAN_TOGGLE.matches(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT)));
+    assert!(!kb::PLAN_TOGGLE.matches(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)));
     let mut app = plan_app();
     assert!(app.plan_form.is_visible());
 
@@ -7186,7 +7188,7 @@ fn ctrl_t_toggles_plan_form_in_plan_mode() {
 }
 
 #[test]
-fn ctrl_t_noop_when_plan_not_ready() {
+fn alt_p_noop_when_plan_not_ready() {
     let mut app = test_app();
     set_root_mode(&mut app, Mode::Plan);
     app.state.plan = PlanState::Drafting(PathBuf::from("test-plan.md"));
@@ -7318,6 +7320,19 @@ fn builtin_runs_when_no_override() {
     assert!(app.help_modal.is_open());
 }
 
+#[test_case(KeyModifiers::CONTROL; "todo")]
+#[test_case(KeyModifiers::ALT; "thinking")]
+fn t_override_runs_when_plan_form_is_dismissed(modifiers: KeyModifiers) {
+    let mut app = plan_app();
+    app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event()));
+    let _probe = install_override(&mut app, KeyCode::Char('t'), modifiers);
+
+    let actions = app.update(Msg::Key(KeyEvent::new(KeyCode::Char('t'), modifiers)));
+
+    assert!(matches!(actions[..], [Action::RunKeybind(OVERRIDE_ID)]));
+    assert!(!app.plan_form.is_visible());
+}
+
 #[test]
 fn plan_toggle_beats_override_when_open_and_after_dismiss() {
     let mut app = plan_app();
@@ -7327,13 +7342,13 @@ fn plan_toggle_beats_override_when_open_and_after_dismiss() {
     let mut actions = app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event()));
     assert!(
         !app.plan_form.is_visible(),
-        "open plan form must consume Ctrl+T before the override"
+        "open plan form must consume Alt+P before the override"
     );
 
     actions.extend(app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event())));
     assert!(
         app.plan_form.is_visible(),
-        "Ctrl+T must reopen the dismissed plan form despite the override"
+        "Alt+P must reopen the dismissed plan form despite the override"
     );
     assert!(
         !actions

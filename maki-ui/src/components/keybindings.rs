@@ -140,7 +140,11 @@ pub mod key {
     pub const SEARCH: Bind = ctrl_bind!('f');
     pub const FILE_PICKER: Bind = ctrl_bind!('s');
     pub const OPEN_EDITOR: Bind = ctrl_bind!('o');
-    pub const PLAN_TOGGLE: Bind = ctrl_bind!('t');
+    pub const PLAN_TOGGLE: Bind = Bind {
+        code: KeyCode::Char('p'),
+        modifiers: KeyModifiers::ALT,
+        label: "Alt+P",
+    };
     pub const TASKS: Bind = ctrl_bind!('x');
     pub const MODEL_PICKER: Bind = ctrl_bind!('m');
     pub const REFRESH: Bind = ctrl_bind!('r');

@@ -32,7 +32,7 @@ When a plan is ready, the plan form opens below the chat. It has three actions:
 - `Implement plan` switches to build mode and implements the plan in the current conversation.
 - `Clear context and implement` starts a fresh build session that holds only the plan, then implements it.
 
-Space toggles parallel implementation, which asks the agent to split the work across subagents. Ctrl+O opens the plan in your editor. Esc hides the form, and Ctrl+T shows or hides it.
+Space toggles parallel implementation, which asks the agent to split the work across subagents. Ctrl+O opens the plan in your editor. Esc hides the form, and Alt+P shows or hides it.
 
 The `Implementation model` row shows the model that will do the work. It starts as the current session model. Press Enter on that row to pick another one. Picking a model here does not change the session model yet. When a different model is picked, a `Use current model` row lets you go back. Your pick stays while you refine or edit the plan, and goes away when you leave plan mode. The [keybindings](/docs/keybindings/#form) page lists every key in the form.
 

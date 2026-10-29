@@ -18,7 +18,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Ctrl+F` | Search messages |
 | `Ctrl+S` | File picker |
 | `Ctrl+O` | Open plan in editor |
-| `Ctrl+T` | Toggle plan panel |
+| `Alt+P` | Toggle plan panel |
 | `Ctrl+X` | Open tasks |
 | `Ctrl+M` | Model picker |
 | `Alt+M` | Defer an input prompt, press again to restore |
