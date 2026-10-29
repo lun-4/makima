@@ -747,13 +747,13 @@ mod tests {
     use tempfile::TempDir;
     use test_case::test_case;
 
+    #[cfg(unix)]
+    use super::DiskBackend;
     use super::{
         CLIPPED_NOTE, LINE_CUT_PREFIX, LimitOpts, MAX_OFFLOAD_FILE_BYTES,
         MAX_OFFLOAD_SESSION_BYTES, OffloadBackend, OffloadError, OffloadStore, OutputLimitOptions,
         OutputLimits, PreviewShape, cut_line, limit_output, line_count,
     };
-    #[cfg(unix)]
-    use super::DiskBackend;
     use crate::tools::FILE_TRUNCATED_MARKER;
 
     const TEST_BODY: &str = "stored body";
