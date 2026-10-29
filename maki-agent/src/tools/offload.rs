@@ -37,7 +37,7 @@ pub const OFFLOAD_FOOTER_PREFIX: &str = "[output truncated: ";
 const CLIPPED_NOTE: &str = "; saved search results also contain clipped lines";
 const INSPECTION_ADVICE: &str = "inspect with read or grep; use bash for long lines";
 #[cfg(unix)]
-const DIR_MODE: u32 = 0o700;
+const DIR_MODE: Mode = Mode::RWXU;
 
 #[derive(Debug, Error)]
 pub enum OffloadError {
@@ -337,7 +337,7 @@ impl DiskBackend {
         let mut dir = root.try_clone()?;
         for part in relative.components() {
             if create {
-                match anchored::mkdirat(&dir, part.as_os_str(), Mode::from_raw_mode(DIR_MODE)) {
+                match anchored::mkdirat(&dir, part.as_os_str(), DIR_MODE) {
                     Err(error) if error == Errno::EXIST => {}
                     result => result?,
                 }
@@ -356,7 +356,7 @@ impl DiskBackend {
     #[cfg(unix)]
     fn create_in(dir: &File, name: &str, bytes: &[u8]) -> io::Result<bool> {
         Self::validate_name(name)?;
-        anchored::fchmod(dir, Mode::from_raw_mode(DIR_MODE))?;
+        anchored::fchmod(dir, DIR_MODE)?;
         let mut random = [0; 16];
         getrandom::fill(&mut random).map_err(|error| io::Error::other(error.to_string()))?;
         let temporary = format!(".offload-{:032x}", u128::from_ne_bytes(random));
@@ -1046,7 +1046,7 @@ mod tests {
         let saved = store.put(TEST_BODY).unwrap();
         let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&store.path_of(&saved)), 0o600);
-        assert_eq!(mode(&store.dir()), DIR_MODE);
+        assert_eq!(mode(&store.dir()), u32::from(DIR_MODE.bits()));
     }
 
     #[test]
