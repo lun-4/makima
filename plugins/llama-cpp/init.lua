@@ -1,7 +1,7 @@
 local chat = require("maki.chat_completions")
 local responses = require("maki.responses")
 
-local function settings(config)
+local function settings(ctx, config)
   config = config or {}
   local host = config.base_url or maki.uv.os_getenv("LLAMA_CPP_HOST")
   if not host or host == "" then
@@ -10,7 +10,19 @@ local function settings(config)
   local keys = {}
   local key = maki.uv.os_getenv(config.api_key_env or "LLAMA_CPP_API_KEY")
   if not key or key == "" then
-    key = config.api_key
+    if ctx and ctx.credentials then
+      local saved, err = ctx.credentials:read("api_key")
+      if err and err.message ~= "credential access denied" and not config.api_key then
+        return nil, err
+      end
+      if saved ~= nil and (type(saved) ~= "table" or type(saved.api_key) ~= "string") then
+        return nil, { kind = "config", message = "Invalid LlamaCpp credentials" }
+      end
+      key = saved and saved.api_key
+    end
+    if not key or key == "" then
+      key = config.api_key
+    end
   end
   for part in (key or ""):gmatch("[^,]+") do
     local value = part:match("^%s*(.-)%s*$")
@@ -93,7 +105,7 @@ local function argument(args, flag)
 end
 
 local function discover(ctx, config)
-  local s, err = settings(config)
+  local s, err = settings(ctx, config)
   if not s then
     return nil, err
   end
@@ -167,8 +179,18 @@ local function api_error(response)
   return { kind = "api", status = response.status, message = table.concat(chunks) }
 end
 
-local function prepare(_, model, config)
-  local s, err = settings(config)
+local function merge_body(target, fragment)
+  for key, value in pairs(fragment) do
+    if type(value) == "table" and type(target[key]) == "table" and value[1] == nil then
+      merge_body(target[key], value)
+    else
+      target[key] = value
+    end
+  end
+end
+
+local function prepare(ctx, model, config)
+  local s, err = settings(ctx, config)
   if not s then
     return nil, err
   end
@@ -201,20 +223,7 @@ local function prepare(_, model, config)
       else
         body, build_err = chat.build_request(request, { max_tokens_field = "max_tokens", include_stream_usage = true })
         if body then
-          local intent = request.thinking or { mode = "off" }
-          local percentages = { minimal = 10, low = 20, medium = 40, high = 60, xhigh = 80, max = 100 }
-          local maximum = request.model.max_output_tokens
-          if intent.mode == "off" then
-            body.thinking_budget_tokens = 0
-          elseif intent.mode == "adaptive" then
-            body.thinking_budget_tokens = -1
-          elseif intent.mode == "budget" then
-            body.thinking_budget_tokens =
-              math.max(1024, maximum and math.min(intent.tokens, math.max(1024, maximum)) or intent.tokens)
-          else
-            body.thinking_budget_tokens =
-              math.max(1024, math.floor((maximum or 32768) * (percentages[intent.level] or 40) / 100))
-          end
+          merge_body(body, request.local_thinking)
         end
       end
       if not body then

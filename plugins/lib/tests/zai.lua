@@ -21,6 +21,10 @@ local usage = assert(
 assert(usage.plan == "Pro" and usage.limits[1].kind.hours == 5 and usage.limits[1].reset_at == 123)
 assert(usage.limits[2].kind.type == "weekly" and usage.limits[3].kind.type == "subscription")
 assert(not zai.parse_quotas('{"data":{"limits":[{"type":"TIME_LIMIT"}]}}'))
+assert(not zai.parse_quotas('{"data":{"limits":[{"type":"TIME_LIMIT","unit":-1,"percentage":2}]}}'))
+assert(not zai.parse_quotas('{"data":{"limits":[{"type":"TIME_LIMIT","unit":1,"percentage":1.5}]}}'))
+local unknown = assert(zai.parse_quotas('{"data":{"limits":[{"type":"X","unit":9,"percentage":50}]}}'))
+assert(unknown.limits[1].kind.label == "X #9")
 local provider = assert(
   zai.prepare(
     nil,
@@ -50,4 +54,4 @@ local ctx = {
 }
 local _, err = provider.stream(ctx, request, function() end)
 assert(sent.url == "https://example.test/chat/completions" and sent.headers.Authorization == "Bearer second")
-assert(err.status == 402 and err.message == "Z.AI request failed")
+assert(err.status == 402 and err.message == "1113 insufficient balance" and err.retry_after_ms == nil)

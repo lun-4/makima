@@ -136,6 +136,33 @@ local function usable_tokens(ctx, tokens)
   return tokens
 end
 
+local function api_keys(ctx, config)
+  local key = maki.uv.os_getenv(config.api_key_env or "OPENAI_API_KEY")
+  if not key or key == "" then
+    key = config.api_key
+  end
+  if (not key or key == "") and ctx and ctx.credentials then
+    local saved, err = ctx.credentials:read("api_key")
+    if err then
+      return nil, err
+    end
+    if saved ~= nil then
+      if type(saved) ~= "table" or type(saved.api_key) ~= "string" then
+        return nil, { kind = "config", message = "Invalid OpenAI saved API key" }
+      end
+      key = saved.api_key
+    end
+  end
+  local keys = {}
+  for part in (key or ""):gmatch("[^,]+") do
+    local trimmed = part:match("^%s*(.-)%s*$")
+    if trimmed ~= "" then
+      keys[#keys + 1] = trimmed
+    end
+  end
+  return keys
+end
+
 local function codex_headers(tokens)
   local headers = { Authorization = "Bearer " .. tokens.access }
   if type(tokens.account_id) == "string" and tokens.account_id ~= "" then
@@ -152,27 +179,18 @@ function M.prepare(ctx, model, config)
   end
   if tokens then
     tokens, token_err = usable_tokens(ctx, tokens)
-    if not tokens then
-      return nil, token_err
-    end
   end
-  local key = maki.uv.os_getenv(config.api_key_env or "OPENAI_API_KEY")
-  if not key or key == "" then
-    key = config.api_key
+  local keys, key_err
+  if tokens then
+    keys, key_err = api_keys(nil, config)
+  else
+    keys, key_err = api_keys(ctx, config)
   end
-  if (not key or key == "") and not tokens then
-    return nil, { kind = "config", message = "OpenAI API key is not configured" }
-  end
-  key = key or ""
-  local keys = {}
-  for part in key:gmatch("[^,]+") do
-    local trimmed = part:match("^%s*(.-)%s*$")
-    if trimmed ~= "" then
-      keys[#keys + 1] = trimmed
-    end
+  if not keys then
+    return nil, key_err
   end
   if #keys == 0 and not tokens then
-    return nil, { kind = "config", message = "OpenAI API key is not configured" }
+    return nil, token_err or { kind = "config", message = "OpenAI API key is not configured" }
   end
   local index = 1
   local base = maki.uv.os_getenv("OPENAI_BASE_URL")
@@ -184,7 +202,7 @@ function M.prepare(ctx, model, config)
     model = model,
     key_count = #keys,
     rotate_key = function()
-      if #keys < 2 then
+      if tokens or #keys < 2 then
         return false
       end
       index = index % #keys + 1
@@ -199,6 +217,9 @@ function M.prepare(ctx, model, config)
       return true
     end or nil,
     refresh_auth = tokens and function(ctx)
+      if not tokens then
+        return true
+      end
       local current, err = refresh_tokens(ctx, tokens, true)
       if not current then
         return nil, err
@@ -208,6 +229,9 @@ function M.prepare(ctx, model, config)
     end or nil,
     fetch_usage = tokens
         and function(ctx)
+          if not tokens then
+            return nil
+          end
           local current, token_err = usable_tokens(ctx, tokens)
           if not current then
             return nil, token_err
@@ -247,7 +271,15 @@ function M.prepare(ctx, model, config)
       if tokens then
         local current, token_err = usable_tokens(ctx, tokens)
         if not current then
-          return nil, token_err
+          local fallback, key_err = api_keys(ctx, config)
+          if not fallback then
+            return nil, key_err
+          end
+          if #fallback == 0 then
+            return nil, token_err
+          end
+          keys = fallback
+          index = 1
         end
         tokens = current
       end
@@ -350,27 +382,22 @@ function M.discover(ctx, config)
   end
   if tokens then
     tokens, token_err = usable_tokens(ctx, tokens)
-    if not tokens then
-      return nil, token_err
-    end
+  end
+  if tokens then
     return require("maki.openai_models").discover(ctx, {
       kind = "codex",
       headers = codex_headers(tokens),
       account_id = tokens.account_id,
     })
   end
-  local key = maki.uv.os_getenv(config.api_key_env or "OPENAI_API_KEY")
-  if not key or key == "" then
-    key = config.api_key
+  local keys, key_err = api_keys(ctx, config)
+  if not keys then
+    return nil, key_err
   end
-  if not key or key == "" then
-    return nil, { kind = "config", message = "OpenAI API key is not configured" }
+  if #keys == 0 then
+    return nil, token_err or { kind = "config", message = "OpenAI API key is not configured" }
   end
-  key = (key:match("^[^,]+") or ""):match("^%s*(.-)%s*$")
-  if not key or key == "" then
-    return nil, { kind = "config", message = "OpenAI API key is not configured" }
-  end
-  local headers = { Authorization = "Bearer " .. key }
+  local headers = { Authorization = "Bearer " .. keys[1] }
   for name, value in pairs(config.headers or {}) do
     for existing in pairs(headers) do
       if existing:lower() == name:lower() then

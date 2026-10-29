@@ -2163,6 +2163,7 @@ mod tests {
             .register(ProviderRegistration {
                 id: "sdk-test-provider".into(),
                 display_name: "SDK test".into(),
+                auth_methods: Vec::new(),
                 models: vec![ModelInfo {
                     context_window: Some(WINDOW),
                     ..ModelInfo::id_only("model".into())

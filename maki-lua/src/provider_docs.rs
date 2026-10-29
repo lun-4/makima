@@ -15,6 +15,14 @@ pub struct OfflineProvider {
     pub display_name: String,
     pub models: Vec<OfflineModel>,
     pub docs_notes: Vec<String>,
+    pub docs: Option<OfflineProviderDocs>,
+}
+
+pub struct OfflineProviderDocs {
+    pub auth_line: String,
+    pub urls: Vec<String>,
+    pub features: Option<String>,
+    pub no_catalog_note: Option<String>,
 }
 
 pub struct OfflineModel {
@@ -40,6 +48,51 @@ fn module_source(name: &str) -> Option<&'static str> {
         "maki.provider_types" => Some(include_str!("../../plugins/lib/maki/provider_types.lua")),
         _ => None,
     }
+}
+
+fn optional_string(table: &Table, field: &str) -> Result<Option<String>> {
+    match table.raw_get::<Value>(field)? {
+        Value::Nil => Ok(None),
+        Value::String(value) => Ok(Some(value.to_str()?.to_string())),
+        _ => Err(Error::runtime(format!("{field}: expected a string"))),
+    }
+}
+
+fn string_array(table: &Table, field: &str) -> Result<Option<Vec<String>>> {
+    let value = match table.raw_get::<Value>(field)? {
+        Value::Nil => return Ok(None),
+        Value::Table(value) => value,
+        _ => {
+            return Err(Error::runtime(format!(
+                "{field}: expected an array of strings"
+            )));
+        }
+    };
+    let mut entries = Vec::new();
+    for pair in value.pairs::<Value, Value>() {
+        let (key, item) = pair?;
+        match (key, item) {
+            (Value::Integer(index), Value::String(item)) if index > 0 => {
+                entries.push((index, item.to_str()?.to_string()));
+            }
+            _ => {
+                return Err(Error::runtime(format!(
+                    "{field}: expected an array of strings"
+                )));
+            }
+        }
+    }
+    entries.sort_unstable_by_key(|(index, _)| *index);
+    if entries
+        .iter()
+        .enumerate()
+        .any(|(index, (key, _))| *key as usize != index + 1)
+    {
+        return Err(Error::runtime(format!(
+            "{field}: expected a contiguous array"
+        )));
+    }
+    Ok(Some(entries.into_iter().map(|(_, value)| value).collect()))
 }
 
 fn load_sources(sources: &[(&str, &str)]) -> Result<Vec<OfflineProvider>> {
@@ -91,7 +144,8 @@ fn load_sources(sources: &[(&str, &str)]) -> Result<Vec<OfflineProvider>> {
     api.set(
         "register_provider",
         lua.create_function(move |_, table: Table| {
-            let id: String = table.raw_get("id")?;
+            let id = optional_string(&table, "id")?
+                .ok_or_else(|| Error::runtime("id: expected a string"))?;
             if id.trim().is_empty()
                 || registered
                     .lock()
@@ -103,7 +157,7 @@ fn load_sources(sources: &[(&str, &str)]) -> Result<Vec<OfflineProvider>> {
                     "invalid or duplicate provider id: {id}"
                 )));
             }
-            let display_name: Option<String> = table.raw_get("display_name")?;
+            let display_name = optional_string(&table, "display_name")?;
             let descriptors = model_descriptors(&table).map_err(Error::runtime)?;
             let model_table: Option<Table> = table.raw_get("models")?;
             let mut models = Vec::with_capacity(descriptors.len());
@@ -112,8 +166,8 @@ fn load_sources(sources: &[(&str, &str)]) -> Result<Vec<OfflineProvider>> {
                     .as_ref()
                     .ok_or_else(|| Error::runtime("models: expected an array"))?;
                 let model: Table = table.raw_get(index + 1)?;
-                let prefixes: Option<Vec<String>> = model.raw_get("prefixes")?;
-                let tier: Option<String> = model.raw_get("tier")?;
+                let prefixes = string_array(&model, "prefixes")?;
+                let tier = optional_string(&model, "tier")?;
                 let tier = tier
                     .map(|tier| tier.parse::<ModelTier>().map_err(Error::external))
                     .transpose()?;
@@ -130,7 +184,19 @@ fn load_sources(sources: &[(&str, &str)]) -> Result<Vec<OfflineProvider>> {
                     default,
                 });
             }
-            let docs_notes: Option<Vec<String>> = table.raw_get("docs_notes")?;
+            let docs_notes = string_array(&table, "docs_notes")?;
+            let docs = match table.raw_get::<Value>("docs")? {
+                Value::Nil => None,
+                Value::Table(docs) => Some(OfflineProviderDocs {
+                    auth_line: optional_string(&docs, "auth_line")?
+                        .ok_or_else(|| Error::runtime("auth_line: expected a string"))?,
+                    urls: string_array(&docs, "urls")?
+                        .ok_or_else(|| Error::runtime("urls: expected an array of strings"))?,
+                    features: optional_string(&docs, "features")?,
+                    no_catalog_note: optional_string(&docs, "no_catalog_note")?,
+                }),
+                _ => return Err(Error::runtime("docs: expected a table")),
+            };
             registered
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -139,6 +205,7 @@ fn load_sources(sources: &[(&str, &str)]) -> Result<Vec<OfflineProvider>> {
                     id,
                     models,
                     docs_notes: docs_notes.unwrap_or_default(),
+                    docs,
                 });
             Ok(())
         })?,
@@ -217,6 +284,56 @@ mod tests {
             )])
             .is_err()
         );
+    }
+
+    #[test]
+    fn validates_docs_raw_without_metamethods() {
+        let source = r#"
+            local trap = {__index = function() error('index called') end,
+                          __len = function() error('len called') end,
+                          __iter = function() error('iter called') end}
+            maki.api.register_provider({id='test', docs=setmetatable({
+                auth_line='API key', urls=setmetatable({'https://example.com', 'https://example.org'}, trap),
+                features='streaming', no_catalog_note='No catalog',
+            }, trap)})
+            maki.api.register_provider({id='minimal', docs={auth_line='', urls={}}})
+            maki.api.register_provider({id='absent'})
+        "#;
+        let providers = load_sources(&[("test", source)]).unwrap();
+        let docs = providers[0].docs.as_ref().unwrap();
+        assert_eq!(docs.auth_line, "API key");
+        assert_eq!(docs.urls, ["https://example.com", "https://example.org"]);
+        assert_eq!(docs.features.as_deref(), Some("streaming"));
+        assert_eq!(docs.no_catalog_note.as_deref(), Some("No catalog"));
+        let docs = providers[1].docs.as_ref().unwrap();
+        assert!(docs.urls.is_empty());
+        assert!(docs.features.is_none());
+        assert!(docs.no_catalog_note.is_none());
+        assert!(providers[2].docs.is_none());
+    }
+
+    #[test]
+    fn rejects_malformed_raw_metadata() {
+        for field in [
+            "docs=false",
+            "docs={}",
+            "docs={auth_line=1, urls={}}",
+            "docs={auth_line='key', urls=false}",
+            "docs={auth_line='key', urls={1}}",
+            "docs={auth_line='key', urls={[2]='url'}}",
+            "docs={auth_line='key', urls={'url', extra='url'}}",
+            "docs={auth_line='key', urls={}, features=false}",
+            "docs={auth_line='key', urls={}, no_catalog_note=1}",
+            "docs=setmetatable({}, {__index={auth_line='key', urls={}}})",
+            "docs_notes={[2]='note'}",
+            "docs_notes={1}",
+            "display_name=1",
+            "models={{id='one', prefixes={[2]='prefix'}}}",
+            "models={{id='one', tier=1}}",
+        ] {
+            let source = format!("maki.api.register_provider({{id='test', {field}}})");
+            assert!(load_sources(&[("test", &source)]).is_err(), "{field}");
+        }
     }
 
     #[test]

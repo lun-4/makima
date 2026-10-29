@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use http_contract::{HttpContract, Response, Step};
 use maki_agent::tools::ToolRegistry;
-use maki_lua::PluginHost;
+use maki_commands::CommandRegistry;
+use maki_config::PluginsConfig;
+use maki_lua::{PluginHost, test_support::InMemoryFs, ui_sink::HostUi};
 use maki_providers::{
     AgentError, Message, Model, ProviderEvent, RequestOptions, StopReason, ThinkingConfig,
 };
@@ -110,9 +112,23 @@ fn lua_synthetic_streams_through_plugin_host_and_http() {
         },
     ]).unwrap();
     maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
-    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-    host.load_source("synthetic", include_str!("../plugins/synthetic/init.lua"))
-        .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut host = PluginHost::with_session_provider_preparer(
+        Arc::new(ToolRegistry::new()),
+        CommandRegistry::new(),
+        true,
+        Arc::new(InMemoryFs::new()),
+        Some(state.path().to_path_buf()),
+        None,
+        HostUi::Frontend,
+    )
+    .unwrap();
+    host.load_builtins(&PluginsConfig {
+        enabled: true,
+        names: vec!["synthetic".into()],
+        ..Default::default()
+    })
+    .unwrap();
     let snapshot = host.provider_registry().snapshot();
     let registration = snapshot.get("synthetic").unwrap();
     assert!(

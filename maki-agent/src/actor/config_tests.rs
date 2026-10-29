@@ -1640,6 +1640,7 @@ fn registry_owned_models_ignore_legacy_discovery() {
             .register(ProviderRegistration {
                 id: REGISTRY_PROVIDER.into(),
                 display_name: REGISTRY_PROVIDER.into(),
+                auth_methods: Vec::new(),
                 models: vec![ModelInfo::id_only(REGISTRY_MODEL_ID.into())],
                 factory: Arc::new(RegistryTestFactory),
             })

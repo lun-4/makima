@@ -27,8 +27,7 @@ local models = {
   },
 }
 
-local function prepare(_, model, config)
-  config = config or {}
+local function credentials(config)
   local key = maki.uv.os_getenv(config.api_key_env or "DEEPSEEK_API_KEY")
   if not key or key == "" then
     key = config.api_key
@@ -43,19 +42,100 @@ local function prepare(_, model, config)
   if #keys == 0 then
     return nil, { kind = "config", message = "DeepSeek API key is not configured" }
   end
-  local index = 1
-  local base = (config.base_url or "https://api.deepseek.com"):gsub("/+$", "")
-  local function headers()
-    local result = { Authorization = "Bearer " .. keys[index], ["Content-Type"] = "application/json" }
-    for name, value in pairs(config.headers or {}) do
-      for existing in pairs(result) do
-        if existing:lower() == name:lower() then
-          result[existing] = nil
+  return keys
+end
+
+local function headers(config, key)
+  local result = { Authorization = "Bearer " .. key, ["Content-Type"] = "application/json" }
+  for name, value in pairs(config.headers or {}) do
+    for existing in pairs(result) do
+      if existing:lower() == name:lower() then
+        result[existing] = nil
+      end
+    end
+    result[name] = value
+  end
+  return result
+end
+
+local function base_url(config)
+  return (config.base_url or "https://api.deepseek.com"):gsub("/+$", "")
+end
+
+local function get_json(ctx, url, request_headers)
+  local response, err = ctx:send({ url = url, method = "GET", headers = request_headers })
+  if not response then
+    return nil, type(err) == "table" and err or { kind = "network", message = "DeepSeek request failed" }
+  end
+  if response.status < 200 or response.status >= 300 then
+    response:close()
+    return nil, { kind = "api", status = response.status, message = "DeepSeek request failed" }
+  end
+  local value, read_err = require("maki.json_response").read(response, 1048576)
+  response:close()
+  return value, read_err
+end
+
+local function discover(ctx, config)
+  config = config or {}
+  local keys, err = credentials(config)
+  if not keys then
+    return nil, err
+  end
+  local value, get_err = get_json(ctx, base_url(config) .. "/models", headers(config, keys[1]))
+  if not value then
+    return nil, get_err
+  end
+  local result = {}
+  if type(value) ~= "table" or type(value.data) ~= "table" then
+    return result
+  end
+  local function uint(value)
+    return type(value) == "number" and value >= 0 and value <= 4294967295 and value % 1 == 0 and value or nil
+  end
+  for _, item in ipairs(value.data) do
+    if type(item) == "table" and type(item.id) == "string" and item.id ~= "" then
+      local model = {
+        id = item.id,
+        context_window = uint(item.context_length) or uint(item.max_model_len) or uint(item.max_context_length),
+        max_output_tokens = uint(item.max_tokens) or uint(item.max_output_length),
+      }
+      if type(item.input_modalities) == "table" then
+        model.supports_vision = false
+        for _, modality in ipairs(item.input_modalities) do
+          if modality == "image" then
+            model.supports_vision = true
+          end
         end
       end
-      result[name] = value
+      local pricing = item.pricing
+      if type(pricing) == "table" and type(pricing.prompt) == "string" and type(pricing.completion) == "string" then
+        local input, output = tonumber(pricing.prompt), tonumber(pricing.completion)
+        if input and output and input >= 0 and output >= 0 and input < math.huge and output < math.huge then
+          local write = type(pricing.cache_creation) == "string" and tonumber(pricing.cache_creation) or 0
+          local read = type(pricing.cache_read) == "string" and tonumber(pricing.cache_read) or 0
+          model.pricing = { input = input, output = output, cache_write = write or 0, cache_read = read or 0 }
+        end
+      end
+      result[#result + 1] = model
     end
-    return result
+  end
+  table.sort(result, function(a, b)
+    return a.id < b.id
+  end)
+  return result, nil
+end
+
+local function prepare(_, model, config)
+  config = config or {}
+  local keys, err = credentials(config)
+  if not keys then
+    return nil, err
+  end
+  local index = 1
+  local base = base_url(config)
+  local function current_headers()
+    return headers(config, keys[index])
   end
   return {
     model = model,
@@ -69,7 +149,7 @@ local function prepare(_, model, config)
     end,
     fetch_usage = function(ctx)
       local response, err =
-        ctx:send({ url = "https://api.deepseek.com/user/balance", method = "GET", headers = headers() })
+        ctx:send({ url = "https://api.deepseek.com/user/balance", method = "GET", headers = current_headers() })
       if not response then
         if type(err) == "table" then
           return nil, err
@@ -87,7 +167,11 @@ local function prepare(_, model, config)
           response:close()
           return nil, read_err
         end
-        if not chunk or chunk == "" then
+        if chunk == nil then
+          response:close()
+          return nil, { kind = "network", message = "DeepSeek balance response read failed" }
+        end
+        if chunk == "" then
           break
         end
         size = size + #chunk
@@ -155,7 +239,7 @@ local function prepare(_, model, config)
         return nil, { kind = "config", message = tostring(encode_err) }
       end
       local response, send_err =
-        ctx:send({ url = base .. "/chat/completions", method = "POST", headers = headers(), body = encoded })
+        ctx:send({ url = base .. "/chat/completions", method = "POST", headers = current_headers(), body = encoded })
       if not response then
         if type(send_err) == "table" then
           return nil, send_err
@@ -185,4 +269,15 @@ local function prepare(_, model, config)
     nil
 end
 
-maki.api.register_provider({ id = "deepseek", display_name = "DeepSeek", models = models, prepare = prepare })
+maki.api.register_provider({
+  id = "deepseek",
+  display_name = "DeepSeek",
+  docs = {
+    auth_line = "`DEEPSEEK_API_KEY`",
+    urls = { "https://api.deepseek.com" },
+    features = "Thinking mode toggle (on/off), open-weight models",
+  },
+  models = models,
+  discover = discover,
+  prepare = prepare,
+})

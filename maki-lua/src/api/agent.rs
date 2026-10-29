@@ -2291,6 +2291,7 @@ mod tests {
             .register(ProviderRegistration {
                 id: "lua-test-provider".into(),
                 display_name: "Lua test".into(),
+                auth_methods: Vec::new(),
                 models: vec![
                     ModelInfo {
                         context_window: Some(42_000),
@@ -2457,6 +2458,7 @@ mod tests {
                     .register(ProviderRegistration {
                         id: "lua-compact-test".into(),
                         display_name: "Compaction test".into(),
+                        auth_methods: Vec::new(),
                         models: vec![ModelInfo {
                             tier: Some(ModelTier::Compaction),
                             ..ModelInfo::id_only("summary".into())

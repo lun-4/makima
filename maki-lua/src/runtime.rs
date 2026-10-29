@@ -210,6 +210,24 @@ impl Drop for PreparedInstance {
 }
 
 impl crate::provider_adapter::ProviderDispatch for RuntimeProviderDispatch {
+    fn auth<'a>(
+        &'a self,
+        provider: &'a str,
+        hook: &'static str,
+        input: &'a Value,
+        cancel: CancelToken,
+    ) -> maki_providers::provider::BoxFuture<'a, Result<Value, maki_providers::AgentError>> {
+        let method = (hook == "login")
+            .then(|| input.get("method").and_then(Value::as_str))
+            .flatten();
+        let argument = if hook == "login" {
+            input.get("interaction").unwrap_or(&Value::Null)
+        } else {
+            input
+        };
+        self.auth_request(provider, hook, method, argument, cancel)
+    }
+
     fn discover<'a>(
         &'a self,
         provider: &'a str,
@@ -340,6 +358,38 @@ impl crate::provider_adapter::ProviderDispatch for RuntimeProviderDispatch {
     }
 }
 
+impl RuntimeProviderDispatch {
+    fn auth_request<'a>(
+        &'a self,
+        provider: &'a str,
+        hook: &'static str,
+        method: Option<&'a str>,
+        input: &'a Value,
+        cancel: CancelToken,
+    ) -> maki_providers::provider::BoxFuture<'a, Result<Value, maki_providers::AgentError>> {
+        Box::pin(async move {
+            let (reply, rx) = flume::bounded(1);
+            self.0
+                .send_async(Request::ProviderAuth {
+                    provider: provider.to_owned(),
+                    generation: self.1,
+                    hook,
+                    method: method.map(str::to_owned),
+                    input: input.clone(),
+                    cancel: cancel.clone(),
+                    reply,
+                })
+                .await
+                .map_err(|_| maki_providers::AgentError::Channel)?;
+            cancel
+                .race(rx.recv_async())
+                .await
+                .map_err(|_| maki_providers::AgentError::Cancelled)?
+                .map_err(|_| maki_providers::AgentError::Channel)?
+        })
+    }
+}
+
 /// Names this host to the graphs it observes, so each graph feeds it once.
 pub(crate) struct HostId(pub(crate) u64);
 
@@ -350,6 +400,15 @@ pub enum Request {
     /// Plugins are loaded, so native codegen may start using idle time. Sent
     /// last so it never interleaves with the loads themselves.
     WarmJit,
+    ProviderAuth {
+        provider: String,
+        generation: Option<u64>,
+        hook: &'static str,
+        method: Option<String>,
+        input: Value,
+        cancel: CancelToken,
+        reply: flume::Sender<Result<Value, maki_providers::AgentError>>,
+    },
     ProviderDiscover {
         provider: String,
         generation: Option<u64>,
@@ -3897,6 +3956,8 @@ impl LuaRuntime {
                     provider_registrations.push(ProviderRegistration {
                         id: id.clone(),
                         display_name,
+                        auth_methods: crate::provider_staging::auth_methods(table)
+                            .map_err(mlua::Error::runtime)?,
                         models: models.clone(),
                         factory: Arc::new(crate::provider_adapter::LuaProviderFactory {
                             provider: id.clone(),
@@ -5478,6 +5539,70 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                     match msg {
                         Request::Shutdown => break,
                         Request::WarmJit => codegen_armed = true,
+                        Request::ProviderAuth { provider, generation, hook, method, input, cancel, reply } => {
+                            let candidate = rt.providers.get(&provider)
+                                .filter(|(_, current, _, _)| generation.is_none_or(|generation| generation == *current))
+                                .and_then(|(owner, _, source, table)| rt.provider_generations.get(owner)
+                                    .map(|(_, cancel)| (source.clone(), table.clone(), cancel.clone(), rt.plugins.borrow().get(owner).map(|plugin| plugin.permissions.clone()).unwrap_or_else(PluginPermissions::denied))));
+                            let lua = rt.lua.clone();
+                            let provider_gate = Rc::clone(&provider_gate);
+                            let paused = Rc::clone(&provider_paused);
+                            let event = Rc::clone(&provider_resume);
+                            ex.spawn(async move {
+                                let result = ProviderPoll { paused, event, listener: None, inner: async {
+                                    let config_error = |message: String| maki_providers::AgentError::Config { message };
+                                    let (source, table, generation_cancel, permissions) = candidate.ok_or_else(|| config_error(format!("unknown provider: {provider}")))?;
+                                    let _slot = generation_cancel.race(provider_gate.acquire_before_abandoned(&cancel, None)).await.map_err(|_| config_error("provider generation revoked".into()))?.map_err(|_| maki_providers::AgentError::Cancelled)?;
+                                    let function: Option<Function> = if hook == "login" {
+                                        let methods: Table = table.raw_get("auth").map_err(|e| config_error(format!("provider {provider} auth: {e}")))?;
+                                        let mut found = None;
+                                        for entry in methods.sequence_values::<Table>() {
+                                            let entry = entry.map_err(|e| config_error(e.to_string()))?;
+                                            if entry.raw_get::<String>("id").map_err(|e| config_error(e.to_string()))? == method.as_deref().unwrap_or_default() {
+                                                found = Some(entry.raw_get("login").map_err(|e| config_error(e.to_string()))?);
+                                                break;
+                                            }
+                                        }
+                                        Some(found.ok_or_else(|| config_error(format!("unknown auth method for provider {provider}")))?)
+                                    } else { table.raw_get(hook).map_err(|e| config_error(format!("provider {provider} {hook}: {e}")))? };
+                                    let Some(function) = function else { return Ok(Value::Null) };
+                                    let input = crate::api::util::convert::json_to_lua_with_nulls(&lua, &input, true).map_err(|e| config_error(e.to_string()))?;
+                                    let scope = TaskScope::new(&lua, TaskCell::new(cancel.clone(), None, None));
+                                    let (context, _net_scope) = crate::api::net::provider_context(&lua, scope.handle().clone(), &permissions).map_err(|e| config_error(e.to_string()))?;
+                                    crate::provider_credentials::attach(&lua, &context, scope.handle().clone(), generation_cancel.clone(), source, provider.clone()).map_err(|e| config_error(e.to_string()))?;
+                                    let result = generation_cancel.race(cancel.race(scope.scope_future(function.call_async::<MultiValue>((context, input))))).await;
+                                    let values = match result {
+                                        Err(_) => { scope.fire_cancel_hooks(); return Err(config_error("provider generation revoked".into())); }
+                                        Ok(Err(_)) => { scope.fire_cancel_hooks(); return Err(maki_providers::AgentError::Cancelled); }
+                                        Ok(Ok(result)) => result.map_err(|e| config_error(format!("provider {provider} {hook} failed: {e}")))?,
+                                    };
+                                    if generation_cancel.is_cancelled() { return Err(config_error("provider generation revoked".into())); }
+                                    if cancel.is_cancelled() { return Err(maki_providers::AgentError::Cancelled); }
+                                    let mut values = values.into_iter();
+                                    match (values.next().unwrap_or(LuaValue::Nil), values.next().unwrap_or(LuaValue::Nil)) {
+                                        (LuaValue::Nil, LuaValue::Table(error)) => Err(crate::provider_stream::provider_error(error)),
+                                        (LuaValue::Boolean(true), LuaValue::Nil) if hook != "auth_status" => Ok(Value::Bool(true)),
+                                        (LuaValue::Table(status), LuaValue::Nil) if hook == "auth_status" => {
+                                            let configured = match status.raw_get::<LuaValue>("configured").map_err(|e| config_error(format!("invalid provider {provider} auth status: {e}")))? {
+                                                LuaValue::Boolean(value) => value,
+                                                _ => return Err(config_error(format!("invalid provider {provider} auth status configured: expected boolean"))),
+                                            };
+                                            let mut result = serde_json::Map::new();
+                                            result.insert("configured".into(), Value::Bool(configured));
+                                            for field in ["source", "method"] {
+                                                let value: Option<String> = status.raw_get(field).map_err(|e| config_error(format!("invalid provider {provider} auth status {field}: {e}")))?;
+                                                if let Some(value) = value { result.insert(field.into(), Value::String(value)); }
+                                            }
+                                            let expires: Option<u64> = status.raw_get("expires_at").map_err(|e| config_error(format!("invalid provider {provider} auth status expires_at: {e}")))?;
+                                            if let Some(expires) = expires { result.insert("expires_at".into(), Value::from(expires)); }
+                                            Ok(Value::Object(result))
+                                        }
+                                        _ => Err(config_error(format!("invalid provider {provider} {hook} result"))),
+                                    }
+                                }}.await;
+                                let _ = reply.send(result);
+                            }).detach();
+                        }
                         Request::ProviderDiscover { provider, generation, config, cancel, reply } => {
                             let candidate = rt.providers.get(&provider)
                                 .filter(|(_, current, _, _)| generation.is_none_or(|generation| generation == *current))

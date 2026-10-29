@@ -7019,7 +7019,9 @@ function M.build_request(request, options)
 M.models = {}
 function M.stream(response, emit)
 function M.discover(ctx, config)
-function M.prepare(_, model, config)
+function M.prepare(ctx, model, config)
+function M.parse_usage(value, parse_timestamp)
+function M.fetch_usage(ctx, base, headers, configured_override)
 function M.register()
 ```
 
@@ -7162,7 +7164,10 @@ function M.check_markers(before, after)
 function M.convert_messages(messages)
 function M.build_request(request)
 function M.discover(ctx, config)
-function M.prepare(_, model, config)
+function M.prepare(ctx, model, config)
+function M.login(ctx, ui)
+function M.auth_status(ctx, config)
+function M.logout(ctx)
 function M.register()
 ```
 
@@ -7266,7 +7271,10 @@ function M.cut(view, out, reason, timeout_secs, limits)
 ```lua
 function M.join_models(ids, groups)
 function M.discover(ctx, config)
-function M.prepare(_, model, config)
+function M.prepare(ctx, model, config)
+function M.login(ctx, ui)
+function M.auth_status(ctx, config)
+function M.logout(ctx)
 function M.register()
 ```
 
@@ -7356,8 +7364,11 @@ function M.new(body, max_event_bytes)
 ```lua
 function M.parse_quotas(response, parse_timestamp)
 function M.encode_thinking(body, intent, max_thinking_budget)
+function M.login(ctx, ui)
+function M.auth_status(ctx, config)
+function M.logout(ctx)
 function M.discover(ctx, config)
-function M.prepare(_, model, config)
+function M.prepare(ctx, model, config)
 function M.register()
 ```
 

@@ -178,6 +178,33 @@ assert(instance.stream(ctx, request, function()
   return true
 end))
 assert(sent.headers["x-goog-api-key"] == "second")
+maki.uv.os_getenv = function(name)
+  if name == "GEMINI_API_KEY" then
+    return "replacement"
+  end
+end
+assert(instance.reload_auth())
+assert(instance.stream(ctx, request, function()
+  return true
+end))
+assert(sent.headers["x-goog-api-key"] == "replacement")
+local error_ctx = {
+  send = function()
+    local result = body_for({ '{"error":{"message":"too many tokens"}}' })
+    result.status = 429
+    result.headers = { ["retry-after"] = "3" }
+    result.close = function()
+      closed = true
+    end
+    return result
+  end,
+}
+closed = false
+local failed_request, api_err = instance.stream(error_ctx, request, function()
+  return true
+end)
+assert(not failed_request and api_err.status == 429 and api_err.retry_after_ms == 3000)
+assert(api_err.message == '{"error":{"message":"too many tokens"}}' and closed)
 
 maki.uv.os_getenv = function(name)
   if name == "GEMINI_API_KEY" then

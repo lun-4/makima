@@ -2553,6 +2553,7 @@ mod tests {
             .register(ProviderRegistration {
                 id: "compact-test".into(),
                 display_name: "test".into(),
+                auth_methods: Vec::new(),
                 models: vec![ModelInfo {
                     tier: Some(maki_providers::ModelTier::Compaction),
                     ..ModelInfo::id_only("model".into())

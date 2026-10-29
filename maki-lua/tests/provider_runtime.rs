@@ -36,6 +36,88 @@ maki.api.register_provider({
 "#;
 
 #[test]
+fn factory_auth_hooks_run_without_preparing_and_revoke_on_unload() {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source(
+        "fixture",
+        r#"
+        local configured = false
+        maki.api.register_provider({
+            id = 'fixture', models = {{ id = 'offline' }},
+            auth = {{ id = 'key', label = 'Key', login = function(ctx, interaction)
+                assert(ctx ~= nil and interaction.value == 'test-key')
+                configured = true
+                return true
+            end }},
+            auth_status = function(ctx, config)
+                assert(ctx ~= nil and config.marker == 'configured')
+                return { configured = configured, source = configured and 'stored' or nil,
+                    method = configured and 'key' or nil }
+            end,
+            logout = function(ctx, config)
+                assert(ctx ~= nil and config.marker == 'configured')
+                configured = false
+                return true
+            end,
+            prepare = function() error('auth must not prepare a provider') end,
+        })
+    "#,
+    )
+    .unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let registration = snapshot.get("fixture").unwrap();
+    assert_eq!(registration.auth_methods.len(), 1);
+    assert_eq!(registration.auth_methods[0].id, "key");
+    assert_eq!(registration.auth_methods[0].label, "Key");
+    let factory = &registration.factory;
+    let config = json!({"marker": "configured"});
+    assert!(smol::block_on(factory.login("unknown", &json!({}))).is_err());
+    assert_eq!(
+        smol::block_on(factory.auth_status(&config)).unwrap()["configured"],
+        false
+    );
+    assert_eq!(
+        smol::block_on(factory.login("key", &json!({"value": "test-key"}))).unwrap(),
+        json!(true)
+    );
+    let status = smol::block_on(factory.auth_status(&config)).unwrap();
+    assert_eq!(status["configured"], true);
+    assert_eq!(status["source"], "stored");
+    assert_eq!(status["method"], "key");
+    assert_eq!(
+        smol::block_on(factory.logout(&config)).unwrap(),
+        json!(true)
+    );
+    assert_eq!(
+        smol::block_on(factory.auth_status(&config)).unwrap()["configured"],
+        false
+    );
+    host.unload("fixture").unwrap();
+    assert!(smol::block_on(factory.auth_status(&config)).is_err());
+    assert!(smol::block_on(factory.logout(&config)).is_err());
+    assert!(smol::block_on(factory.login("key", &json!({"value": "test-key"}))).is_err());
+}
+
+#[test]
+fn factory_rejects_malformed_auth_status() {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source(
+        "fixture",
+        r#"
+        maki.api.register_provider({
+            id = 'fixture', models = {{ id = 'offline' }},
+            auth_status = function() return { configured = 'yes' } end,
+            prepare = function() error('auth must not prepare a provider') end,
+        })
+    "#,
+    )
+    .unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let factory = &snapshot.get("fixture").unwrap().factory;
+    assert!(smol::block_on(factory.auth_status(&json!({}))).is_err());
+}
+
+#[test]
 fn lua_discovery_can_publish_models_without_changing_existing_snapshots() {
     let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
     host.load_source(

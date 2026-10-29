@@ -684,6 +684,7 @@ mod tests {
             .register(ProviderRegistration {
                 id: "lua-test".into(),
                 display_name: "Lua test".into(),
+                auth_methods: Vec::new(),
                 models: vec![info],
                 factory: Arc::new(Factory),
             })

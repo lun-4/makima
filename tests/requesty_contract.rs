@@ -77,8 +77,49 @@ fn requesty_discovery_filters_and_merges_catalogs() {
 }
 
 #[test]
+fn requesty_discovery_tolerates_one_failure_and_rejects_two() {
+    const CATALOG: &str = r#"{"data":[{"id":"available","context_window":8192}]}"#;
+    for statuses in [
+        ["200 OK", "503 Service Unavailable"],
+        ["503 Service Unavailable", "503 Service Unavailable"],
+    ] {
+        let server = HttpContract::start(
+            statuses
+                .into_iter()
+                .map(|status| response(status, CATALOG))
+                .collect(),
+        )
+        .unwrap();
+        maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("requesty", include_str!("../plugins/requesty/init.lua"))
+            .unwrap();
+        let snapshot = host.provider_registry().snapshot();
+        let result = smol::block_on(snapshot.get("requesty").unwrap().factory.discover(&json!({
+            "api_key": "fixture-key", "api_key_env": "REQUESTY_CONTRACT_UNUSED_KEY",
+            "base_url": format!("http://{}/v1", server.addr)
+        })));
+        if statuses[0] == "200 OK" {
+            let models = result.unwrap().unwrap();
+            assert_eq!(models.len(), 1);
+            assert_eq!(models[0].id, "available");
+        } else {
+            assert!(result.is_err());
+        }
+        for _ in 0..2 {
+            let request = server
+                .requests
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            assert_eq!(request.header("authorization"), Some("Bearer fixture-key"));
+        }
+    }
+}
+
+#[test]
 fn requesty_stream_sets_auto_cache_and_rotates_keys() {
-    const SSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    const SSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":4}}}\n\ndata: [DONE]\n\n";
     let server =
         HttpContract::start(vec![response("200 OK", SSE), response("200 OK", SSE)]).unwrap();
     maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
@@ -112,6 +153,14 @@ fn requesty_stream_sets_auto_cache_and_rotates_keys() {
         ))
         .unwrap();
         assert_eq!(result.message.first_text_content(), Some("hello"));
+        assert_eq!(
+            (
+                result.usage.input,
+                result.usage.output,
+                result.usage.cache_read
+            ),
+            (8, 5, 4)
+        );
         let request = server
             .requests
             .recv_timeout(Duration::from_secs(5))
@@ -123,6 +172,7 @@ fn requesty_stream_sets_auto_cache_and_rotates_keys() {
             Some(format!("Bearer {key}").as_str())
         );
         assert_eq!(request.header("x-title"), Some("Makima"));
+        assert_eq!(request.header("http-referer"), Some("https://maki.sh"));
         let body: Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(body["requesty"]["auto_cache"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);

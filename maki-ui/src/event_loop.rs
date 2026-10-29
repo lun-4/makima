@@ -4777,6 +4777,7 @@ mod tests {
             .register(ProviderRegistration {
                 id: "tui-registry-test".into(),
                 display_name: "TUI test".into(),
+                auth_methods: Vec::new(),
                 models: vec![ModelInfo {
                     context_window: Some(WINDOW),
                     ..ModelInfo::id_only("model".into())

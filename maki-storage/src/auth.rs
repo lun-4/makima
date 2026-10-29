@@ -134,6 +134,10 @@ pub enum CredentialError {
     Refresh(String),
     #[error("credentials revoked")]
     Revoked,
+    #[error("credential file contains a different credential type")]
+    Conflict,
+    #[error("invalid credential value")]
+    InvalidValue,
 }
 
 /// A storage namespace, not an authorization capability. Callers must bind it to
@@ -142,6 +146,13 @@ pub enum CredentialError {
 pub struct CredentialScope {
     dir: StateDir,
     name: String,
+    legacy_kind: Option<LegacyCredentialKind>,
+}
+
+#[derive(Clone, Copy)]
+pub enum LegacyCredentialKind {
+    OAuth,
+    ApiKey,
 }
 
 pub enum RefreshOutcome {
@@ -163,14 +174,35 @@ impl CredentialScope {
         Ok(Self {
             dir,
             name: name.to_owned(),
+            legacy_kind: None,
         })
     }
 
-    fn path(&self) -> PathBuf {
-        auth_path(&self.dir, &self.name)
+    pub fn legacy(
+        dir: StateDir,
+        name: &str,
+        kind: LegacyCredentialKind,
+    ) -> Result<Self, CredentialError> {
+        let mut scope = Self::new(dir, name)?;
+        scope.legacy_kind = Some(kind);
+        Ok(scope)
     }
 
-    pub fn read(&self) -> Result<Option<serde_json::Value>, CredentialError> {
+    fn matches_kind(&self, value: &serde_json::Value) -> bool {
+        match self.legacy_kind {
+            Some(kind) => {
+                let oauth = serde_json::from_value::<OAuthTokens>(value.clone()).is_ok();
+                let api_key = serde_json::from_value::<ProviderCredentials>(value.clone()).is_ok();
+                match kind {
+                    LegacyCredentialKind::OAuth => oauth && !api_key,
+                    LegacyCredentialKind::ApiKey => api_key && !oauth,
+                }
+            }
+            None => true,
+        }
+    }
+
+    fn read_raw(&self) -> Result<Option<serde_json::Value>, CredentialError> {
         match fs::read(self.path()) {
             Ok(data) => Ok(Some(
                 serde_json::from_slice(&data).map_err(StorageError::from)?,
@@ -180,12 +212,29 @@ impl CredentialScope {
         }
     }
 
+    fn path(&self) -> PathBuf {
+        auth_path(&self.dir, &self.name)
+    }
+
+    pub fn read(&self) -> Result<Option<serde_json::Value>, CredentialError> {
+        Ok(self.read_raw()?.filter(|value| self.matches_kind(value)))
+    }
+
     pub async fn write(&self, value: &serde_json::Value) -> Result<(), CredentialError> {
         let _lock = self.lock().await?;
         self.write_unlocked(value)
     }
 
     fn write_unlocked(&self, value: &serde_json::Value) -> Result<(), CredentialError> {
+        if !self.matches_kind(value) {
+            return Err(CredentialError::InvalidValue);
+        }
+        if self
+            .read_raw()?
+            .is_some_and(|current| !self.matches_kind(&current))
+        {
+            return Err(CredentialError::Conflict);
+        }
         save_auth(&self.path(), value)?;
         Ok(())
     }
@@ -196,6 +245,12 @@ impl CredentialScope {
     }
 
     fn delete_unlocked(&self) -> Result<bool, CredentialError> {
+        if self
+            .read_raw()?
+            .is_some_and(|current| !self.matches_kind(&current))
+        {
+            return Ok(false);
+        }
         match fs::remove_file(self.path()) {
             Ok(()) => Ok(true),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
@@ -407,6 +462,62 @@ mod tests {
             CredentialScope::new(StateDir::from_path(tmp.path().into()), name),
             Err(CredentialError::InvalidScope)
         ));
+    }
+
+    #[test]
+    fn legacy_credential_views_preserve_other_type() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().into());
+        let oauth =
+            CredentialScope::legacy(dir.clone(), "openai", LegacyCredentialKind::OAuth).unwrap();
+        let key =
+            CredentialScope::legacy(dir.clone(), "openai", LegacyCredentialKind::ApiKey).unwrap();
+        let tokens = OAuthTokens {
+            access: "access".into(),
+            refresh: "refresh".into(),
+            expires: 42,
+            account_id: Some("account".into()),
+        };
+        save_tokens(&dir, "openai", &tokens).unwrap();
+        assert_eq!(oauth.read().unwrap().unwrap()["access"], "access");
+        assert!(key.read().unwrap().is_none());
+        smol::block_on(async {
+            assert!(!key.delete().await.unwrap());
+            assert!(matches!(
+                key.write(&serde_json::json!({"api_key": "key"})).await,
+                Err(CredentialError::Conflict)
+            ));
+            oauth
+                .refresh(|_| async {
+                    Ok(RefreshOutcome::Updated(
+                        serde_json::json!({"access":"new", "refresh":"rotated", "expires":100}),
+                    ))
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                oauth.write(&serde_json::json!({"api_key": "key"})).await,
+                Err(CredentialError::InvalidValue)
+            ));
+        });
+        assert_eq!(load_tokens(&dir, "openai").unwrap().access, "new");
+        delete_tokens(&dir, "openai").unwrap();
+        save_provider_credentials(
+            &dir,
+            "openai",
+            &ProviderCredentials {
+                api_key: "key".into(),
+                host: None,
+            },
+        )
+        .unwrap();
+        assert!(oauth.read().unwrap().is_none());
+        assert_eq!(key.read().unwrap().unwrap()["api_key"], "key");
+        assert!(!smol::block_on(oauth.delete()).unwrap());
+        assert_eq!(
+            load_provider_credentials(&dir, "openai").unwrap().api_key,
+            "key"
+        );
     }
 
     #[test]

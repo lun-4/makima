@@ -72,6 +72,7 @@ impl InitFiles {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SourceIdentity {
     Embedded(&'static str),
+    CoreProviders,
     Other,
 }
 
@@ -83,6 +84,10 @@ struct BundledPlugin {
 /// `lib` is not a default builtin; it exists so plugins can
 /// `require()` shared modules across boundaries.
 static BUNDLED_PLUGINS: &[BundledPlugin] = &[
+    BundledPlugin {
+        name: "synthetic",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/synthetic"),
+    },
     BundledPlugin {
         name: "llama-cpp",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/llama-cpp"),
@@ -235,8 +240,11 @@ pub(crate) fn lib_dir() -> &'static Dir<'static> {
         .dir
 }
 
+static CORE_PROVIDER_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../plugins/providers");
+
 static BUNDLED_DIRS: LazyLock<&'static [&'static Dir<'static>]> = LazyLock::new(|| {
-    let dirs: Vec<&'static Dir<'static>> = BUNDLED_PLUGINS.iter().map(|p| &p.dir).collect();
+    let mut dirs: Vec<&'static Dir<'static>> = BUNDLED_PLUGINS.iter().map(|p| &p.dir).collect();
+    dirs.push(&CORE_PROVIDER_DIR);
     Vec::leak(dirs)
 });
 
@@ -388,13 +396,22 @@ impl PluginHost {
             let actions = lua.ui_action_rx.clone();
             std::thread::spawn(move || crate::ui_sink::serve(actions, sink));
         }
-        Ok(Self {
+        let host = Self {
             inner: lua,
             plugin_rules,
             registry,
             command_registry,
             provider_registry,
-        })
+        };
+        host.send_load(
+            Arc::from("providers"),
+            include_str!("../../plugins/providers/init.lua").to_owned(),
+            None,
+            PluginPermissions::trusted(),
+            PluginOpts::default(),
+            SourceIdentity::CoreProviders,
+        )?;
+        Ok(host)
     }
 
     /// The tool registry the host booted with, so tests can execute the
@@ -601,6 +618,12 @@ impl PluginHost {
         opts: PluginOpts,
         identity: SourceIdentity,
     ) -> Result<(), PluginError> {
+        if name.as_ref() == "providers" && identity != SourceIdentity::CoreProviders {
+            return Err(PluginError::Lua {
+                plugin: name.to_string(),
+                source: mlua::Error::runtime("core providers plugin name is reserved"),
+            });
+        }
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner
             .tx
@@ -638,6 +661,12 @@ impl PluginHost {
         name: &str,
         source: &str,
     ) -> Result<flume::Receiver<Result<(), PluginError>>, PluginError> {
+        if name == "providers" {
+            return Err(PluginError::Lua {
+                plugin: name.to_owned(),
+                source: mlua::Error::runtime("core providers plugin name is reserved"),
+            });
+        }
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner
             .prio_tx
@@ -735,6 +764,12 @@ impl PluginHost {
     }
 
     pub fn unload(&self, plugin: &str) -> Result<(), PluginError> {
+        if plugin == "providers" {
+            return Err(PluginError::Unload {
+                plugin: plugin.to_owned(),
+                error: "core providers plugin cannot be unloaded".to_owned(),
+            });
+        }
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner
             .tx
@@ -1471,6 +1506,29 @@ mod tests {
     use std::thread;
     use std::time::Instant;
     use test_case::test_case;
+
+    #[test]
+    fn core_providers_owner_is_reserved_without_optional_plugins() {
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_builtins(&PluginsConfig {
+            enabled: false,
+            names: Vec::new(),
+            opts: HashMap::new(),
+        })
+        .unwrap();
+        assert!(host.load_source("providers", "return nil").is_err());
+        assert!(host.unload("providers").is_err());
+        host.load_source(
+            "module_probe",
+            "assert(type(require('providers.core')) == 'function')",
+        )
+        .unwrap();
+        host.load_source(
+            "third_party",
+            "maki.api.register_provider({ id = 'third_party' })",
+        )
+        .unwrap();
+    }
 
     #[test]
     fn provider_staging_follows_plugin_transactions() {

@@ -23,3 +23,36 @@ assert(mistral.build_request(request).reasoning_effort == nil)
 request.model.id = "ministral-14b-latest"
 request.thinking = { mode = "adaptive" }
 assert(mistral.build_request(request).reasoning_effort == nil)
+
+local saved
+local ctx = {
+  credentials = {
+    read = function()
+      return saved
+    end,
+    write = function(_, _, value)
+      saved = value
+      return true
+    end,
+    delete = function()
+      saved = nil
+      return true
+    end,
+  },
+}
+local config = { api_key_env = "MAKI_MISTRAL_TEST_MISSING_KEY", api_key = "config-key" }
+assert(mistral.login(ctx, {
+  input = function()
+    return "saved-key"
+  end,
+}))
+assert(mistral.auth_status(ctx, config).configured)
+local instance = assert(mistral.prepare(ctx, request.model, config))
+assert(instance.key_count == 1)
+assert(mistral.logout(ctx) and saved == nil)
+local empty, err = mistral.login(ctx, {
+  input = function()
+    return "  "
+  end,
+})
+assert(not empty and err.kind == "config")

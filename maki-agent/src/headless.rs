@@ -1479,6 +1479,7 @@ pub(crate) mod tests {
                 .register(ProviderRegistration {
                     id: COMPACT_PROVIDER.into(),
                     display_name: COMPACT_PROVIDER.into(),
+                    auth_methods: Vec::new(),
                     models: vec![ModelInfo {
                         tier: Some(ModelTier::Compaction),
                         ..ModelInfo::id_only(COMPACT_MODEL.into())

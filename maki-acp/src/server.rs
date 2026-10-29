@@ -2544,6 +2544,7 @@ mod tests {
             .register(ProviderRegistration {
                 id: "acp-test".into(),
                 display_name: "ACP test".into(),
+                auth_methods: Vec::new(),
                 models: vec![ModelInfo::id_only("model".into())],
                 factory: Arc::new(Factory),
             })

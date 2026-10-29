@@ -63,6 +63,10 @@ function M.build_request(request)
   return body
 end
 
+local function unsigned_integer(value, maximum)
+  return type(value) == "number" and value >= 0 and value <= maximum and value % 1 == 0
+end
+
 function M.parse_quotas(body)
   local value = maki.json.decode(body)
   if type(value) ~= "table" or type(value.data) ~= "table" then
@@ -75,13 +79,18 @@ function M.parse_quotas(body)
   if data.limits ~= nil and type(data.limits) ~= "table" then
     return nil, { kind = "api", message = "Invalid Z.AI quota response" }
   end
+  for key in pairs(data.limits or {}) do
+    if type(key) ~= "number" or key < 1 or key % 1 ~= 0 or key > #data.limits then
+      return nil, { kind = "api", message = "Invalid Z.AI quota response" }
+    end
+  end
   for _, item in ipairs(data.limits or {}) do
     if
       type(item) ~= "table"
       or type(item.type) ~= "string"
-      or type(item.unit) ~= "number"
-      or type(item.percentage) ~= "number"
-      or (item.nextResetTime ~= nil and type(item.nextResetTime) ~= "number")
+      or not unsigned_integer(item.unit, 4294967295)
+      or not unsigned_integer(item.percentage, 4294967295)
+      or (item.nextResetTime ~= nil and not unsigned_integer(item.nextResetTime, 9007199254740991))
     then
       return nil, { kind = "api", message = "Invalid Z.AI quota response" }
     end
@@ -117,6 +126,9 @@ function M.prepare(_, model_value, config)
     return nil, { kind = "config", message = "Z.AI API key is not configured" }
   end
   local index = 1
+  if type(model_value.id) == "string" and M.supports_thinking(model_value.id) then
+    model_value.thinking = thinking
+  end
   local base = (config.base_url or "https://api.z.ai/api/paas/v4"):gsub("/+$", "")
   local function headers()
     local result = { Authorization = "Bearer " .. keys[index], ["Content-Type"] = "application/json" }
@@ -129,6 +141,22 @@ function M.prepare(_, model_value, config)
       result[name] = value
     end
     return result
+  end
+  local function safe_message(message)
+    if type(message) ~= "string" then
+      return "Z.AI request failed"
+    end
+    for _, secret in ipairs(keys) do
+      if message:find(secret, 1, true) then
+        return "Z.AI request failed"
+      end
+    end
+    for _, value in pairs(config.headers or {}) do
+      if type(value) == "string" and value ~= "" and message:find(value, 1, true) then
+        return "Z.AI request failed"
+      end
+    end
+    return message
   end
   local function read_body(response)
     local chunks, size = {}, 0
@@ -163,9 +191,18 @@ function M.prepare(_, model_value, config)
       if not response then
         return nil, err
       end
-      if response.status < 200 or response.status >= 300 then
+      if response.status ~= 200 then
+        local text = read_body(response)
+        local retry = response.headers and response.headers["retry-after"]
+        local seconds = type(retry) == "string" and tonumber(retry:match("^%s*(%d+)%s*$"))
         response:close()
-        return nil, { kind = "api", status = response.status, message = "Z.AI quota request failed" }
+        return nil,
+          {
+            kind = "api",
+            status = response.status,
+            message = safe_message(text or "unable to read error body"),
+            retry_after_ms = seconds and seconds > 0 and seconds <= 9007199254740 and seconds * 1000 or nil,
+          }
       end
       local body, read_err = read_body(response)
       response:close()
@@ -188,7 +225,7 @@ function M.prepare(_, model_value, config)
       if not response then
         return nil, send_err
       end
-      if response.status < 200 or response.status >= 300 then
+      if response.status ~= 200 then
         local text = read_body(response) or ""
         local status = response.status
         local retry = response.headers and response.headers["retry-after"]
@@ -196,12 +233,13 @@ function M.prepare(_, model_value, config)
         response:close()
         if (status == 429 or status >= 500) and (text:find("1113", 1, true) or text:find("nsufficien", 1, true)) then
           status = 402
+          seconds = nil
         end
         return nil,
           {
             kind = "api",
             status = status,
-            message = "Z.AI request failed",
+            message = safe_message(text),
             retry_after_ms = seconds and seconds > 0 and seconds <= 9007199254740 and seconds * 1000 or nil,
           }
       end

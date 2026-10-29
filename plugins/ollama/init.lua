@@ -1,9 +1,21 @@
 local chat = require("maki.chat_completions")
 
-local function settings(config)
+local function settings(ctx, config)
   local key = maki.uv.os_getenv(config.api_key_env or "OLLAMA_API_KEY")
   if not key or key == "" then
-    key = config.api_key
+    if ctx and ctx.credentials then
+      local saved, err = ctx.credentials:read("api_key")
+      if err and err.message ~= "credential access denied" and not config.api_key then
+        return nil, nil, err
+      end
+      if saved ~= nil and (type(saved) ~= "table" or type(saved.api_key) ~= "string") then
+        return nil, nil, { kind = "config", message = "Invalid Ollama credentials" }
+      end
+      key = saved and saved.api_key
+    end
+    if not key or key == "" then
+      key = config.api_key
+    end
   end
   local keys = {}
   for part in (key or ""):gmatch("[^,]+") do
@@ -146,7 +158,7 @@ end
 
 local function discover(ctx, config)
   config = config or {}
-  local base, keys, err = settings(config)
+  local base, keys, err = settings(ctx, config)
   if not base then
     return nil, err
   end
@@ -183,9 +195,9 @@ local function discover(ctx, config)
   return models
 end
 
-local function prepare(_, model, config)
+local function prepare(ctx, model, config)
   config = config or {}
-  local base, keys, err = settings(config)
+  local base, keys, err = settings(ctx, config)
   if not base then
     return nil, err
   end

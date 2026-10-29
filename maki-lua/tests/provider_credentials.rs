@@ -6,6 +6,100 @@ use maki_providers::{Model, RequestOptions, ThinkingConfig};
 use serde_json::json;
 
 #[test]
+fn openai_oauth_provider_contract_through_host() {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source(
+        "openai_contract",
+        r#"
+        local openai = require('maki.openai')
+        local saved = { access = 'old', refresh = 'refresh', expires = 9999999999999, account_id = 'account' }
+        local store = {
+            read = function(_, key) assert(key == 'chatgpt'); return saved end,
+            refresh = function(_, key, callback)
+                assert(key == 'chatgpt')
+                local updated, err = callback(saved)
+                if err then return nil, err end
+                saved = updated or saved
+                return saved
+            end,
+        }
+        local function context()
+            return { credentials = store, send = function(_, request)
+                local body
+                if request.url:find('/models?', 1, true) then
+                    assert(request.headers.Authorization == 'Bearer old')
+                    assert(request.headers['chatgpt-account-id'] == 'account')
+                    body = '{"models":[{"slug":"gpt-5.6-sol","visibility":"list","context_window":12345}]}'
+                elseif request.url:find('/oauth/token', 1, true) then
+                    assert(request.body:find('refresh_token=refresh', 1, true))
+                    local payload = maki.base64.encode('{"chatgpt_account_id":"account"}'):gsub('=+$', '')
+                    body = assert(maki.json.encode({ access_token = 'new', refresh_token = 'rotated',
+                        id_token = 'header.' .. payload .. '.signature', expires_in = 3600 }))
+                elseif request.url:find('/wham/usage', 1, true) then
+                    assert(request.headers.Authorization == 'Bearer new')
+                    body = '{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":20,"limit_window_seconds":18000}}}'
+                else
+                    assert(request.url == 'https://chatgpt.com/backend-api/codex/responses')
+                    assert(request.headers.Authorization == 'Bearer old')
+                    assert(request.headers['chatgpt-account-id'] == 'account')
+                    body = 'event: response.output_text.delta\ndata: {"delta":"answer"}\n\nevent: response.completed\ndata: {"response":{"status":"completed","usage":{"input_tokens":8,"output_tokens":2}}}\n\n'
+                end
+                return { status = 200, read = function() local chunk = body; body = ''; return chunk end,
+                    close = function() end }
+            end }
+        end
+        maki.api.register_provider({
+            id = 'openai_contract', models = {{ id = 'gpt-5.6-sol' }},
+            discover = function(_, config) return openai.discover(context(), config) end,
+            prepare = function(_, model, config)
+                local provider, err = openai.prepare(context(), model, config)
+                if not provider then return nil, err end
+                local stream, refresh, usage = provider.stream, provider.refresh_auth, provider.fetch_usage
+                provider.stream = function(_, request, emit) return stream(context(), request, emit) end
+                provider.refresh_auth = function() return refresh(context()) end
+                provider.fetch_usage = function() return usage(context()) end
+                return provider
+            end,
+        })
+        "#,
+    )
+    .unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let factory = &snapshot.get("openai_contract").unwrap().factory;
+    let models = smol::block_on(factory.discover(&json!({})))
+        .unwrap()
+        .unwrap();
+    assert_eq!(models[0].id, "gpt-5.6-sol");
+    assert_eq!(models[0].context_window, Some(12345));
+    let mut model = Model::from_spec("openai/gpt-5.6-sol").unwrap();
+    model.provider = Arc::from("openai_contract");
+    let (model, provider) = smol::block_on(factory.prepare(&model, &json!({}))).unwrap();
+    let (events, receiver) = flume::unbounded();
+    let response = smol::block_on(provider.stream_message(
+        &model,
+        &[],
+        "system",
+        &json!([]),
+        &events,
+        RequestOptions {
+            thinking: ThinkingConfig::Off,
+            fast: false,
+        },
+        None,
+    ))
+    .unwrap();
+    assert_eq!(response.message.first_text_content(), Some("answer"));
+    assert_eq!(response.usage.input, 8);
+    assert!(!receiver.is_empty());
+    smol::block_on(provider.refresh_auth()).unwrap();
+    let usage = smol::block_on(provider.fetch_usage()).unwrap().unwrap();
+    assert_eq!(usage.plan.as_deref(), Some("pro"));
+    assert_eq!(usage.limits[0].percentage, Some(20));
+    host.unload("openai_contract").unwrap();
+    assert!(smol::block_on(provider.fetch_usage()).is_err());
+}
+
+#[test]
 fn provider_auth_hooks_are_isolated_per_prepared_instance() {
     let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
     host.load_source("fixture", r#"
@@ -50,9 +144,9 @@ fn provider_auth_hooks_are_isolated_per_prepared_instance() {
     );
 }
 
-#[test_case::test_case("synthetic" ; "spoofed_synthetic")]
-#[test_case::test_case("providers" ; "spoofed_providers")]
-fn external_provider_cannot_access_credentials(id: &str) {
+#[test_case::test_case("synthetic", "synthetic" ; "spoofed_synthetic")]
+#[test_case::test_case("external", "providers" ; "spoofed_providers")]
+fn external_provider_cannot_access_credentials(owner: &str, id: &str) {
     const SOURCE: &str = r#"
         maki.api.register_provider({
             id = PROVIDER_ID, models = {{ id = 'gpt-5.6-sol' }},
@@ -82,7 +176,15 @@ fn external_provider_cannot_access_credentials(id: &str) {
         })
     "#;
     let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-    host.load_source(id, &SOURCE.replace("PROVIDER_ID", &format!("'{id}'")))
+    if id == "providers" {
+        let error = host.load_source(id, "return nil").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("core providers plugin name is reserved")
+        );
+    }
+    host.load_source(owner, &SOURCE.replace("PROVIDER_ID", &format!("'{id}'")))
         .unwrap();
     let snapshot = host.provider_registry().snapshot();
     let mut model = Model::from_spec("openai/gpt-5.6-sol").unwrap();

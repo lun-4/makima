@@ -107,7 +107,9 @@ local function discover(ctx, config)
       local supported = {}
       if type(info.supported_openai_params) == "table" then
         for _, param in ipairs(info.supported_openai_params) do
-          supported[param] = true
+          if type(param) == "string" then
+            supported[param] = true
+          end
         end
       end
       flags[entry.model_name] = supported

@@ -167,8 +167,20 @@ function M.stream(response, emit)
   return { message = { role = "assistant", content = content }, usage = usage, stop_reason = stop_reason }
 end
 
-local function credentials(config)
+local function credentials(ctx, config)
   local key = maki.uv.os_getenv(config.api_key_env or "ANTHROPIC_API_KEY")
+  if (not key or key == "") and ctx and ctx.credentials then
+    local saved, err = ctx.credentials:read("api_key")
+    if err and err.message ~= "credential access denied" then
+      return nil, err
+    end
+    if saved ~= nil then
+      if type(saved) ~= "table" or type(saved.api_key) ~= "string" or saved.api_key == "" then
+        return nil, { kind = "config", message = "Invalid Anthropic credentials" }
+      end
+      key = saved.api_key
+    end
+  end
   if not key or key == "" then
     key = config.api_key
   end
@@ -198,7 +210,7 @@ end
 
 function M.discover(ctx, config)
   config = config or {}
-  local keys, err = credentials(config)
+  local keys, err = credentials(ctx, config)
   if not keys then
     return nil, err
   end
@@ -250,9 +262,9 @@ function M.discover(ctx, config)
   return models
 end
 
-function M.prepare(_, model, config)
+function M.prepare(ctx, model, config)
   config = config or {}
-  local keys, err = credentials(config)
+  local keys, err = credentials(ctx, config)
   if not keys then
     return nil, err
   end
@@ -274,6 +286,18 @@ function M.prepare(_, model, config)
     return message
   end
   local base = base_url(config)
+  local function auth_headers()
+    local headers = { ["x-api-key"] = keys[index], ["anthropic-version"] = "2023-06-01" }
+    for name, value in pairs(config.headers or {}) do
+      for existing in pairs(headers) do
+        if existing:lower() == name:lower() then
+          headers[existing] = nil
+        end
+      end
+      headers[name] = value
+    end
+    return headers
+  end
   return {
     model = model,
     key_count = #keys,
@@ -284,6 +308,17 @@ function M.prepare(_, model, config)
       index = index % #keys + 1
       return true
     end,
+    reload_auth = function(reload_ctx)
+      local reloaded, reload_err = credentials(reload_ctx, config)
+      if not reloaded then
+        return nil, reload_err
+      end
+      keys, index = reloaded, 1
+      return true
+    end,
+    fetch_usage = function(usage_ctx)
+      return M.fetch_usage(usage_ctx, base, auth_headers(), base)
+    end,
     stream = function(ctx, request, emit)
       local body, err = messages.build_request(request)
       if not body then
@@ -293,17 +328,9 @@ function M.prepare(_, model, config)
       if not encoded then
         return nil, { kind = "config", message = tostring(encode_err) }
       end
-      local headers =
-        { ["x-api-key"] = keys[index], ["anthropic-version"] = "2023-06-01", ["content-type"] = "application/json" }
+      local headers = auth_headers()
+      headers["content-type"] = "application/json"
       headers["anthropic-beta"] = messages.beta_header(request)
-      for name, value in pairs(config.headers or {}) do
-        for existing in pairs(headers) do
-          if existing:lower() == name:lower() then
-            headers[existing] = nil
-          end
-        end
-        headers[name] = value
-      end
       local response, send_err =
         ctx:send({ url = base .. "/v1/messages", method = "POST", headers = headers, body = encoded })
       if not response then
@@ -344,10 +371,125 @@ function M.prepare(_, model, config)
   }
 end
 
+function M.parse_usage(value, parse_timestamp)
+  if type(value) ~= "table" or (value.limits ~= nil and type(value.limits) ~= "table") then
+    return nil, { kind = "api", message = "Invalid Anthropic usage response" }
+  end
+  local limits = {}
+  local function add(kind, percent, reset)
+    if type(percent) == "number" then
+      limits[#limits + 1] = {
+        kind = kind,
+        percentage = math.clamp(math.floor(percent + 0.5), 0, 4294967295),
+        reset_at = type(reset) == "string" and parse_timestamp and parse_timestamp(reset) or nil,
+      }
+    end
+  end
+  for _, lane in ipairs(value.limits or {}) do
+    if type(lane) ~= "table" or type(lane.kind) ~= "string" then
+      return nil, { kind = "api", message = "Invalid Anthropic usage response" }
+    end
+    local kind
+    if lane.kind == "session" then
+      kind = { type = "hours", hours = 5 }
+    elseif lane.kind == "weekly_all" then
+      kind = { type = "weekly" }
+    elseif lane.kind == "weekly_scoped" then
+      local scope = lane.scope
+      local model = type(scope) == "table" and scope.model
+      kind = {
+        type = "weekly",
+        model = type(model) == "table" and type(model.display_name) == "string" and model.display_name or nil,
+      }
+    else
+      kind = { type = "other", label = lane.kind }
+    end
+    add(kind, lane.percent, lane.resets_at)
+  end
+  if #limits == 0 then
+    for _, window in ipairs({
+      { "five_hour", { type = "hours", hours = 5 } },
+      { "seven_day", { type = "weekly" } },
+      { "seven_day_sonnet", { type = "weekly", model = "Sonnet" } },
+      { "seven_day_opus", { type = "weekly", model = "Opus" } },
+    }) do
+      local lane = value[window[1]]
+      if type(lane) == "table" then
+        add(window[2], lane.utilization, lane.resets_at)
+      end
+    end
+  end
+  local spend, extra = value.spend, value.extra_usage
+  local percent, amount, exponent, currency
+  if type(spend) == "table" and spend.enabled then
+    percent = spend.percent or 0
+    if type(spend.used) == "table" then
+      amount, exponent, currency = spend.used.amount_minor, spend.used.exponent, spend.used.currency
+    end
+  elseif spend == nil and type(extra) == "table" and extra.is_enabled then
+    percent, amount, exponent, currency = extra.utilization, extra.used_credits, extra.decimal_places, extra.currency
+  end
+  if type(percent) == "number" then
+    add({ type = "credits" }, percent)
+    if type(amount) == "number" then
+      local formatted = string.format("%.2f", amount / 10 ^ (exponent or 2))
+      limits[#limits].detail = (currency == nil or currency == "USD") and "$" .. formatted .. " spent"
+        or formatted .. " " .. currency .. " spent"
+    end
+  end
+  return { limits = limits, by_model_today = {} }
+end
+
+function M.fetch_usage(ctx, base, headers, configured_override)
+  local authorization = false
+  for name in pairs(headers) do
+    if name:lower() == "authorization" then
+      authorization = true
+    end
+  end
+  local function origin(url)
+    return url:match("^[^?#]*"):gsub("/+$", ""):gsub("/v1/messages$", "")
+  end
+  base = origin(base or "https://api.anthropic.com")
+  local host = base:match("^https://([^/:]+)")
+  if
+    not authorization
+    or (host ~= "api.anthropic.com" and (not configured_override or base ~= origin(configured_override)))
+  then
+    return nil
+  end
+  local usage_headers = {}
+  for name, value in pairs(headers) do
+    if name:lower() ~= "anthropic-beta" then
+      usage_headers[name] = value
+    end
+  end
+  usage_headers["anthropic-beta"] = "oauth-2025-04-20"
+  local response, err = ctx:send({ url = base .. "/api/oauth/usage", method = "GET", headers = usage_headers })
+  if not response then
+    return nil, err
+  end
+  if response.status ~= 200 then
+    response:close()
+    return nil, { kind = "api", status = response.status, message = "Anthropic usage request failed" }
+  end
+  local value, read_err = require("maki.json_response").read(response, 65536)
+  response:close()
+  if read_err then
+    return nil, read_err
+  end
+  return M.parse_usage(value, maki.time.parse_rfc3339)
+end
+
 function M.register()
   maki.api.register_provider({
     id = "anthropic",
     display_name = "Anthropic",
+    docs = {
+      auth_line = "`ANTHROPIC_API_KEY`",
+      urls = { "https://api.anthropic.com/v1/messages" },
+      features = "Prompt caching, thinking mode (adaptive/budgeted), advanced tool use",
+    },
     models = M.models,
     discover = M.discover,
     prepare = M.prepare,

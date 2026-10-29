@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use http_contract::{HttpContract, Response, Step};
+use http_contract::{Clock, HttpContract, Response, Step};
 use test_case::test_case;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -158,6 +158,36 @@ fn captures_json_semantically_and_preserves_query() {
         request.json().unwrap(),
         serde_json::json!({"name": "test", "items": [2, 1]})
     );
+}
+
+#[test]
+fn scripted_clock_advances_in_response_order() {
+    let clock = Clock::default();
+    let (reached, observed) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let server = HttpContract::start(vec![Response {
+        status: "200 OK".into(),
+        headers: Vec::new(),
+        steps: vec![
+            Step::AdvanceClock(clock.clone(), Duration::from_secs(2)),
+            Step::Signal(reached),
+            Step::Wait(gate),
+            Step::AdvanceClock(clock.clone(), Duration::from_secs(3)),
+            Step::Chunk(b"done".to_vec()),
+        ],
+    }])
+    .unwrap();
+    assert_eq!(clock.now(), Duration::ZERO);
+    let mut stream = TcpStream::connect(server.addr).unwrap();
+    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+    stream.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+    observed.recv_timeout(TIMEOUT).unwrap();
+    assert_eq!(clock.now(), Duration::from_secs(2));
+    release.send(()).unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    assert!(response.ends_with(b"done"));
+    assert_eq!(clock.now(), Duration::from_secs(5));
 }
 
 #[test]

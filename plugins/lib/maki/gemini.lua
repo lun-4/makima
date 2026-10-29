@@ -333,6 +333,49 @@ local function headers(settings, key)
   return result
 end
 
+local function response_error(response, opts)
+  local retry = response.headers and response.headers["retry-after"]
+  local seconds = type(retry) == "string" and retry:match("^%s*(%d+)%s*$")
+  seconds = seconds and tonumber(seconds)
+  local chunks, size = {}, 0
+  while size < 65536 do
+    local chunk, err = response:read()
+    if err or not chunk then
+      chunks = { "unable to read error body" }
+      break
+    end
+    if chunk == "" then
+      break
+    end
+    size = size + #chunk
+    if size > 65536 then
+      chunks = { "Google error response too large" }
+      break
+    end
+    chunks[#chunks + 1] = chunk
+  end
+  response:close()
+  local message = table.concat(chunks)
+  for _, secret in ipairs(opts.keys) do
+    if secret ~= "" and message:find(secret, 1, true) then
+      message = "Google request failed"
+      break
+    end
+  end
+  for _, secret in pairs(opts.headers) do
+    if type(secret) == "string" and secret ~= "" and message:find(secret, 1, true) then
+      message = "Google request failed"
+      break
+    end
+  end
+  return {
+    kind = "api",
+    status = response.status,
+    message = message,
+    retry_after_ms = seconds and seconds > 0 and seconds <= 9007199254740 and seconds * 1000 or nil,
+  }
+end
+
 function M.prepare(_, model, config)
   local opts, err = settings(config)
   if not opts then
@@ -342,6 +385,15 @@ function M.prepare(_, model, config)
   return {
     model = model,
     key_count = #opts.keys,
+    reload_auth = function()
+      local refreshed, reload_err = settings(config)
+      if not refreshed then
+        return nil, reload_err
+      end
+      opts.keys = refreshed.keys
+      index = 1
+      return true
+    end,
     rotate_key = function()
       if #opts.keys < 2 then
         return false
@@ -368,8 +420,7 @@ function M.prepare(_, model, config)
         return nil, type(send_err) == "table" and send_err or { kind = "network", message = "Google request failed" }
       end
       if response.status < 200 or response.status >= 300 then
-        response:close()
-        return nil, { kind = "api", status = response.status, message = "Google request failed" }
+        return nil, response_error(response, opts)
       end
       local result, stream_err = M.stream(response, emit)
       response:close()
@@ -392,8 +443,7 @@ function M.discover(ctx, config)
     return nil, type(send_err) == "table" and send_err or { kind = "network", message = "Google discovery failed" }
   end
   if response.status ~= 200 then
-    response:close()
-    return nil, { kind = "api", status = response.status, message = "Google discovery failed" }
+    return nil, response_error(response, opts)
   end
   local value, read_err = require("maki.json_response").read(response, 4 * 1024 * 1024)
   response:close()
@@ -424,6 +474,11 @@ function M.register()
   maki.api.register_provider({
     id = "google",
     display_name = "Google",
+    docs = {
+      auth_line = "`GEMINI_API_KEY`",
+      urls = { BASE_URL },
+      features = "Native Gemini API with thinking support",
+    },
     models = M.models,
     discover = M.discover,
     prepare = M.prepare,

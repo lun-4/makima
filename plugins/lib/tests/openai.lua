@@ -222,6 +222,68 @@ do
   assert(closed == 5)
 end
 
+do
+  local previous = maki.uv.os_getenv
+  local env = {}
+  maki.uv.os_getenv = function(name)
+    return env[name]
+  end
+  local stored = { api_key = "saved" }
+  local oauth
+  local refresh_error = { kind = "network", message = "refresh failed" }
+  local ctx = {
+    credentials = {
+      read = function(_, key)
+        return key == "chatgpt" and oauth or (key == "api_key" and stored or nil)
+      end,
+      refresh = function()
+        return nil, refresh_error
+      end,
+    },
+  }
+  local sent
+  ctx.send = function(_, request)
+    sent = request
+    return { status = 401, close = function() end }
+  end
+  local model = { id = "gpt-test", max_output_tokens = 1000 }
+  local request = { model = model, messages = {}, tools = {}, thinking = { mode = "off" } }
+  local function check(config, expected)
+    local provider = assert(openai.prepare(ctx, model, config or {}))
+    provider.stream(ctx, request, function() end)
+    assert(sent.headers.Authorization == "Bearer " .. expected)
+  end
+  check(nil, "saved")
+  check({ api_key = "configured" }, "configured")
+  env.OPENAI_API_KEY = "environment"
+  check({ api_key = "configured" }, "environment")
+  oauth = { access = "expired", refresh = "refresh", expires = 0 }
+  check(nil, "environment")
+  env.OPENAI_API_KEY = nil
+  check(nil, "saved")
+  oauth = { access = "valid", refresh = "refresh", expires = 9999999999999 }
+  local live = assert(openai.prepare(ctx, model, {}))
+  live.stream(ctx, request, function() end)
+  assert(sent.headers.Authorization == "Bearer valid")
+  oauth.expires = 0
+  live.stream(ctx, request, function() end)
+  assert(sent.headers.Authorization == "Bearer saved")
+  oauth = { access = "expired", refresh = "refresh", expires = 0 }
+  stored = nil
+  local provider, err = openai.prepare(ctx, model, {})
+  assert(not provider and err == refresh_error)
+  stored = { api_key = "saved" }
+  local models = require("maki.openai_models")
+  local previous_discover = models.discover
+  models.discover = function(_, options)
+    assert(options.kind == "platform" and options.headers.Authorization == "Bearer saved")
+    return { { id = "fixture" } }
+  end
+  assert(openai.discover(ctx, {})[1].id == "fixture")
+  models.discover = previous_discover
+  maki.uv.os_getenv = previous
+end
+
 local usage = assert(
   openai.parse_usage(
     [[{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":12.5,"limit_window_seconds":18000,"reset_at":1760000000},"secondary_window":{"used_percent":150,"limit_window_seconds":604800}}}]]

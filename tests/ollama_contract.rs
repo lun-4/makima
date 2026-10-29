@@ -6,8 +6,14 @@ use std::time::Duration;
 
 use http_contract::{HttpContract, Response, Step};
 use maki_agent::tools::ToolRegistry;
-use maki_lua::PluginHost;
+use maki_commands::CommandRegistry;
+use maki_config::PluginsConfig;
+use maki_lua::{PluginHost, test_support::InMemoryFs, ui_sink::HostUi};
 use maki_providers::{Message, Model, ProviderEvent, RequestOptions, ThinkingConfig};
+use maki_storage::{
+    StateDir,
+    auth::{ProviderCredentials, save_provider_credentials},
+};
 use serde_json::{Value, json};
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -161,4 +167,78 @@ fn ollama_registration_streams_without_credentials() {
     let body: Value = serde_json::from_slice(&request.body).unwrap();
     assert_eq!(body["stream_options"]["include_usage"], true);
     assert!(body.get("thinking").is_none());
+}
+
+#[test]
+fn saved_credentials_are_used_for_discovery_and_streaming() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let response = |body: &str| Response {
+        status: "200 OK".into(),
+        headers: vec![],
+        steps: vec![Step::Chunk(body.as_bytes().to_vec())],
+    };
+    let server = HttpContract::start(vec![
+        response(r#"{"data":[{"id":"test"}]}"#), response("{}"),
+        response("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"),
+    ]).unwrap();
+    maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
+    let _private_host_guard = PrivateHostGuard;
+    let temp = tempfile::tempdir().unwrap();
+    let state = StateDir::from_path(temp.path().to_path_buf());
+    save_provider_credentials(
+        &state,
+        "ollama",
+        &ProviderCredentials {
+            api_key: "saved-key".into(),
+            host: None,
+        },
+    )
+    .unwrap();
+    let mut host = PluginHost::with_session_provider_preparer(
+        Arc::new(ToolRegistry::new()),
+        CommandRegistry::new(),
+        true,
+        Arc::new(InMemoryFs::new()),
+        Some(temp.path().to_path_buf()),
+        None,
+        HostUi::Frontend,
+    )
+    .unwrap();
+    host.load_builtins(&PluginsConfig {
+        enabled: true,
+        names: vec!["ollama".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let factory = &snapshot.get("ollama").unwrap().factory;
+    let config = json!({"api_key_env": "OLLAMA_CONTRACT_UNUSED_KEY", "base_url": format!("http://{}", server.addr)});
+    let models = smol::block_on(factory.discover(&config)).unwrap().unwrap();
+    assert_eq!(models[0].id, "test");
+    let model = Model::from_spec("ollama/test").unwrap();
+    let (model, provider) = smol::block_on(factory.prepare(&model, &config)).unwrap();
+    let (events, _receiver) = flume::unbounded();
+    let result = smol::block_on(provider.stream_message(
+        &model,
+        &[Message::user("prompt".into())],
+        "system",
+        &json!([]),
+        &events,
+        RequestOptions {
+            thinking: ThinkingConfig::Off,
+            fast: false,
+        },
+        None,
+    ))
+    .unwrap();
+    assert_eq!(result.message.first_text_content(), Some("hello"));
+    for target in ["/v1/models", "/api/show", "/v1/chat/completions"] {
+        let request = server
+            .requests
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.target, target);
+        assert_eq!(request.header("authorization"), Some("Bearer saved-key"));
+    }
 }

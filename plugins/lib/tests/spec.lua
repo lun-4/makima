@@ -1854,6 +1854,55 @@ case("synthetic_key_rotation_and_header_override", function()
   eq(captured[4].Authorization, "Bearer second")
 end)
 
+case("synthetic_stored_credentials_and_logout", function()
+  local synthetic = require("maki.synthetic")
+  local saved
+  local store = {
+    read = function(_, key)
+      eq(key, "api_key")
+      return saved
+    end,
+    write = function(_, key, value)
+      eq(key, "api_key")
+      saved = value
+      return true
+    end,
+    delete = function(_, key)
+      eq(key, "api_key")
+      saved = nil
+      return true
+    end,
+  }
+  local ctx = { credentials = store }
+  local config = { api_key_env = "MAKI_TEST_SYNTHETIC_MISSING_KEY", api_key = "config-key" }
+  eq(synthetic.auth_status(ctx, config).source, "config")
+  assert(synthetic.login(ctx, {
+    input = function(_, _, secret, optional)
+      assert(secret and not optional)
+      return " saved-key "
+    end,
+  }))
+  eq(synthetic.auth_status(ctx, config).source, "stored")
+  local instance = assert(synthetic.prepare(ctx, { id = "fixture" }, config))
+  local authorization
+  instance.stream({
+    send = function(_, request)
+      authorization = request.headers.Authorization
+      return nil, { kind = "network", message = "fixture" }
+    end,
+  }, {
+    model = { id = "fixture", max_output_tokens = 100 },
+    messages = {},
+    tools = {},
+    system = "",
+    thinking = { mode = "off" },
+  }, function() end)
+  eq(authorization, "Bearer saved-key")
+  assert(synthetic.logout(ctx))
+  eq(synthetic.auth_status(ctx, config).source, "config")
+  eq(synthetic.auth_status(ctx, { api_key_env = "MAKI_TEST_SYNTHETIC_MISSING_KEY" }).configured, false)
+end)
+
 case("synthetic_discovers_models_with_configured_auth", function()
   local synthetic = require("maki.synthetic")
   local sent, closed = nil, false

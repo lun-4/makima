@@ -1297,6 +1297,7 @@ mod tests {
             .register(maki_providers::provider_registry::ProviderRegistration {
                 id: "test".into(),
                 display_name: "test".into(),
+                auth_methods: Vec::new(),
                 models: vec![
                     advertised,
                     maki_providers::ModelInfo::id_only("chosen".into()),

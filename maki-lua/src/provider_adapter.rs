@@ -4,7 +4,7 @@ use flume::Sender;
 use maki_agent::cancel::CancelToken;
 use maki_providers::{
     AgentError, Message, Model, ModelInfo, ProviderEvent, ProviderUsage, RequestOptions,
-    StreamResponse, ThinkingConfig,
+    StreamResponse, ThinkingConfig, ThinkingConfigExt,
     provider::{BoxFuture, Provider},
     provider_registry::{PreparedProvider, ProviderFactory},
 };
@@ -14,6 +14,16 @@ use serde_json::{Value, json};
 /// Thread-safe dispatch boundary implemented by the Lua runtime. Implementations
 /// must bind instance IDs to their originating plugin generation.
 pub trait ProviderDispatch: Send + Sync {
+    fn auth<'a>(
+        &'a self,
+        _provider: &'a str,
+        _hook: &'static str,
+        _input: &'a Value,
+        _cancel: CancelToken,
+    ) -> BoxFuture<'a, Result<Value, AgentError>> {
+        Box::pin(async { Ok(Value::Null) })
+    }
+
     fn discover<'a>(
         &'a self,
         _provider: &'a str,
@@ -58,6 +68,38 @@ pub struct LuaProviderFactory {
 }
 
 impl ProviderFactory for LuaProviderFactory {
+    fn auth_status<'a>(&'a self, config: &'a Value) -> BoxFuture<'a, Result<Value, AgentError>> {
+        Box::pin(async move {
+            let (_trigger, cancel) = CancelToken::new();
+            self.dispatch
+                .auth(&self.provider, "auth_status", config, cancel)
+                .await
+        })
+    }
+
+    fn logout<'a>(&'a self, config: &'a Value) -> BoxFuture<'a, Result<Value, AgentError>> {
+        Box::pin(async move {
+            let (_trigger, cancel) = CancelToken::new();
+            self.dispatch
+                .auth(&self.provider, "logout", config, cancel)
+                .await
+        })
+    }
+
+    fn login<'a>(
+        &'a self,
+        method: &'a str,
+        interaction: &'a Value,
+    ) -> BoxFuture<'a, Result<Value, AgentError>> {
+        Box::pin(async move {
+            let (_trigger, cancel) = CancelToken::new();
+            let input = json!({ "method": method, "interaction": interaction });
+            self.dispatch
+                .auth(&self.provider, "login", &input, cancel)
+                .await
+        })
+    }
+
     fn discover<'a>(
         &'a self,
         config: &'a Value,
@@ -392,7 +434,11 @@ fn request(
         ThinkingConfig::Effort(level) => json!({"mode": "effort", "level": level.as_str()}),
         ThinkingConfig::Budget(tokens) => json!({"mode": "budget", "tokens": tokens}),
     };
+    let mut local_thinking = json!({});
+    opts.thinking
+        .apply_local_thinking(&mut local_thinking, model);
     Ok(json!({
+        "local_thinking": local_thinking,
         "model": model_metadata(model),
         "system": system,
         "messages": serde_json::to_value(messages)?,

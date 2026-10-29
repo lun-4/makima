@@ -1484,6 +1484,7 @@ mod tests {
             .register(ProviderRegistration {
                 id: "print-test-provider".into(),
                 display_name: "Print test".into(),
+                auth_methods: Vec::new(),
                 models: vec![ModelInfo {
                     context_window: Some(WINDOW),
                     ..ModelInfo::id_only("model".into())

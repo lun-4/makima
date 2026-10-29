@@ -116,25 +116,74 @@ function M.encode_thinking(body, intent, max_thinking_budget)
   return true
 end
 
-local function credentials(config)
-  local key = maki.uv.os_getenv(config.api_key_env or "SYNTHETIC_API_KEY")
-  if not key or key == "" then
-    key = config.api_key
-  end
-  if not key or key == "" then
-    return nil, { kind = "config", message = "Synthetic API key is not configured" }
-  end
+local CREDENTIAL_KEY = "api_key"
+
+local function credentials(ctx, config)
   local keys = {}
-  for part in key:gmatch("[^,]+") do
+  local env = maki.uv.os_getenv(config.api_key_env or "SYNTHETIC_API_KEY") or ""
+  for part in env:gmatch("[^,]+") do
     local trimmed = part:match("^%s*(.-)%s*$")
     if trimmed ~= "" then
       keys[#keys + 1] = trimmed
     end
   end
+  if #keys > 0 then
+    return keys, nil, "env"
+  end
+  if ctx and ctx.credentials then
+    local saved, err = ctx.credentials:read(CREDENTIAL_KEY)
+    if err then
+      return nil, err
+    end
+    if saved ~= nil then
+      if type(saved) ~= "table" or type(saved.api_key) ~= "string" or saved.api_key == "" then
+        return nil, { kind = "config", message = "Invalid Synthetic credentials" }
+      end
+      return { saved.api_key }, nil, "stored"
+    end
+  end
+  if type(config.api_key) == "string" and config.api_key ~= "" then
+    for part in config.api_key:gmatch("[^,]+") do
+      local trimmed = part:match("^%s*(.-)%s*$")
+      if trimmed ~= "" then
+        keys[#keys + 1] = trimmed
+      end
+    end
+  end
   if #keys == 0 then
     return nil, { kind = "config", message = "Synthetic API key is not configured" }
   end
-  return keys
+  return keys, nil, "config"
+end
+
+function M.login(ctx, ui)
+  local key, err = ui:input("Synthetic API key", true, false)
+  if err then
+    return nil, err
+  end
+  if not key then
+    return false
+  end
+  key = key:match("^%s*(.-)%s*$")
+  if key == "" then
+    return nil, { kind = "config", message = "Synthetic API key is not configured" }
+  end
+  return ctx.credentials:write(CREDENTIAL_KEY, { api_key = key })
+end
+
+function M.auth_status(ctx, config)
+  local keys, err, source = credentials(ctx, config or {})
+  if not keys then
+    if err and err.message ~= "Synthetic API key is not configured" then
+      return nil, err
+    end
+    return { configured = false }
+  end
+  return { configured = true, source = source, method = "api_key" }
+end
+
+function M.logout(ctx)
+  return ctx.credentials:delete(CREDENTIAL_KEY)
 end
 
 local function headers(config, key)
@@ -160,7 +209,7 @@ end
 
 function M.discover(ctx, config)
   config = config or {}
-  local keys, err = credentials(config)
+  local keys, err = credentials(ctx, config)
   if not keys then
     return nil, err
   end
@@ -184,9 +233,9 @@ function M.discover(ctx, config)
   return require("maki.openai_models").parse_platform(value)
 end
 
-function M.prepare(_, model, config)
+function M.prepare(ctx, model, config)
   config = config or {}
-  local keys, err = credentials(config)
+  local keys, err = credentials(ctx, config)
   if not keys then
     return nil, err
   end
@@ -318,9 +367,17 @@ function M.register()
   maki.api.register_provider({
     id = "synthetic",
     display_name = "Synthetic",
+    docs = {
+      auth_line = "`SYNTHETIC_API_KEY`",
+      urls = { "https://api.synthetic.new/openai/v1" },
+      features = "Reasoning effort support (low/medium/high), open-weight models",
+    },
     models = M.models,
     prepare = M.prepare,
     discover = M.discover,
+    auth = { { id = "api_key", label = "API key", login = M.login } },
+    auth_status = M.auth_status,
+    logout = M.logout,
   })
 end
 

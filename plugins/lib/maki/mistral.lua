@@ -91,10 +91,22 @@ function M.build_request(request)
   return body
 end
 
-local function credentials(config)
+local function credentials(ctx, config)
   local key = maki.uv.os_getenv(config.api_key_env or "MISTRAL_API_KEY")
   if not key or key == "" then
-    key = config.api_key
+    if ctx and ctx.credentials then
+      local saved, err = ctx.credentials:read("api_key")
+      if err and not config.api_key then
+        return nil, err
+      end
+      key = saved
+    end
+    if not key or key == "" then
+      key = config.api_key
+    end
+  end
+  if key ~= nil and type(key) ~= "string" then
+    return nil, { kind = "config", message = "Invalid Mistral credentials" }
   end
   local keys = {}
   for part in (key or ""):gmatch("[^,]+") do
@@ -126,31 +138,9 @@ local function base_url(config)
   return (config.base_url or "https://api.mistral.ai/v1"):gsub("/+$", "")
 end
 
-local function read_response(response)
-  local chunks, size = {}, 0
-  while true do
-    local chunk, err = response:read()
-    if not chunk then
-      response:close()
-      return nil, err
-    end
-    if chunk == "" then
-      break
-    end
-    size = size + #chunk
-    if size > 65536 then
-      response:close()
-      return nil, { kind = "api", message = "Mistral response too large" }
-    end
-    chunks[#chunks + 1] = chunk
-  end
-  response:close()
-  return table.concat(chunks)
-end
-
 function M.discover(ctx, config)
   config = config or {}
-  local keys, err = credentials(config)
+  local keys, err = credentials(ctx, config)
   if not keys then
     return nil, err
   end
@@ -163,20 +153,26 @@ function M.discover(ctx, config)
     response:close()
     return nil, { kind = "api", status = response.status, message = "Mistral request failed" }
   end
-  local body, read_err = read_response(response)
-  if not body then
+  local data, read_err = require("maki.json_response").read(response, 4 * 1024 * 1024)
+  response:close()
+  if not data then
     return nil, read_err
   end
-  local data, decode_err = maki.json.decode(body)
-  if not data or type(data.data) ~= "table" then
-    return nil, { kind = "api", message = tostring(decode_err or "Invalid Mistral models response") }
+  if type(data) ~= "table" or type(data.data) ~= "table" then
+    return nil, { kind = "api", message = "Invalid Mistral models response" }
   end
   local models = {}
   for _, model in ipairs(data.data) do
-    local caps = model.capabilities
-    if type(model.id) == "string" and type(caps) == "table" and caps.completion_chat == true then
+    local caps = type(model) == "table" and model.capabilities
+    if
+      type(model) == "table"
+      and type(model.id) == "string"
+      and model.id ~= ""
+      and type(caps) == "table"
+      and caps.completion_chat == true
+    then
       local context = model.max_context_length
-      if type(context) ~= "number" or context < 0 or context > 4294967295 or context % 1 ~= 0 then
+      if type(context) ~= "number" or context <= 0 or context > 4294967295 or context % 1 ~= 0 then
         context = nil
       end
       models[#models + 1] = {
@@ -193,9 +189,9 @@ function M.discover(ctx, config)
   return models
 end
 
-function M.prepare(_, model, config)
+function M.prepare(ctx, model, config)
   config = config or {}
-  local keys, err = credentials(config)
+  local keys, err = credentials(ctx, config)
   if not keys then
     return nil, err
   end
@@ -243,13 +239,43 @@ function M.prepare(_, model, config)
   }
 end
 
+function M.login(ctx, ui)
+  local key, err = ui:input("Mistral API key", true, false)
+  if err then
+    return nil, err
+  end
+  if not key then
+    return false
+  end
+  if key:match("^%s*$") then
+    return nil, { kind = "config", message = "Mistral API key is empty" }
+  end
+  return ctx.credentials:write("api_key", key)
+end
+
+function M.auth_status(ctx, config)
+  local keys, err = credentials(ctx, config or {})
+  if err and err.message ~= "Mistral API key is not configured" then
+    return nil, err
+  end
+  return { configured = keys ~= nil, method = "api_key" }
+end
+
+function M.logout(ctx)
+  return ctx.credentials:delete("api_key")
+end
+
 function M.register()
   maki.api.register_provider({
     id = "mistral",
     display_name = "Mistral",
+    docs = { auth_line = "`MISTRAL_API_KEY`", urls = { "https://api.mistral.ai/v1" } },
     models = M.models,
     discover = M.discover,
     prepare = M.prepare,
+    auth = { { id = "api_key", label = "API key", login = M.login } },
+    auth_status = M.auth_status,
+    logout = M.logout,
     supports_thinking = true,
     accepts_arbitrary_models = true,
     fallback_context_window = 128000,

@@ -319,6 +319,7 @@ mod tests {
             .register(ProviderRegistration {
                 id: "lua-provider".into(),
                 display_name: "Lua provider".into(),
+                auth_methods: Vec::new(),
                 models: vec![
                     ModelInfo::id_only("allowed".into()),
                     ModelInfo::id_only("blocked".into()),

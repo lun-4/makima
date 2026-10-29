@@ -394,10 +394,17 @@ fn format_auth(kind: ProviderKind) -> String {
     }
 }
 
-fn build_sections() -> Vec<ProviderSection> {
+fn build_sections(providers: &[OfflineProvider]) -> Vec<ProviderSection> {
     let mut sections = Vec::new();
 
     for kind in ProviderKind::iter() {
+        if kind != ProviderKind::DeepSeek
+            && providers
+                .iter()
+                .any(|provider| provider.id == kind.to_string() && provider.docs.is_some())
+        {
+            continue;
+        }
         match kind {
             ProviderKind::Zai => {
                 sections.push(ProviderSection {
@@ -660,6 +667,39 @@ fn write_section(out: &mut String, section: &ProviderSection, offline: Option<&O
     }
 }
 
+fn write_offline_section(out: &mut String, provider: &OfflineProvider) {
+    let Some(docs) = &provider.docs else {
+        return;
+    };
+    let _ = writeln!(out, "### {}\n", provider.display_name);
+    let _ = writeln!(out, "- **Env var**: {}", docs.auth_line);
+    if docs.urls.len() == 1 {
+        let _ = writeln!(out, "- **API**: `{}`", docs.urls[0]);
+    } else {
+        let _ = writeln!(out, "- **API endpoints**:");
+        for url in &docs.urls {
+            let _ = writeln!(out, "  - `{url}`");
+        }
+    }
+    if let Some(features) = &docs.features {
+        let _ = writeln!(out, "- **Features**: {features}");
+    }
+    let _ = writeln!(out);
+    if provider.models.is_empty() {
+        if let Some(note) = &docs.no_catalog_note {
+            let _ = writeln!(out, "{note}");
+        }
+    } else {
+        write_offline_model_table(out, &provider.models);
+    }
+    for note in &provider.docs_notes {
+        let _ = writeln!(out, "\n{note}");
+    }
+    if provider.id == "anthropic" {
+        let _ = writeln!(out, "\n{LONG_CONTEXT_NOTE}\n\n{BEDROCK_NOTE}");
+    }
+}
+
 pub fn generate() -> Result<String> {
     let providers = load_bundled_providers()
         .map_err(|error| eyre!("offline provider registration: {error}"))?;
@@ -679,11 +719,16 @@ pub fn generate() -> Result<String> {
     let _ = writeln!(out, "{BASE_URL_OVERRIDES}\n");
     let _ = writeln!(out, "## Built-in Providers\n");
 
-    for section in &build_sections() {
+    let sections = build_sections(&providers);
+    for kind in ProviderKind::iter() {
         let offline = providers
             .iter()
-            .find(|provider| provider.id == section.kind.to_string());
-        write_section(&mut out, section, offline);
+            .find(|provider| provider.id == kind.to_string());
+        if let Some(section) = sections.iter().find(|section| section.kind == kind) {
+            write_section(&mut out, section, offline);
+        } else if let Some(provider) = offline {
+            write_offline_section(&mut out, provider);
+        }
         let _ = writeln!(out);
     }
 
@@ -709,21 +754,25 @@ mod tests {
             .iter()
             .find(|provider| provider.id == "synthetic")
             .unwrap();
-        let section = build_sections()
-            .into_iter()
-            .find(|section| section.kind.to_string() == provider.id)
-            .unwrap();
         let mut output = String::new();
-        write_section(&mut output, &section, Some(provider));
+        super::write_offline_section(&mut output, provider);
         for model in &provider.models {
             assert!(output.contains(&model.prefixes.join(", ")));
         }
         assert!(output.contains("Defaults:"));
+        let docs = provider.docs.as_ref().unwrap();
+        assert!(output.contains(&docs.auth_line));
+        assert!(output.contains(&docs.urls[0]));
+        assert!(
+            !build_sections(&providers)
+                .iter()
+                .any(|section| section.kind.to_string() == provider.id)
+        );
     }
 
     #[test]
     fn section_renders_its_supplied_pricing_schedule() {
-        let sections = build_sections();
+        let sections = build_sections(&[]);
         let scheduled = sections
             .iter()
             .find(|section| section.pricing_schedule.is_some())

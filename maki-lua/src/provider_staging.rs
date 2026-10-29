@@ -64,6 +64,58 @@ impl ProviderStaging {
     }
 }
 
+pub(crate) fn auth_methods(
+    provider: &Table,
+) -> Result<Vec<maki_providers::provider_registry::ProviderAuthMethod>, String> {
+    for hook in ["auth_status", "logout"] {
+        match provider.raw_get::<Value>(hook).map_err(|e| e.to_string())? {
+            Value::Nil | Value::Function(_) => {}
+            _ => return Err(format!("{hook}: expected a function")),
+        }
+    }
+    let methods = match provider
+        .raw_get::<Value>("auth")
+        .map_err(|e| e.to_string())?
+    {
+        Value::Nil => return Ok(Vec::new()),
+        Value::Table(table) => table,
+        _ => return Err("auth: expected an array".into()),
+    };
+    let mut entries = Vec::new();
+    for entry in methods.pairs::<Value, Value>() {
+        let (key, value) = entry.map_err(|e| e.to_string())?;
+        let Value::Integer(index) = key else {
+            return Err("auth: expected an array".into());
+        };
+        entries.push((index, value));
+    }
+    entries.sort_by_key(|(index, _)| *index);
+    let mut ids = BTreeSet::new();
+    let mut result = Vec::new();
+    for (position, (index, value)) in entries.into_iter().enumerate() {
+        if index != (position + 1) as i64 {
+            return Err("auth: expected consecutive array keys".into());
+        }
+        let Value::Table(entry) = value else {
+            return Err(format!("auth[{index}]: expected a table"));
+        };
+        let id: String = entry
+            .raw_get("id")
+            .map_err(|e| format!("auth[{index}].id: {e}"))?;
+        let label: String = entry
+            .raw_get("label")
+            .map_err(|e| format!("auth[{index}].label: {e}"))?;
+        let _: mlua::Function = entry
+            .raw_get("login")
+            .map_err(|e| format!("auth[{index}].login: {e}"))?;
+        if id.trim().is_empty() || label.trim().is_empty() || !ids.insert(id.clone()) {
+            return Err(format!("auth[{index}]: empty or duplicate method identity"));
+        }
+        result.push(maki_providers::provider_registry::ProviderAuthMethod { id, label });
+    }
+    Ok(result)
+}
+
 fn validate_models(provider: &Table) -> Result<(), String> {
     model_descriptors(provider).map(|_| ())
 }

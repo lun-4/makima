@@ -65,6 +65,43 @@ local _, api_error = prepared.stream(ctx, { model = { id = "claude-sonnet-5" }, 
 end)
 assert(sent.headers["x-api-key"] == "second")
 assert(api_error.status == 429 and api_error.retry_after_ms == 3000 and api_error.message == "Anthropic request failed")
+local saved_key = "stored-key"
+local credential_ctx = {
+  credentials = {
+    read = function(_, name)
+      assert(name == "api_key")
+      return { api_key = saved_key }
+    end,
+  },
+}
+local stored = assert(
+  direct.prepare(
+    credential_ctx,
+    { id = "claude-sonnet-5" },
+    { api_key_env = "MAKI_TEST_MISSING_ANTHROPIC_KEY", api_key = "config-key" }
+  )
+)
+local function current_key()
+  local _, err = stored.stream(ctx, { model = { id = "claude-sonnet-5" }, messages = {} }, function()
+    return true
+  end)
+  assert(err.status == 429)
+  return sent.headers["x-api-key"]
+end
+assert(current_key() == "stored-key")
+saved_key = "replacement-key"
+assert(stored.reload_auth(credential_ctx))
+assert(current_key() == "replacement-key")
+local _, invalid = direct.prepare(
+  { credentials = {
+    read = function()
+      return { api_key = false }
+    end,
+  } },
+  {},
+  { api_key_env = "MAKI_TEST_MISSING_ANTHROPIC_KEY" }
+)
+assert(invalid.kind == "config" and invalid.message == "Invalid Anthropic credentials")
 local request = {
   model = { id = "claude-opus-4-7-1m", max_output_tokens = 8192, fast = true },
   system = "system",
@@ -178,3 +215,69 @@ for _, case in ipairs({
   })
   assert(wire.output_config.effort == case[2])
 end
+
+local usage = assert(direct.parse_usage({
+  limits = {
+    { kind = "session", percent = 13.6, resets_at = "reset" },
+    { kind = "weekly_scoped", percent = 2.5, scope = { model = { display_name = "Sonnet" } } },
+    { kind = "custom", percent = 4 },
+  },
+  five_hour = { utilization = 99 },
+  spend = { enabled = true, used = { amount_minor = 233 } },
+}, function(timestamp)
+  return timestamp == "reset" and 1234 or nil
+end))
+assert(#usage.limits == 4 and usage.limits[1].percentage == 14 and usage.limits[1].reset_at == 1234)
+assert(usage.limits[2].kind.model == "Sonnet" and usage.limits[2].percentage == 3)
+assert(usage.limits[3].kind.label == "custom")
+assert(usage.limits[4].percentage == 0 and usage.limits[4].detail == "$2.33 spent")
+local fallback = assert(direct.parse_usage({
+  limits = { { kind = "session" } },
+  five_hour = { utilization = 35 },
+  seven_day_opus = { utilization = 3 },
+  extra_usage = { is_enabled = true, utilization = 2, used_credits = 233 },
+}))
+assert(#fallback.limits == 3 and fallback.limits[2].kind.model == "Opus")
+assert(fallback.limits[3].detail == "$2.33 spent")
+assert(
+  #assert(direct.parse_usage({ spend = { enabled = false }, extra_usage = { is_enabled = true, utilization = 2 } })).limits
+    == 0
+)
+assert(not direct.parse_usage({ limits = { {} } }))
+
+local usage_request, closed
+local usage_ctx = {
+  send = function(_, request)
+    usage_request = request
+    local done = false
+    return {
+      status = 200,
+      read = function()
+        if done then
+          return ""
+        end
+        done = true
+        return '{"five_hour":{"utilization":12}}'
+      end,
+      close = function()
+        closed = true
+      end,
+    }
+  end,
+}
+assert(direct.fetch_usage(usage_ctx, "https://proxy.invalid", { Authorization = "Bearer token" }) == nil)
+assert(direct.fetch_usage(usage_ctx, nil, { ["x-api-key"] = "key" }) == nil)
+local fetched = assert(
+  direct.fetch_usage(
+    usage_ctx,
+    "https://proxy.invalid/v1/messages?x=1",
+    { Authorization = "Bearer token" },
+    "https://proxy.invalid"
+  )
+)
+assert(closed and fetched.limits[1].percentage == 12)
+assert(usage_request.url == "https://proxy.invalid/api/oauth/usage" and usage_request.method == "GET")
+assert(
+  usage_request.headers.Authorization == "Bearer token"
+    and usage_request.headers["anthropic-beta"] == "oauth-2025-04-20"
+)

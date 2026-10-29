@@ -295,6 +295,7 @@ mod tests {
             .register(ProviderRegistration {
                 id: "anthropic".into(),
                 display_name: "Anthropic".into(),
+                auth_methods: Vec::new(),
                 models: vec![ModelInfo::id_only("different-model".into())],
                 factory: Arc::new(Factory),
             })

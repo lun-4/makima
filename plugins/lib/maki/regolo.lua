@@ -40,10 +40,27 @@ M.models = {
   },
 }
 
-local function credentials(config)
+local function credentials(ctx, config)
   local key = maki.uv.os_getenv(config.api_key_env or "REGOLO_API_KEY")
   if not key or key == "" then
-    key = config.api_key
+    if ctx and ctx.credentials then
+      local saved, err = ctx.credentials:read("api_key")
+      if err and not config.api_key then
+        return nil, err
+      end
+      if saved ~= nil then
+        if type(saved) ~= "table" or type(saved.api_key) ~= "string" or saved.api_key == "" then
+          return nil, { kind = "config", message = "Invalid Regolo credentials" }
+        end
+        key = saved.api_key
+      end
+    end
+    if not key or key == "" then
+      key = config.api_key
+    end
+  end
+  if key ~= nil and type(key) ~= "string" then
+    return nil, { kind = "config", message = "Invalid Regolo credentials" }
   end
   local keys = {}
   for part in (key or ""):gmatch("[^,]+") do
@@ -75,14 +92,22 @@ local function headers(config, key)
   return result
 end
 
+local function api_error(response)
+  local value = response.headers and response.headers["retry-after"]
+  local seconds = type(value) == "string" and tonumber(value:match("^%s*(%d+)%s*$")) or nil
+  local retry_after_ms = seconds and seconds > 0 and seconds <= 9007199254740 and seconds * 1000 or nil
+  local status = response.status
+  response:close()
+  return { kind = "api", status = status, message = "Regolo request failed", retry_after_ms = retry_after_ms }
+end
+
 local function get(ctx, url, request_headers)
   local response, err = ctx:send({ url = url, method = "GET", headers = request_headers })
   if not response then
     return nil, err
   end
-  if response.status < 200 or response.status >= 300 then
-    response:close()
-    return nil, { kind = "api", status = response.status, message = "Regolo request failed" }
+  if response.status ~= 200 then
+    return nil, api_error(response)
   end
   local value, read_err = require("maki.json_response").read(response, 1048576)
   response:close()
@@ -124,7 +149,7 @@ end
 
 function M.discover(ctx, config)
   config = config or {}
-  local keys, err = credentials(config)
+  local keys, err = credentials(ctx, config)
   if not keys then
     return nil, err
   end
@@ -134,19 +159,32 @@ function M.discover(ctx, config)
   if not response then
     return nil, get_err
   end
-  if type(response.data) ~= "table" then
-    return nil, { kind = "api", message = "Invalid Regolo models response" }
-  end
   local ids = {}
-  for _, model in ipairs(response.data) do
-    if type(model.id) == "string" then
+  local data = type(response) == "table" and type(response.data) == "table" and response.data or {}
+  for _, model in ipairs(data) do
+    if type(model) == "table" and type(model.id) == "string" then
       ids[#ids + 1] = model.id
     end
   end
   table.sort(ids)
   local groups = get(ctx, base:gsub("/v1$", "") .. "/model_group/info", request_headers)
   if type(groups) == "table" and type(groups.data) == "table" then
-    return M.join_models(ids, groups.data)
+    local valid = true
+    for _, group in ipairs(groups.data) do
+      if
+        type(group) ~= "table"
+        or type(group.model_group) ~= "string"
+        or type(group.mode) ~= "string"
+        or type(group.supports_reasoning) ~= "boolean"
+        or type(group.supports_vision) ~= "boolean"
+      then
+        valid = false
+        break
+      end
+    end
+    if valid then
+      return M.join_models(ids, groups.data)
+    end
   end
   local models = {}
   for _, id in ipairs(ids) do
@@ -155,9 +193,9 @@ function M.discover(ctx, config)
   return models
 end
 
-function M.prepare(_, model, config)
+function M.prepare(ctx, model, config)
   config = config or {}
-  local keys, err = credentials(config)
+  local keys, err = credentials(ctx, config)
   if not keys then
     return nil, err
   end
@@ -192,7 +230,8 @@ function M.prepare(_, model, config)
           percentage = math.clamp(math.floor(info.spend / info.max_budget * 100), 0, 100)
         end
       end
-      local limits = { { kind = { type = "credits" }, percentage = percentage, detail = detail } }
+      local reset_at = type(info.budget_reset_at) == "string" and maki.time.parse_rfc3339(info.budget_reset_at) or nil
+      local limits = { { kind = { type = "credits" }, percentage = percentage, reset_at = reset_at, detail = detail } }
       local now = maki.time.now().secs
       local day = os.date("!%Y-%m-%d", now)
       local query = "?start_date=" .. day .. "&end_date=" .. day
@@ -247,7 +286,7 @@ function M.prepare(_, model, config)
     stream = function(ctx, request, emit)
       local chat = require("maki.chat_completions")
       local body, build_err =
-        chat.build_request(request, { max_tokens_field = "max_tokens", include_stream_usage = true })
+        chat.build_request(request, { max_tokens_field = "max_completion_tokens", include_stream_usage = true })
       if not body then
         return nil, { kind = "config", message = tostring(build_err) }
       end
@@ -272,15 +311,43 @@ function M.prepare(_, model, config)
       if not response then
         return nil, send_err
       end
-      if response.status < 200 or response.status >= 300 then
-        response:close()
-        return nil, { kind = "api", status = response.status, message = "Regolo request failed" }
+      if response.status ~= 200 then
+        return nil, api_error(response)
       end
       local result, stream_err = chat.stream(response, emit)
       response:close()
+      if stream_err and stream_err.kind == "api" then
+        return nil, { kind = "api", status = stream_err.status, message = "Regolo request failed" }
+      end
       return result, stream_err
     end,
   }
+end
+
+function M.login(ctx, ui)
+  local key, err = ui:input("Regolo API key", true, false)
+  if err then
+    return nil, err
+  end
+  if not key then
+    return false
+  end
+  if key:match("^%s*$") then
+    return nil, { kind = "config", message = "Regolo API key is empty" }
+  end
+  return ctx.credentials:write("api_key", { api_key = key:match("^%s*(.-)%s*$") })
+end
+
+function M.auth_status(ctx, config)
+  local keys, err = credentials(ctx, config or {})
+  if err and err.message ~= "Regolo API key is not configured" then
+    return nil, err
+  end
+  return { configured = keys ~= nil, method = "api_key" }
+end
+
+function M.logout(ctx)
+  return ctx.credentials:delete("api_key")
 end
 
 function M.register()
@@ -290,6 +357,9 @@ function M.register()
     models = M.models,
     discover = M.discover,
     prepare = M.prepare,
+    auth = { { id = "api_key", label = "API key", login = M.login } },
+    auth_status = M.auth_status,
+    logout = M.logout,
     supports_thinking = true,
     accepts_arbitrary_models = true,
     fallback_context_window = 120000,

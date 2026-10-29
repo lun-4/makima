@@ -17,7 +17,33 @@ const DEFAULT_CONTEXT_WINDOW: u32 = 128_000;
 
 pub type PreparedProvider = Result<(Model, Box<dyn Provider>), AgentError>;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderAuthMethod {
+    pub id: String,
+    pub label: String,
+}
+
 pub trait ProviderFactory: Send + Sync {
+    fn auth_status<'a>(&'a self, _config: &'a Value) -> BoxFuture<'a, Result<Value, AgentError>> {
+        Box::pin(async { Ok(Value::Null) })
+    }
+
+    fn logout<'a>(&'a self, _config: &'a Value) -> BoxFuture<'a, Result<Value, AgentError>> {
+        Box::pin(async { Ok(Value::Null) })
+    }
+
+    fn login<'a>(
+        &'a self,
+        _method: &'a str,
+        _interaction: &'a Value,
+    ) -> BoxFuture<'a, Result<Value, AgentError>> {
+        Box::pin(async {
+            Err(AgentError::Config {
+                message: "provider does not support login".into(),
+            })
+        })
+    }
+
     fn discover<'a>(
         &'a self,
         _config: &'a Value,
@@ -36,6 +62,7 @@ pub trait ProviderFactory: Send + Sync {
 pub struct ProviderRegistration {
     pub id: String,
     pub display_name: String,
+    pub auth_methods: Vec<ProviderAuthMethod>,
     pub models: Vec<ModelInfo>,
     pub factory: Arc<dyn ProviderFactory>,
 }
@@ -331,6 +358,7 @@ mod tests {
         ProviderRegistration {
             id: id.into(),
             display_name: id.into(),
+            auth_methods: Vec::new(),
             models: vec![ModelInfo::id_only(model.into())],
             factory: Arc::new(Factory),
         }

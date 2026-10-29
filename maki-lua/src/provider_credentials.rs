@@ -1,5 +1,5 @@
 use maki_agent::cancel::CancelToken;
-use maki_storage::auth::{CredentialError, CredentialScope, RefreshOutcome};
+use maki_storage::auth::{CredentialError, CredentialScope, LegacyCredentialKind, RefreshOutcome};
 use mlua::{Function, Lua, MultiValue, Table, Value};
 
 use crate::api::util::convert::{json_to_lua_with_nulls, lua_to_json};
@@ -23,8 +23,8 @@ fn scope(
     provider: &str,
     key: &str,
 ) -> Result<CredentialScope, String> {
-    let trusted = matches!(source, SourceIdentity::Embedded("providers"))
-        || matches!(source, SourceIdentity::Embedded("synthetic")) && provider == "synthetic";
+    let trusted = matches!(source, SourceIdentity::CoreProviders)
+        || matches!(source, SourceIdentity::Embedded(name) if *name == provider && matches!(provider, "ollama" | "llama-cpp" | "synthetic") && key == "api_key");
     if !trusted
         || key.is_empty()
         || !key
@@ -33,8 +33,23 @@ fn scope(
     {
         return Err("credential access denied".into());
     }
+    let dir = crate::api::env::host_state_dir(lua)?;
+    if matches!(source, SourceIdentity::CoreProviders) && provider == "openai" {
+        let kind = match key {
+            "chatgpt" => Some(LegacyCredentialKind::OAuth),
+            "api_key" => Some(LegacyCredentialKind::ApiKey),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            return CredentialScope::legacy(dir, "openai", kind).map_err(|e| e.to_string());
+        }
+    }
+    if matches!(provider, "ollama" | "llama-cpp" | "synthetic") && key == "api_key" {
+        return CredentialScope::legacy(dir, provider, LegacyCredentialKind::ApiKey)
+            .map_err(|e| e.to_string());
+    }
     let name = format!("lua_{}_{}_{}", provider.len(), provider, key);
-    CredentialScope::new(crate::api::env::host_state_dir(lua)?, &name).map_err(|e| e.to_string())
+    CredentialScope::new(dir, &name).map_err(|e| e.to_string())
 }
 
 pub(crate) fn attach(
@@ -202,6 +217,90 @@ mod tests {
     use crate::runtime::{TaskCell, TaskScope};
 
     #[test]
+    fn openai_legacy_scope_is_limited_to_trusted_provider() {
+        use super::scope;
+        use maki_storage::StateDir;
+        use maki_storage::auth::{OAuthTokens, load_tokens, save_tokens};
+
+        let tmp = TempDir::new().unwrap();
+        let lua = Lua::new();
+        lua.set_app_data(StateDirOverride(tmp.path().to_owned()));
+        let dir = StateDir::from_path(tmp.path().to_owned());
+        save_tokens(
+            &dir,
+            "openai",
+            &OAuthTokens {
+                access: "old".into(),
+                refresh: "refresh".into(),
+                expires: 100,
+                account_id: None,
+            },
+        )
+        .unwrap();
+        let trusted = SourceIdentity::CoreProviders;
+        assert!(
+            scope(
+                &lua,
+                &SourceIdentity::Embedded("providers"),
+                "openai",
+                "chatgpt"
+            )
+            .is_err()
+        );
+        let oauth = scope(&lua, &trusted, "openai", "chatgpt").unwrap();
+        assert_eq!(oauth.read().unwrap().unwrap()["access"], "old");
+        smol::block_on(
+            oauth.write(&serde_json::json!({"access":"new", "refresh":"refresh", "expires":200})),
+        )
+        .unwrap();
+        assert_eq!(load_tokens(&dir, "openai").unwrap().access, "new");
+        assert!(
+            scope(&lua, &trusted, "other", "chatgpt")
+                .unwrap()
+                .read()
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            scope(
+                &lua,
+                &SourceIdentity::Embedded("synthetic"),
+                "openai",
+                "chatgpt"
+            )
+            .is_err()
+        );
+        assert!(scope(&lua, &trusted, "openai", "../openai").is_err());
+    }
+
+    #[test]
+    fn synthetic_legacy_key_scope_is_restricted() {
+        use super::scope;
+        use maki_storage::StateDir;
+        use maki_storage::auth::{ProviderCredentials, save_provider_credentials};
+
+        let tmp = TempDir::new().unwrap();
+        let lua = Lua::new();
+        lua.set_app_data(StateDirOverride(tmp.path().to_owned()));
+        let dir = StateDir::from_path(tmp.path().to_owned());
+        save_provider_credentials(
+            &dir,
+            "synthetic",
+            &ProviderCredentials {
+                api_key: "saved-key".into(),
+                host: None,
+            },
+        )
+        .unwrap();
+        let trusted = SourceIdentity::Embedded("synthetic");
+        let key = scope(&lua, &trusted, "synthetic", "api_key").unwrap();
+        assert_eq!(key.read().unwrap().unwrap()["api_key"], "saved-key");
+        assert!(scope(&lua, &trusted, "synthetic", "other").is_err());
+        assert!(scope(&lua, &trusted, "openai", "api_key").is_err());
+        assert!(scope(&lua, &SourceIdentity::Other, "synthetic", "api_key").is_err());
+    }
+
+    #[test]
     fn trusted_provider_can_delete_credentials() {
         let tmp = TempDir::new().unwrap();
         let lua = Lua::new();
@@ -213,7 +312,7 @@ mod tests {
             &context,
             task.handle().clone(),
             CancelToken::none(),
-            SourceIdentity::Embedded("providers"),
+            SourceIdentity::CoreProviders,
             "example".into(),
         )
         .unwrap();

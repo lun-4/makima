@@ -3,6 +3,7 @@
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -41,8 +42,23 @@ impl Request {
     }
 }
 
+#[derive(Clone, Default)]
+pub struct Clock(Arc<Mutex<Duration>>);
+
+impl Clock {
+    pub fn now(&self) -> Duration {
+        *self.0.lock().expect("clock lock poisoned")
+    }
+
+    pub fn advance(&self, duration: Duration) {
+        let mut now = self.0.lock().expect("clock lock poisoned");
+        *now = now.checked_add(duration).expect("clock overflow");
+    }
+}
+
 pub enum Step {
     Chunk(Vec<u8>),
+    AdvanceClock(Clock, Duration),
     Signal(Sender<()>),
     Wait(Receiver<()>),
     Disconnect,
@@ -254,6 +270,7 @@ fn write_response(
     for step in response.steps {
         match step {
             Step::Chunk(bytes) => stream.write_all(&bytes)?,
+            Step::AdvanceClock(clock, duration) => clock.advance(duration),
             Step::Signal(reached) => {
                 let _ = reached.send(());
             }

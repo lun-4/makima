@@ -24,9 +24,11 @@ fn google_direct_host_stream_and_discovery_use_http_contract() {
         let responses = [
             "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"cachedContentTokenCount\":3,\"candidatesTokenCount\":4}}\n\n",
             "{\"models\":[{\"name\":\"models/z\",\"supportedGenerationMethods\":[\"generateContent\"]},{\"name\":\"models/skip\",\"supportedGenerationMethods\":[\"embedContent\"]},{\"name\":\"models/a\",\"supportedGenerationMethods\":[\"generateContent\"]}]}",
+            "too many tokens",
+            "data: {\"candidates\":[{\"finishReason\":\"STOP\"}]}\n\n",
         ];
         let mut requests = Vec::new();
-        for response in responses {
+        for (index, response) in responses.into_iter().enumerate() {
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut socket = loop {
                 match listener.accept() {
@@ -62,9 +64,15 @@ fn google_direct_host_stream_and_discovery_use_http_contract() {
                     }
                 }
             }
+            let status = if index == 2 {
+                "429 Too Many Requests\r\nRetry-After: 3"
+            } else {
+                "200 OK"
+            };
             write!(
                 socket,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status,
                 response.len(),
                 response
             )
@@ -121,6 +129,36 @@ fn google_direct_host_stream_and_discovery_use_http_contract() {
             .collect::<Vec<_>>(),
         ["a", "z"]
     );
+    let error = smol::block_on(provider.stream_message(
+        &model,
+        &[Message::user("question".into())],
+        "",
+        &json!([]),
+        &events,
+        RequestOptions {
+            thinking: ThinkingConfig::Off,
+            fast: false,
+        },
+        None,
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(error, maki_providers::AgentError::Api { status: 429, ref message, retry_after: Some(delay) } if message == "too many tokens" && delay == Duration::from_secs(3))
+    );
+    smol::block_on(provider.reload_auth()).unwrap();
+    smol::block_on(provider.stream_message(
+        &model,
+        &[Message::user("question".into())],
+        "",
+        &json!([]),
+        &events,
+        RequestOptions {
+            thinking: ThinkingConfig::Off,
+            fast: false,
+        },
+        None,
+    ))
+    .unwrap();
     let requests = server.join().unwrap();
     maki_lua::set_allowed_private_hosts(&[]);
     let (headers, body) = requests[0].split_once("\r\n\r\n").unwrap();
