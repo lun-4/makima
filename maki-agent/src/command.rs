@@ -1285,18 +1285,20 @@ mod tests {
             Ok(HostResponse::ManualCompaction(Some(ref s))) if s == "keep failing tests"
         ));
 
+        let target_dir = TempDir::new().unwrap();
+        let target = target_dir.path().canonicalize().unwrap();
         let directory = smol::block_on(host.request(request(
             maki_commands::BuiltinOperation::ChangeDirectory {
-                path: PathBuf::from("/tmp"),
+                path: target.clone(),
             },
         )));
         assert!(matches!(
             directory,
             Ok(HostResponse::FrontendFeedback(
                 maki_commands::FrontendFeedback::WorkingDirectory(path)
-            )) if path == Path::new("/tmp")
+            )) if path == target
         ));
-        assert_eq!(coordinator.read().cwd().unwrap(), PathBuf::from("/tmp"));
+        assert_eq!(coordinator.read().cwd().unwrap(), target);
         let elsewhere = TempDir::new().unwrap();
         let elsewhere =
             smol::block_on(coordinator.change_directory(elsewhere.path().into())).unwrap();

@@ -1042,7 +1042,8 @@ mod tests {
     #[test]
     fn disk_backend_creates_private_directory_and_file() {
         let root = TempDir::new().unwrap();
-        let store = OffloadStore::on_disk(root.path().join("store"));
+        let base = root.path().canonicalize().unwrap();
+        let store = OffloadStore::on_disk(base.join("store"));
         let saved = store.put(TEST_BODY).unwrap();
         let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&store.path_of(&saved)), 0o600);
@@ -1052,7 +1053,8 @@ mod tests {
     #[test]
     fn close_rejects_later_puts_and_removes_the_directory() {
         let root = TempDir::new().unwrap();
-        let path = root.path().join("store");
+        let base = root.path().canonicalize().unwrap();
+        let path = base.join("store");
         let store = OffloadStore::on_disk(path.clone());
         store.put(TEST_BODY).unwrap();
         store.close_and_remove().unwrap();
@@ -1136,11 +1138,12 @@ mod tests {
     #[test]
     fn ancestor_handle_swap_cannot_redirect_descendant_creation() {
         let root = TempDir::new().unwrap();
-        let backend = DiskBackend::new(root.path().join(SESSIONS_DIR));
+        let base = root.path().canonicalize().unwrap();
+        let backend = DiskBackend::new(base.join(SESSIONS_DIR));
         let opened = backend.open_dir(true).unwrap();
-        let moved = root.path().join("original");
+        let moved = base.join("original");
         fs::rename(&backend.dir, &moved).unwrap();
-        let external = root.path().join("outside");
+        let external = base.join("outside");
         fs::create_dir(&external).unwrap();
         fs::set_permissions(&external, fs::Permissions::from_mode(EXTERNAL_MODE)).unwrap();
         symlink_dir(&external, &backend.dir).unwrap();
@@ -1161,10 +1164,11 @@ mod tests {
     #[test]
     fn cleanup_does_not_follow_nested_symlink_to_external_sentinel() {
         let root = TempDir::new().unwrap();
-        let external = root.path().join("outside");
+        let base = root.path().canonicalize().unwrap();
+        let external = base.join("outside");
         fs::create_dir(&external).unwrap();
         fs::write(external.join("sentinel"), b"untouched").unwrap();
-        let store = OffloadStore::on_disk(root.path().join("store"));
+        let store = OffloadStore::on_disk(base.join("store"));
         store.put(TEST_BODY).unwrap();
         fs::create_dir(store.dir().join("nested")).unwrap();
         symlink_dir(&external, store.dir().join("nested/link")).unwrap();

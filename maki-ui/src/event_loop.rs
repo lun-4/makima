@@ -7477,16 +7477,15 @@ mod tests {
             let actor = manager.actor(root).unwrap();
             let target = manager.lookup(root).unwrap();
             let directory = tempfile::tempdir().unwrap();
-            let child = directory.path().join("child");
+            let base = directory.path().canonicalize().unwrap();
+            let child = base.join("child");
             std::fs::create_dir(&child).unwrap();
             let barrier = actor.reserve_prepared_operation(None).unwrap();
             event_loop
                 .dispatch_target_directory(0, &target, PathBuf::from("child"))
                 .unwrap();
             barrier
-                .resolve(Some(ConfigChange::WorkingDirectory(
-                    directory.path().to_path_buf(),
-                )))
+                .resolve(Some(ConfigChange::WorkingDirectory(base)))
                 .unwrap();
             smol::block_on(barrier.wait_ready()).unwrap();
             barrier.commit().unwrap();
