@@ -133,7 +133,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
 
 /// Bundled but not enabled by default. Users opt in with
 /// `plugins.<name> = { enabled = true }` in `maki.setup`.
-pub const OPT_IN_BUILTINS: &[&str] = &["llama-cpp", "ollama"];
+pub const OPT_IN_BUILTINS: &[&str] = &["llama-cpp", "ollama", "synthetic"];
 
 /// These used to be their own `tools.<name>` tables and are now edit plugin
 /// options; the config layer uses this list to reject the old form with a

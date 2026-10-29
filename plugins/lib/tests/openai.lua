@@ -61,6 +61,7 @@ do
   replies[1] = { status = 200, body = [[{"access_token":"new","refresh_token":"rotated"}]] }
   local refreshed = assert(auth.refresh(ctx, tokens, 2000))
   assert(refreshed.access == "new" and refreshed.refresh == "rotated" and refreshed.expires == 3602000)
+  assert(refreshed.account_id == "account")
   assert(requests[5].url == requests[4].url)
   assert(requests[5].body:find("grant_type=refresh_token", 1, true))
   assert(requests[5].body:find("refresh_token=refresh", 1, true))
@@ -341,7 +342,7 @@ do
     waits[#waits + 1] = delay
     millis = millis + delay
     callback()
-    return {}
+    return { stop = function() end }
   end
   local replies = {
     { status = 200, body = [[{"device_auth_id":"device","user_code":"user","interval":"7"}]] },
@@ -378,8 +379,8 @@ do
     end,
   }
   assert(auth.login(ctx, ui))
-  assert(written.access == "access" and written.refresh == "refresh" and written.expires == 3610000)
-  assert(#waits == 1 and waits[1] == 10000)
+  assert(written.access == "access" and written.refresh == "refresh" and written.expires == 3620000)
+  assert(#waits == 2 and waits[1] == 10000 and waits[2] == 10000)
   written = nil
   replies = { { status = 200, body = [[{"device_auth_id":"device","user_code":"user"}]] } }
   ui.device_challenge = function()
@@ -406,9 +407,69 @@ do
     return timer
   end
   ok = auth.login(ctx, ui)
-  assert(not ok and stopped and written == nil and #replies == 0)
+  assert(not ok and stopped and written == nil and #replies == 1)
+  maki.defer_fn = function(callback, delay)
+    millis = millis + delay
+    callback()
+    return { stop = function() end }
+  end
+  replies = {
+    { status = 200, body = [[{"device_auth_id":"device","user_code":"user"}]] },
+    { status = 200, body = [[{"authorization_code":"code","code_verifier":"verifier"}]] },
+  }
+  local original_send = ctx.send
+  local count = 0
+  ctx.send = function(...)
+    count = count + 1
+    local response = original_send(...)
+    if count == 2 then
+      cancel()
+    end
+    return response
+  end
+  ok = auth.login(ctx, ui)
+  assert(not ok and written == nil and count == 2)
   maki.time.now, maki.async.await, maki.defer_fn, maki.async.on_cancel =
     previous_now, previous_await, previous_defer, previous_cancel
+end
+
+do
+  local saved, writes = { access = "existing" }, 0
+  local conflict = { kind = "config", message = "credential file contains a different credential type" }
+  local ctx = {
+    credentials = {
+      write = function(_, key, value)
+        writes = writes + 1
+        assert(key == "api_key" and value.api_key == "new-key")
+        if saved.access then
+          return nil, conflict
+        end
+        saved = value
+        return true
+      end,
+    },
+  }
+  local ui = {
+    input = function(_, prompt, secret, optional)
+      assert(prompt == "OpenAI API key" and secret and not optional)
+      return "  new-key  "
+    end,
+  }
+  local ui = {
+    input = function(_, prompt, secret, optional)
+      assert(prompt == "OpenAI API key" and secret and not optional)
+      return "  new-key  "
+    end,
+  }
+  local ok, err = openai.login_api_key(ctx, ui)
+  assert(not ok and err == conflict and saved.access == "existing")
+  saved = {}
+  assert(openai.login_api_key(ctx, ui) and saved.api_key == "new-key")
+  ui.input = function()
+    return "  "
+  end
+  ok, err = openai.login_api_key(ctx, ui)
+  assert(not ok and err.kind == "config" and writes == 2 and saved.api_key == "new-key")
 end
 
 local usage = assert(

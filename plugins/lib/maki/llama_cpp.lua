@@ -213,9 +213,16 @@ local function prepare(ctx, model, config)
         local intent = request.thinking or { mode = "off" }
         local reasoning
         if intent.mode == "adaptive" then
-          reasoning = { summary = "auto" }
+          reasoning = { effort = "medium", summary = "auto" }
         elseif intent.mode == "effort" then
-          reasoning = { effort = intent.level, summary = "auto" }
+          reasoning = { effort = ({ xhigh = "high", max = "high" })[intent.level] or intent.level, summary = "auto" }
+        elseif intent.mode == "budget" then
+          local maximum = request.model.max_output_tokens
+              and math.max(1024, math.floor(request.model.max_output_tokens / 2))
+            or 32768
+          local percent = math.floor(intent.tokens * 100 / maximum)
+          local effort = percent <= 10 and "minimal" or percent <= 20 and "low" or percent <= 40 and "medium" or "high"
+          reasoning = { effort = effort, summary = "auto" }
         end
         body, build_err = responses.build_request(request, { reasoning = reasoning })
         if body then
@@ -258,6 +265,12 @@ local function register()
   maki.api.register_provider({
     id = "llama-cpp",
     display_name = "LlamaCpp",
+    docs = {
+      auth_line = "`LLAMA_CPP_API_KEY`",
+      urls = { "http://localhost:8080/v1" },
+      features = "Local or remote inference via LLAMA_CPP_HOST, set optional key via LLAMA_CPP_API_KEY",
+      no_catalog_note = "Connects to any OpenAI-compatible `/v1` endpoint. Point `LLAMA_CPP_HOST` to your server address (defaults to `http://localhost:8080`).",
+    },
     models = {},
     discover = discover,
     prepare = prepare,

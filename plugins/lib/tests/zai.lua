@@ -14,6 +14,10 @@ request.thinking = { mode = "adaptive" }
 assert(zai.build_request(request).reasoning_effort == "high")
 request.thinking = { mode = "effort", level = "max" }
 assert(zai.build_request(request).reasoning_effort == "xhigh")
+request.thinking = { mode = "budget", tokens = 39976 }
+assert(zai.build_request(request).reasoning_effort == "high")
+request.thinking = { mode = "budget", tokens = 39977 }
+assert(zai.build_request(request).reasoning_effort == "xhigh")
 request.model.id = "glm-5-code"
 assert(zai.build_request(request).reasoning_effort == nil)
 local usage = assert(

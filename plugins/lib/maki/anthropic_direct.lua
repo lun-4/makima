@@ -77,7 +77,7 @@ end
 
 function M.stream(response, emit)
   local next_event = sse.new(response, 1024 * 1024)
-  local content, arguments = assert(maki.json.decode("[]")), {}
+  local content, arguments, blocks = assert(maki.json.decode("[]")), {}, {}
   local usage = { input = 0, output = 0, cache_creation = 0, cache_read = 0 }
   local stop_reason
   while true do
@@ -119,10 +119,11 @@ function M.stream(response, emit)
         end
       end
       if block then
-        content[value.index + 1] = block
+        content[#content + 1] = block
+        blocks[value.index] = block
       end
     elseif kind == "content_block_delta" and valid_index(value.index) and type(value.delta) == "table" then
-      local b, d = content[value.index + 1], value.delta
+      local b, d = blocks[value.index], value.delta
       if d.type == "text_delta" or d.type == "thinking_delta" then
         local field = d.type == "text_delta" and "text" or "thinking"
         local text = d[field]
@@ -141,7 +142,7 @@ function M.stream(response, emit)
         arguments[value.index][#arguments[value.index] + 1] = d.partial_json or ""
       end
     elseif kind == "content_block_stop" and valid_index(value.index) then
-      local b = content[value.index + 1]
+      local b = blocks[value.index]
       if b and b.type == "tool_use" then
         b.input = maki.json.decode(table.concat(arguments[value.index] or {}), { preserve_null = true }) or {}
       end

@@ -90,7 +90,7 @@ fn deepseek_legacy_credentials_discovery_and_logout() {
 fn deepseek_discovery_rotation_stream_and_balance() {
     deepseek_legacy_credentials_discovery_and_logout();
     let server = HttpContract::start(vec![
-        response(r#"{"data":[{"id":"z","max_model_len":12345,"max_output_length":4321,"input_modalities":["text","image"],"pricing":{"prompt":"0.5","completion":"1","cache_read":"0.1"}},{"id":"a"},{}]}"#),
+        response(r#"{"data":[{"id":"z","max_model_len":12345,"max_output_length":4321,"input_modalities":["text","image"],"pricing":{"prompt":"0.5","completion":"1","cache_read":"0.1","cache_creation":"-1"}},{"id":"a"},{}]}"#),
         response(STREAM),
         response(STREAM),
         response(STREAM),
@@ -123,6 +123,7 @@ fn deepseek_discovery_rotation_stream_and_balance() {
     assert_eq!(discovered[1].max_output_tokens, Some(4321));
     assert_eq!(discovered[1].supports_vision, Some(true));
     assert_eq!(discovered[1].pricing.as_ref().unwrap().cache_read, 0.1);
+    assert_eq!(discovered[1].pricing.as_ref().unwrap().cache_write, 0.0);
     let request = server.requests.recv_timeout(TIMEOUT).unwrap().unwrap();
     assert_eq!(request.target, "/models");
     assert_eq!(request.header("authorization"), Some("Bearer first"));

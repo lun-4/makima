@@ -1,1 +1,3 @@
-return function() end
+return function()
+  require("maki.synthetic").register()
+end

@@ -175,6 +175,68 @@ fn synthetic_legacy_auth_discovery_and_logout() {
 }
 
 #[test]
+fn synthetic_quota_through_provider_host() {
+    const CHILD: &str = "SYNTHETIC_QUOTA_CONTRACT_CHILD";
+    const QUOTA_URL: &str = "https://api.synthetic.new/v2/quotas";
+    if std::env::var_os(CHILD).is_none() {
+        let stdout = tempfile::tempfile().unwrap();
+        let stderr = tempfile::tempfile().unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "synthetic_quota_through_provider_host",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env(CHILD, "1")
+            .stdout(stdout.try_clone().unwrap())
+            .stderr(stderr.try_clone().unwrap())
+            .spawn()
+            .unwrap();
+        let output = wait_output(ChildGuard(Some(child)), stdout, stderr);
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let server = HttpContract::start(vec![Response {
+        status: "200 OK".into(),
+        headers: vec![],
+        steps: vec![Step::Chunk(br#"{"rollingFiveHourLimit":{"remaining":25,"max":100,"nextTickAt":"2025-01-01T01:00:00+01:00"},"weeklyTokenLimit":{"percentRemaining":60,"nextRegenAt":"invalid"}}"#.to_vec())],
+    }]).unwrap();
+    maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    let source = include_str!("../plugins/lib/maki/synthetic.lua")
+        .replace("ctx.credentials:read(CREDENTIAL_KEY)", "nil, nil")
+        .replace(QUOTA_URL, &format!("http://{}/v2/quotas", server.addr));
+    host.load_source("synthetic_quota_fixture", &format!("local provider = (function()\n{source}\nend)()\nmaki.api.register_provider({{ id = 'synthetic_quota_fixture', models = provider.models, prepare = provider.prepare }})"))
+        .unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let factory = &snapshot.get("synthetic_quota_fixture").unwrap().factory;
+    let model = Model::from_spec("synthetic/hf:moonshotai/Kimi-K2.5").unwrap();
+    let (_, provider) =
+        smol::block_on(factory.prepare(&model, &json!({"api_key":"first,second"}))).unwrap();
+    assert!(smol::block_on(provider.rotate_key()).unwrap());
+    let usage = smol::block_on(provider.fetch_usage()).unwrap().unwrap();
+    assert_eq!(usage.limits.len(), 2);
+    assert_eq!(usage.limits[0].percentage, Some(75));
+    assert_eq!(usage.limits[0].reset_at, Some(1735689600000));
+    assert_eq!(usage.limits[1].percentage, Some(40));
+    assert_eq!(usage.limits[1].reset_at, None);
+    let request = server
+        .requests
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.method, "GET");
+    assert_eq!(request.target, "/v2/quotas");
+    assert_eq!(request.header("authorization"), Some("Bearer second"));
+}
+
+#[test]
 fn lua_synthetic_streams_through_plugin_host_and_http() {
     const CHILD_MARKER: &str = "SYNTHETIC_CONTRACT_CHILD";
     if std::env::var_os(CHILD_MARKER).is_none() {
@@ -386,6 +448,13 @@ fn synthetic_chat_uses_configured_endpoint_and_bearer_key() {
         ).as_bytes().to_vec())],
     }]).unwrap();
     let home = tempfile::tempdir().unwrap();
+    let config_dir = home.path().join(".config/makima");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("init.lua"),
+        "maki.setup({ plugins = { synthetic = { enabled = false } } })",
+    )
+    .unwrap();
     let stdout = tempfile::tempfile().unwrap();
     let stderr = tempfile::tempfile().unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_makima"))
@@ -416,11 +485,17 @@ fn synthetic_chat_uses_configured_endpoint_and_bearer_key() {
         .spawn()
         .unwrap();
     let child = ChildGuard(Some(child));
-    let discovery = server
-        .requests
-        .recv_timeout(Duration::from_secs(10))
-        .unwrap()
-        .unwrap();
+    let discovery = match server.requests.recv_timeout(Duration::from_secs(10)) {
+        Ok(request) => request.unwrap(),
+        Err(error) => {
+            let output = wait_output(child, stdout, stderr);
+            panic!(
+                "discovery failed: {error}; status: {}; stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    };
     assert_eq!(discovery.method, "GET");
     assert_eq!(discovery.target, "/v1/models");
     assert_eq!(

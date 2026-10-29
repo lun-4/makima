@@ -794,6 +794,25 @@ mod tests {
     }
 
     #[test]
+    fn local_provider_docs_use_offline_metadata() {
+        let providers = maki_lua::provider_docs::load_bundled_providers().unwrap();
+        let sections = build_sections(&providers);
+        for id in ["ollama", "llama-cpp"] {
+            let provider = providers.iter().find(|provider| provider.id == id).unwrap();
+            assert!(
+                !sections
+                    .iter()
+                    .any(|section| section.kind.to_string() == id)
+            );
+            let mut output = String::new();
+            super::write_offline_section(&mut output, provider);
+            let docs = provider.docs.as_ref().unwrap();
+            assert!(output.contains(&docs.auth_line));
+            assert!(output.contains(docs.no_catalog_note.as_ref().unwrap()));
+        }
+    }
+
+    #[test]
     fn offline_empty_prefix_uses_model_id() {
         let mut providers = maki_lua::provider_docs::load_bundled_providers().unwrap();
         let provider = providers.iter_mut().find(|p| p.id == "synthetic").unwrap();

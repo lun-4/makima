@@ -96,22 +96,49 @@ local function headers(config, key)
   return result
 end
 
-local function api_error(response)
+local function api_error(response, config, keys)
   local value = response.headers and response.headers["retry-after"]
   local seconds = type(value) == "string" and tonumber(value:match("^%s*(%d+)%s*$")) or nil
   local retry_after_ms = seconds and seconds > 0 and seconds <= 9007199254740 and seconds * 1000 or nil
+  local chunks, size = {}, 0
+  while size < 65536 do
+    local chunk = response:read()
+    if not chunk or chunk == "" then
+      break
+    end
+    size = size + #chunk
+    if size > 65536 then
+      chunks = {}
+      break
+    end
+    chunks[#chunks + 1] = chunk
+  end
   local status = response.status
   response:close()
-  return { kind = "api", status = status, message = "Regolo request failed", retry_after_ms = retry_after_ms }
+  local message = table.concat(chunks)
+  if message == "" then
+    message = "Regolo request failed"
+  end
+  for _, secret in ipairs(keys) do
+    if secret ~= "" and message:find(secret, 1, true) then
+      message = "Regolo request failed"
+    end
+  end
+  for _, secret in pairs(config.headers or {}) do
+    if type(secret) == "string" and secret ~= "" and message:find(secret, 1, true) then
+      message = "Regolo request failed"
+    end
+  end
+  return { kind = "api", status = status, message = message, retry_after_ms = retry_after_ms }
 end
 
-local function get(ctx, url, request_headers)
+local function get(ctx, url, request_headers, config, keys)
   local response, err = ctx:send({ url = url, method = "GET", headers = request_headers })
   if not response then
     return nil, err
   end
   if response.status ~= 200 then
-    return nil, api_error(response)
+    return nil, api_error(response, config, keys)
   end
   local value, read_err = require("maki.json_response").read(response, 1048576)
   response:close()
@@ -170,7 +197,7 @@ function M.discover(ctx, config)
   end
   local base = base_url(config)
   local request_headers = headers(config, keys[1])
-  local response, get_err = get(ctx, base .. "/models", request_headers)
+  local response, get_err = get(ctx, base .. "/models", request_headers, config, keys)
   if not response then
     return nil, get_err
   end
@@ -182,7 +209,7 @@ function M.discover(ctx, config)
     end
   end
   table.sort(ids)
-  local groups = get(ctx, base:gsub("/v1$", "") .. "/model_group/info", request_headers)
+  local groups = get(ctx, base:gsub("/v1$", "") .. "/model_group/info", request_headers, config, keys)
   if type(groups) == "table" and type(groups.data) == "table" then
     local valid = true
     for _, group in ipairs(groups.data) do
@@ -242,7 +269,7 @@ function M.prepare(ctx, model, config)
     fetch_usage = function(ctx)
       local root = base:gsub("/v1$", "")
       local request_headers = headers(config, keys[index])
-      local key, key_err = get(ctx, root .. "/key/info", request_headers)
+      local key, key_err = get(ctx, root .. "/key/info", request_headers, config, keys)
       if not key then
         return nil, key_err
       end
@@ -269,7 +296,7 @@ function M.prepare(ctx, model, config)
       local now = maki.time.now().secs
       local day = os.date("!%Y-%m-%d", now)
       local query = "?start_date=" .. day .. "&end_date=" .. day
-      local activity = get(ctx, root .. "/global/activity" .. query, request_headers)
+      local activity = get(ctx, root .. "/global/activity" .. query, request_headers, config, keys)
       if
         type(activity) == "table"
         and type(activity.sum_api_requests) == "number"
@@ -281,7 +308,7 @@ function M.prepare(ctx, model, config)
           detail = string.format("%d requests · %d tokens", activity.sum_api_requests, activity.sum_total_tokens),
         }
       end
-      local logs = get(ctx, root .. "/spend/logs/v2" .. query, request_headers)
+      local logs = get(ctx, root .. "/spend/logs/v2" .. query, request_headers, config, keys)
       local by_model, rows = {}, {}
       if type(logs) == "table" and type(logs.data) == "table" then
         for _, entry in ipairs(logs.data) do
@@ -356,7 +383,7 @@ function M.prepare(ctx, model, config)
         return nil, send_err
       end
       if response.status ~= 200 then
-        return nil, api_error(response)
+        return nil, api_error(response, config, keys)
       end
       local result, stream_err = chat.stream(response, emit)
       response:close()

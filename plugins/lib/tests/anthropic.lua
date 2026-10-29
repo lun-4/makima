@@ -27,6 +27,23 @@ assert(result.message.content[1].thinking == "reason" and result.message.content
 assert(result.message.content[2].input.x == 1 and emitted[2].type == "tool_use_start")
 assert(result.usage.input == 12 and result.usage.cache_read == 3 and result.usage.output == 7)
 assert(result.stop_reason == "tool_use")
+local skipped = {
+  'event: content_block_start\ndata: {"index":0,"content_block":{"type":"unknown"}}\n\n',
+  'event: content_block_start\ndata: {"index":1,"content_block":{"type":"text"}}\n\n',
+  'event: content_block_delta\ndata: {"index":1,"delta":{"type":"text_delta","text":"visible"}}\n\n',
+  "event: message_stop\ndata: {}\n\n",
+}
+local skipped_index = 0
+local skipped_result = assert(direct.stream({
+  read = function()
+    skipped_index = skipped_index + 1
+    return skipped[skipped_index] or ""
+  end,
+}, function()
+  return true
+end))
+assert(#skipped_result.message.content == 1 and skipped_result.message.content[1].text == "visible")
+assert(assert(maki.json.encode(skipped_result.message.content)):sub(1, 1) == "[")
 assert(#direct.models == 13 and direct.models[1].id == "claude-haiku-4-5")
 local failed = {
   read = function()

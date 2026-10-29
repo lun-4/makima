@@ -188,7 +188,7 @@ fn requesty_stream_preserves_retry_after_without_leaking_body() {
     let server = HttpContract::start(vec![Response {
         status: "429 Too Many Requests".into(),
         headers: vec![("Retry-After".into(), "3".into())],
-        steps: vec![Step::Chunk(b"private upstream detail".to_vec())],
+        steps: vec![Step::Chunk(b"fixture-key private upstream detail".to_vec())],
     }])
     .unwrap();
     maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
@@ -216,6 +216,39 @@ fn requesty_stream_preserves_retry_after_without_leaking_body() {
     assert!(
         matches!(error, AgentError::Api { status: 429, message, retry_after: Some(delay) } if message == "Requesty request failed" && delay == Duration::from_secs(3))
     );
+}
+
+#[test]
+fn requesty_context_overflow_error_keeps_server_message() {
+    const ERROR: &str = "maximum context length is 8192 tokens";
+    let server = HttpContract::start(vec![response("400 Bad Request", ERROR)]).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let host = requesty_host(state.path());
+    let mut resolver = maki_lua::test_support::ProviderEndpointResolver::default();
+    resolver.add("requesty.fixture.invalid", 8080, vec![server.addr]);
+    resolver.allow_private_host("requesty.fixture.invalid", 8080);
+    host.install_provider_resolver_for_tests(resolver).unwrap();
+    let snapshot = host.provider_registry().snapshot();
+    let model = Model::from_spec("requesty/openai/gpt-5.5").unwrap();
+    let (model, provider) = smol::block_on(snapshot.get("requesty").unwrap().factory.prepare(&model, &json!({
+        "api_key": "fixture-key", "api_key_env": "REQUESTY_CONTRACT_UNUSED_KEY", "base_url": "http://requesty.fixture.invalid:8080/v1"
+    }))).unwrap();
+    let (events, _receiver) = flume::unbounded();
+    let error = smol::block_on(provider.stream_message(
+        &model,
+        &[Message::user("prompt".into())],
+        "system",
+        &json!([]),
+        &events,
+        RequestOptions {
+            thinking: ThinkingConfig::Off,
+            fast: false,
+        },
+        None,
+    ))
+    .unwrap_err();
+    assert!(error.is_context_overflow());
+    assert!(matches!(error, AgentError::Api { status: 400, message, .. } if message == ERROR));
 }
 
 #[test]

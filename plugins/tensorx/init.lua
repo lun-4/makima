@@ -180,17 +180,22 @@ local function prepare(ctx, model, config)
         elseif intent.mode == "adaptive" then
           body.reasoning_effort = "high"
         else
-          local maximum = request.model.max_output_tokens
-            and math.max(1024, math.floor(request.model.max_output_tokens / 2))
-          local resolution, resolve_err = require("maki.thinking").resolve(
-            intent,
-            { mode = "effort", levels = { "low", "medium", "high" } },
-            maximum and { max_tokens = maximum } or nil
-          )
-          if not resolution then
-            return nil, { kind = "config", message = tostring(resolve_err) }
+          local level = intent.level
+          if intent.mode == "budget" then
+            local maximum = request.model.max_output_tokens
+                and math.max(1024, math.floor(request.model.max_output_tokens / 2))
+              or 32768
+            local percent = math.floor(intent.tokens * 100 / maximum)
+            level = percent <= 10 and "minimal" or percent <= 20 and "low" or percent <= 40 and "medium" or "high"
           end
-          body.reasoning_effort = resolution.effective.level
+          body.reasoning_effort = ({
+            minimal = "low",
+            low = "low",
+            medium = "medium",
+            high = "high",
+            xhigh = "high",
+            max = "high",
+          })[level]
         end
       elseif
         not flags.thinking

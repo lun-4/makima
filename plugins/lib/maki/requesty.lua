@@ -121,23 +121,45 @@ local function parse_model(entry)
   }
 end
 
-local function api_error(response, message)
+local function api_error(response, message, secrets)
   local value = response.headers and response.headers["retry-after"]
   local seconds = type(value) == "string" and value:match("^%s*(%d+)%s*$")
   seconds = seconds and tonumber(seconds)
   local retry_after_ms = seconds and seconds > 0 and seconds <= 9007199254740 and seconds * 1000 or nil
+  local chunks, size = {}, 0
+  while size < 65536 do
+    local chunk = response:read()
+    if not chunk or chunk == "" then
+      break
+    end
+    size = size + #chunk
+    if size > 65536 then
+      chunks = {}
+      break
+    end
+    chunks[#chunks + 1] = chunk
+  end
   local status = response.status
   response:close()
+  local detail = table.concat(chunks)
+  if detail ~= "" then
+    for _, secret in ipairs(secrets) do
+      if secret ~= "" and detail:find(secret, 1, true) then
+        return { kind = "api", status = status, message = message, retry_after_ms = retry_after_ms }
+      end
+    end
+    message = detail
+  end
   return { kind = "api", status = status, message = message, retry_after_ms = retry_after_ms }
 end
 
-local function fetch_models(ctx, url, request_headers)
+local function fetch_models(ctx, url, request_headers, secrets)
   local response, err = ctx:send({ url = url, method = "GET", headers = request_headers })
   if not response then
     return nil, err
   end
   if response.status < 200 or response.status >= 300 then
-    return nil, api_error(response, "Requesty models request failed")
+    return nil, api_error(response, "Requesty models request failed", secrets)
   end
   local chunks, size = {}, 0
   while true do
@@ -174,6 +196,19 @@ local function fetch_models(ctx, url, request_headers)
   return models
 end
 
+local function secret_values(config, keys)
+  local secrets = {}
+  for _, key in ipairs(keys) do
+    secrets[#secrets + 1] = key
+  end
+  for _, value in pairs(config.headers or {}) do
+    if type(value) == "string" then
+      secrets[#secrets + 1] = value
+    end
+  end
+  return secrets
+end
+
 local function discover(ctx, config)
   config = config or {}
   local keys, err = credentials(ctx, config)
@@ -182,13 +217,14 @@ local function discover(ctx, config)
   end
   local base = (config.base_url or endpoint):gsub("/+$", "")
   local request_headers = headers(config, keys[1], false)
+  local secrets = secret_values(config, keys)
   local results = maki.async.gather({
     function()
-      local models, failure = fetch_models(ctx, base .. "/models/managed", request_headers)
+      local models, failure = fetch_models(ctx, base .. "/models/managed", request_headers, secrets)
       return { models = models, err = failure }
     end,
     function()
-      local models, failure = fetch_models(ctx, base .. "/models", request_headers)
+      local models, failure = fetch_models(ctx, base .. "/models", request_headers, secrets)
       return { models = models, err = failure }
     end,
   })
@@ -224,6 +260,7 @@ local function prepare(ctx, model, config)
     return nil, err
   end
   local index = 1
+  local secrets = secret_values(config, keys)
   local base = (config.base_url or endpoint):gsub("/+$", "")
   return {
     model = model,
@@ -271,7 +308,7 @@ local function prepare(ctx, model, config)
         return nil, send_err
       end
       if response.status < 200 or response.status >= 300 then
-        return nil, api_error(response, "Requesty request failed")
+        return nil, api_error(response, "Requesty request failed", secrets)
       end
       local result, stream_err = chat.stream(response, emit)
       response:close()

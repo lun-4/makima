@@ -36,7 +36,7 @@ function M.supports_thinking(id)
   if not version then
     return false
   end
-  local major_text, minor_text = version:match("^([^.%-]+)[.%-]([^ .%-]+)")
+  local major_text, minor_text = version:match("^([^.%-]+)[.%-]([^.%-]+)")
   major_text = major_text or version:match("^([^.%-]+)")
   local major = major_text and major_text:match("^%d+$") and tonumber(major_text)
   local minor = minor_text and minor_text:match("^%d+$") and tonumber(minor_text) or 0
@@ -57,8 +57,19 @@ function M.build_request(request)
     else
       local maximum = request.model.max_output_tokens
         and math.max(1024, math.floor(request.model.max_output_tokens / 2))
-      local result, resolve_err =
-        require("maki.thinking").resolve(intent, thinking, maximum and { max_tokens = maximum } or nil)
+      if intent.mode == "budget" then
+        if
+          type(intent.tokens) ~= "number"
+          or intent.tokens <= 0
+          or intent.tokens % 1 ~= 0
+          or intent.tokens == math.huge
+        then
+          return nil, "invalid thinking preference"
+        end
+        local percent = math.floor(intent.tokens * 100 / (maximum or 32768))
+        intent = { mode = "effort", level = percent <= 60 and "high" or "xhigh" }
+      end
+      local result, resolve_err = require("maki.thinking").resolve(intent, thinking)
       if not result then
         return nil, resolve_err
       end

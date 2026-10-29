@@ -101,8 +101,11 @@ fn discovery_http_error_preserves_body() {
     );
 }
 
-#[test]
-fn responses_protocol_streams_progress() {
+#[test_case(ThinkingConfig::Off, None ; "off")]
+#[test_case(ThinkingConfig::Adaptive, Some("medium") ; "adaptive")]
+#[test_case(ThinkingConfig::Effort(Effort::Max), Some("high") ; "max_snaps")]
+#[test_case(ThinkingConfig::Budget(8192), Some("medium") ; "budget")]
+fn responses_protocol_streams_progress(thinking: ThinkingConfig, expected: Option<&str>) {
     let _guard = TEST_LOCK.lock().unwrap();
     let server = HttpContract::start(vec![Response { status: "200 OK".into(), headers: vec![], steps: vec![Step::Chunk(b"event: response.output_text.delta\ndata: {\"delta\":\"hello\"}\n\nevent: response.completed\ndata: {\"response\":{\"status\":\"completed\"}}\n\n".to_vec())] }]).unwrap();
     maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
@@ -121,7 +124,7 @@ fn responses_protocol_streams_progress() {
         &json!([]),
         &events,
         RequestOptions {
-            thinking: ThinkingConfig::Adaptive,
+            thinking,
             fast: false,
         },
         None,
@@ -137,7 +140,14 @@ fn responses_protocol_streams_progress() {
     assert_eq!(request.target, "/v1/responses");
     let body: Value = serde_json::from_slice(&request.body).unwrap();
     assert_eq!(body["return_progress"], true);
-    assert_eq!(body["reasoning"]["summary"], "auto");
+    if let Some(effort) = expected {
+        assert_eq!(
+            body["reasoning"],
+            json!({"effort": effort, "summary": "auto"})
+        );
+    } else {
+        assert!(body.get("reasoning").is_none());
+    }
     assert!(body.get("thinking_budget_tokens").is_none());
 }
 

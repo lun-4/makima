@@ -440,6 +440,7 @@ fn with_print_session<T>(
     let PrintSession {
         handle,
         coordinator,
+        _discovery: discovery,
         ..
     } = session;
     let InteractiveHandle {
@@ -469,6 +470,7 @@ fn with_print_session<T>(
         },
     );
     let _ = smol::block_on(coordinator.close());
+    smol::block_on(discovery.finish());
     settled
 }
 

@@ -195,7 +195,13 @@ function M.login(ctx, ui)
       state.timer = nil
     end
   end)
+  if state.cancelled then
+    return nil, { kind = "config", message = "OpenAI device authorization cancelled" }
+  end
   local session, err = M.start(ctx)
+  if state.cancelled then
+    return nil, { kind = "config", message = "OpenAI device authorization cancelled" }
+  end
   if not session then
     return nil, err
   end
@@ -205,7 +211,21 @@ function M.login(ctx, ui)
   end
   local deadline = now_ms() + POLL_TIMEOUT_MS
   while not state.cancelled and now_ms() < deadline do
+    local remaining = deadline - now_ms()
+    if remaining <= 0 then
+      break
+    end
+    local ok, wait_err = wait(math.min(session.interval * MILLIS_PER_SECOND, remaining), state)
+    if not ok then
+      return nil, { kind = "config", message = "OpenAI device polling timer failed: " .. tostring(wait_err) }
+    end
+    if state.cancelled or now_ms() >= deadline then
+      break
+    end
     local device, poll_err = M.poll(ctx, session)
+    if state.cancelled then
+      return nil, { kind = "config", message = "OpenAI device authorization cancelled" }
+    end
     if device then
       local result, exchange_err = M.exchange(ctx, device, now_ms())
       if not result then
@@ -218,14 +238,6 @@ function M.login(ctx, ui)
     end
     if not poll_err or poll_err.kind ~= "pending" then
       return nil, poll_err or { kind = "api", message = "OpenAI device authorization failed" }
-    end
-    local remaining = deadline - now_ms()
-    if remaining <= 0 then
-      break
-    end
-    local ok, wait_err = wait(math.min(session.interval * MILLIS_PER_SECOND, remaining), state)
-    if not ok then
-      return nil, { kind = "config", message = "OpenAI device polling timer failed: " .. tostring(wait_err) }
     end
   end
   return nil,
@@ -245,7 +257,7 @@ function M.refresh(ctx, current, now_ms)
     return nil, err
   end
   local refreshed, token_err = tokens(value, now_ms)
-  if refreshed and not refreshed.account_id then
+  if refreshed and not refreshed.account_id and nonempty(current.account_id) then
     refreshed.account_id = current.account_id
   end
   return refreshed, token_err

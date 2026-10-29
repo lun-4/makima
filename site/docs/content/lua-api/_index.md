@@ -7187,12 +7187,18 @@ function M.logout(ctx)
 function M.register()
 ```
 
+### `require("maki.ollama")`
+
+```lua
+```
+
 ### `require("maki.openai")`
 
 ```lua
 function M.parse_usage(response)
 function M.prepare(ctx, model, config)
 function M.discover(ctx, config)
+function M.login_api_key(ctx, ui)
 function M.auth_status(ctx, config)
 function M.logout(ctx)
 function M.register()

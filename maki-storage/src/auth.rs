@@ -138,6 +138,10 @@ pub enum CredentialError {
     Conflict,
     #[error("invalid credential value")]
     InvalidValue,
+    #[error("credential lifecycle generation is stale")]
+    StaleGeneration,
+    #[error("credential lifecycle generation exhausted")]
+    GenerationExhausted,
 }
 
 /// A storage namespace, not an authorization capability. Callers must bind it to
@@ -155,11 +159,102 @@ pub enum LegacyCredentialKind {
     ApiKey,
 }
 
+/// Provider-scoped fencing for operations that may finish after logout.
+/// This is a storage namespace, not an authorization capability.
+#[derive(Clone)]
+pub struct CredentialLifecycle {
+    dir: StateDir,
+    name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CredentialGeneration {
+    dir: PathBuf,
+    name: String,
+    value: u64,
+}
+
 pub enum RefreshOutcome {
     Unchanged,
     Updated(serde_json::Value),
     Deleted,
     Revoked,
+}
+
+impl CredentialLifecycle {
+    pub fn new(dir: StateDir, provider: &str) -> Result<Self, CredentialError> {
+        CredentialScope::new(dir.clone(), provider)?;
+        Ok(Self {
+            dir,
+            name: format!("lifecycle_{}_{provider}", provider.len()),
+        })
+    }
+
+    fn path(&self) -> PathBuf {
+        auth_path(&self.dir, &format!("{}.generation", self.name))
+    }
+
+    fn read_generation(&self) -> Result<u64, CredentialError> {
+        match fs::read(self.path()) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(StorageError::from)
+                .map_err(Into::into),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(StorageError::from(error).into()),
+        }
+    }
+
+    pub async fn snapshot(&self) -> Result<CredentialGeneration, CredentialError> {
+        let _lock = lock_credentials(&self.dir, &self.name).await?;
+        Ok(CredentialGeneration {
+            dir: self.dir.path().to_owned(),
+            name: self.name.clone(),
+            value: self.read_generation()?,
+        })
+    }
+
+    /// Fence earlier operations before deleting credentials. A failed delete must
+    /// still be reported; the generation advance alone is not a completed logout.
+    pub async fn invalidate(&self) -> Result<CredentialGeneration, CredentialError> {
+        let _lock = lock_credentials(&self.dir, &self.name).await?;
+        let value = self
+            .read_generation()?
+            .checked_add(1)
+            .ok_or(CredentialError::GenerationExhausted)?;
+        save_auth(&self.path(), &value)?;
+        Ok(CredentialGeneration {
+            dir: self.dir.path().to_owned(),
+            name: self.name.clone(),
+            value,
+        })
+    }
+
+    /// The lifecycle lock precedes the credential lock and remains held until
+    /// the callback and commit finish. Logout therefore waits for in-flight
+    /// refreshes, while operations admitted before logout cannot commit after it.
+    pub async fn refresh<F, Fut>(
+        &self,
+        generation: &CredentialGeneration,
+        scope: &CredentialScope,
+        refresh: F,
+    ) -> Result<Option<serde_json::Value>, CredentialError>
+    where
+        F: FnOnce(Option<serde_json::Value>) -> Fut,
+        Fut: Future<Output = Result<RefreshOutcome, CredentialError>>,
+    {
+        if generation.dir != self.dir.path()
+            || generation.name != self.name
+            || scope.dir.path() != self.dir.path()
+            || scope.name == self.name
+        {
+            return Err(CredentialError::InvalidScope);
+        }
+        let _lock = lock_credentials(&self.dir, &self.name).await?;
+        if self.read_generation()? != generation.value {
+            return Err(CredentialError::StaleGeneration);
+        }
+        scope.refresh(refresh).await
+    }
 }
 
 impl CredentialScope {

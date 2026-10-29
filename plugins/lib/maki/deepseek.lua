@@ -154,9 +154,16 @@ local function discover(ctx, config)
       if type(pricing) == "table" and type(pricing.prompt) == "string" and type(pricing.completion) == "string" then
         local input, output = tonumber(pricing.prompt), tonumber(pricing.completion)
         if input and output and input >= 0 and output >= 0 and input < math.huge and output < math.huge then
-          local write = type(pricing.cache_creation) == "string" and tonumber(pricing.cache_creation) or 0
-          local read = type(pricing.cache_read) == "string" and tonumber(pricing.cache_read) or 0
-          model.pricing = { input = input, output = output, cache_write = write or 0, cache_read = read or 0 }
+          local function rate(value)
+            local parsed = type(value) == "string" and tonumber(value)
+            return parsed and parsed >= 0 and parsed < math.huge and parsed or 0
+          end
+          model.pricing = {
+            input = input,
+            output = output,
+            cache_write = rate(pricing.cache_creation),
+            cache_read = rate(pricing.cache_read),
+          }
         end
       end
       result[#result + 1] = model

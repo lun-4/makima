@@ -120,6 +120,16 @@ fn tensorx_discovery_drives_stream_parameters() {
             headers: vec![],
             steps: vec![Step::Chunk(SSE.as_bytes().to_vec())],
         },
+        Response {
+            status: "200 OK".into(),
+            headers: vec![],
+            steps: vec![Step::Chunk(SSE.as_bytes().to_vec())],
+        },
+        Response {
+            status: "200 OK".into(),
+            headers: vec![],
+            steps: vec![Step::Chunk(SSE.as_bytes().to_vec())],
+        },
     ])
     .unwrap();
     maki_lua::set_allowed_private_hosts(&[server.addr.to_string()]);
@@ -185,6 +195,32 @@ fn tensorx_discovery_drives_stream_parameters() {
     assert_eq!(body["reasoning_effort"], "high");
     assert!(body.get("max_tokens").is_none());
     assert!(body.get("chat_template_kwargs").is_none());
+    for (thinking, expected, enabled) in [
+        (ThinkingConfig::Off, "none", false),
+        (ThinkingConfig::Budget(8192), "medium", true),
+    ] {
+        smol::block_on(provider.stream_message(
+            &model,
+            &[Message::user("prompt".into())],
+            "system",
+            &json!([]),
+            &events,
+            RequestOptions {
+                thinking,
+                fast: false,
+            },
+            None,
+        ))
+        .unwrap();
+        let request = server
+            .requests
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["thinking"], enabled);
+        assert_eq!(body["reasoning_effort"], expected);
+    }
 }
 
 #[test]

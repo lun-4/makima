@@ -43,6 +43,10 @@ impl Discovery {
 
     /// Waits until the active provider's models are applied or every
     /// provider has answered, but no longer than {bound}.
+    pub async fn finish(self) {
+        self._task.await;
+    }
+
     pub async fn wait_active(&self, bound: Duration) {
         futures_lite::future::or(
             async {
@@ -339,6 +343,31 @@ mod tests {
 
     const TIMEOUT: Duration = Duration::from_secs(5);
     const ACTIVE: &str = "dynamic-provider";
+
+    #[test]
+    fn finish_waits_for_discovery_work() {
+        let catalog = ModelCatalog::default();
+        let (started, ready) = flume::bounded(1);
+        let (release, gate) = flume::bounded::<()>(1);
+        let discovery = catalog.discover_from(
+            async move |_| {
+                started.send(()).unwrap();
+                gate.recv_async().await.unwrap();
+            },
+            ACTIVE.to_owned(),
+            |_| {},
+        );
+        ready.recv_timeout(TIMEOUT).unwrap();
+        let (finished, result) = flume::bounded(1);
+        let thread = std::thread::spawn(move || {
+            smol::block_on(discovery.finish());
+            finished.send(()).unwrap();
+        });
+        assert!(result.try_recv().is_err());
+        release.send(()).unwrap();
+        result.recv_timeout(TIMEOUT).unwrap();
+        thread.join().unwrap();
+    }
 
     #[test]
     fn discovery_matches_owned_dynamic_provider_identity() {

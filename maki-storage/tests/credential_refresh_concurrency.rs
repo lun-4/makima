@@ -10,13 +10,14 @@ use std::{
 
 use maki_storage::{
     StateDir,
-    auth::{CredentialScope, RefreshOutcome},
+    auth::{CredentialError, CredentialLifecycle, CredentialScope, RefreshOutcome},
 };
 use serde_json::{Value, json};
 
 const SCOPE: &str = "refresh_test";
 const CHILD_DIR: &str = "MAKI_CREDENTIAL_REFRESH_CHILD_DIR";
 const READY: &str = "credential-child-ready";
+const LIFECYCLE_CHILD_DIR: &str = "MAKI_CREDENTIAL_LIFECYCLE_CHILD_DIR";
 
 fn scope(path: &std::path::Path) -> CredentialScope {
     CredentialScope::new(StateDir::from_path(path.to_owned()), SCOPE).unwrap()
@@ -62,6 +63,72 @@ fn concurrent_refresh_reloads_under_lock() {
     }
     assert_eq!(rotations.load(Ordering::SeqCst), 1);
     assert_eq!(scope.read().unwrap(), Some(json!({ "token": "new" })));
+}
+
+#[test]
+fn invalidation_fences_stale_generation_across_instances() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = StateDir::from_path(dir.path().to_owned());
+    let first = CredentialLifecycle::new(state.clone(), SCOPE).unwrap();
+    let second = CredentialLifecycle::new(state.clone(), SCOPE).unwrap();
+    let scope = CredentialScope::new(state, SCOPE).unwrap();
+    let old = smol::block_on(first.snapshot()).unwrap();
+    let current = smol::block_on(second.invalidate()).unwrap();
+    let result = smol::block_on(first.refresh(&old, &scope, |_| async {
+        Ok(RefreshOutcome::Updated(json!({"token": "stale"})))
+    }));
+    assert!(matches!(result, Err(CredentialError::StaleGeneration)));
+    assert!(scope.read().unwrap().is_none());
+    smol::block_on(second.refresh(&current, &scope, |_| async {
+        Ok(RefreshOutcome::Updated(json!({"token": "fresh"})))
+    }))
+    .unwrap();
+    assert_eq!(scope.read().unwrap(), Some(json!({"token": "fresh"})));
+}
+
+#[test]
+fn lifecycle_stale_child() {
+    let Some(path) = std::env::var_os(LIFECYCLE_CHILD_DIR) else {
+        return;
+    };
+    let state = StateDir::from_path(path.into());
+    let lifecycle = CredentialLifecycle::new(state.clone(), SCOPE).unwrap();
+    let scope = CredentialScope::new(state, SCOPE).unwrap();
+    let generation = smol::block_on(lifecycle.snapshot()).unwrap();
+    println!("{READY}");
+    std::io::stdout().flush().unwrap();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).unwrap();
+    let result = smol::block_on(lifecycle.refresh(&generation, &scope, |_| async {
+        Ok(RefreshOutcome::Updated(json!({"token": "stale"})))
+    }));
+    assert!(matches!(result, Err(CredentialError::StaleGeneration)));
+}
+
+#[test]
+fn logout_fences_login_from_another_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "lifecycle_stale_child", "--nocapture"])
+        .env(LIFECYCLE_CHILD_DIR, dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    loop {
+        let mut line = String::new();
+        assert_ne!(output.read_line(&mut line).unwrap(), 0);
+        if line.contains(READY) {
+            break;
+        }
+    }
+    let lifecycle =
+        CredentialLifecycle::new(StateDir::from_path(dir.path().to_owned()), SCOPE).unwrap();
+    smol::block_on(lifecycle.invalidate()).unwrap();
+    writeln!(child.stdin.take().unwrap(), "continue").unwrap();
+    assert!(child.wait().unwrap().success());
+    assert!(scope(dir.path()).read().unwrap().is_none());
 }
 
 #[test]

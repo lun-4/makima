@@ -106,19 +106,23 @@ local function expired(tokens)
     or now_ms() + REFRESH_BUFFER_MS >= tokens.expires
 end
 
+local function account_id(tokens)
+  return type(tokens.account_id) == "string" and tokens.account_id ~= "" and tokens.account_id or nil
+end
+
 local function refresh_tokens(ctx, previous, force)
   local current, err = ctx.credentials:refresh(TOKEN_KEY, function(saved)
     if type(saved) ~= "table" or type(saved.access) ~= "string" or saved.access == "" then
       return nil, { kind = "config", message = "OpenAI credentials are missing or invalid" }
     end
-    if saved.account_id ~= previous.account_id then
+    if account_id(saved) ~= account_id(previous) then
       return nil, { kind = "config", message = "OpenAI account changed; prepare the provider again" }
     end
     if saved.access ~= previous.access or (not force and not expired(saved)) then
       return nil
     end
     local refreshed, refresh_err = require("maki.openai_auth").refresh(ctx, saved, now_ms())
-    if refreshed and refreshed.account_id ~= saved.account_id then
+    if refreshed and account_id(refreshed) ~= account_id(saved) then
       return nil, { kind = "config", message = "OpenAI account changed; prepare the provider again" }
     end
     return refreshed, refresh_err
@@ -413,6 +417,20 @@ function M.discover(ctx, config)
   return require("maki.openai_models").discover(ctx, { kind = "platform", base_url = base, headers = headers })
 end
 
+function M.login_api_key(ctx, ui)
+  if type(ui) ~= "table" or type(ui.input) ~= "function" then
+    return nil, { kind = "config", message = "OpenAI API key login requires interactive authentication" }
+  end
+  local key, err = ui:input("OpenAI API key", true, false)
+  if err then
+    return nil, err
+  end
+  if type(key) ~= "string" or key:match("^%s*$") then
+    return nil, { kind = "config", message = "OpenAI API key is empty" }
+  end
+  return ctx.credentials:write("api_key", { api_key = key:match("^%s*(.-)%s*$") })
+end
+
 function M.auth_status(ctx, config)
   config = config or {}
   local tokens, err = read_tokens(ctx)
@@ -450,7 +468,10 @@ function M.register()
     display_name = "OpenAI",
     prepare = M.prepare,
     discover = M.discover,
-    auth = { { id = "chatgpt", label = "ChatGPT login", login = require("maki.openai_auth").login } },
+    auth = {
+      { id = "api_key", label = "API key", login = M.login_api_key },
+      { id = "chatgpt", label = "ChatGPT login", login = require("maki.openai_auth").login },
+    },
     auth_status = M.auth_status,
     logout = M.logout,
   })

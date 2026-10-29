@@ -142,7 +142,11 @@ local function headers(config, key)
 end
 
 local function base_url(config)
-  return (config.base_url or "https://api.mistral.ai/v1"):gsub("/+$", "")
+  local base = maki.uv.os_getenv("MISTRAL_BASE_URL")
+  if not base or base == "" then
+    base = config.base_url or "https://api.mistral.ai/v1"
+  end
+  return base:gsub("/+$", "")
 end
 
 function M.discover(ctx, config)
@@ -156,7 +160,7 @@ function M.discover(ctx, config)
   if not response then
     return nil, send_err
   end
-  if response.status < 200 or response.status >= 300 then
+  if response.status ~= 200 then
     response:close()
     return nil, { kind = "api", status = response.status, message = "Mistral request failed" }
   end

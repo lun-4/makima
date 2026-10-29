@@ -360,8 +360,17 @@ fn external_provider_cannot_access_credentials(owner: &str, id: &str) {
                 .contains("core providers plugin name is reserved")
         );
     }
-    host.load_source(owner, &SOURCE.replace("PROVIDER_ID", &format!("'{id}'")))
-        .unwrap();
+    let result = host.load_source(owner, &SOURCE.replace("PROVIDER_ID", &format!("'{id}'")));
+    if id == "synthetic" {
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate provider id")
+        );
+        return;
+    }
+    result.unwrap();
     let snapshot = host.provider_registry().snapshot();
     let mut model = Model::from_spec("openai/gpt-5.6-sol").unwrap();
     model.provider = Arc::from(id);

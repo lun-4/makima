@@ -595,6 +595,9 @@ impl PluginHost {
             }
         }
         for builtin in &config.names {
+            if builtin == "synthetic" {
+                continue;
+            }
             let bundled = match BUNDLED_PLUGINS.iter().find(|p| p.name == builtin.as_str()) {
                 Some(p) => p,
                 None => {
@@ -1537,8 +1540,26 @@ mod tests {
             opts: HashMap::new(),
         })
         .unwrap();
+        assert!(
+            host.provider_registry()
+                .snapshot()
+                .get("synthetic")
+                .is_some()
+        );
         assert!(host.load_source("providers", "return nil").is_err());
         assert!(host.unload("providers").is_err());
+        host.load_builtins(&PluginsConfig {
+            enabled: true,
+            names: vec!["synthetic".into()],
+            opts: HashMap::new(),
+        })
+        .unwrap();
+        assert!(
+            host.provider_registry()
+                .snapshot()
+                .get("synthetic")
+                .is_some()
+        );
         host.load_source(
             "module_probe",
             "assert(type(require('providers.core')) == 'function')",
@@ -1586,14 +1607,100 @@ mod tests {
         .unwrap();
         let snapshot = host.provider_registry().snapshot();
         let factory = &snapshot.get("google").unwrap().factory;
-        let config =
-            serde_json::json!({"api_key_env": "MAKI_GOOGLE_TEST_UNSET", "api_key": "fallback"});
+        use maki_providers::{
+            ContentBlock, Message, ProviderEvent, RequestOptions, StopReason, ThinkingConfig,
+        };
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        crate::set_allowed_private_hosts(&[address.to_string()]);
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0; 4096];
+                loop {
+                    let count = socket.read(&mut buf).unwrap();
+                    assert_ne!(count, 0);
+                    bytes.extend_from_slice(&buf[..count]);
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if bytes.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let body = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"thought\",\"thought\":true,\"thoughtSignature\":\"sig\"},{\"functionCall\":{\"name\":\"lookup\",\"args\":{\"x\":1}},\"thoughtSignature\":\"call-sig\"}]}}],\"usageMetadata\":{\"promptTokenCount\":10,\"cachedContentTokenCount\":3,\"candidatesTokenCount\":4,\"thoughtsTokenCount\":2}}\n\n";
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+                requests.push(String::from_utf8(bytes).unwrap());
+            }
+            requests
+        });
+        let config = serde_json::json!({"api_key_env": "MAKI_GOOGLE_TEST_UNSET", "api_key": "fallback", "base_url": format!("http://{address}/v1")});
         assert_eq!(
             smol::block_on(factory.auth_status(&config)).unwrap()["source"],
             "stored"
         );
         let model = maki_providers::Model::from_spec("google/gemini-2.5-pro").unwrap();
-        let (_, provider) = smol::block_on(factory.prepare(&model, &config)).unwrap();
+        let (model, provider) = smol::block_on(factory.prepare(&model, &config)).unwrap();
+        let (tx, rx) = flume::unbounded();
+        let options = RequestOptions {
+            thinking: ThinkingConfig::Off,
+            fast: false,
+        };
+        let result = smol::block_on(provider.stream_message(
+            &model,
+            &[Message::user("question".into())],
+            "",
+            &serde_json::json!([]),
+            &tx,
+            options,
+            None,
+        ))
+        .unwrap();
+        assert!(
+            matches!(&result.message.content[0], ContentBlock::Thinking { thinking, signature: Some(sig) } if thinking == "thought" && sig == "sig")
+        );
+        assert!(
+            matches!(&result.message.content[1], ContentBlock::ToolUse { name, input, thought_signature: Some(sig), .. } if name == "lookup" && input["x"] == 1 && sig == "call-sig")
+        );
+        assert_eq!(result.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(
+            (
+                result.usage.input,
+                result.usage.output,
+                result.usage.cache_read
+            ),
+            (7, 6, 3)
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ProviderEvent::ThinkingDelta { .. })
+        ));
+        assert!(matches!(rx.try_recv(), Ok(ProviderEvent::ThinkingBlockEnd)));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ProviderEvent::ToolUseStart { .. })
+        ));
         save_provider_credentials(
             &dir,
             "google",
@@ -1604,6 +1711,28 @@ mod tests {
         )
         .unwrap();
         smol::block_on(provider.reload_auth()).unwrap();
+        smol::block_on(provider.stream_message(
+            &model,
+            &[Message::user("question".into())],
+            "",
+            &serde_json::json!([]),
+            &tx,
+            options,
+            None,
+        ))
+        .unwrap();
+        let requests = server.join().unwrap();
+        crate::set_allowed_private_hosts(&[]);
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains("x-goog-api-key: first\r\n")
+        );
+        assert!(
+            requests[1]
+                .to_ascii_lowercase()
+                .contains("x-goog-api-key: second\r\n")
+        );
         smol::block_on(factory.logout(&config)).unwrap();
         assert_eq!(
             smol::block_on(factory.auth_status(&config)).unwrap()["source"],

@@ -143,7 +143,7 @@ fn regolo_registration_discovery_usage_and_stream() {
     }
     let error = smol::block_on(registration.factory.discover(&config)).unwrap_err();
     assert!(
-        matches!(error, AgentError::Api { status: 401, .. }),
+        matches!(error, AgentError::Api { status: 401, ref message, .. } if message == "unauthorized"),
         "{error:?}"
     );
     let request = server.requests.recv_timeout(TIMEOUT).unwrap().unwrap();

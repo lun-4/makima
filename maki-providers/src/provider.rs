@@ -495,6 +495,7 @@ pub async fn fetch_all_models_excluding(
 ) {
     let (tx, rx) = flume::unbounded();
     let timeouts = Timeouts::default();
+    let mut tasks = Vec::new();
 
     for manifest in crate::manifest::ManifestRegistry::builtins() {
         let slug = manifest.slug;
@@ -507,7 +508,7 @@ pub async fn fetch_all_models_excluding(
         };
         let display_name = manifest.display_name;
         let tx = tx.clone();
-        smol::spawn(async move {
+        tasks.push(smol::spawn(async move {
             let result = provider.list_models().await.map_err(|e| e.to_string()).and_then(|models| {
                 crate::model_registry::publish_discovered_models(slug, models)
                     .map_err(|e| e.to_string())
@@ -546,8 +547,7 @@ pub async fn fetch_all_models_excluding(
                 }
             };
             let _ = tx.send_async(batch).await;
-        })
-        .detach();
+        }));
     }
 
     for listed in dynamic::discovered_slugs() {
@@ -556,7 +556,7 @@ pub async fn fetch_all_models_excluding(
         }
         let tx = tx.clone();
         let slug = listed.to_string();
-        smol::spawn(async move {
+        tasks.push(smol::spawn(async move {
             let static_fallback = |reason: String| {
                 warn!(
                     slug,
@@ -586,13 +586,12 @@ pub async fn fetch_all_models_excluding(
                 Err(e) => static_fallback(e.to_string()),
             };
             let _ = tx.send_async(batch).await;
-        })
-        .detach();
+        }));
     }
 
     let tx_catalog = tx.clone();
     let catalog_exclusions = exclusions.clone();
-    smol::spawn(async move {
+    tasks.push(smol::spawn(async move {
         let catalog = smol::unblock(catalog_providers).await;
         for cat in catalog {
             if catalog_exclusions.contains(&cat.slug)
@@ -615,13 +614,12 @@ pub async fn fetch_all_models_excluding(
                 })
                 .await;
         }
-    })
-    .detach();
+    }));
 
     let custom_timeouts = timeouts;
     let tx_custom = tx.clone();
     let custom_exclusions = exclusions.clone();
-    smol::spawn(async move {
+    tasks.push(smol::spawn(async move {
         let declared = crate::providers::custom::declared_model_specs_excluding(&custom_exclusions);
         if !declared.is_empty() {
             let _ = tx_custom
@@ -645,14 +643,16 @@ pub async fn fetch_all_models_excluding(
                 })
                 .await;
         }
-    })
-    .detach();
+    }));
 
     drop(tx);
 
     while let Ok(mut batch) = rx.recv_async().await {
         batch.models.retain(|spec| policy.allows(spec));
         on_ready(batch);
+    }
+    for task in tasks {
+        task.await;
     }
 }
 

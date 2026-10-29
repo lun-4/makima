@@ -49,6 +49,7 @@ fn module_source(name: &str) -> Option<&'static str> {
         "maki.zai" => Some(include_str!("../../plugins/lib/maki/zai.lua")),
         "maki.deepseek" => Some(include_str!("../../plugins/lib/maki/deepseek.lua")),
         "maki.llama_cpp" => Some(include_str!("../../plugins/lib/maki/llama_cpp.lua")),
+        "maki.ollama" => Some(include_str!("../../plugins/lib/maki/ollama.lua")),
         "maki.openai" => Some(include_str!("../../plugins/lib/maki/openai.lua")),
         "maki.openai_auth" => Some(include_str!("../../plugins/lib/maki/openai_auth.lua")),
         "maki.json_response" => Some(include_str!("../../plugins/lib/maki/json_response.lua")),

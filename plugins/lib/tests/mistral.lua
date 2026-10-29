@@ -105,3 +105,11 @@ sent = false
 request.session_id = 42
 local _, invalid_err = instance.stream(stream_ctx, request, function() end)
 assert(not sent and invalid_err.kind == "config" and invalid_err.message == "Invalid Mistral session ID")
+
+local status_ctx = {
+  send = function()
+    return { status = 201, close = function() end }
+  end,
+}
+local result, status_err = mistral.discover(status_ctx, config)
+assert(result == nil and status_err.kind == "api" and status_err.status == 201)
