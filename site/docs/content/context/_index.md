@@ -67,6 +67,14 @@ All four end up in context, but at different times and prices:
 
 Rule of thumb: when `AGENTS.md` grows past a screen, the new material probably wants to be a skill. `AGENTS.md` is a tax on every request; a skill is a tax only on the sessions that need it.
 
+## Todo state
+
+Todo lists belong to an agent's history. The root agent and each child agent have separate lists, even within the same session. `todo_write` replaces the entire list, and `todo_read` returns its current contents. An empty write clears the list explicitly.
+
+A list remains available after a turn ends and when the session resumes. Rewind restores the list at the retained history boundary. Manual and automatic compaction preserve it without asking the model to copy it into the summary. Reset clears it with the history.
+
+The todo panel follows the focused live agent. Ctrl+T changes panel visibility without changing the list. A restored child transcript has no live agent, so selecting it hides the panel. Rendering an older tool card does not restore that card's list as current state. Sessions saved before history state was supported start with an empty list; tool cards do not reconstruct it.
+
 ## When the window fills
 
 Long sessions eventually approach the model's context limit. Makima reserves a slice of the window (`agent.compaction_buffer`, default 20%) and before running out it summarizes the older turns and continues from the summary. `/compact` triggers it early, `/usage` shows where the tokens went, and `agent.compaction_instructions` steers what the summary keeps.

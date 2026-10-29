@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Makima ships with 25 built-in tools in this reference (24 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Makima ships with 26 built-in tools in this reference (25 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
@@ -216,7 +216,14 @@ Create or update a structured todo list to track tasks.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `todos` | array | yes | The updated todo list |
+| `todos` | array | yes | The complete updated todo list, or an empty array to clear it |
+
+### `todo_read` {#todo_read}
+
+Read the current todo list for this agent.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
 
 ### `memory` {#memory}
 

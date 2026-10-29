@@ -359,7 +359,8 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///
 /// Agent events fire for every agent, children included: `"TurnStart"`,
 /// `"TurnEnd"`, `"AgentIdle"`, `"ConfigChanged"`, `"AgentClosed"`,
-/// `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"` and `"CompactionDone"`.
+/// `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`, `"CompactionDone"` and
+/// `"HistoryStateChanged"`.
 /// Their `ev.agent` is the agent's handle (nil once it has left the graph),
 /// `ctx` is a trusted context pinned to it, and `ev.data` carries `agent_id`,
 /// `session_id` and `parent_id` (nil for a root, so `if ev.data.parent_id then
@@ -375,7 +376,16 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `"cancelled"`), and after a compaction inside a turn also
 /// `context_size_before`, `context_size_after` and `context_window`; a
 /// compaction inside a turn that fails ends the turn, so it reports as a
-/// failed `"TurnEnd"`.
+/// failed `"TurnEnd"`. `"HistoryStateChanged"` follows a committed state update
+/// or history replacement. `data.namespace` identifies a changed namespace;
+/// nil requests a full refresh. Callbacks query current state through
+/// `Agent:history_get(ctx, namespace)`.
+///
+/// `"AgentFocusChanged"` follows the selected agent, including child switches
+/// within one session and resumed agent runtimes. It carries `data.session_id`
+/// and `data.agent_id`. A live selection supplies `ev.agent` and a pinned `ctx`;
+/// no live selection supplies nil for the agent, agent ID and context. Async
+/// refreshes must discard responses for an older focus or refresh request.
 ///
 /// Host events with no agent, where `ctx` is nil: `"SessionReset"`,
 /// `"SessionFocusChanged"`, `"ProviderChanged"`, `"SessionPickerRequested"`,

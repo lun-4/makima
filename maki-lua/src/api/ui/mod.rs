@@ -31,7 +31,8 @@ pub(crate) mod buf;
 pub(crate) mod win;
 
 use crate::runtime::{
-    current_managed_turn, in_delegated_tool, pinned_target, validate_plugin_effect, with_task_bufs,
+    current_managed_turn, delegated_tool, in_delegated_tool, pinned_target, validate_plugin_effect,
+    with_task_bufs,
 };
 use win::WinHandle;
 
@@ -563,6 +564,9 @@ async fn open_list_picker(
 /// Opens a floating or split window that displays the contents of {buf}.
 /// Returns a Win handle you can use to receive events, update layout,
 /// and close the window when you are done.
+/// Agent callbacks bind the window to the event's session, even if focus changes
+/// before it opens. Delegated tool handlers use their turn's session. Calls
+/// without either context use the focused session when the window opens.
 ///
 /// @param buf Buf Buffer to display.
 /// @param opts table Float configuration. Fields:
@@ -597,7 +601,7 @@ async fn open_list_picker(
 /// })
 #[lua_fn]
 fn open_win(
-    _lua: &Lua,
+    lua: &Lua,
     #[ctx] tx: flume::Sender<UiAction>,
     buf: mlua::AnyUserData,
     opts: Table,
@@ -666,7 +670,11 @@ fn open_win(
     let (event_tx, event_rx) = flume::unbounded::<WinEvent>();
     let (cmd_tx, cmd_rx) = flume::unbounded::<WinCommand>();
 
+    let session_id = pinned_target(lua)
+        .and_then(|target| target.template.session_id.map(|session| session.id()))
+        .or_else(|| delegated_tool(lua).and_then(|tool| tool.session));
     let _ = tx.try_send(UiAction::OpenWin {
+        session_id,
         buf: buf_handle.buf.clone(),
         config,
         focus,
@@ -1087,12 +1095,39 @@ fn markdown_lines_to_lua(lua: &Lua, lines: &[maki_markdown::render::Line]) -> Lu
 mod tests {
     use super::*;
     use maki_highlight::StyledSegment;
+    use maki_storage::id::MakiId;
     use mlua::Lua;
     use test_case::test_case;
 
     const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
     const MISSING_KEY: &str = "missing";
     const ORANGE_HEX: &str = "#ff8000";
+
+    #[test_case(false ; "unbound")]
+    #[test_case(true ; "delegated_session")]
+    fn open_win_captures_session_before_action_consumption(delegated: bool) {
+        let lua = Lua::new();
+        let scope = crate::runtime::TaskScope::detached(&lua);
+        let original_session = delegated.then(MakiId::generate);
+        if delegated {
+            crate::runtime::lock_cell(scope.handle()).delegated_tool =
+                Some(crate::runtime::DelegatedTool {
+                    session: original_session,
+                });
+        }
+        let (tx, rx) = flume::unbounded();
+        let ui = create_ui_table(&lua, Some(tx), Arc::from("test"), None).unwrap();
+        lua.globals().set("ui", ui).unwrap();
+        lua.load("ui.open_win(ui.buf(), {})").exec().unwrap();
+        crate::runtime::lock_cell(scope.handle()).delegated_tool =
+            Some(crate::runtime::DelegatedTool {
+                session: Some(MakiId::generate()),
+            });
+        let UiAction::OpenWin { session_id, .. } = rx.try_recv().unwrap() else {
+            panic!("expected window request");
+        };
+        assert_eq!(session_id, original_session);
+    }
 
     #[test_case(false ; "no_target")]
     #[test_case(true ; "delegated")]

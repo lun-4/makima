@@ -536,6 +536,7 @@ pub enum BuiltinAction {
 
 pub enum UiAction {
     OpenWin {
+        session_id: Option<MakiId>,
         buf: Arc<SharedBuf>,
         config: FloatConfig,
         focus: bool,

@@ -10,29 +10,34 @@ Add per-agent, namespaced JSON history state to `maki-storage`, `maki-agent`, an
 
 ## Progress
 
-Updated 2026-10-29. The persistence and snapshot foundation is implemented. The todo plugin still uses its previous process-local state; the generic Lua API and plugin migration are not implemented.
+Updated 2026-10-29. All six implementation steps and local verification are complete. The persistence foundation is committed as `d1cbf635`; the shared history owner and Lua API are committed as `ea937eff`. The final commit contains the plugin, UI, tests, documentation and this completion record.
 
 Completed:
 
 - Step 1: `HistoryState` supports ordered whole-value replacements, explicit deletions, prefix truncation, boundary remapping and compaction to a baseline. JSON null and deletion have distinct serialized operations.
-- Step 2 foundation: `HistorySnapshot` includes frozen shared state. Root and child state persists in defaulted session metadata outside `SessionMeta`, including state-only checkpoints, legacy defaults and orphan pruning. State contributes to checkpoint identity, merging, revision detection and waiter retention.
-- Agent restoration, actor/manager creation, child history events and `HistoryChange` carry complete snapshots. Sanitation remaps state boundaries before appending synthetic results. Rewind prepares truncated state before publication. Compaction folds state into the baseline; tested root manual-compaction failures restore the original snapshot.
-- Stale same-epoch snapshots cannot discard newer timeline updates, including after message appends or message-buffer reconstruction. Historical frontend projections preserve the exact state-bearing snapshot.
-- UI sessions with only root or child generic state count as nonempty. This does not implement the focused-agent todo panel.
+- Step 2: `HistorySnapshot` carries frozen shared state through root and child checkpoints, restoration, orphan pruning, sanitation, rewind and compaction. State-only updates participate in checkpoint identity and revision detection. Stale snapshots cannot discard newer updates. Child manual compaction checkpoints an independent candidate before publication; failure leaves the original history unchanged.
+- Step 3: `History` clones share one synchronized owner. Invocation-bound state handles publish matching snapshots immediately, preserve nested commits and reject cancelled or stale operations. Lua exposes strict JSON get/set/delete methods, read-only agent queries and generic state/focus notifications.
+- Step 4: The Lua todo plugin owns validation, replace/read/clear tools, model output and historical cards. The panel follows the focused live agent, discards stale refreshes and retains session-owned windows. Ctrl+T changes visibility only. Turn end does not clear state, and compaction prompts no longer request todo copying.
+- Step 5: Real nested Lua dispatch, disk-backed root/child checkpoints, delayed responses and actual event-loop panel tests cover lifecycle transitions. Queued window tests move native focus before consumption and verify the originating session retains its window.
+- Step 6: Canonical Lua API, tool and context documentation describes isolation, persistence, clearing, rewind, compaction and panel behavior. Generated references include `todo_read` and the generic APIs.
 
-Next:
+Acceptance evidence:
 
-1. Finish the remaining step 2 gap: `LuaActorBackend::run_compact` in `maki-lua/src/api/agent.rs` does not checkpoint child manual compaction or restore the prior snapshot on checkpoint failure. Compaction controls have no `managed_turn`. Supply a durable checkpoint target without retaining a strong manager/actor ownership cycle, and report completion only after publication. Add success/failure regression tests.
-2. Implement step 3 before exposing mutable Lua state: one synchronized snapshot owner, generation-fenced tool contexts, invocation-boundary state commits, immediate matching publication, read-only agent queries and generic focus/state notifications. The current `History` still owns a mutable snapshot and publishes a read projection; tool-side concurrent mutation is not available.
-3. Implement steps 4 to 6: Lua todo tools and validation, focused-agent panel refresh, deterministic nested/cancellation/delayed-focus harnesses, compaction prompt cleanup and documentation.
+- AC.1: Lua API tests cover namespace isolation, null, tagged arrays, invalid values and unavailable capabilities. Storage rejects unreadable state-bearing metadata before publication.
+- AC.2-4: Storage and agent suites cover legacy defaults, state-only checkpoint/resume, child adoption/pruning, sanitation, rewind, manual/automatic compaction and rollback failures.
+- AC.5: `maki-lua/src/history_state_regression.rs` runs real nested dispatch with barriers for pre-join publication, result append/resume, concurrency, cancellation, parent/child isolation and stale handles after rewind, compaction and reset.
+- AC.6-7: `maki-lua/tests/todo_lifecycle.rs`, restore tests and actual-plugin event-loop tests cover validation, model output, clearing, historical rendering, turn end, session/child focus, delayed reads, rewind, runtime resume and empty-history replacement. UI visibility assertions compare complete snapshots to prove toggles do not mutate history.
+- AC.8: Generated references pass `just gen-docs-check`. The context documentation is checked against the tested lifecycle, including historical child tabs without a live agent.
+- AC.9: Nested-dispatch, child-checkpoint and delayed-focus smoke tests verify the harness controls before the acceptance scenarios use them.
 
-Verification for the foundation:
+Verification:
 
-- `OPENSSL_NO_VENDOR=1 cargo nextest run -p maki-storage -p maki-agent -p maki-lua -p maki-ui`: 5615 passed, no skips.
-- `OPENSSL_NO_VENDOR=1 cargo check -p maki-agent -p maki-lua -p maki-ui --tests` passes.
-- `OPENSSL_NO_VENDOR=1 cargo clippy -p maki-storage -p maki-agent -p maki-lua -p maki-ui --tests -- -D warnings` passes.
-- `cargo fmt --all -- --check`, `git diff --check` and `OPENSSL_NO_VENDOR=1 just gen-docs-check` pass. Full-workspace lint/tests are not run.
-- Plan review identified state-only writer identity, startup state loss and message-only history projections. Those findings are addressed. Implementation review identified pointer-dependent stale-state detection; the fix and two disk-backed append/reconstruction regressions pass. The child manual-compaction gap above remains open.
+- The `ea937eff` commit hook ran `OPENSSL_NO_VENDOR=1 just ci` against the cumulative worktree: all 7,633 workspace tests passed, with no skips. Rust/Lua formatting, workspace Clippy including benches, Python checks, generated-doc checks and unused-dependency checks passed.
+- Final UI-scoped `cargo check`, Clippy and all 2,208 tests passed. Seven focused todo/window-routing cases passed 50 stress iterations each (350 test executions), without sleeps.
+- Linux `cargo build` and workspace `cargo check --tests --benches` passed. Windows lint, tests and build remain for the Windows CI runner.
+- Implementation review findings are resolved and follow-up storage/window-routing reviews approve the fixes. The first full-workspace run found a missing `todo_read` documentation index entry; the index is fixed and the subsequent full run passes.
+
+Final staged verification passed `OPENSSL_NO_VENDOR=1 just ci` (7,633 tests, no skips), `OPENSSL_NO_VENDOR=1 just build` and `git diff --check`. No implementation steps remain. Windows validation remains with CI.
 
 ## Implementation Plan
 
@@ -112,5 +117,9 @@ Document the generic Lua API and its ordering, isolation, value and history sema
 - Generic state must be synchronized with history, not independently sampled at checkpoint time. Nested calls, cancellation and stale handles need explicit tests.
 - History sanitation can move message boundaries; preserve their intended associations.
 - Older sessions may have lost todo state to compaction; do not guess from historical render callbacks. Older binaries may discard unknown metadata when rewriting.
+- Panel focus follows live agents. Restored child transcripts have no live agent ID and produce no-agent focus, so the panel hides on those historical tabs. Their stored generic state remains in the session snapshot. Resuming the root restores its current panel state; historical cards do not reconstruct child actors.
+- Tool input normalization retains the existing shared schema behavior: unknown fields are removed. Lua validates known todo fields and stores only those fields; unknown-field rejection is not a separate todo contract.
+- Lua history values have a depth limit of 64. State-bearing metadata is checked against the storage decoder before publication; an unreadable deep record fails rather than silently reverting state.
+- Queued window creation carries the pinned invocation session so a focus change before action consumption cannot move a panel to another session.
 - Full snapshots per update trade space for simplicity. Measure before optimizing; do not introduce a general plugin framework.
 - Existing event-loop, checkpoint and tool harnesses need extensions for real Lua calls, agent focus and disk-backed lifecycle tests.

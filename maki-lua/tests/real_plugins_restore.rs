@@ -8,7 +8,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{KeyCode, KeyModifiers};
 use maki_agent::actor::AgentContextSnapshot;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::permissions::{DEFAULT_DENY_GUIDANCE, PERMISSION_DENIED_PREFIX};
@@ -28,8 +27,8 @@ use maki_config::{
     DefaultEffect, Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey,
     ToolOutputLines,
 };
+use maki_lua::PluginHost;
 use maki_lua::orchestration::{AgentOrchestration, TrustedTarget};
-use maki_lua::{PluginHost, UiAction, WinCommand};
 use maki_providers::{Message, StreamResponse};
 use maki_storage::checkpoint::{CheckpointWriter, accept_all};
 use maki_storage::id::MakiId;
@@ -376,7 +375,7 @@ fn exec_live_with(
 fn todo_write_renders_live_and_restored_body_and_clears() {
     const TOOL: &str = "todo_write";
     const EXPECTED: &str = "[ ] Pending task\n[•] Active task\n[✓] Done task\n[x] Cancelled task";
-    const CLEARED: &str = "Todos cleared";
+    const CLEARED: &str = "[]";
 
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
@@ -386,83 +385,32 @@ fn todo_write_renders_live_and_restored_body_and_clears() {
         { "content": "Done task", "status": "completed" },
         { "content": "Cancelled task", "status": "cancelled" },
     ] });
-    let live = exec_live(&host, &reg, TOOL, input.clone());
+    let history = History::new(Vec::new());
+    let live = exec_live_with(&host, &reg, TOOL, input.clone(), |ctx| {
+        ctx.history_state = Some(history.state_handle(0, ctx.cancel.clone()));
+    });
+    assert_eq!(
+        serde_json::from_str::<Value>(&live.output).unwrap(),
+        input["todos"]
+    );
+    let actions = host.ui_action_rx();
+    assert!(actions.is_empty(), "tool execution does not open the panel");
     let restored = restore(&host, TOOL, input, &live.output, live.state, Vec::new());
-    let cleared = exec_live(&host, &reg, TOOL, json!({ "todos": [] }));
+    assert!(
+        actions.is_empty(),
+        "historical rendering does not open the panel"
+    );
+    let cleared = exec_live_with(&host, &reg, TOOL, json!({ "todos": [] }), |ctx| {
+        ctx.history_state = Some(history.state_handle(0, ctx.cancel.clone()));
+    });
 
     assert_eq!(cleared.output, CLEARED);
+    assert_eq!(
+        history.snapshot().state.get("todo_write.todos"),
+        Some(&json!([]))
+    );
     assert_eq!(restored.body, EXPECTED);
     assert_eq!(live.body, EXPECTED);
-}
-
-#[test_case::test_case(true; "initially_visible")]
-#[test_case::test_case(false; "initially_hidden")]
-fn todo_ctrl_t_toggles_panel(initially_visible: bool) {
-    const TOOL: &str = "todo_write";
-    const TASK: &str = "[ ] Pending task";
-    const TIMEOUT: Duration = Duration::from_secs(5);
-
-    let reg = Arc::new(ToolRegistry::new());
-    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
-    let actions = host.ui_action_rx();
-    let keymaps = host.keymap_reader().load();
-    let keymap = keymaps
-        .entries
-        .iter()
-        .find(|entry| {
-            entry.plugin.as_ref() == TOOL
-                && entry.key == KeyCode::Char('t')
-                && entry.modifiers == KeyModifiers::CONTROL
-        })
-        .expect("bundled todo Ctrl+T keybind is missing")
-        .id;
-    let input = json!({ "todos": [{ "content": "Pending task", "status": "pending" }] });
-    if initially_visible {
-        exec_live(&host, &reg, TOOL, input);
-    } else {
-        restore(&host, TOOL, input, "", None, Vec::new());
-    }
-    let UiAction::OpenWin {
-        buf,
-        config,
-        cmd_rx,
-        ..
-    } = actions.recv_timeout(TIMEOUT).unwrap()
-    else {
-        panic!("todo panel did not open");
-    };
-    assert_eq!(config.visible, initially_visible);
-    assert_eq!(buf.take().text(), TASK);
-    assert!(matches!(
-        cmd_rx.recv_timeout(TIMEOUT).unwrap(),
-        WinCommand::SetConfig(_)
-    ));
-    let handle = host.event_handle();
-    for expected in [!initially_visible, initially_visible] {
-        assert!(handle.run_keybind_callback(keymap, None));
-        assert!(
-            matches!(cmd_rx.recv_timeout(TIMEOUT).unwrap(), WinCommand::SetVisible(visible) if visible == expected)
-        );
-    }
-    exec_live(&host, &reg, TOOL, json!({ "todos": [] }));
-    assert!(matches!(
-        cmd_rx.recv_timeout(TIMEOUT).unwrap(),
-        WinCommand::SetVisible(false)
-    ));
-    exec_live(
-        &host,
-        &reg,
-        TOOL,
-        json!({ "todos": [{ "content": "New task", "status": "pending" }] }),
-    );
-    assert!(matches!(
-        cmd_rx.recv_timeout(TIMEOUT).unwrap(),
-        WinCommand::SetConfig(_)
-    ));
-    assert!(matches!(
-        cmd_rx.recv_timeout(TIMEOUT).unwrap(),
-        WinCommand::SetVisible(true)
-    ));
 }
 
 /// A directory has no skeleton, so index shows the plain listing. Restore must

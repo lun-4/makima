@@ -42,7 +42,7 @@ use maki_agent::session_options::{
 };
 use maki_agent::tools::offload::OffloadStore;
 use maki_agent::{
-    AgentConfig, AgentEvent, AgentRef, CancelToken, Envelope, McpCommand, McpConfigErrors,
+    AgentConfig, AgentEvent, AgentId, AgentRef, CancelToken, Envelope, McpCommand, McpConfigErrors,
     McpHandle, McpSnapshotReader, mcp,
 };
 use maki_commands::{BuiltinOperation, CommandError, HostResponse};
@@ -1593,7 +1593,7 @@ pub(crate) struct EventLoop<'t> {
     sessions: Vec<SessionRuntime>,
     focused: usize,
     session_picker: bool,
-    last_focused: Option<MakiId>,
+    last_focused: Option<(MakiId, Option<AgentId>)>,
     terminal_focused: bool,
     notifier: Option<terminal::TerminalNotifier>,
     ctx: SpawnCtx,
@@ -2544,6 +2544,7 @@ impl<'t> EventLoop<'t> {
             }
         }
 
+        self.sync_orchestration();
         // These two only fire Lua autocmds. Anything a handler does comes back
         // as a `UiAction` on the next wake, which repaints then.
         self.emit_focus_change();
@@ -2835,18 +2836,28 @@ impl<'t> EventLoop<'t> {
     }
 
     fn emit_focus_change(&mut self) {
-        let id = self.sessions[self.focused].id();
-        if self.last_focused == Some(id) {
+        let runtime = &self.sessions[self.focused];
+        let id = runtime.id();
+        let agent = selected_agent(runtime);
+        let focus = (id, agent.as_ref().map(AgentRef::id));
+        if self.last_focused == Some(focus) {
             return;
         }
-        let mut data = json!({ "session_id": id });
-        if let Some(previous) = self.last_focused {
-            data["previous_session_id"] = json!(previous.to_string());
+        let handle = &self.ctx.lua_event_handle;
+        if self.last_focused.map(|(session_id, _)| session_id) != Some(id) {
+            let mut data = json!({ "session_id": id });
+            if let Some((previous, _)) = self.last_focused {
+                data["previous_session_id"] = json!(previous.to_string());
+            }
+            handle.fire_autocmd("SessionFocusChanged", data);
         }
-        self.last_focused = Some(id);
-        self.ctx
-            .lua_event_handle
-            .fire_autocmd("SessionFocusChanged", data);
+        self.last_focused = Some(focus);
+        let data = json!({ "session_id": id, "agent_id": focus.1.map(|id| id.to_string()) });
+        if let Some(agent) = agent {
+            handle.fire_agent_autocmd("AgentFocusChanged", agent, data);
+        } else {
+            handle.fire_autocmd("AgentFocusChanged", data);
+        }
     }
 
     fn start_mailbox_runs(&mut self) -> Dirty {
@@ -4357,8 +4368,16 @@ impl UiSink for EventLoop<'_> {
                 focus,
                 event_tx,
                 cmd_rx,
+                session_id,
             } => {
-                let app = self.focused_app();
+                let index = match session_id {
+                    Some(id) => match self.position(id) {
+                        Some(index) => index,
+                        None => return,
+                    },
+                    None => self.focused,
+                };
+                let app = &mut self.sessions[index].app;
                 app.handle_open_win(buf, config, focus, event_tx, cmd_rx);
                 // An active (non-deferred) ask rings now; a deferred one rings
                 // on promotion. Draining here keeps the active path immediate.
@@ -4694,51 +4713,37 @@ mod tests {
     #[test]
     fn todo_ctrl_t_dispatches_from_terminal_input() {
         const TASK: &str = "Pending task";
-        const TIMEOUT: Duration = Duration::from_secs(5);
-
         with_event_loop(|event_loop| {
-            let registry = Arc::new(maki_agent::tools::ToolRegistry::new());
-            let host = maki_lua::PluginHost::with_all_builtins(registry).unwrap();
-            let handle = host.event_handle();
-            handle.install_orchestration_services(event_loop.orchestration.clone());
-            let app = &mut event_loop.sessions[0].app;
-            app.keymap_reader = host.keymap_reader();
-            app.lua_event_handle = handle.clone();
-            let (tx, _rx) = flume::unbounded();
-            handle.request_restore(
-                maki_lua::RestoreItem {
-                    tool: Arc::from("todo_write"),
-                    tool_use_id: "restore_id".into(),
-                    output: String::new(),
-                    input: json!({ "todos": [{ "content": TASK, "status": "pending" }] }),
-                    is_error: false,
-                    tool_output_lines: Default::default(),
-                    theme_gen: None,
-                    clicks: Vec::new(),
-                    state: None,
-                },
-                maki_agent::EventSender::new(tx),
-            );
-            handle.wait_restore_complete_for_test();
-            let UiAction::OpenWin { config, cmd_rx, .. } =
-                host.ui_action_rx().recv_timeout(TIMEOUT).unwrap()
-            else {
-                panic!("todo panel did not open");
+            let host = super::focus_tests::install_todo_plugin(event_loop);
+            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            super::focus_tests::seed_todos(&actor, TASK);
+            let snapshot = || {
+                serde_json::to_value(
+                    actor
+                        .prepare_idle()
+                        .unwrap()
+                        .source_snapshot()
+                        .unwrap()
+                        .history,
+                )
+                .unwrap()
             };
-            assert!(!config.visible);
-            assert!(matches!(
-                cmd_rx.recv_timeout(TIMEOUT).unwrap(),
-                maki_lua::WinCommand::SetConfig(_)
-            ));
-            for visible in [true, false] {
-                event_loop.handle_input(Event::Key(crossterm::event::KeyEvent::new(
-                    KeyCode::Char('t'),
-                    KeyModifiers::CONTROL,
-                )));
-                assert!(matches!(
-                    cmd_rx.recv_timeout(TIMEOUT).unwrap_or_else(|error| panic!("visibility {visible}: {error}")),
-                    maki_lua::WinCommand::SetVisible(actual) if actual == visible
-                ));
+            let original = snapshot();
+            event_loop.sync_orchestration();
+            event_loop.emit_focus_change();
+            super::focus_tests::settle_todo_ui(event_loop, &host);
+            super::focus_tests::assert_todo_panel(event_loop, 0, TASK, false);
+            host.event_handle().fire_agent_autocmd(
+                "TurnEnd",
+                manager.lookup(root).unwrap(),
+                json!({}),
+            );
+            super::focus_tests::settle_todo_ui(event_loop, &host);
+            for visible in [true, false, true] {
+                super::focus_tests::toggle_todo_panel(event_loop, &host);
+                super::focus_tests::assert_todo_panel(event_loop, 0, TASK, visible);
+                assert_eq!(snapshot(), original);
             }
         });
     }

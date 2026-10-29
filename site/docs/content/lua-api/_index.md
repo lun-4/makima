@@ -171,6 +171,73 @@ Read the executing turn's admitted mode. This can differ from Agent:config(ctx).
 
 **Returns:** (`string?`, `string?`) Registered mode name.
 
+---
+
+### `LuaCtx:history_get()` {#LuaCtx-history_get}
+
+```lua
+LuaCtx:history_get({namespace})
+```
+
+Read a namespaced JSON value from the tool handler's executing agent. Root and child agents have independent state, even with the same session ID. Nested tool calls share their enclosing invocation's history boundary. State survives turn end and session resume. Missing namespaces return nil without an error. JSON null is a non-nil sentinel and round-trips through these methods. Start, restore and trusted callbacks lack this capability; callbacks use Agent:history_get(ctx, namespace).
+
+**Parameters:**
+
+- `{namespace}` (`string`) Independent state key, conventionally prefixed with the plugin name.
+
+**Returns:** (`any?`, `string?`) Committed value, or nil plus an error when the capability is unavailable, cancelled or stale.
+
+**Example:**
+
+```lua
+local value, err = ctx:history_get("plugin.state")
+```
+
+---
+
+### `LuaCtx:history_set()` {#LuaCtx-history_set}
+
+```lua
+LuaCtx:history_set({namespace}, {value})
+```
+
+Replace one namespace's whole JSON value. Supported values are nil (JSON null), booleans, finite numbers, UTF-8 strings, dense arrays and string-keyed objects. Empty tables are objects; decoded empty JSON arrays retain their array type. Values may contain at most 64 nested container levels below the root. Functions, threads, other userdata, table cycles, mixed keys, sparse arrays and deeper values fail without mutation. Commits take effect immediately in lock-acquisition order, before an enclosing tool completes; its later failure does not undo the change. Cancelled operations cannot commit. Rewind restores values at the retained message boundary, compaction preserves current values and reset clears state. History replacement invalidates retained capabilities. One-shot agents keep state in memory without session persistence.
+
+**Parameters:**
+
+- `{namespace}` (`string`) Namespace to replace.
+- `{value}` (`any`) Complete JSON-serializable value. Nil stores JSON null; deletion is explicit.
+
+**Returns:** (`boolean?`, `string?`) True on commit, or nil plus an error with no mutation.
+
+**Example:**
+
+```lua
+local ok, err = ctx:history_set("plugin.state", { completed = 2 })
+```
+
+---
+
+### `LuaCtx:history_delete()` {#LuaCtx-history_delete}
+
+```lua
+LuaCtx:history_delete({namespace})
+```
+
+Delete one namespace at the current invocation's history boundary. Deletion has the same commit ordering, cancellation and history semantics as history_set. It is distinct from storing JSON null. Deleting an absent namespace succeeds.
+
+**Parameters:**
+
+- `{namespace}` (`string`) Namespace to remove.
+
+**Returns:** (`boolean?`, `string?`) True on commit, or nil plus an error with no mutation.
+
+**Example:**
+
+```lua
+local ok, err = ctx:history_delete("plugin.state")
+```
+
 
 ## maki {#maki}
 
@@ -922,7 +989,8 @@ can await, and it never blocks the event that fired it. `ev` is
 
 Agent events fire for every agent, children included: `"TurnStart"`,
 `"TurnEnd"`, `"AgentIdle"`, `"ConfigChanged"`, `"AgentClosed"`,
-`"ToolStart"`, `"ToolDone"`, `"AutoCompacting"` and `"CompactionDone"`.
+`"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`, `"CompactionDone"` and
+`"HistoryStateChanged"`.
 Their `ev.agent` is the agent's handle (nil once it has left the graph),
 `ctx` is a trusted context pinned to it, and `ev.data` carries `agent_id`,
 `session_id` and `parent_id` (nil for a root, so `if ev.data.parent_id then
@@ -938,7 +1006,16 @@ a compaction) settled, not after a config change alone, and adds `settled`;
 `"cancelled"`), and after a compaction inside a turn also
 `context_size_before`, `context_size_after` and `context_window`; a
 compaction inside a turn that fails ends the turn, so it reports as a
-failed `"TurnEnd"`.
+failed `"TurnEnd"`. `"HistoryStateChanged"` follows a committed state update
+or history replacement. `data.namespace` identifies a changed namespace;
+nil requests a full refresh. Callbacks query current state through
+`Agent:history_get(ctx, namespace)`.
+
+`"AgentFocusChanged"` follows the selected agent, including child switches
+within one session and resumed agent runtimes. It carries `data.session_id`
+and `data.agent_id`. A live selection supplies `ev.agent` and a pinned `ctx`;
+no live selection supplies nil for the agent, agent ID and context. Async
+refreshes must discard responses for an older focus or refresh request.
 
 Host events with no agent, where `ctx` is nil: `"SessionReset"`,
 `"SessionFocusChanged"`, `"ProviderChanged"`, `"SessionPickerRequested"`,
@@ -1664,6 +1741,26 @@ Read lifecycle, active turn, queue size, and cumulative usage.
 
 ---
 
+### `Agent:history_get()` {#Agent-history_get}
+
+```lua
+Agent:history_get({ctx}, {namespace})
+```
+
+Read one namespace from this agent's committed history state without changing
+focus or granting mutation authority. Child agents have separate namespaces.
+Rewind restores values at the retained history boundary; compaction keeps
+current values. Reads observe successful tool commits before the turn ends.
+
+**Parameters:**
+
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context authorized to observe this agent.
+- `{namespace}` (`string`) Independent history-state namespace.
+
+**Returns:** (`any?`, `string?`) JSON value, or nil without an error when absent. JSON null uses the Lua JSON null sentinel rather than nil.
+
+---
+
 ### `Agent:config()` {#Agent-config}
 
 ```lua
@@ -1939,6 +2036,26 @@ Alias for `create_autocmd("ConfigChanged", { agent = self, callback = handler })
 
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Trusted invocation context.
 - `{handler}` (`function`) Called as handler(ev, ctx), like any autocmd callback.
+
+**Returns:** ([`AgentSubscription?`](#maki-agent-AgentSubscription), `string?`) Revocable subscription.
+
+---
+
+### `Agent:on_history_state_change()` {#Agent-on_history_state_change}
+
+```lua
+Agent:on_history_state_change({ctx}, {handler})
+```
+
+Alias for `create_autocmd("HistoryStateChanged", { agent = self, callback = handler })`.
+Fires after a committed namespace replacement or deletion, and after history
+replacement. `ev.agent` is the changed agent. `ev.data.namespace` is the changed
+namespace, or nil when history replacement requires a full refresh.
+
+**Parameters:**
+
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Trusted invocation context.
+- `{handler}` (`function`) Called as handler(ev, ctx). Read current values with ev.agent:history_get(ctx, namespace).
 
 **Returns:** ([`AgentSubscription?`](#maki-agent-AgentSubscription), `string?`) Revocable subscription.
 
@@ -6203,6 +6320,9 @@ maki.ui.open_win({buf}, {opts})
 Opens a floating or split window that displays the contents of {buf}.
 Returns a Win handle you can use to receive events, update layout,
 and close the window when you are done.
+Agent callbacks bind the window to the event's session, even if focus changes
+before it opens. Delegated tool handlers use their turn's session. Calls
+without either context use the focused session when the window opens.
 
 **Parameters:**
 

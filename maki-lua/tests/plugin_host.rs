@@ -6174,6 +6174,7 @@ impl SessionsPicker {
             focus,
             event_tx,
             cmd_rx,
+            ..
         } = next_picker_action(actions)
         else {
             panic!("sessions command did not open a window");

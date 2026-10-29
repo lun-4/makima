@@ -78,6 +78,52 @@ const CONTEXT_DOCS: ModuleDoc = ModuleDoc {
             example: "",
             guard: None,
         },
+        FnDoc {
+            name: "history_get",
+            args: "{namespace}",
+            desc: "Read a namespaced JSON value from the tool handler's executing agent. Root and child agents have independent state, even with the same session ID. Nested tool calls share their enclosing invocation's history boundary. State survives turn end and session resume. Missing namespaces return nil without an error. JSON null is a non-nil sentinel and round-trips through these methods. Start, restore and trusted callbacks lack this capability; callbacks use Agent:history_get(ctx, namespace).",
+            params: &[ParamDoc {
+                name: "{namespace}",
+                ty: "string",
+                desc: "Independent state key, conventionally prefixed with the plugin name.",
+            }],
+            returns: "(any?, string?) Committed value, or nil plus an error when the capability is unavailable, cancelled or stale.",
+            example: "local value, err = ctx:history_get(\"plugin.state\")",
+            guard: None,
+        },
+        FnDoc {
+            name: "history_set",
+            args: "{namespace}, {value}",
+            desc: "Replace one namespace's whole JSON value. Supported values are nil (JSON null), booleans, finite numbers, UTF-8 strings, dense arrays and string-keyed objects. Empty tables are objects; decoded empty JSON arrays retain their array type. Values may contain at most 64 nested container levels below the root. Functions, threads, other userdata, table cycles, mixed keys, sparse arrays and deeper values fail without mutation. Commits take effect immediately in lock-acquisition order, before an enclosing tool completes; its later failure does not undo the change. Cancelled operations cannot commit. Rewind restores values at the retained message boundary, compaction preserves current values and reset clears state. History replacement invalidates retained capabilities. One-shot agents keep state in memory without session persistence.",
+            params: &[
+                ParamDoc {
+                    name: "{namespace}",
+                    ty: "string",
+                    desc: "Namespace to replace.",
+                },
+                ParamDoc {
+                    name: "{value}",
+                    ty: "any",
+                    desc: "Complete JSON-serializable value. Nil stores JSON null; deletion is explicit.",
+                },
+            ],
+            returns: "(boolean?, string?) True on commit, or nil plus an error with no mutation.",
+            example: "local ok, err = ctx:history_set(\"plugin.state\", { completed = 2 })",
+            guard: None,
+        },
+        FnDoc {
+            name: "history_delete",
+            args: "{namespace}",
+            desc: "Delete one namespace at the current invocation's history boundary. Deletion has the same commit ordering, cancellation and history semantics as history_set. It is distinct from storing JSON null. Deleting an absent namespace succeeds.",
+            params: &[ParamDoc {
+                name: "{namespace}",
+                ty: "string",
+                desc: "Namespace to remove.",
+            }],
+            returns: "(boolean?, string?) True on commit, or nil plus an error with no mutation.",
+            example: "local ok, err = ctx:history_delete(\"plugin.state\")",
+            guard: None,
+        },
     ],
 };
 
