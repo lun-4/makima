@@ -753,7 +753,7 @@ mod tests {
         OutputLimits, PreviewShape, cut_line, limit_output, line_count,
     };
     #[cfg(unix)]
-    use super::{DIR_MODE, DiskBackend};
+    use super::DiskBackend;
     use crate::tools::FILE_TRUNCATED_MARKER;
 
     const TEST_BODY: &str = "stored body";
@@ -1046,7 +1046,7 @@ mod tests {
         let saved = store.put(TEST_BODY).unwrap();
         let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&store.path_of(&saved)), 0o600);
-        assert_eq!(mode(&store.dir()), u32::from(DIR_MODE.bits()));
+        assert_eq!(mode(&store.dir()), 0o700);
     }
 
     #[test]
