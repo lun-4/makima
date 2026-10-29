@@ -4692,7 +4692,59 @@ mod tests {
     const DISCOVERED_WINDOW: u32 = 524_000;
 
     #[test]
-    fn ui_queue_and_mode_model_projection() {
+    fn todo_ctrl_t_dispatches_from_terminal_input() {
+        const TASK: &str = "Pending task";
+        const TIMEOUT: Duration = Duration::from_secs(5);
+
+        with_event_loop(|event_loop| {
+            let registry = Arc::new(maki_agent::tools::ToolRegistry::new());
+            let host = maki_lua::PluginHost::with_all_builtins(registry).unwrap();
+            let handle = host.event_handle();
+            handle.install_orchestration_services(event_loop.orchestration.clone());
+            let app = &mut event_loop.sessions[0].app;
+            app.keymap_reader = host.keymap_reader();
+            app.lua_event_handle = handle.clone();
+            let (tx, _rx) = flume::unbounded();
+            handle.request_restore(
+                maki_lua::RestoreItem {
+                    tool: Arc::from("todo_write"),
+                    tool_use_id: "restore_id".into(),
+                    output: String::new(),
+                    input: json!({ "todos": [{ "content": TASK, "status": "pending" }] }),
+                    is_error: false,
+                    tool_output_lines: Default::default(),
+                    theme_gen: None,
+                    clicks: Vec::new(),
+                    state: None,
+                },
+                maki_agent::EventSender::new(tx),
+            );
+            handle.wait_restore_complete_for_test();
+            let UiAction::OpenWin { config, cmd_rx, .. } =
+                host.ui_action_rx().recv_timeout(TIMEOUT).unwrap()
+            else {
+                panic!("todo panel did not open");
+            };
+            assert!(!config.visible);
+            assert!(matches!(
+                cmd_rx.recv_timeout(TIMEOUT).unwrap(),
+                maki_lua::WinCommand::SetConfig(_)
+            ));
+            for visible in [true, false] {
+                event_loop.handle_input(Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char('t'),
+                    KeyModifiers::CONTROL,
+                )));
+                assert!(matches!(
+                    cmd_rx.recv_timeout(TIMEOUT).unwrap_or_else(|error| panic!("visibility {visible}: {error}")),
+                    maki_lua::WinCommand::SetVisible(actual) if actual == visible
+                ));
+            }
+        });
+    }
+
+    #[test]
+    fn ui_queue_and_mode_projection() {
         smol::block_on(async {
             let runtime = test_runtime(model_named("test-model"));
             let (manager, root) = runtime.handles.manager_and_root();

@@ -143,6 +143,7 @@ maki.api.register_tool({
     local items = input.todos or {}
     todos[focused or ""] = items
     if #items == 0 then
+      hide_panel()
       return nil
     end
     render_panel(items, false)
@@ -155,14 +156,26 @@ maki.api.register_tool({
     local sid = ctx:session_id() or ""
     local items = input.todos or {}
     todos[sid] = items
+    if #items == 0 then
+      popped[sid] = nil
+    end
     local pop = #items > 0 and not popped[sid]
     if pop then
       popped[sid] = true
     end
     if is_focused(sid) then
       sync_panel(items, pop)
+      if pop and win and not win:is_visible() then
+        win:show()
+        maki.ui.set_status_hint(nil)
+      end
     end
-    return #items == 0 and "Todos cleared" or ""
+    if #items == 0 then
+      return "Todos cleared"
+    end
+    local body = maki.ui.buf()
+    body:set_lines(build_lines(items))
+    return { llm_output = "", body = body }
   end,
 })
 
@@ -205,6 +218,7 @@ maki.api.create_autocmd("SessionFocusChanged", {
     if focused and todos[""] and not todos[focused] then
       todos[focused], todos[""] = todos[""], nil
     end
+    hide_panel()
     sync_panel(items_of(focused), false)
   end,
 })
