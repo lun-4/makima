@@ -215,8 +215,7 @@ impl LuaActorState {
         }
         let event = AgentEvent::SubagentHistory {
             tool_use_id: self.ui_id.clone(),
-            history_epoch: snapshot.epoch,
-            messages: snapshot.messages.as_ref().clone(),
+            history: snapshot,
         };
         let _ = match self.subagent_info.get() {
             Some(subagent) => self.parent_event_tx.send_envelope(Envelope {
@@ -2822,8 +2821,12 @@ mod tests {
         smol::block_on(async {
             loop {
                 let envelope = parent_rx.recv_async().await.unwrap();
-                if let AgentEvent::SubagentHistory { history_epoch, .. } = envelope.event {
-                    assert_eq!(history_epoch, state.relay_snapshot.lock().unwrap().epoch);
+                if let AgentEvent::SubagentHistory { history, .. } = envelope.event {
+                    let snapshot = state.relay_snapshot.lock().unwrap();
+                    assert_eq!(history.epoch, snapshot.epoch);
+                    assert_eq!(history.compacted, snapshot.compacted);
+                    assert!(Arc::ptr_eq(&history.messages, &snapshot.messages));
+                    assert!(Arc::ptr_eq(&history.state, &snapshot.state));
                     break;
                 }
             }
@@ -3440,8 +3443,7 @@ mod tests {
             .send(Envelope {
                 event: AgentEvent::SubagentHistory {
                     tool_use_id: "grandchild".into(),
-                    history_epoch: 0,
-                    messages: Vec::new(),
+                    history: HistorySnapshot::default(),
                 },
                 subagent: Some(grandchild_info),
                 identity: None,

@@ -12,6 +12,7 @@ use maki_providers::{
     AgentError, ContentBlock, ImageSource, Message, Role, StopReason, TokenUsage, add_cost,
 };
 use maki_storage::id::{MakiId, MakiIdParseError};
+use maki_storage::sessions::HistorySnapshot;
 use serde::{Deserialize, Serialize};
 use strum::Display;
 
@@ -935,8 +936,7 @@ pub enum AgentEvent {
     Nudge,
     SubagentHistory {
         tool_use_id: String,
-        history_epoch: u64,
-        messages: Vec<Message>,
+        history: HistorySnapshot<Message>,
     },
     /// A live child was permanently closed and no longer accepts input.
     SubagentClosed,

@@ -8,6 +8,32 @@ Add per-agent, namespaced JSON history state to `maki-storage`, `maki-agent`, an
 
 `plugins/todo_write/init.lua` owns validation, replace-all writes, a `todo_read` tool, model output, and the panel. Retain Ctrl+T for todos and Alt+P for the plan. Do not add dependency graphs, a general plugin framework, or cross-key transactions.
 
+## Progress
+
+Updated 2026-10-29. The persistence and snapshot foundation is implemented. The todo plugin still uses its previous process-local state; the generic Lua API and plugin migration are not implemented.
+
+Completed:
+
+- Step 1: `HistoryState` supports ordered whole-value replacements, explicit deletions, prefix truncation, boundary remapping and compaction to a baseline. JSON null and deletion have distinct serialized operations.
+- Step 2 foundation: `HistorySnapshot` includes frozen shared state. Root and child state persists in defaulted session metadata outside `SessionMeta`, including state-only checkpoints, legacy defaults and orphan pruning. State contributes to checkpoint identity, merging, revision detection and waiter retention.
+- Agent restoration, actor/manager creation, child history events and `HistoryChange` carry complete snapshots. Sanitation remaps state boundaries before appending synthetic results. Rewind prepares truncated state before publication. Compaction folds state into the baseline; tested root manual-compaction failures restore the original snapshot.
+- Stale same-epoch snapshots cannot discard newer timeline updates, including after message appends or message-buffer reconstruction. Historical frontend projections preserve the exact state-bearing snapshot.
+- UI sessions with only root or child generic state count as nonempty. This does not implement the focused-agent todo panel.
+
+Next:
+
+1. Finish the remaining step 2 gap: `LuaActorBackend::run_compact` in `maki-lua/src/api/agent.rs` does not checkpoint child manual compaction or restore the prior snapshot on checkpoint failure. Compaction controls have no `managed_turn`. Supply a durable checkpoint target without retaining a strong manager/actor ownership cycle, and report completion only after publication. Add success/failure regression tests.
+2. Implement step 3 before exposing mutable Lua state: one synchronized snapshot owner, generation-fenced tool contexts, invocation-boundary state commits, immediate matching publication, read-only agent queries and generic focus/state notifications. The current `History` still owns a mutable snapshot and publishes a read projection; tool-side concurrent mutation is not available.
+3. Implement steps 4 to 6: Lua todo tools and validation, focused-agent panel refresh, deterministic nested/cancellation/delayed-focus harnesses, compaction prompt cleanup and documentation.
+
+Verification for the foundation:
+
+- `OPENSSL_NO_VENDOR=1 cargo nextest run -p maki-storage -p maki-agent -p maki-lua -p maki-ui`: 5615 passed, no skips.
+- `OPENSSL_NO_VENDOR=1 cargo check -p maki-agent -p maki-lua -p maki-ui --tests` passes.
+- `OPENSSL_NO_VENDOR=1 cargo clippy -p maki-storage -p maki-agent -p maki-lua -p maki-ui --tests -- -D warnings` passes.
+- `cargo fmt --all -- --check`, `git diff --check` and `OPENSSL_NO_VENDOR=1 just gen-docs-check` pass. Full-workspace lint/tests are not run.
+- Plan review identified state-only writer identity, startup state loss and message-only history projections. Those findings are addressed. Implementation review identified pointer-dependent stale-state detection; the fix and two disk-backed append/reconstruction regressions pass. The child manual-compaction gap above remains open.
+
 ## Implementation Plan
 
 ### 1. Generic history state

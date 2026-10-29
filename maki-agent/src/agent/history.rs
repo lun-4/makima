@@ -26,19 +26,20 @@ impl History {
         }
     }
 
-    pub fn restored_snapshot(snapshot: HistorySnapshot) -> Self {
-        let mut history = Self::restored(Arc::unwrap_or_clone(snapshot.messages));
-        history.snapshot.compacted = snapshot.compacted;
-        history
+    pub fn restored_snapshot(mut snapshot: HistorySnapshot) -> Self {
+        sanitize_restored(&mut snapshot);
+        snapshot.epoch = next_epoch();
+        Self {
+            snapshot,
+            mirror: None,
+        }
     }
 
-    pub fn restored(mut messages: Vec<Message>) -> Self {
-        sanitize_restored(&mut messages);
-        Self::new(messages)
+    pub fn restored(messages: Vec<Message>) -> Self {
+        Self::restored_snapshot(HistorySnapshot::new(messages))
     }
 
     pub fn with_mirror(mut self, mirror: SharedMessages) -> Self {
-        self.snapshot.compacted |= mirror.load().compacted;
         self.mirror = Some(mirror);
         self.publish();
         self
@@ -91,7 +92,7 @@ impl History {
     }
 
     pub fn replace(&mut self, messages: Vec<Message>) {
-        self.rewrite(|msgs| *msgs = messages);
+        self.replace_snapshot(HistorySnapshot::new(messages));
     }
 
     pub fn replace_snapshot(&mut self, snapshot: HistorySnapshot) {
@@ -100,11 +101,13 @@ impl History {
     }
 
     pub fn replace_compacted(&mut self, messages: Vec<Message>) {
+        Arc::make_mut(&mut self.snapshot.state).compact();
         self.snapshot.compacted = true;
-        self.replace(messages);
+        self.rewrite(|msgs| *msgs = messages);
     }
 
     pub fn truncate(&mut self, len: usize) {
+        Arc::make_mut(&mut self.snapshot.state).truncate(len);
         self.rewrite(|msgs| msgs.truncate(len));
     }
 
@@ -135,10 +138,15 @@ impl History {
 }
 
 pub(super) fn remove_orphaned_tool_results(messages: &mut Vec<Message>) -> bool {
+    retain_tool_results(messages, |_| {})
+}
+
+fn retain_tool_results(messages: &mut Vec<Message>, mut retained: impl FnMut(bool)) -> bool {
     let mut changed = false;
     let mut i = 0;
     while i < messages.len() {
         if !matches!(messages[i].role, Role::User) {
+            retained(true);
             i += 1;
             continue;
         }
@@ -170,11 +178,13 @@ pub(super) fn remove_orphaned_tool_results(messages: &mut Vec<Message>) -> bool 
         }
         changed |= messages[i].content.len() != content_len;
 
-        if messages[i].content.is_empty() {
+        let keep = !messages[i].content.is_empty();
+        retained(keep);
+        if keep {
+            i += 1;
+        } else {
             messages.remove(i);
             changed = true;
-        } else {
-            i += 1;
         }
     }
 
@@ -202,9 +212,17 @@ fn is_empty_marker(m: &Message) -> bool {
 
 /// Restored sessions can have orphaned tool_results or unclosed tool_uses
 /// (e.g. the process was killed mid-turn). The API returns 400 if it sees those.
-fn sanitize_restored(messages: &mut Vec<Message>) {
+fn sanitize_restored(snapshot: &mut HistorySnapshot) {
+    let messages = Arc::make_mut(&mut snapshot.messages);
     let len_before = messages.len();
-    let mut changed = remove_orphaned_tool_results(messages);
+    let mut retained_prefix_counts = Vec::with_capacity(len_before + 1);
+    retained_prefix_counts.push(0);
+    let mut retained_count = 0;
+    let mut changed = retain_tool_results(messages, |keep| {
+        retained_count += usize::from(keep);
+        retained_prefix_counts.push(retained_count);
+    });
+    Arc::make_mut(&mut snapshot.state).remap_boundaries(&retained_prefix_counts);
     close_dangling_tool_calls(messages, UNAVAILABLE_RESULT);
     changed |= messages.len() != len_before;
 
@@ -258,6 +276,95 @@ mod tests {
     const FIRST: &str = "first";
     const SECOND: &str = "second";
     const GO: &str = "go";
+    const STATE_NAMESPACE: &str = "test.work";
+    const OTHER_NAMESPACE: &str = "test.other";
+
+    #[test]
+    fn history_state_sanitized_interrupted_resume_and_rewind() {
+        let mut snapshot = HistorySnapshot::new(vec![
+            make_tool_result_msg(&["orphan"]),
+            Message::user(GO.into()),
+            make_tool_use_msg(&["t1"]),
+            make_tool_result_msg(&["wrong"]),
+        ]);
+        let state = Arc::make_mut(&mut snapshot.state);
+        state.set(0, STATE_NAMESPACE.into(), serde_json::json!(FIRST));
+        state.set(1, STATE_NAMESPACE.into(), serde_json::json!(SECOND));
+        state.delete(2, STATE_NAMESPACE.into());
+        state.set(3, OTHER_NAMESPACE.into(), serde_json::json!(GO));
+        state.set(4, STATE_NAMESPACE.into(), serde_json::Value::Null);
+        let original = snapshot.clone();
+        let mut history = History::restored_snapshot(snapshot);
+        assert_eq!(history.len(), 3);
+        assert_eq!(extract_error_ids(&history.as_slice()[2]), ["t1"]);
+        assert_eq!(
+            history.snapshot().state.get(STATE_NAMESPACE),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            history
+                .snapshot()
+                .state
+                .updates
+                .iter()
+                .map(|update| update.boundary)
+                .collect::<Vec<_>>(),
+            [0, 0, 1, 2, 2]
+        );
+        history.truncate(2);
+        assert_eq!(
+            history.snapshot().state.get(STATE_NAMESPACE),
+            Some(&serde_json::Value::Null)
+        );
+        history.truncate(1);
+        assert_eq!(history.snapshot().state.get(STATE_NAMESPACE), None);
+        assert_eq!(history.snapshot().state.get(OTHER_NAMESPACE), None);
+        history.truncate(0);
+        assert_eq!(
+            history.snapshot().state.get(STATE_NAMESPACE),
+            Some(&serde_json::json!(SECOND))
+        );
+        assert_eq!(original.state.updates.last().unwrap().boundary, 4);
+        assert_eq!(original.messages.len(), 4);
+    }
+
+    #[test]
+    fn history_state_compaction_baseline_and_reset() {
+        let mut snapshot = HistorySnapshot::new(vec![Message::user(FIRST.into())]);
+        let state = Arc::make_mut(&mut snapshot.state);
+        state.set(
+            1,
+            STATE_NAMESPACE.into(),
+            serde_json::json!({"work": [FIRST, SECOND]}),
+        );
+        state.set(1, OTHER_NAMESPACE.into(), serde_json::Value::Null);
+        state.delete(1, OTHER_NAMESPACE.into());
+        let mirror = make_mirror();
+        let mut history = History::restored_snapshot(snapshot).with_mirror(Arc::clone(&mirror));
+        let before = mirror.load_full();
+        history.replace_compacted(vec![Message::observation(SECOND.into())]);
+        let compacted = mirror.load_full();
+        assert_eq!(
+            compacted.state.get(STATE_NAMESPACE),
+            before.state.get(STATE_NAMESPACE)
+        );
+        assert_eq!(compacted.state.get(OTHER_NAMESPACE), None);
+        assert!(compacted.state.updates.is_empty());
+        assert!(!before.state.updates.is_empty());
+        assert_ne!(compacted.epoch, before.epoch);
+        history.truncate(0);
+        assert_eq!(
+            history.snapshot().state.get(STATE_NAMESPACE),
+            before.state.get(STATE_NAMESPACE)
+        );
+        history.replace(Vec::new());
+        assert_eq!(history.snapshot().state.get(STATE_NAMESPACE), None);
+        assert!(!history.snapshot().compacted);
+        assert_eq!(
+            compacted.state.get(STATE_NAMESPACE),
+            before.state.get(STATE_NAMESPACE)
+        );
+    }
 
     #[test]
     fn compaction_metadata_survives_append_and_snapshot_restoration() {

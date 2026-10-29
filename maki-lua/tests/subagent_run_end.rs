@@ -386,9 +386,9 @@ fn async_sends_are_fifo_and_surface_each_history_snapshot() {
     let mut replies = Vec::new();
     let mut snapshots = Vec::new();
     while let Ok(envelope) = parent_rx.recv_timeout(TURN_TIMEOUT) {
-        if let AgentEvent::SubagentHistory { messages, .. } = envelope.event {
-            snapshots.push(messages.clone());
-            if let Some(reply) = messages.iter().rev().find_map(|message| {
+        if let AgentEvent::SubagentHistory { history, .. } = envelope.event {
+            snapshots.push(Arc::clone(&history.messages));
+            if let Some(reply) = history.messages.iter().rev().find_map(|message| {
                 message.content.iter().find_map(|block| match block {
                     maki_providers::ContentBlock::Text { text }
                         if matches!(message.role, Role::Assistant) =>
@@ -465,14 +465,14 @@ fn child_cancellation_keeps_session_open_for_recovery() {
     assert_eq!(entered_rx.recv_timeout(TURN_TIMEOUT).unwrap(), 1);
     loop {
         let envelope = parent_rx.recv_timeout(TURN_TIMEOUT).unwrap();
-        let AgentEvent::SubagentHistory { messages, .. } = envelope.event else {
+        let AgentEvent::SubagentHistory { history, .. } = envelope.event else {
             continue;
         };
         assert!(
             envelope.subagent.is_some(),
             "recovered history must remain stamped as child activity"
         );
-        let recovered = messages.iter().rev().any(|message| {
+        let recovered = history.messages.iter().rev().any(|message| {
             matches!(message.role, Role::Assistant)
                 && message.content.iter().any(|block| {
                     matches!(block, maki_providers::ContentBlock::Text { text } if text == RECOVERED_REPLY)
@@ -630,8 +630,9 @@ fn subagent_completion_surfaces_reply_to_parent() {
     let mut found = false;
     for _ in 0..100 {
         for envelope in parent_rx.try_iter() {
-            if let AgentEvent::SubagentHistory { messages, .. } = &envelope.event {
-                let has_reply = messages
+            if let AgentEvent::SubagentHistory { history, .. } = &envelope.event {
+                let has_reply = history
+                    .messages
                     .iter()
                     .any(|m| matches!(m.role, Role::Assistant) && !m.content.is_empty());
                 eprintln!("subagent surfaced history, has reply: {has_reply}");

@@ -516,10 +516,7 @@ fn spawn_agent_internal(
     let (agent_tx, agent_rx) = flume::unbounded::<Envelope>();
     let (cmd_tx, cmd_rx) = flume::unbounded::<AgentCommand>();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
-    // Seeded empty because `AgentActorHandle::spawn` publishes the real
-    // snapshot synchronously, before any handle escapes.
     let shared_history: SharedMessages = Arc::new(ArcSwap::from_pointee(initial_history.clone()));
-    let initial_history = Arc::unwrap_or_clone(initial_history.messages);
     let btw_system: Arc<ArcSwap<String>> = Arc::new(ArcSwap::from_pointee(String::new()));
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
     let prepared_mailbox = session_id
@@ -558,7 +555,7 @@ fn spawn_agent_internal(
                     tool_output_lines,
                     Arc::clone(&btw_system),
                     mcp_handle.clone(),
-                    &initial_history,
+                    initial_history.messages.as_ref(),
                     Arc::clone(permissions),
                     agent_tx.clone(),
                     answer_rx,

@@ -5743,8 +5743,7 @@ mod tests {
             Box::new(Envelope {
                 event: AgentEvent::SubagentHistory {
                     tool_use_id: history_key.clone(),
-                    history_epoch: 0,
-                    messages: Vec::new(),
+                    history: maki_agent::HistorySnapshot::default(),
                 },
                 subagent: Some(SubagentInfo {
                     agent_id: child,

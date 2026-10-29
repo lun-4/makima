@@ -46,9 +46,11 @@ impl RetainedSession {
             return Ok(self.history_version);
         };
         let incoming = (history.epoch, revision);
+        let selected = self.session.history_snapshot();
         if self
             .history_version
             .is_some_and(|current| incoming < current)
+            || (selected.epoch == history.epoch && selected.state.extends(&history.state))
         {
             return Err(HISTORY_SUPERSEDED);
         }
@@ -467,6 +469,7 @@ mod tests {
     use maki_storage::session_lock;
     use maki_storage::sessions::StoredPost;
     use tempfile::TempDir;
+    use test_case::test_case;
 
     use super::*;
     use crate::RunSettings;
@@ -492,6 +495,83 @@ mod tests {
     const SIBLING_KEY: &str = "task/sibling";
     const CHILD_NAME: &str = "child";
     const POST_TEXT: &str = "child observation";
+    const STATE_NAMESPACE: &str = "test.work";
+
+    #[test_case(false; "root")]
+    #[test_case(true; "child")]
+    fn history_state_only_checkpoint_round_trip_and_stale_rejection(is_child: bool) {
+        smol::block_on(async {
+            let tmp = TempDir::new().unwrap();
+            let dir = StateDir::from_path(tmp.path().to_path_buf());
+            let id = MakiId::generate();
+            let options = SessionOptions::new(
+                builtin_option_definitions(
+                    MODEL,
+                    [Arc::from(MODEL)],
+                    false,
+                    false,
+                    false,
+                    ThinkingConfig::Off,
+                ),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            let writer = SessionLogCheckpoint::open(dir.clone(), id, MODEL, CWD, None).unwrap();
+            let mut history = HistorySnapshot::new(vec![Message::user(ORIGINAL.into())]);
+            Arc::make_mut(&mut history.state).set(
+                1,
+                STATE_NAMESPACE.into(),
+                serde_json::json!(ORIGINAL),
+            );
+            let stale = history.clone();
+            for revision in 1..=2 {
+                if revision == 2 {
+                    Arc::make_mut(&mut history.state).set(
+                        1,
+                        STATE_NAMESPACE.into(),
+                        serde_json::Value::Null,
+                    );
+                }
+                if is_child {
+                    writer
+                        .checkpoint_child(child(CHILD_KEY), history.clone())
+                        .await
+                        .unwrap();
+                } else {
+                    let mut checkpoint = request(id, revision, MODEL, &options);
+                    let candidate = Arc::make_mut(&mut checkpoint.snapshot);
+                    candidate.kind = SessionCheckpointKind::History;
+                    candidate.history_revision = Some(revision);
+                    candidate.history = Some(history.clone());
+                    writer.checkpoint(checkpoint).await.unwrap();
+                }
+            }
+            let result = if is_child {
+                writer.checkpoint_child(child(CHILD_KEY), stale).await
+            } else {
+                let mut checkpoint = request(id, 3, MODEL, &options);
+                let candidate = Arc::make_mut(&mut checkpoint.snapshot);
+                candidate.kind = SessionCheckpointKind::History;
+                candidate.history_revision = Some(3);
+                candidate.history = Some(stale);
+                writer.checkpoint(checkpoint).await.map(|_| ())
+            };
+            assert!(
+                matches!(result, Err(CheckpointError::Save { message, .. }) if message.as_ref() == HISTORY_SUPERSEDED)
+            );
+            let loaded = StoredSession::load(id, &dir).unwrap();
+            let saved = if is_child {
+                loaded.subagent_history_snapshot(CHILD_KEY).unwrap()
+            } else {
+                loaded.history_snapshot()
+            };
+            assert_eq!(*saved.state, *history.state);
+            assert_eq!(
+                saved.state.get(STATE_NAMESPACE),
+                Some(&serde_json::Value::Null)
+            );
+        });
+    }
 
     fn child(key: &str) -> StoredSubagent {
         StoredSubagent {

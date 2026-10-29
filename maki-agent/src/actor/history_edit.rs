@@ -21,8 +21,7 @@ pub struct HistoryBoundary {
 #[derive(Clone)]
 pub struct HistoryChange {
     pub agent_id: AgentId,
-    pub epoch: u64,
-    pub messages: Arc<Vec<Message>>,
+    pub history: HistorySnapshot<Message>,
     pub draft: Message,
 }
 
@@ -68,6 +67,8 @@ impl AgentActorHandle {
         let history = self.inner.history.load_full();
         let mut replacement = HistorySnapshot::new(history.messages[..boundary.offset].to_vec());
         replacement.compacted = history.compacted;
+        replacement.state = Arc::clone(&history.state);
+        Arc::make_mut(&mut replacement.state).truncate(boundary.offset);
         Ok((draft, replacement))
     }
 
@@ -235,8 +236,7 @@ impl HistoryEditWork {
                     history.replace_snapshot(snapshot.clone());
                     HistoryChange {
                         agent_id: actor.agent_id(),
-                        epoch: snapshot.epoch,
-                        messages: snapshot.messages,
+                        history: snapshot,
                         draft: Message::user(String::new()),
                     }
                 });
@@ -355,6 +355,76 @@ mod tests {
     };
 
     const CHECKPOINT_ERROR: &str = "checkpoint unavailable";
+    const STATE_NAMESPACE: &str = "test.work";
+    const ORIGINAL_WORK: &str = "original";
+    const LATER_WORK: &str = "later";
+
+    #[test_case(false; "publication_success")]
+    #[test_case(true; "publication_failure")]
+    fn history_state_rewind_publication(fail: bool) {
+        smol::block_on(async {
+            let mut snapshot = HistorySnapshot::new(vec![
+                Message::user(ORIGINAL_WORK.into()),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: LATER_WORK.into(),
+                    }],
+                    ..Default::default()
+                },
+                Message::user(LATER_WORK.into()),
+            ]);
+            let state = Arc::make_mut(&mut snapshot.state);
+            state.set(1, STATE_NAMESPACE.into(), serde_json::json!(ORIGINAL_WORK));
+            state.set(2, STATE_NAMESPACE.into(), serde_json::json!(LATER_WORK));
+            state.delete(3, STATE_NAMESPACE.into());
+            let (actor, runner) =
+                AgentActorHandle::spawn(AgentId::generate(), snapshot, None, Box::new(IdleBackend));
+            actor
+                .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
+                .unwrap();
+            let before = actor.inner.history.load_full();
+            let boundary = actor.history_boundaries().unwrap().pop().unwrap();
+            assert_eq!(boundary.offset, 2);
+            let (_, candidate) = actor.rewind_snapshot(&boundary).unwrap();
+            assert_eq!(
+                candidate.state.get(STATE_NAMESPACE),
+                Some(&serde_json::json!(LATER_WORK))
+            );
+            assert_eq!(before.state.get(STATE_NAMESPACE), None);
+            let publish: PreparedPublication = Box::new(move |snapshot, publication| {
+                Box::pin(async move {
+                    assert_eq!(
+                        snapshot.history.state.get(STATE_NAMESPACE),
+                        Some(&serde_json::json!(LATER_WORK))
+                    );
+                    if fail {
+                        Err(CHECKPOINT_ERROR.into())
+                    } else {
+                        assert!(publication.try_publish());
+                        Ok(())
+                    }
+                })
+            });
+            let result = rewind(&actor, &boundary, publish).await;
+            let after = actor.inner.history.load_full();
+            if fail {
+                assert!(result.is_err());
+                assert_eq!(after.epoch, before.epoch);
+                assert!(Arc::ptr_eq(&after.messages, &before.messages));
+                assert!(Arc::ptr_eq(&after.state, &before.state));
+            } else {
+                result.unwrap();
+                assert_eq!(after.messages.len(), 2);
+                assert_eq!(
+                    after.state.get(STATE_NAMESPACE),
+                    Some(&serde_json::json!(LATER_WORK))
+                );
+            }
+            actor.close();
+            runner.await;
+        });
+    }
 
     fn idle_actor(messages: Vec<Message>) -> (AgentActorHandle, smol::Task<()>) {
         let (actor, runner) =
@@ -690,15 +760,16 @@ mod tests {
             assert_eq!(change.is_some(), clear);
             if let Some(change) = change {
                 let snapshot = checkpointed.recv().unwrap();
-                assert_eq!(change.epoch, snapshot.epoch);
-                assert!(Arc::ptr_eq(&change.messages, &snapshot.messages));
+                assert_eq!(change.history.epoch, snapshot.epoch);
+                assert!(Arc::ptr_eq(&change.history.messages, &snapshot.messages));
+                assert!(Arc::ptr_eq(&change.history.state, &snapshot.state));
                 let published = actor.inner.history.load();
                 assert_eq!(published.epoch, snapshot.epoch);
                 assert_eq!(published.compacted, snapshot.compacted);
                 assert!(Arc::ptr_eq(&published.messages, &snapshot.messages));
                 assert_eq!(change.agent_id, actor.agent_id());
-                assert_ne!(change.epoch, epoch);
-                assert!(change.messages.is_empty());
+                assert_ne!(change.history.epoch, epoch);
+                assert!(change.history.messages.is_empty());
                 assert!(matches!(change.draft.role, Role::User));
             } else {
                 assert_eq!(actor.inner.history.load().epoch, epoch);
@@ -814,7 +885,7 @@ mod tests {
             drop(held);
             assert!(committed.config.config.fast);
             assert!(actor.effective_config().unwrap().fast);
-            assert!(change.unwrap().messages.is_empty());
+            assert!(change.unwrap().history.messages.is_empty());
             assert!(actor.inner.history.load().messages.is_empty());
             if let Some(ticket) = committed.ticket {
                 assert!(ticket.peek_result().is_some());
@@ -1251,7 +1322,7 @@ mod tests {
             }
             assert_eq!(actor.inner.history.load().messages.len(), 1);
             release.send(()).unwrap();
-            assert!(edit.await.unwrap().messages.is_empty());
+            assert!(edit.await.unwrap().history.messages.is_empty());
             actor.runtime_barrier().await.unwrap();
             assert_eq!(actor.committed_message_count(), 1);
             assert!(
@@ -1301,8 +1372,8 @@ mod tests {
             assert_eq!(actor.inner.history.load().epoch, original.epoch);
             assert_eq!(actor.inner.history.load().messages.len(), 2);
             let changed = rewind(&actor, &boundary, published()).await.unwrap();
-            assert_eq!(changed.messages.len(), 1);
-            assert_ne!(changed.epoch, original.epoch);
+            assert_eq!(changed.history.messages.len(), 1);
+            assert_ne!(changed.history.epoch, original.epoch);
             let stale = rewind(&actor, &boundary, published()).await;
             assert!(matches!(stale, Err(ActorError::StaleHistoryBoundary)));
             actor.close();

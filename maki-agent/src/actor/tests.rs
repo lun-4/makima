@@ -16,6 +16,7 @@ use maki_providers::{
     StreamResponse, TokenUsage,
 };
 use maki_storage::id::SessionRef;
+use maki_storage::sessions::Session;
 use serde_json::Value;
 
 fn test_image() -> ImageSource {
@@ -39,7 +40,7 @@ use crate::types::{
     AgentId, DoneReason, Envelope, EventSender, TurnCancellationReason, TurnFailure,
     TurnFailureKind, TurnId, TurnOutcome,
 };
-use crate::{AgentEvent, AgentInput, AgentMode, SharedMessages};
+use crate::{AgentEvent, AgentInput, AgentMode, HistorySnapshot, SharedMessages};
 use std::borrow::Cow;
 
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -3620,6 +3621,69 @@ fn restored_mirror_is_synchronous() {
             snapshot.messages[0].content[0],
             ContentBlock::Text { .. }
         ));
+        handle.close();
+        task.await;
+    });
+}
+
+#[test_case::test_case(false; "root_history")]
+#[test_case::test_case(true; "child_history")]
+fn disk_loaded_snapshot_state_survives_actor_resume(child: bool) {
+    const NAMESPACE: &str = "test.resume";
+    const DELETED_NAMESPACE: &str = "test.deleted";
+    const NULL_NAMESPACE: &str = "test.null";
+    const RESTORED: &str = "restored";
+    const APPENDED: &str = "after resume";
+    const CHILD_KEY: &str = "stored-child";
+    const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+    const CWD: &str = "/tmp";
+
+    smol::block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut initial = HistorySnapshot::new(vec![Message::user(RESTORED.into())]);
+        initial.compacted = true;
+        let state = Arc::make_mut(&mut initial.state);
+        state.set(1, NAMESPACE.into(), serde_json::json!({"work": [RESTORED]}));
+        state.set(1, DELETED_NAMESPACE.into(), Value::Bool(true));
+        state.delete(1, DELETED_NAMESPACE.into());
+        state.set(1, NULL_NAMESPACE.into(), Value::Null);
+        let mut session = Session::<Message, TokenUsage, Value>::new(MODEL, CWD);
+        if child {
+            session.adopt_subagent_history(CHILD_KEY.into(), &initial);
+        } else {
+            session.adopt_history(&initial);
+        }
+        session.save_to(dir.path()).unwrap();
+        let loaded =
+            Session::<Message, TokenUsage, Value>::load_from(session.id, dir.path()).unwrap();
+        let loaded = if child {
+            loaded.subagent_history_snapshot(CHILD_KEY).unwrap()
+        } else {
+            loaded.history_snapshot()
+        };
+        assert_eq!(loaded.state, initial.state);
+        let mut stale = HistorySnapshot::default();
+        Arc::make_mut(&mut stale.state).set(0, NAMESPACE.into(), Value::Bool(false));
+        let mirror = Arc::new(arc_swap::ArcSwap::from_pointee(stale));
+        let (handle, task) = AgentActorHandle::spawn(
+            AgentId::generate(),
+            loaded.clone(),
+            Some(Arc::clone(&mirror)),
+            Box::new(ScriptedBackend::new()),
+        );
+        let restored = mirror.load_full();
+        assert_eq!(restored.state, loaded.state);
+        assert!(restored.compacted);
+        assert_ne!(restored.epoch, loaded.epoch);
+        assert_eq!(restored.messages.len(), loaded.messages.len());
+        assert_eq!(restored.state.get(DELETED_NAMESPACE), None);
+        assert_eq!(restored.state.get(NULL_NAMESPACE), Some(&Value::Null));
+        let ticket = handle
+            .admit_turn(input(APPENDED), None, APPENDED.into())
+            .unwrap();
+        ticket.wait().await;
+        assert_eq!(mirror.load().state, loaded.state);
+        assert_eq!(handle.committed_message_count(), loaded.messages.len() + 1);
         handle.close();
         task.await;
     });

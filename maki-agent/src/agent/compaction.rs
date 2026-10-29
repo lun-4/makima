@@ -286,7 +286,7 @@ pub(super) fn auto_compact_enabled() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
@@ -508,6 +508,59 @@ mod tests {
             assert!(matches!(err, AgentError::EmptySummary));
             assert_eq!(history.len(), 1);
             assert_eq!(history.as_slice()[0].user_text(), Some(KEPT));
+        });
+    }
+
+    const STATE_NAMESPACE: &str = "test.work";
+
+    #[test_case(false; "automatic_compaction_baseline")]
+    #[test_case(true; "empty_summary_preserves_state")]
+    fn history_state_compaction(fail: bool) {
+        smol::block_on(async {
+            let mut response = text_response(StopReason::EndTurn);
+            if fail {
+                response.message.content.clear();
+            }
+            let provider = MockProvider::new(vec![Ok(response)]);
+            let mut snapshot =
+                crate::HistorySnapshot::new(vec![Message::user(CONFIG_EXTRA.into())]);
+            Arc::make_mut(&mut snapshot.state).set(
+                1,
+                STATE_NAMESPACE.into(),
+                serde_json::json!({"work": [CONFIG_EXTRA]}),
+            );
+            let mut history = History::restored_snapshot(snapshot);
+            let before = history.snapshot().clone();
+            let (raw_tx, _rx) = flume::unbounded();
+            let result = compact_history(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx),
+                &CancelToken::none(),
+                &AgentConfig::default(),
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(
+                history.snapshot().state.get(STATE_NAMESPACE),
+                before.state.get(STATE_NAMESPACE)
+            );
+            if fail {
+                assert!(matches!(result, Err(AgentError::EmptySummary)));
+                assert!(Arc::ptr_eq(&history.snapshot().state, &before.state));
+                assert!(Arc::ptr_eq(&history.snapshot().messages, &before.messages));
+                assert_eq!(history.snapshot().epoch, before.epoch);
+            } else {
+                result.unwrap();
+                assert!(history.snapshot().state.updates.is_empty());
+                history.truncate(0);
+                assert_eq!(
+                    history.snapshot().state.get(STATE_NAMESPACE),
+                    before.state.get(STATE_NAMESPACE)
+                );
+            }
         });
     }
 

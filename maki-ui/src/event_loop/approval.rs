@@ -276,6 +276,7 @@ impl EventLoop<'_> {
                 epoch: source.history.epoch.wrapping_add(1),
                 compacted: false,
                 messages: Arc::new(Vec::new()),
+                state: Arc::default(),
             });
             let observer = async move {
                 let (idle, committed, history) = idle

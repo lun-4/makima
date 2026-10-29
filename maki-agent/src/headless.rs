@@ -1060,12 +1060,10 @@ pub fn spawn_interactive_with_binding(
                     root: root.clone(),
                 };
                 let mut template = backend.template(&config);
-                let mirror =
-                    history.map(|snapshot| Arc::new(arc_swap::ArcSwap::from_pointee(snapshot)));
-                let initial_history = mirror
+                let mirror = history
                     .as_ref()
-                    .map(|mirror| mirror.load().messages.as_ref().clone())
-                    .unwrap_or(params.initial_history);
+                    .map(|snapshot| Arc::new(arc_swap::ArcSwap::from_pointee(snapshot.clone())));
+                let initial_history = history.unwrap_or_else(|| params.initial_history.into());
                 let (start, started) = flume::bounded(1);
                 let reference = manager
                     .create_root_deferred_with_config(
@@ -1151,7 +1149,7 @@ pub(crate) mod tests {
     use crate::actor::{ActorEvent, ConfigChange, ConfigPatch, PreparedModel};
     use crate::session_coordinator::{SessionCoordinatorParams, builtin_option_definitions};
     use crate::tools::offload::{OffloadBackend, OffloadError};
-    use crate::{ModeRegistry, TurnOutcome};
+    use crate::{HistorySnapshot, ModeRegistry, TurnOutcome};
     use maki_providers::{ContentBlock, Role, StopReason, StreamResponse, TokenUsage};
     use maki_storage::checkpoint::{
         CheckpointAck, CheckpointError, CheckpointFuture, CheckpointRequest, CheckpointWriter,
@@ -1169,6 +1167,9 @@ pub(crate) mod tests {
     const SECOND: &str = "second provider";
     const TEST_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
     const TEST_CWD: &str = "/tmp";
+    const STATE_NAMESPACE: &str = "test.compaction";
+    const DELETED_NAMESPACE: &str = "test.deleted";
+    const ORIGINAL: &str = "original";
     type Checkpoint = Arc<dyn CheckpointWriter<crate::session_coordinator::SessionCheckpoint>>;
     type RecordedRequest = (&'static str, String, String, bool);
 
@@ -1364,7 +1365,7 @@ pub(crate) mod tests {
     }
 
     fn fixture(
-        history: Vec<Message>,
+        history: impl Into<HistorySnapshot>,
         checkpoint: Checkpoint,
         provider: Arc<dyn Provider>,
     ) -> (InteractiveHandle, SessionCoordinatorHandle) {
@@ -1372,9 +1373,9 @@ pub(crate) mod tests {
         let coordinator = coordinator(session_id, checkpoint);
         let binding = coordinator_binding(coordinator.clone(), Arc::clone(&provider));
         let handle = spawn_interactive_with_binding(
-            interactive_params(session_id, history),
+            interactive_params(session_id, Vec::new()),
             Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) })),
-            None,
+            Some(history.into()),
             Some(binding),
         );
         (handle, coordinator)
@@ -1513,7 +1514,15 @@ pub(crate) mod tests {
     #[test_case(true ; "failed_persistence_reports_failure_and_rolls_history_back")]
     fn managed_manual_compaction(fail: bool) {
         smol::block_on(async {
-            let original = vec![Message::user("original".into())];
+            let mut original = HistorySnapshot::new(vec![Message::user(ORIGINAL.into())]);
+            let state = Arc::make_mut(&mut original.state);
+            state.set(
+                1,
+                STATE_NAMESPACE.into(),
+                serde_json::json!({"work": [ORIGINAL]}),
+            );
+            state.set(1, DELETED_NAMESPACE.into(), Value::Null);
+            state.delete(1, DELETED_NAMESPACE.into());
             let (seen, received) = flume::bounded(1);
             let (release, released) = flume::bounded(1);
             let checkpoint: Checkpoint = Arc::new(
@@ -1521,7 +1530,9 @@ pub(crate) mod tests {
                     let seen = seen.clone();
                     let released = released.clone();
                     Box::pin(async move {
-                        seen.send_async(()).await.unwrap();
+                        seen.send_async(request.snapshot.history.clone().unwrap())
+                            .await
+                            .unwrap();
                         released.recv_async().await.unwrap();
                         if fail {
                             Err(CheckpointError::Save {
@@ -1538,6 +1549,13 @@ pub(crate) mod tests {
             let (handle, coordinator) = fixture(original.clone(), checkpoint, provider);
             let root = handle.initialized_root().await.unwrap();
             let actor = root.actor().unwrap();
+            let before = actor
+                .prepare_idle()
+                .unwrap()
+                .source_snapshot()
+                .unwrap()
+                .history;
+            assert_eq!(before.state, original.state);
             let events = actor.subscribe_events();
             let (output, results) = flume::unbounded();
             handle
@@ -1553,7 +1571,13 @@ pub(crate) mod tests {
                 bounded(results.recv_async()).await.unwrap(),
                 ManualCompactionEvent::Started
             );
-            bounded(received.recv_async()).await.unwrap();
+            let candidate = bounded(received.recv_async()).await.unwrap();
+            assert_eq!(
+                candidate.state.get(STATE_NAMESPACE),
+                original.state.get(STATE_NAMESPACE)
+            );
+            assert_eq!(candidate.state.get(DELETED_NAMESPACE), None);
+            assert!(candidate.state.updates.is_empty());
             assert!(results.is_empty());
             release.send_async(()).await.unwrap();
             let terminal = bounded(results.recv_async()).await.unwrap();
@@ -1584,13 +1608,28 @@ pub(crate) mod tests {
             let transcript = actor
                 .transcript(crate::actor::TranscriptRequest {
                     through_turn: None,
-                    last_messages: original.len() + 4,
+                    last_messages: original.messages.len() + 4,
                     max_bytes: 4096,
                 })
                 .unwrap();
             assert_eq!(transcript.compacted, !fail);
+            let after = actor
+                .prepare_idle()
+                .unwrap()
+                .source_snapshot()
+                .unwrap()
+                .history;
+            assert_eq!(
+                after.state.get(STATE_NAMESPACE),
+                original.state.get(STATE_NAMESPACE)
+            );
+            assert_eq!(after.state.get(DELETED_NAMESPACE), None);
             if fail {
-                assert_eq!(actor.committed_message_count(), original.len());
+                assert_eq!(actor.committed_message_count(), original.messages.len());
+                assert!(Arc::ptr_eq(&after.state, &before.state));
+            } else {
+                assert_eq!(after.state, candidate.state);
+                assert!(after.state.updates.is_empty());
             }
             let ticket = handle.input_tx.admit(first_input()).await.unwrap();
             bounded(received.recv_async()).await.unwrap();
@@ -1642,8 +1681,8 @@ pub(crate) mod tests {
     #[test_case(true ; "cancelled_persistence_reports_cancellation_not_failure")]
     fn unsuccessful_compaction_rolls_back(cancelled: bool) {
         smol::block_on(async {
-            let previous =
-                crate::agent::HistorySnapshot::new(vec![Message::user("original".into())]);
+            let mut previous = HistorySnapshot::new(vec![Message::user(ORIGINAL.into())]);
+            Arc::make_mut(&mut previous.state).set(1, STATE_NAMESPACE.into(), Value::Null);
             let mut history = History::new(vec![Message::user("compacted".into())]);
             let (trigger, cancel) = CancelToken::new();
             if cancelled {
@@ -1670,6 +1709,7 @@ pub(crate) mod tests {
                 serde_json::to_value(previous.messages.as_ref()).unwrap()
             );
             assert_eq!(history.snapshot().epoch, previous.epoch);
+            assert!(Arc::ptr_eq(&history.snapshot().state, &previous.state));
             assert_eq!(
                 event,
                 if cancelled {

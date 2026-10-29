@@ -182,16 +182,19 @@ pub enum HistoryDestination {
     Child(String),
 }
 
-/// Messages plus the token of the run they belong to. Comparing tokens tells
-/// an append from a rewrite, with no need to diff the lists.
-#[derive(Debug, Clone)]
+/// Messages and state from one revision, plus the token of their append-only run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistorySnapshot<M> {
     pub epoch: u64,
+    #[serde(default)]
     pub compacted: bool,
     pub messages: Arc<Vec<M>>,
+    #[serde(default)]
+    pub state: Arc<HistoryState>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct HistoryState {
     pub baseline: BTreeMap<String, serde_json::Value>,
     pub updates: Vec<HistoryStateUpdate>,
@@ -201,10 +204,30 @@ pub struct HistoryState {
 pub struct HistoryStateUpdate {
     pub boundary: usize,
     pub namespace: String,
-    pub value: Option<serde_json::Value>,
+    #[serde(flatten)]
+    pub operation: HistoryStateOperation,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", content = "value", rename_all = "snake_case")]
+pub enum HistoryStateOperation {
+    Set(serde_json::Value),
+    Delete,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct StoredHistoryMeta {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    compacted: bool,
+    #[serde(default, skip_serializing_if = "HistoryState::is_empty")]
+    state: Arc<HistoryState>,
 }
 
 impl HistoryState {
+    pub fn is_empty(&self) -> bool {
+        self.baseline.is_empty() && self.updates.is_empty()
+    }
+
     pub fn get(&self, namespace: &str) -> Option<&serde_json::Value> {
         self.updates
             .iter()
@@ -212,7 +235,10 @@ impl HistoryState {
             .find(|update| update.namespace == namespace)
             .map_or_else(
                 || self.baseline.get(namespace),
-                |update| update.value.as_ref(),
+                |update| match &update.operation {
+                    HistoryStateOperation::Set(value) => Some(value),
+                    HistoryStateOperation::Delete => None,
+                },
             )
     }
 
@@ -220,7 +246,7 @@ impl HistoryState {
         self.updates.push(HistoryStateUpdate {
             boundary,
             namespace,
-            value: Some(value),
+            operation: HistoryStateOperation::Set(value),
         });
     }
 
@@ -228,8 +254,15 @@ impl HistoryState {
         self.updates.push(HistoryStateUpdate {
             boundary,
             namespace,
-            value: None,
+            operation: HistoryStateOperation::Delete,
         });
+    }
+
+    /// Whether this timeline adds commits after an unchanged baseline and update prefix.
+    pub fn extends(&self, earlier: &Self) -> bool {
+        self.baseline == earlier.baseline
+            && self.updates.len() > earlier.updates.len()
+            && self.updates.starts_with(&earlier.updates)
     }
 
     pub fn truncate(&mut self, boundary: usize) {
@@ -246,20 +279,36 @@ impl HistoryState {
 
     pub fn compact(&mut self) {
         for update in self.updates.drain(..) {
-            if let Some(value) = update.value {
-                self.baseline.insert(update.namespace, value);
-            } else {
-                self.baseline.remove(&update.namespace);
+            match update.operation {
+                HistoryStateOperation::Set(value) => {
+                    self.baseline.insert(update.namespace, value);
+                }
+                HistoryStateOperation::Delete => {
+                    self.baseline.remove(&update.namespace);
+                }
             }
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct HistoryIdentity {
     epoch: u64,
     len: usize,
+    compacted: bool,
+    state: Arc<HistoryState>,
 }
+
+impl PartialEq for HistoryIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.epoch == other.epoch
+            && self.len == other.len
+            && self.compacted == other.compacted
+            && Arc::ptr_eq(&self.state, &other.state)
+    }
+}
+
+impl Eq for HistoryIdentity {}
 
 impl<M> HistorySnapshot<M> {
     pub fn new(messages: Vec<M>) -> Self {
@@ -267,6 +316,7 @@ impl<M> HistorySnapshot<M> {
             epoch: next_epoch(),
             compacted: false,
             messages: Arc::new(messages),
+            state: Arc::default(),
         }
     }
 }
@@ -274,6 +324,12 @@ impl<M> HistorySnapshot<M> {
 impl<M> Default for HistorySnapshot<M> {
     fn default() -> Self {
         Self::new(Vec::new())
+    }
+}
+
+impl<M> From<Vec<M>> for HistorySnapshot<M> {
+    fn from(messages: Vec<M>) -> Self {
+        Self::new(messages)
     }
 }
 
@@ -296,9 +352,11 @@ pub struct Session<M, U, T> {
     pub cwd: String,
     pub model: String,
     messages: Arc<Vec<M>>,
+    history_state: Arc<HistoryState>,
     pub token_usage: U,
     tool_outputs: HashMap<String, Arc<T>>,
     subagent_messages: HashMap<String, Arc<Vec<M>>>,
+    subagent_history_meta: BTreeMap<String, StoredHistoryMeta>,
     subagent_history_epochs: HashMap<String, u64>,
     subagents: Vec<StoredSubagent>,
     posts: Vec<StoredPost>,
@@ -466,8 +524,12 @@ enum LogRecord<M, U, T> {
         subagents: Vec<StoredSubagent>,
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         usage_by_model: HashMap<String, StoredTokenUsage>,
+        #[serde(default, skip_serializing_if = "HistoryState::is_empty")]
+        history_state: Arc<HistoryState>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        subagent_history_meta: BTreeMap<String, StoredHistoryMeta>,
         #[serde(flatten)]
-        meta: SessionMeta,
+        meta: Box<SessionMeta>,
     },
 }
 
@@ -894,7 +956,9 @@ where
             updated_at: session.updated_at,
             subagents: session.subagents.clone(),
             usage_by_model: session.usage_by_model.clone(),
-            meta: session.meta.clone(),
+            history_state: Arc::clone(&session.history_state),
+            subagent_history_meta: session.subagent_history_meta.clone(),
+            meta: Box::new(session.meta.clone()),
         },
     )?;
     Ok(buf)
@@ -974,6 +1038,8 @@ where
     let mut messages: Vec<M> = Vec::new();
     let mut tool_outputs = HashMap::new();
     let mut subagent_messages: HashMap<String, Vec<M>> = HashMap::new();
+    let mut history_state = Arc::default();
+    let mut subagent_history_meta = BTreeMap::<String, StoredHistoryMeta>::new();
     let mut title = DEFAULT_TITLE.to_string();
     let mut token_usage = U::default();
     let mut updated_at = 0u64;
@@ -1042,6 +1108,8 @@ where
                 updated_at: m_updated,
                 subagents: m_subagents,
                 usage_by_model: m_usage_by_model,
+                history_state: m_history_state,
+                subagent_history_meta: m_subagent_history_meta,
                 meta: m_meta,
             } => {
                 title = m_title;
@@ -1049,7 +1117,9 @@ where
                 updated_at = m_updated;
                 subagents = m_subagents;
                 usage_by_model = m_usage_by_model;
-                meta = m_meta;
+                history_state = m_history_state;
+                subagent_history_meta = m_subagent_history_meta;
+                meta = *m_meta;
             }
         }
     }
@@ -1058,18 +1128,24 @@ where
         path: display_path.to_string(),
     })?;
 
+    for id in subagent_history_meta.keys() {
+        subagent_messages.entry(id.clone()).or_default();
+    }
+
     Ok(Session {
         id,
         title,
         cwd,
         model,
         messages: Arc::new(messages),
+        history_state,
         token_usage,
         tool_outputs,
         subagent_messages: subagent_messages
             .into_iter()
             .map(|(id, msgs)| (id, Arc::new(msgs)))
             .collect(),
+        subagent_history_meta,
         subagent_history_epochs: HashMap::new(),
         subagents,
         posts,
@@ -1361,9 +1437,11 @@ where
             cwd: cwd.into(),
             model: model.into(),
             messages: Arc::default(),
+            history_state: Arc::default(),
             token_usage: U::default(),
             tool_outputs: HashMap::new(),
             subagent_messages: HashMap::new(),
+            subagent_history_meta: BTreeMap::new(),
             subagent_history_epochs: HashMap::new(),
             subagents: Vec::new(),
             posts: Vec::new(),
@@ -1389,6 +1467,8 @@ where
         HistoryIdentity {
             epoch: self.epoch,
             len: self.messages.len(),
+            compacted: self.meta.compacted,
+            state: Arc::clone(&self.history_state),
         }
     }
 
@@ -1397,6 +1477,7 @@ where
             epoch: self.epoch,
             compacted: self.meta.compacted,
             messages: Arc::clone(&self.messages),
+            state: Arc::clone(&self.history_state),
         }
     }
 
@@ -1461,6 +1542,7 @@ where
 
     pub fn replace_shared_messages(&mut self, messages: Arc<Vec<M>>) {
         self.messages = messages;
+        self.history_state = Arc::default();
         self.rewrite_messages();
     }
 
@@ -1469,13 +1551,22 @@ where
             return;
         }
         Arc::make_mut(&mut self.messages).truncate(len);
+        Arc::make_mut(&mut self.history_state).truncate(len);
         self.rewrite_messages();
     }
 
     /// Adopting a producer's snapshot inherits its run token, so the log's
     /// cursors survive exactly when the snapshot was an append.
     pub fn adopt_history(&mut self, snapshot: &HistorySnapshot<M>) {
+        if self.epoch == snapshot.epoch
+            && self.meta.compacted == snapshot.compacted
+            && Arc::ptr_eq(&self.messages, &snapshot.messages)
+            && Arc::ptr_eq(&self.history_state, &snapshot.state)
+        {
+            return;
+        }
         self.messages = Arc::clone(&snapshot.messages);
+        self.history_state = Arc::clone(&snapshot.state);
         self.epoch = snapshot.epoch;
         self.meta.compacted = snapshot.compacted;
         self.touch();
@@ -1497,7 +1588,10 @@ where
     {
         meta.compacted = history.map_or(this.meta.compacted, |snapshot| snapshot.compacted);
         let history = history.filter(|h| {
-            !Arc::ptr_eq(&this.messages, &h.messages) || h.compacted != this.meta.compacted
+            h.epoch != this.epoch
+                || h.compacted != this.meta.compacted
+                || !Arc::ptr_eq(&this.messages, &h.messages)
+                || !Arc::ptr_eq(&this.history_state, &h.state)
         });
         if history.is_none() && this.meta == meta && this.token_usage == token_usage {
             return;
@@ -1524,35 +1618,57 @@ where
     }
 
     pub fn subagent_history_snapshot(&self, id: &str) -> Option<HistorySnapshot<M>> {
-        self.subagent_messages
-            .get(id)
-            .map(|messages| HistorySnapshot {
+        self.subagent_messages.get(id).map(|messages| {
+            let meta = self.subagent_history_meta.get(id);
+            HistorySnapshot {
                 epoch: self
                     .subagent_history_epochs
                     .get(id)
                     .copied()
                     .unwrap_or_default(),
-                compacted: false,
+                compacted: meta.is_some_and(|meta| meta.compacted),
                 messages: Arc::clone(messages),
-            })
+                state: meta.map_or_else(Arc::default, |meta| Arc::clone(&meta.state)),
+            }
+        })
     }
 
     /// Rejects projections from a run superseded by a child history replacement.
     pub fn adopt_subagent_history(&mut self, id: String, snapshot: &HistorySnapshot<M>) -> bool {
-        if self
-            .subagent_history_epochs
-            .get(&id)
-            .is_some_and(|epoch| *epoch > snapshot.epoch)
+        let epoch = self.subagent_history_epochs.get(&id).copied();
+        if epoch.is_some_and(|epoch| epoch > snapshot.epoch)
+            || (epoch == Some(snapshot.epoch)
+                && self
+                    .subagent_history_meta
+                    .get(&id)
+                    .is_some_and(|meta| meta.state.extends(&snapshot.state)))
         {
             return false;
         }
+        let messages_changed = self
+            .subagent_messages
+            .get(&id)
+            .is_none_or(|messages| !Arc::ptr_eq(messages, &snapshot.messages));
+        let meta_changed = self.subagent_history_meta.get(&id).is_none_or(|meta| {
+            meta.compacted != snapshot.compacted || !Arc::ptr_eq(&meta.state, &snapshot.state)
+        });
+        if !messages_changed && !meta_changed && epoch == Some(snapshot.epoch) {
+            return true;
+        }
+        let rewrite = self.subagent_messages.contains_key(&id)
+            && (messages_changed || epoch != Some(snapshot.epoch));
         self.subagent_history_epochs
             .insert(id.clone(), snapshot.epoch);
-        if self
-            .subagent_messages
-            .insert(id, Arc::clone(&snapshot.messages))
-            .is_some()
-        {
+        self.subagent_history_meta.insert(
+            id.clone(),
+            StoredHistoryMeta {
+                compacted: snapshot.compacted,
+                state: Arc::clone(&snapshot.state),
+            },
+        );
+        self.subagent_messages
+            .insert(id, Arc::clone(&snapshot.messages));
+        if rewrite {
             self.rewrite();
         } else {
             self.touch();
@@ -1561,6 +1677,7 @@ where
     }
 
     pub fn set_subagent_messages(&mut self, id: String, msgs: Vec<M>) {
+        self.subagent_history_meta.remove(&id);
         self.subagent_history_epochs.remove(&id);
         if self.subagent_messages.insert(id, Arc::new(msgs)).is_some() {
             self.rewrite();
@@ -1676,6 +1793,7 @@ where
         self.prune_posts(None, self.messages.len());
         let previous_counts = (
             self.subagent_messages.len(),
+            self.subagent_history_meta.len(),
             self.subagent_history_epochs.len(),
             self.subagents.len(),
             self.posts.len(),
@@ -1717,6 +1835,8 @@ where
         }
         self.subagent_messages
             .retain(|id, _| reachable.contains(id));
+        self.subagent_history_meta
+            .retain(|id, _| reachable.contains(id));
         self.subagent_history_epochs
             .retain(|id, _| reachable.contains(id));
         self.subagents
@@ -1731,6 +1851,7 @@ where
         if previous_counts
             != (
                 self.subagent_messages.len(),
+                self.subagent_history_meta.len(),
                 self.subagent_history_epochs.len(),
                 self.subagents.len(),
                 self.posts.len(),
@@ -1894,8 +2015,8 @@ mod tests {
         write_full_session,
     };
     use super::{
-        HistorySnapshot, SCAN_CACHE_FILE, Session, SessionError, SessionLog, SessionMeta,
-        StorageError, TitleSource,
+        HistorySnapshot, HistoryState, SCAN_CACHE_FILE, Session, SessionError, SessionLog,
+        SessionMeta, StorageError, TitleSource,
     };
     use super::{Post, PostLevel, StoredPost};
     use super::{Prefs, read_prefs, write_prefs};
@@ -1917,24 +2038,159 @@ mod tests {
 
     type TestSession = Session<Value, Value, Value>;
 
+    const STATE_NAMESPACE: &str = "plugin.state";
+    const OTHER_NAMESPACE: &str = "plugin.other";
+
+    #[test_case(0, Some(Value::Bool(false)), false; "baseline_and_zero_boundary")]
+    #[test_case(1, Some(Value::Bool(true)), false; "first_message")]
+    #[test_case(2, Some(Value::Null), false; "same_boundary_commit_order")]
+    #[test_case(3, None, true; "deletion_after_null")]
+    fn history_state_timeline_boundaries(
+        boundary: usize,
+        expected: Option<Value>,
+        other_present: bool,
+    ) {
+        let mut state = HistoryState::default();
+        state.set(0, STATE_NAMESPACE.into(), Value::Bool(false));
+        state.set(1, STATE_NAMESPACE.into(), Value::Bool(true));
+        state.delete(2, STATE_NAMESPACE.into());
+        state.set(2, STATE_NAMESPACE.into(), Value::Null);
+        state.delete(3, STATE_NAMESPACE.into());
+        state.set(3, OTHER_NAMESPACE.into(), Value::Bool(true));
+        state.truncate(boundary);
+        assert_eq!(state.get(STATE_NAMESPACE), expected.as_ref());
+        assert_eq!(state.get(OTHER_NAMESPACE).is_some(), other_present);
+        assert!(
+            state
+                .updates
+                .iter()
+                .all(|update| update.boundary <= boundary)
+        );
+    }
+
     #[test]
-    fn history_state_timeline_boundaries() {
-        let mut state = super::HistoryState::default();
-        state.set(1, "a".into(), serde_json::json!(1));
-        state.delete(2, "a".into());
-        state.set(2, "a".into(), serde_json::json!(null));
-        state.set(3, "b".into(), serde_json::json!(true));
-        state.truncate(2);
-        assert_eq!(state.get("a"), Some(&serde_json::Value::Null));
-        assert_eq!(state.get("b"), None);
-        state.remap_boundaries(&[0, 1, 1]);
-        state.truncate(1);
-        assert_eq!(state.get("a"), Some(&serde_json::Value::Null));
+    fn history_state_compaction_baseline() {
+        let mut state = HistoryState::default();
+        state
+            .baseline
+            .insert(OTHER_NAMESPACE.into(), Value::Bool(true));
+        state.set(1, STATE_NAMESPACE.into(), Value::Bool(false));
+        state.delete(2, OTHER_NAMESPACE.into());
+        state.set(2, STATE_NAMESPACE.into(), Value::Null);
         state.compact();
-        state.delete(0, "a".into());
-        assert_eq!(state.get("a"), None);
+        assert!(state.updates.is_empty());
+        assert_eq!(state.baseline.get(STATE_NAMESPACE), Some(&Value::Null));
+        assert_eq!(state.get(OTHER_NAMESPACE), None);
+
+        state.set(1, STATE_NAMESPACE.into(), Value::Bool(true));
         state.truncate(0);
-        assert_eq!(state.get("a"), None);
+        assert_eq!(state.get(STATE_NAMESPACE), Some(&Value::Null));
+        state.delete(0, STATE_NAMESPACE.into());
+        state.truncate(0);
+        assert_eq!(state.get(STATE_NAMESPACE), None);
+    }
+
+    #[test]
+    fn history_state_remap_preserves_collapsed_boundary_order() {
+        let mut state = HistoryState::default();
+        state.set(0, OTHER_NAMESPACE.into(), Value::Bool(false));
+        state.set(1, STATE_NAMESPACE.into(), Value::Bool(false));
+        state.delete(2, STATE_NAMESPACE.into());
+        state.set(3, STATE_NAMESPACE.into(), Value::Null);
+        state.delete(4, OTHER_NAMESPACE.into());
+        state.remap_boundaries(&[0, 1, 1, 1, 2]);
+        assert_eq!(
+            state
+                .updates
+                .iter()
+                .map(|update| update.boundary)
+                .collect::<Vec<_>>(),
+            [0, 1, 1, 1, 2],
+        );
+        state.set(3, STATE_NAMESPACE.into(), Value::Bool(true));
+        state.truncate(1);
+        assert_eq!(state.get(STATE_NAMESPACE), Some(&Value::Null));
+        assert_eq!(state.get(OTHER_NAMESPACE), Some(&Value::Bool(false)));
+    }
+
+    #[test_case(false, false, false; "equal")]
+    #[test_case(true, false, true; "strict_extension")]
+    #[test_case(true, true, false; "different_baseline")]
+    fn history_state_extends_requires_unchanged_prefix(
+        append: bool,
+        change_baseline: bool,
+        expected: bool,
+    ) {
+        let mut earlier = HistoryState::default();
+        earlier.set(0, STATE_NAMESPACE.into(), Value::Null);
+        let mut later = earlier.clone();
+        if append {
+            later.delete(0, STATE_NAMESPACE.into());
+        }
+        if change_baseline {
+            later.baseline.insert(OTHER_NAMESPACE.into(), Value::Null);
+        }
+        assert_eq!(later.extends(&earlier), expected);
+        assert!(!earlier.extends(&later));
+        later.updates[0].namespace = OTHER_NAMESPACE.into();
+        assert!(!later.extends(&earlier));
+    }
+
+    #[test]
+    fn replacing_and_truncating_messages_update_associated_state() {
+        let mut session = TestSession::new("model", "/project");
+        let mut snapshot =
+            HistorySnapshot::new(vec![user_message("first"), user_message("second")]);
+        Arc::make_mut(&mut snapshot.state).set(0, STATE_NAMESPACE.into(), Value::Null);
+        Arc::make_mut(&mut snapshot.state).set(2, STATE_NAMESPACE.into(), Value::Bool(true));
+        session.adopt_history(&snapshot);
+        session.truncate_messages(1);
+        assert_eq!(
+            session.history_snapshot().state.get(STATE_NAMESPACE),
+            Some(&Value::Null)
+        );
+        assert_eq!(
+            snapshot.state.get(STATE_NAMESPACE),
+            Some(&Value::Bool(true))
+        );
+        session.replace_messages(vec![user_message("replacement")]);
+        assert!(session.history_snapshot().state.is_empty());
+    }
+
+    #[test]
+    fn history_snapshot_serde_defaults_state_and_round_trips() {
+        let messages = vec![user_message("hello")];
+        let mut snapshot: HistorySnapshot<Value> = messages.clone().into();
+        Arc::make_mut(&mut snapshot.state).set(1, STATE_NAMESPACE.into(), Value::Null);
+        snapshot.compacted = true;
+        let encoded = serde_json::to_vec(&snapshot).unwrap();
+        let decoded: HistorySnapshot<Value> = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.epoch, snapshot.epoch);
+        assert_eq!(decoded.compacted, snapshot.compacted);
+        assert_eq!(decoded.messages, snapshot.messages);
+        assert_eq!(decoded.state, snapshot.state);
+
+        let legacy = serde_json::json!({"epoch": snapshot.epoch, "messages": messages});
+        let decoded: HistorySnapshot<Value> = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.state.is_empty());
+        assert!(!decoded.compacted);
+    }
+
+    #[test_case(false; "timeline")]
+    #[test_case(true; "compacted_baseline")]
+    fn history_state_null_and_delete_round_trip(compact: bool) {
+        let mut state = HistoryState::default();
+        state.set(0, STATE_NAMESPACE.into(), Value::Null);
+        state.set(0, OTHER_NAMESPACE.into(), Value::Null);
+        state.delete(1, OTHER_NAMESPACE.into());
+        if compact {
+            state.compact();
+        }
+        let encoded = serde_json::to_vec(&state).unwrap();
+        let decoded: HistoryState = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, state);
+        assert_eq!(decoded.get(STATE_NAMESPACE), Some(&Value::Null));
+        assert_eq!(decoded.get(OTHER_NAMESPACE), None);
     }
 
     #[cfg(any(unix, windows))]
@@ -1958,6 +2214,174 @@ mod tests {
     const EXISTING_ARCHIVE_SEQ: u64 = 7;
     /// A pid no live process on this machine has.
     const FAKE_LOCK_PID: u32 = u32::MAX - 1;
+
+    #[test_case(false; "empty_history")]
+    #[test_case(true; "existing_messages")]
+    fn history_state_only_checkpoint_round_trip(with_messages: bool) {
+        let tmp = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/project");
+        if with_messages {
+            session.push_message(user_message("hello"));
+        }
+        let mut snapshot = session.history_snapshot();
+        let mut session = Arc::new(session);
+        let mut log = SessionLog::rewrite(tmp.path(), &session).unwrap();
+        for value in [Some(Value::Null), Some(Value::Bool(true)), None] {
+            let held = Arc::clone(&session);
+            let previous_state = Arc::clone(&snapshot.state);
+            let state = Arc::make_mut(&mut snapshot.state);
+            match &value {
+                Some(value) => state.set(
+                    snapshot.messages.len(),
+                    STATE_NAMESPACE.into(),
+                    value.clone(),
+                ),
+                None => state.delete(snapshot.messages.len(), STATE_NAMESPACE.into()),
+            }
+            Session::checkpoint(
+                &mut session,
+                Some(&snapshot),
+                SessionMeta::default(),
+                Value::Null,
+            );
+            assert!(Arc::ptr_eq(&held.messages, &session.messages));
+            assert!(Arc::ptr_eq(&held.history_state, &previous_state));
+            assert!(!Arc::ptr_eq(&held.history_state, &session.history_state));
+            assert!(session.content_revision() > held.content_revision());
+            assert!(session.revision() > held.revision());
+            assert_ne!(session.history_identity(), held.history_identity());
+            assert_eq!(
+                session.history_identity(),
+                session.clone().history_identity()
+            );
+            log.append(&session).unwrap();
+
+            let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+            assert_same_session(&loaded, &session);
+            assert_eq!(
+                loaded.history_snapshot().state.get(STATE_NAMESPACE),
+                value.as_ref()
+            );
+            let unchanged = Arc::clone(&session);
+            Session::checkpoint(
+                &mut session,
+                Some(&snapshot),
+                SessionMeta::default(),
+                Value::Null,
+            );
+            assert!(Arc::ptr_eq(&unchanged, &session));
+        }
+        Session::checkpoint(
+            &mut session,
+            None,
+            SessionMeta {
+                input_draft: Some(PENDING_DRAFT.into()),
+                ..Default::default()
+            },
+            Value::Null,
+        );
+        log.append(&session).unwrap();
+        let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert_eq!(loaded.history_snapshot().state, snapshot.state);
+    }
+
+    #[test_case(false; "uncompacted")]
+    #[test_case(true; "compacted")]
+    fn child_state_only_checkpoint_resume_and_prune(compacted: bool) {
+        let tmp = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/project");
+        let mut root = session.history_snapshot();
+        Arc::make_mut(&mut root.state).set(0, STATE_NAMESPACE.into(), Value::Bool(false));
+        session.adopt_history(&root);
+        let mut log = SessionLog::rewrite(tmp.path(), &session).unwrap();
+
+        let mut child = HistorySnapshot {
+            compacted,
+            ..Default::default()
+        };
+        Arc::make_mut(&mut child.state).set(0, STATE_NAMESPACE.into(), Value::Null);
+        let mut orphan = HistorySnapshot::default();
+        Arc::make_mut(&mut orphan.state).set(0, STATE_NAMESPACE.into(), Value::Bool(true));
+        assert!(session.adopt_subagent_history(LIVE_CHILD.into(), &child));
+        assert!(session.adopt_subagent_history(ORPHAN_CHILD.into(), &orphan));
+        log.append(&session).unwrap();
+
+        let frozen = session.subagent_history_snapshot(LIVE_CHILD).unwrap();
+        let revision = session.content_revision();
+        assert!(session.adopt_subagent_history(LIVE_CHILD.into(), &child));
+        assert_eq!(session.content_revision(), revision);
+        Arc::make_mut(&mut child.state).delete(0, STATE_NAMESPACE.into());
+        Arc::make_mut(&mut child.state).set(0, OTHER_NAMESPACE.into(), Value::Null);
+        assert!(session.adopt_subagent_history(LIVE_CHILD.into(), &child));
+        assert!(session.content_revision() > revision);
+        assert_eq!(frozen.state.get(STATE_NAMESPACE), Some(&Value::Null));
+        let revision = session.revision();
+        assert!(!session.adopt_subagent_history(LIVE_CHILD.into(), &frozen));
+        assert_eq!(session.revision(), revision);
+        assert_eq!(
+            session.subagent_history_snapshot(LIVE_CHILD).unwrap().state,
+            child.state
+        );
+        log.append(&session).unwrap();
+
+        let mut loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert_same_session(&loaded, &session);
+        let resumed = loaded.subagent_history_snapshot(LIVE_CHILD).unwrap();
+        assert!(resumed.messages.is_empty());
+        assert_eq!(resumed.compacted, compacted);
+        assert_eq!(resumed.state, child.state);
+        assert_eq!(loaded.history_snapshot().state, root.state);
+        assert_eq!(resumed.state.get(STATE_NAMESPACE), None);
+        assert_eq!(resumed.state.get(OTHER_NAMESPACE), Some(&Value::Null));
+
+        let mut log = SessionLog::rewrite(tmp.path(), &loaded).unwrap();
+        loaded.prune_orphans_preserving(|_| Vec::new(), &[LIVE_CHILD.into()]);
+        write_through(&mut log, tmp.path(), &loaded);
+        let mut loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert!(loaded.subagent_history_snapshot(ORPHAN_CHILD).is_none());
+        assert_eq!(
+            loaded.subagent_history_snapshot(LIVE_CHILD).unwrap().state,
+            child.state
+        );
+        assert!(!loaded.subagent_history_meta.contains_key(ORPHAN_CHILD));
+
+        loaded.prune_orphans(|_| Vec::new());
+        loaded.save_to(tmp.path()).unwrap();
+        let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert!(loaded.subagent_history_snapshot(LIVE_CHILD).is_none());
+        assert!(loaded.subagent_history_meta.is_empty());
+        assert_eq!(loaded.history_snapshot().state, root.state);
+    }
+
+    #[test_case(false; "header_only_metadata")]
+    #[test_case(true; "legacy_meta_record")]
+    fn legacy_session_defaults_empty_history_state(with_meta: bool) {
+        let tmp = TempDir::new().unwrap();
+        let id = MakiId::generate();
+        let mut records = vec![
+            serde_json::json!({
+                "t": "header", "v": super::LOG_FORMAT_VERSION, "id": id,
+                "model": "model", "cwd": "/project", "created_at": 0,
+            }),
+            serde_json::json!({"t": "sub_msg", "sub": LIVE_CHILD, "d": user_message("child")}),
+        ];
+        if with_meta {
+            records.push(serde_json::json!({
+                "t": "meta", "title": DEFAULT_TITLE, "token_usage": null, "updated_at": 0,
+            }));
+        }
+        let mut data = Vec::new();
+        for record in records {
+            super::append_record(&mut data, &record).unwrap();
+        }
+        fs::write(jsonl_path(tmp.path(), id), data).unwrap();
+        let loaded = TestSession::load_from(id, tmp.path()).unwrap();
+        assert!(loaded.history_snapshot().state.is_empty());
+        let child = loaded.subagent_history_snapshot(LIVE_CHILD).unwrap();
+        assert!(child.state.is_empty());
+        assert!(!child.compacted);
+        assert_eq!(child.messages.len(), 1);
+    }
 
     #[test]
     fn child_history_epochs_fence_reconstructed_events_without_changing_disk_format() {
@@ -2489,6 +2913,7 @@ mod tests {
             epoch: next_epoch(),
             compacted: false,
             messages: Arc::new(vec![user_message("hi")]),
+            state: Arc::default(),
         };
         let meta = session.meta.clone();
         Session::checkpoint(&mut session, Some(&run), meta.clone(), Value::Null);
@@ -2502,6 +2927,7 @@ mod tests {
             epoch: run.epoch,
             compacted: run.compacted,
             messages: Arc::new(vec![user_message("hi"), assistant_message("reply")]),
+            state: Arc::clone(&run.state),
         };
         Session::checkpoint(&mut session, Some(&advanced), meta, Value::Null);
         write_through(&mut log, dir, &session);
@@ -3706,6 +4132,14 @@ mod tests {
             loaded.subagent_messages(),
             expected.subagent_messages(),
             "subagent messages",
+        );
+        assert_eq!(
+            loaded.history_state, expected.history_state,
+            "history state"
+        );
+        assert_eq!(
+            loaded.subagent_history_meta, expected.subagent_history_meta,
+            "subagent history metadata",
         );
         assert_eq!(loaded.title, expected.title, "title");
         assert_eq!(loaded.meta, expected.meta, "meta");

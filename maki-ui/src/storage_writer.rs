@@ -147,17 +147,10 @@ enum RequiredHistory {
 impl RequiredHistory {
     fn retained_by(&self, session: &AppSession) -> bool {
         match self {
-            Self::Root(history, _) => {
-                let saved = session.history_snapshot();
-                saved.epoch == history.epoch
-                    && saved.compacted == history.compacted
-                    && Arc::ptr_eq(&history.messages, &saved.messages)
-            }
-            Self::Child { key, history } => {
-                session.subagent_history_snapshot(key).is_some_and(|saved| {
-                    saved.epoch == history.epoch && Arc::ptr_eq(&saved.messages, &history.messages)
-                })
-            }
+            Self::Root(history, _) => same_history(history, &session.history_snapshot()),
+            Self::Child { key, history } => session
+                .subagent_history_snapshot(key)
+                .is_some_and(|saved| same_history(history, &saved)),
         }
     }
 }
@@ -317,15 +310,23 @@ impl CheckpointWriter<SessionCheckpoint> for CoordinatorCheckpointWriter {
         }
         let (base, history_base) = if let Some(pending) = state.coordinator_pending.get(&session_id)
         {
-            (Arc::clone(&pending.session), pending.history_base)
+            (Arc::clone(&pending.session), pending.history_base.clone())
         } else if let Some(latest) = state.latest.get(&session_id) {
             (
                 Arc::clone(latest),
-                state.coordinator_history_bases.get(&session_id).copied(),
+                state.coordinator_history_bases.get(&session_id).cloned(),
             )
         } else {
             return fail(SNAPSHOT_UNAVAILABLE);
         };
+        if history.is_some_and(|history| {
+            stale_history_state(history, &base.history_snapshot())
+                || (incoming == history_version(&state, session_id, &HistoryDestination::Main)
+                    && incoming.is_some()
+                    && !same_history(history, &base.history_snapshot()))
+        }) {
+            return fail(CHECKPOINT_REPLACED);
+        }
         let history_base =
             history_base.or_else(|| history.is_some().then(|| base.history_identity()));
         if let Some(incoming) = incoming {
@@ -340,7 +341,7 @@ impl CheckpointWriter<SessionCheckpoint> for CoordinatorCheckpointWriter {
             CoordinatorPending {
                 generation,
                 session: Arc::clone(&merged),
-                history_base,
+                history_base: history_base.clone(),
             },
         );
         let (reply, response) = flume::bounded(1);
@@ -525,7 +526,8 @@ impl StorageWriter {
             .map(|pending| {
                 if pending
                     .history_base
-                    .is_some_and(|base| base != authoritative.history_identity())
+                    .as_ref()
+                    .is_some_and(|base| *base != authoritative.history_identity())
                 {
                     pending.history_base = None;
                 }
@@ -537,7 +539,7 @@ impl StorageWriter {
                 );
                 pending.generation = coordinator_generation.unwrap();
                 pending.session = Arc::clone(&merged);
-                (merged, pending.history_base)
+                (merged, pending.history_base.clone())
             })
             .unwrap_or((authoritative, None));
         let config_version = state.config_versions.get(&id).copied();
@@ -610,7 +612,9 @@ impl StorageWriter {
             if let Some(latest) = state.latest.get(&session_id) {
                 preserve_newer_child_histories(&mut snapshot, latest);
                 preserve_child_config(&mut snapshot, latest);
-                if snapshot.history_snapshot().epoch < latest.history_snapshot().epoch {
+                if snapshot.history_snapshot().epoch < latest.history_snapshot().epoch
+                    || stale_history_state(&snapshot.history_snapshot(), &latest.history_snapshot())
+                {
                     let session = Arc::make_mut(&mut snapshot);
                     session.adopt_history(&latest.history_snapshot());
                     prune_main_history(
@@ -933,12 +937,9 @@ fn commit_save(pending: &Pending, id: MakiId, save: &PendingSave) {
     let Some(latest) = state.latest.get(&id) else {
         return;
     };
-    let preserve_root = save.coordinator_history_base.is_some_and(|base| {
-        latest.history_identity() == base
-            || Arc::ptr_eq(
-                &latest.history_snapshot().messages,
-                &save.session.history_snapshot().messages,
-            )
+    let preserve_root = save.coordinator_history_base.as_ref().is_some_and(|base| {
+        latest.history_identity() == *base
+            || same_history(&latest.history_snapshot(), &save.session.history_snapshot())
     });
     let live_ids = state.live_children.get(&id).map(Vec::as_slice);
     let mut authoritative = if state.config_versions.get(&id).copied() == save.config_version {
@@ -953,14 +954,14 @@ fn commit_save(pending: &Pending, id: MakiId, save: &PendingSave) {
         prune_main_history(authoritative, live_ids);
     }
     let committed_base = preserve_root
-        .then_some(save.coordinator_history_base)
+        .then(|| save.coordinator_history_base.clone())
         .flatten();
     state.latest.insert(id, Arc::clone(&authoritative));
-    if let Some(history_base) = committed_base {
+    if let Some(history_base) = &committed_base {
         state
             .coordinator_history_bases
             .entry(id)
-            .or_insert(history_base);
+            .or_insert_with(|| history_base.clone());
     }
     let candidate_committed = state.coordinator_pending.get(&id).is_some_and(|candidate| {
         candidate.generation == generation
@@ -978,7 +979,7 @@ fn commit_save(pending: &Pending, id: MakiId, save: &PendingSave) {
             candidate.history_base = Some(authoritative.history_identity());
         }
         let candidate_generation = candidate.generation;
-        let history_base = candidate.history_base;
+        let history_base = candidate.history_base.clone();
         let candidate_session = Arc::clone(&candidate.session);
         if let Some(Entry::Save(queued)) = state.entries.get_mut(&id)
             && queued.coordinator_generation == Some(candidate_generation)
@@ -987,6 +988,20 @@ fn commit_save(pending: &Pending, id: MakiId, save: &PendingSave) {
             queued.session = candidate_session;
         }
     }
+}
+
+fn same_history(left: &HistorySnapshot<Message>, right: &HistorySnapshot<Message>) -> bool {
+    left.epoch == right.epoch
+        && left.compacted == right.compacted
+        && Arc::ptr_eq(&left.messages, &right.messages)
+        && (Arc::ptr_eq(&left.state, &right.state) || left.state == right.state)
+}
+
+fn stale_history_state(
+    incoming: &HistorySnapshot<Message>,
+    latest: &HistorySnapshot<Message>,
+) -> bool {
+    incoming.epoch == latest.epoch && latest.state.extends(&incoming.state)
 }
 
 fn same_histories(left: &AppSession, right: &AppSession) -> bool {
@@ -1073,6 +1088,7 @@ fn preserve_newer_child_histories(incoming: &mut Arc<AppSession>, latest: &AppSe
                 incoming.epoch < history.epoch
                     || (incoming.epoch == history.epoch
                         && incoming.messages.len() < history.messages.len())
+                    || stale_history_state(&incoming, &history)
             })
         {
             let incoming = Arc::make_mut(incoming);
@@ -1090,14 +1106,19 @@ fn adopt_checkpoint_history(
 ) -> bool {
     match destination {
         HistoryDestination::Main => {
-            if session.history_snapshot().epoch > history.epoch {
+            let current = session.history_snapshot();
+            if current.epoch > history.epoch || stale_history_state(history, &current) {
                 return false;
             }
             session.adopt_history(history);
             prune_main_history(session, live_ids);
         }
         HistoryDestination::Child(key) => {
-            if !session.adopt_subagent_history(key.clone(), history) {
+            if session
+                .subagent_history_snapshot(key)
+                .is_some_and(|current| stale_history_state(history, &current))
+                || !session.adopt_subagent_history(key.clone(), history)
+            {
                 return false;
             }
             session.prune_posts(Some(key), history.messages.len());
@@ -1184,8 +1205,10 @@ fn merge_tui_snapshot(
     let mut session = Arc::clone(incoming);
     preserve_newer_child_histories(&mut session, latest);
     preserve_child_config(&mut session, latest);
-    if (preserve_history || session.history_snapshot().epoch < latest.history_snapshot().epoch)
-        && session.history_identity() != latest.history_identity()
+    if (preserve_history
+        || session.history_snapshot().epoch < latest.history_snapshot().epoch
+        || stale_history_state(&session.history_snapshot(), &latest.history_snapshot()))
+        && !same_history(&session.history_snapshot(), &latest.history_snapshot())
     {
         let session = Arc::make_mut(&mut session);
         session.adopt_history(&latest.history_snapshot());
@@ -1563,7 +1586,14 @@ impl Writer {
                                         session.subagent_history_snapshot(key)
                                     }
                                 };
-                                current.is_some_and(|current| current.epoch > history.epoch)
+                                current.is_some_and(|current| {
+                                    current.epoch > history.epoch
+                                        || stale_history_state(history, &current)
+                                        || (save.history_version.is_some()
+                                            && history_version(&state, id, destination)
+                                                == save.history_version
+                                            && !same_history(history, &current))
+                                })
                             })
                         })
                 {
@@ -1616,9 +1646,9 @@ impl Writer {
             promote_staged_checkpoint(latest, request, &candidate, live_ids.as_deref());
         }
         if matches!(&request.history, Some((HistoryDestination::Main, _)))
-            && let Some(base) = history_base
+            && let Some(base) = &history_base
         {
-            state.coordinator_history_bases.insert(id, base);
+            state.coordinator_history_bases.insert(id, base.clone());
         }
         if let Some(provisional) = state.coordinator_pending.get_mut(&id) {
             promote_staged_checkpoint(
@@ -1743,6 +1773,7 @@ mod tests {
     const POST_TEXT: &str = "checkpoint post";
     const LIVE_CHILD: &str = "live-child";
     const ORPHAN_CHILD: &str = "orphan-child";
+    const STATE_NAMESPACE: &str = "test.state";
 
     struct ConfigTestProvider;
 
@@ -3257,6 +3288,304 @@ mod tests {
             assert!(!latest.subagent_messages().contains_key(ORPHAN_CHILD));
             writer.shutdown(DRAIN_TIMEOUT);
         });
+    }
+
+    fn state_only_history(mut history: HistorySnapshot<Message>) -> HistorySnapshot<Message> {
+        Arc::make_mut(&mut history.state).set(
+            history.messages.len(),
+            STATE_NAMESPACE.into(),
+            serde_json::json!(COORDINATOR_MSG),
+        );
+        history
+    }
+
+    #[test_case(false, false; "pending_checkpoint")]
+    #[test_case(true, false; "acknowledged_checkpoint")]
+    #[test_case(false, true; "pending_checkpoint_with_config")]
+    #[test_case(true, true; "acknowledged_checkpoint_with_config")]
+    fn state_only_root_checkpoint_survives_stale_tui_save(committed: bool, config: bool) {
+        let (_tmp, dir) = state_dir();
+        let (writer, _wake_rx) = manual_writer();
+        let mut session = AppSession::new(MODEL, CWD);
+        session.push_message(Message::user(BASE_MSG.into()));
+        let id = session.id;
+        let original = session.history_snapshot();
+        writer.seed(Arc::new(session.clone()));
+        if config {
+            writer.bind_config_runtime(id, 1);
+        }
+        let history = state_only_history(original.clone());
+        assert_eq!(history.epoch, original.epoch);
+        assert!(Arc::ptr_eq(&history.messages, &original.messages));
+        assert_ne!(history.state, original.state);
+        let mut checkpoint = config_checkpoint(1, 1);
+        checkpoint.config = None;
+        checkpoint.kind = SessionCheckpointKind::History;
+        checkpoint.history_revision = Some(1);
+        checkpoint.history = Some(history.clone());
+        let mut replaced = checkpoint.clone();
+        let ack = writer
+            .coordinator_checkpoint()
+            .checkpoint(CheckpointRequest {
+                session_id: id,
+                version: CheckpointVersion {
+                    revision: 1,
+                    epoch: history.epoch,
+                },
+                snapshot: Arc::new(checkpoint),
+            });
+        let replacement = replaced.history.as_mut().unwrap();
+        Arc::make_mut(&mut replacement.state).set(
+            replacement.messages.len(),
+            STATE_NAMESPACE.into(),
+            serde_json::json!(RESUMED_MSG),
+        );
+        let rejected = writer
+            .coordinator_checkpoint()
+            .checkpoint(CheckpointRequest {
+                session_id: id,
+                version: CheckpointVersion {
+                    revision: 1,
+                    epoch: history.epoch,
+                },
+                snapshot: Arc::new(replaced),
+            });
+        let Err(CheckpointError::Save { message, .. }) = smol::block_on(rejected) else {
+            panic!("a reused revision must not replace checkpoint state")
+        };
+        assert_eq!(message.as_ref(), CHECKPOINT_REPLACED);
+        let (warn_tx, _warn_rx) = flume::unbounded();
+        let mut disk = Writer {
+            dir: dir.clone(),
+            warn_tx,
+            logs: HashMap::new(),
+            failing: HashSet::new(),
+        };
+        if committed {
+            disk.flush(&writer.pending);
+        }
+        session.set_title(TITLE.into());
+        writer.send(Arc::new(session.clone()));
+        disk.flush(&writer.pending);
+        assert!(smol::block_on(ack).is_ok());
+        for _ in 0..2 {
+            writer.send(Arc::new(session.clone()));
+            disk.flush(&writer.pending);
+        }
+        let latest = writer.latest_snapshot(id).unwrap();
+        assert!(same_history(&latest.history_snapshot(), &history));
+        let loaded = AppSession::load(id, &dir).unwrap();
+        assert_eq!(loaded.title, TITLE);
+        assert_eq!(message_texts(&loaded), [BASE_MSG]);
+        assert_eq!(loaded.history_snapshot().state, history.state);
+    }
+
+    #[test_case(false; "stale_message_prefix")]
+    #[test_case(true; "reconstructed_messages")]
+    fn history_state_after_append_survives_stale_tui_save(reconstruct: bool) {
+        let (_tmp, dir) = state_dir();
+        let (writer, _wake_rx) = manual_writer();
+        let mut session = AppSession::new(MODEL, CWD);
+        session.push_message(Message::user(BASE_MSG.into()));
+        let id = session.id;
+        let mut original = session.history_snapshot();
+        writer.seed(Arc::new(session.clone()));
+        let mut history = state_only_history(original.clone());
+        Arc::make_mut(&mut history.messages).push(Message::user(COORDINATOR_MSG.into()));
+        assert!(!Arc::ptr_eq(&history.messages, &original.messages));
+        let mut checkpoint = config_checkpoint(1, 1);
+        checkpoint.config = None;
+        checkpoint.kind = SessionCheckpointKind::History;
+        checkpoint.history_revision = Some(1);
+        checkpoint.history = Some(history.clone());
+        let ack = writer
+            .coordinator_checkpoint()
+            .checkpoint(CheckpointRequest {
+                session_id: id,
+                version: CheckpointVersion {
+                    revision: 1,
+                    epoch: history.epoch,
+                },
+                snapshot: Arc::new(checkpoint.clone()),
+            });
+        let (warn_tx, _warn_rx) = flume::unbounded();
+        let mut disk = Writer {
+            dir: dir.clone(),
+            warn_tx,
+            logs: HashMap::new(),
+            failing: HashSet::new(),
+        };
+        disk.flush(&writer.pending);
+        smol::block_on(ack).unwrap();
+        if reconstruct {
+            original.messages = Arc::new(history.messages.as_ref().clone());
+            session.adopt_history(&original);
+        }
+        session.set_title(TITLE.into());
+        writer.send(Arc::new(session));
+        disk.flush(&writer.pending);
+        checkpoint.history_revision = Some(2);
+        checkpoint.history = Some(original);
+        let rejected = writer
+            .coordinator_checkpoint()
+            .checkpoint(CheckpointRequest {
+                session_id: id,
+                version: CheckpointVersion {
+                    revision: 2,
+                    epoch: history.epoch,
+                },
+                snapshot: Arc::new(checkpoint),
+            });
+        assert!(
+            matches!(smol::block_on(rejected), Err(CheckpointError::Save { message, .. }) if message.as_ref() == CHECKPOINT_REPLACED)
+        );
+        let loaded = AppSession::load(id, &dir).unwrap();
+        assert_eq!(loaded.title, TITLE);
+        assert_eq!(message_texts(&loaded), [BASE_MSG, COORDINATOR_MSG]);
+        assert_eq!(loaded.history_snapshot().state, history.state);
+    }
+
+    #[test]
+    fn state_only_child_checkpoint_survives_stale_tui_save() {
+        let (_tmp, dir) = state_dir();
+        let (writer, _wake_rx) = manual_writer();
+        let mut session = AppSession::new(MODEL, CWD);
+        session.push_message(Message::user(BASE_MSG.into()));
+        session.set_subagent_messages(TOOL_ID.into(), vec![Message::user(BASE_MSG.into())]);
+        let id = session.id;
+        let root = session.history_snapshot();
+        let original = session.subagent_history_snapshot(TOOL_ID).unwrap();
+        let history = state_only_history(original.clone());
+        assert_eq!(history.epoch, original.epoch);
+        assert!(Arc::ptr_eq(&history.messages, &original.messages));
+        assert_ne!(history.state, original.state);
+        writer.seed(Arc::new(session.clone()));
+        let lease = session_lock::claim(&dir.ensure_subdir(SESSIONS_DIR).unwrap(), &id)
+            .unwrap()
+            .unwrap();
+        let response = enqueue_staged_checkpoint(
+            &writer.pending,
+            &writer.wake,
+            StagedSessionCheckpoint {
+                session_id: id,
+                checkpoint: None,
+                selected_config: None,
+                history: Some((HistoryDestination::Child(TOOL_ID.into()), history.clone())),
+                publication: CheckpointPublication::default(),
+                claim: publication_claim(),
+                guard: lease.publication_guard(),
+            },
+        )
+        .unwrap();
+        let (warn_tx, _warn_rx) = flume::unbounded();
+        let mut disk = Writer {
+            dir: dir.clone(),
+            warn_tx,
+            logs: HashMap::new(),
+            failing: HashSet::new(),
+        };
+        disk.flush(&writer.pending);
+        response.recv().unwrap().unwrap();
+        session.set_title(TITLE.into());
+        for _ in 0..2 {
+            writer.send(Arc::new(session.clone()));
+            disk.flush(&writer.pending);
+        }
+        let latest = writer.latest_snapshot(id).unwrap();
+        assert!(same_history(&latest.history_snapshot(), &root));
+        assert!(same_history(
+            &latest.subagent_history_snapshot(TOOL_ID).unwrap(),
+            &history
+        ));
+        let loaded = AppSession::load(id, &dir).unwrap();
+        assert_eq!(loaded.title, TITLE);
+        assert_eq!(message_texts(&loaded), [BASE_MSG]);
+        assert_eq!(
+            loaded.subagent_history_snapshot(TOOL_ID).unwrap().state,
+            history.state
+        );
+    }
+
+    #[test_case(false, false; "root_coalesced")]
+    #[test_case(true, false; "child_coalesced")]
+    #[test_case(false, true; "root_requeued")]
+    #[test_case(true, true; "child_requeued")]
+    fn state_only_checkpoint_waiter_rejects_replaced_state(child: bool, requeue: bool) {
+        let (_tmp, dir) = state_dir();
+        let (writer, _wake_rx) = manual_writer();
+        let mut session = AppSession::new(MODEL, CWD);
+        session.push_message(Message::user(BASE_MSG.into()));
+        session.set_subagent_messages(TOOL_ID.into(), vec![Message::user(BASE_MSG.into())]);
+        let id = session.id;
+        let original = if child {
+            session.subagent_history_snapshot(TOOL_ID).unwrap()
+        } else {
+            session.history_snapshot()
+        };
+        let first = state_only_history(original);
+        let mut second = first.clone();
+        Arc::make_mut(&mut second.state).set(
+            second.messages.len(),
+            STATE_NAMESPACE.into(),
+            serde_json::json!(RESUMED_MSG),
+        );
+        assert_eq!(first.epoch, second.epoch);
+        assert!(Arc::ptr_eq(&first.messages, &second.messages));
+        assert_ne!(first.state, second.state);
+        let destination = if child {
+            HistoryDestination::Child(TOOL_ID.into())
+        } else {
+            HistoryDestination::Main
+        };
+        writer.seed(Arc::new(session.clone()));
+        let submit = |history: &HistorySnapshot<Message>, revision| {
+            let mut snapshot = session.clone();
+            assert!(adopt_checkpoint_history(
+                &mut snapshot,
+                &destination,
+                history,
+                None
+            ));
+            writer.checkpoint(CheckpointRequest {
+                session_id: id,
+                version: CheckpointVersion {
+                    revision,
+                    epoch: history.epoch,
+                },
+                snapshot: Arc::new(snapshot),
+            })
+        };
+        let old_ack = submit(&first, 1);
+        let old_save = requeue.then(|| {
+            let Entry::Save(save) = lock(&writer.pending).entries.remove(&id).unwrap() else {
+                unreachable!()
+            };
+            save
+        });
+        let new_ack = submit(&second, 2);
+        if let Some(save) = old_save {
+            assert!(requeue_save(&writer.pending, id, save).is_ok());
+        }
+        let (warn_tx, _warn_rx) = flume::unbounded();
+        Writer {
+            dir: dir.clone(),
+            warn_tx,
+            logs: HashMap::new(),
+            failing: HashSet::new(),
+        }
+        .flush(&writer.pending);
+        let Err(CheckpointError::Save { message, .. }) = smol::block_on(old_ack) else {
+            panic!("replaced state must fail its checkpoint")
+        };
+        assert_eq!(message.as_ref(), CHECKPOINT_REPLACED);
+        assert!(smol::block_on(new_ack).is_ok());
+        let loaded = AppSession::load(id, &dir).unwrap();
+        let saved = if child {
+            loaded.subagent_history_snapshot(TOOL_ID).unwrap()
+        } else {
+            loaded.history_snapshot()
+        };
+        assert_eq!(saved.state, second.state);
     }
 
     #[test]

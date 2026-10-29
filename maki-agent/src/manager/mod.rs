@@ -28,13 +28,12 @@ use std::time::Duration;
 
 use async_lock::{Semaphore, SemaphoreGuardArc};
 use event_listener::Event;
-use maki_providers::Message;
 use tracing::{info, warn};
 
 use crate::actor::{ActorCloseCut, ActorIdleGuard, ManagedTurnAdmission};
 use crate::{
     ActorBackend, ActorError, ActorEvent, ActorLifecycle, ActorStatus, AgentActorHandle, AgentId,
-    SharedMessages, TurnCancellationReason, TurnId, TurnOutcome,
+    HistorySnapshot, SharedMessages, TurnCancellationReason, TurnId, TurnOutcome,
 };
 
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -418,18 +417,18 @@ impl AgentManagerHandle {
 
     pub fn create_root(
         &self,
-        initial_messages: Vec<Message>,
+        initial_history: impl Into<HistorySnapshot>,
         shared_messages: Option<SharedMessages>,
         backend: Box<dyn ActorBackend>,
     ) -> Result<AgentRef, ManagerError> {
-        self.create_root_with(initial_messages, shared_messages, |_| {
+        self.create_root_with(initial_history, shared_messages, |_| {
             Ok::<_, String>(backend)
         })
     }
 
     pub fn create_root_with<F, E>(
         &self,
-        initial_messages: Vec<Message>,
+        initial_history: impl Into<HistorySnapshot>,
         shared_messages: Option<SharedMessages>,
         factory: F,
     ) -> Result<AgentRef, ManagerError>
@@ -437,13 +436,13 @@ impl AgentManagerHandle {
         F: FnOnce(AgentId) -> Result<Box<dyn ActorBackend>, E>,
         E: ToString,
     {
-        self.create_root_with_config(None, initial_messages, shared_messages, factory)
+        self.create_root_with_config(None, initial_history, shared_messages, factory)
     }
 
     pub fn create_root_with_config<F, E>(
         &self,
         config: Option<crate::actor::EffectiveAgentConfig>,
-        initial_messages: Vec<Message>,
+        initial_history: impl Into<HistorySnapshot>,
         shared_messages: Option<SharedMessages>,
         factory: F,
     ) -> Result<AgentRef, ManagerError>
@@ -451,13 +450,13 @@ impl AgentManagerHandle {
         F: FnOnce(AgentId) -> Result<Box<dyn ActorBackend>, E>,
         E: ToString,
     {
-        self.create_root_inner(config, initial_messages, shared_messages, factory, None)
+        self.create_root_inner(config, initial_history, shared_messages, factory, None)
     }
 
     pub fn create_root_deferred_with_config<F, E>(
         &self,
         config: Option<crate::actor::EffectiveAgentConfig>,
-        initial_messages: Vec<Message>,
+        initial_history: impl Into<HistorySnapshot>,
         shared_messages: Option<SharedMessages>,
         factory: F,
         start: flume::Receiver<()>,
@@ -468,7 +467,7 @@ impl AgentManagerHandle {
     {
         self.create_root_inner(
             config,
-            initial_messages,
+            initial_history,
             shared_messages,
             factory,
             Some(start),
@@ -478,7 +477,7 @@ impl AgentManagerHandle {
     fn create_root_inner<F, E>(
         &self,
         config: Option<crate::actor::EffectiveAgentConfig>,
-        initial_messages: Vec<Message>,
+        initial_history: impl Into<HistorySnapshot>,
         shared_messages: Option<SharedMessages>,
         factory: F,
         start: Option<flume::Receiver<()>>,
@@ -533,7 +532,7 @@ impl AgentManagerHandle {
         self.commit_actor(agent_id, reservation, |admission| {
             AgentActorHandle::spawn_managed(
                 agent_id,
-                initial_messages,
+                initial_history,
                 shared_messages,
                 backend,
                 admission,
@@ -547,11 +546,11 @@ impl AgentManagerHandle {
         &self,
         current: &CurrentManagedTurn,
         metadata: AgentMetadata,
-        initial_messages: Vec<Message>,
+        initial_history: impl Into<HistorySnapshot>,
         shared_messages: Option<SharedMessages>,
         backend: Box<dyn ActorBackend>,
     ) -> Result<AgentRef, ManagerError> {
-        self.spawn_child_with(current, metadata, initial_messages, shared_messages, |_| {
+        self.spawn_child_with(current, metadata, initial_history, shared_messages, |_| {
             Ok::<_, String>(backend)
         })
     }
@@ -560,7 +559,7 @@ impl AgentManagerHandle {
         &self,
         current: &CurrentManagedTurn,
         metadata: AgentMetadata,
-        initial_messages: Vec<Message>,
+        initial_history: impl Into<HistorySnapshot>,
         shared_messages: Option<SharedMessages>,
         factory: F,
     ) -> Result<AgentRef, ManagerError>
@@ -587,7 +586,7 @@ impl AgentManagerHandle {
             current,
             inherited_config,
             metadata,
-            initial_messages,
+            initial_history,
             shared_messages,
             factory,
         )
@@ -598,7 +597,7 @@ impl AgentManagerHandle {
         current: &CurrentManagedTurn,
         config: crate::actor::EffectiveAgentConfig,
         metadata: AgentMetadata,
-        initial_messages: Vec<Message>,
+        initial_history: impl Into<HistorySnapshot>,
         shared_messages: Option<SharedMessages>,
         factory: F,
     ) -> Result<AgentRef, ManagerError>
@@ -612,7 +611,7 @@ impl AgentManagerHandle {
             Some(current),
             config,
             metadata,
-            initial_messages,
+            initial_history,
             shared_messages,
             factory,
         )
@@ -624,7 +623,7 @@ impl AgentManagerHandle {
         parent: &AgentRef,
         config: crate::actor::EffectiveAgentConfig,
         metadata: AgentMetadata,
-        initial_messages: Vec<Message>,
+        initial_history: impl Into<HistorySnapshot>,
         shared_messages: Option<SharedMessages>,
         factory: F,
     ) -> Result<AgentRef, ManagerError>
@@ -638,7 +637,7 @@ impl AgentManagerHandle {
             None,
             config,
             metadata,
-            initial_messages,
+            initial_history,
             shared_messages,
             factory,
         )
@@ -651,7 +650,7 @@ impl AgentManagerHandle {
         current: Option<&CurrentManagedTurn>,
         config: crate::actor::EffectiveAgentConfig,
         metadata: AgentMetadata,
-        initial_messages: Vec<Message>,
+        initial_history: impl Into<HistorySnapshot>,
         shared_messages: Option<SharedMessages>,
         factory: F,
     ) -> Result<AgentRef, ManagerError>
@@ -755,7 +754,7 @@ impl AgentManagerHandle {
         self.commit_actor(child_id, reservation, |admission| {
             AgentActorHandle::spawn_managed(
                 child_id,
-                initial_messages,
+                initial_history,
                 shared_messages,
                 backend,
                 admission,

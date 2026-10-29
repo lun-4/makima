@@ -6,7 +6,6 @@ use crate::chat::{Chat, DONE_TEXT, history_to_display};
 use crate::components::DisplayRole;
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::{Action, SessionReplacementKind, SessionReplacementRequest};
-use maki_agent::HistorySnapshot;
 use maki_agent::actor::HistoryChange;
 use maki_agent::agent::estimate_message_tokens;
 #[cfg(test)]
@@ -49,6 +48,12 @@ pub(super) struct Sent {
 /// the report and the disk can never disagree.
 pub(crate) fn session_has_content(session: &AppSession) -> bool {
     !session.messages().is_empty()
+        || !session.history_snapshot().state.is_empty()
+        || session.subagent_messages().keys().any(|key| {
+            session
+                .subagent_history_snapshot(key)
+                .is_some_and(|history| !history.state.is_empty())
+        })
         || session.meta.input_draft.is_some()
         || !session.meta.queued_messages.is_empty()
         || session.meta.mode != Some(maki_storage::sessions::StoredMode::Build)
@@ -388,34 +393,29 @@ impl App {
                     .and_then(|key| self.state.session.subagent_messages().get(key))
                     .map_or(0, |messages| estimate_message_tokens(messages))
             });
-        let context_size = baseline.saturating_add(estimate_message_tokens(&change.messages));
+        let context_size =
+            baseline.saturating_add(estimate_message_tokens(&change.history.messages));
         if index == 0 {
             let baseline = self
                 .state
                 .context_size
                 .saturating_sub(estimate_message_tokens(self.state.session.messages()));
-            self.state
-                .session_mut()
-                .replace_shared_messages(Arc::clone(&change.messages));
+            self.state.session_mut().adopt_history(&change.history);
             self.state.context_size =
-                baseline.saturating_add(estimate_message_tokens(&change.messages));
+                baseline.saturating_add(estimate_message_tokens(&change.history.messages));
             self.state.session_mut().meta.input_draft = Some(draft.clone());
         } else if let Some(key) = self.chats[index].subagent_id.clone()
-            && !self.state.session_mut().adopt_subagent_history(
-                key,
-                &HistorySnapshot {
-                    epoch: change.epoch,
-                    compacted: false,
-                    messages: Arc::clone(&change.messages),
-                },
-            )
+            && !self
+                .state
+                .session_mut()
+                .adopt_subagent_history(key, &change.history)
         {
             return;
         }
         let chat = self.chats[index].subagent_id.clone();
         self.state
             .session_mut()
-            .prune_posts(chat.as_deref(), change.messages.len());
+            .prune_posts(chat.as_deref(), change.history.messages.len());
         if index == 0 {
             let live_children = self.live_child_keys();
             self.state.session_mut().prune_orphans_preserving(
@@ -429,7 +429,7 @@ impl App {
             );
         }
         let (display, items) = history_to_display(
-            &change.messages,
+            &change.history.messages,
             self.state.session.tool_outputs(),
             &self.ui_config.tool_output_lines,
             &posts_in(self.state.session.posts(), chat.as_deref()),

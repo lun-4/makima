@@ -166,7 +166,7 @@ use std::sync::{Arc, Mutex};
 
 use event_listener::Event;
 
-use maki_providers::{Message, TokenUsage};
+use maki_providers::TokenUsage;
 use tracing::info;
 
 use crate::cancel::{CancelToken, ReasonedCancelToken, ReasonedCancelTrigger};
@@ -175,7 +175,10 @@ use crate::types::{
     ActorWorkIdentity, ActorWorkKind, AgentEvent, AgentId, EventSender, TurnCancellationReason,
     TurnId, TurnOutcome,
 };
-use crate::{AgentInput, AgentMode, CancelTrigger, History, ModeDef, RunSettings, SharedMessages};
+use crate::{
+    AgentInput, AgentMode, CancelTrigger, History, HistorySnapshot, ModeDef, RunSettings,
+    SharedMessages,
+};
 
 /// One scheduler operation. Every admitted turn settles into one outcome;
 /// controls and compaction do not produce turn outcomes.
@@ -1245,13 +1248,13 @@ impl AgentActorHandle {
     /// handed out.
     pub fn spawn(
         agent_id: AgentId,
-        initial_messages: Vec<Message>,
+        initial_history: impl Into<HistorySnapshot>,
         shared_messages: Option<SharedMessages>,
         backend: Box<dyn ActorBackend>,
     ) -> (Self, smol::Task<()>) {
         Self::spawn_inner(
             agent_id,
-            initial_messages,
+            initial_history,
             shared_messages,
             backend,
             None,
@@ -1264,7 +1267,7 @@ impl AgentActorHandle {
     /// signal before consuming any work.
     pub(crate) fn spawn_managed(
         agent_id: AgentId,
-        initial_messages: Vec<Message>,
+        initial_history: impl Into<HistorySnapshot>,
         shared_messages: Option<SharedMessages>,
         backend: Box<dyn ActorBackend>,
         managed_admission: ManagedTurnAdmission,
@@ -1273,7 +1276,7 @@ impl AgentActorHandle {
     ) -> (Self, smol::Task<()>) {
         Self::spawn_inner(
             agent_id,
-            initial_messages,
+            initial_history,
             shared_messages,
             backend,
             Some(managed_admission),
@@ -1284,7 +1287,7 @@ impl AgentActorHandle {
 
     fn spawn_inner(
         agent_id: AgentId,
-        initial_messages: Vec<Message>,
+        initial_history: impl Into<HistorySnapshot>,
         shared_messages: Option<SharedMessages>,
         backend: Box<dyn ActorBackend>,
         managed_admission: Option<ManagedTurnAdmission>,
@@ -1292,11 +1295,10 @@ impl AgentActorHandle {
         start: Option<flume::Receiver<()>>,
     ) -> (Self, smol::Task<()>) {
         let mirror = shared_messages.unwrap_or_else(|| {
-            Arc::new(arc_swap::ArcSwap::from_pointee(
-                crate::HistorySnapshot::default(),
-            ))
+            Arc::new(arc_swap::ArcSwap::from_pointee(HistorySnapshot::default()))
         });
-        let history = History::restored(initial_messages).with_mirror(Arc::clone(&mirror));
+        let history =
+            History::restored_snapshot(initial_history.into()).with_mirror(Arc::clone(&mirror));
         let admission_preparation = backend.admission_preparation();
         let mode_ceiling = managed_admission
             .as_ref()

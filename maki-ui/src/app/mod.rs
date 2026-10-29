@@ -26,7 +26,6 @@ use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
 use crate::command_runtime::{CommandRuntime, PreparedCommandTarget};
-use maki_agent::HistorySnapshot;
 
 use crate::components::btw_modal::BtwModal;
 #[cfg(test)]
@@ -2158,17 +2157,11 @@ impl App {
                 match envelope.event {
                     AgentEvent::SubagentHistory {
                         tool_use_id,
-                        history_epoch,
-                        messages,
+                        history,
                     } => {
-                        self.state.session_mut().adopt_subagent_history(
-                            tool_use_id,
-                            &HistorySnapshot {
-                                epoch: history_epoch,
-                                compacted: false,
-                                messages: Arc::new(messages),
-                            },
-                        );
+                        self.state
+                            .session_mut()
+                            .adopt_subagent_history(tool_use_id, &history);
                     }
                     AgentEvent::TurnComplete(turn) => {
                         let chat_idx = self.live_chat_index.get(&subagent.agent_id).copied();
@@ -2230,8 +2223,7 @@ impl App {
         let subagent_agent_id = envelope.subagent.as_ref().map(|subagent| subagent.agent_id);
         if let AgentEvent::SubagentHistory {
             tool_use_id,
-            history_epoch,
-            messages,
+            history,
         } = envelope.event
         {
             // Workflow sessions use synthetic ids that no ToolDone will match,
@@ -2248,14 +2240,9 @@ impl App {
                 self.chats[sub_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
             }
             self.sync_task_picker();
-            self.state.session_mut().adopt_subagent_history(
-                tool_use_id,
-                &HistorySnapshot {
-                    epoch: history_epoch,
-                    compacted: false,
-                    messages: Arc::new(messages),
-                },
-            );
+            self.state
+                .session_mut()
+                .adopt_subagent_history(tool_use_id, &history);
             return vec![];
         }
 
