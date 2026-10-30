@@ -1171,6 +1171,11 @@ fn trusted_config_callback_survives_subscription_gc_and_revocation(shutdown: boo
                     local root = assert(ctx:agent())
                     local selection = assert(root:set_model(ctx, {{ spec = "{FAST_MODEL}", thinking = "low", fast = true }}))
                     assert(selection.spec == "{FAST_MODEL}" and selection.thinking == "low" and selection.fast == true)
+                    local disabled, selection_err = root:set_model(ctx, {{ fast = false }})
+                    assert(disabled and selection_err == nil, selection_err)
+                    assert(disabled.spec == selection.spec and disabled.thinking == selection.thinking and disabled.fast == false)
+                    local restored = assert(root:set_model(ctx, selection))
+                    for _, key in ipairs({{ "spec", "thinking", "fast" }}) do assert(restored[key] == selection[key]) end
                     local roundtrip = assert(root:config(ctx)).model
                     for _, key in ipairs({{ "spec", "thinking", "fast" }}) do assert(selection[key] == roundtrip[key]) end
                     assert(assert(root:config(ctx)).mode == "build")
@@ -2325,8 +2330,11 @@ fn trusted_mode_changes_preserve_registered_target_model_policy() {
                     assert(target:set_mode(ctx, "build") == "build")
                     local changed, model_err = target:set_model(ctx, {UPDATED_MODEL:?})
                     assert(changed == nil and model_err == {not_allowed:?}, model_err)
-                    assert(target:set_model(ctx, {{ thinking = "low" }}))
-                    assert(assert(target:config(ctx)).model.thinking == "low")
+                    local before = assert(target:config(ctx)).model
+                    local selection, selection_err = target:set_model(ctx, {{ thinking = "low" }})
+                    assert(selection and selection_err == nil, selection_err)
+                    assert(selection.spec == before.spec and selection.fast == before.fast and selection.thinking == "low")
+                    assert(assert(target:config(ctx)).model.thinking == selection.thinking)
                 end,
             }})
         "#

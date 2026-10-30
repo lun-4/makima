@@ -106,7 +106,18 @@ async fn build_session_provider(
             Arc::clone(&agent_ctx.provider),
         ));
     };
-    let preparer: ModelPreparer = match prepare {
+    let preparer = session_model_preparer(agent_ctx, prepare);
+    let prepared = prepare_model(spec, &agent_ctx.model_policy, &preparer)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok((prepared.model, prepared.provider))
+}
+
+fn session_model_preparer(
+    agent_ctx: &AgentContext,
+    prepare: Option<SessionProviderPreparer>,
+) -> ModelPreparer {
+    match prepare {
         Some(prepare) => Arc::new(move |model| {
             let prepared = prepare(model)
                 .map(|(model, provider)| PreparedModel { model, provider })
@@ -114,11 +125,7 @@ async fn build_session_provider(
             Box::pin(async move { prepared })
         }),
         None => default_model_preparer(agent_ctx.timeouts),
-    };
-    let prepared = prepare_model(spec, &agent_ctx.model_policy, &preparer)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok((prepared.model, prepared.provider))
+    }
 }
 
 /// Shared backend state, owned by the adapter and cloned into the actor's

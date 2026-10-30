@@ -32,8 +32,7 @@ const GLOBAL_THIRD_PARTY_COMMAND_DIRS: &[&str] = &[".claude/commands"];
 const ARGUMENTS_PLACEHOLDER: &str = "$ARGUMENTS";
 const STANDARD_COMMANDS_ALREADY_REGISTERED: &str = "standard commands are already registered";
 const LOCAL_COMMAND_ATTACHMENTS: &str = "local commands cannot include non-text content";
-pub const NONINTERACTIVE_MODEL_USAGE: &str =
-    "Usage: /model [spec] [thinking=value] [fast=true|false]";
+pub const NONINTERACTIVE_MODEL_USAGE: &str = "Usage: /model [spec] [key=value ...]";
 pub const FAST_UNSUPPORTED: &str = "Fast mode needs Anthropic Opus 4.6+ with an API key, or an eligible Codex model with a ChatGPT subscription";
 
 pub fn command_images(attachments: &[CommandAttachment]) -> Result<Vec<ImageSource>, String> {
@@ -226,7 +225,7 @@ impl maki_commands::CommandHost for SessionCommandHost {
             }),
             BuiltinOperation::SelectModel(selection) => Box::pin(async move {
                 coordinator
-                    .set_model(selection.spec, selection.fast, selection.thinking)
+                    .set_model(selection)
                     .await
                     .map_err(producer_error)?;
                 Ok(HostResponse::Completed)
@@ -392,7 +391,7 @@ fn parsed_directory_argument(
         .transpose()
 }
 
-fn resolve_model(argument: &str, specs: &[Arc<str>]) -> Result<Arc<str>, CommandError> {
+pub fn resolve_model_spec(argument: &str, specs: &[Arc<str>]) -> Result<Arc<str>, CommandError> {
     if argument.contains('/') {
         Model::from_spec(argument)
             .map_err(|error| CommandError::Producer(Arc::from(error.to_string())))?;
@@ -467,15 +466,14 @@ impl CommandBehavior for BuiltinBehavior {
                         specs
                     };
                     if !model.is_empty() {
-                        selection.spec = Some(resolve_model(model, &specs)?);
+                        selection.spec = Some(resolve_model_spec(model, &specs)?);
                     }
-                    match selection {
-                        maki_commands::ModelSelection {
-                            spec: Some(spec),
-                            thinking: None,
-                            fast: None,
-                        } => BuiltinOperation::SetModel { spec },
-                        selection => BuiltinOperation::SelectModel(selection),
+                    if !selection.has_option_overrides()
+                        && let Some(spec) = &selection.spec
+                    {
+                        BuiltinOperation::SetModel { spec: spec.clone() }
+                    } else {
+                        BuiltinOperation::SelectModel(selection)
                     }
                 }
                 maki_commands::BuiltinId::Theme if theme.as_ref().is_ok_and(Option::is_none) => {
@@ -1148,6 +1146,39 @@ mod tests {
         let dispatched = smol::block_on(registry.dispatch_input(&target, input.into()));
         let operations = host.0.lock().unwrap().clone();
         (dispatched, operations)
+    }
+
+    #[test_case("openai/private-model", &[], Ok("openai/private-model"); "undiscovered_exact")]
+    #[test_case("openai/private-model", &["openai/other-private-model"], Ok("openai/private-model"); "slash_not_fuzzy")]
+    #[test_case("openai/", &["openai/gpt-5"], Err("model must be in 'provider/model' format (e.g. anthropic/claude-sonnet-4-20250514)"); "malformed_exact")]
+    #[test_case("gpt", &["openai/gpt-5", "anthropic/claude-sonnet-4"], Ok("openai/gpt-5"); "model_id")]
+    #[test_case("anthropic", &["openai/gpt-5", "anthropic/claude-sonnet-4"], Ok("anthropic/claude-sonnet-4"); "provider")]
+    #[test_case("gpt", &["openai/gpt-5", "openai/gpt-4"], Err("ambiguous model: gpt"); "ambiguous")]
+    #[test_case("absent", &["openai/gpt-5"], Err("no model matches: absent"); "no_match")]
+    fn model_identity_resolution_preserves_command_semantics(
+        argument: &str,
+        candidates: &[&str],
+        expected: Result<&str, &str>,
+    ) {
+        let candidates = candidates
+            .iter()
+            .map(|spec| Arc::from(*spec))
+            .collect::<Vec<_>>();
+        let actual = resolve_model_spec(argument, &candidates)
+            .map(|spec| spec.to_string())
+            .map_err(|error| match error {
+                CommandError::Producer(message) => message.to_string(),
+                error => panic!("unexpected identity error: {error}"),
+            });
+        assert_eq!(actual, expected.map(str::to_owned).map_err(str::to_owned));
+    }
+
+    #[test]
+    fn noninteractive_model_usage_uses_generic_option_hint() {
+        assert_eq!(
+            NONINTERACTIVE_MODEL_USAGE,
+            "Usage: /model [spec] [key=value ...]"
+        );
     }
 
     #[test_case(

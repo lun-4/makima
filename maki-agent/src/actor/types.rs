@@ -4,7 +4,7 @@ use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 
-use maki_providers::TokenUsage;
+use maki_providers::{CompleteModelSelection, TokenUsage};
 use std::sync::Arc;
 
 use crate::cancel::{CancelToken, ReasonedCancelToken};
@@ -39,6 +39,14 @@ impl EffectiveAgentConfig {
             mode_def: None,
             mode_authority: None,
             context: super::AgentContextSnapshot::new(".".into()),
+        }
+    }
+
+    pub fn model_selection(&self) -> CompleteModelSelection {
+        CompleteModelSelection {
+            spec: self.model.spec().into(),
+            thinking: self.thinking,
+            fast: self.fast,
         }
     }
 

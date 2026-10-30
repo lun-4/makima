@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
-use maki_agent::actor::{
-    ActorError, ActorLifecycle, ActorStatus, ConfigChange, ConfigPatch, PreparedModel,
-};
+use maki_agent::actor::{ActorError, ActorLifecycle, ActorStatus, ConfigChange, ConfigPatch};
+use maki_agent::config_change::prepare_selection;
 use maki_agent::session_coordinator::SessionCoordinatorHandle;
 use maki_agent::session_options::{
     DISABLED_VALUE, ENABLED_VALUE, FAST_OPTION_ID, MODEL_OPTION_ID, SessionOptionError,
@@ -28,7 +27,7 @@ use crate::agent_errors::{
     RESTRICTED_MODE_CHANGE, SESSION_LEVEL_OPTION, STALE_TURN, TYPED_OPTION_SETTER,
 };
 use crate::api::agent::{
-    LuaTaskOwner, SessionProviderPreparer, build_session_provider, validate_required_output_mode,
+    LuaTaskOwner, SessionProviderPreparer, session_model_preparer, validate_required_output_mode,
 };
 use crate::api::env::host_state_dir;
 use crate::api::session_option::{ensure_validation_not_in_progress, validate_option_value};
@@ -448,7 +447,6 @@ async fn agent_set_model(
 ) -> mlua::Result<Pair<Table>> {
     try_pair!(authorize(&lua, &ctx, &this));
     let selection = try_pair!(selection_from_lua(&lua, patch));
-    let spec = selection.spec.map(|spec| spec.to_string());
     let template = try_pair!(destination_template(&lua, &this));
     let target = try_pair!(this.manager.lookup(this.id));
     let services = try_pair!(orchestration::services(&lua).ok_or(NO_ORCHESTRATION_SERVICES));
@@ -464,23 +462,11 @@ async fn agent_set_model(
             let prepare = lua
                 .app_data_ref::<SessionProviderPreparer>()
                 .map(|prepare| Arc::clone(&prepare));
-            let model = match spec {
-                Some(_) => {
-                    let (model, provider) =
-                        build_session_provider(&spec, false, &template, prepare).await?;
-                    Some(PreparedModel { model, provider })
-                }
-                None => None,
-            };
+            let prepare = session_model_preparer(&template, prepare);
+            let patch = prepare_selection(&selection, &template.model_policy, &prepare).await?;
             authorize(&lua, &ctx, &this)?;
             drop(this);
             drop(ctx);
-            let patch = ConfigPatch {
-                model,
-                thinking: selection.thinking,
-                fast: selection.fast,
-                ..Default::default()
-            };
             Ok((claim, ConfigChange::Patch(patch)))
         },
     )

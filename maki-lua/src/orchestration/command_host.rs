@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
 use maki_agent::AgentRef;
-use maki_agent::actor::{ConfigChange, ConfigPatch, EffectiveAgentConfig};
+use maki_agent::actor::{ConfigChange, EffectiveAgentConfig};
 use maki_agent::command::SessionCommandHost;
-use maki_agent::config_change::{ConfigChangeError, prepare_patch};
+use maki_agent::config_change::{ConfigChangeError, prepare_selection};
 use maki_agent::session_coordinator::{ModelPreparer, canonical_directory, publication_claim};
 use maki_commands::{
     BuiltinOperation, CommandError, CommandFuture, CommandHost, FrontendFeedback,
@@ -197,13 +197,7 @@ async fn select_model(
     reserve_config_change(&*services, &target)
         .map_err(producer_error)?
         .commit(async |_, _| {
-            let patch = ConfigPatch {
-                thinking: selection.thinking,
-                fast: selection.fast,
-                ..Default::default()
-            };
-            let patch =
-                prepare_patch(patch, selection.spec.as_deref(), &policy, &prepare_model).await?;
+            let patch = prepare_selection(&selection, &policy, &prepare_model).await?;
             Ok::<_, ConfigChangeError>((publication_claim(), ConfigChange::Patch(patch)))
         })
         .await
