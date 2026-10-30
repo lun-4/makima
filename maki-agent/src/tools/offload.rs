@@ -37,7 +37,7 @@ pub const OFFLOAD_FOOTER_PREFIX: &str = "[output truncated: ";
 const CLIPPED_NOTE: &str = "; saved search results also contain clipped lines";
 const INSPECTION_ADVICE: &str = "inspect with read or grep; use bash for long lines";
 #[cfg(unix)]
-const DIR_MODE: u32 = 0o700;
+const DIR_MODE: Mode = Mode::RWXU;
 
 #[derive(Debug, Error)]
 pub enum OffloadError {
@@ -337,7 +337,7 @@ impl DiskBackend {
         let mut dir = root.try_clone()?;
         for part in relative.components() {
             if create {
-                match anchored::mkdirat(&dir, part.as_os_str(), Mode::from_raw_mode(DIR_MODE)) {
+                match anchored::mkdirat(&dir, part.as_os_str(), DIR_MODE) {
                     Err(error) if error == Errno::EXIST => {}
                     result => result?,
                 }
@@ -356,7 +356,7 @@ impl DiskBackend {
     #[cfg(unix)]
     fn create_in(dir: &File, name: &str, bytes: &[u8]) -> io::Result<bool> {
         Self::validate_name(name)?;
-        anchored::fchmod(dir, Mode::from_raw_mode(DIR_MODE))?;
+        anchored::fchmod(dir, DIR_MODE)?;
         let mut random = [0; 16];
         getrandom::fill(&mut random).map_err(|error| io::Error::other(error.to_string()))?;
         let temporary = format!(".offload-{:032x}", u128::from_ne_bytes(random));
@@ -747,13 +747,13 @@ mod tests {
     use tempfile::TempDir;
     use test_case::test_case;
 
+    #[cfg(unix)]
+    use super::DiskBackend;
     use super::{
         CLIPPED_NOTE, LINE_CUT_PREFIX, LimitOpts, MAX_OFFLOAD_FILE_BYTES,
         MAX_OFFLOAD_SESSION_BYTES, OffloadBackend, OffloadError, OffloadStore, OutputLimitOptions,
         OutputLimits, PreviewShape, cut_line, limit_output, line_count,
     };
-    #[cfg(unix)]
-    use super::{DIR_MODE, DiskBackend};
     use crate::tools::FILE_TRUNCATED_MARKER;
 
     const TEST_BODY: &str = "stored body";
@@ -1042,17 +1042,19 @@ mod tests {
     #[test]
     fn disk_backend_creates_private_directory_and_file() {
         let root = TempDir::new().unwrap();
-        let store = OffloadStore::on_disk(root.path().join("store"));
+        let base = root.path().canonicalize().unwrap();
+        let store = OffloadStore::on_disk(base.join("store"));
         let saved = store.put(TEST_BODY).unwrap();
         let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&store.path_of(&saved)), 0o600);
-        assert_eq!(mode(&store.dir()), DIR_MODE);
+        assert_eq!(mode(&store.dir()), 0o700);
     }
 
     #[test]
     fn close_rejects_later_puts_and_removes_the_directory() {
         let root = TempDir::new().unwrap();
-        let path = root.path().join("store");
+        let base = root.path().canonicalize().unwrap();
+        let path = base.join("store");
         let store = OffloadStore::on_disk(path.clone());
         store.put(TEST_BODY).unwrap();
         store.close_and_remove().unwrap();
@@ -1136,11 +1138,12 @@ mod tests {
     #[test]
     fn ancestor_handle_swap_cannot_redirect_descendant_creation() {
         let root = TempDir::new().unwrap();
-        let backend = DiskBackend::new(root.path().join(SESSIONS_DIR));
+        let base = root.path().canonicalize().unwrap();
+        let backend = DiskBackend::new(base.join(SESSIONS_DIR));
         let opened = backend.open_dir(true).unwrap();
-        let moved = root.path().join("original");
+        let moved = base.join("original");
         fs::rename(&backend.dir, &moved).unwrap();
-        let external = root.path().join("outside");
+        let external = base.join("outside");
         fs::create_dir(&external).unwrap();
         fs::set_permissions(&external, fs::Permissions::from_mode(EXTERNAL_MODE)).unwrap();
         symlink_dir(&external, &backend.dir).unwrap();
@@ -1161,10 +1164,11 @@ mod tests {
     #[test]
     fn cleanup_does_not_follow_nested_symlink_to_external_sentinel() {
         let root = TempDir::new().unwrap();
-        let external = root.path().join("outside");
+        let base = root.path().canonicalize().unwrap();
+        let external = base.join("outside");
         fs::create_dir(&external).unwrap();
         fs::write(external.join("sentinel"), b"untouched").unwrap();
-        let store = OffloadStore::on_disk(root.path().join("store"));
+        let store = OffloadStore::on_disk(base.join("store"));
         store.put(TEST_BODY).unwrap();
         fs::create_dir(store.dir().join("nested")).unwrap();
         symlink_dir(&external, store.dir().join("nested/link")).unwrap();

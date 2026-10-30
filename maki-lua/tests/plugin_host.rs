@@ -6914,7 +6914,7 @@ fn timed_out_bash_keeps_hooked_partial_output_offloaded() {
 }
 
 fn disk_store(dir: &Path) -> Arc<OffloadStore> {
-    Arc::new(OffloadStore::on_disk(dir.to_path_buf()))
+    Arc::new(OffloadStore::on_disk(dir.canonicalize().unwrap()))
 }
 
 /// bash reads session options, so it needs a live coordinator: keep the
@@ -6966,7 +6966,7 @@ fn bash_zero_output_override_finishes_on_exit() {
 fn write_new_file_with_preview_cut_marker_is_rejected() {
     let (reg, host) = edit_tools_host();
     let dir = tempfile::tempdir().unwrap();
-    let (ctx, _session) = offload_ctx(&host, &disk_store(&dir.path().join("store")));
+    let (ctx, _session) = offload_ctx(&host, &disk_store(dir.path()));
     let out = exec_with_ctx(
         &reg,
         "bash",

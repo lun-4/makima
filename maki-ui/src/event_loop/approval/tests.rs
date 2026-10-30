@@ -1532,7 +1532,7 @@ fn clear_uses_actor_source_and_captured_absolute_path() {
         let coordinator = event_loop.sessions[index].coordinator.clone();
         let cwd = coordinator.read().cwd().unwrap().join(MOVED_CWD);
         fs::create_dir(&cwd).unwrap();
-        smol::block_on(coordinator.change_directory(cwd.clone())).unwrap();
+        let cwd = smol::block_on(coordinator.change_directory(cwd)).unwrap();
         let relative = PathBuf::from(RELATIVE_PLAN_FILE);
         let absolute = cwd.join(&relative);
         fs::rename(original_path, &absolute).unwrap();
