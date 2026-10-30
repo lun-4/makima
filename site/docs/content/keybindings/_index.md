@@ -87,10 +87,31 @@ Some pickers add extra bindings on top of the defaults:
 |---------|-----|--------|
 | Queue | `Enter` | Remove item |
 | Commands | `Tab` | Complete command |
-| Model Picker | `!/@/#/$` | Set tier (strong/medium/weak/compaction) |
+| Model Picker | `Tab/Shift+Tab` | Focus model list or an available option |
+| Model Picker | `↑/↓` | Cycle free-input option presets, including Use current |
+| Model Picker | `Space/←/→` | Cycle option choices, including Use current |
+| Model Picker | `Enter` | Validate and confirm model and option overrides |
+| Model Picker | `Esc/Ctrl+C` | Cancel model and option edits |
+| Model Picker | `Ctrl+R` | Reset only unavailable or pending option overrides |
+| Model Picker | `!/@/#/$` | Set tier while model list is focused (strong/medium/weak/compaction) |
 | Session Picker | `Ctrl+N` | New session |
 | Session Picker | `Ctrl+R` | Rename session |
 | Session Picker | `Ctrl+D` | Delete session (press twice) |
+
+## Model option controls
+
+The [model picker](/docs/providers/#model-picker) uses these controls for ordinary model changes and plan approval. Only available options receive controls.
+
+| Key | Action |
+|-----|--------|
+| `Tab` / `Shift+Tab` | Move between the model list and available option controls |
+| `Up` / `Down` | Select a model with the list focused; cycle presets and Use current in free-input controls |
+| `Space` / `Left` / `Right` | Cycle choices and Use current in choice controls |
+| `Ctrl+R` | Clear only retained overrides that are unavailable or pending |
+| `Enter` | Validate and confirm the model and option draft together |
+| `Esc` / `Ctrl+C` | Cancel the whole draft without changing the prior selection |
+
+Typing and paste edit only the focused control. Tier shortcuts apply only while the model list is focused. Conflicting overrides remain visible and block confirmation until cleared or supported by the highlighted model.
 
 ## Plugins
 

@@ -100,6 +100,41 @@ fn write_context_specific(out: &mut String) {
     }
 }
 
+fn write_model_picker(out: &mut String) {
+    out.push_str("\n## Model option controls\n\n");
+    out.push_str("The [model picker](/docs/providers/#model-picker) uses these controls for ordinary model changes and plan approval. Only available options receive controls.\n\n");
+    write_table_2col(
+        out,
+        &[
+            (
+                "`Tab` / `Shift+Tab`".into(),
+                "Move between the model list and available option controls",
+            ),
+            (
+                "`Up` / `Down`".into(),
+                "Select a model with the list focused; cycle presets and Use current in free-input controls",
+            ),
+            (
+                "`Space` / `Left` / `Right`".into(),
+                "Cycle choices and Use current in choice controls",
+            ),
+            (
+                "`Ctrl+R`".into(),
+                "Clear only retained overrides that are unavailable or pending",
+            ),
+            (
+                "`Enter`".into(),
+                "Validate and confirm the model and option draft together",
+            ),
+            (
+                "`Esc` / `Ctrl+C`".into(),
+                "Cancel the whole draft without changing the prior selection",
+            ),
+        ],
+    );
+    out.push_str("\nTyping and paste edit only the focused control. Tier shortcuts apply only while the model list is focused. Conflicting overrides remain visible and block confirmation until cleared or supported by the highlighted model.\n");
+}
+
 fn write_plugin_binds(out: &mut String) {
     out.push_str("\n## Plugins\n\n");
     out.push_str("Built-in plugins register these themselves, and your own plugins can add more with `maki.keymap.set`:\n\n");
@@ -150,6 +185,7 @@ pub fn generate() -> String {
     }
 
     write_context_specific(&mut out);
+    write_model_picker(&mut out);
     write_plugin_binds(&mut out);
     write_inheritance(&mut out);
     write_overrides(&mut out);
@@ -210,4 +246,24 @@ fn write_overrides(out: &mut String) {
          - `Ctrl+V` pastes an image from the clipboard into the prompt when the \
          model supports vision. You can also paste image file paths.\n",
     );
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn generated_model_picker_keybindings_include_option_controls() {
+        let generated = super::generate();
+        let controls = generated.split("## Model option controls").nth(1).unwrap();
+        for expected in [
+            "`Tab` / `Shift+Tab`",
+            "`Up` / `Down`",
+            "`Space` / `Left` / `Right`",
+            "`Ctrl+R`",
+            "`Enter`",
+            "`Esc` / `Ctrl+C`",
+            "unavailable or pending",
+        ] {
+            assert!(controls.contains(expected), "{expected}");
+        }
+    }
 }

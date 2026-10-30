@@ -28,19 +28,23 @@ A mode is not a sandbox for plugin effects. Lua filesystem writes require the pl
 
 When a plan is ready, the plan form opens below the chat. It has three actions:
 
-- `Refine plan` hides the form so you can keep planning with the agent.
+- `Refine plan` hides the form and leaves the agent in plan mode.
 - `Implement plan` switches to build mode and implements the plan in the current conversation.
 - `Clear context and implement` starts a fresh build session that holds only the plan, then implements it.
 
-Space toggles parallel implementation, which asks the agent to split the work across subagents. Ctrl+O opens the plan in your editor. Esc hides the form, and Ctrl+T shows or hides it.
+Space toggles parallel implementation, which asks the agent to split the work across subagents. Ctrl+O opens the plan in the configured editor. Esc hides the form, and Ctrl+T shows or hides it.
 
-The `Implementation model` row shows the model that will do the work. It starts as the current session model. Press Enter on that row to pick another one. Picking a model here does not change the session model yet. When a different model is picked, a `Use current model` row lets you go back. Your pick stays while you refine or edit the plan, and goes away when you leave plan mode. The [keybindings](/docs/keybindings/#form) page lists every key in the form.
+The `Implementation model` row opens the shared [model picker](/docs/providers/#model-picker). It stages a model identity and optional settings without changing the agent, saved model preferences, or recent models. The form distinguishes explicit assignments from current values. Staging can change only options and keep the current model. Explicit disabled values remain staged even when they equal the current value. Cancelling the picker preserves the previous stage.
 
-Approval needs planning work to be finished. If the agent or one of its subagents is still running, Makima asks you to try again later and leaves that work running. While approval is getting ready, the form is locked. Esc cancels it and gives you the form back as it was.
+Omitted fields are not snapshots: approval uses the addressed agent's preceding model and option values, subject to capability normalization. Staged assignments remain while the plan is refined or edited, and clear when the plan is replaced or plan mode ends. `Use current model` clears the whole staged request, including option overrides, but leaves parallel implementation unchanged. The [form keybindings](/docs/keybindings/#form) list the form controls.
 
-Approval is strict about the handoff turn's setup. If collecting prompt slots fails, say because a plugin stopped, the implementation cannot start and you get the form back. A turn you send yourself in that situation keeps going with default slots and a warning in the log, because planning should not lose its turn to a broken plugin.
+Approval needs planning work to be finished. If the agent or one of its subagents is still running, Makima asks for a later retry and leaves that work running. While approval is getting ready, the form is locked. Esc cancels approval and restores the form with the same staged request.
 
-After approval, the picked model becomes the session model and the agent starts implementing. The agent gets the plan text as it was at approval, so later edits to the file do not change the task. Cancelling from here stops the implementation like any other turn. It does not bring back the planning session or the old model.
+Approval validates the staged identity against the addressed agent's model policy and checks option support again. The model, option overrides, and build mode commit together before implementation starts. Unsupported explicit enabled values are rejected. Supported inherited values remain; unsupported inherited values turn off, and required thinking normalizes to the model's minimum effort. Validation or persistence failure preserves the plan, staged request, agent configuration, preferences, and recent models.
+
+Approval requires the handoff turn's prompt slots. If collecting them fails, for example because a plugin stopped, implementation does not start and the form returns. A manually sent turn can continue with default slots and a log warning instead.
+
+After approval, the committed model and options become the agent's configuration and implementation starts. The agent gets the plan text captured at approval, so later file edits do not change the task. Cancelling from here stops implementation like any other turn. It does not restore the planning conversation or the previous configuration.
 
 ## Configuration changes
 

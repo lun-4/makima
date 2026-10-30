@@ -1,6 +1,10 @@
 use std::fmt::Write;
 
 use maki_commands::{BUILTIN_COMMANDS, CommandArguments, TargetCapabilities};
+use maki_providers::{
+    FastCapability, MODEL_OPTION_SPECS, ModelCapabilities, ModelOptionSpec, ModelOptionValueKind,
+    ThinkingCapability,
+};
 
 use crate::lua_util;
 
@@ -36,6 +40,63 @@ fn markdown_cell(value: &str) -> String {
         .replace('|', "\\|")
         .replace("\r\n", "<br>")
         .replace(['\r', '\n'], "<br>")
+}
+
+fn availability_notes(option: &ModelOptionSpec) -> String {
+    let mut notes = Vec::new();
+    for thinking in [
+        ThinkingCapability::Unsupported,
+        ThinkingCapability::Supported,
+        ThinkingCapability::Required,
+    ] {
+        for fast in [
+            FastCapability::Unsupported,
+            FastCapability::Supported,
+            FastCapability::Pending,
+        ] {
+            let capabilities = ModelCapabilities {
+                resolved: true,
+                thinking: thinking.clone(),
+                fast,
+            };
+            if let Some(note) = option.availability(&capabilities).explanation()
+                && !notes.contains(&note)
+            {
+                notes.push(note);
+            }
+        }
+    }
+    notes.join(". ")
+}
+
+fn write_model_options(out: &mut String) {
+    writeln!(out, "\n## Model options\n").unwrap();
+    writeln!(out, "`/model [spec] [key=value ...]` applies a model identity and option overrides as one change to the addressed agent. Options without a spec keep its current model. Options also fit in braces after the spec, for example `/model openai/gpt-5{{thinking=high,fast=true}}`. Braces are understood by `/model` only. Each option may appear once; unknown and duplicate options are rejected.\n").unwrap();
+    writeln!(out, "Omitted options preserve the agent's preceding values, subject to the new model's capabilities. Explicit disabled values remain assignments. Unsupported explicit enabled values are rejected. Completion suggests only available options for the resolved model; commit-time validation remains authoritative. The [model picker](/docs/providers/#model-picker) uses the same options.\n").unwrap();
+    writeln!(out, "| Option | Description | Values | Availability |").unwrap();
+    writeln!(out, "|--------|-------------|--------|--------------|").unwrap();
+    for option in MODEL_OPTION_SPECS {
+        let presets = option
+            .presets
+            .iter()
+            .map(|preset| format!("`{}`", preset.value))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let values = match option.value_kind {
+            ModelOptionValueKind::FreeInput => format!("{presets}; custom input accepted"),
+            ModelOptionValueKind::Choice => presets,
+        };
+        writeln!(
+            out,
+            "| `{}` ({}) | {} | {} | {} |",
+            markdown_cell(option.key),
+            markdown_cell(option.label),
+            markdown_cell(option.description),
+            markdown_cell(&values),
+            markdown_cell(&availability_notes(option)),
+        )
+        .unwrap();
+    }
 }
 
 fn argument_mode(arguments: &CommandArguments) -> &'static str {
@@ -219,7 +280,7 @@ pub fn generate() -> color_eyre::Result<String> {
     .unwrap();
     writeln!(
         out,
-        "- **`/model [spec] [thinking=value] [fast=true|false]`**: options change the thinking level and fast mode together with the spec, as one change to the selected agent. Options without a spec keep the current model, so `/model thinking=high` only changes thinking. The same options also fit in braces after the spec, as in `/model openai/gpt-5{{thinking=high,fast=true}}`; braces are understood by `/model` only. Each option may appear once, and unknown options are rejected. Asking for fast mode or thinking on a model without them is rejected; values carried over from the previous model are adjusted to what the new model supports."
+        "- `/model [spec] [key=value ...]`: applies optional settings with the model identity as one change. `/model thinking=high` changes only thinking. The [model-option reference](#model-options) lists registered settings, values, and availability."
     )
     .unwrap();
     writeln!(
@@ -228,6 +289,8 @@ pub fn generate() -> color_eyre::Result<String> {
     )
     .unwrap();
 
+    writeln!(out).unwrap();
+    write_model_options(&mut out);
     writeln!(out).unwrap();
     writeln!(out, "## Sessions").unwrap();
     writeln!(out).unwrap();
@@ -371,6 +434,23 @@ mod tests {
     use maki_commands::{BUILTIN_COMMANDS, CommandArguments, TargetCapabilities};
 
     use super::generate;
+
+    #[test]
+    fn generated_model_option_reference_matches_specs() {
+        let generated = generate().expect("generated commands");
+        assert!(generated.contains("`/model [spec] [key=value ...]`"));
+        for option in super::MODEL_OPTION_SPECS {
+            let row = format!(
+                "| `{}` ({}) | {} |",
+                option.key, option.label, option.description
+            );
+            assert!(generated.contains(&row), "{row}");
+            for preset in option.presets {
+                assert!(generated.contains(&format!("`{}`", preset.value)));
+            }
+            assert!(generated.contains(&super::availability_notes(option)));
+        }
+    }
 
     #[test]
     fn plugin_row_preserves_explicit_argument_hint() {

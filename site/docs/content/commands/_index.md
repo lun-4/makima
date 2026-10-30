@@ -21,7 +21,7 @@ The active registry combines built-ins, custom Markdown commands, MCP prompts, a
 | `/clear` | Alias for `/new` | none |  | all |
 | `/help` | Show keybindings | none |  | TUI only |
 | `/queue` | Remove items from queue | none |  | TUI only |
-| `/model` | Switch model | typed | [spec] [thinking=value] [fast=true\|false] | all |
+| `/model` | Switch model | typed | [spec] [key=value ...] | all |
 | `/theme` | Switch color theme | typed | <theme> | TUI only |
 | `/mcp` | Configure MCP servers | none |  | TUI only |
 | `/login` | Authenticate with an LLM provider | none |  | TUI only |
@@ -65,8 +65,20 @@ Completion callbacks receive the typed argument name as `ctx.argument`, its type
 `/model` and `/theme` also accept an argument. While you type it, the palette lists the possible values (model specs, theme names), and submitting resolves the argument without opening the picker:
 
 - **`/model <spec>`**: a full `provider/id` spec is used as-is, even if it is not in the discovered list. A fragment is fuzzy-matched against the discovered specs, and a unique match switches to it. Zero or multiple matches flash a note and keep the current model.
-- **`/model [spec] [thinking=value] [fast=true|false]`**: options change the thinking level and fast mode together with the spec, as one change to the selected agent. Options without a spec keep the current model, so `/model thinking=high` only changes thinking. The same options also fit in braces after the spec, as in `/model openai/gpt-5{thinking=high,fast=true}`; braces are understood by `/model` only. Each option may appear once, and unknown options are rejected. Asking for fast mode or thinking on a model without them is rejected; values carried over from the previous model are adjusted to what the new model supports.
+- `/model [spec] [key=value ...]`: applies optional settings with the model identity as one change. `/model thinking=high` changes only thinking. The [model-option reference](#model-options) lists registered settings, values, and availability.
 - **`/theme <name>`**: the exact name is applied and persisted. A fragment that matches one theme name (like `toky` for `tokyonight`) is resolved the same way; unknown or ambiguous names flash a note and leave the current theme. With no argument, the picker opens and previews each theme as you navigate.
+
+
+## Model options
+
+`/model [spec] [key=value ...]` applies a model identity and option overrides as one change to the addressed agent. Options without a spec keep its current model. Options also fit in braces after the spec, for example `/model openai/gpt-5{thinking=high,fast=true}`. Braces are understood by `/model` only. Each option may appear once; unknown and duplicate options are rejected.
+
+Omitted options preserve the agent's preceding values, subject to the new model's capabilities. Explicit disabled values remain assignments. Unsupported explicit enabled values are rejected. Completion suggests only available options for the resolved model; commit-time validation remains authoritative. The [model picker](/docs/providers/#model-picker) uses the same options.
+
+| Option | Description | Values | Availability |
+|--------|-------------|--------|--------------|
+| `thinking` (Thinking) | Reasoning effort used for future requests | `off`, `adaptive`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; custom input accepted | Thinking is unsupported by this model. Thinking is required; off uses minimal effort |
+| `fast` (Fast) | Use the model's fast service tier | `true`, `false` | Fast mode is unsupported by this model. Fast mode support is pending discovery |
 
 ## Sessions
 

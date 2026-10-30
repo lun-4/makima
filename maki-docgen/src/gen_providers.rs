@@ -12,7 +12,22 @@ weight = 5
 group = "Reference"
 +++"#;
 
-const TIER_PICKER_NOTE: &str = r#"Open the model picker with `/model` and press `!`, `@`, `#`, or `$` on any row to assign it to strong, medium, weak, or compaction. Press the same key again to remove the assignment. Your overrides are saved to `~/.local/state/makima/model-tiers` and apply across sessions."#;
+const TIER_PICKER_NOTE: &str = r#"With the model list focused, `!`, `@`, `#`, and `$` assign the highlighted model to strong, medium, weak, or compaction. Pressing the same key again removes the assignment. Tier overrides are saved to `~/.local/state/makima/model-tiers` and apply across sessions."#;
+
+const MODEL_PICKER: &str = r#"## Model picker
+
+`/model` without arguments and Ctrl+M open the same picker used by the plan form's `Implementation model` row. The picker edits a model identity and optional settings as one selection. The [model-option reference](/docs/commands/#model-options) lists the settings and accepted values.
+
+Tab and Shift+Tab move between the model list and the available option controls. With the list focused, typing filters models and Up/Down moves the highlight. Free-input controls accept typed values and use Up/Down to cycle through `Use current` and presets. Choice controls use Space or Left/Right to cycle through `Use current` and their choices. Empty input means `Use current`; explicit disabled values remain overrides, even when they match the current value.
+
+Controls follow the highlighted model's provider-adjusted capabilities. Unsupported controls are hidden. Pending or failed capability resolution exposes no editable option controls. Command completion follows the model named in the command, or the addressed agent's current model when no identity is supplied.
+
+Changing the highlighted model retains option drafts. If a retained override becomes unavailable or pending, the picker shows its requested value and reason, and blocks confirmation. Ctrl+R clears only these conflicting overrides. Selecting a supporting model restores their controls and values. Required-thinking models keep the thinking control; an explicit `off` normalizes to the model's minimum thinking effort.
+
+Enter validates the draft and confirms the whole selection. Invalid input keeps the picker and draft open. Esc or Ctrl+C cancels all draft edits. An ordinary model change applies to the addressed agent; a plan-form selection only stages overrides until approval. Cancelling either picker does not change the actor configuration, model preferences, or recent models. Tier assignments remain separate persistent actions.
+
+Omitted settings use the addressed agent's values when the change commits, subject to capability normalization. Supported inherited values remain; unsupported inherited values turn off. Commit-time validation checks the model policy and provider capabilities again. A model shown in discovery is not automatically authorized, and explicit unsupported enabled values are rejected rather than discarded.
+"#;
 
 const AUTH_RELOADING: &str = r#"## Auth Reloading
 
@@ -592,7 +607,7 @@ pub fn generate() -> String {
          **medium** (balanced), and **strong** (highest capability, highest cost). \
          There is also a **compaction** tier for choosing a dedicated model to summarize context when the conversation grows long.\n"
     );
-    let _ = writeln!(out, "{TIER_PICKER_NOTE}\n");
+    let _ = writeln!(out, "{MODEL_PICKER}\n{TIER_PICKER_NOTE}\n");
     let _ = writeln!(out, "{AUTH_RELOADING}\n");
     let _ = writeln!(out, "{BASE_URL_OVERRIDES}\n");
     let _ = writeln!(out, "## Built-in Providers\n");
@@ -611,4 +626,30 @@ pub fn generate() -> String {
     let _ = writeln!(out, "{}", dynamic_providers_section());
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn generated_provider_docs_describe_model_options() {
+        let generated = super::generate();
+        for expected in [
+            "## Model picker",
+            "Tab and Shift+Tab",
+            "Up/Down to cycle",
+            "Space or Left/Right",
+            "Ctrl+R clears only these conflicting overrides",
+            "Unsupported controls are hidden",
+            "Pending or failed capability resolution",
+            "commit-time validation",
+            "[model-option reference](/docs/commands/#model-options)",
+        ] {
+            assert!(
+                generated
+                    .to_ascii_lowercase()
+                    .contains(&expected.to_ascii_lowercase()),
+                "{expected}"
+            );
+        }
+    }
 }
