@@ -423,6 +423,53 @@ fn splash_picker_command_switches_to_default() {
     assert_eq!(switched.recv_timeout(SPLASH_DEADLINE).unwrap(), Ok(()));
 }
 
+#[test]
+fn splash_picker_default_recovers_after_transient_render_error() {
+    const SOURCE: &str = r##"
+local calls = 0
+local function render_default(w, h)
+  calls = calls + 1
+  assert(calls ~= 1, "transient default render failure")
+  return { { { glyphs = "makima", style = "field" } } }
+end
+maki.api.declare_slot("splash.render", render_default)
+maki.store.register("splash", "default", { renderer = render_default })
+maki.store.register("splash", "matrix", {
+  renderer = function()
+    return { { { glyphs = "matrix", style = "field" } } }
+  end,
+})
+"##;
+    let fs = Arc::new(InMemoryFs::new());
+    fs.seed(&selection_path(), SELECTION_MATRIX_JSON.as_bytes().to_vec());
+    let (handle, guard) =
+        maki_lua::test_support::spawn_host_with_fs_for_tests(&["splashes"], fs, Some(SOURCE));
+    pull_frame(&handle, Some(SELECTION_MATRIX));
+    let switched = run_command(&guard.host().command_registry(), "/splash default", 0, None);
+    assert_eq!(switched.recv_timeout(SPLASH_DEADLINE).unwrap(), Ok(()));
+
+    let frame = handle
+        .request_splash_frame(80, 20, 10.0, 1.0)
+        .unwrap()
+        .recv_timeout(SPLASH_DEADLINE)
+        .unwrap();
+    assert!(
+        frame.is_none(),
+        "a failed default render must drop the frame"
+    );
+    assert!(
+        selection_content(&guard)
+            .unwrap()
+            .contains(SELECTION_DEFAULT)
+    );
+    pull_frame(&handle, Some("makima"));
+    assert!(
+        selection_content(&guard)
+            .unwrap()
+            .contains(SELECTION_DEFAULT)
+    );
+}
+
 const SECOND_SOURCE: &str = r##"
 local M = {}
 function M.render(w, h, t, fade)
