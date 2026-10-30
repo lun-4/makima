@@ -13,21 +13,40 @@ use maki_commands::{
     CompletionSessionId, InvocationTargetId, MAX_COMPLETION_CANDIDATES,
 };
 
+use maki_agent::command::resolve_model_spec;
+use maki_commands::parse_model_selection;
+use maki_domain::MODEL_OPTION_SPECS;
 use maki_lua::orchestration::TrustedTarget;
-use maki_providers::{FAST_VALUES, MODEL_FAST_KEY, MODEL_THINKING_KEY};
+
+use crate::model_capabilities::ModelCapabilityResolver;
 
 const PATH_COMPLETION_BATCH_SIZE: usize = 64;
 
 pub(crate) struct ModelArgSource {
     models: Arc<ArcSwapOption<Vec<String>>>,
     targets: Option<Arc<Mutex<HashMap<InvocationTargetId, TrustedTarget>>>>,
+    pub(crate) resolver: Arc<ModelCapabilityResolver>,
 }
 
 impl ModelArgSource {
+    #[cfg(test)]
     pub(crate) fn new(models: Arc<ArcSwapOption<Vec<String>>>) -> Self {
+        Self::with_resolver(
+            models,
+            Arc::new(ModelCapabilityResolver::new(Arc::new(|_| {
+                Box::pin(async { Err(Arc::from("model capabilities unavailable in fixture")) })
+            }))),
+        )
+    }
+
+    pub(crate) fn with_resolver(
+        models: Arc<ArcSwapOption<Vec<String>>>,
+        resolver: Arc<ModelCapabilityResolver>,
+    ) -> Self {
         Self {
             models,
             targets: None,
+            resolver,
         }
     }
 
@@ -38,6 +57,7 @@ impl ModelArgSource {
         Self {
             models: Arc::clone(&self.models),
             targets: Some(targets),
+            resolver: Arc::clone(&self.resolver),
         }
     }
 }
@@ -185,95 +205,166 @@ impl CommandCompletion for ModelArgSource {
     fn complete(
         &self,
         context: CompletionContext,
-        _cancellation: CancellationToken,
+        cancellation: CancellationToken,
     ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
-        let target = self.targets.as_ref().and_then(|targets| {
+        let targets = self.targets.clone();
+        let models = self.models.load_full();
+        let resolver = Arc::clone(&self.resolver);
+        let revision = resolver.revision();
+        let target = targets.as_ref().and_then(|targets| {
             targets
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .get(&context.target_id)
-                .filter(|target| target.target.validate_live().is_ok())
                 .cloned()
         });
-        let mut items = self.models.load_full().map_or_else(Vec::new, |specs| {
-            specs
-                .iter()
-                .filter(|spec| {
-                    self.targets.is_none()
-                        || target
-                            .as_ref()
-                            .is_some_and(|target| target.template.model_policy.allows(spec))
+        Box::pin(async move {
+            let Some(target) = target.filter(|target| target.target.validate_live().is_ok()) else {
+                return Ok(Vec::new());
+            };
+            if cancellation.is_cancelled() {
+                return Ok(Vec::new());
+            }
+            let Some(source) = target
+                .target
+                .actor()
+                .ok()
+                .and_then(|actor| actor.config_snapshot())
+            else {
+                return Ok(Vec::new());
+            };
+            let specs = models.map_or_else(Vec::new, |specs| {
+                specs
+                    .iter()
+                    .filter(|spec| target.template.model_policy.allows(spec))
+                    .map(|spec| Arc::<str>::from(spec.as_str()))
+                    .collect::<Vec<_>>()
+            });
+            let range = context
+                .argument_range
+                .clone()
+                .or_else(|| {
+                    maki_commands::lex_tolerant(&context.arguments)
+                        .ok()?
+                        .get(context.argument_index)
+                        .map(|token| token.range.clone())
                 })
-                .map(|spec| CompletionItem {
-                    label: Arc::from(spec.as_str()),
-                    insertion: Arc::from(spec.as_str()),
-                    description: None,
-                })
-                .collect()
-        });
-        let preceding = context
-            .preceding_arguments
-            .iter()
-            .flat_map(|argument| argument.values.iter())
-            .filter_map(|value| match value {
-                maki_commands::ArgumentValue::String(value) => Some(value.as_ref()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        if preceding.iter().any(|value| !value.contains('=')) || context.argument.contains('=') {
-            items.clear();
-        }
-        let range = context.argument_range.as_ref();
-        let embedded_options = range
-            .and_then(|range| context.arguments[..range.start].rfind('{'))
-            .map(|open| {
+                .unwrap_or(context.arguments.len()..context.arguments.len());
+            let Some(prefix) = context.arguments.get(..range.start) else {
+                return Ok(Vec::new());
+            };
+            let embedded = prefix
+                .rfind('{')
+                .filter(|open| !prefix[*open..].contains('}'));
+            let selection = parse_model_selection(embedded.map_or(prefix, |open| &prefix[..open]));
+            let Ok(selection) = selection else {
+                return Ok(Vec::new());
+            };
+            if embedded.is_some() && selection.spec.is_none() {
+                return Ok(Vec::new());
+            }
+            let mut items = if selection.spec.is_none()
+                && embedded.is_none()
+                && !context.argument.contains('=')
+            {
+                specs
+                    .iter()
+                    .map(|spec| CompletionItem {
+                        label: Arc::clone(spec),
+                        insertion: Arc::clone(spec),
+                        description: None,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let candidate = match selection.spec.as_deref() {
+                Some(argument) => {
+                    let argument = argument.to_owned();
+                    let specs = specs.clone();
+                    match smol::unblock(move || resolve_model_spec(&argument, &specs)).await {
+                        Ok(spec) => Some(spec),
+                        Err(_) => return Ok(Vec::new()),
+                    }
+                }
+                None => None,
+            };
+            let Some(projection) = resolver
+                .resolve(target.clone(), candidate, revision, cancellation.clone())
+                .await
+            else {
+                return Ok(Vec::new());
+            };
+            if !Arc::ptr_eq(&source.identity, &projection.source_identity)
+                || source.generation != projection.source_generation
+            {
+                return Ok(Vec::new());
+            }
+            let embedded_options = embedded.map(|open| {
                 let end = context.arguments[open..]
                     .find('}')
                     .map_or(context.arguments.len(), |end| open + end);
                 (open + 1, end)
             });
-        if embedded_options.is_some() {
-            items.clear();
-        }
-        for (key, values) in [
-            (
-                MODEL_THINKING_KEY,
-                maki_providers::ThinkingConfig::options().as_slice(),
-            ),
-            (MODEL_FAST_KEY, FAST_VALUES.as_slice()),
-        ] {
-            let prefix = format!("{key}=");
-            let duplicate = embedded_options.map_or_else(
-                || preceding.iter().any(|value| value.starts_with(&prefix)),
-                |(start, end)| {
-                    context.arguments[start..end]
-                        .split(',')
-                        .scan(start, |offset, option| {
-                            let option_start = *offset;
-                            *offset += option.len() + 1;
-                            Some((option_start, option))
-                        })
-                        .any(|(start, option)| {
-                            let start = start + option.len() - option.trim_start().len();
-                            range.is_none_or(|range| start != range.start)
-                                && option.trim_start().starts_with(&prefix)
-                        })
-                },
-            );
-            if !duplicate
-                && (!context.argument.contains('=') || context.argument.starts_with(&prefix))
-            {
-                items.extend(values.iter().map(|value| {
-                    let insertion: Arc<str> = Arc::from(format!("{key}={value}"));
-                    CompletionItem {
-                        label: Arc::clone(&insertion),
-                        insertion,
-                        description: None,
-                    }
-                }));
+            for spec in MODEL_OPTION_SPECS {
+                if !spec.availability(&projection.capabilities).is_available() {
+                    continue;
+                }
+                let key = spec.key;
+                let option_prefix = format!("{key}=");
+                let duplicate = embedded_options.map_or_else(
+                    || spec.read(&selection).is_some(),
+                    |(start, end)| {
+                        context.arguments[start..end]
+                            .split(',')
+                            .scan(start, |offset, option| {
+                                let start = *offset;
+                                *offset += option.len() + 1;
+                                Some((start, option))
+                            })
+                            .any(|(start, option)| {
+                                let start = start + option.len() - option.trim_start().len();
+                                start != range.start
+                                    && option.trim_start().starts_with(&option_prefix)
+                            })
+                    },
+                );
+                if !duplicate
+                    && (!context.argument.contains('=')
+                        || context.argument.starts_with(&option_prefix))
+                {
+                    items.extend(spec.presets.iter().map(|value| {
+                        let insertion: Arc<str> = Arc::from(format!("{key}={}", value.value));
+                        CompletionItem {
+                            label: Arc::clone(&insertion),
+                            insertion,
+                            description: Some(Arc::from(spec.description)),
+                        }
+                    }));
+                }
             }
-        }
-        Box::pin(async move { Ok(items) })
+            let admitted = targets.as_ref().is_some_and(|targets| {
+                targets
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .get(&context.target_id)
+                    .is_some_and(|current| {
+                        current.target.same_manager(&target.target)
+                            && current.target.id() == target.target.id()
+                            && current.template.model_policy.allows(&projection.spec)
+                            && specs
+                                .iter()
+                                .all(|spec| current.template.model_policy.allows(spec))
+                    })
+            });
+            if cancellation.is_cancelled()
+                || !admitted
+                || !resolver.is_current(&target, &projection)
+            {
+                items.clear();
+            }
+            Ok(items)
+        })
     }
 }
 
@@ -409,6 +500,9 @@ impl CommandCompletion for ThemeArgSource {
 }
 
 #[cfg(test)]
+mod identity_tests;
+
+#[cfg(test)]
 mod tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -424,7 +518,14 @@ mod tests {
     use test_case::test_case;
 
     use crate::components::file_completion::{FileCandidate, FileResolver, PathDiscovery};
+    use crate::model_capabilities::test_support::{
+        CURRENT_SPEC, FAILED_PREPARATION, FixtureProvider, OTHER_SPEC, model,
+        target as pinned_target,
+    };
     use crate::theme::InMemoryThemesProvider;
+    use maki_agent::{actor::PreparedModel, session_coordinator::ModelPreparer};
+    use maki_config::ModelPolicy;
+    use maki_providers::{MODEL_FAST_KEY, MODEL_THINKING_KEY, model::FastSupport};
 
     use super::*;
 
@@ -512,7 +613,7 @@ mod tests {
         input: &str,
         argument: &str,
         index: usize,
-        model: bool,
+        offers_model: bool,
         thinking: bool,
         fast: bool,
     ) {
@@ -522,16 +623,32 @@ mod tests {
             .iter()
             .find(|definition| definition.id == maki_commands::BuiltinId::Model)
             .unwrap();
+        let target = registry.bind_target(TargetCapabilities::ALL, Arc::new(NoBehavior));
+        let admission = pinned_target(model(CURRENT_SPEC, true, FastSupport::Supported));
+        let resolver = Arc::new(ModelCapabilityResolver::new(Arc::new(|candidate| {
+            Box::pin(async move {
+                Ok(PreparedModel {
+                    provider: Arc::new(FixtureProvider),
+                    model: model(&candidate.spec(), true, FastSupport::Supported),
+                })
+            })
+        })));
         producer
             .replace(vec![Registration {
                 spec: definition.spec(),
                 behavior: Arc::new(NoBehavior),
-                argument_completions: vec![Some(Arc::new(ModelArgSource::new(Arc::new(
-                    ArcSwapOption::from(Some(Arc::new(vec!["openai/gpt-5".into()]))),
-                ))))],
+                argument_completions: vec![Some(Arc::new(
+                    ModelArgSource::with_resolver(
+                        Arc::new(ArcSwapOption::from(Some(Arc::new(vec![OTHER_SPEC.into()])))),
+                        resolver,
+                    )
+                    .with_targets(Arc::new(Mutex::new(HashMap::from([(
+                        target.id(),
+                        admission.clone(),
+                    )])))),
+                ))],
             }])
             .unwrap();
-        let target = registry.bind_target(TargetCapabilities::ALL, Arc::new(NoBehavior));
         let command = registry.resolve_for(&target, "/model").unwrap();
         let session = registry.open_completion(command, target.id()).unwrap();
         let CompletionResult::Items(items) = smol::block_on(session.complete(
@@ -546,7 +663,7 @@ mod tests {
             items
                 .iter()
                 .any(|item| item.item().insertion.as_ref() == "openai/gpt-5"),
-            model
+            offers_model
         );
         assert_eq!(
             items.iter().any(|item| item
@@ -562,6 +679,271 @@ mod tests {
                 .starts_with(&format!("{MODEL_FAST_KEY}="))),
             fast
         );
+        admission.target.close_subtree().unwrap();
+    }
+
+    struct ModelFixture {
+        _producer: maki_commands::Producer,
+        registry: CommandRegistry,
+        target: maki_commands::TargetHandle,
+        admission: TrustedTarget,
+        resolver: Arc<ModelCapabilityResolver>,
+    }
+
+    impl ModelFixture {
+        fn new(admission: TrustedTarget, specs: &[&str], prepare: ModelPreparer) -> Self {
+            let registry = CommandRegistry::new();
+            let producer = registry.create_producer(ProducerPrecedence::Application);
+            let target = registry.bind_target(TargetCapabilities::ALL, Arc::new(NoBehavior));
+            let resolver = Arc::new(ModelCapabilityResolver::new(prepare));
+            let source = ModelArgSource::with_resolver(
+                Arc::new(ArcSwapOption::from(Some(Arc::new(
+                    specs.iter().map(|spec| (*spec).into()).collect(),
+                )))),
+                Arc::clone(&resolver),
+            )
+            .with_targets(Arc::new(Mutex::new(HashMap::from([(
+                target.id(),
+                admission.clone(),
+            )]))));
+            let definition = maki_commands::BUILTIN_COMMANDS
+                .iter()
+                .find(|definition| definition.id == maki_commands::BuiltinId::Model)
+                .unwrap();
+            producer
+                .replace(vec![Registration {
+                    spec: definition.spec(),
+                    behavior: Arc::new(NoBehavior),
+                    argument_completions: vec![Some(Arc::new(source))],
+                }])
+                .unwrap();
+            Self {
+                _producer: producer,
+                registry,
+                target,
+                admission,
+                resolver,
+            }
+        }
+
+        fn session(&self) -> maki_commands::CompletionSession {
+            let command = self.registry.resolve_for(&self.target, "/model").unwrap();
+            self.registry
+                .open_completion(command, self.target.id())
+                .unwrap()
+        }
+
+        async fn complete(&self, input: &str, argument: &str, index: usize) -> Vec<String> {
+            let CompletionResult::Items(items) = self
+                .session()
+                .complete_input(
+                    CompletionInput {
+                        arguments: Arc::from(input),
+                        argument: Arc::from(argument),
+                        argument_index: index,
+                        argument_range: None,
+                        mode: Arc::from("insert"),
+                    }
+                    .normalized("model", input.len()),
+                )
+                .await
+            else {
+                return Vec::new();
+            };
+            items
+                .iter()
+                .map(|item| item.item().insertion.to_string())
+                .collect()
+        }
+    }
+
+    impl Drop for ModelFixture {
+        fn drop(&mut self) {
+            let _ = self.admission.target.close_subtree();
+        }
+    }
+
+    #[test_case("", "", 0, true, true, None; "current_empty_discovery")]
+    #[test_case("openai/gpt-5 ", "", 1, false, false, Some(OTHER_SPEC); "explicit")]
+    #[test_case("gpt-5 ", "", 1, false, false, Some(OTHER_SPEC); "unique_fragment")]
+    #[test_case("openai/gpt-5{fast=", "fast=", 1, false, false, Some(OTHER_SPEC); "embedded")]
+    #[test_case("anthropic/claude-sonnet-4-20250514 ", "", 1, true, true, None; "exact_current")]
+    #[test_case("openai/absent/model ", "", 1, false, false, Some("openai/absent/model"); "slash_identity_verbatim")]
+    #[test_case("missing/model ", "", 1, false, false, None; "malformed_provider")]
+    #[test_case("{fast=", "fast=", 1, false, false, None; "missing_embedded_identity")]
+    fn model_completion_filters_options_by_selected_model(
+        input: &str,
+        argument: &str,
+        index: usize,
+        thinking: bool,
+        fast: bool,
+        expected_preparation: Option<&str>,
+    ) {
+        smol::block_on(async {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let fixture = ModelFixture::new(
+                pinned_target(model(CURRENT_SPEC, true, FastSupport::Supported)),
+                if input.is_empty() { &[] } else { &[OTHER_SPEC] },
+                Arc::new({
+                    let calls = Arc::clone(&calls);
+                    move |candidate| {
+                        calls.lock().unwrap().push(candidate.spec());
+                        Box::pin(async move {
+                            Ok(PreparedModel {
+                                provider: Arc::new(FixtureProvider),
+                                model: model(&candidate.spec(), false, FastSupport::Pending),
+                            })
+                        })
+                    }
+                }),
+            );
+            let items = fixture.complete(input, argument, index).await;
+            assert_eq!(
+                items.iter().any(|item| item.starts_with("thinking=")),
+                thinking
+            );
+            assert_eq!(items.iter().any(|item| item.starts_with("fast=")), fast);
+            assert_eq!(
+                *calls.lock().unwrap(),
+                expected_preparation.into_iter().collect::<Vec<_>>()
+            );
+        });
+    }
+
+    #[test_case("gpt "; "ambiguous")]
+    #[test_case("openai/gpt-5 "; "denied_exact")]
+    fn invalid_or_denied_identity_never_falls_back_to_current(input: &str) {
+        smol::block_on(async {
+            let mut admission = pinned_target(model(CURRENT_SPEC, true, FastSupport::Supported));
+            if input.contains('/') {
+                admission.template.model_policy =
+                    Arc::new(ModelPolicy::new(&[CURRENT_SPEC.into()], &[]).unwrap());
+            }
+            let fixture = ModelFixture::new(
+                admission,
+                &[OTHER_SPEC, "openai/gpt-4.1"],
+                Arc::new(|_| panic!("invalid or denied identity must not prepare a provider")),
+            );
+            assert!(fixture.complete(input, "", 1).await.is_empty());
+        });
+    }
+
+    #[test]
+    fn model_completion_projects_available_descriptor_presets() {
+        smol::block_on(async {
+            let fixture = ModelFixture::new(
+                pinned_target(model(CURRENT_SPEC, true, FastSupport::Supported)),
+                &[],
+                Arc::new(|_| panic!("options-only input must use pinned current model")),
+            );
+            let items = fixture.complete("", "", 0).await;
+            for spec in MODEL_OPTION_SPECS {
+                for preset in spec.presets {
+                    assert!(items.contains(&format!("{}={}", spec.key, preset.value)));
+                }
+                let input = format!("{}={} ", spec.key, spec.presets[0].value);
+                let items = fixture.complete(&input, "", 1).await;
+                assert!(
+                    !items
+                        .iter()
+                        .any(|item| item.starts_with(&format!("{}=", spec.key)))
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn metadata_only_refresh_changes_completion_without_changing_specs() {
+        smol::block_on(async {
+            let supported = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let fixture = ModelFixture::new(
+                pinned_target(model(CURRENT_SPEC, false, FastSupport::Unsupported)),
+                &[OTHER_SPEC],
+                Arc::new({
+                    let supported = Arc::clone(&supported);
+                    move |candidate| {
+                        let supported = supported.load(Ordering::SeqCst);
+                        Box::pin(async move {
+                            Ok(PreparedModel {
+                                provider: Arc::new(FixtureProvider),
+                                model: model(
+                                    &candidate.spec(),
+                                    supported,
+                                    if supported {
+                                        FastSupport::Supported
+                                    } else {
+                                        FastSupport::Unsupported
+                                    },
+                                ),
+                            })
+                        })
+                    }
+                }),
+            );
+            assert!(fixture.complete("openai/gpt-5 ", "", 1).await.is_empty());
+            supported.store(true, Ordering::SeqCst);
+            fixture.resolver.invalidate_metadata();
+            let items = fixture.complete("openai/gpt-5 ", "", 1).await;
+            assert!(items.contains(&"thinking=high".into()));
+            assert!(items.contains(&"fast=true".into()));
+        });
+    }
+
+    #[test]
+    fn unavailable_preparation_and_closed_target_publish_no_options() {
+        smol::block_on(async {
+            let fixture = ModelFixture::new(
+                pinned_target(model(CURRENT_SPEC, true, FastSupport::Supported)),
+                &[OTHER_SPEC],
+                Arc::new(|_| Box::pin(async { Err(Arc::from(FAILED_PREPARATION)) })),
+            );
+            assert!(fixture.complete("openai/gpt-5 ", "", 1).await.is_empty());
+            fixture.admission.target.close_subtree().unwrap();
+            assert!(fixture.complete("", "", 0).await.is_empty());
+        });
+    }
+
+    #[test_case(false; "cancelled_session")]
+    #[test_case(true; "metadata_revision")]
+    fn obsolete_completion_cannot_publish_gated_capabilities(invalidate: bool) {
+        smol::block_on(async {
+            let (entered_tx, entered_rx) = flume::bounded(1);
+            let (gate_tx, gate_rx) = flume::bounded(1);
+            let fixture = ModelFixture::new(
+                pinned_target(model(CURRENT_SPEC, false, FastSupport::Unsupported)),
+                &[OTHER_SPEC],
+                Arc::new(move |candidate| {
+                    entered_tx.send(()).unwrap();
+                    let gate = gate_rx.clone();
+                    Box::pin(async move {
+                        gate.recv_async().await.unwrap();
+                        Ok(PreparedModel {
+                            provider: Arc::new(FixtureProvider),
+                            model: model(&candidate.spec(), true, FastSupport::Supported),
+                        })
+                    })
+                }),
+            );
+            let session = fixture.session();
+            let request = smol::spawn(session.complete(
+                Arc::from("openai/gpt-5 "),
+                Arc::from(""),
+                1,
+                Arc::from("insert"),
+            ));
+            entered_rx.recv_async().await.unwrap();
+            if invalidate {
+                fixture.resolver.invalidate_metadata();
+            } else {
+                session.cancel().unwrap();
+            }
+            gate_tx.send(()).unwrap();
+            match request.await {
+                CompletionResult::Items(items) => assert!(items.is_empty()),
+                CompletionResult::Stale => assert!(invalidate),
+                CompletionResult::Cancelled => assert!(!invalidate),
+            }
+        });
     }
 
     const BASE_THEME: &str = "dracula";

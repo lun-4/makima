@@ -1,15 +1,15 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use maki_agent::actor::{
-    ActorIdleGuard, ActorSourceSnapshot, ConfigChange, ConfigCommit, ConfigPatch, HistoryChange,
+    ActorIdleGuard, ActorSourceSnapshot, ConfigChange, ConfigCommit, HistoryChange,
     PreparedOperationTicket, PreparedTransaction, PreparedTurn, TurnTicket,
 };
-use maki_agent::config_change::prepare_patch;
+use maki_agent::config_change::prepare_selection;
 use maki_agent::{
     AgentId, AgentInput, AgentMode, AgentRef, CancelToken, EffectiveAgentConfig, EventSender,
 };
-use maki_providers::Message;
+use maki_providers::{Message, ModelSelection};
 use maki_storage::checkpoint::CheckpointPublication;
 use maki_storage::sessions::{HistorySnapshot, StoredRule};
 
@@ -40,6 +40,34 @@ pub(super) struct PendingPlanApproval {
     committing: bool,
     target: AgentId,
     publication: CheckpointPublication,
+    pending_fast: ApprovalPendingFast,
+}
+
+#[derive(Default)]
+enum ApprovalPendingFast {
+    #[default]
+    Preserve,
+    ReplaceOnCommit(Arc<OnceLock<ConfigCommit>>),
+}
+
+impl ApprovalPendingFast {
+    fn for_selection(selection: &ModelSelection, root: bool) -> Self {
+        if root && (selection.spec.is_some() || selection.fast.is_some()) {
+            Self::ReplaceOnCommit(Arc::default())
+        } else {
+            Self::Preserve
+        }
+    }
+
+    fn supersedes(&self, commit: &ConfigCommit) -> bool {
+        match self {
+            Self::Preserve => false,
+            Self::ReplaceOnCommit(published) => published.get().is_some_and(|published| {
+                Arc::ptr_eq(&published.identity, &commit.identity)
+                    && published.generation <= commit.generation
+            }),
+        }
+    }
 }
 
 impl Drop for PendingPlanApproval {
@@ -109,7 +137,7 @@ impl Drop for ApprovalPresentation {
 
 struct PlanApprovalRequest {
     path: PathBuf,
-    model: Option<String>,
+    selection: ModelSelection,
     parallel: bool,
     clear_context: bool,
     run_id: u64,
@@ -123,6 +151,19 @@ impl SessionRuntime {
         self.app.plan_approval_pending = true;
     }
 
+    pub(super) fn defer_pending_fast_for_approval(&mut self, commit: &ConfigCommit) -> bool {
+        let Some(pending) = &self.pending_approval else {
+            return false;
+        };
+        if pending.pending_fast.supersedes(commit) {
+            self.app.state.fast_pending = false;
+        }
+        matches!(
+            pending.pending_fast,
+            ApprovalPendingFast::ReplaceOnCommit(_)
+        )
+    }
+
     pub(super) fn end_plan_approval(&mut self) {
         if let Some(pending) = self.pending_approval.as_ref()
             && pending.committing
@@ -131,15 +172,11 @@ impl SessionRuntime {
             return;
         }
         if let Some(pending) = self.pending_approval.take() {
-            let (_, root) = self.handles.manager_and_root();
-            if pending.target == root {
-                self.app.plan_approval_pending = false;
-            } else {
-                self.app.finish_child_plan_approval(pending.target);
-            }
+            self.app.clear_plan_approval_pending(pending.target);
         } else {
             self.app.plan_approval_pending = false;
         }
+        self.resolve_pending_fast();
     }
 
     pub(super) fn settle_plan_approval(&mut self) {
@@ -149,6 +186,7 @@ impl SessionRuntime {
             })
         {
             self.pending_approval = None;
+            self.resolve_pending_fast();
         }
     }
 
@@ -167,11 +205,11 @@ impl SessionRuntime {
             || !Arc::ptr_eq(&source.config.identity, &prepared.source.config.identity)
             || source.config.generation != prepared.source.config.generation
             || !Arc::ptr_eq(&source.config.config, &prepared.source.config.config)
-            || (self.app.selected_agent_id() == Some(prepared.target.id())
-                && !self.app.plan_approval_matches(
-                    prepared.request.model.as_deref(),
-                    prepared.request.parallel,
-                ))
+            || !self.app.plan_approval_matches(
+                prepared.target.id(),
+                &prepared.request.selection,
+                prepared.request.parallel,
+            )
             || prepared.request.yolo != self.app.permissions.persisted_yolo()
             || prepared.request.rules
                 != rules_to_stored(&self.app.permissions.session_rules_snapshot())
@@ -391,6 +429,7 @@ impl EventLoop<'_> {
             committing: false,
             target,
             publication,
+            pending_fast: ApprovalPendingFast::default(),
         });
         let session = runtime.id();
         let runtime_identity = runtime.handles.identity();
@@ -414,7 +453,7 @@ impl EventLoop<'_> {
         &mut self,
         idx: usize,
         clear_context: bool,
-        model: Option<String>,
+        selection: ModelSelection,
         parallel: bool,
         path: PathBuf,
     ) {
@@ -456,7 +495,7 @@ impl EventLoop<'_> {
                 .map_err(|error| error.to_string())?;
             let request = PlanApprovalRequest {
                 path,
-                model,
+                selection,
                 parallel,
                 clear_context,
                 run_id: operation.presentation_id(),
@@ -469,6 +508,8 @@ impl EventLoop<'_> {
                 .map_err(|error| error.to_string())?;
             let transaction =
                 self.reserve_history_transaction(idx, &target, publication.clone())?;
+            let pending_fast =
+                ApprovalPendingFast::for_selection(&request.selection, target.id() == root);
             Ok((
                 target,
                 request,
@@ -479,13 +520,37 @@ impl EventLoop<'_> {
                 operation,
                 publication,
                 transaction,
+                pending_fast,
             ))
         })();
-        let (target, request, source, template, mode, idle, operation, publication, transaction) =
-            match prepared {
-                Ok(prepared) => prepared,
-                Err(error) => return self.sessions[idx].abort_plan_approval(error),
-            };
+        let (
+            target,
+            request,
+            source,
+            template,
+            mode,
+            idle,
+            operation,
+            publication,
+            mut transaction,
+            pending_fast,
+        ) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => return self.sessions[idx].abort_plan_approval(error),
+        };
+        if let ApprovalPendingFast::ReplaceOnCommit(published) = &pending_fast {
+            let published = Arc::clone(published);
+            let prepare_transaction = transaction;
+            transaction = Box::new(move |config, clear_context| {
+                let mut transaction = prepare_transaction(config, clear_context)?;
+                let finalize = transaction.finalize;
+                transaction.finalize = Box::new(move |commit| {
+                    finalize(commit);
+                    let _ = published.set(commit.clone());
+                });
+                Ok(transaction)
+            });
+        }
         let absolute = if request.path.is_absolute() {
             request.path.clone()
         } else {
@@ -498,15 +563,9 @@ impl EventLoop<'_> {
             operation
                 .replace_turn_input(AgentInput::new(plan.message.clone(), Vec::new()))
                 .map_err(|error| error.to_string())?;
-            let spec = request.model.as_deref();
-            let patch = prepare_patch(
-                ConfigPatch::default(),
-                spec,
-                &template.model_policy,
-                &prepare,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+            let patch = prepare_selection(&request.selection, &template.model_policy, &prepare)
+                .await
+                .map_err(|error| error.to_string())?;
             let change = ConfigChange::PatchAndMode {
                 patch,
                 mode: AgentMode::Build,
@@ -535,5 +594,8 @@ impl EventLoop<'_> {
                 transaction,
             })))
         });
+        if let Some(pending) = self.sessions[idx].pending_approval.as_mut() {
+            pending.pending_fast = pending_fast;
+        }
     }
 }

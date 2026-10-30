@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use maki_domain::ModelSelection;
 use maki_providers::provider::Provider;
 use maki_providers::{Model, RequestOptions, ThinkingConfig, ThinkingConfigExt, model_registry};
 
@@ -66,6 +67,16 @@ pub struct ConfigPatch {
     pub toggle_thinking: bool,
     pub fast: Option<bool>,
     pub workflow: Option<bool>,
+}
+
+impl ConfigPatch {
+    pub fn from_model_selection(selection: &ModelSelection) -> Self {
+        Self {
+            thinking: selection.thinking,
+            fast: selection.fast,
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -285,6 +296,62 @@ pub(super) fn equivalent(left: &EffectiveAgentConfig, right: &EffectiveAgentConf
         && left.mode == right.mode
         && left.mode_def == right.mode_def
         && left.context == right.context
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use maki_domain::{Effort, ModelSelection, ThinkingConfig};
+    use test_case::test_case;
+
+    use super::{ConfigChange, ConfigPatch, EffectiveAgentConfig};
+    use crate::AgentMode;
+
+    const MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
+    const THINKING_BUDGET: u32 = 8192;
+
+    #[test_case(None, Some(false), ThinkingConfig::Off, false; "disable_fast_preserves_thinking")]
+    #[test_case(Some(ThinkingConfig::Effort(Effort::Low)), None, ThinkingConfig::Effort(Effort::Low), true; "thinking_preserves_fast")]
+    fn config_selection_projects_applied_partial_options(
+        thinking: Option<ThinkingConfig>,
+        fast: Option<bool>,
+        expected_thinking: ThinkingConfig,
+        expected_fast: bool,
+    ) {
+        let config = EffectiveAgentConfig::new(crate::actor::tests::policy(true), AgentMode::Build);
+        let selection = ModelSelection {
+            thinking,
+            fast,
+            ..Default::default()
+        };
+        let config = ConfigChange::Patch(ConfigPatch::from_model_selection(&selection))
+            .apply(&config)
+            .unwrap();
+        let selection = config.model_selection();
+        assert_eq!(&*selection.spec, MODEL_SPEC);
+        assert_eq!(selection.thinking, expected_thinking);
+        assert_eq!(selection.fast, expected_fast);
+    }
+
+    #[test_case(None, None; "omitted_options")]
+    #[test_case(Some(ThinkingConfig::Off), Some(false); "explicitly_disabled")]
+    #[test_case(Some(ThinkingConfig::Effort(Effort::Low)), Some(true); "enabled_options")]
+    #[test_case(Some(ThinkingConfig::Budget(THINKING_BUDGET)), None; "budget_only")]
+    fn model_selection_preserves_partial_options(
+        thinking: Option<ThinkingConfig>,
+        fast: Option<bool>,
+    ) {
+        let selection = ModelSelection {
+            spec: Some(MODEL_SPEC.into()),
+            thinking,
+            fast,
+        };
+        let patch = ConfigPatch::from_model_selection(&selection);
+        assert_eq!(patch.thinking, thinking);
+        assert_eq!(patch.fast, fast);
+        assert!(patch.model.is_none());
+        assert!(patch.workflow.is_none());
+        assert!(!patch.toggle_thinking);
+    }
 }
 
 #[cfg(test)]

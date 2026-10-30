@@ -27,7 +27,7 @@ use maki_agent::actor::{
 };
 use maki_agent::command::CustomCommand;
 use maki_agent::config_change::{
-    ConfigChangeError, ConfigChangeTicket, prepare_model, prepare_patch,
+    ConfigChangeError, ConfigChangeTicket, prepare_model, prepare_selection,
 };
 #[cfg(test)]
 use maki_agent::permissions::PermissionAnswer;
@@ -82,12 +82,12 @@ use crate::agent::{
     AgentCommand, AgentHandles, PreparedAgentHandles, ProviderChange, ProviderSlot,
     SystemPromptOverride, shared_queue::QueueItem,
 };
-use crate::app::EMPTY_PROMPT_ERR;
 use crate::app::session_state::SessionState;
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::{
     App, Msg, Notification, PreparedApp, SubmitOutcome, session_has_content, turn_response,
 };
+use crate::app::{EMPTY_PROMPT_ERR, ModelCapabilityRequest};
 use crate::color_compat;
 use crate::command_runtime::{CLOSED_TARGET_ERR, CommandEvent, CommandRuntime};
 use crate::components::arg_completion::{ModelArgSource, ThemeArgSource};
@@ -96,6 +96,7 @@ use crate::components::{
     Action, ExitRequest, SessionReplacementKind, SessionReplacementRequest, Status,
 };
 use crate::input::InputReader;
+use crate::model_capabilities::{ModelCapabilityProjection, ModelCapabilityResolver};
 use crate::plan_approval::PrepareProvider;
 use crate::provider_usage::{
     ProviderIdentity, ProviderUsageCoordinator, ProviderUsageFetch, ProviderUsageFetchId,
@@ -1061,16 +1062,24 @@ impl SessionRuntime {
             |projected| projected.config.mode.clone(),
         );
         self.app.update_model(&commit.config.model);
-        if self
-            .app
-            .state
-            .resolve_pending_fast(commit.config.fast, &commit.config.model)
-        {
-            self.restore_pending_fast(commit.config.model.spec());
-        }
+        self.resolve_pending_fast();
         self.app.project_root_mode(&previous, &commit.config.mode);
         self.settle_plan_approval();
         true
+    }
+
+    fn resolve_pending_fast(&mut self) {
+        let Some(commit) = self.projected_config.clone() else {
+            return;
+        };
+        if !self.defer_pending_fast_for_approval(&commit)
+            && self
+                .app
+                .state
+                .resolve_pending_fast(commit.config.fast, &commit.config.model)
+        {
+            self.restore_pending_fast(commit.config.model.spec());
+        }
     }
 
     /// Commits a saved `/fast` that was restored while discovery was pending,
@@ -1488,6 +1497,18 @@ impl SpawnCtx {
 
 enum InternalEvent {
     ModelsDiscovered,
+    ModelCapabilitiesReady {
+        session: MakiId,
+        runtime: Arc<()>,
+        target: Box<TrustedTarget>,
+        generation: u64,
+        projection: ModelCapabilityProjection,
+    },
+    ModelCapabilitiesInvalidated {
+        session: MakiId,
+        runtime: Arc<()>,
+        generation: u64,
+    },
     ProviderUsageFetched {
         fetch_id: ProviderUsageFetchId,
         provider: ProviderIdentity,
@@ -1543,6 +1564,8 @@ struct OrchestrationRevision {
     live: bool,
     root_config: Option<Arc<maki_agent::EffectiveAgentConfig>>,
     selected_config: Option<Arc<maki_agent::EffectiveAgentConfig>>,
+    picker_target: Option<maki_agent::AgentId>,
+    picker_config: Option<ConfigCommit>,
     model_policy: Arc<ModelPolicy>,
     cwd: Arc<PathBuf>,
 }
@@ -1564,6 +1587,16 @@ impl OrchestrationRevision {
             && self.cwd == other.cwd
             && same_config(&self.root_config, &other.root_config)
             && same_config(&self.selected_config, &other.selected_config)
+            && self.picker_target == other.picker_target
+            && match (&self.picker_config, &other.picker_config) {
+                (Some(left), Some(right)) => {
+                    Arc::ptr_eq(&left.identity, &right.identity)
+                        && left.generation == right.generation
+                        && Arc::ptr_eq(&left.config, &right.config)
+                }
+                (None, None) => true,
+                _ => false,
+            }
             && Arc::ptr_eq(&self.model_policy, &other.model_policy)
     }
 }
@@ -1581,6 +1614,11 @@ fn orchestration_revision(runtime: &SessionRuntime) -> OrchestrationRevision {
         live: selected.is_some_and(|id| manager.lookup(id).is_ok()),
         root_config: config(root),
         selected_config: selected.and_then(config),
+        picker_target: runtime.app.model_picker_target.as_ref().map(AgentRef::id),
+        picker_config: runtime.app.model_picker_target.as_ref().and_then(|target| {
+            target.validate_live().ok()?;
+            target.actor().ok()?.config_snapshot()
+        }),
         model_policy: Arc::clone(&runtime.handles.orchestration_template.model_policy),
         cwd: config(root)
             .map(|config| Arc::new(config.context.cwd().to_path_buf()))
@@ -1740,7 +1778,14 @@ impl<'t> EventLoop<'t> {
         let sessions_dir = storage.ensure_subdir(SESSIONS_DIR)?;
 
         let notifier = terminal::TerminalNotifier::new(ui_config.notifications);
-        let model_completion = Arc::new(ModelArgSource::new(catalog.specs()));
+        let capability_resolver = Arc::new(ModelCapabilityResolver::new(model_preparer(
+            Arc::new(prepare_provider),
+            timeouts,
+        )));
+        let model_completion = Arc::new(ModelArgSource::with_resolver(
+            catalog.specs(),
+            capability_resolver,
+        ));
         let theme_completion = Arc::new(ThemeArgSource::new(
             crate::theme::default_provider().clone(),
         ));
@@ -1880,6 +1925,7 @@ impl<'t> EventLoop<'t> {
                 .zip(&self.orchestration_revisions)
                 .all(|(runtime, previous)| orchestration_revision(runtime).matches(previous))
         {
+            self.sync_model_capabilities();
             return;
         }
         self.orchestration_focus = Some(self.focused);
@@ -1931,6 +1977,7 @@ impl<'t> EventLoop<'t> {
         self.ctx.command_runtime.sync_admissions(admissions);
         self.orchestration.select(focused);
         self.sync_model_discovery();
+        self.sync_model_capabilities();
     }
 
     fn sync_model_discovery(&mut self) {
@@ -1950,6 +1997,120 @@ impl<'t> EventLoop<'t> {
                 })
                 .unwrap_or_default();
             runtime.app.project_model_discovery(specs);
+        }
+    }
+
+    fn sync_model_capabilities(&mut self) {
+        let resolver = Arc::clone(&self.ctx.command_runtime.model_capabilities);
+        let revision = resolver.revision();
+        for runtime in &mut self.sessions {
+            let (manager, _) = runtime.handles.manager_and_root();
+            let app = &mut runtime.app;
+            app.sync_child_plan_paths(|target| {
+                manager
+                    .actor(target)
+                    .ok()?
+                    .config_snapshot()?
+                    .config
+                    .mode
+                    .plan_path()
+                    .map(Path::to_path_buf)
+            });
+            app.sync_model_picker_owner();
+            if !app.model_picker.is_open() {
+                if app.model_capability_request.is_some() {
+                    app.retire_model_capability_request();
+                }
+                continue;
+            }
+            let Some(target) = app.model_picker_target.clone() else {
+                continue;
+            };
+            let context = (|| {
+                target.validate_live().ok()?;
+                let source = target.actor().ok()?.config_snapshot()?;
+                let template =
+                    OrchestrationServices::template(&*self.orchestration, &target).ok()?;
+                Some((source, template))
+            })();
+            let Some((source, template)) = context else {
+                app.close_model_picker();
+                app.pending_dirty |= Dirty::YES;
+                continue;
+            };
+            let Some(spec) = app.model_picker.highlighted_spec().map(Arc::<str>::from) else {
+                app.retire_model_capability_request();
+                continue;
+            };
+            if !template.model_policy.allows(&spec) {
+                app.pending_dirty |= app
+                    .model_picker
+                    .update_current(source.config.model_selection());
+                if app.model_capability_request.is_some() {
+                    app.retire_model_capability_request();
+                }
+                app.pending_dirty |= app.model_picker.set_capabilities(&spec, Default::default());
+                continue;
+            }
+            if app
+                .model_capability_request
+                .as_ref()
+                .is_some_and(|request| {
+                    request.target.target.same_manager(&target)
+                        && request.target.target.id() == target.id()
+                        && request.spec == spec
+                        && request.revision == revision
+                        && Arc::ptr_eq(&request.source.identity, &source.identity)
+                        && request.source.generation == source.generation
+                        && Arc::ptr_eq(&request.source.config, &source.config)
+                        && Arc::ptr_eq(
+                            &request.target.template.model_policy,
+                            &template.model_policy,
+                        )
+                })
+            {
+                continue;
+            }
+            app.retire_model_capability_request();
+            app.pending_dirty |= app
+                .model_picker
+                .update_current(source.config.model_selection());
+            app.pending_dirty |= app.model_picker.set_capabilities(&spec, Default::default());
+            let target = TrustedTarget { target, template };
+            let (trigger, cancel) = maki_agent::CancelToken::new();
+            app.model_capability_request = Some(ModelCapabilityRequest {
+                target: target.clone(),
+                spec: Arc::clone(&spec),
+                source,
+                revision,
+                cancel: Some(trigger),
+            });
+            let generation = app.model_picker_generation;
+            let session = runtime.id();
+            let identity = runtime.handles.identity();
+            let resolver = Arc::clone(&resolver);
+            let tx = self.internal_tx.clone();
+            smol::spawn(async move {
+                let resolution =
+                    resolver.resolve(target.clone(), Some(spec), revision, Default::default());
+                let event = match cancel.race(resolution).await {
+                    Ok(Some(projection)) => InternalEvent::ModelCapabilitiesReady {
+                        session,
+                        runtime: identity,
+                        target: Box::new(target),
+                        generation,
+                        projection,
+                    },
+                    Ok(None) => InternalEvent::ModelCapabilitiesInvalidated {
+                        session,
+                        runtime: identity,
+                        generation,
+                    },
+                    Err(_) => return,
+                };
+                let _ = tx.send(event);
+            })
+            .detach();
         }
     }
 
@@ -2104,7 +2265,66 @@ impl<'t> EventLoop<'t> {
                     self.complete_plan_approval(idx, result);
                 }
             }
-            InternalEvent::ModelsDiscovered => self.refresh_discovered_models(),
+            InternalEvent::ModelsDiscovered => {
+                self.ctx
+                    .command_runtime
+                    .model_capabilities
+                    .invalidate_metadata();
+                self.refresh_discovered_models();
+                self.sync_model_capabilities();
+            }
+            InternalEvent::ModelCapabilitiesReady {
+                session,
+                runtime,
+                target,
+                generation,
+                projection,
+            } => {
+                if let Some(idx) = self.position(session)
+                    && Arc::ptr_eq(&runtime, &self.sessions[idx].handles.identity())
+                {
+                    let current = self
+                        .ctx
+                        .command_runtime
+                        .model_capabilities
+                        .is_current(&target, &projection);
+                    let app = &mut self.sessions[idx].app;
+                    app.sync_model_picker_owner();
+                    if app.model_picker.is_open()
+                        && app.model_picker_generation == generation
+                        && app.model_picker_target.as_ref().is_some_and(|active| {
+                            active.same_manager(&target.target) && active.id() == target.target.id()
+                        })
+                        && app.model_picker.highlighted_spec() == Some(projection.spec.as_ref())
+                    {
+                        if current {
+                            app.pending_dirty |= app
+                                .model_picker
+                                .set_capabilities(&projection.spec, projection.capabilities);
+                        } else {
+                            app.retire_model_capability_request();
+                            self.sync_model_capabilities();
+                        }
+                    }
+                }
+            }
+            InternalEvent::ModelCapabilitiesInvalidated {
+                session,
+                runtime,
+                generation,
+            } => {
+                if let Some(idx) = self.position(session)
+                    && Arc::ptr_eq(&runtime, &self.sessions[idx].handles.identity())
+                {
+                    let app = &mut self.sessions[idx].app;
+                    if app.model_picker_generation == generation
+                        && app.model_capability_request.is_some()
+                    {
+                        app.retire_model_capability_request();
+                        self.sync_model_capabilities();
+                    }
+                }
+            }
             InternalEvent::SessionOp {
                 session,
                 runtime,
@@ -2151,6 +2371,12 @@ impl<'t> EventLoop<'t> {
     }
 
     fn handle_provider_change(&mut self, _change: ProviderChange) {
+        self.ctx
+            .command_runtime
+            .model_capabilities
+            .invalidate_metadata();
+        self.sync_model_discovery();
+        self.sync_model_capabilities();
         let provider = self.focused_model_slot().load().provider.identity();
         for runtime in &self.sessions {
             runtime
@@ -3502,15 +3728,9 @@ impl<'t> EventLoop<'t> {
                 },
                 None,
             ),
-            Action::ChangePinnedModel { target, spec } => self.dispatch_model_selection(
-                idx,
-                Some(target),
-                maki_commands::ModelSelection {
-                    spec: Some(Arc::from(spec)),
-                    ..Default::default()
-                },
-                None,
-            ),
+            Action::SelectPinnedModel { target, selection } => {
+                self.dispatch_model_selection(idx, Some(target), selection, None);
+            }
             Action::RunKeybind(id) => self.run_keybind(idx, id),
             Action::SelectModel(selection) => {
                 self.note_if_deferred(idx, "model");
@@ -3528,11 +3748,11 @@ impl<'t> EventLoop<'t> {
             ),
             Action::ApprovePlan {
                 clear_context,
-                model,
+                selection,
                 parallel,
                 path,
             } => {
-                self.prepare_plan_approval(idx, clear_context, model, parallel, path);
+                self.prepare_plan_approval(idx, clear_context, selection, parallel, path);
             }
             Action::CancelPlanApproval => self.sessions[idx].end_plan_approval(),
             Action::RefreshProvider { slug } => self.refresh_provider(slug),
@@ -4063,14 +4283,8 @@ impl<'t> EventLoop<'t> {
         let session = self.sessions[idx].id();
         let runtime = self.sessions[idx].handles.identity();
         smol::spawn(async move {
-            let patch = ConfigPatch {
-                thinking: selection.thinking,
-                fast: selection.fast,
-                ..Default::default()
-            };
-            let spec = selection.spec.as_deref();
             let result = match reservation {
-                Ok(ticket) => commit_model_patch(ticket, patch, spec, &policy, &prepare)
+                Ok(ticket) => commit_model_selection(ticket, &selection, &policy, &prepare)
                     .await
                     .map(|_| ()),
                 Err(error) => Err(error),
@@ -4512,18 +4726,15 @@ fn reserve_config_change(
     )
 }
 
-/// Commits {patch} with {spec}'s model prepared, unless preparation outlives
-/// the session op timeout.
-async fn commit_model_patch(
+async fn commit_model_selection(
     ticket: ConfigChangeTicket<'_>,
-    patch: ConfigPatch,
-    spec: Option<&str>,
+    selection: &maki_commands::ModelSelection,
     policy: &ModelPolicy,
     prepare: &ModelPreparer,
 ) -> Result<ConfigCommit, ConfigChangeError> {
     let change = async {
         Ok(ConfigChange::Patch(
-            prepare_patch(patch, spec, policy, prepare).await?,
+            prepare_selection(selection, policy, prepare).await?,
         ))
     };
     prepare_config_change(ticket, change, async {
@@ -4634,7 +4845,10 @@ fn ring_bell() {
 mod tests {
     use super::*;
     use maki_domain::ThinkingConfig as DomainThinkingConfig;
-    use maki_storage::checkpoint::ClaimingWriter;
+    use maki_storage::checkpoint::{
+        CheckpointRequest, CheckpointVersion, CheckpointWriter, ClaimingWriter,
+    };
+    use std::slice;
 
     /// Projects every pending config commit the way the event loop's tick does,
     /// so a test that mutates config without running a frame still sees what a
@@ -4674,7 +4888,7 @@ mod tests {
     };
     use maki_config::PermissionsConfig;
     use maki_lua::BuiltinAction;
-    use maki_providers::model::FastSupport;
+    use maki_providers::model::{FastSupport, ThinkingSupport};
     use maki_providers::{Effort, TokenUsage};
     use ratatui::{Terminal, backend::TestBackend};
     use std::sync::atomic::AtomicBool;
@@ -5387,6 +5601,7 @@ mod tests {
                 assert_eq!(before.model.spec(), spec(session_model));
                 assert_ne!(before.model.context_window, DISCOVERED_WINDOW);
                 let identity = runtime.model_slot.load().provider.identity();
+                let seed_model = event_loop.ctx.model_slot.load().model.spec();
                 maki_providers::model_registry::set_known_models(
                     DISCOVERY_PROVIDER,
                     vec![maki_providers::ModelInfo {
@@ -5409,7 +5624,10 @@ mod tests {
                 let slot = runtime.model_slot.load();
                 assert_eq!(window(&slot.model), refreshed);
                 assert_eq!(slot.provider.identity(), identity);
-                assert_eq!(window(&event_loop.ctx.model_slot.load().model), refreshed);
+                assert_eq!(
+                    window(&event_loop.ctx.model_slot.load().model),
+                    seed_model == spec(discovered)
+                );
             },
         );
     }
@@ -5680,6 +5898,93 @@ mod tests {
         harness.ctx = Some(event_loop.ctx);
     }
 
+    fn install_model_capability_resolver(
+        event_loop: &mut EventLoop<'_>,
+        prepare: ModelPreparer,
+    ) -> Arc<crate::model_capabilities::ModelCapabilityResolver> {
+        let resolver = Arc::new(crate::model_capabilities::ModelCapabilityResolver::new(
+            prepare,
+        ));
+        let runtime = Arc::new(CommandRuntime::new_for_test(
+            &[],
+            maki_commands::CommandRegistry::new(),
+            Arc::new(ModelArgSource::with_resolver(
+                event_loop.ctx.catalog.specs(),
+                Arc::clone(&resolver),
+            )),
+            Arc::new(ThemeArgSource::new(
+                crate::theme::default_provider().clone(),
+            )),
+        ));
+        event_loop.ctx.command_runtime = Arc::clone(&runtime);
+        for session in &mut event_loop.sessions {
+            session.app.command_target = runtime.bind_target();
+            session.app.command_runtime = Arc::clone(&runtime);
+        }
+        event_loop.orchestration_revisions.clear();
+        event_loop.sync_orchestration();
+        resolver
+    }
+
+    fn next_model_capabilities(
+        event_loop: &mut EventLoop<'_>,
+        target: AgentId,
+        spec: &str,
+    ) -> InternalEvent {
+        loop {
+            let event = event_loop
+                .internal_rx
+                .recv_timeout(SESSION_OP_TIMEOUT)
+                .unwrap();
+            if matches!(&event, InternalEvent::ModelCapabilitiesReady { target: pinned, projection, .. }
+                if pinned.target.id() == target && projection.spec.as_ref() == spec)
+            {
+                return event;
+            }
+            event_loop.handle_internal(event);
+        }
+    }
+
+    fn finish_picker_selection(event_loop: &mut EventLoop<'_>) {
+        loop {
+            let event = event_loop
+                .internal_rx
+                .recv_timeout(SESSION_OP_TIMEOUT)
+                .unwrap();
+            let completed = matches!(
+                &event,
+                InternalEvent::SessionOp {
+                    kind: SessionOpKind::ProviderRefreshed,
+                    result: Ok(()),
+                    ..
+                }
+            );
+            if let InternalEvent::SessionOp {
+                result: Err(error), ..
+            } = &event
+            {
+                panic!("picker selection failed: {error}");
+            }
+            event_loop.handle_internal(event);
+            if completed {
+                return;
+            }
+        }
+    }
+
+    fn model_picker_text(event_loop: &mut EventLoop<'_>) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| {
+                event_loop.sessions[0]
+                    .app
+                    .model_picker
+                    .view(frame, frame.area());
+            })
+            .unwrap();
+        crate::components::buffer_text(terminal.backend().buffer())
+    }
+
     pub(super) fn select_child_chat(event_loop: &mut EventLoop<'_>, child: AgentId, name: &str) {
         let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
         let target = manager.lookup(child).unwrap();
@@ -5808,7 +6113,19 @@ mod tests {
             let command_runtime = Arc::new(CommandRuntime::new_for_test(
                 &[],
                 command_registry,
-                Arc::new(ModelArgSource::new(catalog.specs())),
+                Arc::new(ModelArgSource::with_resolver(
+                    catalog.specs(),
+                    Arc::new(crate::model_capabilities::ModelCapabilityResolver::new(
+                        Arc::new(|model| {
+                            Box::pin(async move {
+                                Ok(maki_agent::PreparedModel {
+                                    model,
+                                    provider: Arc::new(StubProvider),
+                                })
+                            })
+                        }),
+                    )),
+                )),
                 Arc::new(ThemeArgSource::new(
                     crate::theme::default_provider().clone(),
                 )),
@@ -6642,7 +6959,10 @@ mod tests {
         smol::block_on(
             runtime
                 .coordinator
-                .set_model(Some(Arc::from(STORED_MODEL)), None, None),
+                .set_model(maki_commands::ModelSelection {
+                    spec: Some(Arc::from(STORED_MODEL)),
+                    ..Default::default()
+                }),
         )
         .unwrap();
         assert_eq!(runtime.model_slot.load().model.spec(), STORED_MODEL);
@@ -7741,26 +8061,64 @@ mod tests {
             let items = complete(&original);
             assert!(items.iter().any(|spec| spec == ALLOWED));
             assert!(!items.iter().any(|spec| spec == EXCLUDED));
-            assert!(items.iter().any(|spec| spec == "thinking=high"));
-            assert!(items.iter().any(|spec| spec == "fast=true"));
+            let config = target.actor().unwrap().effective_config().unwrap();
+            assert_eq!(
+                items.iter().any(|spec| spec == "thinking=high"),
+                config.model.supports_thinking()
+            );
+            assert_eq!(
+                items.iter().any(|spec| spec == "fast=true"),
+                config.model.supports_fast()
+            );
             let picker = &mut event_loop.sessions[0].app.model_picker;
             picker.set_recents(vec![EXCLUDED.into()]);
-            picker.open(EXCLUDED);
+            let current = |spec: &str| {
+                let mut selection = config.model_selection();
+                selection.spec = Arc::from(spec);
+                selection
+            };
+            picker.open(current(EXCLUDED), Default::default(), Default::default());
+            assert_eq!(picker.highlighted_spec(), Some(EXCLUDED));
             assert!(matches!(
                 picker.handle_key(crate::components::key(KeyCode::Enter)),
-                crate::components::model_picker::ModelPickerAction::Select(spec) if spec == ALLOWED
+                crate::components::model_picker::ModelPickerAction::Select(selection)
+                    if selection == maki_commands::ModelSelection::default()
             ));
 
-            picker.open(ALLOWED);
+            picker.open(current(ALLOWED), Default::default(), Default::default());
             event_loop.sessions[0]
                 .handles
                 .orchestration_template
                 .model_policy = Arc::new(ModelPolicy::new(&[], &[ALLOWED.into()]).unwrap());
             event_loop.sync_orchestration();
+            assert_eq!(
+                event_loop.sessions[0].app.model_picker.highlighted_spec(),
+                Some(ALLOWED)
+            );
             assert!(matches!(
                 event_loop.sessions[0].app.model_picker.handle_key(crate::components::key(KeyCode::Enter)),
-                crate::components::model_picker::ModelPickerAction::Select(spec) if spec == EXCLUDED
+                crate::components::model_picker::ModelPickerAction::Select(selection)
+                    if selection == maki_commands::ModelSelection::default()
             ));
+
+            let before = target.actor().unwrap().config_snapshot().unwrap();
+            let (reply, result) = flume::bounded(1);
+            event_loop.dispatch_model_selection(
+                0,
+                Some(target.clone()),
+                maki_commands::ModelSelection {
+                    spec: Some(ALLOWED.into()),
+                    ..Default::default()
+                },
+                Some(reply),
+            );
+            assert!(matches!(
+                result.recv_timeout(SESSION_OP_TIMEOUT).unwrap(),
+                Err(CommandError::Producer(_))
+            ));
+            let after = target.actor().unwrap().config_snapshot().unwrap();
+            assert_eq!(after.generation, before.generation);
+            assert!(Arc::ptr_eq(&after.config, &before.config));
 
             let mut second = test_runtime(model_named("other-model"));
             second.app.command_runtime = Arc::clone(&command_runtime);
@@ -8064,7 +8422,7 @@ mod tests {
                 assert!(!actions.iter().any(|action| matches!(
                     action,
                     Action::ChangeModel(_)
-                        | Action::ChangePinnedModel { .. }
+                        | Action::SelectPinnedModel { .. }
                         | Action::SelectModel(_)
                 )));
                 assert_eq!(
@@ -8087,8 +8445,8 @@ mod tests {
             let app = &mut event_loop.sessions[0].app;
             let actions = app.update(crate::app::Msg::Key(crate::components::key(KeyCode::Enter)));
             assert!(
-                matches!(actions.as_slice(), [Action::ChangePinnedModel { target, spec }]
-                if target.id() == child && spec == CHILD_MODEL)
+                matches!(actions.as_slice(), [Action::SelectPinnedModel { target, selection }]
+                if target.id() == child && selection == &maki_commands::ModelSelection::default())
             );
             assert_eq!(app.root_config().model.spec(), root_model);
             assert_eq!(actor.effective_config().unwrap().model.spec(), CHILD_MODEL);
@@ -8108,18 +8466,21 @@ mod tests {
             ));
             let actions = app.update(crate::app::Msg::Key(crate::components::key(KeyCode::Enter)));
             assert!(
-                matches!(actions.as_slice(), [Action::ChangePinnedModel { target, spec }]
-                if target.id() == child && spec == NEXT_MODEL)
+                matches!(actions.as_slice(), [Action::SelectPinnedModel { target, selection }]
+                if target.id() == child && selection.spec.as_deref() == Some(NEXT_MODEL)
+                    && !selection.has_option_overrides())
             );
             event_loop.dispatch(0, actions);
-            let completion = std::iter::repeat_with(|| {
-                event_loop
+            let completion = loop {
+                let event = event_loop
                     .internal_rx
                     .recv_timeout(SESSION_OP_TIMEOUT)
-                    .unwrap()
-            })
-            .find(|event| !matches!(event, InternalEvent::ModelsDiscovered))
-            .unwrap();
+                    .unwrap();
+                if matches!(event, InternalEvent::SessionOp { .. }) {
+                    break event;
+                }
+                event_loop.handle_internal(event);
+            };
             assert!(
                 matches!(&completion, InternalEvent::SessionOp { result, .. } if result.is_err() == close_child),
                 "{:?}",
@@ -8142,6 +8503,970 @@ mod tests {
             if !close_child {
                 assert_eq!(actor.effective_config().unwrap().model.spec(), NEXT_MODEL);
             }
+        });
+    }
+
+    #[test_case("high", true ; "enabled_options")]
+    #[test_case("off", false ; "explicit_disabled_options")]
+    fn session_model_picker_commits_provider_and_options_together(thinking: &str, fast: bool) {
+        use maki_providers::RequestOptions;
+
+        const MODEL: &str = "anthropic/picker-committed-model";
+        const PROMPT: &str = "record picker selection";
+        const THINKING_CANDIDATE: &str = "thinking=high";
+        const FAST_CANDIDATE: &str = "fast=true";
+
+        struct RecordingProvider(flume::Sender<(String, RequestOptions)>);
+
+        impl Provider for RecordingProvider {
+            fn stream_message<'a>(
+                &'a self,
+                model: &'a Model,
+                _messages: &'a [Message],
+                _system: &'a str,
+                _tools: &'a serde_json::Value,
+                _event_tx: &'a flume::Sender<maki_providers::ProviderEvent>,
+                options: RequestOptions,
+                _session_id: Option<&'a SessionRef>,
+            ) -> maki_providers::provider::BoxFuture<
+                'a,
+                Result<maki_providers::StreamResponse, maki_providers::AgentError>,
+            > {
+                Box::pin(async move {
+                    self.0.send((model.spec(), options)).unwrap();
+                    std::future::pending().await
+                })
+            }
+
+            fn list_models(
+                &self,
+            ) -> maki_providers::provider::BoxFuture<
+                '_,
+                Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>,
+            > {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+        }
+
+        let adjusted = |mut model: Model| {
+            model.thinking_override = Some(ThinkingSupport::Yes);
+            model.supports_fast_override = Some(FastSupport::Supported);
+            model
+        };
+        with_event_loop(|event_loop| {
+            let preview_preparations = Arc::new(AtomicU64::new(0));
+            let previews = Arc::clone(&preview_preparations);
+            install_model_capability_resolver(
+                event_loop,
+                Arc::new(move |model| {
+                    previews.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async move {
+                        Ok(PreparedModel {
+                            model: adjusted(model),
+                            provider: Arc::new(StubProvider),
+                        })
+                    })
+                }),
+            );
+            let (requests, received) = flume::unbounded();
+            let provider: Arc<dyn Provider> = Arc::new(RecordingProvider(requests));
+            let committed_provider = Arc::clone(&provider);
+            let commit_preparations = Arc::new(AtomicU64::new(0));
+            let commits = Arc::clone(&commit_preparations);
+            event_loop.ctx.prepare_provider = Arc::new(move |model, _| {
+                commits.fetch_add(1, Ordering::SeqCst);
+                Ok(PreparedModel {
+                    model: adjusted(model),
+                    provider: Arc::clone(&provider),
+                })
+            });
+            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let before = actor.config_snapshot().unwrap();
+            let session_id = event_loop.sessions[0].id();
+            event_loop.sessions[0]
+                .app
+                .state
+                .session_mut()
+                .save(&event_loop.ctx.storage)
+                .unwrap();
+            let persisted_before = AppSession::load(session_id, &event_loop.ctx.storage).unwrap();
+            let preference = maki_storage::model::read_model(&event_loop.ctx.storage);
+            let recents = maki_storage::model::read_recents(&event_loop.ctx.storage);
+            event_loop
+                .ctx
+                .catalog
+                .specs()
+                .store(Some(Arc::new(vec![MODEL.into()])));
+            event_loop.sync_orchestration();
+            event_loop.sync_model_discovery();
+            event_loop.sessions[0]
+                .app
+                .run_builtin(BuiltinAction::ModelPicker);
+            assert_eq!(
+                event_loop.sessions[0]
+                    .app
+                    .model_picker_target
+                    .as_ref()
+                    .unwrap()
+                    .id(),
+                root
+            );
+            event_loop.sessions[0]
+                .app
+                .update(Msg::Paste(MODEL.split_once('/').unwrap().1.into()));
+            assert_eq!(
+                event_loop.sessions[0].app.model_picker.highlighted_spec(),
+                Some(MODEL)
+            );
+            event_loop.sync_orchestration();
+            let projection = next_model_capabilities(event_loop, root, MODEL);
+            event_loop.handle_internal(projection);
+            assert_eq!(preview_preparations.load(Ordering::SeqCst), 1);
+            let runtime = Arc::clone(&event_loop.ctx.command_runtime);
+            let target = event_loop.sessions[0].app.command_target.clone();
+            let command = runtime.registry.resolve_for(&target, "/model").unwrap();
+            let completion = runtime
+                .registry
+                .open_completion(command, target.id())
+                .unwrap();
+            let maki_commands::CompletionResult::Items(items) =
+                smol::block_on(completion.complete(
+                    Arc::from(format!("{MODEL} ")),
+                    Arc::from(""),
+                    1,
+                    Arc::from("insert"),
+                ))
+            else {
+                panic!("expected model option completions");
+            };
+            assert!(
+                items
+                    .iter()
+                    .any(|item| item.item().insertion.as_ref() == THINKING_CANDIDATE)
+            );
+            assert!(
+                items
+                    .iter()
+                    .any(|item| item.item().insertion.as_ref() == FAST_CANDIDATE)
+            );
+            assert_eq!(preview_preparations.load(Ordering::SeqCst), 1);
+            let app = &mut event_loop.sessions[0].app;
+            app.update(Msg::Key(crate::components::key(KeyCode::Tab)));
+            app.update(Msg::Paste(thinking.into()));
+            app.update(Msg::Key(crate::components::key(KeyCode::Tab)));
+            app.update(Msg::Key(crate::components::key(KeyCode::Right)));
+            if !fast {
+                app.update(Msg::Key(crate::components::key(KeyCode::Right)));
+            }
+            model_picker_text(event_loop);
+            event_loop.sync_orchestration();
+            assert_eq!(preview_preparations.load(Ordering::SeqCst), 1);
+            assert_eq!(commit_preparations.load(Ordering::SeqCst), 0);
+            let unchanged = actor.config_snapshot().unwrap();
+            assert_eq!(unchanged.generation, before.generation);
+            assert!(Arc::ptr_eq(&unchanged.config, &before.config));
+            assert_eq!(
+                maki_storage::model::read_model(&event_loop.ctx.storage),
+                preference
+            );
+            assert_eq!(
+                maki_storage::model::read_recents(&event_loop.ctx.storage),
+                recents
+            );
+            let persisted_preview = AppSession::load(session_id, &event_loop.ctx.storage).unwrap();
+            assert_eq!(persisted_preview.model, persisted_before.model);
+            assert_eq!(persisted_preview.meta, persisted_before.meta);
+            assert_eq!(
+                serde_json::to_value(persisted_preview.messages()).unwrap(),
+                serde_json::to_value(persisted_before.messages()).unwrap()
+            );
+            let actions = event_loop.sessions[0]
+                .app
+                .update(Msg::Key(crate::components::key(KeyCode::Enter)));
+            let expected_thinking = thinking.parse::<DomainThinkingConfig>().unwrap();
+            assert!(
+                matches!(actions.as_slice(), [Action::SelectPinnedModel { target, selection }]
+                if target.id() == root && selection.spec.as_deref() == Some(MODEL)
+                    && selection.thinking == Some(expected_thinking) && selection.fast == Some(fast))
+            );
+            event_loop.dispatch(0, actions);
+            finish_picker_selection(event_loop);
+            drain_config_commits(&mut event_loop.sessions[0]);
+            let after = actor.config_snapshot().unwrap();
+            assert_eq!(after.generation, before.generation + 1);
+            assert!(Arc::ptr_eq(&after.config.provider, &committed_provider));
+            assert_eq!(after.config.model.spec(), MODEL);
+            let expected = RequestOptions {
+                thinking: expected_thinking,
+                fast,
+            }
+            .clamped(&after.config.model);
+            assert_eq!(after.config.thinking, expected.thinking);
+            assert_eq!(after.config.fast, expected.fast);
+            let persisted = AppSession::load(session_id, &event_loop.ctx.storage).unwrap();
+            assert_eq!(persisted.model, MODEL);
+            assert_eq!(persisted.meta.fast, fast);
+            assert_eq!(persisted.meta.thinking, Some(expected_thinking.into()));
+            assert_eq!(commit_preparations.load(Ordering::SeqCst), 1);
+            event_loop.sessions[0]
+                .app
+                .run_builtin(BuiltinAction::ModelPicker);
+            event_loop.sync_orchestration();
+            let projection = next_model_capabilities(event_loop, root, MODEL);
+            event_loop.handle_internal(projection);
+            let app = &mut event_loop.sessions[0].app;
+            app.update(Msg::Key(crate::components::key(KeyCode::Tab)));
+            app.update(Msg::Paste(thinking.into()));
+            app.update(Msg::Key(crate::components::key(KeyCode::Tab)));
+            app.update(Msg::Key(crate::components::key(KeyCode::Right)));
+            if !fast {
+                app.update(Msg::Key(crate::components::key(KeyCode::Right)));
+            }
+            let actions = app.update(Msg::Key(crate::components::key(KeyCode::Enter)));
+            assert!(
+                matches!(actions.as_slice(), [Action::SelectPinnedModel { target, selection }]
+                if target.id() == root && selection.spec.is_none()
+                    && selection.thinking == Some(expected_thinking) && selection.fast == Some(fast))
+            );
+            event_loop.dispatch(0, actions);
+            finish_picker_selection(event_loop);
+            let same_model = actor.config_snapshot().unwrap();
+            assert_eq!(same_model.generation, after.generation);
+            assert!(Arc::ptr_eq(
+                &same_model.config.provider,
+                &committed_provider
+            ));
+            assert_eq!(commit_preparations.load(Ordering::SeqCst), 1);
+            assert_eq!(preview_preparations.load(Ordering::SeqCst), 1);
+            event_loop.submit_text(0, PROMPT.into()).unwrap();
+            assert_eq!(
+                received.recv_timeout(SESSION_OP_TIMEOUT).unwrap(),
+                (MODEL.into(), expected)
+            );
+        });
+    }
+
+    #[test_case(false; "preparation_error")]
+    #[test_case(true; "denied_current_identity")]
+    fn model_picker_unavailable_capabilities_do_not_retry_without_context_change(denied: bool) {
+        const PREVIEW: &str = "anthropic/picker-unavailable-preview";
+        const PREPARATION_FAILED: &str = "picker preview preparation failed";
+
+        with_event_loop(|event_loop| {
+            let calls = Arc::new(AtomicU64::new(0));
+            let count = Arc::clone(&calls);
+            install_model_capability_resolver(
+                event_loop,
+                Arc::new(move |_| {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async { Err(Arc::from(PREPARATION_FAILED)) })
+                }),
+            );
+            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+            let current = manager
+                .actor(root)
+                .unwrap()
+                .effective_config()
+                .unwrap()
+                .model
+                .spec();
+            if denied {
+                event_loop.sessions[0]
+                    .handles
+                    .orchestration_template
+                    .model_policy =
+                    Arc::new(ModelPolicy::new(&[], slice::from_ref(&current)).unwrap());
+            }
+            event_loop
+                .ctx
+                .catalog
+                .specs()
+                .store(Some(Arc::new(vec![current.clone(), PREVIEW.into()])));
+            event_loop.sync_orchestration();
+            event_loop.sync_model_discovery();
+            event_loop.sessions[0]
+                .app
+                .run_builtin(BuiltinAction::ModelPicker);
+            if !denied {
+                event_loop.sessions[0]
+                    .app
+                    .update(Msg::Paste(PREVIEW.split_once('/').unwrap().1.into()));
+            }
+            event_loop.sync_orchestration();
+            if !denied {
+                let ready = next_model_capabilities(event_loop, root, PREVIEW);
+                assert!(
+                    matches!(&ready, InternalEvent::ModelCapabilitiesReady { projection, .. }
+                    if !projection.capabilities.resolved)
+                );
+                event_loop.handle_internal(ready);
+            }
+            let generation = event_loop.sessions[0].app.model_picker_generation;
+            let screen = model_picker_text(event_loop);
+            event_loop.sync_orchestration();
+            event_loop.sync_orchestration();
+            assert_eq!(
+                event_loop.sessions[0].app.model_picker_generation,
+                generation
+            );
+            assert_eq!(
+                event_loop.sessions[0]
+                    .app
+                    .model_capability_request
+                    .is_none(),
+                denied
+            );
+            assert_eq!(model_picker_text(event_loop), screen);
+            assert_eq!(calls.load(Ordering::SeqCst), u64::from(!denied));
+            assert!(event_loop.internal_rx.try_recv().is_err());
+        });
+    }
+
+    #[test_case(false; "inflight_eviction")]
+    #[test_case(true; "queued_result_eviction")]
+    fn model_picker_retries_evicted_preparation_without_context_change(queued_result: bool) {
+        use crate::model_capabilities::MAX_RETAINED_PROJECTIONS;
+
+        const PREVIEW: &str = "anthropic/picker-evicted-preview";
+        const OTHER_SESSION: &str = "picker-cache-pressure";
+        const THINKING: &str = "high";
+        const THINKING_CONTROL: &str = "Thinking:";
+        const FAST_CONTROL: &str = "Fast:";
+        const THINKING_DRAFT: &str = "Thinking=high";
+
+        with_event_loop(|event_loop| {
+            let (entered, preparations_started) = flume::unbounded();
+            let (release, preparation_gate) = flume::unbounded();
+            let calls = Arc::new(AtomicU64::new(0));
+            let count = Arc::clone(&calls);
+            let resolver = install_model_capability_resolver(
+                event_loop,
+                Arc::new(move |mut model| {
+                    let gate = preparation_gate.clone();
+                    let entered = entered.clone();
+                    let attempt =
+                        (model.spec() == PREVIEW).then(|| count.fetch_add(1, Ordering::SeqCst));
+                    Box::pin(async move {
+                        if let Some(attempt) = attempt {
+                            entered.send(attempt).unwrap();
+                            if attempt == 0 {
+                                gate.recv_async().await.unwrap();
+                            }
+                            model.thinking_override = Some(ThinkingSupport::Yes);
+                            model.supports_fast_override = Some(FastSupport::Supported);
+                        } else {
+                            model.thinking_override = Some(ThinkingSupport::No);
+                            model.supports_fast_override = Some(FastSupport::Unsupported);
+                        }
+                        Ok(PreparedModel {
+                            model,
+                            provider: Arc::new(StubProvider),
+                        })
+                    })
+                }),
+            );
+            let runtime = Arc::clone(&event_loop.ctx.command_runtime);
+            let mut other = test_runtime(model_named(OTHER_SESSION));
+            other.app.command_target = runtime.bind_target();
+            other.app.command_runtime = Arc::clone(&runtime);
+            event_loop.sessions.push(other);
+            event_loop.sync_orchestration();
+            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let before = actor.config_snapshot().unwrap();
+            assert!(before.config.model.supports_thinking());
+            let current = before.config.model.spec();
+            event_loop
+                .ctx
+                .catalog
+                .specs()
+                .store(Some(Arc::new(vec![current.clone(), PREVIEW.into()])));
+            event_loop.sync_model_discovery();
+            let models = event_loop.ctx.catalog.specs().load_full().unwrap();
+            let revision = resolver.revision();
+            let preference = maki_storage::model::read_model(&event_loop.ctx.storage);
+            let recents = maki_storage::model::read_recents(&event_loop.ctx.storage);
+            let session_before = Arc::clone(&event_loop.sessions[0].app.state.session);
+            event_loop.sessions[0]
+                .app
+                .run_builtin(BuiltinAction::ModelPicker);
+            event_loop.sync_orchestration();
+            let ready = next_model_capabilities(event_loop, root, &current);
+            event_loop.handle_internal(ready);
+            let app = &mut event_loop.sessions[0].app;
+            app.update(Msg::Key(crate::components::key(KeyCode::Tab)));
+            app.update(Msg::Paste(THINKING.into()));
+            app.update(Msg::Key(crate::components::key(KeyCode::BackTab)));
+            app.update(Msg::Paste(PREVIEW.split_once('/').unwrap().1.into()));
+            event_loop.sync_orchestration();
+            assert_eq!(
+                preparations_started
+                    .recv_timeout(SESSION_OP_TIMEOUT)
+                    .unwrap(),
+                0
+            );
+            let generation = event_loop.sessions[0].app.model_picker_generation;
+            let pending = model_picker_text(event_loop);
+            assert!(pending.contains(THINKING_DRAFT));
+            assert!(!pending.contains(THINKING_CONTROL));
+            assert!(!pending.contains(FAST_CONTROL));
+            let queued = queued_result.then(|| {
+                release.send(()).unwrap();
+                next_model_capabilities(event_loop, root, PREVIEW)
+            });
+
+            let other_ref = selected_agent(&event_loop.sessions[1]).unwrap();
+            let other_before = other_ref.actor().unwrap().config_snapshot().unwrap();
+            let other_target = TrustedTarget {
+                template: OrchestrationServices::template(&*event_loop.orchestration, &other_ref)
+                    .unwrap(),
+                target: other_ref,
+            };
+            for index in 0..MAX_RETAINED_PROJECTIONS {
+                let spec = Arc::from(format!("openai/picker-cache-pressure-{index}"));
+                let projection = smol::block_on(resolver.resolve(
+                    other_target.clone(),
+                    Some(spec),
+                    revision,
+                    Default::default(),
+                ))
+                .unwrap();
+                assert_eq!(
+                    projection.capabilities.thinking,
+                    maki_domain::ThinkingCapability::Unsupported
+                );
+            }
+            assert_eq!(
+                event_loop.sessions[0].app.model_picker_generation,
+                generation
+            );
+            assert_eq!(model_picker_text(event_loop), pending);
+            let terminal = if let Some(queued) = queued {
+                queued
+            } else {
+                release.send(()).unwrap();
+                loop {
+                    let event = event_loop
+                        .internal_rx
+                        .recv_timeout(SESSION_OP_TIMEOUT)
+                        .unwrap();
+                    if matches!(&event, InternalEvent::ModelCapabilitiesInvalidated { generation: old, .. }
+                        if *old == generation)
+                    {
+                        break event;
+                    }
+                    event_loop.handle_internal(event);
+                }
+            };
+            event_loop.handle_internal(terminal);
+            event_loop.sync_orchestration();
+            assert_eq!(
+                preparations_started
+                    .recv_timeout(SESSION_OP_TIMEOUT)
+                    .unwrap(),
+                1
+            );
+            let retried_generation = event_loop.sessions[0].app.model_picker_generation;
+            assert_ne!(retried_generation, generation);
+            event_loop.handle_internal(InternalEvent::ModelCapabilitiesInvalidated {
+                session: event_loop.sessions[0].id(),
+                runtime: event_loop.sessions[0].handles.identity(),
+                generation,
+            });
+            assert_eq!(
+                event_loop.sessions[0].app.model_picker_generation,
+                retried_generation
+            );
+            assert!(
+                event_loop.sessions[0]
+                    .app
+                    .model_capability_request
+                    .is_some()
+            );
+            assert_eq!(model_picker_text(event_loop), pending);
+            let ready = next_model_capabilities(event_loop, root, PREVIEW);
+            event_loop.handle_internal(ready);
+            event_loop.sync_orchestration();
+            let supported = model_picker_text(event_loop);
+            assert!(supported.contains(THINKING_CONTROL));
+            assert!(supported.contains(FAST_CONTROL));
+            let actions = event_loop.sessions[0]
+                .app
+                .update(Msg::Key(crate::components::key(KeyCode::Enter)));
+            assert!(
+                matches!(actions.as_slice(), [Action::SelectPinnedModel { target, selection }]
+                if target.same_manager(&manager.lookup(root).unwrap()) && target.id() == root
+                    && selection.spec.as_deref() == Some(PREVIEW)
+                    && selection.thinking == Some(DomainThinkingConfig::Effort(Effort::High)))
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            let after = actor.config_snapshot().unwrap();
+            assert_eq!(after.generation, before.generation);
+            assert!(Arc::ptr_eq(&after.config, &before.config));
+            let other_after = other_target
+                .target
+                .actor()
+                .unwrap()
+                .config_snapshot()
+                .unwrap();
+            assert_eq!(other_after.generation, other_before.generation);
+            assert!(Arc::ptr_eq(&other_after.config, &other_before.config));
+            assert_eq!(resolver.revision(), revision);
+            assert!(Arc::ptr_eq(
+                &event_loop.ctx.catalog.specs().load_full().unwrap(),
+                &models
+            ));
+            assert!(Arc::ptr_eq(
+                &event_loop.sessions[0].app.state.session,
+                &session_before
+            ));
+            assert_eq!(
+                maki_storage::model::read_model(&event_loop.ctx.storage),
+                preference
+            );
+            assert_eq!(
+                maki_storage::model::read_recents(&event_loop.ctx.storage),
+                recents
+            );
+        });
+    }
+
+    #[test]
+    fn model_picker_delivers_child_capabilities_after_focus_moves_without_config_change() {
+        const CURRENT_MODEL: &str = "anthropic/picker-focus-child";
+        const NEXT_MODEL: &str = "anthropic/picker-focus-preview";
+        const CHILD_CHAT: &str = "picker focus child";
+        const SPAWN_COMMAND: &str = "/spawn-picker-focus-child";
+        const SPAWNED: &str = "picker focus child spawned";
+        const THINKING: &str = "high";
+        const THINKING_CONTROL: &str = "Thinking:";
+        const FAST_CONTROL: &str = "Fast:";
+        const THINKING_DRAFT: &str = "Thinking=high";
+        const FAST_DRAFT: &str = "Fast=true";
+
+        with_event_loop(|event_loop| {
+            let (started, preparation_started) = flume::bounded(1);
+            let (release, preparation_gate) = flume::bounded(1);
+            let preparations = Arc::new(AtomicU64::new(0));
+            let count = Arc::clone(&preparations);
+            let resolver = install_model_capability_resolver(
+                event_loop,
+                Arc::new(move |mut model| {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let started = started.clone();
+                    let preparation_gate = preparation_gate.clone();
+                    Box::pin(async move {
+                        started.send(model.spec()).unwrap();
+                        preparation_gate.recv_async().await.unwrap();
+                        model.thinking_override = Some(ThinkingSupport::Yes);
+                        model.supports_fast_override = Some(FastSupport::Supported);
+                        Ok(PreparedModel {
+                            model,
+                            provider: Arc::new(StubProvider),
+                        })
+                    })
+                }),
+            );
+            let command_runtime = Arc::clone(&event_loop.ctx.command_runtime);
+            let host = maki_lua::PluginHost::with_command_registry(
+                Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
+                command_runtime.registry.clone(),
+                false,
+                maki_lua::ui_sink::HostUi::Frontend,
+            )
+            .unwrap();
+            host.event_handle()
+                .install_orchestration_services(event_loop.orchestration.clone());
+            host.load_source(
+                "picker_focus_child",
+                &format!(
+                    r#"
+                    maki.api.register_command({{
+                        name = "{SPAWN_COMMAND}", tui_only = false,
+                        handler = function(_, ctx)
+                            assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true }}))
+                            maki.ui.flash("{SPAWNED}")
+                        end,
+                    }})
+                    "#
+                ),
+            )
+            .unwrap();
+            smol::block_on(command_runtime.registry.dispatch_input(
+                &event_loop.sessions[0].app.command_target,
+                SPAWN_COMMAND.into(),
+            ));
+            assert!(matches!(
+                host.ui_action_rx().recv_timeout(SESSION_OP_TIMEOUT).unwrap(),
+                UiAction::Flash(text) if text == SPAWNED
+            ));
+            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+            let child = manager
+                .snapshot()
+                .into_iter()
+                .find(|node| node.parent_id == Some(root))
+                .unwrap()
+                .agent_id;
+            let actor = manager.actor(child).unwrap();
+            let mut model = Model::from_spec(CURRENT_MODEL).unwrap();
+            model.thinking_override = Some(ThinkingSupport::Yes);
+            model.supports_fast_override = Some(FastSupport::Supported);
+            smol::block_on(
+                actor
+                    .reserve_prepared_operation(None)
+                    .unwrap()
+                    .commit_when_ready(Some(ConfigChange::Patch(ConfigPatch {
+                        model: Some(PreparedModel {
+                            model,
+                            provider: Arc::new(StubProvider),
+                        }),
+                        ..Default::default()
+                    }))),
+            )
+            .unwrap();
+            select_child_chat(event_loop, child, CHILD_CHAT);
+            event_loop.ctx.catalog.specs().store(Some(Arc::new(vec![
+                CURRENT_MODEL.into(),
+                NEXT_MODEL.into(),
+            ])));
+            event_loop.sync_model_discovery();
+            let session = Arc::clone(&event_loop.sessions[0].app.state.session);
+            smol::block_on(event_loop.ctx.storage_writer.checkpoint(CheckpointRequest {
+                session_id: session.id,
+                version: CheckpointVersion {
+                    revision: session.revision(),
+                    epoch: session.history_snapshot().epoch,
+                },
+                snapshot: session,
+            }))
+            .unwrap();
+            let child_before = actor.config_snapshot().unwrap();
+            let root_before = manager.actor(root).unwrap().config_snapshot().unwrap();
+            let persisted_before =
+                AppSession::load(event_loop.sessions[0].id(), &event_loop.ctx.storage).unwrap();
+            let preference = maki_storage::model::read_model(&event_loop.ctx.storage);
+            let recents = maki_storage::model::read_recents(&event_loop.ctx.storage);
+            let models = event_loop.ctx.catalog.specs().load_full().unwrap();
+            let metadata_revision = resolver.revision();
+            event_loop.sessions[0]
+                .app
+                .run_builtin(BuiltinAction::ModelPicker);
+            event_loop.sync_orchestration();
+            let current = next_model_capabilities(event_loop, child, CURRENT_MODEL);
+            event_loop.handle_internal(current);
+            let app = &mut event_loop.sessions[0].app;
+            app.update(Msg::Key(crate::components::key(KeyCode::Tab)));
+            app.update(Msg::Paste(THINKING.into()));
+            app.update(Msg::Key(crate::components::key(KeyCode::Tab)));
+            app.update(Msg::Key(crate::components::key(KeyCode::Right)));
+            app.update(Msg::Key(crate::components::key(KeyCode::Tab)));
+            app.update(Msg::Paste(NEXT_MODEL.split_once('/').unwrap().1.into()));
+            assert_eq!(app.model_picker.highlighted_spec(), Some(NEXT_MODEL));
+            event_loop.sync_orchestration();
+            assert_eq!(
+                preparation_started
+                    .recv_timeout(SESSION_OP_TIMEOUT)
+                    .unwrap(),
+                NEXT_MODEL
+            );
+            let generation = event_loop.sessions[0].app.model_picker_generation;
+            let pending = model_picker_text(event_loop);
+            assert!(!pending.contains(THINKING_CONTROL));
+            assert!(!pending.contains(FAST_CONTROL));
+            assert!(pending.contains(THINKING_DRAFT));
+            assert!(pending.contains(FAST_DRAFT));
+            assert!(
+                event_loop.sessions[0]
+                    .app
+                    .update(Msg::Key(crate::components::key(KeyCode::Enter)))
+                    .is_empty()
+            );
+
+            event_loop.sessions[0].app.active_chat = 0;
+            event_loop.sync_orchestration();
+            assert_eq!(
+                command_runtime
+                    .target_agent(&event_loop.sessions[0].app.command_target)
+                    .unwrap()
+                    .id(),
+                root
+            );
+            let app = &event_loop.sessions[0].app;
+            assert_eq!(app.model_picker_generation, generation);
+            assert_eq!(app.model_picker_target.as_ref().unwrap().id(), child);
+            assert_eq!(app.model_picker.highlighted_spec(), Some(NEXT_MODEL));
+            let request = app.model_capability_request.as_ref().unwrap();
+            assert_eq!(request.target.target.id(), child);
+            assert_eq!(request.source.generation, child_before.generation);
+            assert!(Arc::ptr_eq(&request.source.config, &child_before.config));
+            assert_eq!(request.revision, metadata_revision);
+            assert_eq!(model_picker_text(event_loop), pending);
+            release.send(()).unwrap();
+            let ready = next_model_capabilities(event_loop, child, NEXT_MODEL);
+            assert!(matches!(
+                &ready,
+                InternalEvent::ModelCapabilitiesReady { generation: ready_generation, projection, .. }
+                    if *ready_generation == generation
+                        && projection.source_generation == child_before.generation
+                        && projection.metadata_revision == metadata_revision
+            ));
+            event_loop.handle_internal(ready);
+            event_loop.sync_orchestration();
+            let supported = model_picker_text(event_loop);
+            assert!(supported.contains(THINKING_CONTROL));
+            assert!(supported.contains(FAST_CONTROL));
+            assert!(supported.contains(THINKING));
+            assert_eq!(
+                event_loop.sessions[0].app.model_picker_generation,
+                generation
+            );
+            assert_eq!(
+                event_loop.sessions[0]
+                    .app
+                    .model_picker_target
+                    .as_ref()
+                    .unwrap()
+                    .id(),
+                child
+            );
+            let actions = event_loop.sessions[0]
+                .app
+                .update(Msg::Key(crate::components::key(KeyCode::Enter)));
+            assert!(matches!(
+                actions.as_slice(),
+                [Action::SelectPinnedModel { target, selection }]
+                    if target.id() == child && selection.spec.as_deref() == Some(NEXT_MODEL)
+                        && selection.thinking == Some(DomainThinkingConfig::Effort(Effort::High))
+                        && selection.fast == Some(true)
+            ));
+            event_loop.sync_orchestration();
+            let child_after = actor.config_snapshot().unwrap();
+            let root_after = manager.actor(root).unwrap().config_snapshot().unwrap();
+            assert_eq!(child_after.generation, child_before.generation);
+            assert!(Arc::ptr_eq(&child_after.config, &child_before.config));
+            assert_eq!(root_after.generation, root_before.generation);
+            assert!(Arc::ptr_eq(&root_after.config, &root_before.config));
+            assert_eq!(resolver.revision(), metadata_revision);
+            assert!(Arc::ptr_eq(
+                &event_loop.ctx.catalog.specs().load_full().unwrap(),
+                &models
+            ));
+            assert_eq!(preparations.load(Ordering::SeqCst), 1);
+            assert!(preparation_started.try_recv().is_err());
+            assert_eq!(
+                maki_storage::model::read_model(&event_loop.ctx.storage),
+                preference
+            );
+            assert_eq!(
+                maki_storage::model::read_recents(&event_loop.ctx.storage),
+                recents
+            );
+            let persisted_after =
+                AppSession::load(event_loop.sessions[0].id(), &event_loop.ctx.storage).unwrap();
+            assert_eq!(persisted_after.model, persisted_before.model);
+            assert_eq!(persisted_after.meta, persisted_before.meta);
+            assert_eq!(
+                serde_json::to_value(persisted_after.messages()).unwrap(),
+                serde_json::to_value(persisted_before.messages()).unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn model_picker_refreshes_unfocused_pinned_child_after_config_commit() {
+        const MODEL: &str = "anthropic/picker-config-child";
+        const CHILD_CHAT: &str = "picker config child";
+        const SPAWNED: &str = "picker config child spawned";
+        const THINKING: &str = "high";
+        const THINKING_CONTROL: &str = "Thinking:";
+        const FAST_CONTROL: &str = "Fast:";
+
+        with_event_loop(|event_loop| {
+            let preparations = Arc::new(AtomicU64::new(0));
+            let count = Arc::clone(&preparations);
+            let resolver = install_model_capability_resolver(
+                event_loop,
+                Arc::new(move |model| {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async move {
+                        Ok(PreparedModel {
+                            model,
+                            provider: Arc::new(StubProvider),
+                        })
+                    })
+                }),
+            );
+            let command_runtime = Arc::clone(&event_loop.ctx.command_runtime);
+            let host = maki_lua::PluginHost::with_command_registry(
+                Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
+                command_runtime.registry.clone(),
+                false,
+                maki_lua::ui_sink::HostUi::Frontend,
+            )
+            .unwrap();
+            host.event_handle()
+                .install_orchestration_services(event_loop.orchestration.clone());
+            host.load_source(
+                "picker_config_child",
+                &format!(
+                    r#"
+                maki.api.register_command({{
+                    name = "/spawn-picker-config-child", tui_only = false,
+                    handler = function(_, ctx)
+                        assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true }}))
+                        maki.ui.flash("{SPAWNED}")
+                    end,
+                }})
+            "#
+                ),
+            )
+            .unwrap();
+            event_loop.sync_orchestration();
+            smol::block_on(command_runtime.registry.dispatch_input(
+                &event_loop.sessions[0].app.command_target,
+                "/spawn-picker-config-child".into(),
+            ));
+            assert!(
+                matches!(host.ui_action_rx().recv_timeout(SESSION_OP_TIMEOUT).unwrap(),
+                UiAction::Flash(text) if text == SPAWNED)
+            );
+            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+            let child = manager
+                .snapshot()
+                .into_iter()
+                .find(|node| node.parent_id == Some(root))
+                .unwrap()
+                .agent_id;
+            let actor = manager.actor(child).unwrap();
+            let root_before = manager.actor(root).unwrap().config_snapshot().unwrap();
+            let commit_capabilities = |supported: bool| {
+                let mut model = Model::from_spec(MODEL).unwrap();
+                model.thinking_override = Some(if supported {
+                    ThinkingSupport::Yes
+                } else {
+                    ThinkingSupport::No
+                });
+                model.supports_fast_override = Some(if supported {
+                    FastSupport::Supported
+                } else {
+                    FastSupport::Unsupported
+                });
+                smol::block_on(
+                    actor
+                        .reserve_prepared_operation(None)
+                        .unwrap()
+                        .commit_when_ready(Some(ConfigChange::Patch(ConfigPatch {
+                            model: Some(PreparedModel {
+                                model,
+                                provider: Arc::new(StubProvider),
+                            }),
+                            ..Default::default()
+                        }))),
+                )
+                .unwrap()
+            };
+            commit_capabilities(true);
+            select_child_chat(event_loop, child, CHILD_CHAT);
+            event_loop
+                .ctx
+                .catalog
+                .specs()
+                .store(Some(Arc::new(vec![MODEL.into()])));
+            event_loop.sessions[0]
+                .app
+                .run_builtin(BuiltinAction::ModelPicker);
+            event_loop.sync_orchestration();
+            let old = next_model_capabilities(event_loop, child, MODEL);
+            let old = match old {
+                InternalEvent::ModelCapabilitiesReady {
+                    session,
+                    runtime,
+                    target,
+                    generation,
+                    projection,
+                } => {
+                    event_loop.handle_internal(InternalEvent::ModelCapabilitiesReady {
+                        session,
+                        runtime: Arc::clone(&runtime),
+                        target: target.clone(),
+                        generation,
+                        projection: projection.clone(),
+                    });
+                    InternalEvent::ModelCapabilitiesReady {
+                        session,
+                        runtime,
+                        target,
+                        generation,
+                        projection,
+                    }
+                }
+                _ => unreachable!(),
+            };
+            let app = &mut event_loop.sessions[0].app;
+            app.update(Msg::Key(crate::components::key(KeyCode::Tab)));
+            app.update(Msg::Paste(THINKING.into()));
+            app.update(Msg::Key(crate::components::key(KeyCode::Tab)));
+            app.update(Msg::Key(crate::components::key(KeyCode::Right)));
+            let screen = model_picker_text(event_loop);
+            assert!(screen.contains(THINKING_CONTROL));
+            assert!(screen.contains(FAST_CONTROL));
+
+            event_loop.sessions[0].app.active_chat = 0;
+            event_loop.sync_orchestration();
+            let revision_before = orchestration_revision(&event_loop.sessions[0]);
+            let metadata_revision = resolver.revision();
+            commit_capabilities(false);
+            let revision_after = orchestration_revision(&event_loop.sessions[0]);
+            assert!(!revision_before.matches(&revision_after));
+            event_loop.sync_orchestration();
+            let refreshed = next_model_capabilities(event_loop, child, MODEL);
+            event_loop.handle_internal(refreshed);
+            let screen = model_picker_text(event_loop);
+            assert!(!screen.contains(THINKING_CONTROL));
+            assert!(!screen.contains(FAST_CONTROL));
+            assert!(screen.contains(THINKING));
+            event_loop.handle_internal(old);
+            assert_eq!(model_picker_text(event_loop), screen);
+            assert!(
+                event_loop.sessions[0]
+                    .app
+                    .update(Msg::Key(crate::components::key(KeyCode::Enter)))
+                    .is_empty()
+            );
+            assert!(event_loop.sessions[0].app.model_picker.is_open());
+            assert_eq!(
+                event_loop.sessions[0]
+                    .app
+                    .model_picker_target
+                    .as_ref()
+                    .unwrap()
+                    .id(),
+                child
+            );
+
+            commit_capabilities(true);
+            event_loop.sync_orchestration();
+            let refreshed = next_model_capabilities(event_loop, child, MODEL);
+            event_loop.handle_internal(refreshed);
+            let actions = event_loop.sessions[0]
+                .app
+                .update(Msg::Key(crate::components::key(KeyCode::Enter)));
+            assert!(
+                matches!(actions.as_slice(), [Action::SelectPinnedModel { target, selection }]
+                if target.id() == child && selection.spec.is_none()
+                    && selection.thinking == Some(DomainThinkingConfig::Effort(Effort::High))
+                    && selection.fast == Some(true))
+            );
+            let root_after = manager.actor(root).unwrap().config_snapshot().unwrap();
+            assert_eq!(root_before.generation, root_after.generation);
+            assert!(Arc::ptr_eq(&root_before.config, &root_after.config));
+            assert_eq!(resolver.revision(), metadata_revision);
+            assert_eq!(preparations.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                &**event_loop.ctx.catalog.specs().load_full().unwrap(),
+                &[MODEL.to_owned()]
+            );
         });
     }
 

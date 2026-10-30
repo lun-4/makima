@@ -3,7 +3,7 @@ use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use event_listener::{Event, EventListener};
-use maki_providers::ThinkingConfig;
+use maki_providers::{ModelOptionSpec, ModelOptionValueKind, ThinkingConfig};
 use thiserror::Error;
 
 pub const MODEL_OPTION_ID: &str = "model";
@@ -183,6 +183,45 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl SessionOptionDefinition {
+    pub fn model_option(spec: &ModelOptionSpec, initial_value: &str) -> Self {
+        Self {
+            id: Arc::from(spec.key),
+            owner: SessionOptionOwner::Builtin,
+            name: Arc::from(spec.label),
+            description: Arc::from(spec.description),
+            category: SessionOptionCategory::Mode,
+            values: spec
+                .presets
+                .iter()
+                .map(|preset| {
+                    let (value, name) = match spec.value_kind {
+                        ModelOptionValueKind::Choice => match preset.value {
+                            "true" => (ENABLED_VALUE, "Enabled"),
+                            "false" => (DISABLED_VALUE, "Disabled"),
+                            value => (value, preset.label),
+                        },
+                        ModelOptionValueKind::FreeInput => (preset.value, preset.label),
+                    };
+                    SessionOptionValue {
+                        value: Arc::from(value),
+                        name: Arc::from(name),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            free_value: match spec.value_kind {
+                ModelOptionValueKind::FreeInput => Some(FreeValueDomain::ThinkingSetting),
+                ModelOptionValueKind::Choice => None,
+            },
+            initial_value: Arc::from(match (&spec.value_kind, initial_value) {
+                (ModelOptionValueKind::Choice, "true") => ENABLED_VALUE,
+                (ModelOptionValueKind::Choice, "false") => DISABLED_VALUE,
+                _ => initial_value,
+            }),
+            persistent: true,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), SessionOptionError> {
         if !valid_id(&self.id, &self.owner) {
             return Err(SessionOptionError::InvalidDefinition(Arc::from(
@@ -700,6 +739,59 @@ fn valid_id(id: &str, owner: &SessionOptionOwner) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_providers::{MODEL_OPTION_SPECS, model_option_spec};
+    use test_case::test_case;
+
+    #[test]
+    fn model_option_session_metadata_preserves_compatibility() {
+        for spec in MODEL_OPTION_SPECS {
+            let definition = SessionOptionDefinition::model_option(spec, spec.presets[0].value);
+            assert_eq!(definition.id.as_ref(), spec.key);
+            assert_eq!(definition.name.as_ref(), spec.label);
+            assert_eq!(definition.description.as_ref(), spec.description);
+            assert_eq!(definition.owner, SessionOptionOwner::Builtin);
+            assert_eq!(definition.category, SessionOptionCategory::Mode);
+            assert!(definition.persistent);
+            definition.validate().unwrap();
+            for (preset, value) in spec.presets.iter().zip(definition.values.iter()) {
+                let (expected_value, expected_name) = match (&spec.value_kind, preset.value) {
+                    (ModelOptionValueKind::Choice, "true") => (ENABLED_VALUE, "Enabled"),
+                    (ModelOptionValueKind::Choice, "false") => (DISABLED_VALUE, "Disabled"),
+                    _ => (preset.value, preset.label),
+                };
+                assert_eq!(value.value.as_ref(), expected_value);
+                assert_eq!(value.name.as_ref(), expected_name);
+            }
+        }
+    }
+
+    #[test_case("true", ENABLED_VALUE; "enabled")]
+    #[test_case("false", DISABLED_VALUE; "disabled")]
+    fn model_boolean_session_adapter_keeps_legacy_values(initial: &str, expected: &str) {
+        let definition = SessionOptionDefinition::model_option(
+            model_option_spec(FAST_OPTION_ID).unwrap(),
+            initial,
+        );
+        assert_eq!(definition.initial_value.as_ref(), expected);
+        assert!(definition.accepts(expected));
+        assert!(!definition.accepts(initial));
+        assert_eq!(definition.free_value, None);
+    }
+
+    #[test]
+    fn model_thinking_session_adapter_accepts_token_budgets() {
+        let definition = SessionOptionDefinition::model_option(
+            model_option_spec(THINKING_OPTION_ID).unwrap(),
+            "2048",
+        );
+        assert_eq!(
+            definition.free_value,
+            Some(FreeValueDomain::ThinkingSetting)
+        );
+        assert!(definition.accepts("2048"));
+        assert!(!definition.accepts("0"));
+        definition.validate().unwrap();
+    }
 
     fn definition(id: &str, initial: &str) -> SessionOptionDefinition {
         SessionOptionDefinition {

@@ -1835,8 +1835,10 @@ fn argument_at_cursor(input: &str, cursor: usize) -> Option<(usize, usize, Strin
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex, mpsc};
 
+    use arc_swap::ArcSwapOption;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use maki_commands::{
         ArgumentKind, CancellationToken, CommandArguments, CommandBehavior, CommandCompletion,
@@ -1849,7 +1851,13 @@ mod tests {
     use maki_config::DEFAULT_AUTOCOMPLETE_HEIGHT;
     use ratatui::Terminal;
 
+    use crate::components::arg_completion::ModelArgSource;
+    use crate::model_capabilities::{
+        ModelCapabilityResolver,
+        test_support::{OTHER_SPEC, model, preparer, target as pinned_target},
+    };
     use crate::repaint::Cadence;
+    use maki_providers::model::FastSupport;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
     use test_case::test_case;
@@ -3057,21 +3065,27 @@ mod tests {
         selection: &str,
         expected: &str,
     ) {
-        use crate::components::arg_completion::ModelArgSource;
-        use arc_swap::ArcSwapOption;
-
         let registry = CommandRegistry::new();
         let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
+        let admission = pinned_target(model(OTHER_SPEC, true, FastSupport::Supported));
+        let resolver = Arc::new(ModelCapabilityResolver::new(preparer()));
         let mut registration = registration("/model", "Select model");
         let mut argument = PositionalArgument::optional("model", ArgumentKind::String)
             .with_completion(CompletionPolicy::Replace);
         argument.variadic = true;
         registration.spec.arguments = CommandArguments::Positional(Arc::from([argument]));
-        registration.argument_completions = vec![Some(Arc::new(ModelArgSource::new(Arc::new(
-            ArcSwapOption::from(Some(Arc::new(vec!["openai/gpt-5".into()]))),
-        ))))];
+        registration.argument_completions = vec![Some(Arc::new(
+            ModelArgSource::with_resolver(
+                Arc::new(ArcSwapOption::from(Some(Arc::new(vec![OTHER_SPEC.into()])))),
+                resolver,
+            )
+            .with_targets(Arc::new(Mutex::new(HashMap::from([(
+                target.id(),
+                admission.clone(),
+            )])))),
+        ))];
         producer.replace(vec![registration]).unwrap();
-        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
         let mut palette = CommandPalette::new(registry, target);
         palette.sync_arguments(input, cursor.unwrap_or(input.len()), "insert");
         let deadline = std::time::Instant::now() + MATCHER_SETTLE_TIMEOUT;
@@ -3104,6 +3118,7 @@ mod tests {
         };
         assert_eq!(text, expected);
         assert_eq!(cursor, expected.find(selection).unwrap() + selection.len());
+        admission.target.close_subtree().unwrap();
     }
 
     #[test]

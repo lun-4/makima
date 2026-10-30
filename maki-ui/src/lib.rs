@@ -16,6 +16,7 @@ mod highlight;
 pub use highlight::highlight_ansi;
 pub mod image;
 mod markdown;
+mod model_capabilities;
 pub use markdown::text_to_lines;
 pub mod provider_usage;
 mod render_worker;

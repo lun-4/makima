@@ -171,17 +171,37 @@ impl App {
         match mode.plan_path() {
             Some(path) if self.state.plan.path() != Some(path) => {
                 self.state.plan = PlanState::Drafting(path.to_path_buf());
+                if self.plan_form_target.is_none() {
+                    if self.plan_form.sync_plan_path(Some(path)) {
+                        self.plan_approval_pending = false;
+                    }
+                } else if let Some((form, pending)) = self.plan_forms.get_mut(&None)
+                    && form.sync_plan_path(Some(path))
+                {
+                    *pending = false;
+                }
             }
             Some(_) => {}
             None if matches!(previous, AgentMode::Plan(_)) => {
                 self.state.plan = PlanState::None;
-                self.plan_form.reset();
-                self.plan_approval_pending = false;
-                if self.model_picker_purpose == ModelPickerPurpose::PlanImplementation {
-                    self.close_model_picker();
+                if self.plan_form_target.is_none() {
+                    self.plan_form.reset();
+                    self.plan_approval_pending = false;
+                } else if let Some((form, pending)) = self.plan_forms.get_mut(&None) {
+                    form.reset();
+                    *pending = false;
                 }
             }
             None => {}
+        }
+        if previous.plan_path().is_some()
+            && previous.plan_path() != mode.plan_path()
+            && self.model_picker_purpose == ModelPickerPurpose::PlanImplementation
+            && self.model_picker_target.as_ref().is_none_or(|target| {
+                self.chats.first().and_then(|chat| chat.agent_id) == Some(target.id())
+            })
+        {
+            self.close_model_picker();
         }
         self.file_completion.close();
     }
