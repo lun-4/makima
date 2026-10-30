@@ -63,7 +63,7 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 #[cfg(test)]
 pub(crate) use crossterm::event::KeyEventKind;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind as CrosstermKeyEventKind, MouseEvent};
-use maki_agent::actor::{EffectiveAgentConfig, TranscriptRequest};
+use maki_agent::actor::{ConfigCommit, EffectiveAgentConfig, TranscriptRequest};
 use maki_agent::agent::isolated_turn::IsolatedTurnRequest;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
@@ -83,7 +83,10 @@ use maki_lua::{
     BuiltinAction, CompletionCtx, EventHandle, FloatConfig, HintReader, HintSnapshot, ItemSpec,
     KeymapReader, Split, StatusContentReader, StatusContentSnapshot, WinCommand, WinEvent, WinView,
 };
-use maki_providers::{ContentBlock, Message, Model, add_cost, format_tokens};
+use maki_providers::{
+    CompleteModelSelection, ContentBlock, Message, Model, ModelCapabilities, add_cost,
+    format_tokens,
+};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
@@ -367,6 +370,14 @@ enum ModelPickerPurpose {
     PlanImplementation,
 }
 
+pub(crate) struct ModelCapabilityRequest {
+    pub(crate) target: TrustedTarget,
+    pub(crate) spec: Arc<str>,
+    pub(crate) source: ConfigCommit,
+    pub(crate) revision: u64,
+    pub(crate) cancel: Option<maki_agent::CancelTrigger>,
+}
+
 pub struct App {
     pub(super) chats: Vec<Chat>,
     pub(super) active_chat: usize,
@@ -384,6 +395,8 @@ pub struct App {
     pub(super) model_picker: ModelPicker,
     model_picker_purpose: ModelPickerPurpose,
     pub(crate) model_picker_target: Option<AgentRef>,
+    pub(crate) model_picker_generation: u64,
+    pub(crate) model_capability_request: Option<ModelCapabilityRequest>,
     pub(crate) plan_approval_pending: bool,
     pub(super) login_picker: LoginPicker,
     pub(super) mcp_picker: McpPicker,
@@ -587,6 +600,8 @@ impl App {
             model_picker: ModelPicker::new(Arc::clone(&model_picker_models)),
             model_picker_purpose: ModelPickerPurpose::Session,
             model_picker_target: None,
+            model_picker_generation: 0,
+            model_capability_request: None,
             plan_approval_pending: false,
             login_picker: LoginPicker::new(),
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
@@ -750,6 +765,28 @@ impl App {
             .unwrap_or_else(|| Arc::clone(&self.seed_config))
     }
 
+    pub(super) fn focused_model_selection(&self) -> (CompleteModelSelection, ModelCapabilities) {
+        if let Some(target) = self.command_runtime.target_agent(&self.command_target)
+            && Some(target.id()) == self.selected_agent_id()
+            && let Ok(actor) = target.actor()
+            && let Some(snapshot) = actor.config_snapshot()
+        {
+            return (
+                snapshot.config.model_selection(),
+                ModelCapabilities::from(&snapshot.config.model),
+            );
+        }
+        let config = self.root_config();
+        let capabilities = if self.selected_agent_id().is_none() && self.coordinator.is_none() {
+            ModelCapabilities::from(&config.model)
+        } else {
+            ModelCapabilities::default()
+        };
+        let mut selection = config.model_selection();
+        selection.spec = Arc::from(self.focused_model_spec());
+        (selection, capabilities)
+    }
+
     pub(super) fn focused_model_spec(&self) -> String {
         self.focused_config()
             .map(|config| config.model.spec())
@@ -844,6 +881,9 @@ impl App {
         if target == self.plan_form_target {
             return;
         }
+        if self.model_picker_purpose == ModelPickerPurpose::PlanImplementation {
+            self.close_model_picker();
+        }
         let (form, pending) = self
             .plan_forms
             .remove(&target)
@@ -853,6 +893,70 @@ impl App {
         self.plan_forms
             .insert(self.plan_form_target, (previous, previous_pending));
         self.plan_form_target = target;
+    }
+
+    pub(crate) fn sync_model_picker_owner(&mut self) {
+        self.sync_plan_form_target();
+        let path = if self.is_main_chat() {
+            self.focused_plan_path()
+        } else if let Some(config) = self.focused_config() {
+            config.mode.plan_path().map(Path::to_path_buf)
+        } else {
+            return;
+        };
+        let retired = self.plan_form.sync_plan_path(path.as_deref());
+        if retired {
+            self.plan_approval_pending = false;
+            self.pending_dirty |= Dirty::YES;
+        }
+        if self.model_picker_purpose == ModelPickerPurpose::PlanImplementation
+            && (retired || path.is_none())
+        {
+            self.close_model_picker();
+            self.pending_dirty |= Dirty::YES;
+        }
+    }
+
+    pub(crate) fn sync_child_plan_paths(
+        &mut self,
+        mut path_for: impl FnMut(AgentId) -> Option<PathBuf>,
+    ) {
+        let targets = self
+            .plan_forms
+            .keys()
+            .copied()
+            .flatten()
+            .chain(self.plan_form_target)
+            .collect::<Vec<_>>();
+        for target in targets {
+            let path = path_for(target);
+            let retired = if self.plan_form_target == Some(target) {
+                let retired = self.plan_form.sync_plan_path(path.as_deref());
+                if retired {
+                    self.plan_approval_pending = false;
+                }
+                retired
+            } else if let Some((form, pending)) = self.plan_forms.get_mut(&Some(target)) {
+                let retired = form.sync_plan_path(path.as_deref());
+                if retired {
+                    *pending = false;
+                }
+                retired
+            } else {
+                false
+            };
+            if retired {
+                if self.model_picker_purpose == ModelPickerPurpose::PlanImplementation
+                    && self
+                        .model_picker_target
+                        .as_ref()
+                        .is_some_and(|pinned| pinned.id() == target)
+                {
+                    self.close_model_picker();
+                }
+                self.pending_dirty |= Dirty::YES;
+            }
+        }
     }
 
     fn plan_form_active(&self) -> bool {
@@ -955,7 +1059,7 @@ impl App {
     }
 
     pub(crate) fn sync_focused_queue(&mut self) {
-        self.sync_plan_form_target();
+        self.sync_model_picker_owner();
         let id = self.selected_agent_id();
         let actor = self
             .command_runtime
@@ -1451,52 +1555,77 @@ impl App {
         &mut self,
         target: AgentRef,
     ) -> Result<(), CommandError> {
+        self.open_target_model_picker(target, ModelPickerPurpose::Session)
+    }
+
+    fn open_target_model_picker(
+        &mut self,
+        target: AgentRef,
+        purpose: ModelPickerPurpose,
+    ) -> Result<(), CommandError> {
         target
             .validate_live()
             .map_err(|_| CommandError::StaleTarget)?;
-        let config = target
-            .effective_config()
+        let snapshot = target
+            .actor()
             .map_err(|_| CommandError::StaleTarget)?
+            .config_snapshot()
             .ok_or(CommandError::StaleTarget)?;
-        self.model_picker_purpose = ModelPickerPurpose::Session;
+        let config = snapshot.config;
+        let current = config.model_selection();
+        let capabilities = ModelCapabilities::from(&config.model);
+        let draft = if purpose == ModelPickerPurpose::PlanImplementation {
+            self.plan_form.implementation_selection().clone()
+        } else {
+            maki_commands::ModelSelection::default()
+        };
+        self.retire_model_capability_request();
+        self.model_picker_purpose = purpose;
         self.model_picker_target = Some(target);
-        self.model_picker.open(&config.model.spec());
+        self.model_picker.open(current, capabilities, draft);
         Ok(())
     }
 
     fn open_model_picker(&mut self, purpose: ModelPickerPurpose) {
-        if purpose == ModelPickerPurpose::Session
-            && let Some(target) = self.command_runtime.target_agent(&self.command_target)
-        {
-            if let Err(error) = self.open_pinned_model_picker(target) {
+        if let Some(target) = self.command_runtime.target_agent(&self.command_target) {
+            if let Err(error) = self.open_target_model_picker(target, purpose) {
                 self.close_model_picker();
                 self.flash(error.to_string());
             }
             return;
         }
-        if purpose == ModelPickerPurpose::Session
-            && (self.selected_agent_id().is_some() || self.coordinator.is_some())
-        {
+        if self.selected_agent_id().is_some() || self.coordinator.is_some() {
             self.close_model_picker();
             self.flash(CommandError::StaleTarget.to_string());
             return;
         }
+        self.retire_model_capability_request();
         self.model_picker_target = None;
-        let spec = match purpose {
-            ModelPickerPurpose::PlanImplementation => self
-                .plan_form
-                .implementation_model()
-                .map(str::to_owned)
-                .unwrap_or_else(|| self.focused_model_spec()),
-            ModelPickerPurpose::Session => self.focused_model_spec(),
+        let config = self.root_config();
+        let current = config.model_selection();
+        let capabilities = ModelCapabilities::from(&config.model);
+        let draft = if purpose == ModelPickerPurpose::PlanImplementation {
+            self.plan_form.implementation_selection().clone()
+        } else {
+            maki_commands::ModelSelection::default()
         };
         self.model_picker_purpose = purpose;
-        self.model_picker.open(&spec);
+        self.model_picker.open(current, capabilities, draft);
     }
 
     /// Closes the picker and retires its purpose together, so the open state
     /// and the purpose can never disagree.
-    fn close_model_picker(&mut self) {
+    pub(crate) fn retire_model_capability_request(&mut self) {
+        self.model_picker_generation = self.model_picker_generation.wrapping_add(1);
+        if let Some(mut request) = self.model_capability_request.take()
+            && let Some(cancel) = request.cancel.take()
+        {
+            cancel.cancel();
+        }
+    }
+
+    pub(crate) fn close_model_picker(&mut self) {
+        self.retire_model_capability_request();
         self.model_picker.close();
         self.model_picker_purpose = ModelPickerPurpose::Session;
         self.model_picker_target = None;
@@ -1505,16 +1634,19 @@ impl App {
     fn handle_model_picker_key(&mut self, key: KeyEvent) -> Vec<Action> {
         match self.model_picker.handle_key(key) {
             ModelPickerAction::Consumed => vec![],
-            ModelPickerAction::Select(spec) => {
+            ModelPickerAction::Select(selection) => {
                 let purpose = std::mem::take(&mut self.model_picker_purpose);
+                let target = self.model_picker_target.clone();
+                self.close_model_picker();
                 if purpose == ModelPickerPurpose::PlanImplementation {
                     let model = self.focused_model_spec();
-                    self.plan_form.set_implementation_model(spec, &model);
+                    self.plan_form
+                        .set_implementation_selection(selection, &model);
                     vec![]
-                } else if let Some(target) = self.model_picker_target.take() {
-                    vec![Action::ChangePinnedModel { target, spec }]
+                } else if let Some(target) = target {
+                    vec![Action::SelectPinnedModel { target, selection }]
                 } else {
-                    vec![Action::ChangeModel(spec)]
+                    vec![Action::SelectModel(selection)]
                 }
             }
             ModelPickerAction::AssignTier(spec, tier) => vec![Action::AssignTier(spec, tier)],
@@ -2179,6 +2311,14 @@ impl App {
                 return vec![];
             }
             if matches!(&envelope.event, AgentEvent::SubagentClosed) {
+                self.finish_child_plan_approval(subagent.agent_id);
+                if self
+                    .model_picker_target
+                    .as_ref()
+                    .is_some_and(|target| target.id() == subagent.agent_id)
+                {
+                    self.close_model_picker();
+                }
                 self.terminal_subagents.insert(subagent.agent_id);
                 if let Some(channels) = self.subagent_channels.get_mut(&subagent.agent_id) {
                     channels.closed = true;
@@ -3486,24 +3626,50 @@ impl App {
         self.plan_approval_pending = true;
         vec![Action::ApprovePlan {
             clear_context,
-            model: self.plan_form.implementation_model().map(str::to_owned),
+            selection: self.plan_form.implementation_selection().clone(),
             parallel: self.plan_form.parallel(),
             path,
         }]
     }
 
-    pub(crate) fn plan_approval_matches(&self, model: Option<&str>, parallel: bool) -> bool {
-        self.plan_approval_pending
-            && self.focused_plan_path().is_some()
-            && self.plan_form.implementation_model() == model
-            && self.plan_form.parallel() == parallel
+    fn plan_form_key(&self, target: AgentId) -> Option<AgentId> {
+        (self.chats.first().and_then(|chat| chat.agent_id) != Some(target)).then_some(target)
     }
 
-    pub(crate) fn finish_child_plan_approval(&mut self, target: maki_agent::AgentId) {
-        if self.plan_form_target == Some(target) {
+    pub(crate) fn plan_approval_matches(
+        &self,
+        target: AgentId,
+        selection: &maki_commands::ModelSelection,
+        parallel: bool,
+    ) -> bool {
+        let key = self.plan_form_key(target);
+        let state = if self.plan_form_target == key {
+            Some((&self.plan_form, self.plan_approval_pending))
+        } else {
+            self.plan_forms
+                .get(&key)
+                .map(|(form, pending)| (form, *pending))
+        };
+        state.is_some_and(|(form, pending)| {
+            pending && form.implementation_selection() == selection && form.parallel() == parallel
+        })
+    }
+
+    pub(crate) fn clear_plan_approval_pending(&mut self, target: AgentId) {
+        let key = self.plan_form_key(target);
+        if self.plan_form_target == key {
+            self.plan_approval_pending = false;
+        } else if let Some((_, pending)) = self.plan_forms.get_mut(&key) {
+            *pending = false;
+        }
+    }
+
+    pub(crate) fn finish_child_plan_approval(&mut self, target: AgentId) {
+        let key = self.plan_form_key(target);
+        if self.plan_form_target == key {
             self.plan_approval_pending = false;
             self.plan_form.reset();
-        } else if let Some((form, pending)) = self.plan_forms.get_mut(&Some(target)) {
+        } else if let Some((form, pending)) = self.plan_forms.get_mut(&key) {
             form.reset();
             *pending = false;
         }
@@ -3516,8 +3682,6 @@ impl App {
         path: String,
         prompt: String,
     ) {
-        self.plan_approval_pending = false;
-        self.plan_form.reset();
         self.state.plan = PlanState::None;
         self.main_chat().push(DisplayMessage::plan(content, path));
         self.main_chat().show_user_message(prompt, vec![]);

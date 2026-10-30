@@ -224,15 +224,15 @@ pub enum Action {
         boundary: HistoryBoundary,
     },
     ChangeModel(String),
-    ChangePinnedModel {
+    SelectPinnedModel {
         target: AgentRef,
-        spec: String,
+        selection: maki_commands::ModelSelection,
     },
     SelectModel(maki_commands::ModelSelection),
     ChangeMode(String),
     ApprovePlan {
         clear_context: bool,
-        model: Option<String>,
+        selection: maki_commands::ModelSelection,
         parallel: bool,
         path: PathBuf,
     },

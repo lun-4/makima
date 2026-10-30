@@ -694,6 +694,15 @@ impl<T: PickerItem> ListPicker<T> {
             Footer::Builder(build) => build(),
             Footer::Static(line) => line.clone(),
         });
+        self.view_with_footer_lines(frame, area, footer.into_iter().collect())
+    }
+
+    pub fn view_with_footer_lines(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        footer: Vec<Line<'static>>,
+    ) -> Rect {
         match self.state.as_mut() {
             None => Rect::default(),
             Some(s) => render_ready(
@@ -733,10 +742,10 @@ fn render_ready<T: PickerItem>(
     s: &mut State<T>,
     title: &str,
     max_visible: Option<u16>,
-    footer: Option<Line<'static>>,
+    footer: Vec<Line<'static>>,
     error_text: Option<&str>,
 ) -> Rect {
-    let footer_rows = if footer.is_some() { 1u16 } else { 0 };
+    let footer_rows = u16::try_from(footer.len()).unwrap_or(u16::MAX);
     let content_rows = if s.filtered().is_empty() {
         1
     } else {
@@ -755,8 +764,12 @@ fn render_ready<T: PickerItem>(
     let (popup, inner) = modal.render(
         frame,
         area,
-        content_rows + SEARCH_ROW + footer_rows + error_rows,
+        content_rows
+            .saturating_add(SEARCH_ROW)
+            .saturating_add(footer_rows)
+            .saturating_add(error_rows),
     );
+    let footer_rows = footer_rows.min(inner.height.saturating_sub(SEARCH_ROW + error_rows));
     let viewport_h = inner
         .height
         .saturating_sub(error_rows + SEARCH_ROW + footer_rows);
@@ -764,14 +777,14 @@ fn render_ready<T: PickerItem>(
     s.ensure_visible();
 
     let mut constraints: Vec<Constraint> =
-        Vec::with_capacity(3 + footer.is_some() as usize + error_text.is_some() as usize);
+        Vec::with_capacity(3 + usize::from(footer_rows > 0) + error_text.is_some() as usize);
     if error_text.is_some() {
-        constraints.push(Constraint::Length(1)); // error line
-    }
-    constraints.push(Constraint::Min(1)); // list
-    constraints.push(Constraint::Length(1)); // search
-    if footer.is_some() {
         constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Length(viewport_h));
+    constraints.push(Constraint::Length(SEARCH_ROW));
+    if footer_rows > 0 {
+        constraints.push(Constraint::Length(footer_rows));
     }
 
     let areas = Layout::vertical(constraints).split(inner);
@@ -805,8 +818,8 @@ fn render_ready<T: PickerItem>(
     );
     render_search(frame, search_area, &s.search);
 
-    if let Some(line) = footer {
-        frame.render_widget(Paragraph::new(line), areas[area_idx]);
+    if footer_rows > 0 {
+        frame.render_widget(Paragraph::new(footer), areas[area_idx]);
     }
 
     let total_visual = visual_rows_in_range(s.filtered(), &s.items, 0, s.filtered().len());
@@ -2001,6 +2014,114 @@ mod tests {
             footer_y > item_y + 1,
             "footer sits below the list and search rows"
         );
+    }
+
+    #[test]
+    fn multiline_footer_override_preserves_single_line_builder() {
+        const BUILT_FOOTER: &str = "built footer";
+        const OVERRIDE_FOOTER: &str = "override footer";
+        let mut picker = ListPicker::new().with_footer_builder(|| Line::from(BUILT_FOOTER));
+        picker.open(entries(&["alpha", "beta"]), " Test ");
+        let area = Rect::new(0, 0, 80, 24);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                picker.view_with_footer_lines(frame, area, vec![Line::from(OVERRIDE_FOOTER)]);
+            })
+            .unwrap();
+        let lines = buffer_lines(&terminal, area).join("\n");
+        assert!(lines.contains(OVERRIDE_FOOTER));
+        assert!(!lines.contains(BUILT_FOOTER));
+        terminal
+            .draw(|frame| {
+                picker.view(frame, area);
+            })
+            .unwrap();
+        let lines = buffer_lines(&terminal, area).join("\n");
+        assert!(lines.contains(BUILT_FOOTER));
+        assert!(!lines.contains(OVERRIDE_FOOTER));
+    }
+
+    #[test_case(80, 24; "normal")]
+    #[test_case(40, 12; "narrow_short")]
+    fn list_picker_multiline_footer_reserves_viewport(width: u16, height: u16) {
+        const FIRST_FOOTER: &str = "option one";
+        const SECOND_FOOTER: &str = "option two";
+        const CONFIRM_FOOTER: &str = "Enter confirm Esc cancel";
+        const LAST_ITEM: &str = "item 19";
+        let mut picker = ListPicker::new();
+        picker.open(
+            (0..20).map(|index| format!("item {index:02}")).collect(),
+            " Test ",
+        );
+        picker.select(19);
+        let area = Rect::new(0, 0, width, height);
+        let mut popup = Rect::default();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                popup = picker.view_with_footer_lines(
+                    frame,
+                    area,
+                    vec![
+                        Line::from(FIRST_FOOTER),
+                        Line::from(SECOND_FOOTER),
+                        Line::from(CONFIRM_FOOTER),
+                    ],
+                );
+            })
+            .unwrap();
+        let lines = buffer_lines(&terminal, area);
+        let first_y = lines
+            .iter()
+            .position(|line| line.contains(FIRST_FOOTER))
+            .unwrap();
+        let second_y = lines
+            .iter()
+            .position(|line| line.contains(SECOND_FOOTER))
+            .unwrap();
+        let hints_y = lines
+            .iter()
+            .position(|line| line.contains("Enter"))
+            .unwrap();
+        let item_y = lines
+            .iter()
+            .position(|line| line.contains(LAST_ITEM))
+            .unwrap();
+        assert_eq!(second_y, first_y + 1);
+        assert_eq!(hints_y, first_y + 2);
+        assert!(first_y > item_y + 1);
+        assert!(hints_y < popup.bottom() as usize - 1);
+        let state = ready_state(&picker);
+        assert_eq!(
+            state.viewport_height,
+            state.inner_area.height.saturating_sub(4) as usize
+        );
+        assert!(state.scroll_offset > 0);
+        assert!(popup.bottom() <= area.bottom());
+        assert!(popup.right() <= area.right());
+    }
+
+    #[test]
+    fn multiline_footer_is_clipped_inside_small_popup() {
+        const HINT: &str = "confirm";
+        let mut picker = ListPicker::new();
+        picker.open(vec!["item".to_owned()], " Test ");
+        let area = Rect::new(0, 0, 40, 6);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        let mut popup = Rect::default();
+        terminal
+            .draw(|frame| {
+                popup = picker.view_with_footer_lines(frame, area, vec![Line::from(HINT); 20]);
+            })
+            .unwrap();
+        let lines = buffer_lines(&terminal, area);
+        for (row, line) in lines.iter().enumerate() {
+            if line.contains(HINT) {
+                assert!((popup.y as usize + 1..popup.bottom() as usize - 1).contains(&row));
+            }
+        }
+        assert_eq!(ready_state(&picker).viewport_height, 0);
     }
 
     struct DetailSectionEntry {

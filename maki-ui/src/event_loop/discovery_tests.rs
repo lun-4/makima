@@ -6,6 +6,8 @@ use maki_config::{
     ModelPolicy,
     providers::{ProviderDef, ProvidersConfig},
 };
+use maki_domain::{FastCapability, ModelCapabilities, ModelSelection, ThinkingCapability};
+use maki_providers::{CompleteModelSelection, ThinkingConfig};
 use maki_storage::paths;
 use ratatui::{Terminal, backend::TestBackend};
 use smol::Async;
@@ -20,6 +22,30 @@ const RECENT: &str = "mistral/discovery-recent";
 const CATALOG: &str = "mistral/discovery-catalog";
 const FAILURE_RESPONSE: &[u8] =
     b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+fn current_selection(spec: &str) -> CompleteModelSelection {
+    CompleteModelSelection {
+        spec: Arc::from(spec),
+        thinking: ThinkingConfig::Off,
+        fast: false,
+    }
+}
+
+fn open_with_draft(event_loop: &mut EventLoop<'_>, current: &str, draft: ModelSelection) {
+    event_loop.sessions[0].app.model_picker.open(
+        current_selection(current),
+        ModelCapabilities {
+            resolved: true,
+            thinking: ThinkingCapability::Supported,
+            fast: FastCapability::Supported,
+        },
+        draft,
+    );
+}
+
+fn open(event_loop: &mut EventLoop<'_>, spec: &str) {
+    open_with_draft(event_loop, spec, ModelSelection::default());
+}
 
 fn picker_text(event_loop: &mut EventLoop<'_>) -> String {
     let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
@@ -41,21 +67,36 @@ fn picker_text(event_loop: &mut EventLoop<'_>) -> String {
 }
 
 fn assert_picker_usable(event_loop: &mut EventLoop<'_>) {
-    let picker = &mut event_loop.sessions[0].app.model_picker;
-    picker.open(RECENT);
+    open(event_loop, RECENT);
     let text = picker_text(event_loop);
     assert!(text.contains("Recent"), "{text}");
     assert!(text.contains("Mistral"), "{text}");
     assert!(text.contains("discovery-recent"), "{text}");
     assert!(text.contains("discovery-catalog"), "{text}");
-    for spec in [RECENT, CATALOG] {
-        let picker = &mut event_loop.sessions[0].app.model_picker;
-        picker.open(spec);
-        assert!(matches!(
-            picker.handle_key(key(KeyCode::Enter)),
-            ModelPickerAction::Select(selected) if selected == spec
-        ));
-    }
+    open(event_loop, RECENT);
+    assert!(matches!(
+        event_loop.sessions[0]
+            .app
+            .model_picker
+            .handle_key(key(KeyCode::Enter)),
+        ModelPickerAction::Select(selection) if selection == ModelSelection::default()
+    ));
+
+    open_with_draft(
+        event_loop,
+        RECENT,
+        ModelSelection {
+            spec: Some(Arc::from(CATALOG)),
+            ..ModelSelection::default()
+        },
+    );
+    assert!(matches!(
+        event_loop.sessions[0]
+            .app
+            .model_picker
+            .handle_key(key(KeyCode::Enter)),
+        ModelPickerAction::Select(selection) if selection.spec.as_deref() == Some(CATALOG)
+    ));
 }
 
 #[test]
@@ -114,7 +155,7 @@ fn refresh_keeps_catalog_and_recents_through_slow_provider_failure() {
             .model_picker
             .set_recents(vec![RECENT.into()]);
         assert_picker_usable(event_loop);
-        event_loop.sessions[0].app.model_picker.open(RECENT);
+        open(event_loop, RECENT);
 
         event_loop.handle_action(0, Action::RefreshModels);
         entered_rx.recv_timeout(TIMEOUT).unwrap();
@@ -128,11 +169,14 @@ fn refresh_keeps_catalog_and_recents_through_slow_provider_failure() {
         assert!(text.contains("discovery-recent"), "{text}");
         assert!(text.contains("discovery-catalog"), "{text}");
         assert!(matches!(
-            event_loop.sessions[0].app.model_picker.handle_key(key(KeyCode::Enter)),
-            ModelPickerAction::Select(spec) if spec == RECENT
+            event_loop.sessions[0]
+                .app
+                .model_picker
+                .handle_key(key(KeyCode::Enter)),
+            ModelPickerAction::Select(selection) if selection == ModelSelection::default()
         ));
         assert_picker_usable(event_loop);
-        event_loop.sessions[0].app.model_picker.open(RECENT);
+        open(event_loop, RECENT);
 
         event_loop.sessions[0]
             .handles
@@ -140,12 +184,15 @@ fn refresh_keeps_catalog_and_recents_through_slow_provider_failure() {
             .model_policy = Arc::new(ModelPolicy::new(&[], &[RECENT.into()]).unwrap());
         event_loop.sync_orchestration();
         let text = picker_text(event_loop);
-        assert!(!text.contains("discovery-recent"), "{text}");
+        assert!(text.contains("discovery-recent"), "{text}");
         assert!(!text.contains("Recent"), "{text}");
         assert!(text.contains("discovery-catalog"), "{text}");
         assert!(matches!(
-            event_loop.sessions[0].app.model_picker.handle_key(key(KeyCode::Enter)),
-            ModelPickerAction::Select(spec) if spec == CATALOG
+            event_loop.sessions[0]
+                .app
+                .model_picker
+                .handle_key(key(KeyCode::Enter)),
+            ModelPickerAction::Select(selection) if selection == ModelSelection::default()
         ));
         event_loop.sessions[0]
             .handles
@@ -180,9 +227,9 @@ fn refresh_keeps_catalog_and_recents_through_slow_provider_failure() {
             .specs()
             .store(Some(Arc::new(Vec::new())));
         event_loop.sync_model_discovery();
-        event_loop.sessions[0].app.model_picker.open(RECENT);
+        open(event_loop, RECENT);
         let text = picker_text(event_loop);
-        assert!(!text.contains("discovery-recent"), "{text}");
+        assert!(text.contains("discovery-recent"), "{text}");
         assert!(!text.contains("discovery-catalog"), "{text}");
         assert!(!text.contains("Recent"), "{text}");
         assert!(matches!(
@@ -190,7 +237,7 @@ fn refresh_keeps_catalog_and_recents_through_slow_provider_failure() {
                 .app
                 .model_picker
                 .handle_key(key(KeyCode::Enter)),
-            ModelPickerAction::Consumed
+            ModelPickerAction::Select(selection) if selection == ModelSelection::default()
         ));
     });
     smol::block_on(server);

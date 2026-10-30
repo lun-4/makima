@@ -5,7 +5,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::components::arg_completion::{ModelArgSource, PathArgSource, ThemeArgSource};
+use crate::{
+    components::arg_completion::{ModelArgSource, PathArgSource, ThemeArgSource},
+    model_capabilities::ModelCapabilityResolver,
+};
 use maki_agent::command::{self, StandardCommands, StandardCompletions};
 use maki_commands::{
     CommandContent, CommandError, CommandFuture, CommandHost, CommandOutcome, CommandRegistry,
@@ -107,6 +110,7 @@ pub(crate) struct CommandRuntime {
     event_rx: flume::Receiver<CommandEvent>,
     theme_completion: Arc<ThemeArgSource>,
     pub(crate) path_completion: Arc<PathArgSource>,
+    pub(crate) model_capabilities: Arc<ModelCapabilityResolver>,
     _standard_commands: StandardCommands,
 }
 
@@ -135,6 +139,7 @@ impl CommandRuntime {
     ) -> (Self, flume::Receiver<CommandEvent>) {
         let (event_tx, event_rx) = flume::unbounded();
         let admissions = Arc::default();
+        let model_capabilities = Arc::clone(&model_completion.resolver);
         let model_completion = Arc::new(model_completion.with_targets(Arc::clone(&admissions)));
         let standard_commands = StandardCommands::register(
             &registry,
@@ -154,6 +159,7 @@ impl CommandRuntime {
                 event_rx: event_rx.clone(),
                 path_completion: Arc::new(PathArgSource::new(maki_storage::paths::home())),
                 theme_completion,
+                model_capabilities,
                 _standard_commands: standard_commands,
             },
             event_rx,
@@ -383,7 +389,16 @@ mod tests {
                 argument_hint: None,
             }],
             CommandRegistry::new(),
-            Arc::new(ModelArgSource::new(Arc::new(ArcSwapOption::empty()))),
+            Arc::new(ModelArgSource::with_resolver(
+                Arc::new(ArcSwapOption::empty()),
+                Arc::new(crate::model_capabilities::ModelCapabilityResolver::new(
+                    Arc::new(|_| {
+                        Box::pin(async {
+                            Err(Arc::from("model preparation not used by command fixture"))
+                        })
+                    }),
+                )),
+            )),
             Arc::new(ThemeArgSource::new(Arc::new(
                 crate::theme::InMemoryThemesProvider::bundled(),
             ))),

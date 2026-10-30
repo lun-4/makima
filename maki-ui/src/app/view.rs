@@ -1,4 +1,4 @@
-use maki_providers::ThinkingConfigExt;
+use maki_providers::{CompleteModelSelection, ModelCapabilities, ThinkingConfigExt};
 use std::sync::atomic::Ordering;
 
 use crate::components::Overlay;
@@ -37,6 +37,7 @@ fn subagent_input_hint(is_subagent: bool, despawned: bool) -> Option<Line<'stati
 }
 
 struct ViewLayout {
+    plan_model: (CompleteModelSelection, ModelCapabilities),
     msg_area: Rect,
     bottom_area: Rect,
     status_area: Rect,
@@ -82,6 +83,7 @@ impl App {
 
     fn compute_layout(&self, area: Rect, form_visible: bool) -> ViewLayout {
         let permission_open = self.permission_active();
+        let plan_model = self.focused_model_selection();
 
         // Carve the full-width status bar first so the split carving below only
         // ever deals with the content region above it. A manually deferred
@@ -125,7 +127,7 @@ impl App {
             0
         } else if form_visible {
             self.plan_form
-                .height(inner.width, &self.focused_model_spec())
+                .height(inner.width, &plan_model.0, &plan_model.1)
                 .min(max_bottom)
         } else {
             let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
@@ -167,6 +169,7 @@ impl App {
         let input_area = areas[areas.len() - 1];
 
         ViewLayout {
+            plan_model,
             msg_area,
             bottom_area,
             status_area,
@@ -268,8 +271,12 @@ impl App {
             // The active permission form is painted by the topmost pass
             // (`render_active_input`) so it lands above pickers/modals.
         } else if self.plan_form_active() {
-            let model = self.focused_model_spec();
-            self.plan_form.view(frame, layout.bottom_area, &model);
+            self.plan_form.view(
+                frame,
+                layout.bottom_area,
+                &layout.plan_model.0,
+                &layout.plan_model.1,
+            );
         } else if layout.bottom_area.height > 0 {
             let queue_entries = self.queue.panel_entries();
             queue_panel::view(frame, layout.queue_area, &queue_entries, self.queue.focus());

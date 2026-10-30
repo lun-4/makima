@@ -12,14 +12,16 @@ use maki_agent::actor::{
 };
 use maki_agent::config_change::ConfigChangeError;
 use maki_agent::manager::ManagerError;
+use maki_agent::session_options::SessionOptionError;
 use maki_agent::tools::ToolRegistry;
 use maki_agent::{AgentInput, AgentMode};
-use maki_domain::ThinkingConfig as DomainThinkingConfig;
+use maki_domain::{Effort, ModelSelection, ThinkingConfig as DomainThinkingConfig};
 use maki_lua::PluginHost;
+use maki_providers::model::FastSupport;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
-    StopReason, StreamResponse, TokenUsage,
+    AgentError, CompleteModelSelection, ContentBlock, Message, Model, ModelCapabilities, ModelInfo,
+    ProviderEvent, RequestOptions, Role, StopReason, StreamResponse, ThinkingSupport, TokenUsage,
 };
 use maki_storage::checkpoint::{CheckpointRequest, CheckpointVersion, CheckpointWriter};
 use maki_storage::id::{MakiId, SessionRef};
@@ -37,14 +39,19 @@ use super::ApprovalStep;
 use crate::AppSession;
 use crate::app::mode::{Mode, PlanState};
 use crate::components::keybindings::key;
+use crate::components::model_picker::ModelPickerAction;
 use crate::components::{self, Action, Status};
 use crate::plan_approval::{
     APPROVAL_BUSY, APPROVAL_CHANGED, IMPLEMENT_PARALLEL_HINT, idle_error_message, read_plan,
 };
 use crate::storage_writer::{SAVE_FAILED_PREFIX, StorageWriter};
 
+mod options;
+mod pending_fast;
+
 const SOURCE_MODEL: &str = "anthropic/claude-opus-4-6";
 const TARGET_MODEL: &str = "openai/gpt-5";
+const TARGET_MODEL_ID: &str = "gpt-5";
 const HISTORY: &str = "existing planning conversation";
 const PLAN: &str = "# Implementation\n\nImplement the regression tests.\n";
 const RESPONSE: &str = "implementation finished";
@@ -71,6 +78,71 @@ const IMPLEMENT_ROW: usize = 2;
 const USE_CURRENT_ROW: usize = 4;
 
 type RecordedRequest = (String, RequestOptions, Vec<Message>, String);
+
+fn implementation_selection() -> ModelSelection {
+    ModelSelection {
+        spec: Some(TARGET_MODEL.into()),
+        thinking: Some(DomainThinkingConfig::Effort(Effort::High)),
+        fast: Some(false),
+    }
+}
+
+fn implementation_options() -> RequestOptions {
+    RequestOptions {
+        thinking: DomainThinkingConfig::Effort(Effort::High),
+        fast: false,
+    }
+}
+
+fn capable_model(spec: &str) -> Model {
+    let mut model = Model::from_spec(spec).unwrap();
+    model.thinking_override = Some(ThinkingSupport::Yes);
+    model.supports_fast_override = Some(FastSupport::Supported);
+    model
+}
+
+fn stage_with_picker(event_loop: &mut EventLoop<'_>, index: usize) {
+    let app = &mut event_loop.sessions[index].app;
+    let current = CompleteModelSelection::from_model(
+        &capable_model(SOURCE_MODEL),
+        RequestOptions {
+            thinking: DomainThinkingConfig::Off,
+            fast: true,
+        },
+    );
+    app.model_picker.open(
+        current,
+        ModelCapabilities::from(&capable_model(SOURCE_MODEL)),
+        ModelSelection {
+            spec: Some(TARGET_MODEL.into()),
+            ..Default::default()
+        },
+    );
+    let _ = app.model_picker.set_capabilities(
+        TARGET_MODEL,
+        ModelCapabilities::from(&capable_model(TARGET_MODEL)),
+    );
+    app.model_picker.handle_key(components::key(KeyCode::Tab));
+    app.model_picker.handle_paste("high");
+    app.model_picker.handle_key(components::key(KeyCode::Tab));
+    app.model_picker.handle_key(components::key(KeyCode::Left));
+    let ModelPickerAction::Select(selection) =
+        app.model_picker.handle_key(components::key(KeyCode::Enter))
+    else {
+        panic!("picker did not confirm implementation selection");
+    };
+    assert_eq!(selection, implementation_selection());
+    app.plan_form
+        .set_implementation_selection(selection, SOURCE_MODEL);
+}
+
+fn assert_actor_selection(actor: &AgentActorHandle, spec: &str, options: RequestOptions) {
+    let config = actor.effective_config().unwrap();
+    assert_eq!(config.model.spec(), spec);
+    assert_eq!(config.thinking, options.thinking);
+    assert_eq!(config.fast, options.fast);
+    assert_eq!(config.mode, AgentMode::Build);
+}
 
 fn child_tool(auto_deliver: bool) -> String {
     format!(
@@ -405,7 +477,13 @@ fn historical_child_approval_never_falls_back_to_root(clear_context: bool) {
         child.subagent_id = Some(CHILD_PROMPT.into());
         app.chats.push(child);
         app.active_chat = 1;
-        event_loop.prepare_plan_approval(index, clear_context, None, false, path.clone());
+        event_loop.prepare_plan_approval(
+            index,
+            clear_context,
+            ModelSelection::default(),
+            false,
+            path.clone(),
+        );
         assert!(event_loop.sessions[index].pending_approval.is_none());
         assert_eq!(event_loop.sessions[index].app.run_id, run_id);
         assert_eq!(
@@ -433,6 +511,61 @@ fn managed_child_approval_is_pinned(
     delay_checkpoint: bool,
     escape: bool,
     lose_lock: bool,
+) {
+    managed_child_approval(
+        clear_context,
+        fail_checkpoint,
+        delay_checkpoint,
+        escape,
+        lose_lock,
+        None,
+    );
+}
+
+enum ChildApprovalFailure {
+    Unsupported,
+    Cancel,
+    Stale,
+    RootUnsupported,
+    RootCancel,
+}
+
+#[test_case(false, false, ChildApprovalFailure::Unsupported; "reject_keep_active")]
+#[test_case(true, false, ChildApprovalFailure::Unsupported; "reject_clear_active")]
+#[test_case(false, true, ChildApprovalFailure::Unsupported; "reject_keep_saved")]
+#[test_case(true, true, ChildApprovalFailure::Unsupported; "reject_clear_saved")]
+#[test_case(false, false, ChildApprovalFailure::Cancel; "cancel_keep_active")]
+#[test_case(true, false, ChildApprovalFailure::Cancel; "cancel_clear_active")]
+#[test_case(false, true, ChildApprovalFailure::Cancel; "cancel_keep_saved")]
+#[test_case(true, true, ChildApprovalFailure::Cancel; "cancel_clear_saved")]
+#[test_case(false, true, ChildApprovalFailure::Stale; "stale_keep_saved")]
+#[test_case(true, true, ChildApprovalFailure::Stale; "stale_clear_saved")]
+#[test_case(false, true, ChildApprovalFailure::RootUnsupported; "root_reject_keep_saved")]
+#[test_case(true, true, ChildApprovalFailure::RootUnsupported; "root_reject_clear_saved")]
+#[test_case(false, true, ChildApprovalFailure::RootCancel; "root_cancel_keep_saved")]
+#[test_case(true, true, ChildApprovalFailure::RootCancel; "root_cancel_clear_saved")]
+fn child_approval_failure_preserves_selection(
+    clear_context: bool,
+    saved: bool,
+    failure: ChildApprovalFailure,
+) {
+    managed_child_approval(
+        clear_context,
+        false,
+        false,
+        false,
+        false,
+        Some((saved, failure)),
+    );
+}
+
+fn managed_child_approval(
+    clear_context: bool,
+    fail_checkpoint: bool,
+    delay_checkpoint: bool,
+    escape: bool,
+    lose_lock: bool,
+    failure: Option<(bool, ChildApprovalFailure)>,
 ) {
     const CHECKPOINT_FAILURE: &str = "child approval checkpoint failed";
     const CHECKPOINT_FLASH: &str = "history checkpoint failed: child approval checkpoint failed";
@@ -618,22 +751,187 @@ fn managed_child_approval_is_pinned(
             .iter()
             .position(|chat| chat.agent_id == Some(child_id))
             .unwrap();
+        if matches!(
+            &failure,
+            Some((
+                _,
+                ChildApprovalFailure::RootUnsupported | ChildApprovalFailure::RootCancel
+            ))
+        ) {
+            let mode = AgentMode::Plan(path.clone());
+            let reservation = reserve_config_change(
+                &manager.lookup(root).unwrap(),
+                &event_loop.sessions[index].coordinator,
+                None,
+            )
+            .unwrap();
+            let commit = smol::block_on(reservation.commit_change(ConfigChange::Mode {
+                mode: mode.clone(),
+                mode_def: Some(host.event_handle().mode_registry().current(&mode)),
+            }))
+            .unwrap();
+            event_loop.sessions[index].project_config(&commit);
+            event_loop.sync_orchestration();
+            stage_with_picker(event_loop, index);
+            if matches!(&failure, Some((_, ChildApprovalFailure::RootUnsupported))) {
+                let prepare = event_loop.ctx.prepare_provider.clone();
+                event_loop.ctx.prepare_provider = Arc::new(move |model, timeouts| {
+                    let mut prepared = prepare(model, timeouts)?;
+                    prepared.model.thinking_override = Some(ThinkingSupport::No);
+                    Ok(prepared)
+                });
+            }
+            let root_config = root_actor.effective_config().unwrap();
+            let root_history = root_actor.committed_history();
+            event_loop.sessions[index].app.plan_approval_pending = true;
+            event_loop.prepare_plan_approval(
+                index,
+                clear_context,
+                implementation_selection(),
+                false,
+                path.clone(),
+            );
+            let ready = next_ready(event_loop);
+            event_loop.sessions[index].app.active_chat = child_chat;
+            event_loop.sessions[index].app.sync_focused_queue();
+            event_loop.sync_orchestration();
+            assert!(!event_loop.sessions[index].app.plan_approval_pending);
+            if matches!(&failure, Some((_, ChildApprovalFailure::RootCancel))) {
+                event_loop.sessions[index].end_plan_approval();
+            } else {
+                assert!(
+                    matches!(&ready, InternalEvent::PlanApprovalReady { result: Err(error), .. }
+                    if error.contains(&SessionOptionError::ThinkingUnsupported.to_string()))
+                );
+            }
+            event_loop.handle_internal(ready);
+            assert!(event_loop.sessions[index].pending_approval.is_none());
+            assert!(!event_loop.sessions[index].app.plan_approval_pending);
+            event_loop.sessions[index].app.active_chat = 0;
+            event_loop.sessions[index].app.sync_focused_queue();
+            event_loop.sync_orchestration();
+            assert!(!event_loop.sessions[index].app.plan_approval_pending);
+            assert_eq!(
+                event_loop.sessions[index]
+                    .app
+                    .plan_form
+                    .implementation_selection(),
+                &implementation_selection()
+            );
+            assert!(Arc::ptr_eq(
+                &root_config,
+                &root_actor.effective_config().unwrap()
+            ));
+            assert!(Arc::ptr_eq(&root_history, &root_actor.committed_history()));
+            assert!(Arc::ptr_eq(&config, &child.effective_config().unwrap()));
+            assert!(requests.is_empty());
+            shutdown_manager(&manager);
+            return;
+        }
         event_loop.sessions[index].app.active_chat = child_chat;
         event_loop.sessions[index].app.sync_focused_queue();
         event_loop.sync_orchestration();
+        stage_with_picker(event_loop, index);
+        let history = child.committed_history();
+        let prefs = serde_json::to_value(read_prefs(&event_loop.ctx.storage)).unwrap();
+        let recents = read_recents(&event_loop.ctx.storage);
+        let saved_model = read_model(&event_loop.ctx.storage);
+        if matches!(&failure, Some((_, ChildApprovalFailure::Unsupported))) {
+            let prepare = event_loop.ctx.prepare_provider.clone();
+            event_loop.ctx.prepare_provider = Arc::new(move |model, timeouts| {
+                let mut prepared = prepare(model, timeouts)?;
+                prepared.model.thinking_override = Some(ThinkingSupport::No);
+                Ok(prepared)
+            });
+        }
+        event_loop.sessions[index].app.state.fast_pending = true;
         event_loop.prepare_plan_approval(
             index,
             clear_context,
-            Some(TARGET_MODEL.into()),
+            implementation_selection(),
             false,
             path.clone(),
         );
+        assert!(event_loop.sessions[index].app.state.fast_pending);
         assert!(
             event_loop.sessions[index].pending_approval.is_some(),
             "child approval rejected before preparation: {:?}",
             event_loop.sessions[index].app.status_bar.flash_text()
         );
         let mut ready = next_ready(event_loop);
+        if let Some((saved, failure)) = failure {
+            let mut selection = implementation_selection();
+            if matches!(failure, ChildApprovalFailure::Stale) {
+                selection.fast = Some(true);
+                event_loop.sessions[index]
+                    .app
+                    .plan_form
+                    .set_implementation_selection(selection.clone(), SOURCE_MODEL);
+            }
+            if saved {
+                event_loop.sessions[index].app.active_chat = 0;
+                event_loop.sessions[index].app.sync_focused_queue();
+                event_loop.sync_orchestration();
+                assert!(!event_loop.sessions[index].app.plan_approval_pending);
+            }
+            let expected = match failure {
+                ChildApprovalFailure::Unsupported => {
+                    let InternalEvent::PlanApprovalReady {
+                        result: Err(error), ..
+                    } = &ready
+                    else {
+                        panic!("unsupported child thinking was accepted");
+                    };
+                    assert!(error.contains(&SessionOptionError::ThinkingUnsupported.to_string()));
+                    Some(error.clone())
+                }
+                ChildApprovalFailure::Cancel => {
+                    event_loop.sessions[index].end_plan_approval();
+                    None
+                }
+                ChildApprovalFailure::Stale => Some(APPROVAL_CHANGED.into()),
+                ChildApprovalFailure::RootUnsupported | ChildApprovalFailure::RootCancel => {
+                    unreachable!()
+                }
+            };
+            event_loop.handle_internal(ready);
+            assert!(event_loop.sessions[index].pending_approval.is_none());
+            assert_eq!(
+                event_loop.sessions[index].app.status_bar.flash_text(),
+                expected.as_deref()
+            );
+            event_loop.sessions[index].app.active_chat = child_chat;
+            event_loop.sessions[index].app.sync_focused_queue();
+            event_loop.sync_orchestration();
+            assert!(!event_loop.sessions[index].app.plan_approval_pending);
+            assert_eq!(
+                event_loop.sessions[index]
+                    .app
+                    .plan_form
+                    .implementation_selection(),
+                &selection
+            );
+            assert!(Arc::ptr_eq(&config, &child.effective_config().unwrap()));
+            assert!(Arc::ptr_eq(&history, &child.committed_history()));
+            assert_eq!(
+                child.effective_config().unwrap().mode,
+                AgentMode::Plan(path)
+            );
+            assert!(Arc::ptr_eq(
+                &root_config,
+                &root_actor.effective_config().unwrap()
+            ));
+            assert!(Arc::ptr_eq(&root_history, &root_actor.committed_history()));
+            assert_eq!(
+                serde_json::to_value(read_prefs(&event_loop.ctx.storage)).unwrap(),
+                prefs
+            );
+            assert_eq!(read_recents(&event_loop.ctx.storage), recents);
+            assert_eq!(read_model(&event_loop.ctx.storage), saved_model);
+            assert!(requests.is_empty());
+            shutdown_manager(&manager);
+            return;
+        }
         while let Ok(envelope) = event_loop.sessions[index].handles.agent_rx.try_recv() {
             event_loop.handle_agent(index, Box::new(envelope));
         }
@@ -756,15 +1054,18 @@ fn managed_child_approval_is_pinned(
                 shutdown_manager(&manager);
                 return;
             }
+            assert_eq!(
+                event_loop.sessions[index]
+                    .app
+                    .plan_form
+                    .implementation_selection(),
+                &implementation_selection()
+            );
             event_loop.sessions[index].app.plan_approval_pending = true;
-            event_loop.sessions[index]
-                .app
-                .plan_form
-                .set_implementation_model(TARGET_MODEL.into(), SOURCE_MODEL);
             event_loop.prepare_plan_approval(
                 index,
                 clear_context,
-                Some(TARGET_MODEL.into()),
+                implementation_selection(),
                 false,
                 path.clone(),
             );
@@ -809,6 +1110,10 @@ fn managed_child_approval_is_pinned(
         }
         event_loop.handle_internal(committed);
         assert!(event_loop.sessions[index].pending_approval.is_none());
+        if !fail_checkpoint {
+            assert!(event_loop.sessions[index].app.state.fast_pending);
+        }
+        event_loop.sessions[index].app.state.fast_pending = false;
         if fail_checkpoint {
             let idle = child
                 .prepare_idle()
@@ -821,21 +1126,67 @@ fn managed_child_approval_is_pinned(
                 event_loop.sessions[index].app.status_bar.flash_text(),
                 Some(CHECKPOINT_FLASH)
             );
-        } else {
+            event_loop.sessions[index].app.active_chat = child_chat;
+            event_loop.sessions[index].app.sync_focused_queue();
+            event_loop.sync_orchestration();
+            assert!(!event_loop.sessions[index].app.plan_approval_pending);
+            assert_eq!(
+                event_loop.sessions[index]
+                    .app
+                    .plan_form
+                    .implementation_selection(),
+                &implementation_selection()
+            );
+            event_loop.sessions[index].app.plan_approval_pending = true;
+            event_loop.prepare_plan_approval(
+                index,
+                clear_context,
+                implementation_selection(),
+                false,
+                path.clone(),
+            );
+            let retry = next_ready(event_loop);
+            event_loop.handle_internal(retry);
+            let committed = next_ready(event_loop);
+            event_loop.handle_internal(committed);
+        }
+        {
             assert_eq!(
                 event_loop.sessions[index].app.chats[child_chat].last_message_text(),
                 read_plan(path.clone(), false).unwrap().message,
             );
             pump_until(event_loop, |_| !requests.is_empty());
-            let (model, _, messages, _) = requests.recv_timeout(WAIT).unwrap();
+            let (model, options, messages, _) = requests.recv_timeout(WAIT).unwrap();
             assert_eq!(model, TARGET_MODEL);
+            assert_eq!(options, implementation_options());
             assert_eq!(
                 messages
                     .iter()
                     .any(|message| message.user_text() == Some(CHILD_PROMPT)),
                 !clear_context
             );
-            assert_eq!(child.effective_config().unwrap().mode, AgentMode::Build);
+            assert_actor_selection(&child, TARGET_MODEL, implementation_options());
+            pump_until(event_loop, |_| child.snapshot().status == ActorStatus::Idle);
+            checkpoint(event_loop, index);
+            let restored = AppSession::load(session, &event_loop.ctx.storage).unwrap();
+            let stored = restored
+                .subagents()
+                .iter()
+                .find(|stored| stored.tool_use_id == child_key)
+                .unwrap();
+            assert_eq!(stored.model.as_deref(), Some(TARGET_MODEL_ID));
+            assert_eq!(stored.thinking, Some(options.thinking.into()));
+            assert_eq!(stored.fast, options.fast);
+            event_loop.sessions[index].app.active_chat = child_chat;
+            event_loop.sessions[index].app.sync_focused_queue();
+            assert!(!event_loop.sessions[index].app.plan_approval_pending);
+            assert_eq!(
+                event_loop.sessions[index]
+                    .app
+                    .plan_form
+                    .implementation_selection(),
+                &ModelSelection::default()
+            );
         }
         assert!(Arc::ptr_eq(
             &root_config,
@@ -884,7 +1235,7 @@ fn setup_with_registry(
         .spawn_runtime_with_provider(
             session,
             Some(PreparedProvider {
-                model: Model::from_spec(SOURCE_MODEL).unwrap(),
+                model: capable_model(SOURCE_MODEL),
                 provider: Arc::new(RecordingProvider {
                     requests: requests.clone(),
                     release: None,
@@ -897,10 +1248,10 @@ fn setup_with_registry(
     event_loop.sessions[index]
         .app
         .plan_form
-        .set_implementation_model(TARGET_MODEL.into(), SOURCE_MODEL);
+        .set_implementation_selection(implementation_selection(), SOURCE_MODEL);
     event_loop.ctx.prepare_provider = Arc::new(move |model, _| {
         Ok(PreparedModel {
-            model: model.clone(),
+            model: capable_model(&model.spec()),
             provider: Arc::new(RecordingProvider {
                 requests: requests.clone(),
                 release: None,
@@ -1030,12 +1381,32 @@ fn assert_preserved(
     run_id: u64,
     flash: Option<&str>,
 ) {
+    assert_preserved_selection(
+        event_loop,
+        host,
+        index,
+        path,
+        run_id,
+        flash,
+        &implementation_selection(),
+    );
+}
+
+fn assert_preserved_selection(
+    event_loop: &EventLoop<'_>,
+    host: &PluginHost,
+    index: usize,
+    path: &Path,
+    run_id: u64,
+    flash: Option<&str>,
+    selection: &ModelSelection,
+) {
     let app = &event_loop.sessions[index].app;
     assert_eq!(app.status_bar.flash_text(), flash);
     assert_eq!(app.root_config().model.spec(), SOURCE_MODEL);
     assert_eq!(app.root_mode(), Mode::Plan);
     assert_eq!(app.state.plan.path(), Some(path));
-    assert_eq!(app.plan_form.implementation_model(), Some(TARGET_MODEL));
+    assert_eq!(app.plan_form.implementation_selection(), selection);
     assert_eq!(app.run_id, run_id);
     assert!(
         app.state
@@ -1090,6 +1461,7 @@ fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool, prior_co
             smol::block_on(operation.wait_ready()).unwrap();
             operation.commit().unwrap();
         }
+        stage_with_picker(event_loop, index);
         let original_id = event_loop.sessions[index].id();
         let prefs = serde_json::to_value(read_prefs(&event_loop.ctx.storage)).unwrap();
         let stored_model = read_model(&event_loop.ctx.storage);
@@ -1153,13 +1525,11 @@ fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool, prior_co
         );
         let (model, options, messages, _) = requests.recv_timeout(WAIT).unwrap();
         assert_eq!(model, TARGET_MODEL);
-        assert_eq!(
-            options,
-            RequestOptions {
-                thinking: DomainThinkingConfig::Off,
-                fast: true
-            }
-            .clamped(&Model::from_spec(TARGET_MODEL).unwrap())
+        assert_eq!(options, implementation_options());
+        assert_actor_selection(
+            &manager.actor(root).unwrap(),
+            TARGET_MODEL,
+            implementation_options(),
         );
         assert_eq!(
             messages
@@ -1179,7 +1549,10 @@ fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool, prior_co
         assert_eq!(runtime.id(), original_id);
         assert_eq!(runtime.app.root_mode(), Mode::Build);
         assert_eq!(runtime.app.root_config().model.spec(), TARGET_MODEL);
-        assert_eq!(runtime.app.plan_form.implementation_model(), None);
+        assert_eq!(
+            runtime.app.plan_form.implementation_selection(),
+            &ModelSelection::default()
+        );
         let (manager, root) = runtime.handles.manager_and_root();
         assert_eq!(
             manager
@@ -1625,7 +1998,7 @@ fn stale_plan_path_rejects_approval() {
             index,
             vec![Action::ApprovePlan {
                 clear_context: true,
-                model: Some(TARGET_MODEL.into()),
+                selection: implementation_selection(),
                 parallel: true,
                 path: relative.clone(),
             }],
@@ -1633,13 +2006,14 @@ fn stale_plan_path_rejects_approval() {
         pump_until(event_loop, |event_loop| {
             !event_loop.sessions[index].app.plan_approval_pending
         });
-        assert_preserved(
+        assert_preserved_selection(
             event_loop,
             &host,
             index,
             &relative,
             run,
             Some(APPROVAL_CHANGED),
+            &ModelSelection::default(),
         );
         assert_eq!(
             manager
@@ -1689,8 +2063,9 @@ fn provider_preparation_failure_preserves_plan(fresh: bool) {
     });
 }
 
-#[test]
-fn cancel_during_provider_preparation_ignores_late_result() {
+#[test_case(false; "keep_context")]
+#[test_case(true; "clear_context")]
+fn cancel_during_provider_preparation_ignores_late_result(clear_context: bool) {
     with_event_loop(|event_loop| {
         let (index, path, requests, host) = setup(event_loop);
         let run = event_loop.sessions[index].app.run_id;
@@ -1710,7 +2085,7 @@ fn cancel_during_provider_preparation_ignores_late_result() {
                 }),
             })
         });
-        approve(event_loop, index, false);
+        approve(event_loop, index, clear_context);
         entry.recv_timeout(WAIT).unwrap();
         event_loop.dispatch(index, vec![Action::CancelPlanApproval]);
         let cancelled = next_ready(event_loop);
@@ -1812,8 +2187,8 @@ fn without_override_uses_actor_predecessor(fresh: bool) {
             event_loop.sessions[index]
                 .app
                 .plan_form
-                .implementation_model(),
-            None
+                .implementation_selection(),
+            &ModelSelection::default()
         );
         let (record, recorded) = flume::unbounded();
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
@@ -1922,8 +2297,8 @@ fn busy_rejection_preserves_active_turn(fresh: bool) {
             event_loop.sessions[index]
                 .app
                 .plan_form
-                .implementation_model(),
-            Some(TARGET_MODEL)
+                .implementation_selection(),
+            &implementation_selection()
         );
         assert!(!event_loop.sessions[index].app.plan_approval_pending);
         assert_eq!(
