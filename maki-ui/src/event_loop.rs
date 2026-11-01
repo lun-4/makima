@@ -1750,7 +1750,10 @@ impl<'t> EventLoop<'t> {
                 let _ = internal_tx.send(InternalEvent::ModelCapabilitiesResolved);
             }
         });
-        let model_completion = Arc::new(ModelArgSource::new(catalog.specs()));
+        let model_completion = Arc::new(ModelArgSource::new(
+            catalog.specs(),
+            Arc::clone(&model_capabilities),
+        ));
         let theme_completion = Arc::new(ThemeArgSource::new(
             crate::theme::default_provider().clone(),
         ));
@@ -5836,7 +5839,10 @@ mod tests {
             let command_runtime = Arc::new(CommandRuntime::new_for_test(
                 &[],
                 command_registry,
-                Arc::new(ModelArgSource::new(catalog.specs())),
+                Arc::new(ModelArgSource::new(
+                    catalog.specs(),
+                    crate::model_capabilities::test_support::seeded(&[], &[]),
+                )),
                 Arc::new(ThemeArgSource::new(
                     crate::theme::default_provider().clone(),
                 )),
@@ -7774,9 +7780,15 @@ mod tests {
             let items = complete(&original);
             assert!(items.iter().any(|spec| spec == ALLOWED));
             assert!(!items.iter().any(|spec| spec == EXCLUDED));
-            assert!(items.iter().any(|spec| spec == "thinking=high"));
-            assert!(items.iter().any(|spec| spec == "fast=true"));
             let config = target.actor().unwrap().effective_config().unwrap();
+            assert_eq!(
+                items.iter().any(|spec| spec == "thinking=high"),
+                config.model.supports_thinking()
+            );
+            assert_eq!(
+                items.iter().any(|spec| spec == "fast=true"),
+                config.model.supports_fast()
+            );
             let current = |spec: &str| {
                 let mut selection = config.model_selection();
                 selection.spec = Arc::from(spec);

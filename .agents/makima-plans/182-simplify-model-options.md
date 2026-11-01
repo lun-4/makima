@@ -41,7 +41,7 @@ Session options go back to their own definitions on `mistress` (`thinking_defini
 
 The picker asks the cache from `refresh()`, which the app already polls. The current model's capabilities come synchronously from its prepared `Model` at open, so the common case never waits. This removes `ModelCapabilityRequest`, `model_picker_generation`, the picker fields of `OrchestrationRevision`, `sync_model_capabilities`, and the ready and invalidated events.
 
-Command completion goes back to static option suggestions, as on `mistress`: spec completion no longer waits on a live target, an actor snapshot and provider preparation, and commit-time validation rejects unsupported values with a clear error. This is a deliberate scope reduction from the PR's plan. The shared `resolve_model_spec` helper and its identity tests go with it.
+Command completion iterates `ModelOption::ALL` and offers the options the named model supports, resolved through the same cache with the shared `resolve_model` identity resolution, or those of the target's current model when no model is named. It needs no projection identities or revisions: a stale suggestion is harmless because applying the selection validates again.
 
 ### Picker drafts without conflicts
 
@@ -72,5 +72,6 @@ The repository's pre-commit hook runs `just ci`, so every commit has to build an
 3. Treat approval overrides like other model selections for the saved `/fast` wish: drop it when approval starts, which removes `ApprovalPendingFast`. `set_model_with_claim` delegates to `commit_patch`.
 4. Consolidate the docs and regenerate them.
 5. Rename leftovers and record what landed.
+6. Make completion follow the named or current model's capabilities again, through the cache.
 
 An approval with an explicit model or fast override now drops a restored `/fast` wish even if the approval later fails or is cancelled. That matches ordinary model selection, and it is the one behaviour change from the PR as reviewed.

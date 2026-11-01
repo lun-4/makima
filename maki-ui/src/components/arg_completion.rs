@@ -13,20 +13,31 @@ use maki_commands::{
     CompletionSessionId, InvocationTargetId, MAX_COMPLETION_CANDIDATES,
 };
 
+use maki_agent::command::resolve_model;
 use maki_lua::orchestration::TrustedTarget;
-use maki_providers::ModelOption;
+use maki_providers::{ModelCapabilities, ModelOption};
+
+use crate::model_capabilities::ModelCapabilityCache;
 
 const PATH_COMPLETION_BATCH_SIZE: usize = 64;
 
+/// Completes `/model` arguments: model specs, then `key=value` options the
+/// named model supports, or the target's current model when none is named.
+/// Without targets there is no current model, so every option is offered.
 pub(crate) struct ModelArgSource {
     models: Arc<ArcSwapOption<Vec<String>>>,
+    capabilities: Arc<ModelCapabilityCache>,
     targets: Option<Arc<Mutex<HashMap<InvocationTargetId, TrustedTarget>>>>,
 }
 
 impl ModelArgSource {
-    pub(crate) fn new(models: Arc<ArcSwapOption<Vec<String>>>) -> Self {
+    pub(crate) fn new(
+        models: Arc<ArcSwapOption<Vec<String>>>,
+        capabilities: Arc<ModelCapabilityCache>,
+    ) -> Self {
         Self {
             models,
+            capabilities,
             targets: None,
         }
     }
@@ -37,6 +48,7 @@ impl ModelArgSource {
     ) -> Self {
         Self {
             models: Arc::clone(&self.models),
+            capabilities: Arc::clone(&self.capabilities),
             targets: Some(targets),
         }
     }
@@ -195,7 +207,7 @@ impl CommandCompletion for ModelArgSource {
                 .filter(|target| target.target.validate_live().is_ok())
                 .cloned()
         });
-        let mut items = self.models.load_full().map_or_else(Vec::new, |specs| {
+        let allowed: Vec<Arc<str>> = self.models.load_full().map_or_else(Vec::new, |specs| {
             specs
                 .iter()
                 .filter(|spec| {
@@ -204,11 +216,7 @@ impl CommandCompletion for ModelArgSource {
                             .as_ref()
                             .is_some_and(|target| target.template.model_policy.allows(spec))
                 })
-                .map(|spec| CompletionItem {
-                    label: Arc::from(spec.as_str()),
-                    insertion: Arc::from(spec.as_str()),
-                    description: None,
-                })
+                .map(|spec| Arc::from(spec.as_str()))
                 .collect()
         });
         let preceding = context
@@ -220,55 +228,102 @@ impl CommandCompletion for ModelArgSource {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        if preceding.iter().any(|value| !value.contains('=')) || context.argument.contains('=') {
-            items.clear();
-        }
         let range = context.argument_range.as_ref();
-        let embedded_options = range
-            .and_then(|range| context.arguments[..range.start].rfind('{'))
-            .map(|open| {
-                let end = context.arguments[open..]
-                    .find('}')
-                    .map_or(context.arguments.len(), |end| open + end);
-                (open + 1, end)
-            });
-        if embedded_options.is_some() {
-            items.clear();
+        let open_brace = range.and_then(|range| context.arguments[..range.start].rfind('{'));
+        let named_model = match open_brace {
+            Some(open) => {
+                let head = &context.arguments[..open];
+                head.rsplit(char::is_whitespace)
+                    .next()
+                    .map(|token| token.trim_matches('"'))
+            }
+            None => preceding.iter().copied().find(|value| !value.contains('=')),
         }
-        for option in ModelOption::ALL {
-            let key = option.key();
-            let prefix = format!("{key}=");
-            let duplicate = embedded_options.map_or_else(
-                || preceding.iter().any(|value| value.starts_with(&prefix)),
-                |(start, end)| {
-                    context.arguments[start..end]
-                        .split(',')
-                        .scan(start, |offset, option| {
-                            let option_start = *offset;
-                            *offset += option.len() + 1;
-                            Some((option_start, option))
-                        })
-                        .any(|(start, option)| {
-                            let start = start + option.len() - option.trim_start().len();
-                            range.is_none_or(|range| start != range.start)
-                                && option.trim_start().starts_with(&prefix)
-                        })
+        .filter(|argument| !argument.is_empty())
+        .map(str::to_owned);
+        let mut items: Vec<CompletionItem> =
+            if named_model.is_some() || open_brace.is_some() || context.argument.contains('=') {
+                Vec::new()
+            } else {
+                allowed
+                    .iter()
+                    .map(|spec| CompletionItem {
+                        label: Arc::clone(spec),
+                        insertion: Arc::clone(spec),
+                        description: None,
+                    })
+                    .collect()
+            };
+        let embedded_options = open_brace.map(|open| {
+            let end = context.arguments[open..]
+                .find('}')
+                .map_or(context.arguments.len(), |end| open + end);
+            (open + 1, end)
+        });
+        let candidates: Vec<ModelOption> = ModelOption::ALL
+            .into_iter()
+            .filter(|option| {
+                let prefix = format!("{}=", option.key());
+                let duplicate = embedded_options.map_or_else(
+                    || preceding.iter().any(|value| value.starts_with(&prefix)),
+                    |(start, end)| {
+                        context.arguments[start..end]
+                            .split(',')
+                            .scan(start, |offset, option| {
+                                let option_start = *offset;
+                                *offset += option.len() + 1;
+                                Some((option_start, option))
+                            })
+                            .any(|(start, option)| {
+                                let start = start + option.len() - option.trim_start().len();
+                                range.is_none_or(|range| start != range.start)
+                                    && option.trim_start().starts_with(&prefix)
+                            })
+                    },
+                );
+                !duplicate
+                    && (!context.argument.contains('=') || context.argument.starts_with(&prefix))
+            })
+            .collect();
+        let current = target
+            .as_ref()
+            .and_then(|target| target.target.effective_config().ok().flatten())
+            .map(|config| ModelCapabilities::from(&config.model));
+        let unconstrained = self.targets.is_none();
+        let cache = Arc::clone(&self.capabilities);
+        Box::pin(async move {
+            let capabilities = match named_model {
+                Some(argument) => match resolve_model(&argument, &allowed) {
+                    Ok(spec)
+                        if target
+                            .as_ref()
+                            .is_none_or(|target| target.template.model_policy.allows(&spec)) =>
+                    {
+                        Some(cache.resolve(&spec).await)
+                    }
+                    _ => None,
                 },
-            );
-            if !duplicate
-                && (!context.argument.contains('=') || context.argument.starts_with(&prefix))
-            {
+                None => current,
+            };
+            for option in candidates {
+                let supported = match capabilities {
+                    Some(capabilities) => capabilities.supports(option),
+                    None => unconstrained,
+                };
+                if !supported {
+                    continue;
+                }
                 items.extend(option.presets().iter().map(|value| {
-                    let insertion: Arc<str> = Arc::from(format!("{key}={value}"));
+                    let insertion: Arc<str> = Arc::from(format!("{}={value}", option.key()));
                     CompletionItem {
                         label: Arc::clone(&insertion),
                         insertion,
-                        description: None,
+                        description: Some(Arc::from(option.description())),
                     }
                 }));
             }
-        }
-        Box::pin(async move { Ok(items) })
+            Ok(items)
+        })
     }
 }
 
@@ -417,6 +472,10 @@ mod tests {
         TargetCapabilities,
     };
     use maki_providers::{MODEL_FAST_KEY, MODEL_THINKING_KEY};
+
+    use crate::model_capabilities::test_support::{ALL_OPTIONS, THINKING_ONLY, seeded};
+
+    const THINKING_ONLY_MODEL: &str = "zai/glm-5";
     use test_case::test_case;
 
     use crate::components::file_completion::{FileCandidate, FileResolver, PathDiscovery};
@@ -504,6 +563,8 @@ mod tests {
     #[test_case("thinking=high fast=true ", "", 2, true, false, false ; "options_selected")]
     #[test_case("thinking=", "thinking=", 0, false, true, false ; "thinking_value")]
     #[test_case("fast=", "fast=", 0, false, false, true ; "fast_value")]
+    #[test_case("zai/glm-5 ", "", 1, false, true, false ; "named_model_lacks_fast")]
+    #[test_case("glm ", "", 1, false, true, false ; "fuzzy_named_model_lacks_fast")]
     fn model_completion_offers_only_remaining_selection_fields(
         input: &str,
         argument: &str,
@@ -522,9 +583,19 @@ mod tests {
             .replace(vec![Registration {
                 spec: definition.spec(),
                 behavior: Arc::new(NoBehavior),
-                argument_completions: vec![Some(Arc::new(ModelArgSource::new(Arc::new(
-                    ArcSwapOption::from(Some(Arc::new(vec!["openai/gpt-5".into()]))),
-                ))))],
+                argument_completions: vec![Some(Arc::new(ModelArgSource::new(
+                    Arc::new(ArcSwapOption::from(Some(Arc::new(vec![
+                        "openai/gpt-5".into(),
+                        THINKING_ONLY_MODEL.into(),
+                    ])))),
+                    seeded(
+                        &[
+                            ("openai/gpt-5", ALL_OPTIONS),
+                            (THINKING_ONLY_MODEL, THINKING_ONLY),
+                        ],
+                        &[],
+                    ),
+                )))],
             }])
             .unwrap();
         let target = registry.bind_target(TargetCapabilities::ALL, Arc::new(NoBehavior));

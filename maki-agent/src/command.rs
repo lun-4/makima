@@ -392,7 +392,9 @@ fn parsed_directory_argument(
         .transpose()
 }
 
-fn resolve_model(argument: &str, specs: &[Arc<str>]) -> Result<Arc<str>, CommandError> {
+/// Resolves a `/model` argument: an exact `provider/model`, or a fuzzy match
+/// against `specs`.
+pub fn resolve_model(argument: &str, specs: &[Arc<str>]) -> Result<Arc<str>, CommandError> {
     if argument.contains('/') {
         Model::from_spec(argument)
             .map_err(|error| CommandError::Producer(Arc::from(error.to_string())))?;

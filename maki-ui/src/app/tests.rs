@@ -350,6 +350,7 @@ fn build_app_with_full(
         registry,
         Arc::new(crate::components::arg_completion::ModelArgSource::new(
             Arc::new(ArcSwapOption::empty()),
+            seeded(&[], &[]),
         )),
         Arc::new(crate::components::arg_completion::ThemeArgSource::new(
             Arc::new(crate::theme::InMemoryThemesProvider::bundled()),
@@ -398,6 +399,7 @@ fn app_with_custom_commands(commands: &[CustomCommand]) -> App {
         maki_commands::CommandRegistry::new(),
         Arc::new(crate::components::arg_completion::ModelArgSource::new(
             Arc::new(ArcSwapOption::empty()),
+            seeded(&[], &[]),
         )),
         Arc::new(crate::components::arg_completion::ThemeArgSource::new(
             Arc::new(crate::theme::InMemoryThemesProvider::bundled()),

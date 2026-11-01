@@ -64,6 +64,25 @@ impl ModelCapabilityCache {
         None
     }
 
+    /// Returns the capabilities of `spec`, waiting for them if needed.
+    pub(crate) async fn resolve(self: &Arc<Self>, spec: &str) -> ModelCapabilities {
+        let epoch = {
+            let state = self.lock();
+            if let Some(capabilities) = state.resolved.get(spec) {
+                return *capabilities;
+            }
+            state.epoch
+        };
+        let cache = Arc::clone(self);
+        let spec: Arc<str> = Arc::from(spec);
+        smol::unblock(move || {
+            let capabilities = (cache.resolve)(&spec);
+            cache.store(spec, epoch, capabilities);
+            capabilities
+        })
+        .await
+    }
+
     /// Forgets everything, for when discovery or provider auth changes what
     /// a spec resolves to. Resolutions already running are discarded.
     pub(crate) fn clear(&self) {
@@ -114,6 +133,10 @@ pub(crate) mod test_support {
     pub(crate) const THINKING_ONLY: ModelCapabilities = ModelCapabilities {
         thinking: ThinkingSupport::Yes,
         fast: false,
+    };
+    pub(crate) const ALL_OPTIONS: ModelCapabilities = ModelCapabilities {
+        thinking: ThinkingSupport::Yes,
+        fast: true,
     };
 
     /// A cache holding `resolved`, with `pending` resolving forever, so
