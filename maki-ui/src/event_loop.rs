@@ -1062,24 +1062,16 @@ impl SessionRuntime {
             |projected| projected.config.mode.clone(),
         );
         self.app.update_model(&commit.config.model);
-        self.resolve_pending_fast();
-        self.app.project_root_mode(&previous, &commit.config.mode);
-        self.settle_plan_approval();
-        true
-    }
-
-    fn resolve_pending_fast(&mut self) {
-        let Some(commit) = self.projected_config.clone() else {
-            return;
-        };
-        if !self.defer_pending_fast_for_approval(&commit)
-            && self
-                .app
-                .state
-                .resolve_pending_fast(commit.config.fast, &commit.config.model)
+        if self
+            .app
+            .state
+            .resolve_pending_fast(commit.config.fast, &commit.config.model)
         {
             self.restore_pending_fast(commit.config.model.spec());
         }
+        self.app.project_root_mode(&previous, &commit.config.mode);
+        self.settle_plan_approval();
+        true
     }
 
     /// Commits a saved `/fast` that was restored while discovery was pending,
@@ -1121,7 +1113,7 @@ impl SessionRuntime {
 
     /// An explicit choice of model or fast for the root replaces a restored
     /// `/fast` wish. Returns whether one was pending.
-    fn drop_pending_fast(&mut self, target: &AgentRef) -> bool {
+    pub(super) fn drop_pending_fast(&mut self, target: &AgentRef) -> bool {
         let (_, root) = self.handles.manager_and_root();
         target.id() == root && std::mem::take(&mut self.app.state.fast_pending)
     }

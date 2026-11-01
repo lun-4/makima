@@ -307,7 +307,6 @@ mod selection_tests {
     use crate::AgentMode;
 
     const MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
-    const THINKING_BUDGET: u32 = 8192;
 
     #[test_case(None, Some(false), ThinkingConfig::Off, false; "disable_fast_preserves_thinking")]
     #[test_case(Some(ThinkingConfig::Effort(Effort::Low)), None, ThinkingConfig::Effort(Effort::Low), true; "thinking_preserves_fast")]
@@ -330,27 +329,6 @@ mod selection_tests {
         assert_eq!(&*selection.spec, MODEL_SPEC);
         assert_eq!(selection.thinking, expected_thinking);
         assert_eq!(selection.fast, expected_fast);
-    }
-
-    #[test_case(None, None; "omitted_options")]
-    #[test_case(Some(ThinkingConfig::Off), Some(false); "explicitly_disabled")]
-    #[test_case(Some(ThinkingConfig::Effort(Effort::Low)), Some(true); "enabled_options")]
-    #[test_case(Some(ThinkingConfig::Budget(THINKING_BUDGET)), None; "budget_only")]
-    fn model_selection_preserves_partial_options(
-        thinking: Option<ThinkingConfig>,
-        fast: Option<bool>,
-    ) {
-        let selection = ModelSelection {
-            spec: Some(MODEL_SPEC.into()),
-            thinking,
-            fast,
-        };
-        let patch = ConfigPatch::from_model_selection(&selection);
-        assert_eq!(patch.thinking, thinking);
-        assert_eq!(patch.fast, fast);
-        assert!(patch.model.is_none());
-        assert!(patch.workflow.is_none());
-        assert!(!patch.toggle_thinking);
     }
 }
 

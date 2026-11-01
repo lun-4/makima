@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use maki_agent::actor::{
     ActorIdleGuard, ActorSourceSnapshot, ConfigChange, ConfigCommit, HistoryChange,
@@ -40,34 +40,6 @@ pub(super) struct PendingPlanApproval {
     committing: bool,
     target: AgentId,
     publication: CheckpointPublication,
-    pending_fast: ApprovalPendingFast,
-}
-
-#[derive(Default)]
-enum ApprovalPendingFast {
-    #[default]
-    Preserve,
-    ReplaceOnCommit(Arc<OnceLock<ConfigCommit>>),
-}
-
-impl ApprovalPendingFast {
-    fn for_selection(selection: &ModelSelection, root: bool) -> Self {
-        if root && (selection.spec.is_some() || selection.fast.is_some()) {
-            Self::ReplaceOnCommit(Arc::default())
-        } else {
-            Self::Preserve
-        }
-    }
-
-    fn supersedes(&self, commit: &ConfigCommit) -> bool {
-        match self {
-            Self::Preserve => false,
-            Self::ReplaceOnCommit(published) => published.get().is_some_and(|published| {
-                Arc::ptr_eq(&published.identity, &commit.identity)
-                    && published.generation <= commit.generation
-            }),
-        }
-    }
 }
 
 impl Drop for PendingPlanApproval {
@@ -151,19 +123,6 @@ impl SessionRuntime {
         self.app.plan_approval_pending = true;
     }
 
-    pub(super) fn defer_pending_fast_for_approval(&mut self, commit: &ConfigCommit) -> bool {
-        let Some(pending) = &self.pending_approval else {
-            return false;
-        };
-        if pending.pending_fast.supersedes(commit) {
-            self.app.state.fast_pending = false;
-        }
-        matches!(
-            pending.pending_fast,
-            ApprovalPendingFast::ReplaceOnCommit(_)
-        )
-    }
-
     pub(super) fn end_plan_approval(&mut self) {
         if let Some(pending) = self.pending_approval.as_ref()
             && pending.committing
@@ -176,7 +135,6 @@ impl SessionRuntime {
         } else {
             self.app.plan_approval_pending = false;
         }
-        self.resolve_pending_fast();
     }
 
     pub(super) fn settle_plan_approval(&mut self) {
@@ -186,7 +144,6 @@ impl SessionRuntime {
             })
         {
             self.pending_approval = None;
-            self.resolve_pending_fast();
         }
     }
 
@@ -429,7 +386,6 @@ impl EventLoop<'_> {
             committing: false,
             target,
             publication,
-            pending_fast: ApprovalPendingFast::default(),
         });
         let session = runtime.id();
         let runtime_identity = runtime.handles.identity();
@@ -508,8 +464,6 @@ impl EventLoop<'_> {
                 .map_err(|error| error.to_string())?;
             let transaction =
                 self.reserve_history_transaction(idx, &target, publication.clone())?;
-            let pending_fast =
-                ApprovalPendingFast::for_selection(&request.selection, target.id() == root);
             Ok((
                 target,
                 request,
@@ -520,36 +474,15 @@ impl EventLoop<'_> {
                 operation,
                 publication,
                 transaction,
-                pending_fast,
             ))
         })();
-        let (
-            target,
-            request,
-            source,
-            template,
-            mode,
-            idle,
-            operation,
-            publication,
-            mut transaction,
-            pending_fast,
-        ) = match prepared {
-            Ok(prepared) => prepared,
-            Err(error) => return self.sessions[idx].abort_plan_approval(error),
-        };
-        if let ApprovalPendingFast::ReplaceOnCommit(published) = &pending_fast {
-            let published = Arc::clone(published);
-            let prepare_transaction = transaction;
-            transaction = Box::new(move |config, clear_context| {
-                let mut transaction = prepare_transaction(config, clear_context)?;
-                let finalize = transaction.finalize;
-                transaction.finalize = Box::new(move |commit| {
-                    finalize(commit);
-                    let _ = published.set(commit.clone());
-                });
-                Ok(transaction)
-            });
+        let (target, request, source, template, mode, idle, operation, publication, transaction) =
+            match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => return self.sessions[idx].abort_plan_approval(error),
+            };
+        if request.selection.spec.is_some() || request.selection.fast.is_some() {
+            self.sessions[idx].drop_pending_fast(&target);
         }
         let absolute = if request.path.is_absolute() {
             request.path.clone()
@@ -594,8 +527,5 @@ impl EventLoop<'_> {
                 transaction,
             })))
         });
-        if let Some(pending) = self.sessions[idx].pending_approval.as_mut() {
-            pending.pending_fast = pending_fast;
-        }
     }
 }

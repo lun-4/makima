@@ -353,20 +353,15 @@ mod tests {
 
     use maki_config::ModelPolicy;
     use maki_domain::{ModelSelection, ThinkingConfig};
-    use maki_providers::provider::Provider;
     use test_case::test_case;
 
-    use crate::tools::NullProvider;
-
     use super::{
-        ConfigChangeError, ModelPreparer, PreparedModel, SessionOptionError, prepare_model,
-        prepare_selection,
+        ConfigChangeError, ModelPreparer, SessionOptionError, prepare_model, prepare_selection,
     };
 
     const ALLOWED_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
     const DISALLOWED_SPEC: &str = "openai/gpt-5";
     const PREPARE_FAILED: &str = "provider preparation failed";
-    const PREPARED_CONTEXT_WINDOW: u32 = 123_456;
 
     #[test_case(None; "thinking_only")]
     #[test_case(Some(false); "explicit_false")]
@@ -385,35 +380,6 @@ mod tests {
         ))
         .unwrap();
         assert!(patch.model.is_none());
-        assert_eq!(patch.fast, selection.fast);
-        assert_eq!(patch.thinking, selection.thinking);
-    }
-
-    #[test]
-    fn prepare_selection_preserves_prepared_model_and_options() {
-        let expected_provider: Arc<dyn Provider> = Arc::new(NullProvider);
-        let provider = Arc::clone(&expected_provider);
-        let prepare: ModelPreparer = Arc::new(move |mut model| {
-            assert_eq!(model.spec(), ALLOWED_SPEC);
-            model.context_window = PREPARED_CONTEXT_WINDOW;
-            let provider = Arc::clone(&provider);
-            Box::pin(async move { Ok(PreparedModel { model, provider }) })
-        });
-        let selection = ModelSelection {
-            spec: Some(ALLOWED_SPEC.into()),
-            thinking: Some(ThinkingConfig::Off),
-            fast: Some(false),
-        };
-        let patch = smol::block_on(prepare_selection(
-            &selection,
-            &ModelPolicy::default(),
-            &prepare,
-        ))
-        .unwrap();
-        let model = patch.model.unwrap();
-        assert_eq!(model.model.spec(), ALLOWED_SPEC);
-        assert_eq!(model.model.context_window, PREPARED_CONTEXT_WINDOW);
-        assert!(Arc::ptr_eq(&model.provider, &expected_provider));
         assert_eq!(patch.fast, selection.fast);
         assert_eq!(patch.thinking, selection.thinking);
     }

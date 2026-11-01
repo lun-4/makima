@@ -7,12 +7,10 @@ use maki_providers::model::FastSupport;
 use test_case::test_case;
 
 use super::{
-    Action, ActorStatus, AppSession, ApprovalStep, EventLoop, InternalEvent, Status, TARGET_MODEL,
-    WAIT, apply_patch, approve, capable_model, final_ready, next_ready, pump_until, setup,
+    ActorStatus, AppSession, ApprovalStep, EventLoop, InternalEvent, Status, TARGET_MODEL, WAIT,
+    apply_patch, approve, capable_model, final_ready, next_ready, pump_until, setup,
     with_event_loop,
 };
-
-const CHECKPOINT_FAILURE: &str = "pending-fast approval checkpoint failed";
 
 fn set_fast_support(
     event_loop: &mut EventLoop<'_>,
@@ -62,19 +60,13 @@ fn committed_config(event: &InternalEvent) -> ConfigCommit {
     committed.config.clone()
 }
 
-#[test_case(false, false, false; "identity_supported_ready_first")]
-#[test_case(false, false, true; "identity_supported_subscription_first")]
-#[test_case(false, true, false; "identity_pending_ready_first")]
-#[test_case(false, true, true; "identity_pending_subscription_first")]
-#[test_case(true, false, false; "fast_supported_ready_first")]
-#[test_case(true, false, true; "fast_supported_subscription_first")]
-#[test_case(true, true, false; "fast_pending_ready_first")]
-#[test_case(true, true, true; "fast_pending_subscription_first")]
-fn explicit_root_approval_supersedes_saved_fast(
-    fast_only: bool,
-    pending: bool,
-    subscription_first: bool,
-) {
+/// An explicit model or fast choice replaces a restored `/fast` wish as soon
+/// as approval starts, the same as an ordinary model selection does.
+#[test_case(false, false; "identity_supported")]
+#[test_case(false, true; "identity_pending")]
+#[test_case(true, false; "fast_supported")]
+#[test_case(true, true; "fast_pending")]
+fn explicit_root_approval_supersedes_saved_fast(fast_only: bool, pending: bool) {
     with_event_loop(|event_loop| {
         let (index, _, requests, _host) = setup(event_loop);
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
@@ -101,24 +93,16 @@ fn explicit_root_approval_supersedes_saved_fast(
             Ok(prepared)
         });
         approve(event_loop, index, false);
+        assert!(!event_loop.sessions[index].app.state.fast_pending);
         let prepared = final_ready(event_loop, &requests);
-        assert!(event_loop.sessions[index].app.state.fast_pending);
         event_loop.handle_internal(prepared);
         let committed = next_ready(event_loop);
-        let config = committed_config(&committed);
-        assert!(!config.config.fast);
-        if subscription_first {
-            assert!(event_loop.sessions[index].project_config(&config));
-            assert!(!event_loop.sessions[index].app.state.fast_pending);
-        }
+        assert!(!committed_config(&committed).config.fast);
         event_loop.handle_internal(committed);
-        assert!(!event_loop.sessions[index].app.state.fast_pending);
-        assert!(!event_loop.sessions[index].project_config(&config));
         if pending {
             let discovered = set_fast_support(event_loop, index, &actor, FastSupport::Supported);
             assert!(!discovered.config.fast);
         }
-        assert!(!settled_fast(event_loop, index));
         pump_until(event_loop, |event_loop| {
             !event_loop.sessions[index].app.plan_approval_pending
                 && event_loop.sessions[index].app.status == Status::Idle
@@ -126,78 +110,7 @@ fn explicit_root_approval_supersedes_saved_fast(
                 && !requests.is_empty()
         });
         assert!(!requests.recv_timeout(WAIT).unwrap().1.fast);
-        assert!(!event_loop.sessions[index].app.state.fast_pending);
         assert!(!settled_fast(event_loop, index));
-    });
-}
-
-#[test_case(false, false; "cancel_pending")]
-#[test_case(false, true; "cancel_supported")]
-#[test_case(true, false; "checkpoint_failure_pending")]
-#[test_case(true, true; "checkpoint_failure_supported")]
-fn unsuccessful_root_approval_preserves_saved_fast(checkpoint_failure: bool, supported: bool) {
-    with_event_loop(|event_loop| {
-        let (index, _, requests, _host) = setup(event_loop);
-        let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
-        let actor = manager.actor(root).unwrap();
-        let projected = event_loop.sessions[index].projected_config.clone();
-        let source = set_fast_support(
-            event_loop,
-            index,
-            &actor,
-            if supported {
-                FastSupport::Supported
-            } else {
-                FastSupport::Pending
-            },
-        );
-        event_loop.sessions[index].app.state.fast_pending = true;
-        event_loop.sessions[index]
-            .app
-            .plan_form
-            .set_implementation_selection(ModelSelection {
-                fast: Some(false),
-                ..Default::default()
-            });
-        approve(event_loop, index, false);
-        let mut prepared = final_ready(event_loop, &requests);
-        if supported {
-            event_loop.sessions[index].projected_config = projected;
-            assert!(event_loop.sessions[index].project_config(&source));
-        }
-        assert!(event_loop.sessions[index].app.state.fast_pending);
-        if checkpoint_failure {
-            let InternalEvent::PlanApprovalReady {
-                result: Ok(ApprovalStep::Prepared(approval)),
-                ..
-            } = &mut prepared
-            else {
-                unreachable!()
-            };
-            approval.transaction.publish =
-                Box::new(|_, _| Box::pin(async { Err(CHECKPOINT_FAILURE.into()) }));
-            event_loop.handle_internal(prepared);
-            let failed = next_ready(event_loop);
-            assert!(
-                matches!(&failed, InternalEvent::PlanApprovalReady { result: Err(error), .. }
-                if error.contains(CHECKPOINT_FAILURE))
-            );
-            event_loop.handle_internal(failed);
-        } else {
-            event_loop.dispatch(index, vec![Action::CancelPlanApproval]);
-            event_loop.handle_internal(prepared);
-        }
-        assert!(!event_loop.sessions[index].app.plan_approval_pending);
-        assert_eq!(
-            event_loop.sessions[index].app.state.fast_pending,
-            !supported
-        );
-        if !supported {
-            set_fast_support(event_loop, index, &actor, FastSupport::Supported);
-        }
-        assert!(settled_fast(event_loop, index));
-        assert!(!event_loop.sessions[index].app.state.fast_pending);
-        assert!(requests.is_empty());
     });
 }
 

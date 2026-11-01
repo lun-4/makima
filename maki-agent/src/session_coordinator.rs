@@ -23,9 +23,7 @@ use crate::actor::{
     PreparedTransaction,
 };
 use crate::cancel::{CancelToken, CancelTrigger, PublicationRegistration};
-use crate::config_change::{
-    ConfigChangeError, ConfigChangeTicket, prepare_patch, prepare_selection, reserve_in_turn,
-};
+use crate::config_change::{ConfigChangeError, ConfigChangeTicket, prepare_patch, reserve_in_turn};
 use crate::manager::AgentRef;
 use crate::session_options::{
     DISABLED_VALUE, ENABLED_VALUE, FAST_OPTION_ID, FreeValueDomain, MODEL_OPTION_ID,
@@ -897,15 +895,13 @@ impl SessionCoordinatorHandle {
         publication: CheckpointPublication,
         claim: CheckpointClaim,
     ) -> Result<SessionOptionsSnapshot, ConfigChangeError> {
-        let (binding, ticket) = self.reserve_actor_change(publication)?;
-        let policy = &self.read.model_policy;
-        ticket
-            .commit(async |_, _| {
-                let patch = prepare_selection(&selection, policy, &binding.prepare_model).await?;
-                Ok((claim, ConfigChange::Patch(patch)))
-            })
-            .await?;
-        Ok(self.read.options())
+        self.commit_patch(
+            selection.spec.clone(),
+            ConfigPatch::from_model_selection(&selection),
+            publication,
+            claim,
+        )
+        .await
     }
 
     pub async fn change_directory(&self, path: PathBuf) -> Result<PathBuf, ConfigChangeError> {
