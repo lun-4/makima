@@ -67,8 +67,8 @@ use maki_agent::actor::{EffectiveAgentConfig, TranscriptRequest};
 use maki_agent::agent::isolated_turn::IsolatedTurnRequest;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
-    AgentEvent, AgentId, AgentInput, AgentMode, AgentRef, Envelope, ImageMediaType, ImageSource,
-    McpConfigErrors, McpPromptRef, McpSnapshotReader, Post, SharedBuf, SharedMessages,
+    ActorWorkKind, AgentEvent, AgentId, AgentInput, AgentMode, AgentRef, Envelope, ImageMediaType,
+    ImageSource, McpConfigErrors, McpPromptRef, McpSnapshotReader, Post, SharedBuf, SharedMessages,
     SubagentInfo, TurnCompleteEvent,
 };
 use maki_commands::{
@@ -2087,7 +2087,14 @@ impl App {
             && presentation > self.run_id
             && self.queue.accepts_actor_presentation(presentation)
         {
-            self.record_run_start(presentation);
+            if envelope
+                .identity
+                .is_some_and(|identity| matches!(identity.kind, ActorWorkKind::Compact { .. }))
+            {
+                self.record_presentation_start(presentation);
+            } else {
+                self.record_run_start(presentation);
+            }
         }
     }
 
@@ -2442,7 +2449,14 @@ impl App {
                     self.status = Status::error(message.clone());
                     self.status_bar.clear_flash();
                     self.terminalize_turn(&message);
-                    self.recoverable_queue = self.queue.root_text_messages();
+                    let pending = self.queue.root_text_messages();
+                    if envelope.identity.is_some_and(|identity| {
+                        matches!(identity.kind, ActorWorkKind::Compact { .. })
+                    }) {
+                        self.recoverable_queue.extend(pending);
+                    } else {
+                        self.recoverable_queue = pending;
+                    }
                     self.queue.clear_root_user_work();
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Error;
