@@ -1,5 +1,7 @@
 # Shared model-option specification and plan approval
 
+The option descriptors, capability resolver and retained-conflict picker described here were later simplified; see [182-simplify-model-options.md](182-simplify-model-options.md).
+
 ## Goal
 
 Resolve [lun-4/makima#172](https://github.com/lun-4/makima/issues/172) with one model picker for model identity and its options. The picker shows only options supported by the highlighted model. The picker, command completion, selection summaries, and model-change paths use shared option definitions and capability projection rather than separate thinking/fast implementations. Plan approval stages the structured selection and commits it atomically with implementation mode.

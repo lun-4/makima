@@ -1981,7 +1981,7 @@ impl<'t> EventLoop<'t> {
                     .plan_path()
                     .map(Path::to_path_buf)
             });
-            runtime.app.sync_model_picker_owner();
+            runtime.app.sync_focused_plan_form();
         }
     }
 

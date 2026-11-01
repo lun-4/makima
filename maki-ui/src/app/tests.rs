@@ -7381,7 +7381,7 @@ fn plan_picker_retirement_discards_open_draft(child: bool, closed: bool) {
             )),
             identity: Some(work_identity(1)),
         })));
-        app.sync_model_picker_owner();
+        app.sync_focused_plan_form();
     } else if child {
         let mode_def = ModeDefSpec {
             name: "review".into(),
@@ -7402,7 +7402,7 @@ fn plan_picker_retirement_discards_open_draft(child: bool, closed: bool) {
                 })),
         )
         .unwrap();
-        app.sync_model_picker_owner();
+        app.sync_focused_plan_form();
     } else {
         set_root_mode(&mut app, Mode::Build);
     }

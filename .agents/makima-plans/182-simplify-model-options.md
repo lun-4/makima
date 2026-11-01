@@ -65,15 +65,12 @@ The model picker gets one canonical section on the providers page. The commands 
 
 ## Steps
 
-Each step is one commit.
+The repository's pre-commit hook runs `just ci`, so every commit has to build and pass on its own. The descriptor registry, the capability resolver and the picker share types, so they landed together.
 
 1. Commit this plan.
-2. Replace the descriptor registry with `ModelOption`, move capabilities to providers, revert session-option adapters and the deserializer, and revert completion to static suggestions.
-3. Replace the resolver with `ModelCapabilityCache` and remove the event-loop machinery.
-4. Simplify picker drafts and the footer.
-5. Simplify the plan form display and the plan picker's owner, and add the plan-form lookup helper.
-6. Agent-side cleanup: `commit_patch`, and pending-fast handling.
-7. Remove the architecture test and the remaining tautological tests.
-8. Consolidate the docs and regenerate them.
+2. Replace the descriptor registry with `ModelOption`, move capabilities to providers, replace the resolver with `ModelCapabilityCache`, simplify picker drafts and the plan form, add the plan-form lookup helper, and remove the architecture test and the tests of removed machinery.
+3. Treat approval overrides like other model selections for the saved `/fast` wish: drop it when approval starts, which removes `ApprovalPendingFast`. `set_model_with_claim` delegates to `commit_patch`.
+4. Consolidate the docs and regenerate them.
+5. Rename leftovers and record what landed.
 
-`just ci` must pass on the final commit.
+An approval with an explicit model or fast override now drops a restored `/fast` wish even if the approval later fails or is cancelled. That matches ordinary model selection, and it is the one behaviour change from the PR as reviewed.

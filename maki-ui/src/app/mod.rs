@@ -865,7 +865,7 @@ impl App {
 
     /// Brings the focused plan form forward, and retires its staging once
     /// the focused agent's plan is gone or replaced.
-    pub(crate) fn sync_model_picker_owner(&mut self) {
+    pub(crate) fn sync_focused_plan_form(&mut self) {
         self.sync_plan_form_target();
         let path = if self.is_main_chat() {
             self.focused_plan_path()
@@ -1034,7 +1034,7 @@ impl App {
     }
 
     pub(crate) fn sync_focused_queue(&mut self) {
-        self.sync_model_picker_owner();
+        self.sync_focused_plan_form();
         let id = self.selected_agent_id();
         let actor = self
             .command_runtime
@@ -1582,7 +1582,7 @@ impl App {
 
     /// Closes the picker and retires its purpose together, so the open state
     /// and the purpose can never disagree.
-    pub(crate) fn close_model_picker(&mut self) {
+    fn close_model_picker(&mut self) {
         self.model_picker.close();
         self.model_picker_purpose = ModelPickerPurpose::Session;
         self.model_picker_target = None;
