@@ -1,0 +1,79 @@
+# Simplify shared model options and plan approval
+
+## Goal
+
+Keep what #172 asks for, and what PR #182 delivers on top of it: one model picker that edits a model and its thinking and fast options, used for `/model`, Ctrl+M and the plan form's implementation model. Approval still commits the selection and the Build mode together. The difference is the amount of machinery. The PR added about 9,250 lines, with roughly 6,800 of them tests, many of which pin implementation details. This plan removes the parts that are not needed, fixes the bugs the review found, and leaves code that reads in one pass.
+
+## What the review found
+
+The descriptor registry (`ModelOptionSpec`) is a table of function pointers for two options. It round-trips typed values through strings, and the option specifics leak back out anyway: `SessionOptionDefinition::model_option` matches `"true"` and `"false"`, maps any free-input option to `FreeValueDomain::ThinkingSetting`, and docgen enumerates thinking and fast capabilities by hand. Adding a third option would still touch every layer the registry claims to hide.
+
+The capability resolver in `maki-ui/src/model_capabilities.rs` and `sync_model_capabilities` in the event loop use five independent staleness mechanisms, a waiter list, a 10 ms polling loop, a FIFO cache keyed by target and config generation, and two internal events. Even so they have bugs:
+
+- A failed preparation is cached as "unresolved" with no end.
+- Capabilities set at open are reset to unresolved on the next tick, so option rows flicker and focus drops.
+- Moving the highlight from A to B and back to A can leave A unresolved.
+- Each preparation holds two blocking-pool threads.
+
+The picker's retained-conflict state blocks Enter for drafts the backend accepts (`fast=false` on a model without fast) and for drafts whose capabilities are still loading, and the footer then suggests Ctrl+R, which deletes them. The plan form shows inherited option values using the current model's capabilities rather than the staged model's.
+
+Around this sit a 496-line architecture test containing a hand-written Rust tokenizer, a `set_model_with_claim` that copies `commit_patch` so the tokenizer finds the right call, tests that assert constants equal their own literals, docgen tests that look for sentences the same PR wrote, and the model picker described in three separate doc pages.
+
+## Design
+
+### Model options are an enum
+
+`maki-domain/src/selection.rs` defines:
+
+```rust
+pub enum ModelOption { Thinking, Fast }
+```
+
+`ModelOption::ALL` lists them. Methods give the key, label, description, presets, whether free input is accepted, and typed `get`/`set` on a `ModelSelection`. Each method is one exhaustive `match`, so a new option is a compile error in exactly the places that need a decision, and nowhere else. `ModelSelection::set_option` and the derived deserializer go back to the shape on `mistress`, with `set_option` delegating to the enum. The `True`/`False` preset labels go; presets are the canonical values.
+
+Capabilities belong next to `Model`, so `maki-providers/src/selection.rs` defines `ModelCapabilities { thinking: ThinkingSupport, fast: FastSupport }`, which is `Copy`, built with `From<&Model>`, and has `availability(option) -> Availability`. "Not resolved yet" is `Option<ModelCapabilities>::None` in the one place that needs it, the picker. A preparation failure falls back to the static capabilities of `Model::from_spec`, so failure never looks like loading, and commit-time validation stays authoritative.
+
+Session options go back to their own definitions on `mistress` (`thinking_definition`, `toggle_definition`). They have their own vocabulary (`enabled`/`disabled`) and gain nothing from an adapter.
+
+### One capability cache, pulled by the picker
+
+`ModelCapabilityCache` holds `HashMap<Arc<str>, ModelCapabilities>` keyed by spec, plus the set of specs in flight and an epoch. `get(spec)` returns a cached value, or starts one resolution on a blocking thread and returns `None`. When a resolution finishes it stores its result, if the epoch has not moved, and calls a wake callback. The event loop wires that callback to `InternalEvent::ModelCapabilitiesResolved`, which refreshes open pickers. Discovery and provider changes call `clear()`, which bumps the epoch.
+
+The picker asks the cache from `refresh()`, which the app already polls. The current model's capabilities come synchronously from its prepared `Model` at open, so the common case never waits. This removes `ModelCapabilityRequest`, `model_picker_generation`, the picker fields of `OrchestrationRevision`, `sync_model_capabilities`, and the ready and invalidated events.
+
+Command completion goes back to static option suggestions, as on `mistress`: spec completion no longer waits on a live target, an actor snapshot and provider preparation, and commit-time validation rejects unsupported values with a clear error. This is a deliberate scope reduction from the PR's plan. The shared `resolve_model_spec` helper and its identity tests go with it.
+
+### Picker drafts without conflicts
+
+The picker keeps one draft per option. Option rows are shown only for options the highlighted model supports. Enter submits the spec plus the drafts of the visible options; drafts for hidden options stay in their editors, so moving back to a supporting model restores them, but they are never submitted. While capabilities are unresolved, Enter waits only if a draft exists, and the footer says why. The conflict list, Ctrl+R, the width-dependent hint variants and the footer budget arithmetic go; `ListPicker` already clamps footer rows. `current_spec` folds into `current`, and the test-only `specs` field goes.
+
+### Plan form shows what is staged
+
+The plan form shows the staged model, or the current one, and one line of staged overrides such as `thinking=high fast=false`. It no longer predicts inherited values, which needs the staged model's capabilities that the form does not have. `plan_form.height` and `view` go back to taking the current spec, and `focused_model_selection` and the `ViewLayout` plumbing go. The plan picker takes its current selection from the agent that owns the plan form, which removes the double clearing against two different agents.
+
+The "focused form, or the saved one in `plan_forms`" lookup is written six times. One `plan_form_entry(key)` helper replaces those copies.
+
+### Agent side
+
+`set_model_with_claim` calls `commit_patch`, and `commit_patch` takes a `ModelSelection`. `prepare_selection` stays as the single conversion used by approval, the TUI and both Lua paths. The approval's pending-fast handling (`ApprovalPendingFast`, the wrapped transaction finalizer) becomes a plain flag if the success path can clear the saved `/fast` wish directly; otherwise it stays and gets a comment explaining the race.
+
+### Tests and docs
+
+Delete the architecture test, the constant-equals-literal test, the docgen prose tests, and the resolver and event-loop tests that assert internal counters and requests. Keep and adapt the behaviour tests: atomic approval, omitted versus explicit options, staging kept on cancel and failure, stale approval rejected, pinned-target policy, picker submit and cancel.
+
+The model picker gets one canonical section on the providers page. The commands page keeps a short `/model` entry that links to it. The keybindings page relies on the `KEYBINDS` table it already generates, without a hand-written duplicate. The prose follows the docs tone in `AGENTS.md`.
+
+## Steps
+
+Each step is one commit.
+
+1. Commit this plan.
+2. Replace the descriptor registry with `ModelOption`, move capabilities to providers, revert session-option adapters and the deserializer, and revert completion to static suggestions.
+3. Replace the resolver with `ModelCapabilityCache` and remove the event-loop machinery.
+4. Simplify picker drafts and the footer.
+5. Simplify the plan form display and the plan picker's owner, and add the plan-form lookup helper.
+6. Agent-side cleanup: `commit_patch`, and pending-fast handling.
+7. Remove the architecture test and the remaining tautological tests.
+8. Consolidate the docs and regenerate them.
+
+`just ci` must pass on the final commit.
