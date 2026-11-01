@@ -397,12 +397,15 @@ impl App {
     }
 
     pub(super) fn record_run_start(&mut self, run_id: u64) {
+        self.recoverable_queue.clear();
+        self.record_presentation_start(run_id);
+    }
+
+    pub(super) fn record_presentation_start(&mut self, run_id: u64) {
         self.run_id = run_id;
         self.queue.set_run_id(run_id);
         self.clear_exit_request();
         self.stamped_subagent_outcomes.clear();
-        // New work supersedes text held for recovery after an agent error.
-        self.recoverable_queue.clear();
         self.status = Status::Streaming;
         // The turn runs on whatever the model is now; a change after this
         // point lands on the next turn.

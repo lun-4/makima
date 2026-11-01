@@ -6624,6 +6624,67 @@ fn error_event_matching_run_id_saves_session_and_queued_messages() {
     assert!(app.state.session.meta.queued_messages.is_empty());
 }
 
+#[test_case(false; "success")]
+#[test_case(true; "failure")]
+fn standalone_compaction_preserves_error_recovery_text_in_checkpoint(failed: bool) {
+    const PENDING: &str = "pending user message";
+    const SUMMARY: &str = "compacted conversation";
+    const FAILURE: &str = "root failure";
+    let mut app = with_history(idle_busy_app());
+    app.queue_and_notify(queued_msg(PENDING));
+    app.update(agent_msg_with_run_id(
+        AgentEvent::ControlError {
+            message: FAILURE.into(),
+        },
+        app.run_id,
+    ));
+    assert!(app.holds_recovery_text());
+    app.checkpoint();
+    assert_eq!(app.state.session.meta.queued_messages, [PENDING]);
+
+    let presentation = app.queue.reserve_run_id(app.run_id);
+    let identity = maki_agent::ActorWorkIdentity::new(
+        AgentId::generate(),
+        maki_agent::ActorWorkKind::Compact {
+            operation_id: presentation,
+        },
+        presentation,
+    );
+    for event in [
+        AgentEvent::ModelSwitched {
+            spec: test_model().spec(),
+        },
+        AgentEvent::TextDelta {
+            text: SUMMARY.into(),
+        },
+        if failed {
+            AgentEvent::ControlError {
+                message: FAILURE.into(),
+            }
+        } else {
+            AgentEvent::ControlComplete {
+                usage: TokenUsage::default(),
+            }
+        },
+    ] {
+        app.update(Msg::Agent(Box::new(Envelope {
+            event,
+            subagent: None,
+            identity: Some(identity),
+        })));
+        assert!(app.holds_recovery_text());
+        app.checkpoint();
+        assert_eq!(app.state.session.meta.queued_messages, [PENDING]);
+    }
+    assert_eq!(app.run_id, presentation);
+    if failed {
+        assert!(matches!(&app.status, Status::Error { message, .. } if message == FAILURE));
+    } else {
+        assert_eq!(app.status, Status::Idle);
+        assert_actor_response(&mut app, SUMMARY);
+    }
+}
+
 #[test]
 fn flush_restored_queue_drops_recovery_snapshot() {
     let mut app = with_history(idle_busy_app());
