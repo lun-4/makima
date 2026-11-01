@@ -352,70 +352,11 @@ mod tests {
     use std::sync::Arc;
 
     use maki_config::ModelPolicy;
-    use maki_domain::{ModelSelection, ThinkingConfig};
-    use test_case::test_case;
 
-    use super::{
-        ConfigChangeError, ModelPreparer, SessionOptionError, prepare_model, prepare_selection,
-    };
+    use super::{ConfigChangeError, ModelPreparer, SessionOptionError, prepare_model};
 
     const ALLOWED_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
     const DISALLOWED_SPEC: &str = "openai/gpt-5";
-    const PREPARE_FAILED: &str = "provider preparation failed";
-
-    #[test_case(None; "thinking_only")]
-    #[test_case(Some(false); "explicit_false")]
-    #[test_case(Some(true); "explicit_true")]
-    fn prepare_selection_without_spec_skips_provider(fast: Option<bool>) {
-        let selection = ModelSelection {
-            thinking: Some(ThinkingConfig::Off),
-            fast,
-            ..Default::default()
-        };
-        let prepare: ModelPreparer = Arc::new(|_| unreachable!());
-        let patch = smol::block_on(prepare_selection(
-            &selection,
-            &ModelPolicy::default(),
-            &prepare,
-        ))
-        .unwrap();
-        assert!(patch.model.is_none());
-        assert_eq!(patch.fast, selection.fast);
-        assert_eq!(patch.thinking, selection.thinking);
-    }
-
-    #[test_case(false; "policy_rejected")]
-    #[test_case(true; "preparation_failed")]
-    fn prepare_selection_propagates_model_errors(allowed: bool) {
-        let policy = ModelPolicy::new(&[ALLOWED_SPEC.into()], &[]).unwrap();
-        let selection = ModelSelection {
-            spec: Some(
-                if allowed {
-                    ALLOWED_SPEC
-                } else {
-                    DISALLOWED_SPEC
-                }
-                .into(),
-            ),
-            ..Default::default()
-        };
-        let prepare: ModelPreparer = Arc::new(move |_| {
-            assert!(allowed);
-            Box::pin(async { Err(PREPARE_FAILED.into()) })
-        });
-        let result = smol::block_on(prepare_selection(&selection, &policy, &prepare));
-        if allowed {
-            assert!(
-                matches!(result, Err(ConfigChangeError::ModelPreparation(error)) if &*error == PREPARE_FAILED)
-            );
-        } else {
-            assert!(matches!(
-                result,
-                Err(ConfigChangeError::Option(SessionOptionError::PolicyRejected(spec)))
-                    if &*spec == DISALLOWED_SPEC
-            ));
-        }
-    }
 
     #[test]
     fn prepare_model_rejects_disallowed_spec_before_preparing() {

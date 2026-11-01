@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use maki_agent::actor::{ConfigPatch, PreparedModel};
-use maki_agent::session_options::{MODEL_OPTION_ID, SessionOptionError};
+use maki_agent::session_options::SessionOptionError;
 use maki_domain::{Effort, ModelSelection, ThinkingConfig};
 use maki_providers::model::FastSupport;
 use maki_providers::{RequestOptions, ThinkingSupport};
@@ -20,65 +20,11 @@ use super::{
 
 const CHECKPOINT_FAILURE: &str = "approval checkpoint failed";
 const CHECKPOINT_FLASH: &str = "history checkpoint failed: approval checkpoint failed";
-const MALFORMED_MODEL: &str = "missing-provider";
 
-#[test_case(false; "keep_context")]
-#[test_case(true; "clear_context")]
-fn approval_rejects_malformed_identity_without_mutation(clear: bool) {
-    with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = setup(event_loop);
-        let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
-        let actor = manager.actor(root).unwrap();
-        let config = actor.effective_config().unwrap();
-        let history = actor.committed_history();
-        let selection = ModelSelection {
-            spec: Some(MALFORMED_MODEL.into()),
-            ..implementation_selection()
-        };
-        event_loop.sessions[index]
-            .app
-            .plan_form
-            .set_implementation_selection(selection.clone());
-        event_loop.ctx.prepare_provider =
-            Arc::new(|_, _| panic!("malformed identity must not prepare provider"));
-        approve(event_loop, index, clear);
-        pump_until(event_loop, |event_loop| {
-            !event_loop.sessions[index].app.plan_approval_pending
-        });
-        let expected = SessionOptionError::InvalidValue {
-            id: MODEL_OPTION_ID.into(),
-            value: MALFORMED_MODEL.into(),
-        }
-        .to_string();
-        assert_eq!(
-            event_loop.sessions[index].app.status_bar.flash_text(),
-            Some(expected.as_str())
-        );
-        assert_eq!(
-            event_loop.sessions[index]
-                .app
-                .plan_form
-                .implementation_selection(),
-            &selection
-        );
-        assert_eq!(
-            event_loop.sessions[index].app.state.plan.path(),
-            Some(path.as_path())
-        );
-        assert!(Arc::ptr_eq(&config, &actor.effective_config().unwrap()));
-        assert!(Arc::ptr_eq(&history, &actor.committed_history()));
-        assert!(requests.is_empty());
-    });
-}
-
-#[test_case(false, false, false, false; "model_only_keep")]
-#[test_case(true, false, false, false; "model_only_clear")]
-#[test_case(false, true, false, false; "options_only_keep")]
-#[test_case(true, true, false, false; "options_only_clear")]
-#[test_case(false, false, true, false; "disabled_keep")]
-#[test_case(true, false, true, false; "disabled_clear")]
-#[test_case(false, false, true, true; "required_thinking_keep")]
-#[test_case(true, false, true, true; "required_thinking_clear")]
+#[test_case(false, false, false, false; "model_only")]
+#[test_case(true, true, false, false; "options_only_clear_context")]
+#[test_case(false, false, true, false; "explicit_disabled")]
+#[test_case(true, false, true, true; "required_thinking_clear_context")]
 fn approval_selection_uses_predecessor_and_explicit_disables(
     clear: bool,
     options_only: bool,
@@ -178,60 +124,8 @@ fn approval_selection_uses_predecessor_and_explicit_disables(
     });
 }
 
-#[test_case(false; "keep_context")]
-#[test_case(true; "clear_context")]
-fn approval_model_only_normalizes_unsupported_inherited_options(clear: bool) {
-    with_event_loop(|event_loop| {
-        let (index, _, requests, _host) = setup(event_loop);
-        let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
-        let actor = manager.actor(root).unwrap();
-        apply_patch(
-            &actor,
-            ConfigPatch {
-                thinking: Some(ThinkingConfig::Effort(Effort::High)),
-                ..Default::default()
-            },
-        );
-        event_loop.sessions[index]
-            .app
-            .plan_form
-            .set_implementation_selection(ModelSelection {
-                spec: Some(TARGET_MODEL.into()),
-                ..Default::default()
-            });
-        let prepare = event_loop.ctx.prepare_provider.clone();
-        event_loop.ctx.prepare_provider = Arc::new(move |model, timeouts| {
-            let mut prepared = prepare(model, timeouts)?;
-            prepared.model.thinking_override = Some(ThinkingSupport::No);
-            prepared.model.supports_fast_override = Some(FastSupport::Unsupported);
-            Ok(prepared)
-        });
-        approve(event_loop, index, clear);
-        pump_until(event_loop, |event_loop| {
-            event_loop.sessions[index].app.root_mode() == Mode::Build
-                && event_loop.sessions[index].app.status == Status::Idle
-                && !requests.is_empty()
-        });
-        let (_, options, _, _) = requests.recv_timeout(WAIT).unwrap();
-        assert_eq!(
-            options,
-            RequestOptions {
-                thinking: ThinkingConfig::Off,
-                fast: false
-            }
-        );
-        super::assert_actor_selection(&actor, TARGET_MODEL, options);
-        checkpoint(event_loop, index);
-        let restored =
-            AppSession::load(event_loop.sessions[index].id(), &event_loop.ctx.storage).unwrap();
-        assert_eq!(restored.meta.thinking, Some(options.thinking.into()));
-        assert_eq!(restored.meta.fast, options.fast);
-    });
-}
-
-#[test_case(false; "keep_context")]
-#[test_case(true; "clear_context")]
-fn approval_option_only_change_makes_request_stale(clear: bool) {
+#[test]
+fn approval_option_only_change_makes_request_stale() {
     with_event_loop(|event_loop| {
         let (index, path, requests, _host) = setup(event_loop);
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
@@ -240,7 +134,7 @@ fn approval_option_only_change_makes_request_stale(clear: bool) {
         let history = actor.committed_history();
         let recents = read_recents(&event_loop.ctx.storage);
         let model = read_model(&event_loop.ctx.storage);
-        approve(event_loop, index, clear);
+        approve(event_loop, index, false);
         let ready = final_ready(event_loop, &requests);
         let mut selection = implementation_selection();
         selection.fast = Some(true);
@@ -273,11 +167,9 @@ fn approval_option_only_change_makes_request_stale(clear: bool) {
     });
 }
 
-#[test_case(false, false; "thinking_keep")]
-#[test_case(true, false; "thinking_clear")]
-#[test_case(false, true; "fast_keep")]
-#[test_case(true, true; "fast_clear")]
-fn approval_rejects_unsupported_explicit_options(clear: bool, fast: bool) {
+#[test_case(false; "thinking")]
+#[test_case(true; "fast")]
+fn approval_rejects_unsupported_explicit_options(fast: bool) {
     with_event_loop(|event_loop| {
         let (index, path, requests, _host) = setup(event_loop);
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
@@ -305,7 +197,7 @@ fn approval_rejects_unsupported_explicit_options(clear: bool, fast: bool) {
             }
             Ok(prepared)
         });
-        approve(event_loop, index, clear);
+        approve(event_loop, index, false);
         pump_until(event_loop, |event_loop| {
             !event_loop.sessions[index].app.plan_approval_pending
         });

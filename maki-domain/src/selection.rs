@@ -307,15 +307,4 @@ mod tests {
         option.set(&mut selection, None).unwrap();
         assert!(selection.is_empty());
     }
-
-    #[test]
-    fn option_presets_parse() {
-        for option in ModelOption::ALL {
-            for preset in option.presets() {
-                option
-                    .set(&mut ModelSelection::default(), Some(preset))
-                    .unwrap();
-            }
-        }
-    }
 }

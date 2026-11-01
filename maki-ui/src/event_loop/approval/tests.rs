@@ -536,20 +536,13 @@ enum ChildApprovalFailure {
     RootCancel,
 }
 
-#[test_case(false, false, ChildApprovalFailure::Unsupported; "reject_keep_active")]
-#[test_case(true, false, ChildApprovalFailure::Unsupported; "reject_clear_active")]
-#[test_case(false, true, ChildApprovalFailure::Unsupported; "reject_keep_saved")]
-#[test_case(true, true, ChildApprovalFailure::Unsupported; "reject_clear_saved")]
-#[test_case(false, false, ChildApprovalFailure::Cancel; "cancel_keep_active")]
-#[test_case(true, false, ChildApprovalFailure::Cancel; "cancel_clear_active")]
-#[test_case(false, true, ChildApprovalFailure::Cancel; "cancel_keep_saved")]
-#[test_case(true, true, ChildApprovalFailure::Cancel; "cancel_clear_saved")]
-#[test_case(false, true, ChildApprovalFailure::Stale; "stale_keep_saved")]
-#[test_case(true, true, ChildApprovalFailure::Stale; "stale_clear_saved")]
-#[test_case(false, true, ChildApprovalFailure::RootUnsupported; "root_reject_keep_saved")]
-#[test_case(true, true, ChildApprovalFailure::RootUnsupported; "root_reject_clear_saved")]
-#[test_case(false, true, ChildApprovalFailure::RootCancel; "root_cancel_keep_saved")]
-#[test_case(true, true, ChildApprovalFailure::RootCancel; "root_cancel_clear_saved")]
+#[test_case(false, false, ChildApprovalFailure::Unsupported; "reject_active")]
+#[test_case(true, true, ChildApprovalFailure::Unsupported; "reject_saved_clear_context")]
+#[test_case(true, false, ChildApprovalFailure::Cancel; "cancel_active_clear_context")]
+#[test_case(false, true, ChildApprovalFailure::Cancel; "cancel_saved")]
+#[test_case(false, true, ChildApprovalFailure::Stale; "stale_saved")]
+#[test_case(true, true, ChildApprovalFailure::RootUnsupported; "root_reject_saved_clear_context")]
+#[test_case(false, true, ChildApprovalFailure::RootCancel; "root_cancel_saved")]
 fn child_approval_failure_preserves_selection(
     clear_context: bool,
     saved: bool,

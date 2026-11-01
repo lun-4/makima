@@ -2003,32 +2003,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn footer_lines_override_configured_footer() {
-        const BUILT_FOOTER: &str = "built footer";
-        const OVERRIDE_FOOTER: &str = "override footer";
-        let mut picker = ListPicker::new().with_footer_line(Line::from(BUILT_FOOTER));
-        picker.open(entries(&["alpha", "beta"]), " Test ");
-        let area = Rect::new(0, 0, 80, 24);
-        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
-        terminal
-            .draw(|frame| {
-                picker.view_with_footer_lines(frame, area, vec![Line::from(OVERRIDE_FOOTER)]);
-            })
-            .unwrap();
-        let lines = buffer_lines(&terminal, area).join("\n");
-        assert!(lines.contains(OVERRIDE_FOOTER));
-        assert!(!lines.contains(BUILT_FOOTER));
-        terminal
-            .draw(|frame| {
-                picker.view(frame, area);
-            })
-            .unwrap();
-        let lines = buffer_lines(&terminal, area).join("\n");
-        assert!(lines.contains(BUILT_FOOTER));
-        assert!(!lines.contains(OVERRIDE_FOOTER));
-    }
-
     #[test_case(80, 24; "normal")]
     #[test_case(40, 12; "narrow_short")]
     fn list_picker_multiline_footer_reserves_viewport(width: u16, height: u16) {

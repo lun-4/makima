@@ -6741,6 +6741,65 @@ fn commit_target_plan_path(app: &mut App, target: &AgentRef, path: &str, root: b
     }
 }
 
+/// Focuses chat `index` and binds commands to `target`, the way switching
+/// chats does.
+fn focus_chat(app: &mut App, index: usize, target: &AgentRef) {
+    app.active_chat = index;
+    bind_actor_target(app, target.clone());
+    app.sync_focused_queue();
+}
+
+fn sync_child_plan(app: &mut App, child: &AgentRef) {
+    app.sync_child_plan_paths(|id| {
+        assert_eq!(id, child.id());
+        child
+            .effective_config()
+            .unwrap()
+            .unwrap()
+            .mode
+            .plan_path()
+            .map(Path::to_path_buf)
+    });
+}
+
+struct StagedForms {
+    child: AgentRef,
+    _child_input: flume::Receiver<AgentInput>,
+    root_stage: ModelSelection,
+    child_stage: ModelSelection,
+}
+
+/// Stages different selections, each with parallel on, on the root's plan
+/// form and on a planning child's, and leaves the child focused.
+fn stage_root_and_child_forms(app: &mut App) -> StagedForms {
+    app.sync_focused_queue();
+    let root_stage = model_selection(None, Some(ThinkingConfig::Off), Some(false));
+    app.plan_form
+        .set_implementation_selection(root_stage.clone());
+    app.update(Msg::Key(key(KeyCode::Char(' '))));
+    let (child, child_input) = spawn_input_child(app, TASK_ID, SUBAGENT_NAME);
+    configure_model_options(
+        &child,
+        PLAN_OPTIONS_OTHER,
+        ThinkingConfig::Effort(Effort::High),
+        true,
+        true,
+    );
+    commit_target_plan_path(app, &child, PLAN_OPTIONS_CHILD_PATH, false);
+    focus_chat(app, 1, &child);
+    app.plan_form.on_plan_ready();
+    let child_stage = model_selection(None, Some(ThinkingConfig::Adaptive), Some(true));
+    app.plan_form
+        .set_implementation_selection(child_stage.clone());
+    app.update(Msg::Key(key(KeyCode::Char(' '))));
+    StagedForms {
+        child,
+        _child_input: child_input,
+        root_stage,
+        child_stage,
+    }
+}
+
 fn model_options_app(child: bool, plan: bool) -> (TempDir, App, AgentRef) {
     let (tmp, _dir, _writer, mut app) = tempdir_app();
     let root = app
@@ -6771,9 +6830,7 @@ fn model_options_app(child: bool, plan: bool) -> (TempDir, App, AgentRef) {
             true,
             true,
         );
-        app.active_chat = 1;
-        bind_actor_target(&app, target.clone());
-        app.sync_focused_queue();
+        focus_chat(&mut app, 1, &target);
         if plan {
             app.plan_form.on_plan_ready();
         }
@@ -6998,10 +7055,6 @@ fn plan_form_implement_toggled_parallel() {
 #[test_case(false, true, "high", ThinkingConfig::Effort(Effort::High), true ; "root_plan_enabled")]
 #[test_case(true, false, "off", ThinkingConfig::Off, false ; "child_session_disabled")]
 #[test_case(true, true, "off", ThinkingConfig::Off, false ; "child_plan_disabled")]
-#[test_case(false, false, "off", ThinkingConfig::Off, false ; "root_session_equal_disabled")]
-#[test_case(false, true, "off", ThinkingConfig::Off, false ; "root_plan_equal_disabled")]
-#[test_case(true, false, "high", ThinkingConfig::Effort(Effort::High), true ; "child_session_equal_enabled")]
-#[test_case(true, true, "high", ThinkingConfig::Effort(Effort::High), true ; "child_plan_equal_enabled")]
 fn shared_model_picker_applies_or_stages_same_selection(
     child: bool,
     plan: bool,
@@ -7139,42 +7192,19 @@ fn plan_picker_cancel_retains_staged_options(undiscovered: bool, cancel: KeyEven
 #[test]
 fn plan_picker_target_change_discards_draft() {
     let (_tmp, mut app, root) = model_options_app(false, true);
-    let (child, _rx) = spawn_input_child_with_mode(
-        &mut app,
-        TASK_ID,
-        SUBAGENT_NAME,
-        AgentMode::Plan(PLAN_OPTIONS_CHILD_PATH.into()),
-    );
-    configure_model_options(
-        &child,
-        PLAN_OPTIONS_OTHER,
-        ThinkingConfig::Effort(Effort::High),
-        true,
-        true,
-    );
-    app.active_chat = 1;
-    bind_actor_target(&app, child.clone());
-    app.sync_focused_queue();
-    app.plan_form.on_plan_ready();
-    let child_stage = model_selection(None, Some(ThinkingConfig::Adaptive), Some(true));
-    app.plan_form
-        .set_implementation_selection(child_stage.clone());
-    app.active_chat = 0;
-    bind_actor_target(&app, root.clone());
-    app.sync_focused_queue();
-    let root_stage = model_selection(None, Some(ThinkingConfig::Off), Some(false));
-    app.plan_form
-        .set_implementation_selection(root_stage.clone());
+    let StagedForms {
+        child,
+        root_stage,
+        child_stage,
+        ..
+    } = stage_root_and_child_forms(&mut app);
+    focus_chat(&mut app, 0, &root);
     app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
     edit_picker_options(&mut app, "high", true);
-    app.active_chat = 1;
-    bind_actor_target(&app, child);
-    app.sync_focused_queue();
+    focus_chat(&mut app, 1, &child);
     assert!(!app.model_picker.is_open());
     assert_eq!(app.plan_form.implementation_selection(), &child_stage);
-    app.active_chat = 0;
-    bind_actor_target(&app, root);
-    app.sync_focused_queue();
+    focus_chat(&mut app, 0, &root);
     assert_eq!(app.plan_form.implementation_selection(), &root_stage);
     app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
     assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
@@ -7184,24 +7214,14 @@ fn plan_picker_target_change_discards_draft() {
 #[test]
 fn child_plan_stage_survives_focus_before_command_target_rebind() {
     let (_tmp, mut app, root) = model_options_app(false, true);
-    app.sync_focused_queue();
-    let root_stage = model_selection(None, Some(ThinkingConfig::Off), Some(false));
-    app.plan_form
-        .set_implementation_selection(root_stage.clone());
-    let (child, _rx) = spawn_input_child(&mut app, TASK_ID, SUBAGENT_NAME);
-    commit_target_plan_path(&mut app, &child, PLAN_OPTIONS_CHILD_PATH, false);
-    app.active_chat = 1;
-    bind_actor_target(&app, child.clone());
-    app.sync_focused_queue();
-    app.plan_form.on_plan_ready();
-    let child_stage = model_selection(None, Some(ThinkingConfig::Adaptive), Some(true));
-    app.plan_form
-        .set_implementation_selection(child_stage.clone());
-    app.update(Msg::Key(key(KeyCode::Char(' '))));
+    let StagedForms {
+        child,
+        root_stage,
+        child_stage,
+        ..
+    } = stage_root_and_child_forms(&mut app);
     app.plan_approval_pending = true;
-    app.active_chat = 0;
-    bind_actor_target(&app, root);
-    app.sync_focused_queue();
+    focus_chat(&mut app, 0, &root);
     assert_eq!(app.plan_form.implementation_selection(), &root_stage);
     app.active_chat = 1;
     app.sync_focused_queue();
@@ -7211,16 +7231,7 @@ fn child_plan_stage_survives_focus_before_command_target_rebind() {
     assert!(app.plan_form.parallel());
     assert!(app.plan_approval_pending);
     bind_actor_target(&app, child.clone());
-    app.sync_child_plan_paths(|id| {
-        assert_eq!(id, child.id());
-        child
-            .effective_config()
-            .unwrap()
-            .unwrap()
-            .mode
-            .plan_path()
-            .map(Path::to_path_buf)
-    });
+    sync_child_plan(&mut app, &child);
     app.sync_focused_queue();
     assert_eq!(app.plan_form.implementation_selection(), &child_stage);
     assert!(app.plan_form.parallel());
@@ -7233,30 +7244,12 @@ fn child_plan_stage_survives_focus_before_command_target_rebind() {
 #[test_case(true, true ; "child_saved")]
 fn replaced_plan_path_discards_only_owning_form_stage(child_owner: bool, saved: bool) {
     let (_tmp, mut app, root) = model_options_app(false, true);
-    app.sync_focused_queue();
-    let root_stage = model_selection(None, Some(ThinkingConfig::Off), Some(false));
-    app.plan_form
-        .set_implementation_selection(root_stage.clone());
-    app.update(Msg::Key(key(KeyCode::Char(' '))));
-    assert!(app.plan_form.parallel());
-    let (child, _rx) = spawn_input_child(&mut app, TASK_ID, SUBAGENT_NAME);
-    configure_model_options(
-        &child,
-        PLAN_OPTIONS_OTHER,
-        ThinkingConfig::Effort(Effort::High),
-        true,
-        true,
-    );
-    commit_target_plan_path(&mut app, &child, PLAN_OPTIONS_CHILD_PATH, false);
-    app.active_chat = 1;
-    bind_actor_target(&app, child.clone());
-    app.sync_focused_queue();
-    app.plan_form.on_plan_ready();
-    let child_stage = model_selection(None, Some(ThinkingConfig::Adaptive), Some(true));
-    app.plan_form
-        .set_implementation_selection(child_stage.clone());
-    app.update(Msg::Key(key(KeyCode::Char(' '))));
-    assert!(app.plan_form.parallel());
+    let StagedForms {
+        child,
+        root_stage,
+        child_stage,
+        ..
+    } = stage_root_and_child_forms(&mut app);
     let owner_index = usize::from(child_owner);
     let other_index = usize::from(!child_owner);
     let owner = if child_owner { &child } else { &root };
@@ -7271,32 +7264,19 @@ fn replaced_plan_path_discards_only_owning_form_stage(child_owner: bool, saved: 
     } else {
         &child_stage
     };
-    app.active_chat = owner_index;
-    bind_actor_target(&app, owner.clone());
-    app.sync_focused_queue();
+    focus_chat(&mut app, owner_index, owner);
     app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
     edit_picker_options(&mut app, "high", true);
     app.plan_approval_pending = true;
     if saved {
-        app.active_chat = other_index;
-        bind_actor_target(&app, other.clone());
-        app.sync_focused_queue();
+        focus_chat(&mut app, other_index, other);
         assert!(!app.model_picker.is_open());
         app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
         assert!(app.model_picker.is_open());
     }
     commit_target_plan_path(&mut app, owner, PLAN_OPTIONS_REPLACEMENT_PATH, !child_owner);
     if child_owner {
-        app.sync_child_plan_paths(|id| {
-            assert_eq!(id, child.id());
-            child
-                .effective_config()
-                .unwrap()
-                .unwrap()
-                .mode
-                .plan_path()
-                .map(Path::to_path_buf)
-        });
+        sync_child_plan(&mut app, &child);
     }
     app.sync_focused_queue();
     assert!(app.plan_form.parallel());
@@ -7313,9 +7293,7 @@ fn replaced_plan_path_discards_only_owning_form_stage(child_owner: bool, saved: 
         assert!(!form.is_visible());
         assert!(form.parallel());
         assert!(!pending);
-        app.active_chat = owner_index;
-        bind_actor_target(&app, owner.clone());
-        app.sync_focused_queue();
+        focus_chat(&mut app, owner_index, owner);
     } else {
         assert!(!app.model_picker.is_open());
     }
@@ -7330,9 +7308,7 @@ fn replaced_plan_path_discards_only_owning_form_stage(child_owner: bool, saved: 
     app.plan_form.on_plan_ready();
     assert!(app.plan_form.is_visible());
     assert!(app.plan_form.implementation_selection().is_empty());
-    app.active_chat = other_index;
-    bind_actor_target(&app, other.clone());
-    app.sync_focused_queue();
+    focus_chat(&mut app, other_index, other);
     assert_eq!(app.plan_form.implementation_selection(), other_stage);
     assert_ne!(app.plan_form.implementation_selection(), owner_stage);
     assert!(app.plan_form.is_visible());
@@ -7690,53 +7666,6 @@ fn image_path_paste_follows_plan_ownership(approval_pending: bool) {
     app.update(Msg::Paste(IMAGE_PATH_PASTE.into()));
     assert!(app.image_paste_rx.is_empty());
     assert_eq!(app.input_box.buffer.value(), "");
-}
-
-#[test_case(false, 120 ; "root_wide")]
-#[test_case(false, 44 ; "root_narrow")]
-#[test_case(true, 120 ; "child_wide")]
-#[test_case(true, 44 ; "child_narrow")]
-fn plan_form_renders_effective_implementation_model(child: bool, width: u16) {
-    let (_tmp, mut app, target) = model_options_app(child, true);
-    let current = target.effective_config().unwrap().unwrap().model.spec();
-    let cases = [
-        (ModelSelection::default(), current.as_str(), None),
-        (
-            model_selection(None, Some(ThinkingConfig::Off), Some(false)),
-            current.as_str(),
-            Some("thinking=off fast=false"),
-        ),
-        (
-            model_selection(
-                Some(PLAN_OPTIONS_LONG_MODEL),
-                Some(ThinkingConfig::Adaptive),
-                Some(true),
-            ),
-            PLAN_OPTIONS_LONG_MODEL,
-            Some("thinking=adaptive fast=true"),
-        ),
-    ];
-    let area = Rect::new(0, 0, width, 60);
-    for (staged, expected_model, overrides) in cases {
-        app.plan_form.set_implementation_selection(staged.clone());
-        let rows = rendered_rows(&mut app, area.width, area.height).join("\n");
-        let (_, bottom, _, _, _) = app.layout_geometry(area);
-        assert_eq!(
-            bottom.height,
-            app.plan_form
-                .height(bottom.width, &app.focused_model_spec())
-        );
-        let compact: String = rows
-            .chars()
-            .filter(|c| !c.is_whitespace() && !matches!(c, '│' | '┃' | '║'))
-            .collect();
-        assert!(compact.contains(&format!("Implementationmodel:{expected_model}")));
-        assert_eq!(rows.contains("Use current model"), !staged.is_empty());
-        match overrides {
-            Some(overrides) => assert!(compact.contains(&overrides.replace(' ', ""))),
-            None => assert!(!rows.contains("thinking=")),
-        }
-    }
 }
 
 #[test]

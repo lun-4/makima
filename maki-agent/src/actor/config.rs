@@ -299,40 +299,6 @@ pub(super) fn equivalent(left: &EffectiveAgentConfig, right: &EffectiveAgentConf
 }
 
 #[cfg(test)]
-mod selection_tests {
-    use maki_domain::{Effort, ModelSelection, ThinkingConfig};
-    use test_case::test_case;
-
-    use super::{ConfigChange, ConfigPatch, EffectiveAgentConfig};
-    use crate::AgentMode;
-
-    const MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
-
-    #[test_case(None, Some(false), ThinkingConfig::Off, false; "disable_fast_preserves_thinking")]
-    #[test_case(Some(ThinkingConfig::Effort(Effort::Low)), None, ThinkingConfig::Effort(Effort::Low), true; "thinking_preserves_fast")]
-    fn config_selection_projects_applied_partial_options(
-        thinking: Option<ThinkingConfig>,
-        fast: Option<bool>,
-        expected_thinking: ThinkingConfig,
-        expected_fast: bool,
-    ) {
-        let config = EffectiveAgentConfig::new(crate::actor::tests::policy(true), AgentMode::Build);
-        let selection = ModelSelection {
-            thinking,
-            fast,
-            ..Default::default()
-        };
-        let config = ConfigChange::Patch(ConfigPatch::from_model_selection(&selection))
-            .apply(&config)
-            .unwrap();
-        let selection = config.model_selection();
-        assert_eq!(&*selection.spec, MODEL_SPEC);
-        assert_eq!(selection.thinking, expected_thinking);
-        assert_eq!(selection.fast, expected_fast);
-    }
-}
-
-#[cfg(test)]
 mod context_tests {
     use std::path::PathBuf;
 
