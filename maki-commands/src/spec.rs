@@ -398,7 +398,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         "Switch model",
         typed MODEL_ARGUMENTS,
         MODEL_COMPLETIONS,
-        Some("[spec] [key=value ...]"),
+        Some("[spec] [thinking=value] [fast=true|false]"),
         MODEL,
     ),
     builtin!(

@@ -76,16 +76,11 @@ pub enum PickerAction<T> {
     Close,
 }
 
-enum Footer {
-    Builder(fn() -> Line<'static>),
-    Static(Line<'static>),
-}
-
 pub struct ListPicker<T> {
     state: Option<State<T>>,
     title: String,
     max_visible: Option<u16>,
-    footer: Option<Footer>,
+    footer: Option<Line<'static>>,
     error_text: Option<String>,
     submit_keys: Vec<KeyEvent>,
     delete_key: Option<KeyEvent>,
@@ -373,13 +368,8 @@ impl<T: PickerItem> ListPicker<T> {
         self
     }
 
-    pub fn with_footer_builder(mut self, builder: fn() -> Line<'static>) -> Self {
-        self.footer = Some(Footer::Builder(builder));
-        self
-    }
-
     pub fn with_footer_line(mut self, line: Line<'static>) -> Self {
-        self.footer = Some(Footer::Static(line));
+        self.footer = Some(line);
         self
     }
 
@@ -690,11 +680,8 @@ impl<T: PickerItem> ListPicker<T> {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
-        let footer = self.footer.as_ref().map(|f| match f {
-            Footer::Builder(build) => build(),
-            Footer::Static(line) => line.clone(),
-        });
-        self.view_with_footer_lines(frame, area, footer.into_iter().collect())
+        let footer = self.footer.clone().into_iter().collect();
+        self.view_with_footer_lines(frame, area, footer)
     }
 
     pub fn view_with_footer_lines(
@@ -2017,10 +2004,10 @@ mod tests {
     }
 
     #[test]
-    fn multiline_footer_override_preserves_single_line_builder() {
+    fn footer_lines_override_configured_footer() {
         const BUILT_FOOTER: &str = "built footer";
         const OVERRIDE_FOOTER: &str = "override footer";
-        let mut picker = ListPicker::new().with_footer_builder(|| Line::from(BUILT_FOOTER));
+        let mut picker = ListPicker::new().with_footer_line(Line::from(BUILT_FOOTER));
         picker.open(entries(&["alpha", "beta"]), " Test ");
         let area = Rect::new(0, 0, 80, 24);
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();

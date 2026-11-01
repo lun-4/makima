@@ -38,7 +38,7 @@ fn approval_rejects_malformed_identity_without_mutation(clear: bool) {
         event_loop.sessions[index]
             .app
             .plan_form
-            .set_implementation_selection(selection.clone(), SOURCE_MODEL);
+            .set_implementation_selection(selection.clone());
         event_loop.ctx.prepare_provider =
             Arc::new(|_, _| panic!("malformed identity must not prepare provider"));
         approve(event_loop, index, clear);
@@ -95,7 +95,7 @@ fn approval_selection_uses_predecessor_and_explicit_disables(
         event_loop.sessions[index]
             .app
             .plan_form
-            .set_implementation_selection(selection.clone(), SOURCE_MODEL);
+            .set_implementation_selection(selection.clone());
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let actor = manager.actor(root).unwrap();
         let (record, recorded) = flume::unbounded();
@@ -195,13 +195,10 @@ fn approval_model_only_normalizes_unsupported_inherited_options(clear: bool) {
         event_loop.sessions[index]
             .app
             .plan_form
-            .set_implementation_selection(
-                ModelSelection {
-                    spec: Some(TARGET_MODEL.into()),
-                    ..Default::default()
-                },
-                SOURCE_MODEL,
-            );
+            .set_implementation_selection(ModelSelection {
+                spec: Some(TARGET_MODEL.into()),
+                ..Default::default()
+            });
         let prepare = event_loop.ctx.prepare_provider.clone();
         event_loop.ctx.prepare_provider = Arc::new(move |model, timeouts| {
             let mut prepared = prepare(model, timeouts)?;
@@ -250,7 +247,7 @@ fn approval_option_only_change_makes_request_stale(clear: bool) {
         event_loop.sessions[index]
             .app
             .plan_form
-            .set_implementation_selection(selection.clone(), SOURCE_MODEL);
+            .set_implementation_selection(selection.clone());
         event_loop.handle_internal(ready);
         assert_eq!(
             event_loop.sessions[index].app.status_bar.flash_text(),
@@ -297,7 +294,7 @@ fn approval_rejects_unsupported_explicit_options(clear: bool, fast: bool) {
         event_loop.sessions[index]
             .app
             .plan_form
-            .set_implementation_selection(selection.clone(), SOURCE_MODEL);
+            .set_implementation_selection(selection.clone());
         let prepare = event_loop.ctx.prepare_provider.clone();
         event_loop.ctx.prepare_provider = Arc::new(move |model, timeouts| {
             let mut prepared = prepare(model, timeouts)?;

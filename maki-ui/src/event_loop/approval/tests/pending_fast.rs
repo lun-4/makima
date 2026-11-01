@@ -7,9 +7,9 @@ use maki_providers::model::FastSupport;
 use test_case::test_case;
 
 use super::{
-    Action, ActorStatus, AppSession, ApprovalStep, EventLoop, InternalEvent, SOURCE_MODEL, Status,
-    TARGET_MODEL, WAIT, apply_patch, approve, capable_model, final_ready, next_ready, pump_until,
-    setup, with_event_loop,
+    Action, ActorStatus, AppSession, ApprovalStep, EventLoop, InternalEvent, Status, TARGET_MODEL,
+    WAIT, apply_patch, approve, capable_model, final_ready, next_ready, pump_until, setup,
+    with_event_loop,
 };
 
 const CHECKPOINT_FAILURE: &str = "pending-fast approval checkpoint failed";
@@ -89,14 +89,11 @@ fn explicit_root_approval_supersedes_saved_fast(
         event_loop.sessions[index]
             .app
             .plan_form
-            .set_implementation_selection(
-                ModelSelection {
-                    spec: (!fast_only).then(|| TARGET_MODEL.into()),
-                    fast: fast_only.then_some(false),
-                    ..Default::default()
-                },
-                SOURCE_MODEL,
-            );
+            .set_implementation_selection(ModelSelection {
+                spec: (!fast_only).then(|| TARGET_MODEL.into()),
+                fast: fast_only.then_some(false),
+                ..Default::default()
+            });
         let prepare = Arc::clone(&event_loop.ctx.prepare_provider);
         event_loop.ctx.prepare_provider = Arc::new(move |model, timeouts| {
             let mut prepared = prepare(model, timeouts)?;
@@ -158,13 +155,10 @@ fn unsuccessful_root_approval_preserves_saved_fast(checkpoint_failure: bool, sup
         event_loop.sessions[index]
             .app
             .plan_form
-            .set_implementation_selection(
-                ModelSelection {
-                    fast: Some(false),
-                    ..Default::default()
-                },
-                SOURCE_MODEL,
-            );
+            .set_implementation_selection(ModelSelection {
+                fast: Some(false),
+                ..Default::default()
+            });
         approve(event_loop, index, false);
         let mut prepared = final_ready(event_loop, &requests);
         if supported {
@@ -228,7 +222,7 @@ fn omitted_root_fast_retains_saved_fast_restore(pending: bool) {
         event_loop.sessions[index]
             .app
             .plan_form
-            .set_implementation_selection(ModelSelection::default(), SOURCE_MODEL);
+            .set_implementation_selection(ModelSelection::default());
         approve(event_loop, index, false);
         let prepared = final_ready(event_loop, &requests);
         event_loop.handle_internal(prepared);

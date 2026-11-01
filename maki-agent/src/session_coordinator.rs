@@ -28,10 +28,11 @@ use crate::config_change::{
 };
 use crate::manager::AgentRef;
 use crate::session_options::{
-    DISABLED_VALUE, ENABLED_VALUE, FAST_OPTION_ID, MODEL_OPTION_ID, SessionOptionCategory,
-    SessionOptionDefinition, SessionOptionError, SessionOptionOwner, SessionOptionValue,
-    SessionOptions, SessionOptionsCandidate, SessionOptionsReservation, SessionOptionsSnapshot,
-    SessionOptionsSubscription, THINKING_OPTION_ID, WORKFLOW_OPTION_ID, YOLO_OPTION_ID,
+    DISABLED_VALUE, ENABLED_VALUE, FAST_OPTION_ID, FreeValueDomain, MODEL_OPTION_ID,
+    SessionOptionCategory, SessionOptionDefinition, SessionOptionError, SessionOptionOwner,
+    SessionOptionValue, SessionOptions, SessionOptionsCandidate, SessionOptionsReservation,
+    SessionOptionsSnapshot, SessionOptionsSubscription, THINKING_OPTION_ID, WORKFLOW_OPTION_ID,
+    YOLO_OPTION_ID,
 };
 
 static DIRECTORY: LazyLock<Mutex<HashMap<MakiId, DirectoryEntry>>> =
@@ -1662,16 +1663,7 @@ pub fn builtin_option_definitions(
             },
         );
     }
-    let selection = ModelSelection {
-        spec: None,
-        thinking: Some(thinking),
-        fast: Some(fast),
-    };
-    let (choices, free_inputs): (Vec<_>, Vec<_>) = selection
-        .option_values()
-        .map(|(spec, value)| SessionOptionDefinition::model_option(spec, &value))
-        .partition(|definition| definition.free_value.is_none());
-    [
+    vec![
         SessionOptionDefinition {
             id: Arc::from(MODEL_OPTION_ID),
             owner: SessionOptionOwner::Builtin,
@@ -1684,12 +1676,15 @@ pub fn builtin_option_definitions(
             persistent: true,
         },
         yolo_definition(yolo),
+        toggle_definition(
+            FAST_OPTION_ID,
+            "Fast",
+            "Use the model's fast service tier",
+            fast,
+        ),
+        workflow_definition(workflow),
+        thinking_definition(thinking),
     ]
-    .into_iter()
-    .chain(choices)
-    .chain([workflow_definition(workflow)])
-    .chain(free_inputs)
-    .collect()
 }
 
 /// The built-in options a plain set accepts; model, thinking and fast have
@@ -1709,6 +1704,27 @@ fn workflow_definition(workflow: bool) -> SessionOptionDefinition {
         "Enable workflow tools for future turns",
         workflow,
     )
+}
+
+fn thinking_definition(thinking: ThinkingConfig) -> SessionOptionDefinition {
+    SessionOptionDefinition {
+        id: Arc::from(THINKING_OPTION_ID),
+        owner: SessionOptionOwner::Builtin,
+        name: Arc::from("Thinking"),
+        description: Arc::from("Reasoning effort used for future requests"),
+        category: SessionOptionCategory::Mode,
+        values: ThinkingConfig::options()
+            .iter()
+            .map(|value| SessionOptionValue {
+                value: Arc::from(*value),
+                name: Arc::from(*value),
+            })
+            .collect::<Vec<_>>()
+            .into(),
+        free_value: Some(FreeValueDomain::ThinkingSetting),
+        initial_value: Arc::from(thinking.to_string()),
+        persistent: true,
+    }
 }
 
 fn toggle_definition(

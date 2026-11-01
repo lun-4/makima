@@ -7,8 +7,7 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent};
-use maki_domain::{MODEL_OPTION_SPECS, ModelCapabilities, ModelSelection};
-use maki_providers::CompleteModelSelection;
+use maki_providers::{ModelOption, ModelSelection};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -157,9 +156,8 @@ impl PlanForm {
         &self.implementation_selection
     }
 
-    pub fn set_implementation_selection(&mut self, selection: ModelSelection, current_model: &str) {
+    pub fn set_implementation_selection(&mut self, selection: ModelSelection) {
         self.implementation_selection = selection;
-        self.clear_model_if_current(current_model);
         self.selected = self
             .selected
             .min(Self::menu_len(!self.implementation_selection.is_empty()) - 1);
@@ -195,14 +193,9 @@ impl PlanForm {
         ]))
     }
 
-    pub fn height(
-        &self,
-        width: u16,
-        baseline: &CompleteModelSelection,
-        capabilities: &ModelCapabilities,
-    ) -> u16 {
+    pub fn height(&self, width: u16, current_model: &str) -> u16 {
         if self.is_visible() {
-            form_height(self.lines(baseline, capabilities), width)
+            form_height(self.lines(current_model), width)
         } else {
             0
         }
@@ -245,13 +238,7 @@ impl PlanForm {
         }
     }
 
-    pub fn view(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        baseline: &CompleteModelSelection,
-        capabilities: &ModelCapabilities,
-    ) {
+    pub fn view(&self, frame: &mut Frame, area: Rect, current_model: &str) {
         if !self.is_visible() {
             return;
         }
@@ -261,21 +248,16 @@ impl PlanForm {
             FORM_LABEL,
             frame,
             area,
-            self.lines(baseline, capabilities),
+            self.lines(current_model),
             (0, 0),
         );
     }
 
-    fn lines(
-        &self,
-        baseline: &CompleteModelSelection,
-        capabilities: &ModelCapabilities,
-    ) -> Vec<Line<'static>> {
+    fn lines(&self, current_model: &str) -> Vec<Line<'static>> {
         let t = theme::current();
         let staged = &self.implementation_selection;
         let menu_len = Self::menu_len(!staged.is_empty());
-        let mut lines: Vec<Line<'static>> =
-            Vec::with_capacity(menu_len + MODEL_OPTION_SPECS.len() + 2);
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(menu_len + 3);
 
         for (row, item) in MENU.iter().enumerate() {
             let mut spans = self.row_spans(&t, row, item.label, item.desc);
@@ -286,7 +268,7 @@ impl PlanForm {
         }
         let (spec, tag) = match staged.spec.as_deref() {
             Some(spec) => (spec, MODEL_STAGED_TAG),
-            None => (baseline.spec.as_ref(), MODEL_CURRENT_TAG),
+            None => (current_model, MODEL_CURRENT_TAG),
         };
         lines.push(Line::from(self.row_spans(
             &t,
@@ -294,23 +276,15 @@ impl PlanForm {
             format!("{MODEL_LABEL}: {spec}"),
             tag,
         )));
-        let current = baseline.as_selection();
-        for option in MODEL_OPTION_SPECS {
-            let assignment = option.read(staged).map(|value| (value, MODEL_STAGED_TAG));
-            let assignment = assignment.or_else(|| {
-                option
-                    .availability(capabilities)
-                    .is_available()
-                    .then(|| option.read(&current))
-                    .flatten()
-                    .map(|value| (value, MODEL_CURRENT_TAG))
-            });
-            if let Some((value, tag)) = assignment {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("    {}={value}", option.key), t.tool_dim),
-                    Span::styled(tag, t.tool_dim),
-                ]));
-            }
+        let overrides: Vec<String> = ModelOption::ALL
+            .into_iter()
+            .filter_map(|option| Some(format!("{}={}", option.key(), option.get(staged)?)))
+            .collect();
+        if !overrides.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled(format!("    {}", overrides.join(" ")), t.tool_dim),
+                Span::styled(MODEL_STAGED_TAG, t.tool_dim),
+            ]));
         }
         if !staged.is_empty() {
             lines.push(Line::from(self.row_spans(
@@ -344,14 +318,11 @@ impl PlanForm {
 #[cfg(test)]
 mod tests {
     use super::{
-        MODEL_ROW, ModelCapabilities, ModelSelection, PlanForm, PlanFormAction, USE_CURRENT_LABEL,
-        USE_CURRENT_ROW,
+        MODEL_ROW, ModelSelection, PlanForm, PlanFormAction, USE_CURRENT_LABEL, USE_CURRENT_ROW,
     };
     use crate::components::keybindings::key;
     use crate::components::{buffer_text, key};
     use crossterm::event::{KeyCode, KeyEvent};
-    use maki_domain::{FastCapability, ThinkingCapability, ThinkingConfig};
-    use maki_providers::CompleteModelSelection;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::path::Path;
@@ -365,22 +336,6 @@ mod tests {
     const PLAN_PATH: &str = "plan.md";
     const REPLACEMENT_PLAN_PATH: &str = "replacement-plan.md";
 
-    fn baseline(spec: &str) -> CompleteModelSelection {
-        CompleteModelSelection {
-            spec: spec.into(),
-            thinking: ThinkingConfig::Off,
-            fast: false,
-        }
-    }
-
-    fn capabilities() -> ModelCapabilities {
-        ModelCapabilities {
-            resolved: true,
-            thinking: ThinkingCapability::Supported,
-            fast: FastCapability::Supported,
-        }
-    }
-
     fn selection(spec: Option<&str>, options: &[(&str, &str)]) -> ModelSelection {
         let mut selection = ModelSelection {
             spec: spec.map(Into::into),
@@ -392,16 +347,11 @@ mod tests {
         selection
     }
 
-    fn render(
-        form: &PlanForm,
-        width: u16,
-        baseline: &CompleteModelSelection,
-        capabilities: &ModelCapabilities,
-    ) -> String {
-        let height = form.height(width, baseline, capabilities);
+    fn render(form: &PlanForm, width: u16) -> String {
+        let height = form.height(width, CURRENT_MODEL);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| form.view(frame, frame.area(), baseline, capabilities))
+            .draw(|frame| form.view(frame, frame.area(), CURRENT_MODEL))
             .unwrap();
         buffer_text(terminal.backend().buffer())
     }
@@ -456,7 +406,7 @@ mod tests {
         assert!(!form.sync_plan_path(Some(Path::new(PLAN_PATH))));
         form.on_plan_ready();
         let staged = selection(Some(OTHER_MODEL), &[("thinking", "off"), ("fast", "false")]);
-        form.set_implementation_selection(staged.clone(), CURRENT_MODEL);
+        form.set_implementation_selection(staged.clone());
         assert_eq!(
             form.handle_key(key(KeyCode::Char(' '))),
             PlanFormAction::Consumed
@@ -502,13 +452,11 @@ mod tests {
     #[test]
     fn height_reflects_visibility() {
         let mut form = PlanForm::new();
-        let baseline = baseline(CURRENT_MODEL);
-        let capabilities = capabilities();
-        assert_eq!(form.height(WIDE, &baseline, &capabilities), 0);
+        assert_eq!(form.height(WIDE, CURRENT_MODEL), 0);
         form.on_plan_ready();
-        assert!(form.height(WIDE, &baseline, &capabilities) > 0);
+        assert!(form.height(WIDE, CURRENT_MODEL) > 0);
         form.hide();
-        assert_eq!(form.height(WIDE, &baseline, &capabilities), 0);
+        assert_eq!(form.height(WIDE, CURRENT_MODEL), 0);
     }
 
     #[test_case(80, true, None, MODEL_ROW - 1, "Implement plan" ; "parallel_at_80_cols")]
@@ -524,13 +472,13 @@ mod tests {
         form.on_plan_ready();
         form.parallel = parallel;
         if let Some(spec) = staged {
-            form.set_implementation_selection(
-                selection(Some(spec), &[("thinking", "off"), ("fast", "false")]),
-                CURRENT_MODEL,
-            );
+            form.set_implementation_selection(selection(
+                Some(spec),
+                &[("thinking", "off"), ("fast", "false")],
+            ));
         }
         form.selected = selected;
-        let text = render(&form, width, &baseline(CURRENT_MODEL), &capabilities());
+        let text = render(&form, width);
         assert!(text.contains(HINT_TAIL));
         assert!(text.contains(&format!("▸ {row_label}")));
     }
@@ -559,27 +507,14 @@ mod tests {
         assert_eq!(form.handle_key(key(KeyCode::Enter)), expected);
     }
 
-    #[test_case(false ; "current_identity_at_staging")]
-    #[test_case(true ; "identity_becomes_current")]
-    fn plan_form_preserves_options_when_identity_matches(later: bool) {
+    #[test]
+    fn staged_identity_becoming_current_keeps_options() {
         let mut form = PlanForm::new();
         let options = [("thinking", "off"), ("fast", "false")];
-        form.set_implementation_selection(
-            selection(
-                Some(if later { OTHER_MODEL } else { CURRENT_MODEL }),
-                &options,
-            ),
-            CURRENT_MODEL,
-        );
+        form.set_implementation_selection(selection(Some(OTHER_MODEL), &options));
         form.selected = USE_CURRENT_ROW;
-        if later {
-            form.clear_model_if_current(OTHER_MODEL);
-        }
+        form.clear_model_if_current(OTHER_MODEL);
         assert_eq!(form.implementation_selection(), &selection(None, &options));
-        assert_eq!(form.selected, USE_CURRENT_ROW);
-        form.on_plan_ready();
-        form.selected = MODEL_ROW;
-        form.handle_key(key(KeyCode::Down));
         assert_eq!(form.selected, USE_CURRENT_ROW);
     }
 
@@ -588,10 +523,10 @@ mod tests {
     fn plan_form_use_current_clears_all_overrides(spec: Option<&str>) {
         let mut form = PlanForm::new();
         form.parallel = true;
-        form.set_implementation_selection(
-            selection(spec, &[("thinking", "off"), ("fast", "false")]),
-            CURRENT_MODEL,
-        );
+        form.set_implementation_selection(selection(
+            spec,
+            &[("thinking", "off"), ("fast", "false")],
+        ));
         form.use_current_model();
         assert!(form.implementation_selection().is_empty());
         assert!(form.parallel());
@@ -604,7 +539,7 @@ mod tests {
     fn staged_selection_survives_planning_lifecycle_until_reset() {
         let mut form = PlanForm::new();
         let selection = selection(Some(OTHER_MODEL), &[("thinking", "high"), ("fast", "true")]);
-        form.set_implementation_selection(selection.clone(), CURRENT_MODEL);
+        form.set_implementation_selection(selection.clone());
         form.parallel = true;
         form.on_plan_ready();
         form.hide();
@@ -620,77 +555,40 @@ mod tests {
     #[test]
     fn matching_identity_cleanup_clamps_reset_row() {
         let mut form = PlanForm::new();
-        form.set_implementation_selection(selection(Some(OTHER_MODEL), &[]), CURRENT_MODEL);
+        form.set_implementation_selection(selection(Some(OTHER_MODEL), &[]));
         form.selected = USE_CURRENT_ROW;
         form.clear_model_if_current(OTHER_MODEL);
         assert!(form.implementation_selection().is_empty());
         assert_eq!(form.selected, MODEL_ROW);
     }
 
-    #[test_case(None, false, FastCapability::Unsupported ; "options_only_unresolved")]
-    #[test_case(Some(OTHER_MODEL), true, FastCapability::Unsupported ; "identity_and_options_unsupported")]
-    #[test_case(None, true, FastCapability::Pending ; "options_only_pending")]
-    #[test_case(None, true, FastCapability::Supported ; "options_only_supported")]
-    fn plan_form_renders_structured_selection(
-        spec: Option<&str>,
-        resolved: bool,
-        fast: FastCapability,
-    ) {
+    #[test_case(None ; "options_only")]
+    #[test_case(Some(OTHER_MODEL) ; "identity_and_options")]
+    fn renders_staged_selection(spec: Option<&str>) {
         let mut form = PlanForm::new();
         form.on_plan_ready();
-        form.set_implementation_selection(
-            selection(spec, &[("thinking", "off"), ("fast", "false")]),
-            CURRENT_MODEL,
-        );
-        let capabilities = ModelCapabilities {
-            resolved,
-            thinking: ThinkingCapability::Unsupported,
-            fast,
-        };
-        let text = render(&form, WIDE, &baseline(CURRENT_MODEL), &capabilities);
+        form.set_implementation_selection(selection(
+            spec,
+            &[("thinking", "off"), ("fast", "false")],
+        ));
+        let text = render(&form, WIDE);
         assert!(text.contains(&format!(
             "Implementation model: {}",
             spec.unwrap_or(CURRENT_MODEL)
         )));
-        assert!(text.contains("thinking=off  selected"));
-        assert!(text.contains("fast=false  selected"));
+        assert!(text.contains("thinking=off fast=false  selected"));
         assert!(text.contains(USE_CURRENT_LABEL));
         assert!(text.contains(HINT_TAIL));
     }
 
-    #[test_case(ThinkingCapability::Supported, FastCapability::Supported, true, true ; "both")]
-    #[test_case(ThinkingCapability::Supported, FastCapability::Unsupported, true, false ; "thinking")]
-    #[test_case(ThinkingCapability::Unsupported, FastCapability::Supported, false, true ; "fast")]
-    #[test_case(ThinkingCapability::Unsupported, FastCapability::Unsupported, false, false ; "neither")]
-    #[test_case(ThinkingCapability::Required, FastCapability::Pending, true, false ; "required_pending")]
-    fn inherited_options_follow_capabilities(
-        thinking: ThinkingCapability,
-        fast: FastCapability,
-        shows_thinking: bool,
-        shows_fast: bool,
-    ) {
-        let mut form = PlanForm::new();
-        form.on_plan_ready();
-        let capabilities = ModelCapabilities {
-            resolved: true,
-            thinking,
-            fast,
-        };
-        let text = render(&form, WIDE, &baseline(CURRENT_MODEL), &capabilities);
-        assert_eq!(text.contains("thinking=off  current"), shows_thinking);
-        assert_eq!(text.contains("fast=false  current"), shows_fast);
-        assert!(!text.contains(USE_CURRENT_LABEL));
-    }
-
     #[test]
-    fn options_only_summary_keeps_supported_inherited_values() {
+    fn unstaged_form_shows_current_model_only() {
         let mut form = PlanForm::new();
         form.on_plan_ready();
-        form.set_implementation_selection(selection(None, &[("fast", "false")]), CURRENT_MODEL);
-        let text = render(&form, WIDE, &baseline(CURRENT_MODEL), &capabilities());
-        assert!(text.contains("thinking=off  current"));
-        assert!(text.contains("fast=false  selected"));
-        assert!(text.contains(USE_CURRENT_LABEL));
+        let text = render(&form, WIDE);
+        assert!(text.contains(&format!("Implementation model: {CURRENT_MODEL}  current")));
+        assert!(!text.contains("thinking="));
+        assert!(!text.contains(USE_CURRENT_LABEL));
     }
 
     #[test]

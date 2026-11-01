@@ -6,6 +6,7 @@ use crate::components::command::ParsedCommand;
 use crate::components::file_picker::EMPTY_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
 use crate::components::{ExitRequest, buffer_text, key, test_model};
+use crate::model_capabilities::test_support::seeded;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
 use arc_swap::ArcSwap;
@@ -687,7 +688,18 @@ fn app_with_model_slot() -> (App, Arc<ArcSwapOption<Vec<String>>>) {
 
 fn install_model_slot(app: &mut App) -> Arc<ArcSwapOption<Vec<String>>> {
     let models = Arc::new(ArcSwapOption::empty());
-    app.model_picker = ModelPicker::new(Arc::clone(&models));
+    let options = ModelCapabilities {
+        thinking: ThinkingSupport::Yes,
+        fast: true,
+    };
+    let resolved = [
+        PLAN_OPTIONS_MODEL,
+        PLAN_OPTIONS_OTHER,
+        PLAN_OPTIONS_LONG_MODEL,
+        LATE_MODEL_SPEC,
+    ]
+    .map(|spec| (spec, options));
+    app.model_picker = ModelPicker::new(Arc::clone(&models), seeded(&resolved, &[]));
     app.available_models = Arc::clone(&models);
     models
 }
@@ -7091,16 +7103,9 @@ fn plan_picker_cancel_retains_staged_options(undiscovered: bool, cancel: KeyEven
     );
     let config = target.effective_config().unwrap().unwrap();
     let original = config.model_selection();
-    let capabilities = ModelCapabilities::from(&config.model);
-    app.plan_form
-        .set_implementation_selection(staged.clone(), &original.spec);
+    app.plan_form.set_implementation_selection(staged.clone());
     let persisted = model_persistence(&app);
     app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
-    if undiscovered {
-        let _ = app
-            .model_picker
-            .set_capabilities(PLAN_OPTIONS_LONG_MODEL, capabilities.clone());
-    }
     app.update(Msg::Key(key(KeyCode::Tab)));
     app.update(Msg::Key(KeyEvent::new(
         KeyCode::Char('a'),
@@ -7121,11 +7126,6 @@ fn plan_picker_cancel_retains_staged_options(undiscovered: bool, cancel: KeyEven
     );
     assert_eq!(model_persistence(&app), persisted);
     app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
-    if undiscovered {
-        let _ = app
-            .model_picker
-            .set_capabilities(PLAN_OPTIONS_LONG_MODEL, capabilities);
-    }
     assert_eq!(
         app.model_picker.highlighted_spec(),
         Some(staged.spec.as_deref().unwrap_or(&original.spec))
@@ -7156,13 +7156,13 @@ fn plan_picker_target_change_discards_draft() {
     app.plan_form.on_plan_ready();
     let child_stage = model_selection(None, Some(ThinkingConfig::Adaptive), Some(true));
     app.plan_form
-        .set_implementation_selection(child_stage.clone(), PLAN_OPTIONS_OTHER);
+        .set_implementation_selection(child_stage.clone());
     app.active_chat = 0;
     bind_actor_target(&app, root.clone());
     app.sync_focused_queue();
     let root_stage = model_selection(None, Some(ThinkingConfig::Off), Some(false));
     app.plan_form
-        .set_implementation_selection(root_stage.clone(), PLAN_OPTIONS_MODEL);
+        .set_implementation_selection(root_stage.clone());
     app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
     edit_picker_options(&mut app, "high", true);
     app.active_chat = 1;
@@ -7185,7 +7185,7 @@ fn child_plan_stage_survives_focus_before_command_target_rebind() {
     app.sync_focused_queue();
     let root_stage = model_selection(None, Some(ThinkingConfig::Off), Some(false));
     app.plan_form
-        .set_implementation_selection(root_stage.clone(), PLAN_OPTIONS_MODEL);
+        .set_implementation_selection(root_stage.clone());
     let (child, _rx) = spawn_input_child(&mut app, TASK_ID, SUBAGENT_NAME);
     commit_target_plan_path(&mut app, &child, PLAN_OPTIONS_CHILD_PATH, false);
     app.active_chat = 1;
@@ -7194,7 +7194,7 @@ fn child_plan_stage_survives_focus_before_command_target_rebind() {
     app.plan_form.on_plan_ready();
     let child_stage = model_selection(None, Some(ThinkingConfig::Adaptive), Some(true));
     app.plan_form
-        .set_implementation_selection(child_stage.clone(), &app.focused_model_spec());
+        .set_implementation_selection(child_stage.clone());
     app.update(Msg::Key(key(KeyCode::Char(' '))));
     app.plan_approval_pending = true;
     app.active_chat = 0;
@@ -7234,7 +7234,7 @@ fn replaced_plan_path_discards_only_owning_form_stage(child_owner: bool, saved: 
     app.sync_focused_queue();
     let root_stage = model_selection(None, Some(ThinkingConfig::Off), Some(false));
     app.plan_form
-        .set_implementation_selection(root_stage.clone(), PLAN_OPTIONS_MODEL);
+        .set_implementation_selection(root_stage.clone());
     app.update(Msg::Key(key(KeyCode::Char(' '))));
     assert!(app.plan_form.parallel());
     let (child, _rx) = spawn_input_child(&mut app, TASK_ID, SUBAGENT_NAME);
@@ -7252,7 +7252,7 @@ fn replaced_plan_path_discards_only_owning_form_stage(child_owner: bool, saved: 
     app.plan_form.on_plan_ready();
     let child_stage = model_selection(None, Some(ThinkingConfig::Adaptive), Some(true));
     app.plan_form
-        .set_implementation_selection(child_stage.clone(), PLAN_OPTIONS_OTHER);
+        .set_implementation_selection(child_stage.clone());
     app.update(Msg::Key(key(KeyCode::Char(' '))));
     assert!(app.plan_form.parallel());
     let owner_index = usize::from(child_owner);
@@ -7364,13 +7364,7 @@ fn ordinary_model_picker_keeps_owner_after_focus_change() {
 fn plan_picker_retirement_discards_open_draft(child: bool, closed: bool) {
     let (_tmp, mut app, target) = model_options_app(child, true);
     let staged = model_selection(None, Some(ThinkingConfig::Off), Some(false));
-    let current = target
-        .effective_config()
-        .unwrap()
-        .unwrap()
-        .model_selection();
-    app.plan_form
-        .set_implementation_selection(staged, &current.spec);
+    app.plan_form.set_implementation_selection(staged);
     app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
     edit_picker_options(&mut app, "adaptive", true);
     if closed {
@@ -7602,10 +7596,8 @@ fn plan_form_yields_escape_to_blocking_modal(btw: bool) {
 #[test_case("custom" ; "custom")]
 fn plan_mode_exit_clears_staging_and_picker(mode: &str) {
     let mut app = plan_app();
-    app.plan_form.set_implementation_selection(
-        model_selection(Some(LATE_MODEL_SPEC), None, None),
-        &app.root_config().model.spec(),
-    );
+    app.plan_form
+        .set_implementation_selection(model_selection(Some(LATE_MODEL_SPEC), None, None));
     app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
     set_root_mode(&mut app, Mode::from_id(mode));
     assert!(app.plan_form.implementation_selection().is_empty());
@@ -7657,10 +7649,8 @@ fn normal_model_picker_still_requests_model_change() {
 #[test]
 fn plan_approval_pending_blocks_edits_and_requests_cancellation() {
     let mut app = plan_app();
-    app.plan_form.set_implementation_selection(
-        model_selection(Some(LATE_MODEL_SPEC), None, None),
-        &app.root_config().model.spec(),
-    );
+    app.plan_form
+        .set_implementation_selection(model_selection(Some(LATE_MODEL_SPEC), None, None));
     app.update(Msg::Key(key(KeyCode::Down)));
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(app.plan_approval_pending);
@@ -7706,25 +7696,13 @@ fn image_path_paste_follows_plan_ownership(approval_pending: bool) {
 #[test_case(true, 44 ; "child_narrow")]
 fn plan_form_renders_effective_implementation_model(child: bool, width: u16) {
     let (_tmp, mut app, target) = model_options_app(child, true);
-    let baseline = target
-        .effective_config()
-        .unwrap()
-        .unwrap()
-        .model_selection();
-    let inherited_thinking = if child { "high" } else { "off" };
-    let inherited_fast = if child { "true" } else { "false" };
+    let current = target.effective_config().unwrap().unwrap().model.spec();
     let cases = [
-        (
-            ModelSelection::default(),
-            baseline.spec.as_ref(),
-            inherited_thinking,
-            inherited_fast,
-        ),
+        (ModelSelection::default(), current.as_str(), None),
         (
             model_selection(None, Some(ThinkingConfig::Off), Some(false)),
-            baseline.spec.as_ref(),
-            "off",
-            "false",
+            current.as_str(),
+            Some("thinking=off fast=false"),
         ),
         (
             model_selection(
@@ -7733,80 +7711,37 @@ fn plan_form_renders_effective_implementation_model(child: bool, width: u16) {
                 Some(true),
             ),
             PLAN_OPTIONS_LONG_MODEL,
-            "adaptive",
-            "true",
+            Some("thinking=adaptive fast=true"),
         ),
     ];
     let area = Rect::new(0, 0, width, 60);
-    let mut previous_height = 0;
-    for (staged, expected_model, thinking, fast) in cases {
-        app.plan_form
-            .set_implementation_selection(staged.clone(), &baseline.spec);
+    for (staged, expected_model, overrides) in cases {
+        app.plan_form.set_implementation_selection(staged.clone());
         let rows = rendered_rows(&mut app, area.width, area.height).join("\n");
         let (_, bottom, _, _, _) = app.layout_geometry(area);
-        let (current, capabilities) = app.focused_model_selection();
-        let height = app.plan_form.height(bottom.width, &current, &capabilities);
-        assert_eq!(bottom.height, height);
+        assert_eq!(
+            bottom.height,
+            app.plan_form
+                .height(bottom.width, &app.focused_model_spec())
+        );
         let compact: String = rows
             .chars()
             .filter(|c| !c.is_whitespace() && !matches!(c, '│' | '┃' | '║'))
             .collect();
         assert!(compact.contains(&format!("Implementationmodel:{expected_model}")));
-        assert!(rows.contains(&format!("thinking={thinking}")));
-        assert!(rows.contains(&format!("fast={fast}")));
         assert_eq!(rows.contains("Use current model"), !staged.is_empty());
-        let tag = if staged.is_empty() {
-            "current"
-        } else {
-            "selected"
-        };
-        assert!(
-            rows.lines()
-                .any(|row| row.contains(&format!("thinking={thinking}")) && row.contains(tag))
-        );
-        assert!(
-            rows.lines()
-                .any(|row| row.contains(&format!("fast={fast}")) && row.contains(tag))
-        );
-        if !staged.is_empty() {
-            assert!(height >= previous_height);
-            if staged.spec.is_none() {
-                assert!(height > previous_height);
-            }
+        match overrides {
+            Some(overrides) => assert!(compact.contains(&overrides.replace(' ', ""))),
+            None => assert!(!rows.contains("thinking=")),
         }
-        previous_height = height;
     }
-    configure_model_options(&target, &baseline.spec, ThinkingConfig::Off, false, false);
-    app.plan_form
-        .set_implementation_selection(ModelSelection::default(), &baseline.spec);
-    let rows = rendered_rows(&mut app, area.width, area.height).join("\n");
-    assert!(!rows.contains("thinking="));
-    assert!(!rows.contains("fast="));
-    let (_, empty_bottom, _, _, _) = app.layout_geometry(area);
-    app.plan_form.set_implementation_selection(
-        model_selection(None, Some(ThinkingConfig::Off), Some(false)),
-        &baseline.spec,
-    );
-    let rows = rendered_rows(&mut app, area.width, area.height).join("\n");
-    assert!(rows.contains("thinking=off"));
-    assert!(rows.contains("fast=false"));
-    assert!(rows.contains("Use current model"));
-    let (_, bottom, _, _, _) = app.layout_geometry(area);
-    let (current, capabilities) = app.focused_model_selection();
-    assert_eq!(
-        bottom.height,
-        app.plan_form.height(bottom.width, &current, &capabilities)
-    );
-    assert!(bottom.height > empty_bottom.height);
 }
 
 #[test]
 fn staged_model_matching_session_model_approves_without_override() {
     let mut app = plan_app();
-    app.plan_form.set_implementation_selection(
-        model_selection(Some(LATE_MODEL_SPEC), None, None),
-        &app.focused_model_spec(),
-    );
+    app.plan_form
+        .set_implementation_selection(model_selection(Some(LATE_MODEL_SPEC), None, None));
     commit_root_model(&app, Model::from_spec(LATE_MODEL_SPEC).unwrap());
     app.update(Msg::Key(key(KeyCode::Down)));
     app.update(Msg::Key(key(KeyCode::Down)));

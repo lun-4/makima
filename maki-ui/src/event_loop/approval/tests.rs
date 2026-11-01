@@ -39,8 +39,9 @@ use super::ApprovalStep;
 use crate::AppSession;
 use crate::app::mode::{Mode, PlanState};
 use crate::components::keybindings::key;
-use crate::components::model_picker::ModelPickerAction;
+use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::{self, Action, Status};
+use crate::model_capabilities::test_support::seeded;
 use crate::plan_approval::{
     APPROVAL_BUSY, APPROVAL_CHANGED, IMPLEMENT_PARALLEL_HINT, idle_error_message, read_plan,
 };
@@ -110,17 +111,23 @@ fn stage_with_picker(event_loop: &mut EventLoop<'_>, index: usize) {
             fast: true,
         },
     );
+    app.model_picker = ModelPicker::new(
+        Arc::clone(&app.available_models),
+        seeded(
+            &[(
+                TARGET_MODEL,
+                ModelCapabilities::from(&capable_model(TARGET_MODEL)),
+            )],
+            &[],
+        ),
+    );
     app.model_picker.open(
         current,
         ModelCapabilities::from(&capable_model(SOURCE_MODEL)),
-        ModelSelection {
+        &ModelSelection {
             spec: Some(TARGET_MODEL.into()),
             ..Default::default()
         },
-    );
-    let _ = app.model_picker.set_capabilities(
-        TARGET_MODEL,
-        ModelCapabilities::from(&capable_model(TARGET_MODEL)),
     );
     app.model_picker.handle_key(components::key(KeyCode::Tab));
     app.model_picker.handle_paste("high");
@@ -132,8 +139,7 @@ fn stage_with_picker(event_loop: &mut EventLoop<'_>, index: usize) {
         panic!("picker did not confirm implementation selection");
     };
     assert_eq!(selection, implementation_selection());
-    app.plan_form
-        .set_implementation_selection(selection, SOURCE_MODEL);
+    app.plan_form.set_implementation_selection(selection);
 }
 
 fn assert_actor_selection(actor: &AgentActorHandle, spec: &str, options: RequestOptions) {
@@ -866,7 +872,7 @@ fn managed_child_approval(
                 event_loop.sessions[index]
                     .app
                     .plan_form
-                    .set_implementation_selection(selection.clone(), SOURCE_MODEL);
+                    .set_implementation_selection(selection.clone());
             }
             if saved {
                 event_loop.sessions[index].app.active_chat = 0;
@@ -1248,7 +1254,7 @@ fn setup_with_registry(
     event_loop.sessions[index]
         .app
         .plan_form
-        .set_implementation_selection(implementation_selection(), SOURCE_MODEL);
+        .set_implementation_selection(implementation_selection());
     event_loop.ctx.prepare_provider = Arc::new(move |model, _| {
         Ok(PreparedModel {
             model: capable_model(&model.spec()),

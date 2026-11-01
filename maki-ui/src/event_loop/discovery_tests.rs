@@ -6,8 +6,9 @@ use maki_config::{
     ModelPolicy,
     providers::{ProviderDef, ProvidersConfig},
 };
-use maki_domain::{FastCapability, ModelCapabilities, ModelSelection, ThinkingCapability};
-use maki_providers::{CompleteModelSelection, ThinkingConfig};
+use maki_providers::{
+    CompleteModelSelection, ModelCapabilities, ModelSelection, ThinkingConfig, ThinkingSupport,
+};
 use maki_storage::paths;
 use ratatui::{Terminal, backend::TestBackend};
 use smol::Async;
@@ -35,11 +36,10 @@ fn open_with_draft(event_loop: &mut EventLoop<'_>, current: &str, draft: ModelSe
     event_loop.sessions[0].app.model_picker.open(
         current_selection(current),
         ModelCapabilities {
-            resolved: true,
-            thinking: ThinkingCapability::Supported,
-            fast: FastCapability::Supported,
+            thinking: ThinkingSupport::Yes,
+            fast: true,
         },
-        draft,
+        &draft,
     );
 }
 
