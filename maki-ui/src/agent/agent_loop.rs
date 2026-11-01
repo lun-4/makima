@@ -573,6 +573,7 @@ impl ActorBackend for TuiActorBackend {
                 self.timeouts,
                 &self.model_policy,
             );
+            event_tx.try_send(AgentEvent::ModelSwitched { spec: model.spec() });
             let previous = history.snapshot().clone();
             let mut result = maki_agent::agent::compact(
                 &*provider,
@@ -2517,6 +2518,91 @@ mod tests {
         > {
             Box::pin(async { Ok(Vec::new()) })
         }
+    }
+
+    #[test_case(false; "success")]
+    #[test_case(true; "cancelled")]
+    fn idle_compaction_adopts_presentation_and_displays_progress(cancel: bool) {
+        smol::block_on(async {
+            const PREVIOUS_PRESENTATION: u64 = 7;
+            let (mut backend, _, events) = failing_backend();
+            backend.model_policy = Arc::new(ModelPolicy::new(&[], &["*".into()]).unwrap());
+            let (release, released) = flume::bounded(1);
+            let config = EffectiveAgentConfig::new(
+                RunSettings {
+                    provider: Arc::new(ExplicitProvider { release: released }),
+                    model: crate::components::test_model(),
+                    fast: false,
+                    workflow: false,
+                    thinking: Default::default(),
+                },
+                AgentMode::Build,
+            );
+            let manager = AgentManagerHandle::new(Default::default()).unwrap();
+            let root = manager
+                .create_root_with_config(
+                    Some(config),
+                    vec![Message::user("summarize this conversation".into())],
+                    None,
+                    |agent_id| {
+                        backend.agent_id = agent_id;
+                        Ok::<Box<dyn ActorBackend>, String>(Box::new(backend))
+                    },
+                )
+                .unwrap();
+            let actor = root.actor().unwrap();
+            actor.observe_presentation(PREVIOUS_PRESENTATION);
+            let actor_events = actor.subscribe_events();
+            let mut app =
+                crate::app::tests::actor_presentation_app(root.clone(), PREVIOUS_PRESENTATION);
+            actor.push_compact(PREVIOUS_PRESENTATION, None).unwrap();
+            let presentation = PREVIOUS_PRESENTATION + 1;
+            loop {
+                let envelope = events.recv_timeout(TEST_TIMEOUT).unwrap();
+                assert_eq!(envelope.presentation(), Some(presentation));
+                let streamed = matches!(envelope.event, AgentEvent::TextDelta { .. });
+                app.update(crate::app::Msg::Agent(Box::new(envelope)));
+                assert_eq!(app.run_id, presentation);
+                assert_eq!(app.status, crate::components::Status::Streaming);
+                if streamed {
+                    assert!(!app.main_chat().streaming_text_is_empty());
+                    break;
+                }
+            }
+            if cancel {
+                actor.cancel_existing();
+            } else {
+                release.send(()).unwrap();
+            }
+            loop {
+                let envelope = events.recv_timeout(TEST_TIMEOUT).unwrap();
+                let finished = matches!(
+                    envelope.event,
+                    AgentEvent::ControlComplete { .. } | AgentEvent::ControlError { .. }
+                );
+                app.update(crate::app::Msg::Agent(Box::new(envelope)));
+                if finished {
+                    break;
+                }
+            }
+            if cancel {
+                assert!(matches!(
+                    app.status,
+                    crate::components::Status::Error { .. }
+                ));
+            } else {
+                assert_eq!(app.status, crate::components::Status::Idle);
+                crate::app::tests::assert_actor_response(&mut app, EXPLICIT_RESPONSE);
+            }
+            await_settlement(&actor_events, presentation).await;
+            assert!(
+                manager
+                    .shutdown(SHUTDOWN_TIMEOUT)
+                    .await
+                    .timed_out
+                    .is_empty()
+            );
+        });
     }
 
     #[test]
