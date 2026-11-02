@@ -3535,7 +3535,7 @@ impl<'t> EventLoop<'t> {
                 self.prepare_plan_approval(idx, clear_context, model, parallel, path);
             }
             Action::CancelPlanApproval => self.sessions[idx].end_plan_approval(),
-            Action::RefreshProvider { slug } => self.refresh_provider(slug),
+            Action::RefreshProvider { slug } => self.refresh_provider(idx, slug),
             Action::AssignTier(spec, tier) => {
                 maki_providers::model_registry::set_and_persist(spec, tier, &self.ctx.storage);
             }
@@ -4181,14 +4181,12 @@ impl<'t> EventLoop<'t> {
         self.sync_model_discovery();
     }
 
-    fn refresh_provider(&mut self, slug: String) {
-        let idx = self.focused;
-        let slot = Arc::clone(self.focused_model_slot());
-        let model = slot.load().model.clone();
+    fn refresh_provider(&mut self, idx: usize, slug: String) {
+        let model = self.sessions[idx].model_slot.load().model.clone();
         if model.provider.to_string() == slug {
             self.reprepare_root_model(idx, model.spec());
         } else if let Some(builtin) = maki_config::providers::builtin_provider(&slug) {
-            self.change_model(self.focused, builtin.default_model);
+            self.change_model(idx, builtin.default_model);
         }
     }
 
@@ -6317,6 +6315,48 @@ mod tests {
 
         let stored = AppSession::load(id, &storage).unwrap();
         assert_eq!(stored.messages()[0].user_text(), Some(OWNER_CONTENT));
+    }
+
+    #[test]
+    fn login_refresh_reprepares_the_originating_session() {
+        const FOCUSED: &str = "anthropic/claude-sonnet-4-6";
+        const BACKGROUND: &str = "anthropic/claude-opus-4-6";
+        const PROVIDER: &str = "anthropic";
+
+        with_event_loop(|event_loop| {
+            for spec in [FOCUSED, BACKGROUND] {
+                let runtime = event_loop
+                    .ctx
+                    .spawn_runtime_with_provider(
+                        AppSession::new(spec, &event_loop.session_cwd),
+                        Some(PreparedProvider {
+                            model: Model::from_spec(spec).unwrap(),
+                            provider: Arc::new(StubProvider),
+                        }),
+                    )
+                    .unwrap();
+                event_loop.push_runtime(runtime);
+            }
+            let (prepared_tx, prepared_rx) = flume::unbounded();
+            event_loop.ctx.prepare_provider = Arc::new(move |requested, _| {
+                prepared_tx.send(requested.spec()).unwrap();
+                Ok(PreparedModel {
+                    model: requested.clone(),
+                    provider: Arc::new(StubProvider),
+                })
+            });
+            event_loop.set_focused(1);
+            event_loop.dispatch(
+                2,
+                vec![Action::RefreshProvider {
+                    slug: PROVIDER.into(),
+                }],
+            );
+            assert_eq!(
+                prepared_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap(),
+                BACKGROUND
+            );
+        });
     }
 
     #[test]
