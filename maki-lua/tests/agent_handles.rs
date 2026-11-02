@@ -3695,13 +3695,32 @@ fn public_output_schema_retries_invalid_reports_and_resets_each_turn() {
 #[test]
 fn managed_sibling_tool_call_cannot_use_another_calls_ctx() {
     const TOOL: &str = "pr5_managed_sibling";
+    const READY: &str = "/pr5_managed_sibling_ready";
+    const RELEASE: &str = "/pr5_managed_sibling_release";
     const FOREIGN_CONTEXT: &str = "context belongs to another invocation";
     smol::block_on(async {
         let (sibling, sibling_context) = flume::bounded(1);
         let fixture = Fixture::start_with_options(
             TOOL,
             FixtureOptions {
-                plugin_source: "local gate, held, shared = maki.async.semaphore(1)".into(),
+                plugin_source: format!(
+                    r#"
+                    local gate, held, shared = maki.async.semaphore(1)
+                    local entered, on_entered
+                    maki.api.register_command({{
+                        name = "{READY}", tui_only = false,
+                        handler = function()
+                            if not entered then
+                                maki.async.await(1, function(done) on_entered = done end)
+                            end
+                        end,
+                    }})
+                    maki.api.register_command({{
+                        name = "{RELEASE}", tui_only = false,
+                        handler = function() held:release() end,
+                    }})
+                "#
+                ),
                 sibling: Some(sibling),
                 ..Default::default()
             },
@@ -3710,12 +3729,13 @@ fn managed_sibling_tool_call_cannot_use_another_calls_ctx() {
                 if shared == nil then
                     shared = ctx
                     held = gate:acquire()
+                    entered = true
+                    if on_entered then on_entered() end
                     gate:acquire():release()
                 else
                     local listed, err = maki.agent.list(shared)
                     assert(listed == nil and err == "{FOREIGN_CONTEXT}", err)
                     assert(maki.agent.list(ctx))
-                    held:release()
                 end
             "#
             ),
@@ -3723,6 +3743,13 @@ fn managed_sibling_tool_call_cannot_use_another_calls_ctx() {
         let context = bounded(sibling_context.recv_async(), "managed tool context")
             .await
             .unwrap();
+        let ready = run_command(&fixture._host.command_registry(), READY, 0, None);
+        assert_eq!(
+            bounded(ready.recv_async(), "first invocation entry")
+                .await
+                .unwrap(),
+            Ok(())
+        );
         let sibling = ToolRegistry::global()
             .get(TOOL)
             .unwrap()
@@ -3734,6 +3761,13 @@ fn managed_sibling_tool_call_cannot_use_another_calls_ctx() {
                 .await
                 .output
                 .map(|_| ()),
+            Ok(())
+        );
+        let release = run_command(&fixture._host.command_registry(), RELEASE, 0, None);
+        assert_eq!(
+            bounded(release.recv_async(), "first invocation release")
+                .await
+                .unwrap(),
             Ok(())
         );
         fixture.finish().await;
