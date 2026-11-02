@@ -5982,6 +5982,7 @@ mod tests {
         const BODY: &str = "pending background session output";
         const EXISTING_BODY: &str = "referenced output retained if deletion is rejected";
         const ARTIFACT_NAME: &str = "existing-output.txt";
+        const REPLACEMENT_PID: &str = "4294967295";
         with_event_loop(|event_loop| {
             let mut session = AppSession::new("test-model", &event_loop.session_cwd);
             let id = session.id;
@@ -6036,13 +6037,17 @@ mod tests {
                     .is_none()
             );
             assert_eq!(std::fs::read_to_string(&artifact).unwrap(), EXISTING_BODY);
-            let replacement = if lose_ownership {
-                std::fs::remove_file(session_lock::lock_path(&event_loop.ctx.sessions_dir, &id))
-                    .unwrap();
-                Some(claim_lock(&event_loop.ctx.sessions_dir, &id).unwrap())
-            } else {
-                None
-            };
+            if lose_ownership {
+                let path = session_lock::lock_path(&event_loop.ctx.sessions_dir, &id);
+                std::fs::remove_file(&path).unwrap();
+                let replacement = path.with_extension("replacement");
+                std::fs::write(&replacement, REPLACEMENT_PID).unwrap();
+                std::fs::rename(replacement, path).unwrap();
+                assert!(session_lock::open_elsewhere(
+                    &event_loop.ctx.sessions_dir,
+                    &id
+                ));
+            }
             release_tx.send(()).unwrap();
             let saved = worker.join().unwrap().unwrap();
             let reply = reply_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap();
@@ -6064,9 +6069,6 @@ mod tests {
                 assert!(!dir.exists());
             }
             assert!(matches!(store.put(BODY), Err(OffloadError::Closed)));
-            if let Some(replacement) = replacement {
-                replacement.release().unwrap();
-            }
         });
     }
 
