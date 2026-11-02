@@ -5693,6 +5693,7 @@ mod tests {
                 event: AgentEvent::SubagentHistory {
                     tool_use_id: history_key.clone(),
                     history_epoch: 0,
+                    conversation_id: None,
                     messages: Vec::new(),
                 },
                 subagent: Some(SubagentInfo {

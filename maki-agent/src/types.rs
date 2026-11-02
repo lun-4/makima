@@ -936,6 +936,8 @@ pub enum AgentEvent {
     SubagentHistory {
         tool_use_id: String,
         history_epoch: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        conversation_id: Option<Arc<str>>,
         messages: Vec<Message>,
     },
     /// A live child was permanently closed and no longer accepts input.

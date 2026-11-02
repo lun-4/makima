@@ -152,6 +152,7 @@ impl App {
         let draft = self.input_box.buffer.value();
         SessionMeta {
             compacted: state.session.meta.compacted,
+            conversation_id: state.session.meta.conversation_id.clone(),
             mode: Some(Mode::from(&config.mode).into()),
             plan_path: state.plan.path().map(|p| p.to_string_lossy().into_owned()),
             plan_written: state.plan.is_ready(),
@@ -406,6 +407,7 @@ impl App {
                 &HistorySnapshot {
                     epoch: change.epoch,
                     compacted: false,
+                    conversation_id: None,
                     messages: Arc::clone(&change.messages),
                 },
             )

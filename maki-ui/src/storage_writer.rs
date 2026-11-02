@@ -151,6 +151,7 @@ impl RequiredHistory {
                 let saved = session.history_snapshot();
                 saved.epoch == history.epoch
                     && saved.compacted == history.compacted
+                    && saved.conversation_id == history.conversation_id
                     && Arc::ptr_eq(&history.messages, &saved.messages)
             }
             Self::Child { key, history } => {

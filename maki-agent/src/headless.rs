@@ -756,6 +756,8 @@ impl ActorBackend for HeadlessBackend {
                 Some(InteractiveControl::Reset(reply)) => {
                     let previous = history.snapshot().clone();
                     history.replace(Vec::new());
+                    // Rotated before the write, so the reset log never stores the ended id.
+                    let ended = history.rotate_conversation();
                     let result = persist_history(
                         self.params.session_id.as_ref().unwrap().id(),
                         history.snapshot().clone(),
@@ -763,15 +765,13 @@ impl ActorBackend for HeadlessBackend {
                     .await;
                     if result.is_err() {
                         history.replace_snapshot(previous);
-                    } else {
-                        let ended = history.rotate_conversation();
-                        if let Ok(config) = self.config(&context).await {
-                            end_conversation_detached(
-                                &config.settings.provider,
-                                ended,
-                                ConversationEnd::Closed,
-                            );
-                        }
+                    }
+                    if let Ok(config) = self.config(&context).await {
+                        end_conversation_detached(
+                            &config.settings.provider,
+                            ended,
+                            ConversationEnd::Closed,
+                        );
                     }
                     let _ = reply.send(result);
                 }

@@ -19,23 +19,30 @@ pub struct History {
     /// disagree and so a new run can never inherit the last one's epoch.
     snapshot: HistorySnapshot,
     mirror: Option<SharedMessages>,
-    /// Kept apart from the snapshot: a rollback restores messages, never a
-    /// conversation id that may already have been ended.
+    /// The authority over `snapshot.conversation_id`, which only copies it
+    /// for persistence: a rollback restores messages, never a conversation id
+    /// that may already have been ended.
     conversation_id: Arc<str>,
 }
 
 impl History {
     pub fn new(messages: Vec<Message>) -> Self {
+        let conversation_id = fresh_id();
+        let mut snapshot = HistorySnapshot::new(messages);
+        snapshot.conversation_id = Some(Arc::clone(&conversation_id));
         Self {
-            snapshot: HistorySnapshot::new(messages),
+            snapshot,
             mirror: None,
-            conversation_id: fresh_id(),
+            conversation_id,
         }
     }
 
     pub fn restored_snapshot(snapshot: HistorySnapshot) -> Self {
         let mut history = Self::restored(Arc::unwrap_or_clone(snapshot.messages));
         history.snapshot.compacted = snapshot.compacted;
+        if let Some(id) = snapshot.conversation_id {
+            history.set_conversation(id);
+        }
         history
     }
 
@@ -44,8 +51,13 @@ impl History {
         Self::new(messages)
     }
 
+    /// A seeded mirror is the stored session, so its conversation id carries on.
     pub fn with_mirror(mut self, mirror: SharedMessages) -> Self {
-        self.snapshot.compacted |= mirror.load().compacted;
+        let seed = mirror.load_full();
+        self.snapshot.compacted |= seed.compacted;
+        if let Some(id) = &seed.conversation_id {
+            self.set_conversation(Arc::clone(id));
+        }
         self.mirror = Some(mirror);
         self.publish();
         self
@@ -61,7 +73,14 @@ impl History {
 
     /// Starts a new conversation id and returns the outgoing one.
     pub fn rotate_conversation(&mut self) -> Arc<str> {
-        mem::replace(&mut self.conversation_id, fresh_id())
+        let ended = self.set_conversation(fresh_id());
+        self.publish();
+        ended
+    }
+
+    fn set_conversation(&mut self, id: Arc<str>) -> Arc<str> {
+        self.snapshot.conversation_id = Some(Arc::clone(&id));
+        mem::replace(&mut self.conversation_id, id)
     }
 
     pub fn as_slice(&self) -> &[Message] {
@@ -111,7 +130,10 @@ impl History {
     }
 
     pub fn replace_snapshot(&mut self, snapshot: HistorySnapshot) {
-        self.snapshot = snapshot;
+        self.snapshot = HistorySnapshot {
+            conversation_id: Some(Arc::clone(&self.conversation_id)),
+            ..snapshot
+        };
         self.publish();
     }
 
@@ -290,6 +312,38 @@ mod tests {
         let restored = History::restored_snapshot((*mirror.load_full()).clone());
         assert!(restored.snapshot.compacted);
         assert_eq!(restored.len(), 2);
+    }
+
+    #[test]
+    fn conversation_id_resumes_from_mirror_and_never_rolls_back() {
+        const STORED: &str = "stored-conversation";
+        let mut seed = HistorySnapshot::new(vec![Message::user(FIRST.into())]);
+        seed.conversation_id = Some(STORED.into());
+        let mirror = Arc::new(ArcSwap::from_pointee(seed));
+        let mut history =
+            History::restored(vec![Message::user(FIRST.into())]).with_mirror(Arc::clone(&mirror));
+        assert_eq!(history.conversation_id().as_ref(), STORED);
+        assert_eq!(mirror.load().conversation_id.as_deref(), Some(STORED));
+
+        let previous = history.snapshot().clone();
+        let ended = history.rotate_conversation();
+        assert_eq!(ended.as_ref(), STORED);
+        let current = Arc::clone(history.conversation_id());
+        assert_eq!(mirror.load().conversation_id.as_ref(), Some(&current));
+
+        history.replace_snapshot(previous);
+        assert_eq!(history.conversation_id(), &current);
+        assert_eq!(mirror.load().conversation_id.as_ref(), Some(&current));
+    }
+
+    #[test]
+    fn fresh_history_publishes_its_minted_conversation_id() {
+        let mirror = Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
+        let history = History::new(Vec::new()).with_mirror(Arc::clone(&mirror));
+        assert_eq!(
+            mirror.load().conversation_id.as_ref(),
+            Some(history.conversation_id())
+        );
     }
 
     #[track_caller]

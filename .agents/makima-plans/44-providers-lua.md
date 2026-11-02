@@ -87,7 +87,8 @@ An `operation_id` is generated for each logical request, which is one call of th
 - Only the host calls it. It means the host will never send another request with that id, and every stream for that id has already been dropped. The provider may discard all state for the id. Ids are never reused.
 - Providers treat repeated calls, and calls for ids they never saw, as no-ops. The host aims at one call per id but does not guarantee it.
 - It is a best-effort notification. It runs detached, so it never delays a cancel, a close or the next turn. Each call is bounded by a 10 second timeout. Errors and timeouts are logged at warn level and are not shown to the user or retried. Delivery at process exit is not guaranteed, so remote services keep their own orphan cleanup.
-- The reason is `cancelled` (a turn was cancelled and the agent continues later under a new id), `closed` (the owner is gone or done: agent exit, `/new`, a finished isolated turn, a finished compaction summary), `compacted` (the history was replaced by a summary) or `rewound` (the history was cut back by rewind).
+- The reason is `cancelled` (a turn was cancelled and the agent continues later under a new id), `closed` (the history is discarded for good: `/new`, a finished isolated turn, a finished compaction summary), `compacted` (the history was replaced by a summary) or `rewound` (the history was cut back by rewind).
+- Exiting an agent, including at shutdown, does not end its conversation. The id is persisted with the session and a resume continues it, so a remote service relies on its own orphan cleanup for sessions that are never resumed.
 
 In Lua this is an optional instance method `end_conversation(ctx, conversation_id, reason)`. Its return values are ignored, and a raised error is logged like any other failure. Native providers ignore the invocation and do not implement `end_conversation`.
 

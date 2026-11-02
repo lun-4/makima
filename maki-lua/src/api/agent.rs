@@ -216,6 +216,7 @@ impl LuaActorState {
         let event = AgentEvent::SubagentHistory {
             tool_use_id: self.ui_id.clone(),
             history_epoch: snapshot.epoch,
+            conversation_id: snapshot.conversation_id.clone(),
             messages: snapshot.messages.as_ref().clone(),
         };
         let _ = match self.subagent_info.get() {
@@ -3446,6 +3447,7 @@ mod tests {
                 event: AgentEvent::SubagentHistory {
                     tool_use_id: "grandchild".into(),
                     history_epoch: 0,
+                    conversation_id: None,
                     messages: Vec::new(),
                 },
                 subagent: Some(grandchild_info),

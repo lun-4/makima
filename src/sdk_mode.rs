@@ -1292,7 +1292,12 @@ fn resolve_session(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<ResolvedS
             let resumed = (!cli.fork_session).then_some(session_ref);
             let model = session.model.clone();
             let meta = session.meta.clone();
-            (resumed, session.history_snapshot(), Some(model), meta)
+            let mut history = session.history_snapshot();
+            // A fork mints its own id, so two copies never address the same remote state.
+            if cli.fork_session {
+                history.conversation_id = None;
+            }
+            (resumed, history, Some(model), meta)
         } else if cli.last_session {
             match StoredSession::latest(cwd, storage) {
                 Ok(Some(session)) => {
@@ -2772,8 +2777,10 @@ mod tests {
         use clap::Parser;
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
+        const STORED_CONVERSATION: &str = "stored-conversation";
         let mut session = StoredSession::new(STARTUP_MODEL, THIS_CWD);
         session.meta.compacted = true;
+        session.meta.conversation_id = Some(STORED_CONVERSATION.into());
         session.save(&storage).unwrap();
         let mut args = vec!["makima".to_owned(), "-c".to_owned(), session.id.to_string()];
         if fork {
@@ -2782,6 +2789,11 @@ mod tests {
         let cli = Cli::parse_from(args);
         let restored = resolve_session(&cli, THIS_CWD, &storage).unwrap();
         assert!(restored.history.compacted);
+        let history = maki_agent::agent::History::restored_snapshot(restored.history.clone());
+        assert_eq!(
+            history.conversation_id().as_ref() == STORED_CONVERSATION,
+            !fork
+        );
         assert_eq!(
             serde_json::to_value(restored.history.messages.as_ref()).unwrap(),
             serde_json::to_value(session.history_snapshot().messages.as_ref()).unwrap()

@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use futures_lite::future::{self};
-use maki_providers::{ConversationEnd, TokenUsage};
+use maki_providers::TokenUsage;
 use tracing::{debug, info, warn};
 
 use super::queue::{ActorQueue, InterruptQueue};
@@ -13,7 +13,6 @@ use super::{
     ActiveCancel, ActorEvent, ActorInner, ActorWork, CompactionStatus, ProcessingWork,
     TurnAdmission, cancelled_outcome, settle_and_finalize_turn,
 };
-use crate::agent::streaming::end_conversation_detached;
 use crate::types::{ActorWorkIdentity, TurnCancellationReason, TurnOutcome};
 use crate::{ActorBackend, ActorLifecycle, History, InterruptSource};
 
@@ -105,20 +104,6 @@ impl Runner {
             match self.step().await {
                 Step::Waiting => {}
                 Step::Exit => {
-                    let policy = self
-                        .inner
-                        .state
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .policy
-                        .clone();
-                    if let Some(policy) = policy {
-                        end_conversation_detached(
-                            &policy.settings.provider,
-                            Arc::clone(self.history.conversation_id()),
-                            ConversationEnd::Closed,
-                        );
-                    }
                     info!(agent_id = %self.inner.agent_id, "actor runner exited");
                     return;
                 }

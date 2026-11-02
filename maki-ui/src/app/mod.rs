@@ -2160,6 +2160,7 @@ impl App {
                     AgentEvent::SubagentHistory {
                         tool_use_id,
                         history_epoch,
+                        conversation_id,
                         messages,
                     } => {
                         self.state.session_mut().adopt_subagent_history(
@@ -2167,6 +2168,7 @@ impl App {
                             &HistorySnapshot {
                                 epoch: history_epoch,
                                 compacted: false,
+                                conversation_id,
                                 messages: Arc::new(messages),
                             },
                         );
@@ -2232,6 +2234,7 @@ impl App {
         if let AgentEvent::SubagentHistory {
             tool_use_id,
             history_epoch,
+            conversation_id,
             messages,
         } = envelope.event
         {
@@ -2254,6 +2257,7 @@ impl App {
                 &HistorySnapshot {
                     epoch: history_epoch,
                     compacted: false,
+                    conversation_id,
                     messages: Arc::new(messages),
                 },
             );

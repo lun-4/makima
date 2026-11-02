@@ -3137,12 +3137,34 @@ fn open_task_picker_refreshes_after_subagent_history() {
 
     app.update(agent_msg(AgentEvent::SubagentHistory {
         history_epoch: 0,
+        conversation_id: None,
         tool_use_id: "session-abc".into(),
         messages: vec![],
     }));
 
     assert!(app.task_picker.is_open());
     assert_eq!(app.task_picker.item(1).unwrap().finished, Some(true));
+}
+
+#[test]
+fn subagent_history_stores_the_child_conversation_id() {
+    const CHILD_KEY: &str = "session-abc";
+    const CHILD_CONVERSATION: &str = "child-conversation";
+    let mut app = app_with_subagent_id(CHILD_KEY);
+    app.update(agent_msg(AgentEvent::SubagentHistory {
+        history_epoch: 0,
+        conversation_id: Some(CHILD_CONVERSATION.into()),
+        tool_use_id: CHILD_KEY.into(),
+        messages: vec![Message::user("child".into())],
+    }));
+
+    let stored = app.state.session.subagent_history_snapshot(CHILD_KEY);
+    assert_eq!(
+        stored
+            .and_then(|history| history.conversation_id)
+            .as_deref(),
+        Some(CHILD_CONVERSATION)
+    );
 }
 
 #[test]
@@ -7481,6 +7503,7 @@ fn subagent_history_finishes_workflow_chat() {
     app.update(agent_msg_with_run_id(
         AgentEvent::SubagentHistory {
             history_epoch: 0,
+            conversation_id: None,
             tool_use_id: "session-abc".into(),
             messages: vec![],
         },
@@ -7616,6 +7639,7 @@ fn reusable_subagent_processes_distinct_turn_outcomes() {
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentHistory {
             history_epoch: 0,
+            conversation_id: None,
             tool_use_id: TASK_ID.into(),
             messages: vec![Message {
                 role: Role::Assistant,
@@ -7668,6 +7692,7 @@ fn stamped_child_failure_wins_over_prior_history_snapshot() {
     app.update(subagent_msg_with_run_id(
         AgentEvent::SubagentHistory {
             history_epoch: 0,
+            conversation_id: None,
             tool_use_id: TASK_ID.into(),
             messages: vec![],
         },
@@ -10376,6 +10401,7 @@ fn final_history_after_subagent_closed_only_persists_messages() {
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentHistory {
             history_epoch: 0,
+            conversation_id: None,
             tool_use_id: TASK_ID.into(),
             messages: messages.clone(),
         },
@@ -10504,6 +10530,7 @@ fn reconstructed_subagent_history_cannot_resurrect_rewound_history(closed: bool)
         event: AgentEvent::SubagentHistory {
             tool_use_id: TASK_ID.into(),
             history_epoch: earlier.epoch,
+            conversation_id: None,
             messages: earlier.messages.as_ref().clone(),
         },
         subagent: Some(info),
@@ -10646,6 +10673,7 @@ fn subagent_history_updates_storage_without_queuing_parent_work() {
         subagent_msg(
             AgentEvent::SubagentHistory {
                 history_epoch: 0,
+                conversation_id: None,
                 tool_use_id: TASK_ID.to_string(),
                 messages,
             },
@@ -10691,6 +10719,7 @@ fn grandchild_history_is_visible_but_not_promoted_to_root() {
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentHistory {
             history_epoch: 0,
+            conversation_id: None,
             tool_use_id: "grandchild-task".into(),
             messages: vec![Message {
                 role: Role::Assistant,

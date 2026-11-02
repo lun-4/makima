@@ -1353,7 +1353,7 @@ mod tests {
     }
 
     #[test]
-    fn rewind_ends_the_outgoing_conversation_and_close_ends_the_new_one() {
+    fn rewind_ends_the_outgoing_conversation_and_close_keeps_the_new_one() {
         smol::block_on(async {
             let (ended_tx, ended_rx) = flume::unbounded();
             let (actor, runner) = AgentActorHandle::spawn(
@@ -1373,11 +1373,10 @@ mod tests {
             rewind(&actor, &boundary, published()).await.unwrap();
             let (rewound, reason) = ended_rx.recv_async().await.unwrap();
             assert_eq!(reason, ConversationEnd::Rewound);
+            assert!(!rewound.is_empty());
             actor.close();
             runner.await;
-            let (closed, reason) = ended_rx.recv_async().await.unwrap();
-            assert_eq!(reason, ConversationEnd::Closed);
-            assert_ne!(closed, rewound);
+            assert!(ended_rx.try_recv().is_err());
         });
     }
 
