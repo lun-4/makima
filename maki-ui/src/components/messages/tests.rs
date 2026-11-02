@@ -498,7 +498,18 @@ fn cancel_in_progress_marks_pending_as_error(cache_built: bool) {
 
 const THINKING_TEXT: &str = "a long chain of reasoning";
 const HIGHLIGHTED_CODE: &str = "fn main() {}";
-const HIGHLIGHT_DEADLINE: Duration = Duration::from_secs(10);
+/// A hang detector, not a runtime budget: the highlight thread, shared by
+/// every test in the binary, stalls for seconds under CI contention.
+const HIGHLIGHT_DEADLINE: Duration = Duration::from_secs(30);
+const HIGHLIGHT_POLL: Duration = Duration::from_millis(1);
+
+fn wait_for_highlight(panel: &mut MessagesPanel, what: &str) {
+    let deadline = Instant::now() + HIGHLIGHT_DEADLINE;
+    while panel.tick() == Dirty::NO {
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(HIGHLIGHT_POLL);
+    }
+}
 
 /// Only `view` advances a typewriter, and collapsed thinking is never drawn,
 /// so its reveal can never finish. Believing it would hold the loop at full
@@ -629,10 +640,10 @@ fn splash_frame(width: u16, height: u16) -> maki_lua::SplashFrame {
     }
 }
 
-/// `drain_highlights` moved out of `view`, so `tick` is the only thing feeding
-/// the worker now. The wait is the worker's own round trip, not a sleep: the
-/// loop ends the moment the result lands, and the deadline only turns a broken
-/// drain into a failure instead of a hang.
+/// With `drain_highlights` out of `view`, `tick` alone feeds the worker, with
+/// a dirty tick meaning the result landed. A 1ms poll interval leaves CPU for
+/// the highlight thread under contention. The deadline turns a broken drain
+/// into a failure, not a hang.
 #[test]
 fn tick_drains_the_highlight_worker() {
     let mut panel = MessagesPanel::new(
@@ -657,14 +668,10 @@ fn tick_drains_the_highlight_worker() {
     });
     rebuild(&mut panel);
 
-    let deadline = Instant::now() + HIGHLIGHT_DEADLINE;
-    while panel.tick() == Dirty::NO {
-        assert!(
-            Instant::now() < deadline,
-            "a highlighted tool stays unstyled until some unrelated repaint"
-        );
-        std::thread::yield_now();
-    }
+    wait_for_highlight(
+        &mut panel,
+        "a highlighted tool stays unstyled until some unrelated repaint",
+    );
 
     assert!(
         seg_text(&panel, "t1").contains(HIGHLIGHTED_CODE),
@@ -2620,14 +2627,7 @@ fn code_span_styles(panel: &MessagesPanel, tool_id: &str) -> Vec<(String, Style)
 }
 
 fn drain_highlight_worker(panel: &mut MessagesPanel) {
-    let deadline = Instant::now() + HIGHLIGHT_DEADLINE;
-    while panel.tick() == Dirty::NO {
-        assert!(
-            Instant::now() < deadline,
-            "the highlight worker never delivered a result"
-        );
-        std::thread::yield_now();
-    }
+    wait_for_highlight(panel, "the highlight worker never delivered a result");
     render(panel, 80, 20);
 }
 
