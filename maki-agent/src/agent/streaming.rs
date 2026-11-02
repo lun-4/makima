@@ -1,9 +1,13 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use maki_providers::provider::Provider;
 use maki_providers::retry::{RetryPolicy, RetryState};
-use maki_providers::{ContentBlock, Message, Model, ProviderEvent, RequestOptions, StreamResponse};
-use maki_storage::id::SessionRef;
+use maki_providers::{
+    ContentBlock, ConversationEnd, Invocation, InvocationPurpose, Message, Model, ProviderEvent,
+    RequestOptions, StreamResponse,
+};
+use maki_storage::id::{MakiId, SessionRef};
 use serde_json::Value;
 use tracing::warn;
 
@@ -11,6 +15,63 @@ use crate::cancel::CancelToken;
 use crate::{AgentError, AgentEvent, EventSender};
 
 const FUNCTIONS_PREFIX: &str = "functions.";
+const END_CONVERSATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub(crate) fn fresh_id() -> Arc<str> {
+    MakiId::generate().to_string().into()
+}
+
+/// The conversation a request belongs to; [`stream_with_retry`] adds the
+/// operation and attempt.
+pub(crate) struct Conversation {
+    pub id: Arc<str>,
+    pub purpose: InvocationPurpose,
+    pub agent_id: Option<Arc<str>>,
+}
+
+impl Conversation {
+    fn invocation(self) -> Invocation {
+        Invocation {
+            conversation_id: self.id,
+            operation_id: fresh_id(),
+            attempt: 0,
+            purpose: self.purpose,
+            agent_id: self.agent_id,
+        }
+    }
+}
+
+/// Best effort: never delays the caller, never retried, bounded by
+/// [`END_CONVERSATION_TIMEOUT`].
+pub(crate) fn end_conversation_detached(
+    provider: &Arc<dyn Provider>,
+    conversation_id: Arc<str>,
+    reason: ConversationEnd,
+) {
+    let provider = Arc::clone(provider);
+    smol::spawn(async move {
+        let ended = futures_lite::future::or(
+            async {
+                provider.end_conversation(&conversation_id, reason).await;
+                true
+            },
+            async {
+                smol::Timer::after(END_CONVERSATION_TIMEOUT).await;
+                false
+            },
+        )
+        .await;
+        if !ended {
+            warn!(
+                %conversation_id,
+                %reason,
+                timeout_ms = END_CONVERSATION_TIMEOUT.as_millis() as u64,
+                "end_conversation timed out"
+            );
+        }
+    })
+    .detach();
+}
 
 /// GPT models sometimes emit `functions.<name>`, a Codex training habit.
 /// Stripped here at the provider boundary so no raw name enters the agent;
@@ -89,6 +150,7 @@ impl From<StreamError> for AgentError {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn stream_with_retry(
     provider: &dyn Provider,
+    conversation: Conversation,
     model: &Model,
     messages: &[Message],
     system: &str,
@@ -102,11 +164,8 @@ pub(crate) async fn stream_with_retry(
     let opts = opts.clamped(model);
     let messages = maki_providers::adapt_images_for_model(model, messages).await;
     let messages = &*messages;
-    let mut retry = RetryState::new(
-        retry_policy,
-        provider.keys().map_or(1, |keys| keys.key_count()),
-    );
-    let mut attempt = 0;
+    let mut retry = RetryState::new(retry_policy, provider.key_count());
+    let mut invocation = conversation.invocation();
     if let Some(output) = event_tx.output() {
         output.begin_text_attempt();
     }
@@ -117,7 +176,16 @@ pub(crate) async fn stream_with_retry(
             async move { forward_provider_events(prx, &event_tx).await }
         });
         let result = futures_lite::future::race(
-            provider.stream_message(model, messages, system, tools, &ptx, opts, session_id),
+            provider.stream_message(
+                model,
+                messages,
+                system,
+                tools,
+                &ptx,
+                opts,
+                session_id,
+                &invocation,
+            ),
             async {
                 cancel.cancelled().await;
                 Err(AgentError::Cancelled)
@@ -145,10 +213,10 @@ pub(crate) async fn stream_with_retry(
             }
             Err(AgentError::Cancelled) => return Err(StreamError::Cancelled { streamed }),
             Err(e) => {
-                attempt += 1;
-                let rotated = e.should_rotate_key()
-                    && retry.book_rotation()
-                    && provider.keys().is_some_and(|keys| keys.rotate());
+                invocation.attempt += 1;
+                let attempt = invocation.attempt;
+                let rotated =
+                    e.should_rotate_key() && retry.book_rotation() && provider.rotate_key().await;
                 let (message, delay) = if rotated {
                     (e.retry_message(), Duration::ZERO)
                 } else if let Some(kind) = e.retry_kind() {
@@ -281,6 +349,25 @@ mod tests {
     const FORBIDDEN: u16 = 403;
     const REJECTED_BODY: &str = "this key is done";
 
+    const CONVERSATION: &str = "conversation";
+
+    fn test_conversation() -> Conversation {
+        Conversation {
+            id: CONVERSATION.into(),
+            purpose: InvocationPurpose::Agent,
+            agent_id: None,
+        }
+    }
+
+    fn instant_retry() -> RetryPolicy {
+        RetryPolicy {
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            max_retries: 1,
+            max_timeout_retries: 0,
+        }
+    }
+
     fn no_budget() -> RetryPolicy {
         RetryPolicy {
             max_retries: 0,
@@ -289,8 +376,10 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
     struct CapturedProvider {
         attempt: std::sync::atomic::AtomicUsize,
+        invocations: std::sync::Mutex<Vec<Invocation>>,
     }
 
     impl Provider for CapturedProvider {
@@ -303,7 +392,9 @@ mod tests {
             events: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
+            invocation: &'a Invocation,
         ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            self.invocations.lock().unwrap().push(invocation.clone());
             Box::pin(async move {
                 let attempt = self
                     .attempt
@@ -350,25 +441,19 @@ mod tests {
         smol::block_on(async {
             const PRIOR: &str = "prior message";
             const EXPECTED: &str = "accepted response";
-            let provider = CapturedProvider {
-                attempt: std::sync::atomic::AtomicUsize::new(0),
-            };
+            let provider = CapturedProvider::default();
             let ticket = crate::TurnTicket::new(crate::TurnId::generate(), std::sync::Arc::new(()));
             let (tx, _rx) = flume::unbounded();
             let sender = EventSender::new(tx).with_output(ticket.output());
             sender
                 .send(AgentEvent::TextDelta { text: PRIOR.into() })
                 .unwrap();
-            let policy = RetryPolicy {
-                base_delay: Duration::ZERO,
-                max_delay: Duration::ZERO,
-                max_retries: 1,
-                max_timeout_retries: 0,
-            };
+            let policy = instant_retry();
             let model = Model::from_spec("ollama/qwen3").unwrap();
             for _ in 0..2 {
                 stream_with_retry(
                     &provider,
+                    test_conversation(),
                     &model,
                     &[],
                     "",
@@ -390,6 +475,43 @@ mod tests {
                 crate::DoneReason::EndTurn,
             ));
             assert_eq!(ticket.peek_result().unwrap().text, EXPECTED);
+        });
+    }
+
+    #[test]
+    fn operation_id_is_stable_across_retries_and_fresh_per_call() {
+        smol::block_on(async {
+            let provider = CapturedProvider::default();
+            let (tx, _rx) = flume::unbounded();
+            let sender = EventSender::new(tx);
+            let model = Model::from_spec("ollama/qwen3").unwrap();
+            for _ in 0..2 {
+                stream_with_retry(
+                    &provider,
+                    test_conversation(),
+                    &model,
+                    &[],
+                    "",
+                    &json!([]),
+                    &sender,
+                    &CancelToken::none(),
+                    RequestOptions::default(),
+                    None,
+                    instant_retry(),
+                )
+                .await
+                .unwrap();
+            }
+            let invocations = provider.invocations.lock().unwrap();
+            let attempts: Vec<_> = invocations.iter().map(|i| i.attempt).collect();
+            assert_eq!(attempts, [0, 1, 0]);
+            assert_eq!(invocations[0].operation_id, invocations[1].operation_id);
+            assert_ne!(invocations[1].operation_id, invocations[2].operation_id);
+            assert!(
+                invocations
+                    .iter()
+                    .all(|i| &*i.conversation_id == CONVERSATION)
+            );
         });
     }
 
@@ -431,6 +553,7 @@ mod tests {
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 let key = self.pool.current().to_owned();
@@ -456,12 +579,18 @@ mod tests {
             Box::pin(async { unimplemented!() })
         }
 
-        fn keys(&self) -> Option<maki_providers::KeyRotation<'_>> {
-            Some(maki_providers::KeyRotation::new(
+        fn key_count(&self) -> usize {
+            self.pool.len()
+        }
+
+        fn rotate_key(&self) -> maki_providers::provider::BoxFuture<'_, bool> {
+            let rotated = maki_providers::KeyRotation::new(
                 &self.pool,
                 &self.auth,
                 maki_providers::KeyHeader::Bearer,
-            ))
+            )
+            .rotate();
+            Box::pin(async move { rotated })
         }
     }
 
@@ -470,6 +599,7 @@ mod tests {
         let model = Model::from_spec("ollama/qwen3").unwrap();
         stream_with_retry(
             server,
+            test_conversation(),
             &model,
             &[Message::user("hi".into())],
             "",

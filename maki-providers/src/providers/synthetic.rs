@@ -7,10 +7,10 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, NativeProvider, Provider};
 use crate::{
-    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
-    UsageWindow, dialect,
+    AgentError, Invocation, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+    UsageLimit, UsageWindow, dialect,
 };
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
@@ -139,6 +139,7 @@ impl Provider for Synthetic {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
@@ -160,20 +161,22 @@ impl Provider for Synthetic {
         })
     }
 
-    fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Bearer,
-        ))
-    }
-
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
             let body = self.compat.get_text(&auth, QUOTA_URL).await?;
             Ok(Some(parse_quotas(&body)?))
         })
+    }
+}
+
+impl NativeProvider for Synthetic {
+    fn keys(&self) -> Option<KeyRotation<'_>> {
+        Some(KeyRotation::new(
+            self.key_pool.as_ref()?,
+            &self.auth,
+            KeyHeader::Bearer,
+        ))
     }
 }
 

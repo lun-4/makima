@@ -18,8 +18,8 @@ use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    AgentError, KeyRotation, Message, Model, ModelInfo, ProviderEvent, ProviderUsage,
-    RequestOptions, StreamResponse,
+    AgentError, ConversationEnd, Invocation, Message, Model, ModelInfo, ProviderEvent,
+    ProviderUsage, RequestOptions, StreamResponse,
 };
 use maki_storage::id::SessionRef;
 use tracing::{info, warn};
@@ -90,9 +90,11 @@ impl Provider for TrackedProvider {
         event_tx: &'a flume::Sender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
+        invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-        self.inner
-            .stream_message(model, messages, system, tools, event_tx, opts, session_id)
+        self.inner.stream_message(
+            model, messages, system, tools, event_tx, opts, session_id, invocation,
+        )
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
@@ -119,8 +121,20 @@ impl Provider for TrackedProvider {
         })
     }
 
-    fn keys(&self) -> Option<KeyRotation<'_>> {
-        self.inner.keys()
+    fn key_count(&self) -> usize {
+        self.inner.key_count()
+    }
+
+    fn rotate_key(&self) -> BoxFuture<'_, bool> {
+        self.inner.rotate_key()
+    }
+
+    fn end_conversation(
+        &self,
+        conversation_id: &str,
+        reason: ConversationEnd,
+    ) -> BoxFuture<'_, ()> {
+        self.inner.end_conversation(conversation_id, reason)
     }
 
     fn adjust_model(&self, model: &mut Model) {
@@ -623,7 +637,9 @@ mod tests {
 
     use maki_config::PermissionsConfig;
     use maki_providers::provider::BoxFuture;
-    use maki_providers::{AgentError, ModelInfo, ProviderEvent, RequestOptions, StreamResponse};
+    use maki_providers::{
+        AgentError, Invocation, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
+    };
 
     use super::*;
 
@@ -643,6 +659,7 @@ mod tests {
             _event_tx: &'a flume::Sender<ProviderEvent>,
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(std::future::pending())
         }
@@ -666,6 +683,7 @@ mod tests {
             _event_tx: &'a flume::Sender<ProviderEvent>,
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(std::future::pending())
         }

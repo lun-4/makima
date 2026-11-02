@@ -27,13 +27,14 @@ use maki_storage::auth::load_provider_credentials;
 use maki_storage::id::SessionRef;
 
 use crate::model::{Model, ModelInfo, ModelPricing};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, NativeProvider, Provider};
 use crate::providers::anthropic::shared;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::providers::opencode::{USAGE_PATH, parse_usage, session_header};
 use crate::providers::{ResolvedAuth, Timeouts, http_client};
 use crate::{
-    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, dialect,
+    AgentError, Invocation, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+    dialect,
 };
 
 const MESSAGES_PATH: &str = "/messages";
@@ -751,6 +752,7 @@ impl Provider for CatalogProvider {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = match &self.auth {
@@ -878,6 +880,8 @@ impl Provider for CatalogProvider {
     }
 }
 
+impl NativeProvider for CatalogProvider {}
+
 /// The catalog is one process-wide `OnceLock`, but the tests disagree about
 /// what belongs in it: most want it warm and empty, one wants a specific
 /// index. First-writer-wins turned that into a race in any runner that shares
@@ -955,11 +959,14 @@ impl Provider for LazyCatalogProvider {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
+        invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             self.resolve()
                 .await?
-                .stream_message(model, messages, system, tools, event_tx, opts, session_id)
+                .stream_message(
+                    model, messages, system, tools, event_tx, opts, session_id, invocation,
+                )
                 .await
         })
     }
@@ -972,6 +979,8 @@ impl Provider for LazyCatalogProvider {
         Box::pin(async move { self.resolve().await?.fetch_usage().await })
     }
 }
+
+impl NativeProvider for LazyCatalogProvider {}
 
 fn create_resolved(slug: &str, timeouts: Timeouts) -> Result<CatalogProvider, AgentError> {
     let data = catalog_provider(slug).ok_or_else(|| AgentError::Config {
@@ -996,13 +1005,16 @@ fn free_fallback_allowed() -> bool {
 /// the catalog is warm and the slug is not in it. With a cold catalog it
 /// returns a [`LazyCatalogProvider`] instead of blocking on the fetch;
 /// membership is then checked on first use.
-pub fn try_create(slug: &str, timeouts: Timeouts) -> Option<Result<Box<dyn Provider>, AgentError>> {
+pub(crate) fn try_create(
+    slug: &str,
+    timeouts: Timeouts,
+) -> Option<Result<Box<dyn NativeProvider>, AgentError>> {
     if SHARED_CATALOG.get().is_some() {
         let data = catalog_provider_if_available(slug)?;
         let state_dir = StateDir::resolve().ok()?;
         return Some(
             CatalogProvider::new(data, &state_dir, timeouts, free_fallback_allowed())
-                .map(|c| Box::new(c) as Box<dyn Provider>),
+                .map(|c| Box::new(c) as Box<dyn NativeProvider>),
         );
     }
     Some(Ok(Box::new(LazyCatalogProvider {
@@ -1048,7 +1060,9 @@ mod tests {
     use crate::model::{Model, ModelInfo, ModelPricing};
     use crate::provider::Provider;
     use crate::providers::{Timeouts, deepseek};
-    use crate::{AgentError, ModelFamily, ModelTier, RequestOptions};
+    use crate::{
+        AgentError, Invocation, InvocationPurpose, ModelFamily, ModelTier, RequestOptions,
+    };
     use maki_storage::id::SessionRef;
     use test_case::test_case;
 
@@ -1156,6 +1170,16 @@ mod tests {
         (base_url, handle)
     }
 
+    fn test_invocation() -> Invocation {
+        Invocation {
+            conversation_id: "conversation".into(),
+            operation_id: "operation".into(),
+            attempt: 0,
+            purpose: InvocationPurpose::Agent,
+            agent_id: None,
+        }
+    }
+
     // This is the highest supported integration level for fake catalog metadata.
     // Agent tests cannot construct CatalogProvider because its required catalog types are private.
     // TODO: Find a way to make this test work with a real agent driving a fake provider.
@@ -1178,6 +1202,7 @@ mod tests {
             &tx,
             RequestOptions::default(),
             Some(&session),
+            &test_invocation(),
         ))
         .unwrap();
 
@@ -1208,6 +1233,7 @@ mod tests {
             &tx,
             RequestOptions::default(),
             None,
+            &test_invocation(),
         ));
         assert!(matches!(
             result,

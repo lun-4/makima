@@ -31,8 +31,8 @@ use maki_lua::PluginHost;
 use maki_lua::orchestration::{AgentOrchestration, CommandRunner, TrustedTarget};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
-    StopReason, StreamResponse, ThinkingConfig, TokenUsage,
+    AgentError, ContentBlock, Invocation, Message, Model, ModelInfo, ProviderEvent, RequestOptions,
+    Role, StopReason, StreamResponse, ThinkingConfig, TokenUsage,
 };
 use maki_storage::id::SessionRef;
 use serde_json::Value;
@@ -93,6 +93,7 @@ impl Provider for CannedProvider {
         _event_tx: &'a flume::Sender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             self.captured_opts.lock().unwrap().push(opts);

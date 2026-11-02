@@ -74,6 +74,23 @@ The existing `Provider` trait stays as the boundary that `maki-agent` and the fr
 
 `LuaProvider` uses one generic helper to invoke an instance method and await its result. Each trait method is a call to that helper. Dropping the Rust future cancels the Lua call and closes the event emitter, so late emissions are discarded.
 
+### Invocation identity and conversation lifecycle
+
+`session_id` keeps its current meaning. Every stream call also carries an `Invocation` with `conversation_id`, `operation_id`, `attempt`, `purpose` (agent, compaction or isolated) and an optional `agent_id`.
+
+A `conversation_id` belongs to one agent and outlives a single turn. A forked or child agent gets its own id at once. Sharing an id until the histories diverge is rejected, because concurrent forks could then address and cancel the same remote state. When compaction replaces the history, the old id is ended and a new one starts; the summary request uses a separate fresh id. Rewind starts a new id and ends the old one. A cancelled turn ends the current id and the next turn uses a new one. Isolated turns and compaction summaries each have their own id.
+
+An `operation_id` is generated for each logical request, which is one call of the retry loop. `attempt` starts at 0 and goes up by one per retry. It is set before each stream call, so `(operation_id, attempt)` names one stream attempt.
+
+`end_conversation(conversation_id, reason)` has this contract:
+
+- Only the host calls it. It means the host will never send another request with that id, and every stream for that id has already been dropped. The provider may discard all state for the id. Ids are never reused.
+- Providers treat repeated calls, and calls for ids they never saw, as no-ops. The host aims at one call per id but does not guarantee it.
+- It is a best-effort notification. It runs detached, so it never delays a cancel, a close or the next turn. Each call is bounded by a 10 second timeout. Errors and timeouts are logged at warn level and are not shown to the user or retried. Delivery at process exit is not guaranteed, so remote services keep their own orphan cleanup.
+- The reason is `cancelled` (a turn was cancelled and the agent continues later under a new id), `closed` (the owner is gone or done: agent exit, `/new`, a finished isolated turn, a finished compaction summary), `compacted` (the history was replaced by a summary) or `rewound` (the history was cut back by rewind).
+
+In Lua this is an optional instance method `end_conversation(ctx, conversation_id, reason)`. Its return values are ignored, and a raised error is logged like any other failure. Native providers ignore the invocation and do not implement `end_conversation`.
+
 ### Request conversion
 
 The message history is converted from Rust types to Lua tables once per request with `mlua` serde, without a JSON intermediate. The first attempt converted the full history to JSON and then to Lua twice per turn on the shared Lua thread. The existing benchmark target measures conversion for large histories before the branch is merged.

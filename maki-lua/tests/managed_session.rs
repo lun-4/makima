@@ -20,8 +20,8 @@ use maki_lua::agent_errors::{INVOCATION_EXPIRED, TURN_WAIT_TIMEOUT};
 use maki_lua::test_support::InMemoryFs;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    AgentError, ContentBlock, Message, Model, ModelInfo, ObservationSource, ProviderEvent,
-    RequestOptions, Role, StreamResponse,
+    AgentError, ContentBlock, Invocation, Message, Model, ModelInfo, ObservationSource,
+    ProviderEvent, RequestOptions, Role, StreamResponse,
 };
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
@@ -789,6 +789,7 @@ impl Provider for NestedRecordingProvider {
         _: &'a flume::Sender<ProviderEvent>,
         opts: RequestOptions,
         _: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             self.requests.send((model.spec(), opts)).unwrap();
@@ -815,6 +816,7 @@ impl Provider for RecordingProvider {
         _: &'a flume::Sender<ProviderEvent>,
         opts: RequestOptions,
         _: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             self.requests.send((model.spec(), opts)).unwrap();
@@ -1022,6 +1024,7 @@ impl Provider for PendingProvider {
         _: &'a flume::Sender<ProviderEvent>,
         _: RequestOptions,
         _: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let _signal = DropSignal(self.dropped.clone());
@@ -1164,6 +1167,7 @@ impl Provider for AutoDeliveryProvider {
         _: &'a flume::Sender<ProviderEvent>,
         _: RequestOptions,
         _: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             if !messages
@@ -1459,6 +1463,7 @@ impl Provider for ScriptedTaskProvider {
         _: &'a flume::Sender<ProviderEvent>,
         _: RequestOptions,
         _: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             if !messages

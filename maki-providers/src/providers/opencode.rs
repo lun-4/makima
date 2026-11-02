@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tracing::debug;
 
 use crate::model::{Model, ModelInfo};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, NativeProvider, Provider};
 use crate::providers::anthropic::shared;
 use crate::providers::catalog::{
     CatalogMeta, EndpointType, OPENCODE_FAMILY_SLUGS, config_error, init_shared_catalog_if_needed,
@@ -18,7 +18,9 @@ use crate::providers::catalog::{
 use crate::providers::http_client;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::types::{ProviderUsage, UsageLimit, UsageWindow};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
+use crate::{
+    AgentError, Invocation, Message, ProviderEvent, RequestOptions, StreamResponse, dialect,
+};
 
 use super::{ResolvedAuth, user_agent, with_prefix};
 
@@ -192,6 +194,7 @@ impl Provider for Opencode {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let model_for_stream = model.clone();
@@ -253,6 +256,8 @@ impl Provider for Opencode {
         Box::pin(async { Ok(()) })
     }
 }
+
+impl NativeProvider for Opencode {}
 
 pub(super) fn session_header<'a>(
     provider_slug: &str,

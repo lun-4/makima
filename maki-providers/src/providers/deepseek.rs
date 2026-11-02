@@ -9,10 +9,11 @@ use tracing::warn;
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::pricing::{PricingSchedule, PricingWindow};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, NativeProvider, Provider};
 use crate::types::{ProviderUsage, UsageLimit, UsageWindow};
 use crate::{
-    AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig, dialect,
+    AgentError, Invocation, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
+    dialect,
 };
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
@@ -184,6 +185,7 @@ impl Provider for DeepSeek {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
@@ -224,7 +226,9 @@ impl Provider for DeepSeek {
             Ok(Some(parsed.into()))
         })
     }
+}
 
+impl NativeProvider for DeepSeek {
     fn keys(&self) -> Option<KeyRotation<'_>> {
         Some(KeyRotation::new(
             self.key_pool.as_ref()?,

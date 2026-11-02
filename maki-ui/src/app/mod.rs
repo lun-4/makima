@@ -146,6 +146,7 @@ impl maki_providers::provider::Provider for DetachedProvider {
         _event_tx: &'a flume::Sender<maki_providers::ProviderEvent>,
         _opts: maki_providers::RequestOptions,
         _session_id: Option<&'a maki_storage::id::SessionRef>,
+        _invocation: &'a maki_providers::Invocation,
     ) -> maki_providers::provider::BoxFuture<
         'a,
         Result<maki_providers::StreamResponse, maki_agent::AgentError>,

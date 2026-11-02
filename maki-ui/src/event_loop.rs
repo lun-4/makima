@@ -4632,6 +4632,7 @@ fn ring_bell() {
 mod tests {
     use super::*;
     use maki_domain::ThinkingConfig as DomainThinkingConfig;
+    use maki_providers::Invocation;
     use maki_storage::checkpoint::ClaimingWriter;
 
     /// Projects every pending config commit the way the event loop's tick does,
@@ -5557,6 +5558,7 @@ mod tests {
             _event_tx: &'a flume::Sender<maki_providers::ProviderEvent>,
             _opts: maki_providers::RequestOptions,
             _session_id: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, maki_providers::AgentError>,
@@ -5586,6 +5588,7 @@ mod tests {
             _event_tx: &'a flume::Sender<maki_providers::ProviderEvent>,
             _opts: maki_providers::RequestOptions,
             _session_id: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, maki_providers::AgentError>,
@@ -6101,6 +6104,7 @@ mod tests {
                 _event_tx: &'a flume::Sender<maki_providers::ProviderEvent>,
                 _opts: maki_providers::RequestOptions,
                 _session_id: Option<&'a SessionRef>,
+                _invocation: &'a Invocation,
             ) -> maki_providers::provider::BoxFuture<
                 'a,
                 Result<maki_providers::StreamResponse, maki_providers::AgentError>,
@@ -6419,6 +6423,7 @@ mod tests {
                 _event_tx: &'a flume::Sender<maki_providers::ProviderEvent>,
                 opts: RequestOptions,
                 _session_id: Option<&'a SessionRef>,
+                _invocation: &'a Invocation,
             ) -> maki_providers::provider::BoxFuture<
                 'a,
                 Result<StreamResponse, maki_providers::AgentError>,

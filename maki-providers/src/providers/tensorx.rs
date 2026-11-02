@@ -6,8 +6,10 @@ use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 
 use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
-use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
+use crate::provider::{BoxFuture, NativeProvider, Provider};
+use crate::{
+    AgentError, Invocation, Message, ProviderEvent, RequestOptions, StreamResponse, dialect,
+};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, deepseek};
@@ -90,6 +92,7 @@ impl Provider for TensorX {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
@@ -227,7 +230,9 @@ impl Provider for TensorX {
             Ok(models)
         })
     }
+}
 
+impl NativeProvider for TensorX {
     fn keys(&self) -> Option<KeyRotation<'_>> {
         Some(KeyRotation::new(
             self.key_pool.as_ref()?,

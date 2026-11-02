@@ -16,10 +16,10 @@ use serde_json::{Value, json};
 use tracing::debug;
 
 use crate::model::Model;
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, NativeProvider, Provider};
 use crate::{
-    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
-    UsageWindow,
+    AgentError, Invocation, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+    UsageLimit, UsageWindow,
 };
 
 use super::{KeyHeader, KeyPool, KeyRotation};
@@ -408,6 +408,7 @@ impl Provider for Anthropic {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let system_blocks = if let Some(prefix) = &self.system_prefix {
@@ -463,14 +464,6 @@ impl Provider for Anthropic {
         })
     }
 
-    fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Raw(API_KEY_HEADER),
-        ))
-    }
-
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
         Box::pin(async move {
             if !usage_eligible(
@@ -490,6 +483,16 @@ impl Provider for Anthropic {
             let parsed: OauthUsage = serde_json::from_str(&response.text().await?)?;
             Ok(Some(parsed.into()))
         })
+    }
+}
+
+impl NativeProvider for Anthropic {
+    fn keys(&self) -> Option<KeyRotation<'_>> {
+        Some(KeyRotation::new(
+            self.key_pool.as_ref()?,
+            &self.auth,
+            KeyHeader::Raw(API_KEY_HEADER),
+        ))
     }
 }
 

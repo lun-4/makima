@@ -12,7 +12,7 @@ use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_providers::Message;
 use maki_providers::model::Model;
 use maki_providers::provider::{self, BoxFuture, Provider};
-use maki_providers::{RequestOptions, Timeouts};
+use maki_providers::{ConversationEnd, RequestOptions, Timeouts};
 use maki_storage::id::{MakiId, SessionRef};
 use serde_json::Value;
 use tracing::warn;
@@ -22,6 +22,7 @@ use crate::actor::{
     PreparedModel, PreparedReadiness, TurnAdmissionOptions, TurnOrigin, TurnProvenance,
 };
 use crate::agent::isolated_turn::IsolatedTurnEvent;
+use crate::agent::streaming::end_conversation_detached;
 use crate::agent::{self, History, PromptSlotSource, TurnSetup};
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::permissions::{PermissionManager, PluginRuleStore};
@@ -586,7 +587,8 @@ impl HeadlessBackend {
         };
         let previous = history.snapshot().clone();
         let result = agent::compact(
-            &*config.provider,
+            &config.provider,
+            &config.provider,
             &config.model,
             history,
             &self.event_sender(context),
@@ -761,6 +763,15 @@ impl ActorBackend for HeadlessBackend {
                     .await;
                     if result.is_err() {
                         history.replace_snapshot(previous);
+                    } else {
+                        let ended = history.rotate_conversation();
+                        if let Ok(config) = self.config(&context).await {
+                            end_conversation_detached(
+                                &config.settings.provider,
+                                ended,
+                                ConversationEnd::Closed,
+                            );
+                        }
                     }
                     let _ = reply.send(result);
                 }
@@ -1152,7 +1163,7 @@ pub(crate) mod tests {
     use crate::session_coordinator::{SessionCoordinatorParams, builtin_option_definitions};
     use crate::tools::offload::{OffloadBackend, OffloadError};
     use crate::{ModeRegistry, TurnOutcome};
-    use maki_providers::{ContentBlock, Role, StopReason, StreamResponse, TokenUsage};
+    use maki_providers::{ContentBlock, Invocation, Role, StopReason, StreamResponse, TokenUsage};
     use maki_storage::checkpoint::{
         CheckpointAck, CheckpointError, CheckpointFuture, CheckpointRequest, CheckpointWriter,
         accept_all,
@@ -1206,6 +1217,7 @@ pub(crate) mod tests {
             _: &'a flume::Sender<maki_providers::ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
             Box::pin(async move {
                 self.entered.send_async(()).await.unwrap();
@@ -1239,6 +1251,7 @@ pub(crate) mod tests {
             _: &'a flume::Sender<maki_providers::ProviderEvent>,
             options: RequestOptions,
             _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
             Box::pin(async move {
                 let _ = self

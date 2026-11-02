@@ -17,9 +17,11 @@ use tracing::{debug, warn};
 
 use crate::manifest::ManifestRegistry;
 use crate::model::{Model, ModelPricing, ModelTier, ThinkingSupport};
-use crate::provider::{BoxFuture, Provider, ProviderKind};
+use crate::provider::{BoxFuture, NativeProvider, Provider, ProviderKind};
 use crate::types::ThinkingFields;
-use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
+use crate::{
+    AgentError, Invocation, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+};
 
 use super::ResolvedAuth;
 use super::anthropic::Anthropic;
@@ -541,7 +543,10 @@ pub fn auth_providers() -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
-pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+pub(crate) fn create(
+    slug: &str,
+    timeouts: super::Timeouts,
+) -> Result<Box<dyn NativeProvider>, AgentError> {
     let meta = find_meta(slug).ok_or_else(|| AgentError::Config {
         message: format!("unknown dynamic provider '{slug}'"),
     })?;
@@ -772,6 +777,7 @@ impl Provider for DynamicProvider {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
+        invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             // First attempt streams through a counting relay: a 401 is only
@@ -782,7 +788,9 @@ impl Provider for DynamicProvider {
             let attempt = async {
                 let result = self
                     .inner
-                    .stream_message(model, messages, system, tools, &tx, opts, session_id)
+                    .stream_message(
+                        model, messages, system, tools, &tx, opts, session_id, invocation,
+                    )
                     .await;
                 drop(tx);
                 result
@@ -812,6 +820,7 @@ impl Provider for DynamicProvider {
                             self.inner
                                 .stream_message(
                                     model, messages, system, tools, event_tx, opts, session_id,
+                                    invocation,
                                 )
                                 .await
                         }
@@ -870,6 +879,8 @@ impl Provider for DynamicProvider {
         self.inner.fetch_usage()
     }
 }
+
+impl NativeProvider for DynamicProvider {}
 
 #[cfg(test)]
 mod tests {

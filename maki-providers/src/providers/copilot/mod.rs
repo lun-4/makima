@@ -17,10 +17,10 @@ use super::openai_compat;
 use crate::model::{
     Model, ModelEntry, ModelFamily, ModelInfo, ModelPricing, ModelTier, lookup_entry,
 };
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, NativeProvider, Provider};
 use crate::{
-    AgentError, Effort, EffortDialect, Message, ProviderEvent, RequestOptions, StreamResponse,
-    ThinkingConfig, dialect,
+    AgentError, Effort, EffortDialect, Invocation, Message, ProviderEvent, RequestOptions,
+    StreamResponse, ThinkingConfig, dialect,
 };
 
 pub mod auth;
@@ -1085,6 +1085,7 @@ impl Provider for Copilot {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let mut prefixed_system = String::new();
@@ -1130,6 +1131,8 @@ impl Provider for Copilot {
         })
     }
 }
+
+impl NativeProvider for Copilot {}
 
 #[cfg(test)]
 mod tests {

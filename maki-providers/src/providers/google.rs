@@ -11,9 +11,9 @@ use serde_json::{Value, json};
 use tracing::warn;
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, NativeProvider, Provider};
 use crate::{
-    AgentError, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
+    AgentError, ContentBlock, Invocation, Message, ProviderEvent, RequestOptions, Role, StopReason,
     StreamResponse, ThinkingConfig, TokenUsage,
 };
 
@@ -239,6 +239,7 @@ impl Provider for Google {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(self.do_stream(model, messages, system, tools, event_tx, opts.thinking))
     }
@@ -284,7 +285,9 @@ impl Provider for Google {
             Ok(())
         })
     }
+}
 
+impl NativeProvider for Google {
     fn keys(&self) -> Option<KeyRotation<'_>> {
         Some(KeyRotation::new(
             self.key_pool.as_ref()?,

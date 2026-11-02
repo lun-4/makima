@@ -15,8 +15,8 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use crate::model::Model;
-use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::provider::{BoxFuture, NativeProvider, Provider};
+use crate::{AgentError, Invocation, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::shared;
 
@@ -526,6 +526,7 @@ impl Provider for Bedrock {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             if self.needs_refresh() {
@@ -693,6 +694,8 @@ impl Provider for Bedrock {
         })
     }
 }
+
+impl NativeProvider for Bedrock {}
 
 fn decode_event_payload(payload: &[u8]) -> Result<(String, String), AgentError> {
     let json_str =

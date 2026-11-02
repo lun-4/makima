@@ -18,8 +18,8 @@ use maki_domain::ThinkingConfig as DomainThinkingConfig;
 use maki_lua::PluginHost;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
-    StopReason, StreamResponse, TokenUsage,
+    AgentError, ContentBlock, Invocation, Message, Model, ModelInfo, ProviderEvent, RequestOptions,
+    Role, StopReason, StreamResponse, TokenUsage,
 };
 use maki_storage::checkpoint::{CheckpointRequest, CheckpointVersion, CheckpointWriter};
 use maki_storage::id::{MakiId, SessionRef};
@@ -132,6 +132,7 @@ impl Provider for RecordingProvider {
         _events: &'a flume::Sender<ProviderEvent>,
         options: RequestOptions,
         _session: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             self.requests
@@ -175,6 +176,7 @@ impl Provider for ChildProvider {
         _events: &'a flume::Sender<ProviderEvent>,
         _options: RequestOptions,
         _session: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let child = system == "child"

@@ -1,15 +1,19 @@
 use std::env;
+use std::sync::Arc;
 
 use maki_config::AgentConfig;
+use maki_providers::provider::Provider;
 use maki_providers::{
-    ContentBlock, IMAGE_PLACEHOLDER, Message, Model, RequestOptions, Role, StreamResponse,
-    TokenUsage,
+    ContentBlock, ConversationEnd, IMAGE_PLACEHOLDER, InvocationPurpose, Message, Model,
+    RequestOptions, Role, StreamResponse, TokenUsage,
 };
 use maki_storage::id::SessionRef;
 use tracing::info;
 
 use super::history::{History, remove_orphaned_tool_results};
-use super::streaming::{StreamError, stream_with_retry};
+use super::streaming::{
+    Conversation, StreamError, end_conversation_detached, fresh_id, stream_with_retry,
+};
 use crate::cancel::CancelToken;
 use crate::{AgentError, AgentEvent, EventSender, TurnCompleteEvent};
 
@@ -52,9 +56,12 @@ pub(super) fn continue_message(config: &AgentConfig) -> String {
     }
 }
 
+/// `provider` writes the summary; `agent_provider` owns the conversation the
+/// summary replaces.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn compact_history(
-    provider: &dyn maki_providers::provider::Provider,
+    provider: &Arc<dyn Provider>,
+    agent_provider: &Arc<dyn Provider>,
     model: &Model,
     history: &mut History,
     event_tx: &EventSender,
@@ -72,18 +79,54 @@ pub(super) async fn compact_history(
     strip_old_tool_results(&mut compaction_history);
     compaction_history.push(Message::user(summary_prompt(config, instructions)));
 
+    let summary_id = fresh_id();
+    let result = summarize(
+        provider,
+        &summary_id,
+        model,
+        compaction_history,
+        &event_tx,
+        cancel,
+        session_id,
+    )
+    .await;
+    end_conversation_detached(provider, summary_id, ConversationEnd::Closed);
+    finish_compact(
+        result?,
+        history,
+        agent_provider,
+        &event_tx,
+        compact_start,
+        model,
+    )
+}
+
+async fn summarize(
+    provider: &Arc<dyn Provider>,
+    summary_id: &Arc<str>,
+    model: &Model,
+    mut compaction_history: Vec<Message>,
+    event_tx: &EventSender,
+    cancel: &CancelToken,
+    session_id: Option<&SessionRef>,
+) -> Result<StreamResponse, AgentError> {
     let empty_tools = serde_json::json!([]);
     let max_attempts = 3;
     let mut last_error = None;
 
     for attempt in 0..max_attempts {
         match stream_with_retry(
-            provider,
+            &**provider,
+            Conversation {
+                id: Arc::clone(summary_id),
+                purpose: InvocationPurpose::Compaction,
+                agent_id: None,
+            },
             model,
             &compaction_history,
             crate::prompt::COMPACTION_SYSTEM,
             &empty_tools,
-            &event_tx,
+            event_tx,
             cancel,
             RequestOptions::default(),
             session_id,
@@ -98,7 +141,7 @@ pub(super) async fn compact_history(
                         "compaction succeeded after truncating oldest rounds"
                     );
                 }
-                return finish_compact(response, history, &event_tx, compact_start, model);
+                return Ok(response);
             }
             Err(StreamError::Other(e)) if e.is_context_overflow() && attempt < max_attempts - 1 => {
                 last_error = Some(e);
@@ -114,6 +157,7 @@ pub(super) async fn compact_history(
 fn finish_compact(
     response: StreamResponse,
     history: &mut History,
+    agent_provider: &Arc<dyn Provider>,
     event_tx: &EventSender,
     compact_start: std::time::Instant,
     model: &Model,
@@ -137,7 +181,8 @@ fn finish_compact(
         Message::user("What did we do so far?".into()),
         response.message,
     ];
-    history.replace_compacted(new_history);
+    let previous = history.replace_compacted(new_history);
+    end_conversation_detached(agent_provider, previous, ConversationEnd::Compacted);
     info!(
         model = %model.id,
         duration_ms = compact_start.elapsed().as_millis() as u64,
@@ -149,7 +194,8 @@ fn finish_compact(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn compact(
-    provider: &dyn maki_providers::provider::Provider,
+    provider: &Arc<dyn Provider>,
+    agent_provider: &Arc<dyn Provider>,
     model: &Model,
     history: &mut History,
     event_tx: &EventSender,
@@ -160,6 +206,7 @@ pub async fn compact(
 ) -> Result<(), AgentError> {
     let usage = compact_history(
         provider,
+        agent_provider,
         model,
         history,
         event_tx,
@@ -288,9 +335,9 @@ pub(super) fn auto_compact_enabled() -> bool {
 mod tests {
     use std::sync::Mutex;
 
-    use maki_providers::provider::{BoxFuture, Provider};
+    use maki_providers::provider::BoxFuture;
     use maki_providers::{
-        ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
+        ContentBlock, Invocation, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
         StreamResponse, TokenUsage,
     };
     use maki_storage::id::SessionRef;
@@ -301,20 +348,30 @@ mod tests {
     use crate::AgentConfig;
     use maki_config::CompactionBuffer;
 
+    type Ended = (Arc<str>, ConversationEnd);
+
     struct MockProvider {
         responses: Mutex<Vec<Result<StreamResponse, AgentError>>>,
         requests: Mutex<Vec<Vec<Message>>>,
         sessions: Mutex<Vec<Option<SessionRef>>>,
+        invocations: Mutex<Vec<Invocation>>,
+        ended: (flume::Sender<Ended>, flume::Receiver<Ended>),
     }
 
     impl MockProvider {
-        fn new(responses: Vec<Result<StreamResponse, AgentError>>) -> Self {
-            Self {
+        fn new(responses: Vec<Result<StreamResponse, AgentError>>) -> Arc<Self> {
+            Arc::new(Self {
                 responses: Mutex::new(responses),
                 requests: Mutex::new(Vec::new()),
                 sessions: Mutex::new(Vec::new()),
-            }
+                invocations: Mutex::new(Vec::new()),
+                ended: flume::unbounded(),
+            })
         }
+    }
+
+    fn dyn_provider(provider: &Arc<MockProvider>) -> Arc<dyn Provider> {
+        Arc::clone(provider) as Arc<dyn Provider>
     }
 
     impl Provider for MockProvider {
@@ -327,7 +384,9 @@ mod tests {
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
             session_id: Option<&'a SessionRef>,
+            invocation: &'a Invocation,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            self.invocations.lock().unwrap().push(invocation.clone());
             Box::pin(async move {
                 self.requests.lock().unwrap().push(messages.to_vec());
                 self.sessions.lock().unwrap().push(session_id.cloned());
@@ -339,6 +398,15 @@ mod tests {
 
         fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
             Box::pin(async { unimplemented!() })
+        }
+
+        fn end_conversation(
+            &self,
+            conversation_id: &str,
+            reason: ConversationEnd,
+        ) -> BoxFuture<'_, ()> {
+            let _ = self.ended.0.send((conversation_id.into(), reason));
+            Box::pin(async {})
         }
     }
 
@@ -383,7 +451,8 @@ mod tests {
             let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
             let mut history = History::new(vec![Message::user("work".into())]);
             compact_history(
-                &provider,
+                &dyn_provider(&provider),
+                &dyn_provider(&provider),
                 &default_model(),
                 &mut history,
                 &sender,
@@ -417,7 +486,8 @@ mod tests {
             let (raw_tx, _rx) = flume::unbounded();
 
             compact(
-                &provider,
+                &dyn_provider(&provider),
+                &dyn_provider(&provider),
                 &default_model(),
                 &mut history,
                 &EventSender::new(raw_tx),
@@ -439,9 +509,9 @@ mod tests {
     #[test]
     fn compact_replaces_history_with_summary() {
         smol::block_on(async {
-            let provider: std::sync::Arc<dyn Provider> = std::sync::Arc::new(MockProvider::new(
-                vec![Ok(text_response(StopReason::EndTurn))],
-            ));
+            let provider = dyn_provider(&MockProvider::new(vec![Ok(text_response(
+                StopReason::EndTurn,
+            ))]));
             let model = default_model();
             let (raw_tx, _rx) = flume::unbounded();
             let mut history = History::new(vec![
@@ -456,7 +526,8 @@ mod tests {
             ]);
 
             compact(
-                &*provider,
+                &provider,
+                &provider,
                 &model,
                 &mut history,
                 &EventSender::new(raw_tx),
@@ -472,6 +543,44 @@ mod tests {
             assert_eq!(msgs.len(), 2);
             assert!(matches!(msgs[0].role, Role::User));
             assert!(matches!(msgs[1].role, Role::Assistant));
+        });
+    }
+
+    #[test]
+    fn compaction_summarizes_under_its_own_id_and_rotates_the_agents() {
+        smol::block_on(async {
+            let summarizer = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let agent = MockProvider::new(Vec::new());
+            let mut history = History::new(vec![Message::user("work".into())]);
+            let original = Arc::clone(history.conversation_id());
+            let (raw_tx, _rx) = flume::unbounded();
+
+            compact(
+                &dyn_provider(&summarizer),
+                &dyn_provider(&agent),
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx),
+                &CancelToken::none(),
+                &AgentConfig::default(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let summary = summarizer.invocations.lock().unwrap()[0].clone();
+            assert_eq!(summary.purpose, InvocationPurpose::Compaction);
+            assert_ne!(summary.conversation_id, original);
+            assert_eq!(
+                summarizer.ended.1.recv_async().await.unwrap(),
+                (summary.conversation_id, ConversationEnd::Closed)
+            );
+            assert_eq!(
+                agent.ended.1.recv_async().await.unwrap(),
+                (Arc::clone(&original), ConversationEnd::Compacted)
+            );
+            assert_ne!(history.conversation_id(), &original);
         });
     }
 
@@ -493,7 +602,8 @@ mod tests {
             let (raw_tx, _rx) = flume::unbounded();
 
             let err = compact(
-                &provider,
+                &dyn_provider(&provider),
+                &dyn_provider(&provider),
                 &default_model(),
                 &mut history,
                 &EventSender::new(raw_tx),
@@ -530,7 +640,8 @@ mod tests {
             };
 
             compact(
-                &provider,
+                &dyn_provider(&provider),
+                &dyn_provider(&provider),
                 &default_model(),
                 &mut history,
                 &EventSender::new(raw_tx),
@@ -610,7 +721,8 @@ mod tests {
             let (raw_tx, _rx) = flume::unbounded();
 
             compact_history(
-                &provider,
+                &dyn_provider(&provider),
+                &dyn_provider(&provider),
                 &default_model(),
                 &mut history,
                 &EventSender::new(raw_tx),
@@ -843,7 +955,8 @@ mod tests {
             let (raw_tx, _rx) = flume::unbounded();
 
             compact_history(
-                &provider,
+                &dyn_provider(&provider),
+                &dyn_provider(&provider),
                 &default_model(),
                 &mut history,
                 &EventSender::new(raw_tx),
@@ -887,7 +1000,8 @@ mod tests {
             let (raw_tx, _rx) = flume::unbounded();
 
             compact_history(
-                &provider,
+                &dyn_provider(&provider),
+                &dyn_provider(&provider),
                 &default_model(),
                 &mut history,
                 &EventSender::new(raw_tx),

@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use maki_providers::{ContentBlock, Message, MessageKind, Role};
+use maki_providers::{ContentBlock, ConversationEnd, Message, MessageKind, Role};
 use maki_storage::sessions::HistorySnapshot;
 
 use super::prepared::{CancelPublication, PreparedOperation};
@@ -9,6 +9,7 @@ use super::{
     ActorError, ActorIdleGuard, ActorLifecycle, AgentActorHandle, PreparedCommit,
     PreparedOperationTicket, PreparedTransaction,
 };
+use crate::agent::streaming::end_conversation_detached;
 use crate::{AgentId, History};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,6 +234,14 @@ impl HistoryEditWork {
                 let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
                 let change = replacement.map(|snapshot| {
                     history.replace_snapshot(snapshot.clone());
+                    let ended = history.rotate_conversation();
+                    if let Some(policy) = &state.policy {
+                        end_conversation_detached(
+                            &policy.settings.provider,
+                            ended,
+                            ConversationEnd::Rewound,
+                        );
+                    }
                     HistoryChange {
                         agent_id: actor.agent_id(),
                         epoch: snapshot.epoch,
@@ -337,9 +346,15 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use futures_lite::future;
-    use maki_providers::{ContentBlock, Message, Role, TokenUsage};
+    use maki_providers::provider::{BoxFuture, Provider};
+    use maki_providers::{
+        AgentError, ContentBlock, ConversationEnd, Invocation, Message, Model, ProviderEvent,
+        RequestOptions, Role, StreamResponse, TokenUsage,
+    };
     use maki_storage::checkpoint::CheckpointPublication;
+    use maki_storage::id::SessionRef;
     use maki_storage::sessions::HistorySnapshot;
+    use serde_json::Value;
     use test_case::test_case;
 
     use super::{HistoryBoundary, HistoryChange, valid_boundary};
@@ -1307,6 +1322,62 @@ mod tests {
             assert!(matches!(stale, Err(ActorError::StaleHistoryBoundary)));
             actor.close();
             runner.await;
+        });
+    }
+
+    struct EndRecorder(flume::Sender<(Arc<str>, ConversationEnd)>);
+
+    impl Provider for EndRecorder {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+            _: &'a Invocation,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async { unreachable!() })
+        }
+
+        fn end_conversation(
+            &self,
+            conversation_id: &str,
+            reason: ConversationEnd,
+        ) -> BoxFuture<'_, ()> {
+            let _ = self.0.send((conversation_id.into(), reason));
+            Box::pin(async {})
+        }
+    }
+
+    #[test]
+    fn rewind_ends_the_outgoing_conversation_and_close_ends_the_new_one() {
+        smol::block_on(async {
+            let (ended_tx, ended_rx) = flume::unbounded();
+            let (actor, runner) = AgentActorHandle::spawn(
+                AgentId::generate(),
+                vec![Message::user("first".into()), Message::user("draft".into())],
+                None,
+                Box::new(IdleBackend),
+            );
+            let settings = crate::RunSettings {
+                provider: Arc::new(EndRecorder(ended_tx)),
+                ..policy(false)
+            };
+            actor
+                .initialize_config(EffectiveAgentConfig::new(settings, AgentMode::Build))
+                .unwrap();
+            let boundary = actor.history_boundaries().unwrap().remove(1);
+            rewind(&actor, &boundary, published()).await.unwrap();
+            let (rewound, reason) = ended_rx.recv_async().await.unwrap();
+            assert_eq!(reason, ConversationEnd::Rewound);
+            actor.close();
+            runner.await;
+            let (closed, reason) = ended_rx.recv_async().await.unwrap();
+            assert_eq!(reason, ConversationEnd::Closed);
+            assert_ne!(closed, rewound);
         });
     }
 

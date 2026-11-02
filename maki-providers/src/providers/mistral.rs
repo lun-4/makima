@@ -6,8 +6,10 @@ use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier, ThinkingSupport};
-use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
+use crate::provider::{BoxFuture, NativeProvider, Provider};
+use crate::{
+    AgentError, Invocation, Message, ProviderEvent, RequestOptions, StreamResponse, dialect,
+};
 
 use super::openai_compat::{MODELS_PATH, OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
@@ -211,6 +213,7 @@ impl Provider for Mistral {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
@@ -279,16 +282,18 @@ impl Provider for Mistral {
         })
     }
 
+    fn adjust_model(&self, model: &mut Model) {
+        adjust_model(model);
+    }
+}
+
+impl NativeProvider for Mistral {
     fn keys(&self) -> Option<KeyRotation<'_>> {
         Some(KeyRotation::new(
             self.key_pool.as_ref()?,
             &self.auth,
             KeyHeader::Bearer,
         ))
-    }
-
-    fn adjust_model(&self, model: &mut Model) {
-        adjust_model(model);
     }
 }
 

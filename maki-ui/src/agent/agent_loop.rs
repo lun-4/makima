@@ -575,7 +575,8 @@ impl ActorBackend for TuiActorBackend {
             );
             let previous = history.snapshot().clone();
             let mut result = maki_agent::agent::compact(
-                &*provider,
+                &provider,
+                &base_provider,
                 &model,
                 history,
                 &event_tx,
@@ -669,7 +670,7 @@ mod tests {
     };
     use maki_config::PermissionsConfig;
     use maki_lua::test_support::run_command;
-    use maki_providers::ContentBlock;
+    use maki_providers::{ContentBlock, Invocation};
     use test_case::test_case;
 
     use super::*;
@@ -1559,6 +1560,7 @@ mod tests {
                 _: &'a flume::Sender<maki_providers::ProviderEvent>,
                 _: maki_providers::RequestOptions,
                 _: Option<&'a SessionRef>,
+                _invocation: &'a Invocation,
             ) -> maki_providers::provider::BoxFuture<
                 'a,
                 Result<maki_providers::StreamResponse, AgentError>,
@@ -1701,6 +1703,7 @@ mod tests {
             _: &'a flume::Sender<maki_providers::ProviderEvent>,
             _: maki_providers::RequestOptions,
             _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, AgentError>,
@@ -2105,6 +2108,7 @@ mod tests {
             events: &'a flume::Sender<maki_providers::ProviderEvent>,
             _: maki_providers::RequestOptions,
             _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, AgentError>,
@@ -2382,6 +2386,7 @@ mod tests {
             _: &'a flume::Sender<maki_providers::ProviderEvent>,
             _: maki_providers::RequestOptions,
             _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, AgentError>,
@@ -2450,13 +2455,15 @@ mod tests {
             events: &'a flume::Sender<maki_providers::ProviderEvent>,
             options: maki_providers::RequestOptions,
             session: Option<&'a SessionRef>,
+            invocation: &'a Invocation,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, AgentError>,
         > {
             self.requests.send(messages.to_vec()).unwrap();
-            self.inner
-                .stream_message(model, messages, system, tools, events, options, session)
+            self.inner.stream_message(
+                model, messages, system, tools, events, options, session, invocation,
+            )
         }
 
         fn list_models(
@@ -2485,6 +2492,7 @@ mod tests {
             events: &'a flume::Sender<maki_providers::ProviderEvent>,
             _: maki_providers::RequestOptions,
             _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, AgentError>,
@@ -2928,6 +2936,7 @@ mod tests {
             _event_tx: &'a flume::Sender<maki_providers::ProviderEvent>,
             _opts: maki_providers::RequestOptions,
             _session_id: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, AgentError>,

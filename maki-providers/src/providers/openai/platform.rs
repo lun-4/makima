@@ -10,11 +10,11 @@ use tracing::{debug, warn};
 
 use crate::model::{FastSupport, Model, ModelInfo};
 use crate::model_registry;
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, NativeProvider, Provider};
 use crate::types::{EffortDialect, ThinkingConfigExt};
 use crate::{
-    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
-    UsageWindow, dialect,
+    AgentError, Invocation, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+    UsageLimit, UsageWindow, dialect,
 };
 
 use super::auth;
@@ -475,6 +475,7 @@ impl Provider for OpenAi {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let mut buf = String::new();
@@ -599,6 +600,8 @@ impl Provider for OpenAi {
         }
     }
 }
+
+impl NativeProvider for OpenAi {}
 
 #[cfg(test)]
 mod tests {

@@ -478,6 +478,36 @@ pub enum ProviderEvent {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvocationPurpose {
+    Agent,
+    Compaction,
+    Isolated,
+}
+
+/// Who a stream call belongs to. `(operation_id, attempt)` names one attempt;
+/// `conversation_id` names the remote state it may build on.
+#[derive(Debug, Clone, Serialize)]
+pub struct Invocation {
+    pub conversation_id: Arc<str>,
+    pub operation_id: Arc<str>,
+    pub attempt: u32,
+    pub purpose: InvocationPurpose,
+    pub agent_id: Option<Arc<str>>,
+}
+
+/// Why the host will never send another request for a conversation id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Display)]
+#[strum(serialize_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationEnd {
+    Cancelled,
+    Closed,
+    Compacted,
+    Rewound,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Display, IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 #[serde(rename_all = "snake_case")]

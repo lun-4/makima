@@ -808,8 +808,8 @@ mod tests {
         CommandError, CommandFuture, FrontendFeedback, TargetCapabilities, TargetCapability,
     };
     use maki_providers::{
-        ContentBlock, Message, ModelInfo, ProviderEvent, RequestOptions, Role, StopReason,
-        StreamResponse, TokenUsage, model_registry,
+        ContentBlock, Invocation, Message, ModelInfo, ProviderEvent, RequestOptions, Role,
+        StopReason, StreamResponse, TokenUsage, model_registry,
         provider::{BoxFuture, ModelBatch, Provider},
     };
     use maki_storage::sessions::{SESSIONS_DIR, offload_dir};
@@ -1140,6 +1140,7 @@ mod tests {
             events: &'a flume::Sender<maki_providers::ProviderEvent>,
             options: maki_providers::RequestOptions,
             _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, maki_agent::AgentError>,
@@ -1298,6 +1299,7 @@ mod tests {
             _: &'a Sender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 self.polled.send_async(()).await.unwrap();

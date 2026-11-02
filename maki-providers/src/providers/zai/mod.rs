@@ -9,11 +9,11 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier, ThinkingSupport};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, NativeProvider, Provider};
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::{
-    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
-    UsageWindow, dialect,
+    AgentError, Invocation, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+    UsageLimit, UsageWindow, dialect,
 };
 
 use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
@@ -331,6 +331,7 @@ impl Provider for Zai {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
@@ -375,16 +376,18 @@ impl Provider for Zai {
         })
     }
 
+    fn adjust_model(&self, model: &mut Model) {
+        adjust_model(model);
+    }
+}
+
+impl NativeProvider for Zai {
     fn keys(&self) -> Option<KeyRotation<'_>> {
         Some(KeyRotation::new(
             self.key_pool.as_ref()?,
             &self.auth,
             KeyHeader::Bearer,
         ))
-    }
-
-    fn adjust_model(&self, model: &mut Model) {
-        adjust_model(model);
     }
 }
 

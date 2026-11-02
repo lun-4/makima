@@ -1,9 +1,12 @@
+use std::mem;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use maki_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, Role};
 use maki_storage::sessions::next_epoch;
 use tracing::warn;
+
+use super::streaming::fresh_id;
 
 const CANCEL_MARKER: &str = "[Cancelled by user]";
 pub const UNAVAILABLE_RESULT: &str = "[Tool result not available]";
@@ -16,6 +19,9 @@ pub struct History {
     /// disagree and so a new run can never inherit the last one's epoch.
     snapshot: HistorySnapshot,
     mirror: Option<SharedMessages>,
+    /// Kept apart from the snapshot: a rollback restores messages, never a
+    /// conversation id that may already have been ended.
+    conversation_id: Arc<str>,
 }
 
 impl History {
@@ -23,6 +29,7 @@ impl History {
         Self {
             snapshot: HistorySnapshot::new(messages),
             mirror: None,
+            conversation_id: fresh_id(),
         }
     }
 
@@ -46,6 +53,15 @@ impl History {
 
     pub fn snapshot(&self) -> &HistorySnapshot {
         &self.snapshot
+    }
+
+    pub fn conversation_id(&self) -> &Arc<str> {
+        &self.conversation_id
+    }
+
+    /// Starts a new conversation id and returns the outgoing one.
+    pub fn rotate_conversation(&mut self) -> Arc<str> {
+        mem::replace(&mut self.conversation_id, fresh_id())
     }
 
     pub fn as_slice(&self) -> &[Message] {
@@ -99,9 +115,11 @@ impl History {
         self.publish();
     }
 
-    pub fn replace_compacted(&mut self, messages: Vec<Message>) {
+    /// Returns the conversation id the compacted history leaves behind.
+    pub fn replace_compacted(&mut self, messages: Vec<Message>) -> Arc<str> {
         self.snapshot.compacted = true;
         self.replace(messages);
+        self.rotate_conversation()
     }
 
     pub fn truncate(&mut self, len: usize) {

@@ -9,8 +9,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelInfo, ModelPricing, ModelTier};
-use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::provider::{BoxFuture, NativeProvider, Provider};
+use crate::{AgentError, Invocation, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::google;
 use super::{Timeouts, http_client, user_agent};
@@ -261,6 +261,7 @@ impl Provider for Vertex {
         event_tx: &'a Sender<ProviderEvent>,
         options: RequestOptions,
         _session_id: Option<&'a maki_storage::id::SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(self.do_stream(model, messages, system, tools, event_tx, options))
     }
@@ -279,6 +280,8 @@ impl Provider for Vertex {
         Box::pin(async { self.tokens.clear() })
     }
 }
+
+impl NativeProvider for Vertex {}
 
 struct VertexEndpoint {
     project: String,

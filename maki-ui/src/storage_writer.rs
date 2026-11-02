@@ -1713,7 +1713,7 @@ mod tests {
     use maki_domain::{Post, PostLevel};
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        AgentError, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
+        AgentError, Invocation, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
     };
     use maki_providers::{Effort, Message};
     use maki_storage::id::SessionRef;
@@ -1756,6 +1756,7 @@ mod tests {
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(std::future::pending())
         }

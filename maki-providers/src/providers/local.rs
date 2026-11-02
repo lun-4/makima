@@ -11,8 +11,8 @@ use tracing::warn;
 use maki_config::providers::Protocol;
 
 use crate::model::Model;
-use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::provider::{BoxFuture, NativeProvider, Provider};
+use crate::{AgentError, Invocation, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::openai::responses;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
@@ -135,6 +135,7 @@ impl Provider for LocalEndpoint {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
@@ -185,7 +186,9 @@ impl Provider for LocalEndpoint {
             }
         })
     }
+}
 
+impl NativeProvider for LocalEndpoint {
     fn keys(&self) -> Option<KeyRotation<'_>> {
         Some(KeyRotation::new(
             self.key_pool.as_ref()?,

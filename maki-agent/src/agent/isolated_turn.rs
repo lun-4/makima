@@ -1,12 +1,16 @@
 use std::sync::Arc;
 
 use maki_providers::provider::Provider;
-use maki_providers::{ImageSource, Message, Model, ProviderEvent, RequestOptions};
+use maki_providers::{
+    ConversationEnd, ImageSource, Invocation, InvocationPurpose, Message, Model, ProviderEvent,
+    RequestOptions,
+};
 use maki_storage::id::SessionRef;
 use serde_json::Value;
 
 use crate::cancel::CancelToken;
 
+use super::streaming::{end_conversation_detached, fresh_id};
 use super::{UNAVAILABLE_RESULT, close_dangling_tool_calls};
 
 const BTW_REMINDER: &str = "<system-reminder>\nThis is a side question. Answer it directly in a \
@@ -74,6 +78,13 @@ pub async fn run_isolated_turn(
             }
         }
     });
+    let invocation = Invocation {
+        conversation_id: fresh_id(),
+        operation_id: fresh_id(),
+        attempt: 0,
+        purpose: InvocationPurpose::Isolated,
+        agent_id: None,
+    };
     let result = futures_lite::future::race(
         provider.stream_message(
             &model,
@@ -83,6 +94,7 @@ pub async fn run_isolated_turn(
             &provider_tx,
             RequestOptions::default(),
             session_id.as_ref(),
+            &invocation,
         ),
         async {
             cancel.cancelled().await;
@@ -92,6 +104,11 @@ pub async fn run_isolated_turn(
     .await;
     drop(provider_tx);
     forwarder.await;
+    let reason = match result {
+        Err(crate::AgentError::Cancelled) => ConversationEnd::Cancelled,
+        _ => ConversationEnd::Closed,
+    };
+    end_conversation_detached(&provider, invocation.conversation_id, reason);
     let terminal = match result {
         Ok(_) => IsolatedTurnEvent::Done,
         Err(crate::AgentError::Cancelled) => IsolatedTurnEvent::Cancelled,
@@ -108,6 +125,7 @@ mod tests {
     use maki_providers::{
         ContentBlock, ProviderEvent, Role, StopReason, StreamResponse, TokenUsage,
     };
+    use test_case::test_case;
 
     use super::*;
 
@@ -116,6 +134,7 @@ mod tests {
         messages: Vec<Message>,
         tools: Value,
         system: String,
+        invocation: Option<Invocation>,
     }
 
     enum ProviderOutcome {
@@ -127,6 +146,7 @@ mod tests {
     struct CapturingProvider {
         captured: Arc<Mutex<Captured>>,
         outcome: ProviderOutcome,
+        ended: Option<flume::Sender<(Arc<str>, ConversationEnd)>>,
     }
 
     impl Provider for CapturingProvider {
@@ -139,8 +159,10 @@ mod tests {
             events: &'a flume::Sender<ProviderEvent>,
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
+            invocation: &'a Invocation,
         ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
             let mut captured = self.captured.lock().unwrap();
+            captured.invocation = Some(invocation.clone());
             captured.messages = messages.to_vec();
             captured.tools = tools.clone();
             captured.system = system.to_owned();
@@ -178,6 +200,17 @@ mod tests {
         ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, crate::AgentError>> {
             Box::pin(async { unimplemented!() })
         }
+
+        fn end_conversation(
+            &self,
+            conversation_id: &str,
+            reason: ConversationEnd,
+        ) -> BoxFuture<'_, ()> {
+            if let Some(ended) = &self.ended {
+                let _ = ended.send((conversation_id.into(), reason));
+            }
+            Box::pin(async {})
+        }
     }
 
     /// The request owns its history (`IsolatedTurnRequest.history: Vec<Message>`),
@@ -192,6 +225,7 @@ mod tests {
         let provider = Arc::new(CapturingProvider {
             captured: Arc::new(Mutex::new(Captured::default())),
             outcome,
+            ended: None,
         });
         let (tx, rx) = flume::unbounded();
         run_isolated_turn(
@@ -209,6 +243,51 @@ mod tests {
         )
         .await;
         rx.iter().collect()
+    }
+
+    #[test_case(ProviderOutcome::Success, false, ConversationEnd::Closed ; "finished")]
+    #[test_case(ProviderOutcome::Pending, true, ConversationEnd::Cancelled ; "cancelled")]
+    fn isolated_turn_ends_its_own_conversation(
+        outcome: ProviderOutcome,
+        cancelled: bool,
+        reason: ConversationEnd,
+    ) {
+        smol::block_on(async {
+            let (trigger, cancel) = CancelToken::new();
+            if cancelled {
+                trigger.cancel();
+            }
+            let captured = Arc::new(Mutex::new(Captured::default()));
+            let (ended_tx, ended_rx) = flume::unbounded();
+            let provider = Arc::new(CapturingProvider {
+                captured: Arc::clone(&captured),
+                outcome,
+                ended: Some(ended_tx),
+            });
+            let (tx, _rx) = flume::unbounded();
+            run_isolated_turn(
+                IsolatedTurnRequest {
+                    provider,
+                    model: Model::from_spec("openai/gpt-4o").unwrap(),
+                    history: Vec::new(),
+                    system: "system".into(),
+                    question: "why?".into(),
+                    images: Vec::new(),
+                    session_id: None,
+                    cancel,
+                },
+                tx,
+            )
+            .await;
+
+            let invocation = captured.lock().unwrap().invocation.clone().unwrap();
+            assert_eq!(invocation.purpose, InvocationPurpose::Isolated);
+            assert_eq!(invocation.attempt, 0);
+            assert_eq!(
+                ended_rx.recv_async().await.unwrap(),
+                (invocation.conversation_id, reason)
+            );
+        });
     }
 
     #[test]
@@ -250,6 +329,7 @@ mod tests {
             let provider = Arc::new(CapturingProvider {
                 captured: Arc::clone(&captured),
                 outcome: ProviderOutcome::Success,
+                ended: None,
             });
             let (tx, _rx) = flume::unbounded();
             run_isolated_turn(
@@ -292,6 +372,7 @@ mod tests {
             let provider = Arc::new(CapturingProvider {
                 captured: Arc::clone(&captured),
                 outcome: ProviderOutcome::Success,
+                ended: None,
             });
             let (tx, rx) = flume::unbounded();
             run_isolated_turn(

@@ -14,10 +14,10 @@ use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::dialect;
 use crate::manifest::ManifestRegistry;
 use crate::model::{FastPricing, Model, ModelInfo, ModelPricing, ModelTier, ThinkingSupport};
-use crate::provider::{BoxFuture, Provider, ProviderKind};
+use crate::provider::{BoxFuture, NativeProvider, Provider, ProviderKind};
 use crate::providers::Timeouts;
 use crate::types::{ThinkingConfig, ThinkingConfigExt};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{AgentError, Invocation, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 static CUSTOM_OPENAI_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     // Custom providers resolve their own base URL (including any override) from
@@ -64,7 +64,10 @@ fn resolve_custom_auth(slug: &str) -> Result<ResolvedAuth, AgentError> {
     Ok(ResolvedAuth::bearer(slug, pool.current())?.with_base_url(base_url))
 }
 
-pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+pub(crate) fn create(
+    slug: &str,
+    timeouts: Timeouts,
+) -> Result<Box<dyn NativeProvider>, AgentError> {
     let kind = base_kind(slug).ok_or_else(|| AgentError::Config {
         message: format!("unknown custom provider '{slug}'"),
     })?;
@@ -279,6 +282,7 @@ impl Provider for CustomOpenAiProvider {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
@@ -321,6 +325,8 @@ impl Provider for CustomOpenAiProvider {
         Box::pin(async move { self.compat.do_list_models(&auth).await })
     }
 }
+
+impl NativeProvider for CustomOpenAiProvider {}
 
 #[cfg(test)]
 mod tests {

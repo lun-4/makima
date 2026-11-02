@@ -9,8 +9,8 @@ use tracing::warn;
 
 use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry};
-use crate::provider::{BoxFuture, Provider, ProviderKind};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::provider::{BoxFuture, NativeProvider, Provider, ProviderKind};
+use crate::{AgentError, Invocation, Message, ProviderEvent, RequestOptions, StreamResponse};
 use maki_storage::id::SessionRef;
 
 use super::anthropic::Anthropic;
@@ -430,6 +430,7 @@ impl Provider for Aperture {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
+        invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let (provider_id, model_id) = model.id.split_once('/').unwrap_or(("", &model.id));
@@ -449,6 +450,7 @@ impl Provider for Aperture {
                         event_tx,
                         opts,
                         session_id,
+                        invocation,
                     )
                     .await;
             }
@@ -494,6 +496,8 @@ impl Provider for Aperture {
         apply_adjustments(model, &self.overrides);
     }
 }
+
+impl NativeProvider for Aperture {}
 
 #[cfg(test)]
 mod tests {

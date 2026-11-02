@@ -35,9 +35,9 @@ pub use selection::{
 };
 pub use tokens::{ContextGauge, estimate_message_tokens, estimate_prompt_tokens};
 pub use types::{
-    ContentBlock, EMPTY_RESPONSE_MARKER, EffortDialect, IMAGE_EVICTED_NOTE, IMAGE_OMITTED_NOTE,
-    IMAGE_PLACEHOLDER, IMAGE_UNUSABLE_NOTE, ImageMediaType, ImageSource, Message, MessageKind,
-    ModelUsageRow, ObservationSource, ProviderEvent, ProviderUsage, RequestOptions, Role,
-    StopReason, StreamResponse, THINKING_USAGE, ThinkingConfigExt, UsageLimit, UsageWindow,
-    adapt_images_for_model, dialect,
+    ContentBlock, ConversationEnd, EMPTY_RESPONSE_MARKER, EffortDialect, IMAGE_EVICTED_NOTE,
+    IMAGE_OMITTED_NOTE, IMAGE_PLACEHOLDER, IMAGE_UNUSABLE_NOTE, ImageMediaType, ImageSource,
+    Invocation, InvocationPurpose, Message, MessageKind, ModelUsageRow, ObservationSource,
+    ProviderEvent, ProviderUsage, RequestOptions, Role, StopReason, StreamResponse, THINKING_USAGE,
+    ThinkingConfigExt, UsageLimit, UsageWindow, adapt_images_for_model, dialect,
 };

@@ -6,9 +6,11 @@ use serde_json::{Value, json};
 use tracing::warn;
 
 use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, NativeProvider, Provider};
 use crate::types::ThinkingConfigExt;
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
+use crate::{
+    AgentError, Invocation, Message, ProviderEvent, RequestOptions, StreamResponse, dialect,
+};
 
 use super::openai_compat::{MODELS_PATH, OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
@@ -176,6 +178,7 @@ impl Provider for Requesty {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
@@ -225,7 +228,9 @@ impl Provider for Requesty {
             }
         })
     }
+}
 
+impl NativeProvider for Requesty {
     fn keys(&self) -> Option<KeyRotation<'_>> {
         Some(KeyRotation::new(
             self.key_pool.as_ref()?,

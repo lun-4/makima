@@ -44,9 +44,9 @@ use crate::{
     AgentConfig, AgentId, AgentMode, CurrentManagedTurn, EventSender, RunLedger, SharedBuf,
 };
 use maki_config::{ModelPolicy, ToolOutputLines};
-use maki_providers::Model;
 use maki_providers::RequestOptions;
 use maki_providers::provider::Provider;
+use maki_providers::{Invocation, Model};
 use maki_storage::id::SessionRef;
 
 pub struct DescriptionContext<'a> {
@@ -833,6 +833,7 @@ impl Provider for NullProvider {
         _: &'a flume::Sender<ProviderEvent>,
         _: RequestOptions,
         _: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
         Box::pin(async { unimplemented!() })
     }

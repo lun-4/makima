@@ -35,7 +35,10 @@ use crate::providers::synthetic::Synthetic;
 use crate::providers::tensorx::TensorX;
 use crate::providers::vertex::Vertex;
 use crate::providers::zai::Zai;
-use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
+use crate::{
+    AgentError, ConversationEnd, Invocation, Message, ProviderEvent, ProviderUsage, RequestOptions,
+    StreamResponse,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, EnumString, EnumIter)]
 #[strum(serialize_all = "kebab-case")]
@@ -241,7 +244,7 @@ impl ProviderKind {
         }
     }
 
-    pub fn create(self, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    pub(crate) fn create(self, timeouts: Timeouts) -> Result<Box<dyn NativeProvider>, AgentError> {
         match self {
             Self::Anthropic => {
                 if bedrock::is_enabled() {
@@ -283,9 +286,12 @@ pub trait Provider: Send + Sync {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
+        invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>>;
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>>;
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
 
     /// Fetch provider-side usage quota (remaining percentage / reset times).
     /// `Ok(None)` means the provider does not expose a programmatic usage endpoint.
@@ -301,19 +307,92 @@ pub trait Provider: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
-    /// The keys this provider rotates through, and where the current one lives.
-    /// `None` is one fixed credential that never changes. This is the only hook
-    /// for rotation: both the count and the swap come off it, so they can never
-    /// describe different pools, which is what a per-provider `rotate_key` let
-    /// happen before.
-    fn keys(&self) -> Option<KeyRotation<'_>> {
-        None
+    /// How many keys a retry walk can try before it is back where it started.
+    fn key_count(&self) -> usize {
+        1
+    }
+
+    /// Switch to the next key. `false` means there was nothing to switch to.
+    fn rotate_key(&self) -> BoxFuture<'_, bool> {
+        Box::pin(async { false })
+    }
+
+    /// The host will never send another request for `conversation_id`, and
+    /// every stream for it has been dropped. Must be idempotent and accept
+    /// ids the provider never saw.
+    fn end_conversation(
+        &self,
+        _conversation_id: &str,
+        _reason: ConversationEnd,
+    ) -> BoxFuture<'_, ()> {
+        Box::pin(async {})
     }
 
     fn adjust_model(&self, _model: &mut Model) {}
 }
 
-pub fn provider_for_slug(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+pub(crate) trait NativeProvider: Provider {
+    /// The keys this provider rotates through, and where the current one lives.
+    /// `None` is one fixed credential that never changes. Both the count and
+    /// the swap come off it, so they can never describe different pools.
+    fn keys(&self) -> Option<KeyRotation<'_>> {
+        None
+    }
+}
+
+struct Native(Box<dyn NativeProvider>);
+
+impl Provider for Native {
+    fn stream_message<'a>(
+        &'a self,
+        model: &'a Model,
+        messages: &'a [Message],
+        system: &'a str,
+        tools: &'a Value,
+        event_tx: &'a Sender<ProviderEvent>,
+        opts: RequestOptions,
+        session_id: Option<&'a SessionRef>,
+        invocation: &'a Invocation,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        self.0.stream_message(
+            model, messages, system, tools, event_tx, opts, session_id, invocation,
+        )
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        self.0.list_models()
+    }
+
+    fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
+        self.0.fetch_usage()
+    }
+
+    fn refresh_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
+        self.0.refresh_auth()
+    }
+
+    fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
+        self.0.reload_auth()
+    }
+
+    fn key_count(&self) -> usize {
+        self.0.keys().map_or(1, |keys| keys.key_count())
+    }
+
+    fn rotate_key(&self) -> BoxFuture<'_, bool> {
+        let rotated = self.0.keys().is_some_and(|keys| keys.rotate());
+        Box::pin(async move { rotated })
+    }
+
+    fn adjust_model(&self, model: &mut Model) {
+        self.0.adjust_model(model);
+    }
+}
+
+pub(crate) fn provider_for_slug(
+    slug: &str,
+    timeouts: Timeouts,
+) -> Result<Box<dyn NativeProvider>, AgentError> {
     if let Ok(kind) = ProviderKind::from_str(slug) {
         return kind.create(timeouts);
     }
@@ -352,7 +431,7 @@ pub fn from_model(model: &mut Model, timeouts: Timeouts) -> Result<Box<dyn Provi
     let provider = provider_for_slug(&model.provider, timeouts)?;
     provider.adjust_model(model);
     debug!(provider = %model.provider, model = %model.id, "provider created");
-    Ok(provider)
+    Ok(Box::new(Native(provider)))
 }
 
 /// Adjust a model against its provider's static table without retaining the
@@ -393,6 +472,7 @@ impl Provider for UnconfiguredProvider {
         _event_tx: &'a Sender<ProviderEvent>,
         _opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async {
             Err(AgentError::Config {
@@ -419,7 +499,7 @@ pub async fn from_model_async(
     let provider = smol::unblock(move || provider_for_slug(&slug, timeouts)).await?;
     provider.adjust_model(model);
     debug!(provider = %model.provider, model = %id, "provider created");
-    Ok(provider)
+    Ok(Box::new(Native(provider)))
 }
 
 pub struct ModelBatch {

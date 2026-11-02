@@ -2439,7 +2439,7 @@ mod tests {
     use maki_agent::{AgentMode, TurnTicket};
     use maki_commands::TargetCapabilities;
     use maki_lua::orchestration::{OrchestrationServices, TurnCompletion};
-    use maki_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
+    use maki_providers::{ContentBlock as MsgBlock, Invocation, Role, TokenUsage};
     use maki_storage::StateDir;
     use maki_storage::checkpoint::{ClaimingWriter, accept_all};
     use maki_storage::sessions::StoredMode;
@@ -2502,6 +2502,7 @@ mod tests {
             events: &'a Sender<maki_providers::ProviderEvent>,
             options: maki_providers::RequestOptions,
             session: Option<&'a SessionRef>,
+            invocation: &'a Invocation,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, maki_agent::AgentError>,
@@ -2628,6 +2629,7 @@ mod tests {
                 events,
                 options,
                 session,
+                invocation,
             )
         }
 
@@ -2904,6 +2906,7 @@ mod tests {
             _: &'a Sender<maki_providers::ProviderEvent>,
             _: maki_providers::RequestOptions,
             _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, maki_agent::AgentError>,
@@ -2950,6 +2953,7 @@ mod tests {
             events: &'a Sender<maki_providers::ProviderEvent>,
             _: maki_providers::RequestOptions,
             _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, maki_agent::AgentError>,

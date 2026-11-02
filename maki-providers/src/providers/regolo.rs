@@ -8,9 +8,11 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, NativeProvider, Provider};
 use crate::types::{ModelUsageRow, ProviderUsage, ThinkingConfigExt, UsageLimit, UsageWindow};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
+use crate::{
+    AgentError, Invocation, Message, ProviderEvent, RequestOptions, StreamResponse, dialect,
+};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
@@ -338,6 +340,7 @@ impl Provider for Regolo {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
@@ -420,7 +423,9 @@ impl Provider for Regolo {
             }))
         })
     }
+}
 
+impl NativeProvider for Regolo {
     fn keys(&self) -> Option<KeyRotation<'_>> {
         Some(KeyRotation::new(
             self.key_pool.as_ref()?,
