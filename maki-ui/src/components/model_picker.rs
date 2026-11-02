@@ -6,10 +6,10 @@ use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 
-use maki_providers::ModelTier;
 use maki_providers::dynamic;
 use maki_providers::model_registry;
 use maki_providers::provider::ProviderKind;
+use maki_providers::{ModelTier, ProviderRegistry};
 
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
@@ -98,6 +98,7 @@ impl PickerItem for ModelEntry {
 pub struct ModelPicker {
     picker: ListPicker<ModelEntry>,
     models: Arc<ArcSwapOption<Vec<String>>>,
+    providers: Arc<ProviderRegistry>,
     available: Watch<Vec<String>>,
     recents: Vec<String>,
     current_spec: String,
@@ -107,10 +108,11 @@ pub struct ModelPicker {
 }
 
 impl ModelPicker {
-    pub fn new(models: Arc<ArcSwapOption<Vec<String>>>) -> Self {
+    pub fn new(models: Arc<ArcSwapOption<Vec<String>>>, providers: Arc<ProviderRegistry>) -> Self {
         Self {
             picker: ListPicker::new().with_footer_builder(footer_line),
             models,
+            providers,
             available: Watch::default(),
             recents: Vec::new(),
             current_spec: String::new(),
@@ -163,7 +165,7 @@ impl ModelPicker {
         let mut entries = Vec::new();
         for spec in &self.recents {
             if specs.is_none_or(|specs| specs.contains(spec))
-                && let Some(mut e) = parse_model_entry(spec)
+                && let Some(mut e) = parse_model_entry(spec, &self.providers)
             {
                 e.suffix = Some(std::mem::take(&mut e.provider_display));
                 e.provider_display = RECENT_SECTION.to_string();
@@ -171,7 +173,11 @@ impl ModelPicker {
             }
         }
         let mut full: Vec<ModelEntry> = specs
-            .map(|s| s.iter().filter_map(|s| parse_model_entry(s)).collect())
+            .map(|s| {
+                s.iter()
+                    .filter_map(|s| parse_model_entry(s, &self.providers))
+                    .collect()
+            })
             .unwrap_or_default();
         full.sort_by(|a, b| {
             a.provider_display
@@ -269,7 +275,7 @@ impl Overlay for ModelPicker {
     }
 }
 
-fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
+fn parse_model_entry(spec: &str, providers: &ProviderRegistry) -> Option<ModelEntry> {
     let (provider_str, model_id) = spec.split_once('/')?;
 
     let provider_display = if let Ok(kind) = provider_str.parse::<ProviderKind>() {
@@ -282,12 +288,14 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
         builtin.display_name.to_string()
     } else {
         let config = maki_config::providers::ProvidersConfig::load();
-        config.get(provider_str)?;
-        maki_config::providers::resolve_display_name(provider_str, config.get(provider_str))
+        match config.get(provider_str) {
+            Some(entry) => maki_config::providers::resolve_display_name(provider_str, Some(entry)),
+            None => providers.display_name(provider_str)?.to_string(),
+        }
     };
 
     let override_tiers = model_registry::override_tiers(spec);
-    let (tier, free) = match maki_providers::Model::from_spec(spec) {
+    let (tier, free) = match providers.model(spec) {
         Ok(m) => (m.tier.to_string(), m.is_free()),
         Err(_) => (String::new(), false),
     };
@@ -336,7 +344,7 @@ mod tests {
         models.store(Some(Arc::new(vec![
             "anthropic/claude-sonnet-4-20250514".into(),
         ])));
-        let mut p = ModelPicker::new(Arc::clone(&models));
+        let mut p = ModelPicker::new(Arc::clone(&models), Arc::default());
         p.open("");
         assert_eq!(p.refresh(), Dirty::NO);
 
@@ -362,7 +370,7 @@ mod tests {
     #[test_case(key(KeyCode::Esc)          ; "esc_closes")]
     #[test_case(kb::QUIT.to_key_event()    ; "ctrl_c_closes")]
     fn close_keys(cancel_key: KeyEvent) {
-        let mut p = ModelPicker::new(test_models());
+        let mut p = ModelPicker::new(test_models(), Arc::default());
         p.open("");
         let action = p.handle_key(cancel_key);
         assert!(matches!(action, ModelPickerAction::Close));
@@ -375,7 +383,7 @@ mod tests {
         models.store(Some(Arc::new(vec![
             "anthropic/claude-sonnet-4-20250514".into(),
         ])));
-        let mut p = ModelPicker::new(models.clone());
+        let mut p = ModelPicker::new(models.clone(), Arc::default());
         p.open("");
 
         p.handle_key(key(KeyCode::Char('o')));
@@ -396,7 +404,7 @@ mod tests {
 
     #[test]
     fn open_preselects_current_model() {
-        let mut p = ModelPicker::new(test_models());
+        let mut p = ModelPicker::new(test_models(), Arc::default());
         p.open("anthropic/claude-opus-4-6-20260101");
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(
@@ -406,7 +414,11 @@ mod tests {
 
     #[test]
     fn parse_model_entry_valid() {
-        let entry = parse_model_entry("anthropic/claude-sonnet-4-20250514").unwrap();
+        let entry = parse_model_entry(
+            "anthropic/claude-sonnet-4-20250514",
+            &ProviderRegistry::default(),
+        )
+        .unwrap();
         assert_eq!(entry.id, "claude-sonnet-4-20250514");
         assert_eq!(entry.provider_display, "Anthropic");
         assert!(!entry.tier.is_empty());
@@ -414,7 +426,11 @@ mod tests {
 
     #[test]
     fn parse_model_entry_paid_model_not_marked_free() {
-        let entry = parse_model_entry("anthropic/claude-sonnet-4-20250514").unwrap();
+        let entry = parse_model_entry(
+            "anthropic/claude-sonnet-4-20250514",
+            &ProviderRegistry::default(),
+        )
+        .unwrap();
         assert!(
             !entry.tier.starts_with(FREE_PREFIX),
             "paid anthropic model must not be marked free"
@@ -423,7 +439,7 @@ mod tests {
 
     #[test]
     fn parse_model_entry_no_slash() {
-        assert!(parse_model_entry("no-slash").is_none());
+        assert!(parse_model_entry("no-slash", &ProviderRegistry::default()).is_none());
     }
 
     #[test_case(key(KeyCode::Char('!')),           ModelTier::Strong     ; "legacy_bang_strong")]
@@ -432,7 +448,7 @@ mod tests {
     #[test_case(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::SHIFT), ModelTier::Strong     ; "kitty_shift_1_strong")]
     #[test_case(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::SHIFT), ModelTier::Compaction ; "kitty_shift_4_compaction")]
     fn tier_shortcut_assigns_and_keeps_picker_open(k: KeyEvent, want: ModelTier) {
-        let mut p = ModelPicker::new(test_models());
+        let mut p = ModelPicker::new(test_models(), Arc::default());
         p.open("anthropic/claude-sonnet-4-20250514");
         let action = p.handle_key(k);
         assert!(
@@ -446,7 +462,7 @@ mod tests {
     #[test]
     fn refresh_preserves_selection_for_current_model() {
         let models = Arc::new(ArcSwapOption::empty());
-        let mut p = ModelPicker::new(models.clone());
+        let mut p = ModelPicker::new(models.clone(), Arc::default());
         p.open("anthropic/claude-opus-4-6-20260101");
 
         models.store(Some(Arc::new(vec![
@@ -466,7 +482,7 @@ mod tests {
     #[test]
     fn recents_include_current_model_preselected() {
         let models = test_models();
-        let mut p = ModelPicker::new(models);
+        let mut p = ModelPicker::new(models, Arc::default());
         p.set_recents(vec![
             "zai/glm-5".into(),
             "anthropic/claude-sonnet-4-20250514".into(),
@@ -495,7 +511,7 @@ mod tests {
     #[test]
     fn reopen_preselects_current_model_in_provider_section() {
         let models = test_models();
-        let mut p = ModelPicker::new(models);
+        let mut p = ModelPicker::new(models, Arc::default());
         p.set_recents(vec![
             "zai/glm-5".into(),
             "anthropic/claude-sonnet-4-20250514".into(),
@@ -522,7 +538,7 @@ mod tests {
     #[test]
     fn refresh_keeps_selection_on_provider_entry() {
         let models = test_models();
-        let mut p = ModelPicker::new(models);
+        let mut p = ModelPicker::new(models, Arc::default());
         p.set_recents(vec![
             "zai/glm-5".into(),
             "anthropic/claude-sonnet-4-20250514".into(),
@@ -545,7 +561,7 @@ mod tests {
     #[test]
     fn refresh_after_collapse_anchors_to_provider_entry() {
         let models = test_models();
-        let mut p = ModelPicker::new(models.clone());
+        let mut p = ModelPicker::new(models.clone(), Arc::default());
         p.set_recents(vec![
             "zai/glm-5".into(),
             "anthropic/claude-sonnet-4-20250514".into(),
@@ -577,7 +593,7 @@ mod tests {
     #[test]
     fn refresh_preserves_navigation_to_recent_entry() {
         let models = test_models();
-        let mut p = ModelPicker::new(models.clone());
+        let mut p = ModelPicker::new(models.clone(), Arc::default());
         p.set_recents(vec![
             "zai/glm-5".into(),
             "anthropic/claude-sonnet-4-20250514".into(),
@@ -606,7 +622,7 @@ mod tests {
     #[test]
     fn refresh_preserves_selection_with_active_search() {
         let models = test_models();
-        let mut p = ModelPicker::new(models.clone());
+        let mut p = ModelPicker::new(models.clone(), Arc::default());
         p.set_recents(vec![
             "zai/glm-5".into(),
             "anthropic/claude-sonnet-4-20250514".into(),

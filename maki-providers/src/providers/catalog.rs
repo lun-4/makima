@@ -256,6 +256,7 @@ impl CatalogMeta {
             supports_vision: self.supports_vision,
             tier: None,
             provider_info: None,
+            ..Default::default()
         }
     }
 }

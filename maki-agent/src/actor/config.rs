@@ -2,7 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use maki_providers::provider::Provider;
-use maki_providers::{Model, RequestOptions, ThinkingConfig, ThinkingConfigExt, model_registry};
+use maki_providers::{
+    Model, PreparedProvider, RequestOptions, ThinkingConfig, ThinkingConfigExt, model_registry,
+};
 
 use crate::{AgentMode, ModeDef};
 
@@ -53,11 +55,7 @@ impl ModeCeiling {
     }
 }
 
-#[derive(Clone)]
-pub struct PreparedModel {
-    pub provider: Arc<dyn Provider>,
-    pub model: Model,
-}
+pub type PreparedModel = PreparedProvider;
 
 #[derive(Clone, Default)]
 pub struct ConfigPatch {

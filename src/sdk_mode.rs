@@ -48,7 +48,9 @@ use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::orchestration::ModelCatalog;
 use maki_lua::session_snapshot::HeadlessObserver;
 use maki_providers::model::Model;
-use maki_providers::{ImageSource, Message, StopReason, Timeouts, TokenUsage, add_cost};
+use maki_providers::{
+    ImageSource, Message, ProviderRegistry, StopReason, Timeouts, TokenUsage, add_cost,
+};
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::session_lock;
@@ -521,6 +523,7 @@ pub struct SdkParams {
     pub prompt_slots: PromptSlotSource,
     pub defaults: SessionDefaults,
     pub model_policy: Arc<ModelPolicy>,
+    pub providers: Arc<ProviderRegistry>,
     pub plugin_rules: Arc<PluginRuleStore>,
     pub project_config: ProjectConfig,
     pub commands: Vec<CustomCommand>,
@@ -632,6 +635,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         prompt_slots,
         defaults,
         model_policy,
+        providers,
         plugin_rules,
         project_config,
         commands,
@@ -654,7 +658,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     let storage = StateDir::resolve().context("resolve state dir")?;
     let mut restored = resolve_session(&cli, &working_dir, &storage)?;
     let restored_state = restored.model.is_some();
-    let model = startup_model(model, &restored, explicit_model, &model_policy);
+    let model = startup_model(&providers, model, &restored, explicit_model, &model_policy);
     let permission_mode = restored_permission_mode(
         restored_state,
         restored.meta.yolo,
@@ -686,7 +690,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     }
 
     let startup_model = model.clone();
-    let catalog = ModelCatalog::offline(&model_policy);
+    let catalog = ModelCatalog::offline(Arc::clone(&providers), &model_policy);
     let (binding, root_target) = maki_lua::orchestration::root_binding();
     let handle = headless::spawn_interactive_with_binding(
         InteractiveParams {
@@ -707,13 +711,14 @@ pub fn run(params: SdkParams) -> Result<()> {
             defaults,
             modes: lua_handle.mode_registry(),
             model_policy: Arc::clone(&model_policy),
+            providers: Arc::clone(&providers),
             plugin_rules,
             project_config,
             local_tools: Default::default(),
             state_dir: Some(storage.path().to_path_buf()),
             answers: true,
         },
-        headless::default_preparation(),
+        headless::default_preparation(Arc::clone(&providers)),
         Some(initial_history),
         Some(binding),
     );
@@ -760,7 +765,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         &handle,
         &coordinator,
         &root_target,
-        headless::default_model_preparer(timeouts),
+        headless::default_model_preparer(Arc::clone(&providers)),
     ))
     .map_err(|error| eyre!("bind session actor: {error}"))?;
     let root = trusted_root.target.clone();
@@ -775,10 +780,14 @@ pub fn run(params: SdkParams) -> Result<()> {
         command_registry,
         &commands,
         maki_lua::orchestration::PinnedCommandHost::new(
-            SessionCommandHost::new(handle.control_tx.clone(), coordinator.clone()),
+            SessionCommandHost::new(
+                handle.control_tx.clone(),
+                coordinator.clone(),
+                Arc::clone(&providers),
+            ),
             trusted_root,
             &orchestration,
-            headless::default_model_preparer(timeouts),
+            headless::default_model_preparer(Arc::clone(&providers)),
         ),
     )?);
     orchestration.bind_commands(
@@ -1254,6 +1263,7 @@ struct ResolvedSession {
 }
 
 fn startup_model(
+    providers: &ProviderRegistry,
     startup: Model,
     restored: &ResolvedSession,
     explicit_model: bool,
@@ -1265,7 +1275,7 @@ fn startup_model(
     restored
         .model
         .as_deref()
-        .and_then(|spec| Model::from_spec(spec).ok())
+        .and_then(|spec| providers.model(spec).ok())
         .filter(|candidate| model_policy.allows(&candidate.spec()))
         .unwrap_or(startup)
 }
@@ -1762,8 +1772,7 @@ impl EventPump {
     fn model_id(&self) -> String {
         self.read
             .model()
-            .and_then(|spec| Model::from_spec(&spec).ok())
-            .map(|model| model.id)
+            .and_then(|spec| Model::parse_spec(&spec).ok().map(|(_, id)| id.to_owned()))
             .unwrap_or_default()
     }
 
@@ -2095,6 +2104,7 @@ mod tests {
             meta: SessionMeta::default(),
         };
         let resolved = startup_model(
+            &ProviderRegistry::default(),
             Model::from_spec(STARTUP_MODEL).unwrap(),
             &restored,
             explicit_model,
@@ -2172,7 +2182,7 @@ mod tests {
     fn sdk_commands(registry: CommandRegistry) -> SdkCommands {
         let handle = headless::spawn_interactive_with_binding(
             idle_params(),
-            Box::new(|_, _| {
+            Box::new(|_| {
                 Box::pin(async {
                     Err(AgentError::Config {
                         message: UNSTARTED_ROOT.into(),
@@ -2188,6 +2198,7 @@ mod tests {
             SessionCommandHost::new(
                 handle.control_tx.clone(),
                 unbound_coordinator(handle.session_id.id()),
+                Arc::default(),
             ),
         )
         .unwrap()
@@ -2211,6 +2222,7 @@ mod tests {
             append_system_prompt: None,
             defaults: SessionDefaults::default(),
             model_policy: Arc::default(),
+            providers: Arc::default(),
             modes: Arc::new(maki_agent::ModeRegistry::builtin()),
             question_mode: QuestionMode::Headless,
             plugin_rules: Arc::default(),
@@ -2284,7 +2296,7 @@ mod tests {
         });
         let handle = headless::spawn_interactive_with_binding(
             idle_params(),
-            Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) })),
+            Box::new(move |model| Box::pin(async move { Ok(PreparedModel { model, provider }) })),
             None,
             None,
         );
@@ -3104,6 +3116,7 @@ mod tests {
                 append_system_prompt: None,
                 defaults,
                 model_policy: Arc::default(),
+                providers: Arc::default(),
                 modes: lua_handle.mode_registry(),
                 question_mode: QuestionMode::Headless,
                 plugin_rules: Arc::default(),
@@ -3112,7 +3125,14 @@ mod tests {
                 state_dir: Some(cwd.clone()),
                 answers: true,
             },
-            Box::new(move |model, _| Box::pin(async move { Ok((model, prepared_provider)) })),
+            Box::new(move |model| {
+                Box::pin(async move {
+                    Ok(PreparedModel {
+                        model,
+                        provider: prepared_provider,
+                    })
+                })
+            }),
             None,
             Some(binding),
         );
@@ -3171,8 +3191,9 @@ mod tests {
             &root_target,
             Arc::new({
                 let provider = Arc::clone(&provider);
-                move |model| {
+                move |spec: Arc<str>| {
                     let provider = Arc::clone(&provider);
+                    let model = Model::from_spec(&spec).unwrap();
                     Box::pin(async move { Ok(PreparedModel { model, provider }) })
                 }
             }),
@@ -3243,8 +3264,12 @@ mod tests {
         let commands = SdkCommands::new(
             host.command_registry(),
             &[],
-            SessionCommandHost::new(handle.control_tx.clone(), coordinator.clone())
-                .with_admission_context(trusted_root),
+            SessionCommandHost::new(
+                handle.control_tx.clone(),
+                coordinator.clone(),
+                Arc::default(),
+            )
+            .with_admission_context(trusted_root),
         )
         .unwrap();
         host.wait_for_worker_barrier_for_test();

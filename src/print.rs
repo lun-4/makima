@@ -44,7 +44,7 @@ use maki_lua::orchestration::{
 };
 use maki_lua::session_snapshot::HeadlessObserver;
 use maki_providers::model::Model;
-use maki_providers::{TokenUsage, add_cost};
+use maki_providers::{ProviderRegistry, TokenUsage, add_cost};
 use maki_storage::StateDir;
 use maki_storage::checkpoint::ClaimingWriter;
 use maki_storage::id::{MakiId, SessionRef};
@@ -322,7 +322,7 @@ fn start_print_session(
     registry: &CommandRegistry,
     discover: impl FnOnce(&ModelCatalog, String) -> Discovery,
 ) -> Result<PrintSession> {
-    let catalog = ModelCatalog::offline(&params.model_policy);
+    let catalog = ModelCatalog::offline(Arc::clone(&params.providers), &params.model_policy);
     let active_provider = params.model.provider.to_string();
     let definitions = builtin_option_definitions(
         Arc::from(params.model.spec()),
@@ -333,7 +333,7 @@ fn start_print_session(
         params.defaults.thinking.into(),
     );
     let model_policy = Arc::clone(&params.model_policy);
-    let timeouts = params.timeouts;
+    let providers = Arc::clone(&params.providers);
     let (binding, root_target) = orchestration::root_binding();
     let handle = headless::spawn_interactive_with_binding(params, prepare, None, Some(binding));
     smol::block_on(handle.initialized_root()).map_err(|error| eyre!(error))?;
@@ -351,7 +351,7 @@ fn start_print_session(
         &handle,
         &coordinator,
         &root_target,
-        headless::default_model_preparer(timeouts),
+        headless::default_model_preparer(Arc::clone(&providers)),
     ))
     .map_err(|error| eyre!("bind print root: {error}"))?;
     let orchestration = Arc::new(orchestration::frontend_root(
@@ -366,10 +366,14 @@ fn start_print_session(
     let commands = registry.bind_target(
         session_capabilities(),
         Arc::new(orchestration::PinnedCommandHost::new(
-            SessionCommandHost::new(handle.control_tx.clone(), coordinator.clone()),
+            SessionCommandHost::new(
+                handle.control_tx.clone(),
+                coordinator.clone(),
+                Arc::clone(&providers),
+            ),
             root.clone(),
             &orchestration,
-            headless::default_model_preparer(timeouts),
+            headless::default_model_preparer(providers),
         )),
     );
     orchestration.bind_commands(
@@ -467,6 +471,7 @@ pub fn run(
     lua_handle: EventHandle,
     defaults: SessionDefaults,
     model_policy: Arc<ModelPolicy>,
+    providers: Arc<ProviderRegistry>,
     system_prompt_override: Option<String>,
     append_system_prompt: Option<String>,
     plugin_rules: Arc<PluginRuleStore>,
@@ -529,6 +534,7 @@ pub fn run(
                 append_system_prompt,
                 defaults,
                 model_policy: Arc::clone(&model_policy),
+                providers: Arc::clone(&providers),
                 modes: lua_handle.mode_registry(),
                 question_mode: QuestionMode::Headless,
                 plugin_rules: Arc::clone(&plugin_rules),
@@ -537,7 +543,7 @@ pub fn run(
                 state_dir,
                 answers: false,
             },
-            headless::default_preparation(),
+            headless::default_preparation(providers),
             session_options,
             &lua_handle,
             &command_registry,
@@ -1066,6 +1072,7 @@ mod tests {
             append_system_prompt: None,
             defaults: Default::default(),
             model_policy: Arc::default(),
+            providers: Arc::default(),
             modes: EventHandle::disconnected_for_test().mode_registry(),
             question_mode: QuestionMode::Headless,
             plugin_rules: Arc::default(),
@@ -1077,7 +1084,9 @@ mod tests {
     }
 
     fn provided(provider: Arc<dyn Provider>) -> ProviderPreparation {
-        Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) }))
+        Box::new(move |model| {
+            Box::pin(async move { Ok(maki_agent::actor::PreparedModel { model, provider }) })
+        })
     }
 
     /// Starts a print session on {provider} and admits {message}.
@@ -1442,7 +1451,7 @@ mod tests {
                             }],
                         );
                         on_ready(ModelBatch {
-                            provider: Some(DISCOVERY_PROVIDER),
+                            provider: Some(DISCOVERY_PROVIDER.into()),
                             models: vec![spec],
                             warnings: Vec::new(),
                         });

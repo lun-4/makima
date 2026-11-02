@@ -895,6 +895,7 @@ pub enum AgentEvent {
     /// reporting the one it started on.
     ModelSwitched {
         spec: String,
+        context_window: u32,
     },
     /// The sole terminal event for an accepted agent turn.
     TurnOutcome(TurnOutcome),

@@ -11,8 +11,8 @@ use futures_lite::future;
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_providers::Message;
 use maki_providers::model::Model;
-use maki_providers::provider::{self, BoxFuture, Provider};
-use maki_providers::{ConversationEnd, RequestOptions, Timeouts};
+use maki_providers::provider::BoxFuture;
+use maki_providers::{ConversationEnd, ProviderRegistry, RequestOptions, Timeouts};
 use maki_storage::id::{MakiId, SessionRef};
 use serde_json::Value;
 use tracing::warn;
@@ -25,6 +25,7 @@ use crate::agent::isolated_turn::IsolatedTurnEvent;
 use crate::agent::streaming::end_conversation_detached;
 use crate::agent::{self, History, PromptSlotSource, TurnSetup};
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
+use crate::config_change::{ConfigChangeError, invalid_model_spec};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
 use crate::session_coordinator::{ModelPreparer, SessionCoordinatorHandle};
@@ -102,6 +103,7 @@ pub struct InteractiveParams {
     pub append_system_prompt: Option<String>,
     pub defaults: SessionDefaults,
     pub model_policy: Arc<ModelPolicy>,
+    pub providers: Arc<ProviderRegistry>,
     pub modes: Arc<crate::ModeRegistry>,
     pub question_mode: crate::tools::QuestionMode,
     pub plugin_rules: Arc<PluginRuleStore>,
@@ -420,34 +422,25 @@ impl InteractiveHandle {
     }
 }
 
-pub type ProviderPreparation = Box<
-    dyn FnOnce(
-            Model,
-            Timeouts,
-        ) -> BoxFuture<'static, Result<(Model, Arc<dyn Provider>), crate::AgentError>>
-        + Send,
->;
+pub type ProviderPreparation =
+    Box<dyn FnOnce(Model) -> BoxFuture<'static, Result<PreparedModel, crate::AgentError>> + Send>;
 
-pub fn default_preparation() -> ProviderPreparation {
-    Box::new(|mut model, timeouts| {
-        Box::pin(async move {
-            let provider = provider::from_model_async(&mut model, timeouts).await?;
-            Ok((model, Arc::from(provider)))
-        })
-    })
+pub fn default_preparation(providers: Arc<ProviderRegistry>) -> ProviderPreparation {
+    Box::new(|model| Box::pin(async move { providers.prepare(model).await }))
 }
 
-/// Prepares the provider for a model a session coordinator commits.
-pub fn default_model_preparer(timeouts: Timeouts) -> ModelPreparer {
-    Arc::new(move |mut model| {
+/// Resolves and prepares the model a session coordinator commits.
+pub fn default_model_preparer(providers: Arc<ProviderRegistry>) -> ModelPreparer {
+    Arc::new(move |spec| {
+        let providers = Arc::clone(&providers);
         Box::pin(async move {
-            let provider = provider::from_model_async(&mut model, timeouts)
+            let model = providers
+                .model(&spec)
+                .map_err(|_| invalid_model_spec(&spec))?;
+            providers
+                .prepare(model)
                 .await
-                .map_err(|error| Arc::from(error.user_message()))?;
-            Ok(PreparedModel {
-                model,
-                provider: Arc::from(provider),
-            })
+                .map_err(|error| ConfigChangeError::ModelPreparation(error.user_message().into()))
         })
     })
 }
@@ -566,6 +559,7 @@ impl HeadlessBackend {
             )),
             live_sink: None,
             model_policy: Arc::clone(&self.params.model_policy),
+            providers: Arc::clone(&self.params.providers),
             file_write_locks: Arc::clone(&self.params.file_write_locks),
             offload: self.params.offload.clone(),
             pending_output_limits: None,
@@ -1014,7 +1008,7 @@ pub fn spawn_interactive_with_binding(
         async move {
             let _lifetime = lifetime;
             let initialized = async {
-                let (model, provider) = prepare(params.model.clone(), params.timeouts)
+                let PreparedModel { model, provider } = prepare(params.model.clone())
                     .await
                     .map_err(|error| error.user_message())?;
                 model_source.install(Arc::clone(&provider), model.clone());
@@ -1049,6 +1043,7 @@ pub fn spawn_interactive_with_binding(
                         audience: ToolAudience::MAIN,
                         question_mode: params.question_mode,
                         model_policy: params.model_policy,
+                        providers: params.providers,
                         file_write_locks: Arc::new(crate::tools::FileWriteLocks::new()),
                         offload,
                         managed_turn: None,
@@ -1163,6 +1158,7 @@ pub(crate) mod tests {
     use crate::session_coordinator::{SessionCoordinatorParams, builtin_option_definitions};
     use crate::tools::offload::{OffloadBackend, OffloadError};
     use crate::{ModeRegistry, TurnOutcome};
+    use maki_providers::provider::Provider;
     use maki_providers::{ContentBlock, Invocation, Role, StopReason, StreamResponse, TokenUsage};
     use maki_storage::checkpoint::{
         CheckpointAck, CheckpointError, CheckpointFuture, CheckpointRequest, CheckpointWriter,
@@ -1279,8 +1275,8 @@ pub(crate) mod tests {
     ) -> InteractiveHandle {
         let handle = spawn_interactive_with_binding(
             params,
-            Box::new(move |model, _| {
-                Box::pin(async move { provider.map(|provider| (model, provider)) })
+            Box::new(move |model| {
+                Box::pin(async move { provider.map(|provider| PreparedModel { model, provider }) })
             }),
             None,
             None,
@@ -1292,6 +1288,7 @@ pub(crate) mod tests {
     fn interactive_params(session_id: MakiId, history: Vec<Message>) -> InteractiveParams {
         InteractiveParams {
             model: Model::from_spec(TEST_MODEL).unwrap(),
+            providers: Arc::default(),
             config: AgentConfig::default(),
             permissions_config: PermissionsConfig::default(),
             timeouts: Timeouts::default(),
@@ -1326,7 +1323,7 @@ pub(crate) mod tests {
         let binding = coordinator_binding(coordinator, Arc::clone(&provider));
         spawn_interactive_with_binding(
             params,
-            Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) })),
+            Box::new(move |model| Box::pin(async move { Ok(PreparedModel { model, provider }) })),
             None,
             Some(binding),
         )
@@ -1341,8 +1338,9 @@ pub(crate) mod tests {
                 coordinator
                     .bind_actor(
                         root,
-                        Arc::new(move |model| {
+                        Arc::new(move |spec| {
                             let provider = Arc::clone(&provider);
+                            let model = Model::from_spec(&spec).unwrap();
                             Box::pin(async move { Ok(PreparedModel { provider, model }) })
                         }),
                         Arc::new(|_| {}),
@@ -1386,7 +1384,7 @@ pub(crate) mod tests {
         let binding = coordinator_binding(coordinator.clone(), Arc::clone(&provider));
         let handle = spawn_interactive_with_binding(
             interactive_params(session_id, history),
-            Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) })),
+            Box::new(move |model| Box::pin(async move { Ok(PreparedModel { model, provider }) })),
             None,
             Some(binding),
         );
@@ -1489,7 +1487,9 @@ pub(crate) mod tests {
             }
             let handle = spawn_interactive_with_binding(
                 params,
-                Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) })),
+                Box::new(move |model| {
+                    Box::pin(async move { Ok(PreparedModel { model, provider }) })
+                }),
                 None,
                 Some(binding),
             );
@@ -1836,7 +1836,9 @@ pub(crate) mod tests {
             params.config.max_concurrent_agent_turns = 1;
             let handle = spawn_interactive_with_binding(
                 params,
-                Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) })),
+                Box::new(move |model| {
+                    Box::pin(async move { Ok(PreparedModel { model, provider }) })
+                }),
                 None,
                 Some(Box::new(move |manager, root, template| {
                     Box::pin(async move {

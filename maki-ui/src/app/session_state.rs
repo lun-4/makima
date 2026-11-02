@@ -6,7 +6,7 @@ use maki_agent::{AgentMode, ModeRegistry, RunSettings, SessionDefaults};
 use maki_agent::{modes, session_defaults};
 use maki_config::{Effect, ModelPolicy};
 use maki_providers::provider::{Provider, adjust_model};
-use maki_providers::{Model, Timeouts, TokenUsage, settle_session};
+use maki_providers::{Model, ProviderRegistry, Timeouts, TokenUsage, settle_session};
 use maki_storage::StateDir;
 use maki_storage::sessions::{StoredEffect, StoredMode, StoredRule, read_prefs};
 
@@ -69,8 +69,9 @@ impl SessionState {
         mut session: AppSession,
         fallback_model: &Model,
         model_policy: &ModelPolicy,
+        providers: &ProviderRegistry,
     ) -> Self {
-        let model = resumed_model(&mut session, fallback_model, model_policy);
+        let model = resumed_model(&mut session, fallback_model, model_policy, providers);
 
         let mut warnings = Vec::new();
 
@@ -186,6 +187,7 @@ fn resumed_model(
     session: &mut AppSession,
     fallback_model: &Model,
     model_policy: &ModelPolicy,
+    providers: &ProviderRegistry,
 ) -> Model {
     // A caller that resolved the session's own model hands in a value that
     // has already been through the provider (and its `adjust_model`), so it
@@ -196,7 +198,7 @@ fn resumed_model(
     } else {
         match model_policy
             .allows(&session.model)
-            .then(|| Model::from_spec(&session.model))
+            .then(|| providers.model(&session.model))
             .transpose()
             .ok()
             .flatten()
@@ -308,7 +310,12 @@ mod tests {
     const UNRESOLVABLE_MODEL: &str = "a-model-no-table-has-ever-heard-of";
 
     fn resumed(session: AppSession, model: &Model) -> SessionState {
-        SessionState::from_session(session, model, &ModelPolicy::default())
+        SessionState::from_session(
+            session,
+            model,
+            &ModelPolicy::default(),
+            &ProviderRegistry::default(),
+        )
     }
 
     /// An old session: counters, no per-model breakdown.
@@ -375,7 +382,12 @@ mod tests {
         });
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
-        let state = SessionState::from_session(session, &model, &ModelPolicy::default());
+        let state = SessionState::from_session(
+            session,
+            &model,
+            &ModelPolicy::default(),
+            &ProviderRegistry::default(),
+        );
         assert_eq!(state.fast_pending, pending);
         assert_eq!(
             state.cost,
@@ -424,7 +436,12 @@ mod tests {
     /// then let the app adopt it.
     fn restore(session: AppSession, storage: &StateDir) -> (SessionState, EffectiveAgentConfig) {
         let model = test_model();
-        let mut state = SessionState::from_session(session, &model, &ModelPolicy::default());
+        let mut state = SessionState::from_session(
+            session,
+            &model,
+            &ModelPolicy::default(),
+            &ProviderRegistry::default(),
+        );
         let config = state.starting_config(
             maki_agent::tools::cli_tool_ctx(std::env::temp_dir()).provider,
             &model,
@@ -499,7 +516,12 @@ mod tests {
         .unwrap();
         let policy = raw.into_config().unwrap().provider.model_policy;
 
-        let model = resumed_model(&mut session, &fallback, &policy);
+        let model = resumed_model(
+            &mut session,
+            &fallback,
+            &policy,
+            &ProviderRegistry::default(),
+        );
 
         assert_eq!(model.spec(), fallback.spec());
         assert_eq!(session.model, fallback.spec());
@@ -519,7 +541,12 @@ mod tests {
         // SAFETY: this test runs single-threaded; no other thread reads the env.
         unsafe { std::env::set_var("APERTURE_HOST", "https://example.com") };
         let mut session = AppSession::new("aperture/zai/glm-5.2", "/tmp");
-        let model = resumed_model(&mut session, &test_model(), &ModelPolicy::default());
+        let model = resumed_model(
+            &mut session,
+            &test_model(),
+            &ModelPolicy::default(),
+            &ProviderRegistry::default(),
+        );
         assert!(
             model.supports_thinking(),
             "resumed aperture/zai/glm-5.2 should inherit thinking support from adjust_model",

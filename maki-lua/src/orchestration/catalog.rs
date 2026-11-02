@@ -6,7 +6,8 @@ use arc_swap::ArcSwapOption;
 use maki_agent::actor::ConfigChange;
 use maki_agent::session_coordinator::{SessionCoordinatorHandle, publication_claim};
 use maki_config::ModelPolicy;
-use maki_providers::provider::{ModelBatch, available_model_specs, fetch_all_models};
+use maki_providers::ProviderRegistry;
+use maki_providers::provider::ModelBatch;
 use tracing::warn;
 
 use super::{AgentOrchestration, commit_config_change};
@@ -23,6 +24,7 @@ pub const ACTIVE_DISCOVERY_BOUND: Duration = Duration::from_secs(3);
 pub struct ModelCatalog {
     specs: Arc<ArcSwapOption<Vec<String>>>,
     attached: Arc<Mutex<Vec<Weak<AgentOrchestration>>>>,
+    providers: Arc<ProviderRegistry>,
 }
 
 /// A running discovery; dropping it stops discovery.
@@ -57,11 +59,14 @@ impl Discovery {
 
 impl ModelCatalog {
     /// Seeded with the specs known without a network round trip.
-    pub fn offline(policy: &ModelPolicy) -> Self {
-        let catalog = Self::default();
+    pub fn offline(providers: Arc<ProviderRegistry>, policy: &ModelPolicy) -> Self {
+        let catalog = Self {
+            providers,
+            ..Self::default()
+        };
         catalog
             .specs
-            .store(Some(Arc::new(available_model_specs(policy))));
+            .store(Some(Arc::new(catalog.providers.offline_specs(policy))));
         catalog
     }
 
@@ -91,8 +96,9 @@ impl ModelCatalog {
         active: String,
         applied: impl FnMut(Vec<String>) + Send + 'static,
     ) -> Discovery {
+        let providers = Arc::clone(&self.providers);
         self.discover_from(
-            async move |on_ready| fetch_all_models(&policy, on_ready).await,
+            async move |on_ready| providers.fetch_all(&policy, on_ready).await,
             active,
             applied,
         )
@@ -116,7 +122,7 @@ impl ModelCatalog {
         let task = smol::spawn(async move {
             let (landed, refreshes) = flume::unbounded();
             let fetch = fetch(Box::new(move |batch| {
-                let active = batch.provider == Some(active.as_str());
+                let active = batch.provider.as_deref() == Some(active.as_str());
                 let _ = landed.send((catalog.apply(batch.models), active));
                 applied(batch.warnings);
             }));

@@ -28,7 +28,7 @@ use maki_agent::{
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
-use maki_providers::{AgentError, Message, Model};
+use maki_providers::{AgentError, Message, Model, ProviderRegistry};
 use maki_storage::id::SessionRef;
 use tracing::{info, warn};
 
@@ -53,6 +53,7 @@ pub(crate) struct TuiActorBackend {
     lua_handle: EventHandle,
     subagent_cancels: Arc<CancelMap<String>>,
     model_policy: Arc<ModelPolicy>,
+    providers: Arc<ProviderRegistry>,
     system_prompt: SystemPromptOverride,
     file_write_locks: Arc<maki_agent::tools::FileWriteLocks>,
     offload: Option<Arc<OffloadStore>>,
@@ -85,6 +86,7 @@ pub(super) fn new_backend(
     lua_handle: EventHandle,
     subagent_cancels: Arc<CancelMap<String>>,
     model_policy: Arc<ModelPolicy>,
+    providers: Arc<ProviderRegistry>,
     system_prompt: SystemPromptOverride,
     file_write_locks: Arc<maki_agent::tools::FileWriteLocks>,
     offload: Option<Arc<OffloadStore>>,
@@ -109,6 +111,7 @@ pub(super) fn new_backend(
         lua_handle,
         subagent_cancels,
         model_policy,
+        providers,
         system_prompt,
         file_write_locks,
         offload,
@@ -146,6 +149,7 @@ impl TuiActorBackend {
                 audience: ToolAudience::MAIN,
                 question_mode: QuestionMode::Tui,
                 model_policy: Arc::clone(&self.model_policy),
+                providers: Arc::clone(&self.providers),
                 file_write_locks: Arc::clone(&self.file_write_locks),
                 offload: self.offload.clone(),
                 managed_turn: None,
@@ -369,6 +373,7 @@ impl TuiActorBackend {
                 audience: ToolAudience::MAIN,
                 question_mode: QuestionMode::Tui,
                 model_policy: Arc::clone(&self.model_policy),
+                providers: Arc::clone(&self.providers),
                 file_write_locks: Arc::clone(&self.file_write_locks),
                 offload: self.offload.clone(),
                 managed_turn: context.managed_turn.clone(),
@@ -481,6 +486,7 @@ impl ActorBackend for TuiActorBackend {
                 EventSender::with_identity(self.agent_tx.clone(), Some(work_identity)).try_send(
                     AgentEvent::ModelSwitched {
                         spec: policy.settings.model.spec(),
+                        context_window: policy.settings.model.context_window,
                     },
                 );
             }
@@ -570,9 +576,10 @@ impl ActorBackend for TuiActorBackend {
             let (provider, model) = maki_agent::agent::resolve_compaction_model(
                 &base_provider,
                 &base_model,
-                self.timeouts,
+                &self.providers,
                 &self.model_policy,
-            );
+            )
+            .await;
             let previous = history.snapshot().clone();
             let mut result = maki_agent::agent::compact(
                 &provider,
@@ -2576,6 +2583,7 @@ mod tests {
             EventHandle::disconnected_for_test(),
             Arc::new(CancelMap::new()),
             Arc::new(ModelPolicy::default()),
+            Arc::default(),
             SystemPromptOverride::default(),
             Arc::new(maki_agent::tools::FileWriteLocks::new()),
             None,
@@ -2735,6 +2743,7 @@ mod tests {
             EventHandle::disconnected_for_test(),
             Arc::new(CancelMap::new()),
             Arc::new(ModelPolicy::default()),
+            Arc::default(),
             SystemPromptOverride::default(),
             Arc::new(maki_agent::tools::FileWriteLocks::new()),
             None,

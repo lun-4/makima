@@ -1,5 +1,6 @@
 mod agent_loop;
 mod command_router;
+pub(crate) mod pending;
 pub(crate) mod shared_queue;
 
 use std::path::PathBuf;
@@ -19,7 +20,7 @@ use maki_lua::EventHandle;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
     AgentError, ConversationEnd, Invocation, Message, Model, ModelInfo, ProviderEvent,
-    ProviderUsage, RequestOptions, StreamResponse,
+    ProviderRegistry, ProviderUsage, RequestOptions, StreamResponse,
 };
 use maki_storage::id::SessionRef;
 use tracing::{info, warn};
@@ -335,6 +336,7 @@ impl AgentHandles {
         lua_handle: EventHandle,
         mcp_handle: Option<McpHandle>,
         model_policy: Arc<ModelPolicy>,
+        providers: Arc<ProviderRegistry>,
         system_prompt: SystemPromptOverride,
     ) -> Self {
         let selected = model_slot.load();
@@ -363,6 +365,7 @@ impl AgentHandles {
             lua_handle,
             mcp_handle,
             model_policy,
+            providers,
             system_prompt,
         )
         .activate();
@@ -385,6 +388,7 @@ impl AgentHandles {
         lua_handle: EventHandle,
         mcp_handle: Option<McpHandle>,
         model_policy: Arc<ModelPolicy>,
+        providers: Arc<ProviderRegistry>,
         system_prompt: SystemPromptOverride,
     ) -> PreparedAgentHandles {
         spawn_agent_internal(
@@ -401,6 +405,7 @@ impl AgentHandles {
             timeouts,
             lua_handle,
             model_policy,
+            providers,
             system_prompt,
         )
     }
@@ -525,6 +530,7 @@ fn spawn_agent_internal(
     timeouts: maki_providers::Timeouts,
     lua_handle: EventHandle,
     model_policy: Arc<ModelPolicy>,
+    providers: Arc<ProviderRegistry>,
     system_prompt: SystemPromptOverride,
 ) -> PreparedAgentHandles {
     let (agent_tx, agent_rx) = flume::unbounded::<Envelope>();
@@ -582,6 +588,7 @@ fn spawn_agent_internal(
                     lua_handle,
                     Arc::clone(&subagent_cancels),
                     Arc::clone(&model_policy),
+                    Arc::clone(&providers),
                     system_prompt.clone(),
                     Arc::new(maki_agent::tools::FileWriteLocks::new()),
                     offload.clone(),
@@ -737,6 +744,7 @@ mod tests {
             EventHandle::disconnected_for_test(),
             None,
             Arc::new(ModelPolicy::default()),
+            Arc::default(),
             SystemPromptOverride::default(),
         )
     }

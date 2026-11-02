@@ -15,6 +15,7 @@ use maki_config::{Config, ModelPolicy, ProjectConfig, load_env_files, load_permi
 use maki_lua::PluginHost;
 use maki_lua::ui_sink::{HeadlessUi, HostUi};
 use maki_providers::model::Model;
+use maki_providers::{ProviderRegistry, Timeouts};
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
 use maki_storage::session_lock;
@@ -43,13 +44,14 @@ struct Stack {
     plugin_host: PluginHost,
     config: Config,
     commands: Vec<CustomCommand>,
+    providers: Arc<ProviderRegistry>,
     model: Model,
     needs_login: bool,
 }
 
 impl Stack {
-    fn timeouts(&self) -> maki_providers::Timeouts {
-        maki_providers::Timeouts::from(&self.config.provider)
+    fn timeouts(&self) -> Timeouts {
+        Timeouts::from(&self.config.provider)
     }
 }
 
@@ -188,7 +190,11 @@ fn build_stack(
 
     let commands = discover_commands(cli.no_commands, cwd, &trust.project_config);
 
-    let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, storage);
+    let providers = plugin_host
+        .provider_registry(Timeouts::from(&config.provider))
+        .context("build provider registry")?;
+    let model_result =
+        setup::resolve_model(&providers, cli.model.as_deref(), &config.provider, storage);
     let (model, needs_login) = match (model_result, fallback_model) {
         (Ok(m), _) => (m, false),
         (Err(e), Some(last_model)) => {
@@ -196,7 +202,9 @@ fn build_stack(
             (last_model, false)
         }
         (Err(_), None) if !cli.print => {
-            let placeholder = Model::from_spec(FALLBACK_MODEL_SPEC).expect("fallback model");
+            let placeholder = providers
+                .model(FALLBACK_MODEL_SPEC)
+                .expect("fallback model");
             (placeholder, true)
         }
         (Err(e), None) => return Err(e),
@@ -207,6 +215,7 @@ fn build_stack(
             plugin_host,
             config,
             commands,
+            providers,
             model,
             needs_login,
         },
@@ -215,6 +224,7 @@ fn build_stack(
 }
 
 fn restored_session_model(
+    providers: &ProviderRegistry,
     startup: &Model,
     session: &AppSession,
     explicit_model: bool,
@@ -223,7 +233,9 @@ fn restored_session_model(
     if explicit_model || !model_policy.allows(&session.model) {
         return startup.clone();
     }
-    Model::from_spec(&session.model).unwrap_or_else(|_| startup.clone())
+    providers
+        .model(&session.model)
+        .unwrap_or_else(|_| startup.clone())
 }
 
 fn resolve_session(
@@ -374,6 +386,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
             prompt_slots: stack.plugin_host.event_handle().prompt_slot_source(),
             defaults: stack.config.session_defaults,
             model_policy: Arc::new(stack.config.provider.model_policy.clone()),
+            providers: stack.providers,
             plugin_rules: stack.plugin_host.plugin_rules(),
             project_config: trust.project_config.clone(),
             commands: stack.commands,
@@ -401,6 +414,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
             stack.plugin_host.event_handle(),
             stack.config.session_defaults,
             Arc::new(stack.config.provider.model_policy.clone()),
+            stack.providers,
             cli.system_prompt,
             cli.append_system_prompt,
             stack.plugin_host.plugin_rules(),
@@ -428,6 +442,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
     loop {
         let focused_tab = &tabs[focused];
         let model = restored_session_model(
+            &stack.providers,
             &stack.model,
             focused_tab,
             apply_explicit_model,
@@ -464,6 +479,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
                 ui_action_rx: stack.plugin_host.ui_action_rx(),
                 lua_event_handle: stack.plugin_host.event_handle(),
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),
+                providers: Arc::clone(&stack.providers),
                 session_defaults: stack.config.session_defaults,
                 system_prompt_override: cli.system_prompt.clone(),
                 append_system_prompt: cli.append_system_prompt.clone(),
@@ -631,8 +647,13 @@ mod tests {
         let startup = Model::from_spec("openai/gpt-5").unwrap();
         let session = AppSession::new("anthropic/claude-opus-4-6", "/tmp");
 
-        let resolved =
-            restored_session_model(&startup, &session, explicit_model, &ModelPolicy::default());
+        let resolved = restored_session_model(
+            &ProviderRegistry::default(),
+            &startup,
+            &session,
+            explicit_model,
+            &ModelPolicy::default(),
+        );
 
         assert_eq!(resolved.spec(), expected);
     }

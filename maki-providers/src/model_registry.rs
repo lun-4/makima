@@ -43,6 +43,11 @@ pub fn spec_for_tier(provider: &str, tier: ModelTier) -> Option<String> {
     read().spec_for_tier(provider, tier)
 }
 
+/// The spec the user assigned to `tier`, whatever its provider.
+pub fn tier_override(tier: ModelTier) -> Option<String> {
+    read().overrides.get(&tier).cloned()
+}
+
 pub fn spec_for_tier_any(tier: ModelTier) -> Option<String> {
     read().spec_for_tier_any(tier)
 }

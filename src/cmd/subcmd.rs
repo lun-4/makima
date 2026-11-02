@@ -17,7 +17,6 @@ use maki_config::providers::{
 use maki_config::{Config, load_env_files, load_permissions};
 use maki_lua::PluginHost;
 use maki_lua::ui_sink::{HeadlessUi, HostUi};
-use maki_providers::provider::fetch_all_models;
 use maki_providers::{ProviderData, catalog_providers};
 use maki_providers::{copilot_auth, dynamic, openai_auth};
 use maki_storage::StateDir;
@@ -571,7 +570,10 @@ pub fn models(
         }
     }
 
-    smol::block_on(fetch_all_models(&config.provider.model_policy, |batch| {
+    let providers = host
+        .provider_registry(maki_providers::Timeouts::from(&config.provider))
+        .context("build provider registry")?;
+    smol::block_on(providers.fetch_all(&config.provider.model_policy, |batch| {
         for model in batch.models {
             println!("{model}");
         }

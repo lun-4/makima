@@ -27,7 +27,7 @@ use maki_agent::actor::{
 };
 use maki_agent::agent::{PromptSlotSource, TurnSetup, build_mode_system_prompt, tool_dispatch};
 use maki_agent::cancel::CancelMap;
-use maki_agent::config_change::prepare_model;
+use maki_agent::config_change::{ConfigChangeError, invalid_model_spec, prepare_model};
 use maki_agent::headless::default_model_preparer;
 use maki_agent::session_coordinator::ModelPreparer;
 use maki_agent::template::env_vars_for;
@@ -106,14 +106,20 @@ async fn build_session_provider(
             Arc::clone(&agent_ctx.provider),
         ));
     };
+    let providers = Arc::clone(&agent_ctx.providers);
     let preparer: ModelPreparer = match prepare {
-        Some(prepare) => Arc::new(move |model| {
-            let prepared = prepare(model)
-                .map(|(model, provider)| PreparedModel { model, provider })
-                .map_err(Arc::from);
+        Some(prepare) => Arc::new(move |spec| {
+            let prepared = providers
+                .model(&spec)
+                .map_err(|_| invalid_model_spec(&spec))
+                .and_then(|model| {
+                    prepare(model)
+                        .map(|(model, provider)| PreparedModel { model, provider })
+                        .map_err(|error| ConfigChangeError::ModelPreparation(error.into()))
+                });
             Box::pin(async move { prepared })
         }),
-        None => default_model_preparer(agent_ctx.timeouts),
+        None => default_model_preparer(providers),
     };
     let prepared = prepare_model(spec, &agent_ctx.model_policy, &preparer)
         .await
@@ -533,9 +539,10 @@ impl ActorBackend for LuaActorBackend {
             let (provider, model) = maki_agent::agent::resolve_compaction_model(
                 &settings.provider,
                 &settings.model,
-                params.timeouts,
+                &params.providers,
                 &params.model_policy,
-            );
+            )
+            .await;
             match maki_agent::agent::compact(
                 &provider,
                 &settings.provider,
@@ -575,15 +582,24 @@ fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Mode
         return Ok(Model::clone(&ctx.model));
     }
     let slug = &ctx.model.provider;
-    maki_providers::model_registry::spec_for_tier(slug, effective)
-        .or_else(|| maki_providers::model_registry::spec_for_tier_any(effective))
+    ctx.providers
+        .spec_for_tier(slug, effective)
+        .or_else(|| ctx.providers.spec_for_tier_any(effective))
         .filter(|spec| ctx.model_policy.allows(spec))
-        .and_then(|s| Model::from_spec(&s).ok())
+        .and_then(|s| ctx.providers.model(&s).ok())
         .map(Ok)
         .unwrap_or_else(|| {
-            Model::from_tier_with_policy(slug, effective, &ctx.model_policy)
+            ctx.providers
+                .model_for_tier(slug, effective, &ctx.model_policy)
                 .map_err(|e| e.to_string())
         })
+}
+
+fn allowed_model(ctx: &AgentContext, spec: &str) -> Result<Model, ModelError> {
+    if !ctx.model_policy.allows(spec) {
+        return Err(ModelError::NotAllowed(spec.to_string()));
+    }
+    ctx.providers.model(spec)
 }
 
 fn dispatch_ctx<'a>(lua: &Lua, ctx: &'a LuaCtx, method: &str) -> Result<&'a AgentContext, String> {
@@ -665,7 +681,7 @@ async fn resolve_model(
         .and_then(|t| t.get::<Option<String>>("spec").ok().flatten());
 
     let model = match spec_str {
-        Some(ref spec) => try_pair!(Model::from_spec_with_policy(spec, &agent.model_policy)),
+        Some(ref spec) => try_pair!(allowed_model(agent, spec)),
         None => try_pair!(resolve_model_from_ctx(agent, tier_str.as_deref())),
     };
     Ok((Some(crate::api::model::model_table(&lua, &model)?), None))
@@ -764,7 +780,7 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
 
     let parsed = spec_str
         .as_deref()
-        .and_then(|spec| Model::from_spec_with_policy(spec, &agent.model_policy).ok());
+        .and_then(|spec| allowed_model(agent, spec).ok());
     let model = parsed.as_ref().unwrap_or(&agent.model);
 
     let base = match (only, except) {
@@ -1567,6 +1583,7 @@ fn agent_params(
         audience: options.audience,
         question_mode: context.question_mode,
         model_policy: Arc::clone(&context.model_policy),
+        providers: Arc::clone(&context.providers),
         file_write_locks: Arc::clone(&context.file_write_locks),
         offload: context.offload.clone(),
         managed_turn: None,
@@ -2471,6 +2488,7 @@ mod tests {
             audience: ToolAudience::GENERAL_SUB,
             question_mode: ctx.question_mode,
             model_policy: Arc::clone(&ctx.model_policy),
+            providers: Arc::clone(&ctx.providers),
             file_write_locks: Arc::clone(&ctx.file_write_locks),
             offload: ctx.offload.clone(),
             managed_turn: None,

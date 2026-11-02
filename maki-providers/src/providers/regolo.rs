@@ -276,6 +276,7 @@ fn join_model_info(ids: Vec<String>, groups: Vec<ModelGroup>) -> Vec<crate::mode
                 id,
                 tier: None,
                 provider_info: None,
+                ..Default::default()
             })
         })
         .collect()

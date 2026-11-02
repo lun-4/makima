@@ -46,7 +46,7 @@ use crate::{
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_providers::RequestOptions;
 use maki_providers::provider::Provider;
-use maki_providers::{Invocation, Model};
+use maki_providers::{Invocation, Model, ProviderRegistry};
 use maki_storage::id::SessionRef;
 
 pub struct DescriptionContext<'a> {
@@ -495,6 +495,7 @@ pub struct ToolContext {
     /// it for its own call only.
     pub live_sink: Option<flume::Sender<ToolLive>>,
     pub model_policy: Arc<ModelPolicy>,
+    pub providers: Arc<ProviderRegistry>,
     /// Shared same-process per-path mutation locks for every context cloned
     /// from this one (batch siblings, subagents, recursive `call_tool`). See
     /// [`FileWriteLocks`].
@@ -901,6 +902,7 @@ pub fn interpreter_ctx(
         local_tool_capture: None,
         live_sink: None,
         model_policy: Arc::new(ModelPolicy::default()),
+        providers: Arc::default(),
         file_write_locks: Arc::new(FileWriteLocks::new()),
         offload: None,
         pending_output_limits: None,

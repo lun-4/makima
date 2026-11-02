@@ -5,7 +5,6 @@ use std::path::Path;
 use std::sync::{Arc, MutexGuard};
 
 use maki_config::ModelPolicy;
-use maki_providers::Model;
 use maki_storage::StateDir;
 use maki_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
 use thiserror::Error;
@@ -310,13 +309,16 @@ pub async fn prepare_model(
     if !policy.allows(spec) {
         return Err(SessionOptionError::PolicyRejected(spec.into()).into());
     }
-    let model = Model::from_spec(spec).map_err(|_| SessionOptionError::InvalidValue {
+    prepare(Arc::from(spec)).await
+}
+
+/// The error a preparer reports for a spec that names no model.
+pub fn invalid_model_spec(spec: &str) -> ConfigChangeError {
+    SessionOptionError::InvalidValue {
         id: MODEL_OPTION_ID.into(),
         value: spec.into(),
-    })?;
-    prepare(model)
-        .await
-        .map_err(ConfigChangeError::ModelPreparation)
+    }
+    .into()
 }
 
 /// Fills {patch}'s model from {spec}, when one is given.

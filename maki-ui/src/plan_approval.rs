@@ -1,13 +1,7 @@
 use std::fmt::Display;
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use maki_agent::actor::PreparedModel;
 use maki_agent::manager::ManagerError;
-use maki_providers::{Model, Timeouts};
-
-pub(crate) type PrepareProvider =
-    Arc<dyn Fn(Model, Timeouts) -> Result<PreparedModel, Arc<str>> + Send + Sync>;
 
 pub(crate) const APPROVAL_BUSY: &str =
     "Planning work is still running or queued. Retry approval when it finishes.";

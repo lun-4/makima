@@ -220,8 +220,9 @@ fn gated_config_mutations(
             *committed.lock().unwrap() = Some(Arc::clone(&config));
             handle.bind_actor(
                 target.clone(),
-                Arc::new(move |model| {
+                Arc::new(move |spec| {
                     let provider = Arc::clone(&provider);
+                    let model = Model::from_spec(&spec).unwrap();
                     Box::pin(
                         async move { Ok(maki_agent::actor::PreparedModel { model, provider }) },
                     )

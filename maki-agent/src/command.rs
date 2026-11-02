@@ -16,7 +16,7 @@ use maki_commands::{
 };
 use maki_config::ProjectConfig;
 use maki_match::{MatchCandidate, Resolution, fuzzy_resolve, fuzzy_resolve_candidates};
-use maki_providers::{ImageMediaType, ImageSource, Model};
+use maki_providers::{ImageMediaType, ImageSource, Model, ProviderRegistry};
 
 use crate::headless::{InteractiveControl, InteractiveControlSender};
 use crate::session_coordinator::SessionCoordinatorHandle;
@@ -93,6 +93,7 @@ pub fn session_capabilities() -> TargetCapabilities {
 pub struct SessionCommandHost {
     control_tx: InteractiveControlSender,
     coordinator: SessionCoordinatorHandle,
+    providers: Arc<ProviderRegistry>,
     reset_session_guidance: Option<Arc<str>>,
     admission: Option<Arc<dyn Any + Send + Sync>>,
 }
@@ -101,10 +102,12 @@ impl SessionCommandHost {
     pub fn new(
         control_tx: InteractiveControlSender,
         coordinator: SessionCoordinatorHandle,
+        providers: Arc<ProviderRegistry>,
     ) -> Self {
         Self {
             control_tx,
             coordinator,
+            providers,
             reset_session_guidance: None,
             admission: None,
         }
@@ -187,7 +190,8 @@ impl maki_commands::CommandHost for SessionCommandHost {
                     }
                     HostContextRequest::FastModeSupported => {
                         HostContextResponse::FastModeSupported(read.model().is_some_and(|spec| {
-                            Model::from_spec(&spec)
+                            self.providers
+                                .model(&spec)
                                 .is_ok_and(|model| model.supports_fast() || model.fast_pending())
                         }))
                     }
@@ -394,7 +398,7 @@ fn parsed_directory_argument(
 
 fn resolve_model(argument: &str, specs: &[Arc<str>]) -> Result<Arc<str>, CommandError> {
     if argument.contains('/') {
-        Model::from_spec(argument)
+        Model::parse_spec(argument)
             .map_err(|error| CommandError::Producer(Arc::from(error.to_string())))?;
         return Ok(Arc::from(argument));
     }
@@ -1236,7 +1240,11 @@ mod tests {
             FAST_MODEL,
             [Arc::from(FAST_MODEL), Arc::from(OFFLINE_MODEL)],
         );
-        let host = SessionCommandHost::new(handle.control_tx.clone(), coordinator.clone());
+        let host = SessionCommandHost::new(
+            handle.control_tx.clone(),
+            coordinator.clone(),
+            Arc::default(),
+        );
         let request = |operation| HostRequest::Builtin(operation);
         assert!(matches!(
             smol::block_on(host.request(request(maki_commands::BuiltinOperation::ToggleYolo))),
@@ -1343,6 +1351,7 @@ mod tests {
         let host = Arc::new(SessionCommandHost::new(
             handle.control_tx.clone(),
             coordinator.clone(),
+            Arc::default(),
         ));
         let target = registry.bind_target(portable_capabilities(), host);
 

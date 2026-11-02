@@ -9,7 +9,7 @@ use tracing::{error, info, warn};
 use maki_providers::provider::Provider;
 use maki_providers::{
     ContentBlock, ConversationEnd, IMAGE_PLACEHOLDER, InvocationPurpose, Message, Model,
-    RequestOptions, Role, StopReason, StreamResponse, ThinkingConfig, TokenUsage,
+    ProviderRegistry, RequestOptions, Role, StopReason, StreamResponse, ThinkingConfig, TokenUsage,
 };
 
 use super::compaction;
@@ -59,19 +59,18 @@ const CANCELLED_TEXT_NOTE: &str = "[Response cut off by user cancel]";
 const INTERRUPT_NOTE: &str =
     "The user sent a new message while you were working. Address it and continue.";
 
-pub fn resolve_compaction_model(
+pub async fn resolve_compaction_model(
     provider: &Arc<dyn Provider>,
     model: &Model,
-    timeouts: maki_providers::Timeouts,
+    providers: &ProviderRegistry,
     model_policy: &ModelPolicy,
 ) -> (Arc<dyn Provider>, Model) {
-    if let Some(spec) =
-        maki_providers::model_registry::spec_for_tier_any(maki_providers::ModelTier::Compaction)
+    if let Some(spec) = providers.spec_for_tier_any(maki_providers::ModelTier::Compaction)
         && model_policy.allows(&spec)
-        && let Ok(mut m) = Model::from_spec(&spec)
-        && let Ok(p) = maki_providers::provider::from_model(&mut m, timeouts)
+        && let Ok(model) = providers.model(&spec)
+        && let Ok(prepared) = providers.prepare(model).await
     {
-        return (Arc::from(p), m);
+        return (prepared.provider, prepared.model);
     }
     (Arc::clone(provider), model.clone())
 }
@@ -180,6 +179,7 @@ pub struct AgentParams {
     pub audience: ToolAudience,
     pub question_mode: crate::tools::QuestionMode,
     pub model_policy: Arc<ModelPolicy>,
+    pub providers: Arc<ProviderRegistry>,
     /// Same-process per-path mutation locks, cloned from the parent context
     /// for subagents so concurrent same-path mutations stay serialized.
     pub file_write_locks: Arc<crate::tools::FileWriteLocks>,
@@ -241,6 +241,7 @@ pub struct Agent<'h> {
     local_tool_capture: Option<Arc<Mutex<Option<Value>>>>,
     turn_bindings: Arc<TurnToolBindings>,
     model_policy: Arc<ModelPolicy>,
+    providers: Arc<ProviderRegistry>,
     file_write_locks: Arc<crate::tools::FileWriteLocks>,
     offload: Option<Arc<OffloadStore>>,
     managed_turn: Option<crate::CurrentManagedTurn>,
@@ -332,6 +333,7 @@ impl<'h> Agent<'h> {
             local_tool_capture: None,
             turn_bindings: Arc::new(TurnToolBindings::default()),
             model_policy: params.model_policy,
+            providers: params.providers,
             file_write_locks: params.file_write_locks,
             offload: params.offload,
             managed_turn: params.managed_turn,
@@ -960,6 +962,7 @@ impl<'h> Agent<'h> {
             turn_bindings: Arc::clone(&self.turn_bindings),
             live_sink: None,
             model_policy: Arc::clone(&self.model_policy),
+            providers: Arc::clone(&self.providers),
             file_write_locks: Arc::clone(&self.file_write_locks),
             offload: self.offload.clone(),
             pending_output_limits: None,
@@ -995,9 +998,10 @@ impl<'h> Agent<'h> {
         let (compact_provider, compact_model) = resolve_compaction_model(
             &self.provider,
             &self.model,
-            self.timeouts,
+            &self.providers,
             &self.model_policy,
-        );
+        )
+        .await;
         let compaction_usage = compaction::compact_history(
             &compact_provider,
             &self.provider,
@@ -2308,6 +2312,7 @@ mod tests {
             audience: ToolAudience::MAIN,
             question_mode: crate::tools::QuestionMode::Tui,
             model_policy: Arc::new(ModelPolicy::default()),
+            providers: Arc::default(),
             file_write_locks: Arc::new(crate::tools::FileWriteLocks::new()),
             offload: None,
             managed_turn: None,

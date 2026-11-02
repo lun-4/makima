@@ -83,7 +83,7 @@ use maki_lua::{
     BuiltinAction, CompletionCtx, EventHandle, FloatConfig, HintReader, HintSnapshot, ItemSpec,
     KeymapReader, Split, StatusContentReader, StatusContentSnapshot, WinCommand, WinEvent, WinView,
 };
-use maki_providers::{ContentBlock, Message, Model, add_cost, format_tokens};
+use maki_providers::{ContentBlock, Message, Model, ProviderRegistry, add_cost, format_tokens};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
@@ -543,10 +543,12 @@ impl App {
         permissions: Arc<PermissionManager>,
         lua_event_handle: EventHandle,
         model_policy: Arc<ModelPolicy>,
+        providers: Arc<ProviderRegistry>,
         theme_provider: Arc<dyn ThemesProvider>,
         command_runtime: Arc<CommandRuntime>,
     ) -> PreparedApp {
-        let mut state = SessionState::from_session(session, &config.model, &model_policy);
+        let mut state =
+            SessionState::from_session(session, &config.model, &model_policy, &providers);
         state.adopt(&config);
         permissions.load_session_rules(session_state::stored_to_rules(
             &state.session.meta.session_rules,
@@ -585,7 +587,7 @@ impl App {
             task_picker_original: None,
             lua_picker: LuaPicker::new(lua_event_handle.clone()),
             theme_picker: ThemePicker::new(Arc::clone(&theme_provider)),
-            model_picker: ModelPicker::new(Arc::clone(&model_picker_models)),
+            model_picker: ModelPicker::new(Arc::clone(&model_picker_models), providers),
             model_picker_purpose: ModelPickerPurpose::Session,
             model_picker_target: None,
             plan_approval_pending: false,
@@ -688,16 +690,20 @@ impl App {
         theme_provider: Arc<dyn ThemesProvider>,
         command_runtime: Arc<CommandRuntime>,
     ) -> Self {
-        let config =
-            session_state::SessionState::from_session(session.clone(), model, &model_policy)
-                .starting_config(
-                    Arc::new(DetachedProvider),
-                    model,
-                    PathBuf::from(&session.cwd),
-                    &lua_event_handle.mode_registry(),
-                    &storage,
-                    maki_config::SessionDefaults::default(),
-                );
+        let config = session_state::SessionState::from_session(
+            session.clone(),
+            model,
+            &model_policy,
+            &ProviderRegistry::default(),
+        )
+        .starting_config(
+            Arc::new(DetachedProvider),
+            model,
+            PathBuf::from(&session.cwd),
+            &lua_event_handle.mode_registry(),
+            &storage,
+            maki_config::SessionDefaults::default(),
+        );
         Self::prepare(
             config,
             session,
@@ -714,6 +720,7 @@ impl App {
             permissions,
             lua_event_handle,
             model_policy,
+            Arc::default(),
             theme_provider,
             command_runtime,
         )
@@ -2144,13 +2151,14 @@ impl App {
         // The run reached its next request and picked the model up; the bar
         // can stop marking the switch as queued.
         if envelope.subagent.is_none()
-            && let AgentEvent::ModelSwitched { spec } = &envelope.event
+            && let AgentEvent::ModelSwitched {
+                spec,
+                context_window,
+            } = &envelope.event
         {
             self.chats[0].retry_info = None;
             self.run_model = Some(spec.clone());
-            if let Ok(model) = Model::from_spec(spec) {
-                self.run_context_window = Some(model.context_window);
-            }
+            self.run_context_window = Some(*context_window);
             return vec![];
         }
 

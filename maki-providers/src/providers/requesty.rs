@@ -154,6 +154,7 @@ fn parse_model(m: &Value) -> Option<ModelInfo> {
         supports_vision: Some(entry.flag("supports_vision")),
         tier: None,
         provider_info: None,
+        ..Default::default()
     })
 }
 

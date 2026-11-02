@@ -451,7 +451,12 @@ impl App {
         self.permissions.set_session_yolo(session.meta.yolo);
         self.permissions
             .load_session_rules(stored_to_rules(&session.meta.session_rules));
-        self.state = SessionState::from_session(session, fallback_model, &self.model_policy);
+        self.state = SessionState::from_session(
+            session,
+            fallback_model,
+            &self.model_policy,
+            &maki_providers::ProviderRegistry::default(),
+        );
         for w in self.state.warnings.drain(..) {
             self.status_bar.flash(w);
         }

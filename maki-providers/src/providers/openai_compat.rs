@@ -284,6 +284,7 @@ impl OpenAiCompatProvider {
             supports_vision,
             tier: None,
             provider_info: None,
+            ..Default::default()
         })
     }
 

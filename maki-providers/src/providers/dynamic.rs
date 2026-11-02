@@ -852,6 +852,7 @@ impl Provider for DynamicProvider {
                     supports_vision: m.supports_vision,
                     tier: None,
                     provider_info: None,
+                    ..Default::default()
                 })
                 .collect())
         })

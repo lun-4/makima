@@ -42,7 +42,7 @@ use maki_config::{
 use maki_lua::orchestration::{AgentOrchestration, ModelCatalog, TrustedTarget};
 use maki_lua::session_snapshot::HeadlessObserver;
 use maki_providers::model::Model;
-use maki_providers::{Message, TokenUsage, add_cost, settle_session};
+use maki_providers::{Message, ProviderRegistry, TokenUsage, add_cost, settle_session};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::session_lock;
@@ -301,7 +301,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
 
     let mut server = Server {
         out_tx,
-        catalog: ModelCatalog::offline(&params.model_policy),
+        catalog: ModelCatalog::offline(Arc::clone(&params.providers), &params.model_policy),
         session: None,
         elicitation: false,
         supports_boolean: false,
@@ -574,7 +574,7 @@ async fn load_session(
     .await;
     let sid = SessionId::from(session_ref.to_string());
     let home = maki_storage::paths::home();
-    let recorded_model = match Model::from_spec(&restored.model) {
+    let recorded_model = match params.providers.model(&restored.model) {
         Ok(model) if params.model_policy.allows(&model.spec()) => model,
         _ => params.model.clone(),
     };
@@ -697,6 +697,7 @@ fn spawn_session_with_history(
         append_system_prompt: params.append_system_prompt.clone(),
         defaults,
         model_policy: Arc::clone(&params.model_policy),
+        providers: Arc::clone(&params.providers),
         question_mode: if elicitation {
             QuestionMode::Elicitation
         } else {
@@ -711,7 +712,7 @@ fn spawn_session_with_history(
     let (binding, root_target) = maki_lua::orchestration::root_binding();
     let handle = headless::spawn_interactive_with_binding(
         interactive,
-        headless::default_preparation(),
+        headless::default_preparation(Arc::clone(&params.providers)),
         snapshot,
         Some(binding),
     );
@@ -984,7 +985,7 @@ async fn install_session_with_lock(
         &handle,
         &coordinator,
         &root_target,
-        headless::default_model_preparer(params.timeouts),
+        headless::default_model_preparer(Arc::clone(&params.providers)),
     )
     .await
     {
@@ -1028,7 +1029,8 @@ async fn install_session_with_lock(
         &coordinator,
         &trusted_root,
         &orchestration,
-        headless::default_model_preparer(params.timeouts),
+        headless::default_model_preparer(Arc::clone(&params.providers)),
+        Arc::clone(&params.providers),
     );
     orchestration.bind_commands(
         &trusted_root.target,
@@ -1084,6 +1086,7 @@ fn session_command_target(
     root: &TrustedTarget,
     orchestration: &Arc<AgentOrchestration>,
     prepare_model: ModelPreparer,
+    providers: Arc<ProviderRegistry>,
 ) -> TargetHandle {
     registry.bind_target_with_presentation(
         maki_agent::command::session_capabilities(),
@@ -1092,6 +1095,7 @@ fn session_command_target(
             maki_agent::command::SessionCommandHost::new(
                 handle.control_tx.clone(),
                 coordinator.clone(),
+                providers,
             )
             .with_reset_session_guidance(NEW_SESSION_GUIDANCE),
             root.clone(),
@@ -2757,6 +2761,7 @@ mod tests {
                 append_system_prompt: None,
                 defaults: Default::default(),
                 model_policy: Arc::default(),
+                providers: Arc::default(),
                 modes: Arc::new(maki_agent::ModeRegistry::builtin()),
                 question_mode: QuestionMode::Headless,
                 plugin_rules: Arc::default(),
@@ -2765,7 +2770,14 @@ mod tests {
                 state_dir: None,
                 answers: true,
             },
-            Box::new(move |model, _| Box::pin(async move { Ok((model, initial)) })),
+            Box::new(move |model| {
+                Box::pin(async move {
+                    Ok(maki_agent::actor::PreparedModel {
+                        model,
+                        provider: initial,
+                    })
+                })
+            }),
             None,
             Some(Box::new(move |manager, target, template| {
                 Box::pin(async move {
@@ -2786,8 +2798,9 @@ mod tests {
             &handle,
             &coordinator,
             &root_target,
-            Arc::new(move |model| {
+            Arc::new(move |spec| {
                 let provider = Arc::clone(&replacement);
+                let model = Model::from_spec(&spec).unwrap();
                 Box::pin(async move { Ok(maki_agent::actor::PreparedModel { provider, model }) })
             }),
         )
@@ -2843,7 +2856,8 @@ mod tests {
             &coordinator,
             &root,
             &services,
-            headless::default_model_preparer(Default::default()),
+            headless::default_model_preparer(Arc::default()),
+            Arc::default(),
         );
         session.coordinator = Some(coordinator.clone());
         session.option_projection = Some(Arc::new(OptionProjection {
@@ -3109,6 +3123,7 @@ mod tests {
             system_prompt_override: Some(String::new()),
             append_system_prompt: None,
             model_policy: Arc::default(),
+            providers: Arc::default(),
             plugin_rules: Arc::default(),
             lua_event_handle: maki_lua::EventHandle::disconnected_for_test(),
             command_registry: test_registry(&[]),
@@ -3143,8 +3158,12 @@ mod tests {
                 maki_agent::command::session_capabilities(),
                 maki_agent::command::portable_capabilities(),
                 Arc::new(
-                    maki_agent::command::SessionCommandHost::new(control_tx, coordinator)
-                        .with_reset_session_guidance(NEW_SESSION_GUIDANCE),
+                    maki_agent::command::SessionCommandHost::new(
+                        control_tx,
+                        coordinator,
+                        Arc::default(),
+                    )
+                    .with_reset_session_guidance(NEW_SESSION_GUIDANCE),
                 ),
             )
         }
@@ -3285,6 +3304,7 @@ mod tests {
                 append_system_prompt: None,
                 defaults: Default::default(),
                 model_policy: Arc::default(),
+                providers: Arc::default(),
                 question_mode: QuestionMode::Headless,
                 plugin_rules: Arc::default(),
                 project_config: ProjectConfig::for_project(Path::new("/project")),
@@ -3292,7 +3312,14 @@ mod tests {
                 state_dir: None,
                 answers: true,
             },
-            Box::new(move |model, _| Box::pin(async move { Ok((model, prepared)) })),
+            Box::new(move |model| {
+                Box::pin(async move {
+                    Ok(maki_agent::actor::PreparedModel {
+                        model,
+                        provider: prepared,
+                    })
+                })
+            }),
             None,
             None,
         );
@@ -3312,11 +3339,16 @@ mod tests {
         coordinator
             .bind_actor(
                 root.clone(),
-                Arc::new(move |model| {
+                Arc::new(move |spec| {
                     let provider = Arc::clone(&provider);
-                    Box::pin(
-                        async move { Ok(maki_agent::actor::PreparedModel { model, provider }) },
-                    )
+                    let model = Model::from_spec(&spec)
+                        .map_err(|_| maki_agent::config_change::invalid_model_spec(&spec));
+                    Box::pin(async move {
+                        Ok(maki_agent::actor::PreparedModel {
+                            model: model?,
+                            provider,
+                        })
+                    })
                 }),
                 Arc::new({
                     let model = handle.model.clone();
@@ -3338,6 +3370,7 @@ mod tests {
                 maki_agent::command::SessionCommandHost::new(
                     handle.control_tx.clone(),
                     coordinator.clone(),
+                    Arc::default(),
                 )
                 .with_reset_session_guidance(NEW_SESSION_GUIDANCE),
             ),
@@ -5971,6 +6004,7 @@ mod tests {
                     system_prompt_override: Some(String::new()),
                     append_system_prompt: None,
                     model_policy: Arc::default(),
+                    providers: Arc::default(),
                     plugin_rules: Arc::default(),
                     lua_event_handle: maki_lua::EventHandle::disconnected_for_test(),
                     command_registry: test_registry(&[]),
@@ -6821,11 +6855,11 @@ mod tests {
 
         assert_eq!(
             first.message,
-            "command failed: unsupported provider 'definitely-invalid-provider'"
+            "command failed: invalid value \"definitely-invalid-provider/test\" for session option model"
         );
         assert_eq!(
             second.message,
-            "command failed: unsupported provider 'codex'"
+            "command failed: invalid value \"codex/gpt-5.6-sol\" for session option model"
         );
         turns.assert_untouched();
     }

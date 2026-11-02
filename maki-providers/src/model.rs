@@ -14,6 +14,7 @@ use jiff::Timestamp;
 use maki_config::ModelPolicy;
 use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredTokenUsage};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model_registry;
@@ -22,6 +23,7 @@ use crate::providers::{anthropic, custom, dynamic};
 use crate::types::ThinkingFields;
 
 const PER_MILLION: f64 = 1_000_000.0;
+pub const UNKNOWN_CONTEXT_WINDOW: u32 = 128_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
@@ -41,7 +43,7 @@ pub enum ModelError {
     NotAllowed(String),
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelPricing {
     pub input: f64,
     pub output: f64,
@@ -54,18 +56,34 @@ pub struct ModelPricing {
     pub fast: Option<FastPricing>,
 }
 
-/// Metadata discovered at runtime from a provider's `/models` endpoint.
-/// All fields optional -- most providers only return an ID.
-#[derive(Debug, Clone, Default)]
+/// What is known about one model, from a curated descriptor or discovery.
+/// Absent fields stay unknown.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelInfo {
     pub id: String,
+    #[serde(default)]
     pub context_window: Option<u32>,
+    #[serde(default)]
     pub max_output_tokens: Option<u32>,
+    #[serde(default)]
     pub pricing: Option<ModelPricing>,
+    #[serde(default)]
     pub supports_thinking: Option<bool>,
+    #[serde(default)]
+    pub requires_thinking: Option<bool>,
+    #[serde(default)]
     pub supports_vision: Option<bool>,
+    #[serde(default)]
+    pub supports_fast: Option<bool>,
+    #[serde(default)]
+    pub supports_tool_examples: Option<bool>,
+    #[serde(default)]
     pub tier: Option<ModelTier>,
+    #[serde(default)]
+    pub provider_data: Option<Value>,
     /// Store of additional metadata from the provider.
+    #[serde(skip)]
     pub provider_info: Option<Arc<dyn Any + Send + Sync>>,
 }
 
@@ -73,13 +91,7 @@ impl ModelInfo {
     pub fn id_only(id: String) -> Self {
         Self {
             id,
-            context_window: None,
-            max_output_tokens: None,
-            pricing: None,
-            supports_thinking: None,
-            supports_vision: None,
-            tier: None,
-            provider_info: None,
+            ..Self::default()
         }
     }
 }
@@ -87,7 +99,7 @@ impl ModelInfo {
 /// Cache rates are missing on purpose: Anthropic derives them from `input` with
 /// the same multipliers it uses for standard pricing, so storing them would just
 /// invite the two copies to drift apart.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FastPricing {
     pub input: f64,
     pub output: f64,
@@ -428,6 +440,37 @@ impl Model {
         }
     }
 
+    /// A model described by a registered provider's descriptor. Every
+    /// capability the descriptor states becomes an override, so nothing falls
+    /// back to the native tables.
+    pub fn from_info(provider: &str, info: &ModelInfo) -> Self {
+        let spec = format!("{provider}/{}", info.id);
+        Self {
+            id: info.id.clone(),
+            provider: Arc::from(provider),
+            tier: model_registry::tier_for(&spec, provider, info.tier),
+            family: ModelFamily::Generic,
+            supports_tool_examples_override: info.supports_tool_examples,
+            thinking_override: ThinkingSupport::from_flags(
+                info.supports_thinking,
+                info.requires_thinking == Some(true),
+            ),
+            supports_vision_override: info.supports_vision,
+            supports_fast_override: info.supports_fast.map(|fast| {
+                if fast {
+                    FastSupport::Supported
+                } else {
+                    FastSupport::Unsupported
+                }
+            }),
+            pricing: info.pricing.clone().unwrap_or_default(),
+            max_output_tokens: info.max_output_tokens,
+            turn_output_tokens: None,
+            context_window: info.context_window.unwrap_or(UNKNOWN_CONTEXT_WINDOW),
+            thinking_fields: None,
+        }
+    }
+
     /// Build a `Model` from a models.dev catalogue sub-provider (nvidia,
     /// fireworks, groq, ...). The slug is the catalogue sub-provider key, not a
     /// builtin; metadata is read once from the models.dev catalog and cached on
@@ -585,10 +628,6 @@ impl Model {
     /// the honest guess.
     pub fn list_cost(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
         (!self.pricing.is_zero()).then(|| usage.cost(&self.pricing, fast && self.supports_fast()))
-    }
-
-    pub fn provider_display_name(&self) -> &'static str {
-        ManifestRegistry::for_slug(&self.provider).map_or("Unknown", |m| m.display_name)
     }
 
     pub fn from_tier(slug: &str, tier: ModelTier) -> Result<Self, ModelError> {

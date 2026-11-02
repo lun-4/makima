@@ -458,6 +458,11 @@ pub fn from_model_fallback(model: &mut Model, timeouts: Timeouts) -> Box<dyn Pro
     }
 }
 
+/// A provider whose every request asks the user to log in.
+pub fn unconfigured() -> Arc<dyn Provider> {
+    Arc::new(UnconfiguredProvider)
+}
+
 struct UnconfiguredProvider;
 
 const NOT_CONFIGURED: &str = "no provider configured — run /login or `makima auth login`";
@@ -503,8 +508,8 @@ pub async fn from_model_async(
 }
 
 pub struct ModelBatch {
-    /// The one builtin or dynamic provider this batch lists, if it lists one.
-    pub provider: Option<&'static str>,
+    /// The one provider this batch lists, if it lists one.
+    pub provider: Option<Arc<str>>,
     pub models: Vec<String>,
     pub warnings: Vec<String>,
 }
@@ -588,7 +593,7 @@ pub async fn fetch_all_models(policy: &ModelPolicy, mut on_ready: impl FnMut(Mod
                         }
                     }
                     ModelBatch {
-                        provider: Some(slug),
+                        provider: Some(Arc::from(slug)),
                         models: specs,
                         warnings: Vec::new(),
                     }
@@ -602,7 +607,7 @@ pub async fn fetch_all_models(policy: &ModelPolicy, mut on_ready: impl FnMut(Mod
                         .map(|p| format!("{slug}/{p}"))
                         .collect();
                     ModelBatch {
-                        provider: Some(slug),
+                        provider: Some(Arc::from(slug)),
                         models: fallback,
                         warnings: vec![format!(
                             "{display_name}: {e} (using static fallback)"
@@ -626,7 +631,7 @@ pub async fn fetch_all_models(policy: &ModelPolicy, mut on_ready: impl FnMut(Mod
                     "dynamic model listing failed, using static fallback"
                 );
                 ModelBatch {
-                    provider: Some(listed),
+                    provider: Some(Arc::from(listed)),
                     models: dynamic::dynamic_model_specs_for(&slug),
                     warnings: vec![format!("{slug}: {reason} (using static fallback)")],
                 }
@@ -634,7 +639,7 @@ pub async fn fetch_all_models(policy: &ModelPolicy, mut on_ready: impl FnMut(Mod
             let batch = match dynamic::create(&slug, timeouts) {
                 Ok(provider) => match provider.list_models().await {
                     Ok(models) => ModelBatch {
-                        provider: Some(listed),
+                        provider: Some(Arc::from(listed)),
                         models: models.iter().map(|m| format!("{slug}/{}", m.id)).collect(),
                         warnings: Vec::new(),
                     },

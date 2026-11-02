@@ -6,6 +6,7 @@ pub mod model_registry;
 pub mod pricing;
 pub mod provider;
 pub(crate) mod providers;
+pub mod registry;
 pub mod retry;
 pub mod selection;
 pub mod tokens;
@@ -28,6 +29,7 @@ pub use providers::copilot::auth as copilot_auth;
 pub use providers::dynamic;
 pub use providers::openai::auth as openai_auth;
 pub use providers::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
+pub use registry::{PreparedProvider, ProviderBackend, ProviderRegistry, RegisteredProvider};
 pub use retry::{RetryKind, RetryPolicy, RetryState};
 pub use selection::{
     CompleteModelSelection, FAST_VALUES, MODEL_FAST_KEY, MODEL_OPTION_KEYS, MODEL_SPEC_KEY,

@@ -676,7 +676,7 @@ fn app_with_model_slot() -> (App, Arc<ArcSwapOption<Vec<String>>>) {
 
 fn install_model_slot(app: &mut App) -> Arc<ArcSwapOption<Vec<String>>> {
     let models = Arc::new(ArcSwapOption::empty());
-    app.model_picker = ModelPicker::new(Arc::clone(&models));
+    app.model_picker = ModelPicker::new(Arc::clone(&models), Arc::default());
     app.available_models = Arc::clone(&models);
     models
 }
@@ -7470,16 +7470,17 @@ fn model_switch_updates_active_run_status() {
     app.status = Status::Streaming;
     app.run_context_window = Some(INITIAL_CONTEXT_WINDOW);
 
+    let expected_context_window = maki_providers::Model::from_spec(SWITCHED_MODEL_SPEC)
+        .unwrap()
+        .context_window;
     app.update(agent_msg_with_run_id(
         AgentEvent::ModelSwitched {
             spec: SWITCHED_MODEL_SPEC.into(),
+            context_window: expected_context_window,
         },
         app.run_id,
     ));
 
-    let expected_context_window = maki_providers::Model::from_spec(SWITCHED_MODEL_SPEC)
-        .unwrap()
-        .context_window;
     let status = rendered_rows(&mut app, 120, 24).pop().expect("status row");
 
     assert!(status.contains(SWITCHED_MODEL_SPEC));

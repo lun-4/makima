@@ -15,7 +15,7 @@ use maki_storage::sessions::{HistorySnapshot, StoredRule};
 
 use super::{
     EventLoop, InternalEvent, SESSION_OP_TIMEOUT, SessionLockState, SessionRuntime,
-    bounded_session_op, model_preparer,
+    bounded_session_op,
 };
 use crate::app::session_state::rules_to_stored;
 use crate::plan_approval::{
@@ -492,7 +492,7 @@ impl EventLoop<'_> {
         } else {
             source.config.config.context.cwd().join(&request.path)
         };
-        let prepare = model_preparer(Arc::clone(&self.ctx.prepare_provider), template.timeouts);
+        let prepare = Arc::clone(&self.ctx.prepare_provider);
         self.spawn_approval_step(idx, target.id(), publication, async move {
             let parallel = request.parallel;
             let plan = smol::unblock(move || read_plan(absolute, parallel)).await?;

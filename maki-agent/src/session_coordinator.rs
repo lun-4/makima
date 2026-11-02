@@ -2,12 +2,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
 use maki_config::ModelPolicy;
-use maki_providers::{Message, Model, ThinkingConfig};
+use maki_providers::provider::BoxFuture;
+use maki_providers::{Message, ThinkingConfig};
 use maki_storage::checkpoint::{
     CheckpointClaim, CheckpointError, CheckpointFuture, CheckpointPublication, CheckpointRequest,
     CheckpointVersion, CheckpointWriter,
@@ -84,10 +84,11 @@ impl PublicationLifetime {
     }
 }
 
-/// Resolves a provider without changing host state or awaiting the actor runner.
-pub type ModelPreparationFuture =
-    Pin<Box<dyn Future<Output = Result<PreparedModel, Arc<str>>> + Send + 'static>>;
-pub type ModelPreparer = Arc<dyn Fn(Model) -> ModelPreparationFuture + Send + Sync>;
+/// Resolves a spec and prepares its provider without changing host state or
+/// awaiting the actor runner.
+pub type ModelPreparer = Arc<
+    dyn Fn(Arc<str>) -> BoxFuture<'static, Result<PreparedModel, ConfigChangeError>> + Send + Sync,
+>;
 /// Applies the committed host snapshot synchronously. It must not fail, panic,
 /// acquire the actor lock, or enqueue work on that actor.
 pub type ConfigProjector = Arc<dyn Fn(&ConfigCommit) + Send + Sync>;
@@ -1767,7 +1768,7 @@ mod tests {
     use crate::tools::NullProvider;
     use crate::{AgentInput, AgentMode, History, RunSettings, TurnContext};
     use maki_providers::Effort;
-    use maki_providers::provider::BoxFuture;
+    use maki_providers::Model;
     use maki_storage::checkpoint::CheckpointAck;
     use test_case::test_case;
 
@@ -1966,11 +1967,11 @@ mod tests {
         coordinator
             .bind_actor(
                 agent.clone(),
-                Arc::new(|model| {
+                Arc::new(|spec| {
                     Box::pin(async move {
                         Ok(PreparedModel {
                             provider: Arc::new(NullProvider),
-                            model,
+                            model: Model::from_spec(&spec).unwrap(),
                         })
                     })
                 }),
@@ -2703,7 +2704,7 @@ mod tests {
             lock(&coordinator.read.binding)
                 .as_mut()
                 .unwrap()
-                .prepare_model = Arc::new(move |model| {
+                .prepare_model = Arc::new(move |spec| {
                 let started_tx = started_tx.clone();
                 let release_rx = release_rx.clone();
                 Box::pin(async move {
@@ -2711,7 +2712,7 @@ mod tests {
                     release_rx.recv_async().await.unwrap();
                     Ok(PreparedModel {
                         provider: Arc::new(NullProvider),
-                        model,
+                        model: Model::from_spec(&spec).unwrap(),
                     })
                 })
             });

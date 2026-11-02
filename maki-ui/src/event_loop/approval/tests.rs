@@ -2,7 +2,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent};
@@ -28,9 +27,9 @@ use maki_storage::session_lock;
 use maki_storage::sessions::{StoredMode, read_prefs};
 use test_case::test_case;
 
-use super::super::tests::{shutdown_manager, with_event_loop};
+use super::super::tests::{pump_until, shutdown_manager, sync_preparer, with_event_loop};
 use super::super::{
-    EventLoop, InternalEvent, LOCK_LOST_MSG, PreparedProvider, Wake, reserve_config_change,
+    EventLoop, InternalEvent, LOCK_LOST_MSG, PreparedProvider, reserve_config_change,
     start_runtime_heartbeat_with,
 };
 use super::ApprovalStep;
@@ -900,7 +899,7 @@ fn setup_with_registry(
         .app
         .plan_form
         .set_implementation_model(TARGET_MODEL.into(), SOURCE_MODEL);
-    event_loop.ctx.prepare_provider = Arc::new(move |model, _| {
+    event_loop.ctx.prepare_provider = sync_preparer(move |model| {
         Ok(PreparedModel {
             model: model.clone(),
             provider: Arc::new(RecordingProvider {
@@ -952,31 +951,6 @@ fn next_ready(event_loop: &mut EventLoop<'_>) -> InternalEvent {
             return event;
         }
         event_loop.handle_internal(event);
-    }
-}
-
-fn pump_until(event_loop: &mut EventLoop<'_>, mut done: impl FnMut(&EventLoop<'_>) -> bool) {
-    let deadline = Instant::now() + WAIT;
-    loop {
-        while let Ok(event) = event_loop.internal_rx.try_recv() {
-            event_loop.handle_internal(event);
-        }
-        for index in 0..event_loop.sessions.len() {
-            while let Ok(envelope) = event_loop.sessions[index].handles.agent_rx.try_recv() {
-                event_loop
-                    .handle_wake(Wake::Agent(index, Box::new(envelope)))
-                    .unwrap();
-            }
-        }
-        let _ = event_loop.tick();
-        if done(event_loop) {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "approval event processing timed out"
-        );
-        thread::yield_now();
     }
 }
 
@@ -1360,7 +1334,7 @@ fn postcommit_cancel_keeps_selected_build_runtime(fresh: bool) {
         let source_id = event_loop.sessions[index].id();
         let (record, recorded) = flume::unbounded();
         let (release, gate) = flume::bounded(1);
-        event_loop.ctx.prepare_provider = Arc::new(move |model, _| {
+        event_loop.ctx.prepare_provider = sync_preparer(move |model| {
             Ok(PreparedModel {
                 model,
                 provider: Arc::new(RecordingProvider {
@@ -1679,7 +1653,7 @@ fn provider_preparation_failure_preserves_plan(fresh: bool) {
         let (index, path, requests, host) = setup(event_loop);
         let id = event_loop.sessions[index].id();
         let run = event_loop.sessions[index].app.run_id;
-        event_loop.ctx.prepare_provider = Arc::new(|_, _| Err(PROVIDER_FAILURE.into()));
+        event_loop.ctx.prepare_provider = sync_preparer(|_| Err(PROVIDER_FAILURE.into()));
         approve(event_loop, index, fresh);
         pump_until(event_loop, |event_loop| {
             !event_loop.sessions[index].app.plan_approval_pending
@@ -1700,7 +1674,7 @@ fn cancel_during_provider_preparation_ignores_late_result() {
         let (release, gate) = flume::bounded(1);
         let (completed, completion) = flume::bounded(1);
         let (record, late_requests) = flume::unbounded();
-        event_loop.ctx.prepare_provider = Arc::new(move |model, _| {
+        event_loop.ctx.prepare_provider = sync_preparer(move |model| {
             entered.send(()).unwrap();
             gate.recv().unwrap();
             completed.send(()).unwrap();
@@ -1835,7 +1809,7 @@ fn without_override_uses_actor_predecessor(fresh: bool) {
             },
         );
         event_loop.ctx.prepare_provider =
-            Arc::new(|_, _| panic!("no-override approval must reuse actor provider"));
+            sync_preparer(|_| panic!("no-override approval must reuse actor provider"));
         approve(event_loop, index, fresh);
         let ready = next_ready(event_loop);
         if let InternalEvent::PlanApprovalReady {
