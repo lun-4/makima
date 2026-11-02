@@ -33,8 +33,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(350);
 #[cfg(unix)]
 const PROBE_POLL_SLICE: Duration = Duration::from_millis(50);
 /// Replies arriving after the probe stops reading become keypresses in the
-/// input box, so the probe keeps reading until the tty has been quiet for
-/// this long.
+/// input box, hence this quiet window.
 #[cfg(unix)]
 const PROBE_QUIET: Duration = Duration::from_millis(20);
 #[cfg(unix)]
@@ -43,7 +42,7 @@ const PROBE_KITTY_DIRECT: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
 const PROBE_SENTINELS: &[u8] = b"\x1b[>c\x1b[c\x1b[5n";
 /// Ghostty resumes escape parsing inside an ignored DCS, so the doubled ESC
 /// makes it answer this wrapper even without tmux. The probe sends it only
-/// once tmux is detected.
+/// after tmux detection.
 #[cfg(unix)]
 const PROBE_KITTY_TMUX: &[u8] =
     b"\x1bPtmux;\x1b\x1b_Gi=32,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\x1b\\\x1b\x1b[5n\x1b\\";
