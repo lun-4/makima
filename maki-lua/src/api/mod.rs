@@ -3,9 +3,11 @@ pub(crate) mod r#async;
 pub(crate) mod autocmd;
 pub(crate) mod base64;
 pub(crate) mod completion;
+pub(crate) mod crypto;
 pub(crate) mod env;
 pub(crate) mod r#fn;
 pub(crate) mod fs;
+pub(crate) mod host;
 pub(crate) mod image;
 pub(crate) mod interpreter;
 pub(crate) mod json;
@@ -97,6 +99,8 @@ pub(crate) fn create_maki_global(
     maki.set("json", json::create_json_table(lua)?)?;
     maki.set("yaml", yaml::create_yaml_table(lua)?)?;
     maki.set("net", net::create_net_table(lua, permissions)?)?;
+    maki.set("crypto", crypto::create_crypto_table(lua)?)?;
+    maki.set("host", host::create_host_table(lua, permissions)?)?;
     maki.set("text", text::create_text_table(lua)?)?;
     maki.set("match", r#match::create_match_table(lua)?)?;
     maki.set(

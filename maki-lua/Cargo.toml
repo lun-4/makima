@@ -50,6 +50,9 @@ jiff = { workspace = true }
 humantime = { workspace = true }
 isahc = { workspace = true }
 htmd = { workspace = true }
+hmac = { workspace = true }
+open = { workspace = true }
+sha2 = { workspace = true }
 jsonschema = { workspace = true }
 toml = { workspace = true }
 tree-sitter-bash = { workspace = true }

@@ -99,9 +99,11 @@ The rules:
 | [`maki.async.Semaphore`](#maki-async-Semaphore) | A counting semaphore for limiting how many tasks run at once. |
 | [`maki.async.Permit`](#maki-async-Permit) | One slot in a semaphore, obtained from `Semaphore:acquire()`. |
 | [`maki.base64`](#maki-base64) | Base64 encoding and decoding, modelled after `vim.base64`. |
+| [`maki.crypto`](#maki-crypto) | Hashing on binary strings. |
 | [`maki.env`](#maki-env) | Paths to makima's own directories (config, state, logs), and whether |
 | [`maki.fn`](#maki-fn) | Process and environment helpers, modeled after Neovim's `vim.fn` job |
 | [`maki.fs`](#maki-fs) | File-system utilities, modelled after `vim.fs` and `vim.uv`. |
+| [`maki.host`](#maki-host) | Actions on the host machine, such as opening a browser for a login. |
 | [`maki.image`](#maki-image) | Small building blocks for working with images: probe metadata, decode |
 | [`maki.image.Image`](#maki-image-Image) | A decoded image you can inspect, resize, and re-encode. |
 | [`maki.interpreter`](#maki-interpreter) | Run Python code in a memory-safe, time-limited sandbox. |
@@ -112,7 +114,8 @@ The rules:
 | [`maki.match`](#maki-match) | Fuzzy matching via nucleo, the same matcher makima's built-in pickers use. |
 | [`maki.api.mode`](#maki-api-mode) | `maki.api.mode`: define, override and list agent modes. |
 | [`maki.model`](#maki-model) | Model catalog reads that address no agent. |
-| [`maki.net`](#maki-net) | HTTP client for fetching web content. |
+| [`maki.net`](#maki-net) | HTTP clients: a guarded `request` for web content and a raw, streaming |
+| [`maki.net.Response`](#maki-net-Response) | A streaming HTTP response from `maki.net.send`. |
 | [`maki.session`](#maki-session) | Host session primitives. |
 | [`maki.usage`](#maki-usage) | Provider-side quota snapshots. |
 | [`maki.text`](#maki-text) | Text transformation utilities. |
@@ -2415,6 +2418,61 @@ maki.base64.decode("aGVsbG8=") -- "hello"
 ```
 
 
+## maki.crypto {#maki-crypto}
+
+Hashing on binary strings. Digests come back as raw bytes, not hex.
+Both functions accept strings and Luau buffers.
+
+```lua
+local signature = maki.crypto.hmac_sha256(key, maki.crypto.sha256(body))
+```
+
+---
+
+### `maki.crypto.sha256()` {#maki-crypto-sha256}
+
+```lua
+maki.crypto.sha256({data})
+```
+
+SHA-256 digest of {data}, as 32 raw bytes.
+
+**Parameters:**
+
+- `{data}` (`string|buffer`) Bytes to hash.
+
+**Returns:** (`string`) Raw 32-byte digest.
+
+**Example:**
+
+```lua
+local digest = maki.crypto.sha256("abc")
+```
+
+---
+
+### `maki.crypto.hmac_sha256()` {#maki-crypto-hmac_sha256}
+
+```lua
+maki.crypto.hmac_sha256({key}, {data})
+```
+
+HMAC-SHA256 of {data} keyed with {key}, as 32 raw bytes.
+
+**Parameters:**
+
+- `{key}` (`string|buffer`) Secret key, any length.
+- `{data}` (`string|buffer`) Message to authenticate.
+
+**Returns:** (`string`) Raw 32-byte MAC.
+
+**Example:**
+
+```lua
+local mac = maki.crypto.hmac_sha256("secret", "message")
+```
+
+
 ## maki.env {#maki-env}
 
 Paths to makima's own directories (config, state, logs), and whether
@@ -3224,6 +3282,40 @@ end
 ```
 
 
+## maki.host {#maki-host}
+
+Actions on the host machine, such as opening a browser for a login.
+
+```lua
+maki.host.open("https://example.com")
+```
+
+---
+
+### `maki.host.open()` {#maki-host-open}
+
+```lua
+maki.host.open({url})
+```
+
+Open {url} in the user's default browser. Only `http` and `https` URLs
+are accepted.
+
+Requires the `run` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{url}` (`string`) URL to open.
+
+**Returns:** (`boolean?`, `string?`) true, or nil plus an error string.
+
+**Example:**
+
+```lua
+local ok, err = maki.host.open("https://example.com/login")
+```
+
+
 ## maki.image {#maki-image}
 
 Small building blocks for working with images: probe metadata, decode
@@ -3949,11 +4041,14 @@ local levels = maki.model.thinking_levels()
 
 ## maki.net {#maki-net}
 
-HTTP client for fetching web content. All traffic goes over HTTPS
-(plain HTTP is upgraded). Private and metadata IP addresses are
-blocked to prevent SSRF, including after a redirect. Hosts listed in
-the `net.allowed_private_hosts` config option are exempt.
-Failed requests (5xx) are retried automatically.
+HTTP clients: a guarded `request` for web content and a raw, streaming
+`send` for trusted plugin code.
+
+With `request`, all traffic goes over HTTPS (plain HTTP is upgraded),
+private and metadata IP addresses are blocked to prevent SSRF,
+including after a redirect, and failed requests (5xx) are retried.
+Hosts listed in the `net.allowed_private_hosts` config option are
+exempt from the block. `send` has none of these guards.
 
 ```lua
 local res, err = maki.net.request("https://example.com")
@@ -4002,6 +4097,111 @@ if err then
 else
   print(res.status, res.body)
 end
+```
+
+---
+
+### `maki.net.send()` {#maki-net-send}
+
+```lua
+maki.net.send({request})
+```
+
+Send one HTTP request and return a streaming response. This is the raw
+primitive for trusted plugin code, such as LLM providers: there is no
+private address blocking, no https upgrade, no retry, no size cap, and
+redirects are not followed (a 3xx comes back as is). Never pass it a URL
+that came from the model without checking it first; use
+`maki.net.request` for that.
+
+The response arrives with the first body byte or when the transfer ends,
+not at the end of the headers. A server that sends headers and then stalls
+blocks `send` until its first byte or until `low_speed_timeout` fires.
+
+{request} fields:
+  `url` (string) Required, `http://` or `https://`.
+  `method` (string) HTTP verb (default `"GET"`).
+  `headers` (table) Header name/value pairs. `User-Agent` defaults to `maki/<version>`.
+  `body` (string|buffer) Request body, binary safe.
+  `connect_timeout` (number) Seconds to connect (default 10).
+  `low_speed_timeout` (number) Seconds without any received byte before
+  the transfer fails (default 30).
+  `idle_timeout` (number) Seconds a single `read()` may wait (default 300).
+
+Requires the `net` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{request}` (`table`) Request description (see above).
+
+**Returns:** ([`maki.net.Response?`](#maki-net-Response), `string?`) Response handle, or nil plus an error string.
+
+**Example:**
+
+```lua
+local res, err = maki.net.send({
+  url = "https://api.example.com/v1/stream",
+  method = "POST",
+  headers = { ["content-type"] = "application/json" },
+  body = maki.json.encode({ stream = true }),
+})
+if not res then return print(err) end
+local parts = {}
+while true do
+  local chunk, read_err = res:read()
+  if read_err then print(read_err) end
+  if not chunk then break end
+  table.insert(parts, chunk)
+end
+res:close()
+```
+
+
+## maki.net.Response {#maki-net-Response}
+
+A streaming HTTP response from `maki.net.send`.
+
+`status` is the integer status code. `headers` is a table keyed by
+lowercase header name, with repeated headers joined by `", "`. Read
+the body with `:read()`. Closing or dropping the handle closes the
+connection once the next byte arrives from the server.
+
+---
+
+### `Response:read()` {#Response-read}
+
+```lua
+Response:read()
+```
+
+Read the next chunk of the body, up to 64 KiB. Returns nil at the end of
+the stream, or nil plus an error when the read fails, when no byte arrives
+within `idle_timeout`, or after `close()`.
+
+**Returns:** (`string?`, `string?`) Binary chunk, nil at the end, or nil plus an error string.
+
+**Example:**
+
+```lua
+local chunk, err = res:read()
+```
+
+---
+
+### `Response:close()` {#Response-close}
+
+```lua
+Response:close()
+```
+
+Drop the body and close the connection. Safe to call more than once.
+The socket itself closes when the next byte arrives from the server, or
+when `low_speed_timeout` fires.
+
+**Example:**
+
+```lua
+res:close()
 ```
 
 

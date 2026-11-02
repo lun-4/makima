@@ -80,15 +80,15 @@ The message history is converted from Rust types to Lua tables once per request 
 
 ### HTTP
 
-`ctx:send(request)` sends a request and returns a response handle once the headers arrive. The handle exposes status and headers, `read()` for the next body chunk with an explicit end-of-stream value, and an idempotent `close()`. Cancellation closes the connection. Rules:
+`maki.net.send(request)` sends a request and returns a response handle. The handle exposes status and headers, `read()` for the next body chunk with an explicit end-of-stream value, and an idempotent `close()`. Dropping or closing the handle aborts the transfer. Rules:
 
-- One pooled `isahc` client for provider traffic, with DNS pinning per request.
+- One pooled `isahc` client for provider traffic. There is no private-address blocking and no DNS pinning: `send` serves trusted plugin code, and `maki.net.request` keeps its guard for model-supplied URLs.
 - No byte cap on streamed bodies. Buffered helpers keep a cap.
 - No automatic retry of provider requests. Retry policy is the provider's, in Lua.
 - The User-Agent is `maki/<version>`, and the `Expect: 100-continue` fix from `7f75a8bd` applies.
-- Redirect validation and credential stripping across authorities are shared with `maki.net.request`.
+- Redirects are not followed. A 3xx response is returned to the caller.
 
-Stock `isahc` is used. The first attempt vendored a fork to publish responses at headers rather than at the first body byte. The native providers streamed correctly on stock `isahc`, so the first HTTP commit confirms that behaviour with a test. If stock `isahc` turns out to be insufficient, the fix goes upstream and the workspace pins a git revision.
+Stock `isahc` is used. It completes a response at the first body byte or at transfer end, not at the end of the headers. Streaming providers see no difference, because SSE and error responses send body bytes immediately. The transport stays behind the `send` API. Replacing smol and isahc with tokio and reqwest is tracked in #186.
 
 Hash and HMAC primitives (`maki.crypto.sha256`, `maki.crypto.hmac_sha256`) operate on binary strings, for SigV4 in Lua.
 
@@ -145,7 +145,7 @@ Fixes on the first attempt that are unrelated to providers become separate commi
 1. This plan.
 2. Unrelated fixes taken from the first attempt, one commit each.
 3. `RefreshProvider` carries its session index, so a login that finishes in an unfocused tab refreshes that tab. This bug predates the branch.
-4. Host primitives: streaming `ctx:send`, crypto primitives, `maki.host.open`.
+4. Host primitives: streaming `maki.net.send`, crypto primitives, `maki.host.open`.
 5. Host provider API: `register_provider`, `ProviderSpec`, `ProviderRegistry`, `LuaProvider`, the `Provider` trait changes, and the registry wired into model resolution. Native providers still resolve through `ProviderKind` when the registry has no entry.
 6. Host auth: `ctx.credentials`, the refresh transaction, `InteractionService`, `drive_login` and `auth_status`, used by both frontends for registered providers.
 7. `plugins/providers/` with the shared helpers, codecs and spec runner.
