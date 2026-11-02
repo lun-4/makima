@@ -40,7 +40,9 @@ Bundled and user plugins are equal. A plugin that calls `register_provider` owns
 
 `plugins/providers/` is an ordinary bundled plugin. Its `init.lua` registers every built-in provider, the models.dev catalog providers, and providers from `providers.toml` (custom and executable). Shared codecs and helpers live in modules inside the plugin. Rust holds no list of provider ids. The loader has no special case for the plugin.
 
-Whether a single built-in provider can be disabled is an open question for review. The first attempt shipped a `plugins.<provider>.enabled` switch that the loader silently ignored, so the decision is either a working switch or no switch.
+A single built-in provider cannot be disabled. A provider without credentials or configuration is unused, so a switch adds configuration surface without a current need. The first attempt shipped a `plugins.<provider>.enabled` switch that the loader silently ignored; no such option exists here.
+
+`plugins/providers/types.lua` holds Luau type annotations for the provider table, model descriptors and instances, as documentation for plugin authors. Nothing tests it against the Rust types. Generating it from the Rust types is tracked in #47.
 
 ### Registration
 
@@ -66,7 +68,7 @@ A provider instance returned by `prepare` has `stream(ctx, request, emit)` and o
 
 ### Registry and the Provider trait
 
-`ProviderRegistry` maps provider ids to their spec and current model list. It is built after the plugin host loads, and an `Arc` of it is passed to the places that call `Model::from_spec` today. Model resolution reads the registry and never calls Lua. Discovery results replace a provider's model list in one write.
+`ProviderRegistry` maps provider ids to their spec and current model list. It is built after the plugin host loads, and an `Arc` of it is passed explicitly to every place that resolves models, including the callers of `Model::from_spec` today. There is no process-wide registry. Model resolution reads the registry and never calls Lua. Discovery results replace a provider's model list in one write.
 
 The existing `Provider` trait stays as the boundary that `maki-agent` and the frontends use. `LuaProvider` in `maki-lua` implements it by sending requests to the Lua runtime thread. Two trait changes are needed: `keys()` returns a borrowed key pool that Lua cannot provide, so it becomes `key_count()` and an async `rotate_key()`; and `adjust_model` is removed because `prepare` returns the adjusted model.
 
@@ -167,7 +169,7 @@ Fixes on the first attempt that are unrelated to providers become separate commi
 | Vendored `isahc` fork, 18k lines | Stock `isahc`; behaviour confirmed by test in commit 4 |
 | New TCP and TLS connection per request | One pooled client |
 | `${VAR}` header expansion missing in Synthetic and Mistral; Copilot ignores configured headers; TensorX duplicate Content-Type | Shared helper; one spec per provider |
-| Optional provider plugins silently ignored by the loader | One plugin, no manifest; the disable switch is an open question |
+| Optional provider plugins silently ignored by the loader | One plugin, no manifest, no disable switch |
 | Provider ids hard-coded in five Rust lists, `opencode` checks, env scanning for `*_API_KEY`, metadata IPs in Rust | Registration in Lua only; architecture test in commit 9 |
 | `Protocol` enum and provider-only fields in `ProviderDef`, `ModelFamily`, error-string sniffing per provider | Removed in commit 9; provider config fields come from the spec |
 | Source proofs, endpoint grants and sandboxed core environments that a fully permissioned plugin bypasses | Removed by the trust model |
@@ -192,9 +194,3 @@ Fixes on the first attempt that are unrelated to providers become separate commi
 | About 10k lines of provider-specific Rust tests, self-re-executing tests, source regexes, metadata snapshots | Test rules above |
 | Provider docs rewritten as internal-contract prose, examples lost | Commit 10 |
 | 20 stale plan files and a build-box IP committed | Not carried over |
-
-## Open questions
-
-- Whether a single built-in provider can be disabled, and how.
-- Whether `ProviderRegistry` is passed explicitly everywhere `Model::from_spec` is called, or installed once in a process-wide `OnceLock`. Passing it explicitly is preferred; the number of call sites decides.
-- Whether `plugins/providers/types.lua` keeps Luau type annotations as documentation for plugin authors. If it does, nothing tests them against Rust types.
