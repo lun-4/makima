@@ -4127,6 +4127,8 @@ blocks `send` until its first byte or until `low_speed_timeout` fires.
   `low_speed_timeout` (number) Seconds without any received byte before
   the transfer fails (default 30).
   `idle_timeout` (number) Seconds a single `read()` may wait (default 300).
+  `unix_socket` (string) Connect through this Unix domain socket instead of
+  TCP. `url` still supplies the path and the Host header. Unix only.
 
 Requires the `net` [plugin permission](#plugin-permissions).
 

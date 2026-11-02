@@ -3,11 +3,14 @@
 //! swapped out without touching the Lua API.
 
 use std::io;
+use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::time::Duration;
 
 use futures_lite::future;
 use futures_lite::io::AsyncReadExt;
+#[cfg(unix)]
+use isahc::config::Dialer;
 use isahc::config::{Configurable, RedirectPolicy};
 use isahc::{AsyncBody, HttpClient, Request};
 use maki_lua_macro::{lua_class, lua_fn};
@@ -32,6 +35,8 @@ const USER_AGENT: &str = concat!("maki/", env!("CARGO_PKG_VERSION"));
 const HEADER_VALUE_SEPARATOR: &str = ", ";
 const CLOSED_ERR: &str = "response is closed";
 const IDLE_TIMEOUT_ERR: &str = "idle timeout waiting for response body";
+#[cfg(not(unix))]
+const UNIX_SOCKET_UNSUPPORTED_ERR: &str = "unix_socket is not supported on this platform";
 
 /// One pooled client for every plugin. libcurl sends `Expect: 100-continue`
 /// for HTTP/1.1 bodies over 1 KB by default, and edge proxies (notably
@@ -52,6 +57,7 @@ struct SendParams {
     connect_timeout: Duration,
     low_speed_timeout: Duration,
     idle_timeout: Duration,
+    unix_socket: Option<PathBuf>,
 }
 
 impl SendParams {
@@ -82,6 +88,9 @@ impl SendParams {
                 DEFAULT_LOW_SPEED_TIMEOUT_SECS,
             )?,
             idle_timeout: timeout_field(request, "idle_timeout", DEFAULT_IDLE_TIMEOUT_SECS)?,
+            unix_socket: request
+                .get::<Option<String>>("unix_socket")?
+                .map(PathBuf::from),
         })
     }
 }
@@ -142,6 +151,17 @@ async fn open(params: SendParams) -> Result<LuaResponse, String> {
         .uri(url.as_str())
         .connect_timeout(params.connect_timeout)
         .low_speed_timeout(LOW_SPEED_BYTES_PER_SEC, params.low_speed_timeout);
+    if let Some(path) = params.unix_socket {
+        #[cfg(unix)]
+        {
+            builder = builder.dial(Dialer::unix_socket(path));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            return Err(UNIX_SOCKET_UNSUPPORTED_ERR.to_string());
+        }
+    }
     if !params
         .headers
         .iter()
@@ -202,6 +222,8 @@ async fn open(params: SendParams) -> Result<LuaResponse, String> {
 ///   `low_speed_timeout` (number) Seconds without any received byte before
 ///   the transfer fails (default 30).
 ///   `idle_timeout` (number) Seconds a single `read()` may wait (default 300).
+///   `unix_socket` (string) Connect through this Unix domain socket instead of
+///   TCP. `url` still supplies the path and the Host header. Unix only.
 ///
 /// @param request table Request description (see above).
 /// @return (maki.net.Response?, string?) Response handle, or nil plus an error string.
@@ -327,6 +349,7 @@ mod tests {
             connect_timeout: Duration::from_secs_f64(DEFAULT_CONNECT_TIMEOUT_SECS),
             low_speed_timeout: Duration::from_secs_f64(DEFAULT_LOW_SPEED_TIMEOUT_SECS),
             idle_timeout: Duration::from_secs_f64(DEFAULT_IDLE_TIMEOUT_SECS),
+            unix_socket: None,
         }
     }
 
@@ -608,5 +631,44 @@ mod tests {
         assert!(nil_after_close);
         assert_eq!(closed_err, CLOSED_ERR);
         server.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_socket_carries_the_request() {
+        use std::os::unix::net::UnixListener;
+
+        const SOCKET_URL: &str = "http://bridge/v1/status";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let mut head = Vec::new();
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).unwrap();
+                assert!(n > 0, "client closed before sending a request");
+                head.extend_from_slice(&buf[..n]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst")
+                .unwrap();
+            String::from_utf8_lossy(&head).to_ascii_lowercase()
+        });
+        smol::block_on(bounded(async {
+            let mut response = open(SendParams {
+                unix_socket: Some(path),
+                ..params(SOCKET_URL)
+            })
+            .await
+            .unwrap();
+            assert_eq!(response.status, 200);
+            assert_eq!(response.next_chunk().await.unwrap(), Some(CHUNKS[0]));
+            assert_eq!(response.next_chunk().await.unwrap(), None);
+        }));
+        let head = server.join().unwrap();
+        assert!(head.starts_with("get /v1/status "), "{head}");
+        assert!(head.contains("host: bridge"), "{head}");
     }
 }
