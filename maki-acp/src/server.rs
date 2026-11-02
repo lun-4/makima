@@ -610,6 +610,7 @@ async fn load_session(
         &mut restored.by_model,
         &recorded_model,
         defaults.fast,
+        &params.providers,
     );
     let snapshot = install_session(
         srv,
@@ -6490,7 +6491,12 @@ mod tests {
                 }],
             );
 
-            srv.catalog.apply(vec![DISCOVERED_SPEC.to_owned()]).await;
+            srv.catalog
+                .apply(
+                    vec![DISCOVERED_SPEC.to_owned()],
+                    Some(DISCOVERY_PROVIDER.into()),
+                )
+                .await;
 
             let commit = commits.recv_async().await.unwrap();
             assert_eq!(commit.config.model.context_window, DISCOVERED_WINDOW);
@@ -6518,7 +6524,12 @@ mod tests {
                     .any(|option| option["value"] == DISCOVERED_SPEC)
             );
             let version = read.options().version;
-            srv.catalog.apply(vec![DISCOVERED_SPEC.to_owned()]).await;
+            srv.catalog
+                .apply(
+                    vec![DISCOVERED_SPEC.to_owned()],
+                    Some(DISCOVERY_PROVIDER.into()),
+                )
+                .await;
             assert_eq!(read.options().version, version);
             close_session(&mut srv).await;
             match previous_host {

@@ -137,10 +137,6 @@ impl Provider for TrackedProvider {
     ) -> BoxFuture<'_, ()> {
         self.inner.end_conversation(conversation_id, reason)
     }
-
-    fn adjust_model(&self, model: &mut Model) {
-        self.inner.adjust_model(model);
-    }
 }
 
 pub(crate) struct ProviderSnapshot {

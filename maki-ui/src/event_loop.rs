@@ -1489,6 +1489,12 @@ impl SpawnCtx {
 
 enum InternalEvent {
     ModelsDiscovered,
+    /// The UI slot's model prepared differently once discovery landed.
+    ModelRediscovered {
+        spec: String,
+        provider: ProviderIdentity,
+        model: Model,
+    },
     ProviderUsageFetched {
         fetch_id: ProviderUsageFetchId,
         provider: ProviderIdentity,
@@ -2200,6 +2206,11 @@ impl<'t> EventLoop<'t> {
                 }
             }
             InternalEvent::ModelsDiscovered => self.refresh_discovered_models(),
+            InternalEvent::ModelRediscovered {
+                spec,
+                provider,
+                model,
+            } => self.apply_rediscovered_model(&spec, provider, model),
             InternalEvent::StartupPrepared {
                 spec,
                 root,
@@ -4410,19 +4421,39 @@ impl<'t> EventLoop<'t> {
         );
     }
 
-    /// The UI slot only seeds new tabs, so it is written directly; the
-    /// catalog's discovery refreshes live agents.
+    /// The UI slot only seeds new tabs, so it is written directly once its
+    /// model re-prepares; the catalog's discovery refreshes live agents.
     fn refresh_discovered_models(&mut self) {
         let current = self.ctx.model_slot.load();
-        if let Some(model) =
-            maki_agent::actor::rediscovered_model(&*current.provider, &current.model)
-        {
-            let provider = Arc::clone(&current.provider) as Arc<dyn Provider>;
-            drop(current);
-            self.ctx.model_slot.project(model, provider);
-        }
+        let model = current.model.clone();
+        let provider = current.provider.identity();
+        drop(current);
+        let providers = Arc::clone(&self.ctx.providers);
+        let internal_tx = self.internal_tx.clone();
+        smol::spawn(async move {
+            let Some(refined) = maki_agent::actor::rediscovered_model(&providers, &model).await
+            else {
+                return;
+            };
+            let _ = internal_tx.send(InternalEvent::ModelRediscovered {
+                spec: model.spec(),
+                provider,
+                model: refined,
+            });
+        })
+        .detach();
         self.sync_orchestration();
         self.sync_model_discovery();
+    }
+
+    fn apply_rediscovered_model(&mut self, spec: &str, provider: ProviderIdentity, model: Model) {
+        let current = self.ctx.model_slot.load();
+        if current.model.spec() != spec || current.provider.identity() != provider {
+            return;
+        }
+        let tracked = Arc::clone(&current.provider) as Arc<dyn Provider>;
+        drop(current);
+        self.ctx.model_slot.project(model, tracked);
     }
 
     fn refresh_provider(&mut self, idx: usize, slug: String) {
@@ -4928,7 +4959,10 @@ mod tests {
     const OBSERVATION: &str = "failed";
     const PENDING_FAST_MODEL: &str = "pending-fast-model";
     const SWITCHED_FAST_MODEL: &str = "switched-fast-model";
-    const DISCOVERY_PROVIDER: &str = "synthetic";
+    /// Re-preparing needs a constructible provider; ollama needs only a host.
+    const DISCOVERY_PROVIDER: &str = "ollama";
+    const DISCOVERY_HOST_ENV: &str = "OLLAMA_HOST";
+    const UNREACHABLE_HOST: &str = "http://127.0.0.1:1";
     const STARTUP_MODEL_ID: &str = "tui-discovery-startup";
     const RESUMED_MODEL_ID: &str = "tui-discovery-resumed";
     const UNRELATED_MODEL_ID: &str = "tui-discovery-unrelated";
@@ -5610,6 +5644,8 @@ mod tests {
         discovered: &str,
         refreshed: bool,
     ) {
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var(DISCOVERY_HOST_ENV, UNREACHABLE_HOST) };
         let spec = |id: &str| format!("{DISCOVERY_PROVIDER}/{id}");
         with_event_loop_runtime(
             |harness| {
@@ -5640,8 +5676,19 @@ mod tests {
                 );
 
                 event_loop.sync_orchestration();
-                smol::block_on(event_loop.ctx.catalog.apply(Vec::new()));
+                smol::block_on(
+                    event_loop
+                        .ctx
+                        .catalog
+                        .apply(Vec::new(), Some(DISCOVERY_PROVIDER.into())),
+                );
                 event_loop.handle_internal(InternalEvent::ModelsDiscovered);
+                let mut awaiting = refreshed;
+                while awaiting {
+                    let event = event_loop.internal_rx.recv().unwrap();
+                    awaiting = !matches!(event, InternalEvent::ModelRediscovered { .. });
+                    event_loop.handle_internal(event);
+                }
 
                 let runtime = &event_loop.sessions[0];
                 if refreshed {
@@ -5661,6 +5708,8 @@ mod tests {
     #[test_case(true ; "idle_guard")]
     #[test_case(false ; "session_lease")]
     fn busy_discovery_refresh_applies_once_released(idle_guard: bool) {
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var(DISCOVERY_HOST_ENV, UNREACHABLE_HOST) };
         let spec = format!("{DISCOVERY_PROVIDER}/{BUSY_MODEL_ID}");
         with_event_loop_runtime(
             |harness| {
@@ -5691,7 +5740,12 @@ mod tests {
                         .reserve_transaction(CheckpointPublication::default())
                         .unwrap()
                 });
-                let mut refresh = Box::pin(event_loop.ctx.catalog.apply(Vec::new()));
+                let mut refresh = Box::pin(
+                    event_loop
+                        .ctx
+                        .catalog
+                        .apply(Vec::new(), Some(DISCOVERY_PROVIDER.into())),
+                );
 
                 assert!(smol::block_on(futures_lite::future::poll_once(&mut refresh)).is_none());
                 drop((guard, lease));

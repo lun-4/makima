@@ -223,7 +223,7 @@ fn build_routed_provider(
     auth: Arc<Mutex<ResolvedAuth>>,
     timeouts: Timeouts,
     system_prefix: Option<String>,
-) -> Box<dyn Provider> {
+) -> Box<dyn NativeProvider> {
     match kind {
         ProviderKind::Ollama => Box::new(
             LocalEndpoint::with_auth(&OLLAMA, auth, timeouts).with_system_prefix(system_prefix),
@@ -477,7 +477,9 @@ impl Provider for Aperture {
             Ok(parse_models(&body, &self.overrides))
         })
     }
+}
 
+impl NativeProvider for Aperture {
     fn adjust_model(&self, model: &mut Model) {
         if let Some((provider_id, model_id)) = model.id.split_once('/') {
             let model_id = model_id.to_string();
@@ -497,8 +499,6 @@ impl Provider for Aperture {
         apply_adjustments(model, &self.overrides);
     }
 }
-
-impl NativeProvider for Aperture {}
 
 #[cfg(test)]
 mod tests {

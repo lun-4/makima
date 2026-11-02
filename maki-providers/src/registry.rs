@@ -283,6 +283,10 @@ mod tests {
     const CONTEXT_WINDOW: u32 = 42_000;
     const NATIVE_SPEC: &str = "anthropic/claude-sonnet-4-5";
     const DISCOVERY_FAILURE: &str = "listing failed";
+    const APERTURE_HOST_ENV: &str = "APERTURE_HOST";
+    const APERTURE_HOST: &str = "https://example.com";
+    /// Routed through aperture, it inherits zai's thinking support.
+    const ROUTED_SPEC: &str = "aperture/zai/glm-5.2";
 
     struct FakeBackend {
         discovered: Option<Result<Vec<ModelInfo>, String>>,
@@ -414,6 +418,17 @@ mod tests {
             registry.display_name(SHADOWED).as_deref(),
             ManifestRegistry::for_slug(SHADOWED).map(|manifest| manifest.display_name)
         );
+    }
+
+    #[test]
+    fn native_prepare_applies_provider_adjustments() {
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var(APERTURE_HOST_ENV, APERTURE_HOST) };
+        let registry = ProviderRegistry::default();
+        let model = registry.model(ROUTED_SPEC).unwrap();
+        assert!(!model.supports_thinking());
+        let prepared = smol::block_on(registry.prepare(model)).unwrap();
+        assert!(prepared.model.supports_thinking());
     }
 
     #[test]

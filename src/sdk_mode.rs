@@ -3232,7 +3232,7 @@ mod tests {
             .unwrap(),
         );
         let catalog = ModelCatalog::default();
-        smol::block_on(catalog.apply(vec![STARTUP_MODEL.into(), TARGET_MODEL.into()]));
+        smol::block_on(catalog.apply(vec![STARTUP_MODEL.into(), TARGET_MODEL.into()], None));
         let services = Arc::new_cyclic(|weak| {
             let persistence = maki_lua::orchestration::child_persistence(
                 "SDK",
@@ -3332,7 +3332,7 @@ mod tests {
         );
         assert_eq!(handle.model.current().unwrap().1.spec(), TARGET_MODEL);
 
-        smol::block_on(catalog.apply(vec![SDK_DISCOVERED_MODEL.into()]));
+        smol::block_on(catalog.apply(vec![SDK_DISCOVERED_MODEL.into()], None));
         assert!(
             OrchestrationServices::available_models(&*services, &agent)
                 .unwrap()
@@ -3568,7 +3568,7 @@ mod tests {
             && options.thinking == thinking
             && !options.fast));
         catalog.attach(&services);
-        smol::block_on(catalog.apply(vec![SDK_LATE_MODEL.into()]));
+        smol::block_on(catalog.apply(vec![SDK_LATE_MODEL.into()], None));
         let values = &coordinator.read().options().options[0].definition.values;
         for spec in [SDK_DISCOVERED_MODEL, SDK_LATE_MODEL] {
             assert!(values.iter().any(|value| &*value.value == spec));

@@ -1,9 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use maki_providers::provider::Provider;
 use maki_providers::{
-    Model, PreparedProvider, RequestOptions, ThinkingConfig, ThinkingConfigExt, model_registry,
+    Model, PreparedProvider, ProviderRegistry, RequestOptions, ThinkingConfig, ThinkingConfigExt,
 };
 
 use crate::{AgentMode, ModeDef};
@@ -95,42 +94,22 @@ pub struct ConfigCommit {
     pub config: Arc<EffectiveAgentConfig>,
 }
 
-/// Re-resolves `model` against what discovery knows now. `None` when that
-/// changes nothing, so an already-correct agent is left alone.
-pub fn rediscovered_model(provider: &dyn Provider, model: &Model) -> Option<Model> {
-    let mut refined = Model::from_spec(&model.spec()).ok()?;
-    provider.adjust_model(&mut refined);
+/// Re-prepares `model` against what discovery knows now. `None` when that
+/// changes nothing or fails, so an already-correct agent is left alone.
+pub async fn rediscovered_model(providers: &ProviderRegistry, model: &Model) -> Option<Model> {
+    let resolved = providers.model(&model.spec()).ok()?;
+    let refined = providers.prepare(resolved).await.ok()?.model;
     (!same_model(&refined, model)).then_some(refined)
-}
-
-/// {candidate} as it commits over {current}: a model it switched to takes
-/// what discovery knows by now, so discovery that lands after the change
-/// materialized is not lost.
-pub(super) fn with_discovery(
-    current: Option<&EffectiveAgentConfig>,
-    candidate: &Arc<EffectiveAgentConfig>,
-) -> Arc<EffectiveAgentConfig> {
-    let switched = current.is_none_or(|current| {
-        !Arc::ptr_eq(&current.provider, &candidate.provider)
-            || current.model.spec() != candidate.model.spec()
-    });
-    let Some(model) = switched
-        .then(|| model_registry::discovered(&candidate.model.provider, &candidate.model.id))
-        .flatten()
-        .and_then(|_| rediscovered_model(&*candidate.provider, &candidate.model))
-    else {
-        return Arc::clone(candidate);
-    };
-    let mut config = (**candidate).clone();
-    config.settings.model = model;
-    Arc::new(config)
 }
 
 impl ConfigChange {
     /// A metadata-only refresh: the provider stays, so a concurrent model
     /// switch makes the compare-and-swap a no-op.
-    pub fn rediscovered(config: &EffectiveAgentConfig) -> Option<Self> {
-        let model = rediscovered_model(&*config.provider, &config.model)?;
+    pub async fn rediscovered(
+        config: &EffectiveAgentConfig,
+        providers: &ProviderRegistry,
+    ) -> Option<Self> {
+        let model = rediscovered_model(providers, &config.model).await?;
         Some(Self::Refresh {
             expected: PreparedModel {
                 provider: Arc::clone(&config.provider),

@@ -282,13 +282,13 @@ impl Provider for Mistral {
                 .await
         })
     }
-
-    fn adjust_model(&self, model: &mut Model) {
-        adjust_model(model);
-    }
 }
 
 impl NativeProvider for Mistral {
+    fn adjust_model(&self, model: &mut Model) {
+        adjust_model(model);
+    }
+
     fn keys(&self) -> Option<KeyRotation<'_>> {
         Some(KeyRotation::new(
             self.key_pool.as_ref()?,

@@ -5,8 +5,8 @@ use maki_agent::actor::{AgentContextSnapshot, EffectiveAgentConfig};
 use maki_agent::{AgentMode, ModeRegistry, RunSettings, SessionDefaults};
 use maki_agent::{modes, session_defaults};
 use maki_config::{Effect, ModelPolicy};
-use maki_providers::provider::{Provider, adjust_model};
-use maki_providers::{Model, ProviderRegistry, Timeouts, TokenUsage, settle_session};
+use maki_providers::provider::Provider;
+use maki_providers::{Model, ProviderRegistry, TokenUsage, settle_session};
 use maki_storage::StateDir;
 use maki_storage::sessions::{StoredEffect, StoredMode, StoredRule, read_prefs};
 
@@ -93,7 +93,13 @@ impl SessionState {
         let fast_pending = session.meta.fast && !model.supports_fast() && model.fast_pending();
         let token_usage = session.token_usage;
         let fast = session.meta.fast && model.supports_fast();
-        let cost = settle_session(&token_usage, session.usage_by_model_mut(), &model, fast);
+        let cost = settle_session(
+            &token_usage,
+            session.usage_by_model_mut(),
+            &model,
+            fast,
+            providers,
+        );
         let context_size = session.meta.context_size;
 
         Self {
@@ -190,9 +196,9 @@ fn resumed_model(
     providers: &ProviderRegistry,
 ) -> Model {
     // A caller that resolved the session's own model hands in a value that
-    // has already been through the provider (and its `adjust_model`), so it
-    // is richer than anything a rebuild from the spec could produce. Only a
-    // saved model the caller did not resolve gets rebuilt and adjusted.
+    // has already been through its provider, so it is richer than anything a
+    // rebuild from the spec could produce. Only a saved model the caller did
+    // not resolve gets rebuilt.
     if model_policy.allows(&session.model) && fallback_model.spec() == session.model {
         fallback_model.clone()
     } else {
@@ -203,15 +209,7 @@ fn resumed_model(
             .ok()
             .flatten()
         {
-            Some(mut model) => {
-                // Apply the provider's per-model adjustments (e.g. ZAI's
-                // glm-5.2 thinking support) so a resumed session matches one
-                // started fresh.
-                if let Err(e) = adjust_model(&mut model, Timeouts::default()) {
-                    tracing::warn!(model = %model.id, error = %e, "failed to adjust resumed model");
-                }
-                model
-            }
+            Some(model) => model,
             None => {
                 session.model = fallback_model.spec();
                 fallback_model.clone()
@@ -534,22 +532,5 @@ mod tests {
         let (state, _) = restore(make_plan_session(Some(StoredMode::Build), None), &storage);
         assert!(state.plan.path().is_none());
         assert!(state.warnings.is_empty());
-    }
-
-    #[test]
-    fn from_session_applies_provider_adjust_model() {
-        // SAFETY: this test runs single-threaded; no other thread reads the env.
-        unsafe { std::env::set_var("APERTURE_HOST", "https://example.com") };
-        let mut session = AppSession::new("aperture/zai/glm-5.2", "/tmp");
-        let model = resumed_model(
-            &mut session,
-            &test_model(),
-            &ModelPolicy::default(),
-            &ProviderRegistry::default(),
-        );
-        assert!(
-            model.supports_thinking(),
-            "resumed aperture/zai/glm-5.2 should inherit thinking support from adjust_model",
-        );
     }
 }

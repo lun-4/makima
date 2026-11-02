@@ -327,11 +327,11 @@ pub trait Provider: Send + Sync {
     ) -> BoxFuture<'_, ()> {
         Box::pin(async {})
     }
-
-    fn adjust_model(&self, _model: &mut Model) {}
 }
 
 pub(crate) trait NativeProvider: Provider {
+    fn adjust_model(&self, _model: &mut Model) {}
+
     /// The keys this provider rotates through, and where the current one lives.
     /// `None` is one fixed credential that never changes. Both the count and
     /// the swap come off it, so they can never describe different pools.
@@ -383,10 +383,6 @@ impl Provider for Native {
         let rotated = self.0.keys().is_some_and(|keys| keys.rotate());
         Box::pin(async move { rotated })
     }
-
-    fn adjust_model(&self, model: &mut Model) {
-        self.0.adjust_model(model);
-    }
 }
 
 pub(crate) fn provider_for_slug(
@@ -432,20 +428,6 @@ pub fn from_model(model: &mut Model, timeouts: Timeouts) -> Result<Box<dyn Provi
     provider.adjust_model(model);
     debug!(provider = %model.provider, model = %model.id, "provider created");
     Ok(Box::new(Native(provider)))
-}
-
-/// Adjust a model against its provider's static table without retaining the
-/// provider. Used to reconcile a resumed model so it matches one started
-/// fresh (e.g. inherited thinking support for a routed Aperture model).
-pub fn adjust_model(model: &mut Model, timeouts: Timeouts) -> Result<(), AgentError> {
-    // Script-backed providers adjust nothing but run their auth script at
-    // construction; resumed-session callers sit on the UI thread and must
-    // not wait on that.
-    if dynamic::display_name(&model.provider).is_some() {
-        return Ok(());
-    }
-    provider_for_slug(&model.provider, timeouts)?.adjust_model(model);
-    Ok(())
 }
 
 pub fn from_model_fallback(model: &mut Model, timeouts: Timeouts) -> Box<dyn Provider> {

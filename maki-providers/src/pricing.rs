@@ -15,6 +15,7 @@ use jiff::tz::Offset;
 use maki_storage::sessions::StoredTokenUsage;
 
 use crate::model::{Model, TokenUsage};
+use crate::registry::ProviderRegistry;
 
 const HOURS_PER_DAY: u8 = 24;
 /// Multiplier of a provider that bills the same rate around the clock.
@@ -152,12 +153,13 @@ pub fn settle_session(
     by_model: &mut HashMap<String, StoredTokenUsage>,
     current: &Model,
     fast: bool,
+    providers: &ProviderRegistry,
 ) -> Option<f64> {
     if by_model.is_empty() && *total != TokenUsage::default() {
         by_model.insert(current.id.clone(), total.billed(None));
     }
     for (id, usage) in by_model.iter_mut() {
-        usage.cost = model_cost(id, usage, current, fast);
+        usage.cost = model_cost(id, usage, current, fast, providers);
     }
     by_model
         .values()
@@ -168,15 +170,22 @@ pub fn settle_session(
 /// One model's slice of [`settle_session`], as `/usage` breaks it down per row.
 /// Usage is keyed by bare model id, so resolving it needs the session's
 /// provider put back in front.
-pub fn model_cost(id: &str, usage: &StoredTokenUsage, current: &Model, fast: bool) -> Option<f64> {
+pub fn model_cost(
+    id: &str,
+    usage: &StoredTokenUsage,
+    current: &Model,
+    fast: bool,
+    providers: &ProviderRegistry,
+) -> Option<f64> {
     if let Some(cost) = usage.cost {
         return Some(cost);
     }
     if id == current.id {
         return current.list_cost(&(*usage).into(), fast);
     }
-    Model::from_spec(id)
-        .or_else(|_| Model::from_spec(&format!("{}/{}", current.provider, id)))
+    providers
+        .model(id)
+        .or_else(|_| providers.model(&format!("{}/{}", current.provider, id)))
         .ok()?
         .list_cost(&(*usage).into(), fast)
 }
@@ -360,7 +369,13 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(
-                settle_session(&total, &mut by_model, &current, false),
+                settle_session(
+                    &total,
+                    &mut by_model,
+                    &current,
+                    false,
+                    &ProviderRegistry::default()
+                ),
                 expected,
                 "total of {input} input tokens"
             );
@@ -381,14 +396,26 @@ mod tests {
         };
 
         assert_eq!(
-            settle_session(&total, &mut by_model, &current, false),
+            settle_session(
+                &total,
+                &mut by_model,
+                &current,
+                false,
+                &ProviderRegistry::default()
+            ),
             Some(LIST_PRICE)
         );
 
         *by_model.entry(CURRENT.to_owned()).or_default() += stored(Some(RECORDED));
 
         assert_eq!(
-            settle_session(&total, &mut by_model, &current, false),
+            settle_session(
+                &total,
+                &mut by_model,
+                &current,
+                false,
+                &ProviderRegistry::default()
+            ),
             Some(LIST_PRICE + RECORDED)
         );
     }
@@ -407,7 +434,13 @@ mod tests {
         let sibling = Model::from_spec(&format!("{}/{sibling_id}", current.provider)).unwrap();
         let usage = stored(None);
 
-        let cost = model_cost(sibling_id, &usage, &current, false);
+        let cost = model_cost(
+            sibling_id,
+            &usage,
+            &current,
+            false,
+            &ProviderRegistry::default(),
+        );
         assert_eq!(cost, sibling.list_cost(&usage.into(), false));
         assert_ne!(cost, current.list_cost(&usage.into(), false));
     }
@@ -419,7 +452,13 @@ mod tests {
     fn a_recorded_cost_short_circuits_the_price_table(input_rate: f64) {
         let current = model(CURRENT, input_rate);
         assert_eq!(
-            model_cost(CURRENT, &stored(Some(RECORDED)), &current, false),
+            model_cost(
+                CURRENT,
+                &stored(Some(RECORDED)),
+                &current,
+                false,
+                &ProviderRegistry::default()
+            ),
             Some(RECORDED)
         );
     }
@@ -441,6 +480,12 @@ mod tests {
             ..Default::default()
         };
 
-        settle_session(&total, &mut breakdown(entries), &current, fast)
+        settle_session(
+            &total,
+            &mut breakdown(entries),
+            &current,
+            fast,
+            &ProviderRegistry::default(),
+        )
     }
 }

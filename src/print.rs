@@ -842,7 +842,10 @@ mod tests {
     const CHILD_RESPONSE: &str = "print child response";
     const GRANDCHILD_RESPONSE: &str = "print grandchild response";
     const COMMAND_CHILD_PROMPT: &str = "print command child request";
-    const DISCOVERY_PROVIDER: &str = "mistral";
+    /// Re-preparing needs a constructible provider; ollama needs only a host.
+    const DISCOVERY_PROVIDER: &str = "ollama";
+    const DISCOVERY_HOST_ENV: &str = "OLLAMA_HOST";
+    const UNREACHABLE_HOST: &str = "http://127.0.0.1:1";
     const DISCOVERY_MODEL_ID: &str = "print-discovery-root";
     const DISCOVERED_WINDOW: u32 = 777_000;
     const MODELS_COMMAND: &str = "/print_models";
@@ -1394,6 +1397,8 @@ mod tests {
     /// plugins read already has the provider's models.
     #[test]
     fn print_root_starts_on_its_discovered_provider() {
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var(DISCOVERY_HOST_ENV, UNREACHABLE_HOST) };
         let state = tempfile::tempdir().unwrap();
         let spec = format!("{DISCOVERY_PROVIDER}/{DISCOVERY_MODEL_ID}");
         let registry = CommandRegistry::new();

@@ -3,11 +3,11 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
-use maki_agent::actor::ConfigChange;
+use maki_agent::actor::{ConfigChange, ConfigPatch, EffectiveAgentConfig};
 use maki_agent::session_coordinator::{SessionCoordinatorHandle, publication_claim};
 use maki_config::ModelPolicy;
-use maki_providers::ProviderRegistry;
 use maki_providers::provider::ModelBatch;
+use maki_providers::{Model, ProviderRegistry};
 use tracing::warn;
 
 use super::{AgentOrchestration, commit_config_change};
@@ -123,7 +123,7 @@ impl ModelCatalog {
             let (landed, refreshes) = flume::unbounded();
             let fetch = fetch(Box::new(move |batch| {
                 let active = batch.provider.as_deref() == Some(active.as_str());
-                let _ = landed.send((catalog.apply(batch.models), active));
+                let _ = landed.send((catalog.apply(batch.models, batch.provider), active));
                 applied(batch.warnings);
             }));
             let mut ready = Some(ready);
@@ -141,13 +141,18 @@ impl ModelCatalog {
         }
     }
 
-    /// Merges {models} in; the returned future commits a metadata refresh
-    /// for every attached agent whose model resolves differently now and,
-    /// when the catalog grew, republishes each attached session's model
-    /// values. It reads committed configs only after the batch's metadata is
-    /// registered, and a change in flight re-resolves when it commits, so
-    /// neither side misses the other.
-    pub fn apply(&self, models: Vec<String>) -> impl Future<Output = ()> + Send + use<> {
+    /// Merges {models}, listed by {provider} when one, in; the returned
+    /// future commits a metadata refresh for every attached agent on a listed
+    /// spec or on {provider} whose model prepares differently now and, when
+    /// the catalog grew, republishes each attached session's model values.
+    /// A refresh is decided before its change is reserved, so an agent that
+    /// is already right is never held; one that a change in flight overtook
+    /// is refreshed from the config it commits over rather than lost.
+    pub fn apply(
+        &self,
+        models: Vec<String>,
+        provider: Option<Arc<str>>,
+    ) -> impl Future<Output = ()> + Send + use<> {
         let mut grown = false;
         self.specs.rcu(|current| {
             let known = current.as_deref().map_or(&[][..], Vec::as_slice);
@@ -168,21 +173,39 @@ impl ModelCatalog {
             .iter()
             .filter_map(Weak::upgrade)
             .collect::<Vec<_>>();
+        let providers = Arc::clone(&self.providers);
+        let listed = move |model: &Model| {
+            provider.as_deref() == Some(&*model.provider) || models.contains(&model.spec())
+        };
         async move {
             for orchestration in orchestrations {
                 for root in orchestration.roots() {
                     for target in root.target.manager().list() {
-                        let Some(change) = target
+                        let Some(committed) = target
                             .effective_config()
                             .ok()
                             .flatten()
-                            .and_then(|config| ConfigChange::rediscovered(&config))
+                            .filter(|config| listed(&config.model))
                         else {
                             continue;
                         };
-                        let fixed = async |_, _| Ok((publication_claim(), change));
+                        let Some(change) = ConfigChange::rediscovered(&committed, &providers).await
+                        else {
+                            continue;
+                        };
+                        let refresh = async |_, predecessor: Arc<EffectiveAgentConfig>| {
+                            let change = if same_target(&committed, &predecessor) {
+                                Some(change)
+                            } else if listed(&predecessor.model) {
+                                ConfigChange::rediscovered(&predecessor, &providers).await
+                            } else {
+                                None
+                            };
+                            let unchanged = || ConfigChange::Patch(ConfigPatch::default());
+                            Ok((publication_claim(), change.unwrap_or_else(unchanged)))
+                        };
                         if let Err(error) =
-                            commit_config_change(&*orchestration, &target, fixed).await
+                            commit_config_change(&*orchestration, &target, refresh).await
                         {
                             warn!(agent = %target.id(), %error, "failed to refresh discovered model");
                         }
@@ -202,4 +225,8 @@ impl ModelCatalog {
             }
         }
     }
+}
+
+fn same_target(left: &EffectiveAgentConfig, right: &EffectiveAgentConfig) -> bool {
+    Arc::ptr_eq(&left.provider, &right.provider) && left.model.spec() == right.model.spec()
 }

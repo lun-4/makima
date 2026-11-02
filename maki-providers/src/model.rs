@@ -696,13 +696,6 @@ impl Model {
         Err(ModelError::UnsupportedProvider(slug.to_string()))
     }
 
-    pub fn from_spec_with_policy(spec: &str, policy: &ModelPolicy) -> Result<Self, ModelError> {
-        if !policy.allows(spec) {
-            return Err(ModelError::NotAllowed(spec.to_string()));
-        }
-        Self::from_spec(spec)
-    }
-
     pub fn parse_spec(spec: &str) -> Result<(&str, &str), ModelError> {
         let (slug, model_id) = spec.split_once('/').ok_or(ModelError::InvalidFormat)?;
         if slug.is_empty() || model_id.is_empty() {
@@ -1039,25 +1032,6 @@ mod tests {
         };
 
         assert_eq!(model.output_tokens(), expected);
-    }
-
-    #[test]
-    fn from_spec_with_policy_rejects_disallowed_exact_spec() {
-        let policy = policy(&["anthropic/*"], &[]);
-        let spec = "openai/gpt-5.6-sol";
-
-        let error = Model::from_spec_with_policy(spec, &policy).unwrap_err();
-
-        assert!(matches!(error, ModelError::NotAllowed(disallowed) if disallowed == spec));
-    }
-
-    #[test]
-    fn from_spec_with_policy_resolves_allowed_exact_spec() {
-        let policy = policy(&["openai/gpt-5.6-sol"], &[]);
-
-        let model = Model::from_spec_with_policy("openai/gpt-5.6-sol", &policy).unwrap();
-
-        assert_eq!(model.spec(), "openai/gpt-5.6-sol");
     }
 
     #[test]

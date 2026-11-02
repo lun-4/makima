@@ -581,7 +581,9 @@ impl Provider for OpenAi {
             Ok(())
         })
     }
+}
 
+impl NativeProvider for OpenAi {
     /// An api-key user gets no opinion at all: stamping `Unsupported` here
     /// would shadow the pricing gate in `Model::supports_fast` for good, and
     /// that gate is not ours to close.
@@ -601,8 +603,6 @@ impl Provider for OpenAi {
         }
     }
 }
-
-impl NativeProvider for OpenAi {}
 
 #[cfg(test)]
 mod tests {

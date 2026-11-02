@@ -375,13 +375,13 @@ impl Provider for Zai {
             Ok(Some(parsed.into()))
         })
     }
-
-    fn adjust_model(&self, model: &mut Model) {
-        adjust_model(model);
-    }
 }
 
 impl NativeProvider for Zai {
+    fn adjust_model(&self, model: &mut Model) {
+        adjust_model(model);
+    }
+
     fn keys(&self) -> Option<KeyRotation<'_>> {
         Some(KeyRotation::new(
             self.key_pool.as_ref()?,
