@@ -1,4 +1,5 @@
 local google = require("providers.google")
+local http = require("providers.http")
 local t = require("maki.test_helpers")
 
 local KEY_ENV = "GEMINI_API_KEY"
@@ -87,7 +88,8 @@ t.case("missing_key_fails_prepare", function()
   t.with_env({}, function()
     local instance, err = spec.prepare(t.provider_ctx({}), { id = "gemini-2.5-pro" }, {})
     t.eq(instance, nil)
-    t.has(err, KEY_ENV)
+    t.eq(err.kind, http.CONFIG_KIND)
+    t.has(err.message, KEY_ENV)
   end)
 end)
 

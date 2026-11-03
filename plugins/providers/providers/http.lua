@@ -9,15 +9,28 @@ local RETRY_AFTER_HEADER = "retry-after"
 local CONTENT_TYPE = "Content-Type"
 local JSON_TYPE = "application/json"
 
+M.CONFIG_KIND = "config"
+
 local function trim(text)
   return text:match("^%s*(.-)%s*$")
+end
+
+-- A failure the host does not retry, for missing keys, settings or
+-- credentials that only the user can fix.
+function M.config_error(message)
+  return { kind = M.CONFIG_KIND, message = message }
+end
+
+-- The text of an error, whether a string or a table.
+function M.message(err)
+  return type(err) == "table" and err.message or err
 end
 
 -- Keys in precedence order: {env_var} (or `config.api_key_env`) as a
 -- comma-separated pool, then the saved `api_key`, then `config.api_key`. An
 -- empty variable counts as unset. Returns the keys and their source (`env`,
 -- `saved` or `configured`, which are also `auth_status` states), or nil plus
--- an error that says how to log in.
+-- a config error that says how to log in.
 function M.api_keys(ctx, config, env_var)
   env_var = config.api_key_env or env_var
   if env_var then
@@ -43,7 +56,7 @@ function M.api_keys(ctx, config, env_var)
     return { config.api_key }, "configured"
   end
   local missing = env_var and env_var .. " not set and no saved credentials" or "no saved credentials"
-  return nil, string.format("%s for '%s'; run `maki auth login %s`", missing, ctx.id, ctx.id)
+  return nil, M.config_error(string.format("%s for '%s'; run `maki auth login %s`", missing, ctx.id, ctx.id))
 end
 
 -- Round-robin over {keys}, for an instance's `key_count` and `rotate_key`.
@@ -100,14 +113,17 @@ function M.set_header(headers, name, value)
 end
 
 -- A copy of {base} with the `providers.toml` headers of provider {id}
--- expanded and set over it, or nil plus an error naming the missing variable.
+-- expanded and set over it, or nil plus a config error naming the missing
+-- variable.
 function M.headers(id, base, configured)
   local result = table.clone(base)
   for name, value in pairs(configured or {}) do
     local expanded, missing = M.expand_env(value)
     if not expanded then
       return nil,
-        string.format("provider '%s' header '%s': environment variable '%s' is unset or empty", id, name, missing)
+        M.config_error(
+          string.format("provider '%s' header '%s': environment variable '%s' is unset or empty", id, name, missing)
+        )
     end
     M.set_header(result, name, expanded)
   end

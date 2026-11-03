@@ -37,6 +37,7 @@ pub(crate) const HOST_STOPPED: &str = "plugin host stopped";
 const NO_STREAM: &str = "provider instance has no stream function";
 const DEFAULT_KEY_COUNT: usize = 1;
 const LOGIN_INCOMPLETE: &str = "login did not complete";
+const CONFIG_KIND: &str = "config";
 
 pub(crate) type ProviderJob = Box<dyn FnOnce(Lua) -> LocalBoxFuture<'static, ()> + Send>;
 /// The outer error is raised Lua; the inner one is what the provider returned.
@@ -149,24 +150,31 @@ fn returned(values: MultiValue) -> Result<MultiValue, AgentError> {
 }
 
 fn returned_error(error: &LuaValue) -> AgentError {
-    let (status, message, retry_after) = match error {
-        LuaValue::Table(fields) => (
-            fields.get::<Option<u16>>("status").ok().flatten(),
-            fields
-                .get::<Option<String>>("message")
-                .ok()
-                .flatten()
-                .unwrap_or_default(),
-            fields.get::<Option<f64>>("retry_after").ok().flatten(),
-        ),
-        LuaValue::String(message) => (None, message.to_string_lossy(), None),
-        other => (None, other.type_name().to_owned(), None),
+    let fields = match error {
+        LuaValue::Table(fields) => fields,
+        LuaValue::String(message) => {
+            return AgentError::Io(io::Error::other(message.to_string_lossy()));
+        }
+        other => return AgentError::Io(io::Error::other(other.type_name())),
     };
-    match status {
+    let message = fields
+        .get::<Option<String>>("message")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let kind = fields.get::<Option<String>>("kind").ok().flatten();
+    if kind.as_deref() == Some(CONFIG_KIND) {
+        return config_error(message);
+    }
+    match fields.get::<Option<u16>>("status").ok().flatten() {
         Some(status) => AgentError::Api {
             status,
             message,
-            retry_after: retry_after.and_then(|secs| Duration::try_from_secs_f64(secs).ok()),
+            retry_after: fields
+                .get::<Option<f64>>("retry_after")
+                .ok()
+                .flatten()
+                .and_then(|secs| Duration::try_from_secs_f64(secs).ok()),
         },
         None => AgentError::Io(io::Error::other(message)),
     }

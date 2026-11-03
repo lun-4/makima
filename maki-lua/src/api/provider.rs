@@ -211,9 +211,12 @@ fn spec_error(message: impl fmt::Display) -> mlua::Error {
 /// conversation id again. `emit(event)` takes `{ type = "text_delta", text }`
 /// and the other provider events, and returns false once the call is over.
 /// `stream` returns `{ message, usage, stop_reason }`. A failure returns nil
-/// plus an error: a table with `status`, `message` and optional
-/// `retry_after` seconds is an API error, anything else a retryable
-/// transport error. A raised error is not retried.
+/// plus an error: `{ kind = "config", message }` is a configuration error,
+/// such as a missing key or setting, and is not retried; a table with
+/// `status`, `message` and optional `retry_after` seconds is an API error;
+/// anything else is a retryable transport error. A raised error is not
+/// retried. Every callback that returns nil plus an error follows these
+/// rules.
 ///
 /// @param spec table Provider definition (see above).
 /// @return

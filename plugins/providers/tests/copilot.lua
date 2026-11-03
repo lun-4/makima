@@ -1,4 +1,5 @@
 local copilot = require("providers.copilot")
+local http = require("providers.http")
 local t = require("maki.test_helpers")
 
 local TOKEN_ENV = "GH_COPILOT_TOKEN"
@@ -409,6 +410,14 @@ t.case("login_imports_once_and_status_reports_the_source", function()
   t.eq(ok, nil)
   t.eq(err, copilot.NOT_FOUND)
   t.eq(empty.saved, nil)
+end)
+
+t.case("prepare_without_a_token_is_a_config_error", function()
+  t.with_env({}, function()
+    local instance, err = spec.prepare(t.provider_ctx({}), { id = "gpt-5" }, {})
+    t.eq(instance, nil)
+    t.same(err, http.config_error(copilot.NOT_AUTHENTICATED))
+  end)
 end)
 
 t.report()

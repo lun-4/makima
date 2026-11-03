@@ -1,4 +1,5 @@
 local anthropic = require("providers.anthropic_provider")
+local http = require("providers.http")
 local t = require("maki.test_helpers")
 
 local KEY_ENV = "ANTHROPIC_API_KEY"
@@ -124,13 +125,23 @@ t.case("saved_key_and_configured_headers", function()
   t.eq(header(headers, "authorization"), "Bearer oauth")
 end)
 
+t.case("missing_key_fails_prepare_with_a_config_error", function()
+  t.with_env({}, function()
+    local instance, err = spec.prepare(t.provider_ctx({}), { id = "claude-sonnet-4-5" }, {})
+    t.eq(instance, nil)
+    t.eq(err.kind, http.CONFIG_KIND)
+    t.has(err.message, KEY_ENV .. " not set")
+  end)
+end)
+
 t.case("unset_header_variable_fails_prepare", function()
   t.with_env({ [KEY_ENV] = "k" }, function()
     local instance, err = spec.prepare(t.provider_ctx({}), { id = "claude-sonnet-4-5" }, {
       headers = { Authorization = "Bearer ${MISSING}" },
     })
     t.eq(instance, nil)
-    t.has(err, "'MISSING'")
+    t.eq(err.kind, http.CONFIG_KIND)
+    t.has(err.message, "'MISSING'")
   end)
 end)
 

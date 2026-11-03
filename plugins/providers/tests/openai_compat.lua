@@ -1,4 +1,5 @@
 local compat = require("providers.openai_compat")
+local http = require("providers.http")
 local t = require("maki.test_helpers")
 
 local KEY_ENV = "TEST_API_KEY"
@@ -134,7 +135,8 @@ t.case("prepare_without_key_fails", function()
   t.with_env({}, function()
     local instance, err = compat.provider(def()).prepare(t.provider_ctx({}), { id = "row-1" }, {})
     t.eq(instance, nil)
-    t.has(err, KEY_ENV)
+    t.eq(err.kind, http.CONFIG_KIND)
+    t.has(err.message, KEY_ENV)
   end)
 end)
 
@@ -143,7 +145,7 @@ t.case("prepare_names_unset_header_variable", function()
     local _, err = compat.provider(def()).prepare(t.provider_ctx({}), { id = "row-1" }, {
       headers = { ["X-Gateway"] = "${GATEWAY}" },
     })
-    t.eq(err, HEADER_ERROR)
+    t.same(err, http.config_error(HEADER_ERROR))
   end)
 end)
 

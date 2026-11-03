@@ -1,5 +1,6 @@
 local synthetic = require("providers.synthetic")
 local compat = require("providers.openai_compat")
+local http = require("providers.http")
 local t = require("maki.test_helpers")
 
 local Y2K_MS = 946684800000
@@ -44,7 +45,7 @@ t.case("malformed_or_empty_bodies_fail", function()
     t.eq(result, nil)
     assert(err, body)
   end
-  t.eq(select(2, usage("{}")), synthetic.EMPTY_USAGE_ERROR)
+  t.same(select(2, usage("{}")), http.config_error(synthetic.EMPTY_USAGE_ERROR))
 end)
 
 t.case("percentage_clamps", function()

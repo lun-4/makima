@@ -69,10 +69,10 @@ end
 function M.parse_container_credentials(body)
   body = type(body) == "table" and body or {}
   if type(body.AccessKeyId) ~= "string" then
-    return nil, "container creds response missing AccessKeyId"
+    return nil, http.config_error("container creds response missing AccessKeyId")
   end
   if type(body.SecretAccessKey) ~= "string" then
-    return nil, "container creds response missing SecretAccessKey"
+    return nil, http.config_error("container creds response missing SecretAccessKey")
   end
   local expires = clock.parse_rfc3339(body.Expiration)
   return {
@@ -90,7 +90,7 @@ local function container_credentials(ctx, url)
   if token_file then
     local content, err = maki.fs.read(token_file)
     if not content then
-      return nil, string.format("read container auth token file %s: %s", token_file, tostring(err))
+      return nil, http.config_error(string.format("read container auth token file %s: %s", token_file, tostring(err)))
     end
     token = content
   end
@@ -102,11 +102,12 @@ local function container_credentials(ctx, url)
     idle_timeout = CONTAINER_TIMEOUT_SECS,
   })
   if not response then
-    return nil, "container creds request: " .. tostring(err)
+    return nil, http.config_error("container creds request: " .. tostring(err))
   end
   if response.status ~= 200 then
     local failure = http.error(response)
-    return nil, string.format("container creds endpoint returned %d: %s", failure.status, failure.message)
+    return nil,
+      http.config_error(string.format("container creds endpoint returned %d: %s", failure.status, failure.message))
   end
   local body, read_err = http.read_json(response)
   if read_err then
@@ -123,7 +124,7 @@ end
 function M.resolve(ctx, offline)
   local region = env("AWS_REGION")
   if not region then
-    return nil, M.MISSING_REGION
+    return nil, http.config_error(M.MISSING_REGION)
   end
   local credentials, err
   local bearer = env("AWS_BEARER_TOKEN_BEDROCK")
@@ -153,7 +154,7 @@ function M.resolve(ctx, offline)
     local content = home and maki.fs.read(home .. CREDENTIALS_FILE)
     credentials = content and M.parse_credentials_file(content, env("AWS_PROFILE") or DEFAULT_PROFILE)
     if not credentials then
-      return nil, M.NO_CREDENTIALS
+      return nil, http.config_error(M.NO_CREDENTIALS)
     end
     credentials.method = "profile"
   end
@@ -164,7 +165,7 @@ end
 function M.auth_status(ctx)
   local credentials, err = M.resolve(ctx, true)
   if not credentials then
-    return { state = "missing", detail = err }
+    return { state = "missing", detail = http.message(err) }
   end
   return { state = "env", detail = STATUS_DETAIL .. " (" .. credentials.method .. ")" }
 end

@@ -310,7 +310,7 @@ local function connect(ctx, state)
   end
   local auth, err = M.token(ctx)
   if not auth then
-    return nil, err or M.NOT_AUTHENTICATED
+    return nil, err or http.config_error(M.NOT_AUTHENTICATED)
   end
   auth.endpoint = discover_endpoint(ctx, auth)
   state.auth = auth
@@ -525,7 +525,7 @@ function M.provider()
       end
       local auth, auth_err = M.token(ctx)
       if not auth then
-        return nil, auth_err or M.NOT_AUTHENTICATED
+        return nil, auth_err or http.config_error(M.NOT_AUTHENTICATED)
       end
       local model = compat.describe(M.def, info)
       return {

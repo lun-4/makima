@@ -34,6 +34,7 @@ const API_STATUS: u16 = 429;
 const RETRY_AFTER_SECS: f64 = 1.5;
 const TRANSPORT_MESSAGE: &str = "connection reset";
 const RAISED_MESSAGE: &str = "boom";
+const CONFIG_MESSAGE: &str = "AWS_REGION must be set";
 const DUPLICATE_ERR: &str =
     r#"provider "fake" from plugin "other_plugin" is already registered by plugin "fake_plugin""#;
 const UNKNOWN_FIELD_ERR: &str = "unknown field `colour`";
@@ -323,6 +324,14 @@ fn prepare_may_adjust_the_model_but_not_its_id() {
     &format!("return nil, {{ message = '{TRANSPORT_MESSAGE}' }}"),
     |e| matches!(e, AgentError::Io(io) if io.to_string() == TRANSPORT_MESSAGE) && e.retry_kind().is_some()
     ; "error table without status is retryable")]
+#[test_case(
+    &format!("return nil, {{ kind = 'config', message = '{CONFIG_MESSAGE}' }}"),
+    |e| matches!(e, AgentError::Config { message } if message == CONFIG_MESSAGE) && e.retry_kind().is_none()
+    ; "config kind is not retried")]
+#[test_case(
+    &format!("return nil, {{ kind = 'config', status = {API_STATUS}, message = '{CONFIG_MESSAGE}' }}"),
+    |e| matches!(e, AgentError::Config { message } if message == CONFIG_MESSAGE)
+    ; "config kind wins over status")]
 #[test_case(
     &format!("error('{RAISED_MESSAGE}')"),
     |e| matches!(e, AgentError::Config { message } if message.contains(RAISED_MESSAGE)) && e.retry_kind().is_none()

@@ -100,7 +100,7 @@ function M.parse_adc(content)
     return nil, M.INVALID_ADC
   end
   if file.type ~= AUTHORIZED_USER then
-    return nil, string.format(UNSUPPORTED_ADC, file.type)
+    return nil, http.config_error(string.format(UNSUPPORTED_ADC, file.type))
   end
   if
     type(file.client_id) ~= "string"
@@ -133,7 +133,7 @@ function M.source()
   local path = env("GOOGLE_APPLICATION_CREDENTIALS")
   if path then
     if not maki.fs.metadata(path) then
-      return nil, "GOOGLE_APPLICATION_CREDENTIALS does not exist: " .. path
+      return nil, http.config_error("GOOGLE_APPLICATION_CREDENTIALS does not exist: " .. path)
     end
   else
     path = default_adc_path()
@@ -163,7 +163,7 @@ function M.settings(config)
     or nonempty(config.project)
     or nonempty(source.quota_project)
   if not project then
-    return nil, M.PROJECT_ERROR
+    return nil, http.config_error(M.PROJECT_ERROR)
   end
   local location = nonempty(env("GOOGLE_CLOUD_LOCATION")) or nonempty(config.location) or DEFAULT_LOCATION
   return { source = source, project = project, location = location }
@@ -215,7 +215,7 @@ local function token_response(ctx, source)
   end
   local response, err = ctx.send({ url = M.METADATA_TOKEN_URL, headers = { ["Metadata-Flavor"] = "Google" } })
   if not response then
-    return nil, M.METADATA_UNAVAILABLE .. tostring(err)
+    return nil, http.config_error(M.METADATA_UNAVAILABLE .. tostring(err))
   end
   if response.status ~= OK then
     return nil, http.error(response)
@@ -305,7 +305,7 @@ end
 local function auth_status(_, config)
   local settings, err = M.settings(config)
   if not settings then
-    return { state = "missing", detail = err }
+    return { state = "missing", detail = http.message(err) }
   end
   local via = settings.source.metadata and "metadata server" or "ADC"
   return { state = "env", detail = string.format("via %s, project %s", via, settings.project) }

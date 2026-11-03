@@ -1,4 +1,5 @@
 local bedrock = require("providers.bedrock")
+local http = require("providers.http")
 local sigv4 = require("providers.sigv4")
 local t = require("maki.test_helpers")
 
@@ -118,7 +119,8 @@ t.case("container_credentials_response", function()
   })
   local missing, err = bedrock.parse_container_credentials({ SecretAccessKey = "s1" })
   t.eq(missing, nil)
-  t.has(err, "AccessKeyId")
+  t.eq(err.kind, http.CONFIG_KIND)
+  t.has(err.message, "AccessKeyId")
 end)
 
 t.case("resolve_follows_claude_code_precedence", function()
@@ -130,7 +132,7 @@ t.case("resolve_follows_claude_code_precedence", function()
     end
     return env
   end
-  t.eq(select(2, resolve({})), bedrock.MISSING_REGION)
+  t.same(select(2, resolve({})), http.config_error(bedrock.MISSING_REGION))
   t.same(
     resolve(with({ AWS_BEARER_TOKEN_BEDROCK = "bt", CLAUDE_CODE_SKIP_BEDROCK_AUTH = "1" })),
     { region = REGION, method = "bearer", bearer = "bt" }
@@ -144,7 +146,7 @@ t.case("resolve_follows_claude_code_precedence", function()
     resolve(with(keys)),
     { region = REGION, method = "env", access_key = "AKID", secret_key = "SECRET", session_token = "TOK" }
   )
-  t.eq(select(2, resolve(with({ HOME = "/nonexistent" }))), bedrock.NO_CREDENTIALS)
+  t.same(select(2, resolve(with({ HOME = "/nonexistent" }))), http.config_error(bedrock.NO_CREDENTIALS))
 end)
 
 t.case("resolve_reads_the_profile_from_home", function()
@@ -183,7 +185,15 @@ t.case("container_failure_names_the_status", function()
     { AWS_REGION = REGION, AWS_CONTAINER_CREDENTIALS_FULL_URI = CONTAINER_URL },
     { t.response({ "denied" }, { status = 403 }) }
   )
-  t.eq(err, "container creds endpoint returned 403: denied")
+  t.same(err, http.config_error("container creds endpoint returned 403: denied"))
+end)
+
+t.case("missing_region_status_shows_the_message", function()
+  local status
+  t.with_env({}, function()
+    status = bedrock.auth_status(t.provider_ctx({}))
+  end)
+  t.same(status, { state = "missing", detail = bedrock.MISSING_REGION })
 end)
 
 t.case("offline_status_never_calls_the_container", function()
@@ -293,7 +303,8 @@ t.case("failed_refresh_stops_the_request", function()
       local instance = assert(bedrock.instance(ctx))
       local result, err = instance.stream(ctx, request("claude-sonnet-4-5"), t.recorder())
       t.eq(result, nil)
-      t.has(err, "returned 500")
+      t.eq(err.kind, http.CONFIG_KIND)
+      t.has(err.message, "returned 500")
     end)
   end)
   t.eq(#ctx.requests, 2)

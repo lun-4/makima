@@ -1,3 +1,4 @@
+local http = require("providers.http")
 local openai = require("providers.openai")
 local t = require("maki.test_helpers")
 
@@ -219,7 +220,7 @@ t.case("plan_models_reject_responses_without_visible_models", function()
   for _, response in ipairs({ {}, { models = { { slug = "x", visibility = "hide" } } } }) do
     local models, err = openai.parse_plan_models(response, ACCOUNT)
     t.eq(models, nil)
-    t.eq(err, openai.EMPTY_MODELS_ERROR)
+    t.same(err, http.config_error(openai.EMPTY_MODELS_ERROR))
   end
 end)
 
@@ -501,7 +502,7 @@ t.case("usage_parses_quota_windows", function()
   for _, response in ipairs({ {}, { rate_limit = {} } }) do
     local empty, err = openai.parse_usage(response)
     t.eq(empty, nil)
-    t.eq(err, openai.EMPTY_USAGE_ERROR)
+    t.same(err, http.config_error(openai.EMPTY_USAGE_ERROR))
   end
 end)
 

@@ -1,5 +1,6 @@
 local clock = require("providers.clock")
 local compat = require("providers.openai_compat")
+local http = require("providers.http")
 local thinking = require("providers.thinking")
 
 local M = {}
@@ -35,7 +36,7 @@ end
 -- fallback.
 function M.parse_quotas(body)
   if type(body) ~= "table" then
-    return nil, M.EMPTY_USAGE_ERROR
+    return nil, http.config_error(M.EMPTY_USAGE_ERROR)
   end
   local limits = {}
   local rolling, subscription, weekly =
@@ -61,7 +62,7 @@ function M.parse_quotas(body)
     }
   end
   if #limits == 0 then
-    return nil, M.EMPTY_USAGE_ERROR
+    return nil, http.config_error(M.EMPTY_USAGE_ERROR)
   end
   return { limits = limits }
 end

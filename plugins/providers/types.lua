@@ -105,9 +105,14 @@ export type StreamResult = {
   stop_reason: ("end_turn" | "tool_use" | "max_tokens")?,
 }
 
--- Returned as `nil, err`. A table with a status is an API error; anything
--- else is a transport error the host retries. A raised error is not retried.
-export type Error = string | { status: number, message: string, retry_after: number? }
+-- Returned as `nil, err`. A table with `kind = "config"` is a configuration
+-- error (missing key, setting or credentials file) the host does not retry;
+-- a table with a status is an API error; anything else is a transport error
+-- the host retries. A raised error is not retried.
+export type Error =
+  string
+  | { kind: "config", message: string }
+  | { status: number, message: string, retry_after: number? }
 
 export type Response = {
   status: number,

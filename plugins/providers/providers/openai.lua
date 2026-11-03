@@ -454,7 +454,7 @@ function M.parse_plan_models(body, account_id)
     end
   end
   if #models == 0 then
-    return nil, M.EMPTY_MODELS_ERROR
+    return nil, http.config_error(M.EMPTY_MODELS_ERROR)
   end
   return models
 end
@@ -490,7 +490,7 @@ function M.parse_usage(body)
   end
   local plan = type(body.plan_type) == "string" and body.plan_type or nil
   if not plan and #limits == 0 then
-    return nil, M.EMPTY_USAGE_ERROR
+    return nil, http.config_error(M.EMPTY_USAGE_ERROR)
   end
   return { plan = plan, limits = limits }
 end
