@@ -2464,8 +2464,8 @@ mod tests {
     const THINKING_MODEL_ID: &str = "acp-load-thinker";
     const PRIMARY_TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
     const LIFECYCLE_STRESS_ITERATIONS: usize = 64;
-    const SPAWN_TEST_SPEC: &str = "ollama/acp-end-turn-test";
-    const DISCOVERY_PROVIDER: &str = "ollama";
+    const SPAWN_TEST_SPEC: &str = "aperture/acp-end-turn-test";
+    const DISCOVERY_PROVIDER: &str = "aperture";
     const DISCOVERY_MODEL_ID: &str = "acp-discovery-refresh-test";
     const DISCOVERED_WINDOW: u32 = 524_000;
     const NEW_SESSION_REQUEST: i64 = 91;
@@ -4031,12 +4031,13 @@ mod tests {
     }
 
     const GHOST_MODE: &str = "ghost";
-    const UNREACHABLE_OLLAMA_HOST: &str = "http://127.0.0.1:1";
+    const UNREACHABLE_HOST: &str = "http://127.0.0.1:1";
+    const HOST_ENV: &str = "APERTURE_HOST";
 
     #[test]
     fn closing_a_session_releases_its_orchestration() {
         // SAFETY: nextest runs each test in its own process.
-        unsafe { std::env::set_var("OLLAMA_HOST", UNREACHABLE_OLLAMA_HOST) };
+        unsafe { std::env::set_var(HOST_ENV, UNREACHABLE_HOST) };
         smol::block_on(async {
             let cwd = TempDir::new().unwrap();
             let host = maki_lua::PluginHost::new(Arc::new(maki_agent::tools::ToolRegistry::new()))
@@ -4112,7 +4113,7 @@ mod tests {
     #[test_case(GHOST_MODE, true ; "unknown_mode_is_invalid_params")]
     fn set_mode_commits_through_the_shared_setter(mode: &str, invalid: bool) {
         // SAFETY: nextest runs each test in its own process.
-        unsafe { std::env::set_var("OLLAMA_HOST", UNREACHABLE_OLLAMA_HOST) };
+        unsafe { std::env::set_var(HOST_ENV, UNREACHABLE_HOST) };
         smol::block_on(async {
             let cwd = TempDir::new().unwrap();
             let params = test_params(
@@ -5987,8 +5988,8 @@ mod tests {
     #[test]
     fn spawned_primary_turn_end_turn_releases_pending_operation() {
         smol::block_on(async {
-            let previous_host = std::env::var_os("OLLAMA_HOST");
-            unsafe { std::env::set_var("OLLAMA_HOST", "http://127.0.0.1:1") };
+            let previous_host = std::env::var_os(HOST_ENV);
+            unsafe { std::env::set_var(HOST_ENV, UNREACHABLE_HOST) };
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
             let session_id = srv.session.as_ref().unwrap().handle.session_id.clone();
             let model = Model::from_spec(SPAWN_TEST_SPEC).unwrap();
@@ -6135,8 +6136,8 @@ mod tests {
             );
             close_session(&mut srv).await;
             match previous_host {
-                Some(host) => unsafe { std::env::set_var("OLLAMA_HOST", host) },
-                None => unsafe { std::env::remove_var("OLLAMA_HOST") },
+                Some(host) => unsafe { std::env::set_var(HOST_ENV, host) },
+                None => unsafe { std::env::remove_var(HOST_ENV) },
             }
         });
     }
@@ -6369,8 +6370,8 @@ mod tests {
     #[test]
     fn prompt_immediately_after_new_session_is_queued() {
         smol::block_on(async {
-            let previous_host = std::env::var_os("OLLAMA_HOST");
-            unsafe { std::env::set_var("OLLAMA_HOST", "http://127.0.0.1:1") };
+            let previous_host = std::env::var_os(HOST_ENV);
+            unsafe { std::env::set_var(HOST_ENV, UNREACHABLE_HOST) };
             let temp = TempDir::new().unwrap();
             let cwd = temp.path().to_path_buf();
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
@@ -6448,8 +6449,8 @@ mod tests {
             );
             close_session(&mut srv).await;
             match previous_host {
-                Some(host) => unsafe { std::env::set_var("OLLAMA_HOST", host) },
-                None => unsafe { std::env::remove_var("OLLAMA_HOST") },
+                Some(host) => unsafe { std::env::set_var(HOST_ENV, host) },
+                None => unsafe { std::env::remove_var(HOST_ENV) },
             }
         });
     }
@@ -6457,8 +6458,8 @@ mod tests {
     #[test]
     fn discovery_reaches_the_root_its_catalog_and_the_client() {
         smol::block_on(async {
-            let previous_host = std::env::var_os("OLLAMA_HOST");
-            unsafe { std::env::set_var("OLLAMA_HOST", "http://127.0.0.1:1") };
+            let previous_host = std::env::var_os(HOST_ENV);
+            unsafe { std::env::set_var(HOST_ENV, UNREACHABLE_HOST) };
             let temp = TempDir::new().unwrap();
             let cwd = temp.path().to_path_buf();
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
@@ -6534,8 +6535,8 @@ mod tests {
             assert_eq!(read.options().version, version);
             close_session(&mut srv).await;
             match previous_host {
-                Some(host) => unsafe { std::env::set_var("OLLAMA_HOST", host) },
-                None => unsafe { std::env::remove_var("OLLAMA_HOST") },
+                Some(host) => unsafe { std::env::set_var(HOST_ENV, host) },
+                None => unsafe { std::env::remove_var(HOST_ENV) },
             }
         });
     }
@@ -6543,8 +6544,8 @@ mod tests {
     #[test]
     fn completed_then_cancelled_session_can_be_replaced_and_prompted() {
         smol::block_on(async {
-            let previous_host = std::env::var_os("OLLAMA_HOST");
-            unsafe { std::env::set_var("OLLAMA_HOST", "http://127.0.0.1:1") };
+            let previous_host = std::env::var_os(HOST_ENV);
+            unsafe { std::env::set_var(HOST_ENV, UNREACHABLE_HOST) };
             let temp = TempDir::new().unwrap();
             let cwd = temp.path().to_path_buf();
             let (mut srv, _, out_rx, turns) = server_awaiting_answer();
@@ -6722,8 +6723,8 @@ mod tests {
             );
             close_session(&mut srv).await;
             match previous_host {
-                Some(host) => unsafe { std::env::set_var("OLLAMA_HOST", host) },
-                None => unsafe { std::env::remove_var("OLLAMA_HOST") },
+                Some(host) => unsafe { std::env::set_var(HOST_ENV, host) },
+                None => unsafe { std::env::remove_var(HOST_ENV) },
             }
         });
     }
@@ -7166,7 +7167,7 @@ mod tests {
     #[test]
     fn load_restores_saved_mode_and_thinking_over_config() {
         // SAFETY: nextest runs each test in its own process.
-        unsafe { std::env::set_var("OLLAMA_HOST", UNREACHABLE_OLLAMA_HOST) };
+        unsafe { std::env::set_var(HOST_ENV, UNREACHABLE_HOST) };
         smol::block_on(async {
             let tmp = TempDir::new().unwrap();
             maki_storage::paths::init_at(tmp.path().to_path_buf()).unwrap();

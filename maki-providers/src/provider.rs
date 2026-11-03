@@ -19,7 +19,6 @@ use crate::providers::catalog::{
     OPENCODE_FAMILY_SLUGS, available_if_warm, catalog_providers, catalog_providers_if_available,
 };
 use crate::providers::dynamic;
-use crate::providers::local::{LLAMACPP, LocalEndpoint, OLLAMA};
 use crate::providers::opencode::Opencode;
 use crate::{
     AgentError, ConversationEnd, Invocation, Message, ProviderEvent, ProviderUsage, RequestOptions,
@@ -39,7 +38,11 @@ pub enum ProviderKind {
     /// Only the protocol base that Aperture routes and dynamic and custom
     /// providers name. The `google` provider is registered from Lua.
     Google,
+    /// Only the protocol base that Aperture routes and dynamic providers
+    /// name. The `ollama` provider is registered from Lua.
     Ollama,
+    /// Only the protocol base that Aperture routes and dynamic providers
+    /// name. The `llama-cpp` provider is registered from Lua.
     LlamaCpp,
     #[strum(serialize = "opencode")]
     Opencode,
@@ -89,12 +92,6 @@ impl ProviderKind {
                 Some("Prompt caching, thinking mode (adaptive/budgeted), advanced tool use")
             }
             Self::Google => Some("Native Gemini API with thinking support"),
-            Self::Ollama => {
-                Some("Local or remote inference via OLLAMA_HOST, cloud fallback via OLLAMA_API_KEY")
-            }
-            Self::LlamaCpp => Some(
-                "Local or remote inference via LLAMA_CPP_HOST, set optional key via LLAMA_CPP_API_KEY",
-            ),
             Self::Opencode => Some(
                 "Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Zen API",
             ),
@@ -147,11 +144,11 @@ impl ProviderKind {
 
     pub(crate) fn create(self, timeouts: Timeouts) -> Result<Box<dyn NativeProvider>, AgentError> {
         match self {
-            Self::Anthropic | Self::OpenAi | Self::Google => Err(AgentError::Config {
-                message: format!("provider '{self}' is registered by the providers plugin"),
-            }),
-            Self::Ollama => Ok(Box::new(LocalEndpoint::new(&OLLAMA, timeouts)?)),
-            Self::LlamaCpp => Ok(Box::new(LocalEndpoint::new(&LLAMACPP, timeouts)?)),
+            Self::Anthropic | Self::OpenAi | Self::Google | Self::Ollama | Self::LlamaCpp => {
+                Err(AgentError::Config {
+                    message: format!("provider '{self}' is registered by the providers plugin"),
+                })
+            }
             Self::Opencode => Ok(Box::new(Opencode::new(timeouts)?)),
             Self::Aperture => Ok(Box::new(Aperture::new(timeouts)?)),
         }

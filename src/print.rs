@@ -842,9 +842,9 @@ mod tests {
     const CHILD_RESPONSE: &str = "print child response";
     const GRANDCHILD_RESPONSE: &str = "print grandchild response";
     const COMMAND_CHILD_PROMPT: &str = "print command child request";
-    /// Re-preparing needs a constructible provider; ollama needs only a host.
-    const DISCOVERY_PROVIDER: &str = "ollama";
-    const DISCOVERY_HOST_ENV: &str = "OLLAMA_HOST";
+    /// Re-preparing needs a constructible provider; aperture needs only a host.
+    const DISCOVERY_PROVIDER: &str = "aperture";
+    const DISCOVERY_HOST_ENV: &str = "APERTURE_HOST";
     const UNREACHABLE_HOST: &str = "http://127.0.0.1:1";
     const DISCOVERY_MODEL_ID: &str = "print-discovery-root";
     const DISCOVERED_WINDOW: u32 = 777_000;

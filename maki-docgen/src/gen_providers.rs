@@ -350,9 +350,7 @@ struct ProviderSection {
 
 fn format_auth(kind: ProviderKind) -> String {
     let env = kind.api_key_env();
-    if kind == ProviderKind::Ollama {
-        format!("`OLLAMA_HOST` for local/remote (e.g. `http://localhost:11434`), `{env}` for auth")
-    } else if kind == ProviderKind::Aperture {
+    if kind == ProviderKind::Aperture {
         "`APERTURE_HOST` (e.g. `https://your-host.tailnet.ts.net`)".into()
     } else {
         format!("`{env}`")
@@ -365,7 +363,11 @@ fn build_sections() -> Vec<ProviderSection> {
     for kind in ProviderKind::iter() {
         match kind {
             // Registered from Lua; the variants are only protocol bases.
-            ProviderKind::Anthropic | ProviderKind::OpenAi | ProviderKind::Google => {}
+            ProviderKind::Anthropic
+            | ProviderKind::OpenAi
+            | ProviderKind::Google
+            | ProviderKind::Ollama
+            | ProviderKind::LlamaCpp => {}
             _ => {
                 sections.push(ProviderSection {
                     kind,
@@ -432,16 +434,6 @@ fn write_model_table(out: &mut String, entries: &[ModelEntry]) {
 
 fn no_catalog_note(kind: ProviderKind) -> &'static str {
     match kind {
-        ProviderKind::Ollama => {
-            "This provider talks the OpenAI-compatible `/v1` API, so it also works with \
-             llama.cpp's server, LocalAI, or anything else that speaks the same protocol. \
-             Just point `OLLAMA_HOST` to the right address \
-             (e.g. `http://localhost:8080` for llama.cpp)."
-        }
-        ProviderKind::LlamaCpp => {
-            "Connects to any OpenAI-compatible `/v1` endpoint. Point `LLAMA_CPP_HOST` \
-             to your server address (defaults to `http://localhost:8080`)."
-        }
         ProviderKind::Aperture => {
             "Aperture discovers models from your gateway. Set `APERTURE_HOST` to your Tailscale Aperture \
              endpoint (e.g. `https://your-host.tailnet.ts.net`). No API key needed, Tailscale handles auth."

@@ -16,9 +16,8 @@ use std::{
 };
 
 const TIMEOUT: Duration = Duration::from_secs(5);
-const RECENT: &str = "llama-cpp/discovery-recent";
-const CATALOG: &str = "llama-cpp/discovery-catalog";
-const API_KEY_ENV: &str = "LLAMA_CPP_API_KEY";
+const RECENT: &str = "aperture/discovery-recent";
+const CATALOG: &str = "aperture/discovery-catalog";
 const FAILURE_RESPONSE: &[u8] =
     b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
@@ -46,7 +45,7 @@ fn assert_picker_usable(event_loop: &mut EventLoop<'_>) {
     picker.open(RECENT);
     let text = picker_text(event_loop);
     assert!(text.contains("Recent"), "{text}");
-    assert!(text.contains("LlamaCpp"), "{text}");
+    assert!(text.contains("Aperture"), "{text}");
     assert!(text.contains("discovery-recent"), "{text}");
     assert!(text.contains("discovery-catalog"), "{text}");
     for spec in [RECENT, CATALOG] {
@@ -65,11 +64,9 @@ fn refresh_keeps_catalog_and_recents_through_slow_provider_failure() {
     paths::init_at(root.path().to_path_buf()).unwrap();
     std::fs::write(root.path().join("models-dev-catalog.json"), "{}").unwrap();
     let listener = Async::new(TcpListener::bind(("127.0.0.1", 0)).unwrap()).unwrap();
-    // SAFETY: nextest runs each test in its own process.
-    unsafe { std::env::set_var(API_KEY_ENV, "discovery-test-key") };
     let mut providers = ProvidersConfig::default();
     providers.upsert(
-        "llama-cpp".into(),
+        "aperture".into(),
         ProviderDef {
             base_url: Some(format!(
                 "http://{}",
@@ -89,7 +86,7 @@ fn refresh_keeps_catalog_and_recents_through_slow_provider_failure() {
             assert_eq!(stream.read(&mut byte).await.unwrap(), 1);
             request.push(byte[0]);
         }
-        assert!(request.starts_with(b"GET /props?"));
+        assert!(request.starts_with(b"GET /v1/models "));
         entered_tx.send_async(()).await.unwrap();
         if release_rx.recv_async().await.is_ok() {
             stream.write_all(FAILURE_RESPONSE).await.unwrap();
@@ -163,7 +160,7 @@ fn refresh_keeps_catalog_and_recents_through_slow_provider_failure() {
                 .warn_rx
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                 .unwrap();
-            if warning.starts_with("LlamaCpp:") {
+            if warning.starts_with("Aperture:") {
                 assert!(warning.contains("503"), "{warning}");
                 assert!(warning.contains("using static fallback"), "{warning}");
                 break;

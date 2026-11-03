@@ -38,22 +38,6 @@ The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discov
 
 ## Built-in Providers
 
-### Ollama
-
-- **Env var**: `OLLAMA_HOST` for local/remote (e.g. `http://localhost:11434`), `OLLAMA_API_KEY` for auth
-- **API**: `http://localhost:11434/v1`
-- **Features**: Local or remote inference via OLLAMA_HOST, cloud fallback via OLLAMA_API_KEY
-
-This provider talks the OpenAI-compatible `/v1` API, so it also works with llama.cpp's server, LocalAI, or anything else that speaks the same protocol. Just point `OLLAMA_HOST` to the right address (e.g. `http://localhost:8080` for llama.cpp).
-
-### LlamaCpp
-
-- **Env var**: `LLAMA_CPP_API_KEY`
-- **API**: `http://localhost:8080/v1`
-- **Features**: Local or remote inference via LLAMA_CPP_HOST, set optional key via LLAMA_CPP_API_KEY
-
-Connects to any OpenAI-compatible `/v1` endpoint. Point `LLAMA_CPP_HOST` to your server address (defaults to `http://localhost:8080`).
-
 ### Opencode Zen
 
 - **Env var**: `OPENCODE_API_KEY`

@@ -7,6 +7,7 @@
 --   `plans`: optional `{ id, label, base_url?, model?, login_url? }` list,
 --   chosen at login and stored as `plan` in `providers.toml`.
 --   `login_url`, `model`: the key page and default model id after login.
+--   `key_optional`: login says the key can be skipped.
 --   `models`: curated descriptors, each with optional `aliases`: ids that
 --   share the row. Unknown ids take the row with the longest matching prefix.
 --   `defaults`: descriptor fields every model starts from.
@@ -35,6 +36,7 @@ local DEFAULT_MAX_TOKENS_FIELD = "max_tokens"
 local BASE_URL_SUFFIX = "_BASE_URL"
 local METHOD_ID = "api_key"
 local METHOD_LABEL = "API key"
+local KEY_SKIP_HINT = " (or Enter to skip)"
 local PLAN_KEY = "plan"
 local PLAN_PROMPT = "Plan"
 local MASK_EDGE = 4
@@ -273,7 +275,8 @@ local function login(def)
         return nil, open_err
       end
     end
-    local key, err = ui:input(def.display_name .. " " .. METHOD_LABEL, true)
+    local prompt = def.display_name .. " " .. METHOD_LABEL .. (def.key_optional and KEY_SKIP_HINT or "")
+    local key, err = ui:input(prompt, true)
     if not key then
       return nil, err
     end
@@ -295,7 +298,14 @@ local function mask(key)
   return "****"
 end
 
-local function auth_status(def)
+-- The API key login method: opens the key page, asks for a key and saves
+-- it unless empty.
+function M.api_key_auth(def)
+  return { { id = METHOD_ID, label = METHOD_LABEL, login = login(def) } }
+end
+
+-- Where the key comes from: `env`, `saved`, `configured` or `missing`.
+function M.auth_status(def)
   return function(ctx, config)
     local keys, source = http.api_keys(ctx, config, def.env)
     if not keys then
@@ -319,8 +329,8 @@ function M.provider(def)
     id = def.id,
     display_name = def.display_name,
     models = M.descriptors(def),
-    auth = { { id = METHOD_ID, label = METHOD_LABEL, login = login(def) } },
-    auth_status = auth_status(def),
+    auth = M.api_key_auth(def),
+    auth_status = M.auth_status(def),
   }
   if def.plans then
     local choices = {}

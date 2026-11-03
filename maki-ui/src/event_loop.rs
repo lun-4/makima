@@ -4958,9 +4958,9 @@ mod tests {
     const OBSERVATION: &str = "failed";
     const PENDING_FAST_MODEL: &str = "pending-fast-model";
     const SWITCHED_FAST_MODEL: &str = "switched-fast-model";
-    /// Re-preparing needs a constructible provider; ollama needs only a host.
-    const DISCOVERY_PROVIDER: &str = "ollama";
-    const DISCOVERY_HOST_ENV: &str = "OLLAMA_HOST";
+    /// Re-preparing needs a constructible provider; aperture needs only a host.
+    const DISCOVERY_PROVIDER: &str = "aperture";
+    const DISCOVERY_HOST_ENV: &str = "APERTURE_HOST";
     const UNREACHABLE_HOST: &str = "http://127.0.0.1:1";
     const STARTUP_MODEL_ID: &str = "tui-discovery-startup";
     const RESUMED_MODEL_ID: &str = "tui-discovery-resumed";
