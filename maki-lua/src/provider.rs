@@ -26,9 +26,10 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::api::provider::{ProviderSpec, ProviderStore};
+use crate::credentials::Credentials;
 use crate::runtime::{Request, strip_traceback};
 
-const HOST_STOPPED: &str = "plugin host stopped";
+pub(crate) const HOST_STOPPED: &str = "plugin host stopped";
 const NO_STREAM: &str = "provider instance has no stream function";
 const DEFAULT_KEY_COUNT: usize = 1;
 
@@ -155,7 +156,7 @@ fn first(values: MultiValue) -> LuaValue {
     values.into_iter().next().unwrap_or(LuaValue::Nil)
 }
 
-fn serialize_options() -> SerializeOptions {
+pub(crate) fn serialize_options() -> SerializeOptions {
     SerializeOptions::new().serialize_none_to_null(false)
 }
 
@@ -171,6 +172,12 @@ impl Callbacks {
         let ctx = lua.create_table()?;
         ctx.set("id", &*self.id)?;
         ctx.set("send", lua.registry_value::<Function>(&self.send)?)?;
+        ctx.set(
+            "credentials",
+            Credentials {
+                id: Arc::clone(&self.id),
+            },
+        )?;
         Ok(ctx)
     }
 }

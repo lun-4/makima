@@ -9,6 +9,10 @@ use serde::de::{Deserializer, Error, Visitor};
 
 use crate::runtime::require_plugin_load;
 
+const ID_PUNCTUATION: &str = "-_.";
+const BAD_ID_ERR: &str =
+    "must be non-empty ASCII letters, digits, '-', '_' or '.', and not start with '.'";
+
 pub(crate) struct ProviderSpec {
     pub(crate) plugin: Arc<str>,
     pub(crate) id: Arc<str>,
@@ -90,6 +94,15 @@ struct SpecFields {
     _discover: Callback,
 }
 
+/// The id names the provider's credentials file, so it must be a plain file name.
+fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.starts_with('.')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || ID_PUNCTUATION.contains(c))
+}
+
 fn spec_error(message: impl fmt::Display) -> mlua::Error {
     mlua::Error::runtime(format!("register_provider: {message}"))
 }
@@ -99,7 +112,8 @@ fn spec_error(message: impl fmt::Display) -> mlua::Error {
 /// already owns fails and names both plugins.
 ///
 /// {spec} fields:
-///   `id` (string) Required. The provider part of `provider/model` specs.
+///   `id` (string) Required. The provider part of `provider/model` specs,
+///   made of ASCII letters, digits, `-`, `_` and `.`, not starting with `.`.
 ///   `display_name` (string) Required.
 ///   `models` (table) Model descriptors: `id` plus optional
 ///   `context_window`, `max_output_tokens`, `pricing`, `supports_thinking`,
@@ -112,7 +126,10 @@ fn spec_error(message: impl fmt::Display) -> mlua::Error {
 ///   `discover` (function) Optional. `discover(ctx)` returns the descriptors
 ///   the provider offers now.
 ///
-/// `ctx` is `{ id, send }`, where `send` is `maki.net.send`. An instance has
+/// `ctx` is `{ id, send, credentials }`, where `send` is `maki.net.send` and
+/// `credentials` is the provider's `maki.provider.Credentials`. Only the
+/// registering plugin's callbacks receive `ctx`, so a provider id's
+/// credentials belong to the plugin that registered it. An instance has
 /// `stream(ctx, request, emit)` and optionally `fetch_usage(ctx)`,
 /// `refresh_auth(ctx)`, `reload_auth(ctx)`, `rotate_key(ctx)`,
 /// `end_conversation(ctx, conversation_id, reason)` and `key_count` (a
@@ -163,11 +180,8 @@ fn register_provider(
             DeserializeOptions::new().deny_unsupported_types(false),
         )
         .map_err(spec_error)?;
-    if fields.id.is_empty() || fields.id.contains('/') {
-        return Err(spec_error(format!(
-            "id {:?} must be non-empty and contain no '/'",
-            fields.id
-        )));
+    if !valid_id(&fields.id) {
+        return Err(spec_error(format!("id {:?} {BAD_ID_ERR}", fields.id)));
     }
     let prepare = spec
         .get::<Option<Function>>("prepare")?

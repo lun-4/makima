@@ -5,6 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tracing::debug;
 
 use crate::{StateDir, StorageError, atomic_write_permissions};
@@ -197,6 +198,15 @@ pub fn save_provider_credentials(
 
 pub fn delete_provider_credentials(dir: &StateDir, slug: &str) -> Result<bool, StorageError> {
     delete_auth(&auth_path(dir, slug))
+}
+
+/// The credentials file of {provider} as stored, whatever its shape.
+pub fn load_credentials(dir: &StateDir, provider: &str) -> Option<Value> {
+    load_auth(&auth_path(dir, provider))
+}
+
+pub fn save_credentials(dir: &StateDir, provider: &str, value: &Value) -> Result<(), StorageError> {
+    save_auth(&auth_path(dir, provider), value)
 }
 
 #[cfg(test)]

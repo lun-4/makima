@@ -117,6 +117,7 @@ The rules:
 | [`maki.net`](#maki-net) | HTTP clients: a guarded `request` for web content and a raw, streaming |
 | [`maki.net.Response`](#maki-net-Response) | A streaming HTTP response from `maki.net.send`. |
 | [`maki.session`](#maki-session) | Host session primitives. |
+| [`maki.provider.Credentials`](#maki-provider-Credentials) | The calling provider's stored credentials, `ctx.credentials`. |
 | [`maki.usage`](#maki-usage) | Provider-side quota snapshots. |
 | [`maki.text`](#maki-text) | Text transformation utilities. |
 | [`maki.time`](#maki-time) | Wall-clock timestamps and relative-age formatting. |
@@ -1187,7 +1188,8 @@ A provider id belongs to one plugin; registering an id another plugin
 already owns fails and names both plugins.
 
 {spec} fields:
-  `id` (string) Required. The provider part of `provider/model` specs.
+  `id` (string) Required. The provider part of `provider/model` specs,
+  made of ASCII letters, digits, `-`, `_` and `.`, not starting with `.`.
   `display_name` (string) Required.
   `models` (table) Model descriptors: `id` plus optional
   `context_window`, `max_output_tokens`, `pricing`, `supports_thinking`,
@@ -1200,7 +1202,10 @@ already owns fails and names both plugins.
   `discover` (function) Optional. `discover(ctx)` returns the descriptors
   the provider offers now.
 
-`ctx` is `{ id, send }`, where `send` is `maki.net.send`. An instance has
+`ctx` is `{ id, send, credentials }`, where `send` is `maki.net.send` and
+`credentials` is the provider's `maki.provider.Credentials`. Only the
+registering plugin's callbacks receive `ctx`, so a provider id's
+credentials belong to the plugin that registered it. An instance has
 `stream(ctx, request, emit)` and optionally `fetch_usage(ctx)`,
 `refresh_auth(ctx)`, `reload_auth(ctx)`, `rotate_key(ctx)`,
 `end_conversation(ctx, conversation_id, reason)` and `key_count` (a
@@ -4542,6 +4547,106 @@ the saved default alone.
 
 ```lua
 maki.session.set_default_thinking("medium")
+```
+
+
+## maki.provider.Credentials {#maki-provider-Credentials}
+
+The calling provider's stored credentials, `ctx.credentials`.
+
+It always addresses that provider's own credentials file. The value is
+whatever JSON table the provider stores, such as `{ api_key }` or
+`{ access, refresh, expires }`.
+
+---
+
+### `Credentials:read()` {#Credentials-read}
+
+```lua
+Credentials:read()
+```
+
+Read the stored credentials.
+
+**Returns:** (`table?`, `string?`) The stored table, nil when there is none or it does not parse, or nil plus an error.
+
+**Example:**
+
+```lua
+local saved = ctx.credentials:read()
+```
+
+---
+
+### `Credentials:write()` {#Credentials-write}
+
+```lua
+Credentials:write({value})
+```
+
+Replace the stored credentials with {value}. The write is atomic and the
+file is readable only by the user.
+
+**Parameters:**
+
+- `{value}` (`table`) Any JSON-compatible table.
+
+**Returns:** (`boolean?`, `string?`) true, or nil plus an error.
+
+**Example:**
+
+```lua
+local ok, err = ctx.credentials:write({ api_key = key })
+```
+
+---
+
+### `Credentials:delete()` {#Credentials-delete}
+
+```lua
+Credentials:delete()
+```
+
+Delete the stored credentials.
+
+**Returns:** (`boolean?`, `string?`) true if a file was removed, false if there was none, or nil plus an error.
+
+**Example:**
+
+```lua
+ctx.credentials:delete()
+```
+
+---
+
+### `Credentials:refresh()` {#Credentials-refresh}
+
+```lua
+Credentials:refresh({fn})
+```
+
+Refresh the stored credentials as one transaction. {fn}`(current)` runs
+with a cross-process lock held and `current` reread from disk after the
+lock was taken. It returns a new table to store, nil to keep `current`
+(another process already refreshed), or nil plus an error.
+
+Concurrent refreshes of one provider share a single call of {fn}. The
+call runs on its own and is not cancelled with the caller, so a rotated
+token that the server already issued is always written.
+
+**Parameters:**
+
+- `{fn}` (`function`) `fn(current)` returning the table to store.
+
+**Returns:** (`table?`, `string?`) The stored table after the refresh, or nil plus an error.
+
+**Example:**
+
+```lua
+local tokens, err = ctx.credentials:refresh(function(current)
+  if current and current.expires > maki.time.now().secs * 1000 + 60000 then return nil end
+  return exchange(current.refresh)
+end)
 ```
 
 

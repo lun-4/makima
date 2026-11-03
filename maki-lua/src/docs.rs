@@ -121,6 +121,7 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
         &api::session::DOCS,
         &api::session_option::DOCS,
         &api::provider::DOCS,
+        &crate::credentials::CREDENTIALS_DOCS,
         &api::usage::DOCS,
         &api::text::DOCS,
         &api::time::DOCS,

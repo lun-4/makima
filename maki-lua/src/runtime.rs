@@ -2784,6 +2784,7 @@ impl LuaRuntime {
         lua.set_app_data(TimerStore::new());
         lua.set_app_data(Store::default());
         lua.set_app_data(ProviderStore::default());
+        lua.set_app_data(crate::credentials::RefreshFlights::default());
         let layered: Arc<LayeredTools> = Arc::default();
         lua.set_app_data(SlotStore::new(Arc::clone(&layered)));
         registry.set_hook(crate::hook::SlotHook {

@@ -37,7 +37,7 @@ const DUPLICATE_ERR: &str =
 const UNKNOWN_FIELD_ERR: &str = "unknown field `colour`";
 const PREPARE_REQUIRED_ERR: &str = "prepare is required";
 const EXPECTED_FUNCTION_ERR: &str = "expected a function";
-const BAD_ID_ERR: &str = "must be non-empty and contain no '/'";
+const BAD_ID_ERR: &str = "must be non-empty ASCII letters, digits";
 const TOP_LEVEL_ERR: &str = "may only be called at the top level during plugin load";
 const CALL_LOG: &str =
     "c-cancelled:cancelled,c-closed:closed,c-compacted:compacted,c-rewound:rewound,rotate";
@@ -162,6 +162,7 @@ fn invalid_spec_fields_are_rejected(extra: &str, expected: &str) {
 #[test_case(r#"maki.api.register_provider({ id = "x", display_name = "X" })"#, PREPARE_REQUIRED_ERR ; "missing prepare")]
 #[test_case(r#"maki.api.register_provider({ id = 1, display_name = "X", prepare = print })"#, "invalid type" ; "id of wrong type")]
 #[test_case(r#"maki.api.register_provider({ id = "x/y", display_name = "X", prepare = print })"#, BAD_ID_ERR ; "id with slash")]
+#[test_case(r#"maki.api.register_provider({ id = "..", display_name = "X", prepare = print })"#, BAD_ID_ERR ; "id with leading dot")]
 #[test_case(r#"maki.api.register_provider({ id = "x", display_name = "X", prepare = print, models = { { id = "m", colour = 1 } } })"#, UNKNOWN_FIELD_ERR ; "model descriptor field")]
 #[test_case(r#"maki.async.run(function() maki.api.register_provider({ id = "x", display_name = "X", prepare = print }) end)"#, TOP_LEVEL_ERR ; "outside plugin load")]
 fn invalid_registrations_are_rejected(source: &str, expected: &str) {
