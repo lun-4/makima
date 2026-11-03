@@ -125,6 +125,10 @@ impl ProviderRegistry {
         Self { entries, timeouts }
     }
 
+    pub fn contains(&self, id: &str) -> bool {
+        self.entries.contains_key(id)
+    }
+
     pub(crate) fn entries(&self) -> impl Iterator<Item = (&Arc<str>, &Entry)> {
         self.entries.iter()
     }

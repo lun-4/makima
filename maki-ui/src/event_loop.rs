@@ -377,8 +377,7 @@ fn prepare_terminal_handoff<'a>(
 }
 
 fn tick_session(app: &mut App, focused: bool, now: Instant) -> (Dirty, Vec<Action>) {
-    let actions = app.poll_login_picker();
-    let mut dirty = Dirty::NO;
+    let (mut dirty, actions) = app.poll_login_picker();
     if focused {
         dirty |= app.tick_at(now);
     } else {
@@ -1917,7 +1916,7 @@ impl<'t> EventLoop<'t> {
         let app = &mut runtimes[focused].app;
         app.exit_on_done = exit_on_done;
         if needs_login {
-            app.login_picker.open(app.storage.clone());
+            app.login_picker.open();
         }
         if !ctx.mcp_config_errors.is_empty() {
             let msg = format!("MCP config error: {}", ctx.mcp_config_errors);

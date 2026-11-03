@@ -562,6 +562,7 @@ impl App {
         let model_picker_models = Arc::new(ArcSwapOption::from(Some(Arc::new(Vec::new()))));
         let prepared_command_target = command_runtime.prepare_target();
         let command_target = prepared_command_target.handle().clone();
+        let login_picker = LoginPicker::new(Arc::clone(&providers), storage.clone());
         let mut app = Self {
             chats: vec![Chat::new(
                 "Main".into(),
@@ -591,7 +592,7 @@ impl App {
             model_picker_purpose: ModelPickerPurpose::Session,
             model_picker_target: None,
             plan_approval_pending: false,
-            login_picker: LoginPicker::new(),
+            login_picker,
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             rewind_picker: RewindPicker::new(),
             help_modal: HelpModal::new(),
@@ -921,11 +922,10 @@ impl App {
         Dirty::YES
     }
 
-    pub fn poll_login_picker(&mut self) -> Vec<Action> {
-        match self.login_picker.poll_codex() {
-            Some(action) => self.login_picker_actions(action),
-            None => Vec::new(),
-        }
+    pub fn poll_login_picker(&mut self) -> (Dirty, Vec<Action>) {
+        let (dirty, action) = self.login_picker.poll();
+        let actions = action.map_or_else(Vec::new, |action| self.login_picker_actions(action));
+        (dirty, actions)
     }
 
     fn login_picker_actions(&self, action: LoginPickerAction) -> Vec<Action> {
@@ -2794,7 +2794,7 @@ impl App {
                 vec![]
             }
             BuiltinOperation::OpenLoginPicker => {
-                self.login_picker.open(self.storage.clone());
+                self.login_picker.open();
                 vec![]
             }
             BuiltinOperation::QuickQuestion {

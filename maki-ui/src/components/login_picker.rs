@@ -1,18 +1,27 @@
+use std::env;
+use std::iter;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::event::{KeyCode, KeyEvent};
+use flume::{Receiver, Sender};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Wrap;
+use smol::Task;
 
 use maki_config::providers::{
     self, Protocol, ProviderDef, ProvidersConfig, VERTEX_LOGIN_INSTRUCTIONS, slugify,
 };
-use maki_providers::catalog_providers_if_available;
+use maki_providers::login::{
+    AuthState, ChoiceOption, InteractionRequest, InteractionService, LoginOutcome, LoginRequest,
+    drive_login,
+};
 use maki_providers::openai_auth;
+use maki_providers::provider::BoxFuture;
+use maki_providers::{AgentError, ProviderData, ProviderRegistry};
 use maki_storage::StateDir;
 use maki_storage::auth::{
     ProviderCredentials, load_provider_credentials, load_tokens, save_provider_credentials,
@@ -22,19 +31,27 @@ use maki_storage::model::persist_model;
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::modal::Modal;
+use crate::repaint::Dirty;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 
 const TITLE: &str = " Login ";
 const CATALOG_UNAVAILABLE_SLUG: &str = "catalog-unavailable";
+const CATALOG_UNAVAILABLE_LABEL: &str = "Models.dev providers (not yet downloaded)";
+const CATALOG_SECTION: &str = "Providers from Models.dev";
+pub const CUSTOM_SLUG: &str = "custom";
+const CUSTOM_LABEL: &str = "Custom provider...";
+const OPENCODE_SLUG: &str = "opencode";
 const OPENAI_SLUG: &str = "openai";
-const OPENAI_CODEX_SLUG: &str = "openai-codex";
+pub const OPENAI_CODEX_SLUG: &str = "openai-codex";
 const OPENAI_CODEX_DISPLAY: &str = "OpenAI Codex";
 const OPENAI_CODEX_LABEL: &str = "OpenAI Codex (ChatGPT login)";
 const CODEX_DONE_MESSAGE: &str = "Authenticated: OpenAI";
 const CODEX_ERROR_MESSAGE: &str = "Codex login failed: ";
 const INSTRUCTIONS_HEIGHT: u16 = 4;
 const INSTRUCTIONS_DISMISS: &str = "Press Enter or Esc to return";
+const WAITING_MESSAGE: &str = "Waiting... (Esc to cancel)";
+const SECRET_MASK: &str = "*";
 
 const PROTOCOLS: &[(&str, &str)] = &[
     ("openai", "OpenAI-compatible"),
@@ -42,36 +59,45 @@ const PROTOCOLS: &[(&str, &str)] = &[
     ("google", "Google Gemini"),
 ];
 
-#[derive(Clone)]
-struct ProviderItem {
-    slug: String,
-    display_name: String,
-    has_key: bool,
-    has_env: bool,
-    configured: bool,
-    section: Option<&'static str>,
-}
+struct ChoiceItem(ChoiceOption);
 
-impl PickerItem for ProviderItem {
+impl PickerItem for ChoiceItem {
     fn label(&self) -> &str {
-        &self.display_name
+        &self.0.label
     }
 
     fn section(&self) -> Option<&str> {
-        self.section
+        self.0.section.as_deref()
     }
 
     fn detail(&self) -> Option<&str> {
-        if self.has_key {
-            Some("saved")
-        } else if self.has_env {
-            Some("env")
-        } else if self.configured {
-            Some("configured")
-        } else {
-            None
-        }
+        self.0.detail.as_deref()
     }
+}
+
+enum LoginEvent {
+    Prompt(InteractionRequest, Sender<String>),
+    Finished(Result<LoginOutcome, AgentError>),
+}
+
+/// Hands each request to the picker, which answers from the UI thread.
+struct TuiInteraction(Sender<LoginEvent>);
+
+impl InteractionService for TuiInteraction {
+    fn interact(&self, request: InteractionRequest) -> BoxFuture<'_, Result<String, AgentError>> {
+        let (reply, answer) = flume::bounded(1);
+        let sent = self.0.send(LoginEvent::Prompt(request, reply));
+        Box::pin(async move {
+            sent.map_err(|_| AgentError::Cancelled)?;
+            answer.recv_async().await.map_err(|_| AgentError::Cancelled)
+        })
+    }
+}
+
+/// Dropping it cancels the login.
+struct LoginTask {
+    _task: Task<()>,
+    events: Receiver<LoginEvent>,
 }
 
 struct PlanItem {
@@ -110,7 +136,18 @@ enum CodexEvent {
 
 enum Step {
     Closed,
-    PickProvider(ListPicker<ProviderItem>),
+    /// The login driver is busy off the UI thread.
+    Waiting,
+    Choice {
+        picker: ListPicker<ChoiceItem>,
+        reply: Sender<String>,
+    },
+    Input {
+        input: TextBuffer,
+        prompt: String,
+        secret: bool,
+        reply: Sender<String>,
+    },
     PickPlan {
         picker: ListPicker<PlanItem>,
         slug: String,
@@ -158,6 +195,7 @@ enum Step {
 
 enum StepAction {
     None,
+    Wait,
     GoEnterKey {
         slug: String,
         plan: Option<String>,
@@ -199,117 +237,269 @@ enum StepAction {
 
 pub struct LoginPicker {
     step: Step,
-    provider_items: Vec<ProviderItem>,
-    storage: Option<maki_storage::StateDir>,
+    providers: Arc<ProviderRegistry>,
+    storage: StateDir,
+    /// The native rows of the current login, which name native steps.
+    native: Vec<ChoiceOption>,
+    login: Option<LoginTask>,
+    /// Notices from the provider's login, shown until the picker closes.
+    notes: Vec<String>,
 }
 
-impl LoginPicker {
-    pub fn new() -> Self {
-        Self {
-            step: Step::Closed,
-            provider_items: Vec::new(),
-            storage: None,
-        }
-    }
-
-    pub fn open(&mut self, storage: maki_storage::StateDir) {
-        let builtins = providers::all_builtins();
-        let config = providers::ProvidersConfig::load();
-        let mut items: Vec<ProviderItem> = builtins
-            .iter()
-            .map(|b| {
-                let has_key = load_provider_credentials(&storage, b.slug).is_some()
-                    || load_tokens(&storage, b.slug).is_some();
-                let has_env = std::env::var(b.default_api_key_env).is_ok();
-                let configured = !has_key
-                    && !has_env
-                    && config.get(b.slug).is_some_and(|d| d.base_url.is_some());
-                ProviderItem {
-                    slug: b.slug.to_string(),
-                    display_name: b.display_name.to_string(),
-                    has_key,
-                    has_env,
-                    configured,
-                    section: None,
-                }
-            })
-            .collect();
-
-        for (slug, def) in &config.providers {
-            if slug == "opencode" || providers::builtin_provider(slug).is_some() {
-                continue;
-            }
-            let has_key = load_provider_credentials(&storage, slug).is_some();
+/// Native providers a frontend logs in to itself, skipping any the registry
+/// now owns. Goes away with the native providers in commit 9.
+pub fn native_login_choices(
+    storage: &StateDir,
+    registry: &ProviderRegistry,
+    catalog: Option<Vec<ProviderData>>,
+) -> Vec<ChoiceOption> {
+    let config = ProvidersConfig::load();
+    let builtins = providers::all_builtins().into_iter().map(|b| {
+        let has_key = load_provider_credentials(storage, b.slug).is_some()
+            || load_tokens(storage, b.slug).is_some();
+        let has_env = env::var(b.default_api_key_env).is_ok();
+        let configured = config.get(b.slug).is_some_and(|d| d.base_url.is_some());
+        native_choice(
+            b.slug,
+            b.display_name,
+            None,
+            found_state(has_key, has_env, configured),
+        )
+    });
+    let custom = config
+        .providers
+        .iter()
+        .filter(|(slug, _)| *slug != OPENCODE_SLUG && providers::builtin_provider(slug).is_none())
+        .map(|(slug, def)| {
+            let has_key = load_provider_credentials(storage, slug).is_some();
             let has_env = def
                 .api_key_env
                 .as_deref()
-                .is_some_and(|e| std::env::var(e).is_ok());
-            items.push(ProviderItem {
-                slug: slug.clone(),
-                display_name: def.display_name.clone().unwrap_or_else(|| slug.clone()),
-                has_key,
-                has_env,
-                configured: false,
-                section: None,
-            });
-        }
-
-        items.push(ProviderItem {
-            slug: OPENAI_CODEX_SLUG.to_string(),
-            display_name: OPENAI_CODEX_LABEL.to_string(),
-            has_key: false,
-            has_env: false,
-            configured: false,
-            section: None,
+                .is_some_and(|e| env::var(e).is_ok());
+            let label = def.display_name.as_deref().unwrap_or(slug);
+            native_choice(slug, label, None, found_state(has_key, has_env, false))
         });
-
-        if let Some(catalog) = catalog_providers_if_available() {
-            let state_dir = StateDir::resolve().ok();
-            for cat in catalog {
-                let has_key = state_dir
-                    .as_ref()
-                    .and_then(|s| cat.load_key_from_storage(s))
-                    .is_some();
+    let codex = native_choice(
+        OPENAI_CODEX_SLUG,
+        OPENAI_CODEX_LABEL,
+        None,
+        AuthState::Missing,
+    );
+    let catalog: Vec<ChoiceOption> = match catalog {
+        Some(catalog) => catalog
+            .iter()
+            .map(|cat| {
+                let has_key = cat.load_key_from_storage(storage).is_some();
                 let has_env = cat.env_key_set().is_some();
-                items.push(ProviderItem {
-                    slug: cat.slug.clone(),
-                    display_name: cat.display_name.clone(),
-                    has_key,
-                    has_env,
-                    configured: false,
-                    section: Some("Providers from Models.dev"),
-                });
-            }
-        } else {
-            items.push(ProviderItem {
-                slug: CATALOG_UNAVAILABLE_SLUG.to_string(),
-                display_name: "Models.dev providers (not yet downloaded)".to_string(),
-                has_key: false,
-                has_env: false,
-                configured: false,
-                section: Some("Providers from Models.dev"),
-            });
+                let state = found_state(has_key, has_env, false);
+                native_choice(&cat.slug, &cat.display_name, Some(CATALOG_SECTION), state)
+            })
+            .collect(),
+        None => vec![native_choice(
+            CATALOG_UNAVAILABLE_SLUG,
+            CATALOG_UNAVAILABLE_LABEL,
+            Some(CATALOG_SECTION),
+            AuthState::Missing,
+        )],
+    };
+    let custom_choice = native_choice(CUSTOM_SLUG, CUSTOM_LABEL, None, AuthState::Missing);
+    builtins
+        .chain(custom)
+        .chain(iter::once(codex))
+        .chain(catalog)
+        .chain(iter::once(custom_choice))
+        .filter(|choice| !registry.contains(&choice.id))
+        .collect()
+}
+
+fn found_state(has_key: bool, has_env: bool, configured: bool) -> AuthState {
+    match () {
+        _ if has_key => AuthState::Saved,
+        _ if has_env => AuthState::Env,
+        _ if configured => AuthState::Configured,
+        _ => AuthState::Missing,
+    }
+}
+
+fn native_choice(id: &str, label: &str, section: Option<&str>, state: AuthState) -> ChoiceOption {
+    ChoiceOption {
+        id: id.into(),
+        label: label.into(),
+        detail: state.label().map(str::to_owned),
+        section: section.map(str::to_owned),
+    }
+}
+
+impl LoginPicker {
+    pub fn new(providers: Arc<ProviderRegistry>, storage: StateDir) -> Self {
+        Self {
+            step: Step::Closed,
+            providers,
+            storage,
+            native: Vec::new(),
+            login: None,
+            notes: Vec::new(),
         }
+    }
 
-        items.push(ProviderItem {
-            slug: "custom".to_string(),
-            display_name: "Custom provider...".to_string(),
-            has_key: false,
-            has_env: false,
-            configured: false,
-            section: None,
+    /// Starts the shared login driver in the background; its questions
+    /// arrive through `poll`.
+    pub fn open(&mut self) {
+        self.native = native_login_choices(
+            &self.storage,
+            &self.providers,
+            maki_providers::catalog_providers_if_available(),
+        );
+        let (events_tx, events) = flume::unbounded();
+        let providers = Arc::clone(&self.providers);
+        let storage = self.storage.clone();
+        let request = LoginRequest {
+            provider: None,
+            native: self.native.clone(),
+        };
+        let task = smol::spawn(async move {
+            let ui = Arc::new(TuiInteraction(events_tx.clone()));
+            let outcome = drive_login(&providers, ui, &storage, request).await;
+            let _ = events_tx.send(LoginEvent::Finished(outcome));
         });
+        self.login = Some(LoginTask {
+            _task: task,
+            events,
+        });
+        self.notes.clear();
+        self.step = Step::Waiting;
+    }
 
-        self.provider_items = items.clone();
-        let mut picker = ListPicker::new();
-        picker.open(items, TITLE);
-        self.storage = Some(storage);
-        self.step = Step::PickProvider(picker);
+    pub fn poll(&mut self) -> (Dirty, Option<LoginPickerAction>) {
+        if let Some(action) = self.poll_codex() {
+            return (Dirty::YES, Some(action));
+        }
+        let mut dirty = Dirty::NO;
+        let mut action = None;
+        while let Some(event) = self.login.as_ref().and_then(|l| l.events.try_recv().ok()) {
+            dirty = Dirty::YES;
+            action = self.handle_event(event).or(action);
+        }
+        (dirty, action)
+    }
+
+    fn handle_event(&mut self, event: LoginEvent) -> Option<LoginPickerAction> {
+        match event {
+            LoginEvent::Prompt(request, reply) => {
+                let note = match request {
+                    InteractionRequest::Input {
+                        prompt,
+                        secret,
+                        default,
+                    } => {
+                        self.step = Step::Input {
+                            input: TextBuffer::new(default.unwrap_or_default()),
+                            prompt,
+                            secret,
+                            reply,
+                        };
+                        return None;
+                    }
+                    InteractionRequest::Choice { prompt, options } => {
+                        let mut picker = ListPicker::new();
+                        picker.open(
+                            options.into_iter().map(ChoiceItem).collect(),
+                            format!(" {prompt} "),
+                        );
+                        self.step = Step::Choice { picker, reply };
+                        return None;
+                    }
+                    InteractionRequest::Instructions(text) => text,
+                    InteractionRequest::DeviceCode { url, code } => {
+                        format!("Open {url} and enter code {code}")
+                    }
+                    InteractionRequest::OpenBrowser(url) => format!("Opening {url}"),
+                };
+                self.notes.push(note);
+                let _ = reply.send(String::new());
+                None
+            }
+            LoginEvent::Finished(Ok(LoginOutcome::LoggedIn {
+                provider,
+                display_name,
+                model,
+            })) => {
+                self.step = Step::Done {
+                    message: format!("Authenticated: {display_name}"),
+                };
+                Some(match model {
+                    Some(model_spec) => LoginPickerAction::Authenticated { model_spec },
+                    None => LoginPickerAction::Configured {
+                        slug: provider.to_string(),
+                    },
+                })
+            }
+            LoginEvent::Finished(Ok(LoginOutcome::Native(slug))) => Some(self.select_native(slug)),
+            LoginEvent::Finished(Err(AgentError::Cancelled)) => {
+                Some(self.transition(StepAction::Close))
+            }
+            LoginEvent::Finished(Err(error)) => {
+                self.step = Step::Done {
+                    message: format!("Error: {error}"),
+                };
+                Some(LoginPickerAction::Consumed)
+            }
+        }
+    }
+
+    fn select_native(&mut self, slug: String) -> LoginPickerAction {
+        let action = match slug.as_str() {
+            CATALOG_UNAVAILABLE_SLUG => StepAction::Back,
+            CUSTOM_SLUG => StepAction::GoCustomName,
+            OPENAI_CODEX_SLUG => StepAction::GoCodex {
+                display_name: OPENAI_CODEX_DISPLAY.into(),
+            },
+            _ => {
+                let config = providers::ProvidersConfig::load();
+                let def = config.get(&slug);
+                let has_plans = providers::builtin_provider(&slug)
+                    .and_then(|b| b.plans)
+                    .is_some_and(|p| p.len() > 1);
+                if has_plans {
+                    StepAction::GoPickPlan { slug }
+                } else {
+                    let display_name =
+                        if providers::builtin_provider(&slug).is_some() || def.is_some() {
+                            providers::resolve_display_name(&slug, def)
+                        } else {
+                            self.native
+                                .iter()
+                                .find(|choice| choice.id == slug)
+                                .map_or_else(|| slug.clone(), |choice| choice.label.clone())
+                        };
+                    let needs_url = providers::builtin_provider(&slug).is_some_and(|b| b.needs_url);
+                    if slug == "vertex" {
+                        StepAction::GoInstructions {
+                            display_name,
+                            message: VERTEX_LOGIN_INSTRUCTIONS,
+                        }
+                    } else if needs_url {
+                        StepAction::GoBuiltinUrl { slug, display_name }
+                    } else {
+                        StepAction::GoEnterKey {
+                            slug,
+                            plan: None,
+                            display_name,
+                            custom: None,
+                            builtin_url: None,
+                            api_key_optional: false,
+                        }
+                    }
+                }
+            }
+        };
+        self.transition(action)
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
         match &mut self.step {
-            Step::EnterKey { input, .. }
+            Step::Input { input, .. }
+            | Step::EnterKey { input, .. }
             | Step::CustomName { input }
             | Step::CustomUrl { input, .. }
             | Step::BuiltinUrl { input, .. } => {
@@ -327,56 +517,28 @@ impl LoginPicker {
                 KeyCode::Esc | KeyCode::Enter => StepAction::Back,
                 _ => return LoginPickerAction::Consumed,
             },
-            Step::PickProvider(picker) => match picker.handle_key(key) {
+            Step::Waiting => match key.code {
+                KeyCode::Esc => StepAction::Close,
+                _ => return LoginPickerAction::Consumed,
+            },
+            Step::Choice { picker, reply } => match picker.handle_key(key) {
                 PickerAction::Select(item) => {
-                    if item.slug == CATALOG_UNAVAILABLE_SLUG {
-                        StepAction::None
-                    } else if item.slug == "custom" {
-                        StepAction::GoCustomName
-                    } else if item.slug == OPENAI_CODEX_SLUG {
-                        StepAction::GoCodex {
-                            display_name: OPENAI_CODEX_DISPLAY.into(),
-                        }
-                    } else {
-                        let slug = item.slug.clone();
-                        let config = providers::ProvidersConfig::load();
-                        let def = config.get(&slug);
-                        let has_plans = providers::builtin_provider(&slug)
-                            .and_then(|b| b.plans)
-                            .is_some_and(|p| p.len() > 1);
-                        if has_plans {
-                            StepAction::GoPickPlan { slug }
-                        } else {
-                            let display_name =
-                                if providers::builtin_provider(&slug).is_some() || def.is_some() {
-                                    providers::resolve_display_name(&slug, def)
-                                } else {
-                                    item.display_name.clone()
-                                };
-                            let needs_url =
-                                providers::builtin_provider(&slug).is_some_and(|b| b.needs_url);
-                            if slug == "vertex" {
-                                StepAction::GoInstructions {
-                                    display_name,
-                                    message: VERTEX_LOGIN_INSTRUCTIONS,
-                                }
-                            } else if needs_url {
-                                StepAction::GoBuiltinUrl { slug, display_name }
-                            } else {
-                                StepAction::GoEnterKey {
-                                    slug,
-                                    plan: None,
-                                    display_name,
-                                    custom: None,
-                                    builtin_url: None,
-                                    api_key_optional: false,
-                                }
-                            }
-                        }
-                    }
+                    let _ = reply.send(item.0.id);
+                    StepAction::Wait
                 }
-                PickerAction::Close => StepAction::Close,
+                PickerAction::Close => StepAction::Wait,
                 PickerAction::Consumed | PickerAction::Toggle(..) | PickerAction::Delete(..) => {
+                    return LoginPickerAction::Consumed;
+                }
+            },
+            Step::Input { input, reply, .. } => match key.code {
+                KeyCode::Enter => {
+                    let _ = reply.send(input.value().trim().to_owned());
+                    StepAction::Wait
+                }
+                KeyCode::Esc => StepAction::Wait,
+                _ => {
+                    input.handle_key(key);
                     return LoginPickerAction::Consumed;
                 }
             },
@@ -464,14 +626,10 @@ impl LoginPicker {
                     if api_key.is_empty() && !*api_key_optional {
                         return LoginPickerAction::Consumed;
                     }
-                    let Some(storage) = self.storage.as_ref() else {
-                        self.step = Step::Closed;
-                        return LoginPickerAction::Close;
-                    };
                     let slug_c = slug.clone();
                     let plan_c = plan.clone();
                     let dn_c = display_name.clone();
-                    let storage = storage.clone();
+                    let storage = self.storage.clone();
                     let custom_c = custom.take();
                     let builtin_url_c = builtin_url.take();
 
@@ -666,10 +824,7 @@ impl LoginPicker {
                 let (tx, rx) = flume::unbounded();
                 let abort = Arc::new(AtomicBool::new(false));
                 let thread_abort = abort.clone();
-                let Some(storage) = self.storage.clone() else {
-                    self.step = Step::Closed;
-                    return LoginPickerAction::Close;
-                };
+                let storage = self.storage.clone();
                 std::thread::spawn(move || {
                     let session = match openai_auth::start_device_login() {
                         Ok(session) => session,
@@ -763,14 +918,16 @@ impl LoginPicker {
                     LoginPickerAction::Configured { slug }
                 }
             }
+            StepAction::Wait => {
+                self.step = Step::Waiting;
+                LoginPickerAction::Consumed
+            }
             StepAction::Back => {
-                let mut picker = ListPicker::new();
-                picker.open(self.provider_items.clone(), TITLE);
-                self.step = Step::PickProvider(picker);
+                self.open();
                 LoginPickerAction::Consumed
             }
             StepAction::Close => {
-                self.step = Step::Closed;
+                self.close();
                 LoginPickerAction::Close
             }
         }
@@ -823,7 +980,27 @@ impl LoginPicker {
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
         match &mut self.step {
             Step::Closed => Rect::default(),
-            Step::PickProvider(picker) => picker.view(frame, area),
+            Step::Choice { picker, .. } => picker.view(frame, area),
+            Step::Waiting => {
+                let lines = note_lines(&self.notes)
+                    .chain(iter::once(placeholder_line(WAITING_MESSAGE)))
+                    .collect();
+                notes_modal(frame, area, lines)
+            }
+            Step::Input {
+                input,
+                prompt,
+                secret,
+                ..
+            } => {
+                let lines = note_lines(&self.notes)
+                    .chain([
+                        placeholder_line(prompt),
+                        input_line_with_cursor(input, *secret),
+                    ])
+                    .collect();
+                notes_modal(frame, area, lines)
+            }
             Step::PickPlan { picker, .. } => picker.view(frame, area),
             Step::CodexWaiting {
                 display_name,
@@ -862,7 +1039,7 @@ impl LoginPicker {
                 let (popup, inner) = modal.render(frame, area, 2);
                 let t = theme::current();
                 let hint = Span::styled("Enter provider name, then Enter", t.input_placeholder);
-                let input_line = input_line_with_cursor(input);
+                let input_line = input_line_with_cursor(input, false);
                 frame.render_widget(
                     ratatui::widgets::Paragraph::new(vec![Line::from(hint), input_line])
                         .style(Style::new().bg(t.background))
@@ -881,7 +1058,7 @@ impl LoginPicker {
                 let (popup, inner) = modal.render(frame, area, 2);
                 let t = theme::current();
                 let hint = Span::styled("Enter base URL, then Enter", t.input_placeholder);
-                let input_line = input_line_with_cursor(input);
+                let input_line = input_line_with_cursor(input, false);
                 frame.render_widget(
                     ratatui::widgets::Paragraph::new(vec![Line::from(hint), input_line])
                         .style(Style::new().bg(t.background))
@@ -903,7 +1080,7 @@ impl LoginPicker {
                 let (popup, inner) = modal.render(frame, area, 2);
                 let t = theme::current();
                 let hint = Span::styled("Edit host URL, or Enter to confirm", t.input_placeholder);
-                let input_line = input_line_with_cursor(input);
+                let input_line = input_line_with_cursor(input, false);
                 frame.render_widget(
                     ratatui::widgets::Paragraph::new(vec![Line::from(hint), input_line])
                         .style(Style::new().bg(t.background))
@@ -931,7 +1108,7 @@ impl LoginPicker {
                     "Paste API key, then Enter"
                 };
                 let hint = Span::styled(hint_text, t.input_placeholder);
-                let input_line = input_line_with_cursor(input);
+                let input_line = input_line_with_cursor(input, false);
                 frame.render_widget(
                     ratatui::widgets::Paragraph::new(vec![Line::from(hint), input_line])
                         .style(Style::new().bg(t.background))
@@ -965,18 +1142,10 @@ impl LoginPicker {
                 popup
             }
             Step::Done { message } => {
-                let modal = Modal {
-                    title: " Login ",
-                    width_percent: 50,
-                    max_height_percent: 30,
-                };
-                let (popup, inner) = modal.render(frame, area, 1);
-                frame.render_widget(
-                    ratatui::widgets::Paragraph::new(Line::from(message.clone()))
-                        .style(Style::new().bg(theme::current().background)),
-                    inner,
-                );
-                popup
+                let lines = iter::once(Line::from(message.clone()))
+                    .chain(note_lines(&self.notes))
+                    .collect();
+                notes_modal(frame, area, lines)
             }
         }
     }
@@ -989,13 +1158,45 @@ impl Overlay for LoginPicker {
 
     fn close(&mut self) {
         self.abort_codex();
+        self.login = None;
         self.step = Step::Closed;
     }
 }
 
-fn input_line_with_cursor(input: &TextBuffer) -> Line<'static> {
+fn note_lines(notes: &[String]) -> impl Iterator<Item = Line<'static>> + '_ {
+    notes.iter().map(|note| Line::from(note.clone()))
+}
+
+fn placeholder_line(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        text.to_owned(),
+        theme::current().input_placeholder,
+    ))
+}
+
+fn notes_modal(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) -> Rect {
+    let modal = Modal {
+        title: TITLE,
+        width_percent: 65,
+        max_height_percent: 45,
+    };
+    let height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let (popup, inner) = modal.render(frame, area, height);
+    frame.render_widget(
+        ratatui::widgets::Paragraph::new(lines)
+            .style(Style::new().bg(theme::current().background))
+            .wrap(Wrap { trim: true }),
+        inner,
+    );
+    popup
+}
+
+fn input_line_with_cursor(input: &TextBuffer, secret: bool) -> Line<'static> {
     let t = theme::current();
-    let value = input.value();
+    let value = match secret {
+        true => SECRET_MASK.repeat(input.value().chars().count()),
+        false => input.value(),
+    };
     let cursor_byte = TextBuffer::char_to_byte(&value, input.x());
     let (before, rest) = value.split_at(cursor_byte);
     let mut chars = rest.chars();
@@ -1018,31 +1219,206 @@ pub enum LoginPickerAction {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use crossterm::event::KeyModifiers;
+    use maki_agent::tools::ToolRegistry;
+    use maki_config::providers::ProvidersConfig;
+    use maki_lua::PluginHost;
+    use maki_lua::test_support::InMemoryFs;
+    use maki_lua::ui_sink::HostUi;
+    use maki_providers::Timeouts;
+    use maki_storage::model::read_model;
+    use tempfile::TempDir;
     use test_case::test_case;
 
     use super::*;
+    use crate::components::key;
 
-    fn provider_slugs() -> Vec<String> {
-        let dir = StateDir::from_path(tempfile::tempdir().unwrap().keep());
-        let mut picker = LoginPicker::new();
-        picker.open(dir);
-        picker
-            .provider_items
-            .iter()
-            .map(|p| p.slug.clone())
-            .collect()
+    /// A builtin id, so the registered provider shadows the native one.
+    const PROVIDER: &str = "deepseek";
+    const DISPLAY_NAME: &str = "Fake DeepSeek";
+    const DEFAULT_URL: &str = "http://localhost:8080";
+    const ANSWERED_URL: &str = "http://example.test";
+    const URL_PROMPT: &str = "Host URL";
+    const KEY_PROMPT: &str = "API key";
+    const KEY: &str = "sk-from-tui";
+    const MODEL_SPEC: &str = "deepseek/fake-2";
+    const BOUND: Duration = Duration::from_secs(10);
+
+    const SOURCE: &str = r#"
+        maki.api.register_provider({
+            id = "deepseek",
+            display_name = "Fake DeepSeek",
+            models = { { id = "fake-1", tier = "strong" } },
+            prepare = function() return {} end,
+            config = {
+                { key = "base_url", prompt = "Host URL", default = "http://localhost:8080", optional = true },
+            },
+            auth = {
+                { id = "api_key", label = "API key", login = function(ctx, ui, config)
+                    local key, err = ui:input("API key", true)
+                    if not key then return nil, err end
+                    assert(ctx.credentials:write({ api_key = key, host = config.base_url }))
+                    return { model = "fake-2" }
+                end },
+            },
+        })
+    "#;
+
+    struct Fixture {
+        _host: PluginHost,
+        picker: LoginPicker,
+        storage: StateDir,
+        _state: TempDir,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let state = TempDir::new().unwrap();
+            maki_storage::paths::init_at(state.path().to_path_buf()).unwrap();
+            let host = PluginHost::with_session_provider_preparer(
+                Arc::new(ToolRegistry::new()),
+                Default::default(),
+                true,
+                Arc::new(InMemoryFs::new()),
+                Some(state.path().to_path_buf()),
+                None,
+                HostUi::Frontend,
+            )
+            .unwrap();
+            host.load_source("fake_plugin", SOURCE).unwrap();
+            let registry = host.provider_registry(Timeouts::default()).unwrap();
+            let storage = StateDir::from_path(state.path().to_path_buf());
+            Self {
+                picker: LoginPicker::new(registry, storage.clone()),
+                _host: host,
+                storage,
+                _state: state,
+            }
+        }
+
+        /// Handles the login's next event, waiting a bounded time for it.
+        fn next_event(&mut self) -> Option<LoginPickerAction> {
+            let login = self.picker.login.as_ref().expect("login running");
+            let event = login.events.recv_timeout(BOUND).expect("login event");
+            self.picker.handle_event(event)
+        }
+
+        fn input(&self) -> (String, String, bool) {
+            match &self.picker.step {
+                Step::Input {
+                    input,
+                    prompt,
+                    secret,
+                    ..
+                } => (prompt.clone(), input.value(), *secret),
+                _ => panic!("expected an input step"),
+            }
+        }
+    }
+
+    fn picker_with(step: Step) -> LoginPicker {
+        let registry = Arc::new(ProviderRegistry::new(Vec::new(), Timeouts::default()));
+        LoginPicker {
+            step,
+            ..LoginPicker::new(registry, StateDir::from_path(env::temp_dir()))
+        }
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// The same outcome as the driver's own test: only the frontend differs.
+    #[test]
+    fn tui_login_matches_driver_outcome() {
+        let mut fixture = Fixture::new();
+        fixture.picker.open();
+
+        assert!(fixture.next_event().is_none());
+        let Step::Choice { picker, .. } = &mut fixture.picker.step else {
+            panic!("expected the provider choice");
+        };
+        assert!(picker.select_item_by(|item| item.0.id == PROVIDER));
+        fixture.picker.handle_key(key(KeyCode::Enter));
+
+        assert!(fixture.next_event().is_none());
+        assert_eq!(
+            fixture.input(),
+            (URL_PROMPT.into(), DEFAULT_URL.into(), false)
+        );
+        fixture.picker.handle_key(ctrl('a'));
+        fixture.picker.handle_key(ctrl('k'));
+        fixture.picker.handle_paste(ANSWERED_URL);
+        fixture.picker.handle_key(key(KeyCode::Enter));
+
+        assert!(fixture.next_event().is_none());
+        assert_eq!(fixture.input(), (KEY_PROMPT.into(), String::new(), true));
+        fixture.picker.handle_paste(KEY);
+        fixture.picker.handle_key(key(KeyCode::Enter));
+
+        let action = fixture.next_event();
+        assert!(matches!(
+            action,
+            Some(LoginPickerAction::Authenticated { model_spec }) if model_spec == MODEL_SPEC
+        ));
+        assert!(
+            matches!(&fixture.picker.step, Step::Done { message } if message.contains(DISPLAY_NAME))
+        );
+        let saved = load_provider_credentials(&fixture.storage, PROVIDER).unwrap();
+        assert_eq!(saved.api_key, KEY);
+        assert_eq!(saved.host.as_deref(), Some(ANSWERED_URL));
+        let section = ProvidersConfig::try_load().unwrap();
+        assert_eq!(
+            section.get(PROVIDER).unwrap().base_url.as_deref(),
+            Some(ANSWERED_URL)
+        );
+        assert_eq!(read_model(&fixture.storage).as_deref(), Some(MODEL_SPEC));
+    }
+
+    #[test]
+    fn escape_on_prompt_cancels_login() {
+        let mut fixture = Fixture::new();
+        fixture.picker.open();
+        assert!(fixture.next_event().is_none());
+        let Step::Choice { picker, .. } = &mut fixture.picker.step else {
+            panic!("expected the provider choice");
+        };
+        assert!(picker.select_item_by(|item| item.0.id == PROVIDER));
+        fixture.picker.handle_key(key(KeyCode::Enter));
+        assert!(fixture.next_event().is_none());
+
+        fixture.picker.handle_key(key(KeyCode::Esc));
+        assert!(matches!(fixture.picker.step, Step::Waiting));
+
+        assert!(matches!(
+            fixture.next_event(),
+            Some(LoginPickerAction::Close)
+        ));
+        assert!(!fixture.picker.is_open());
+        assert!(load_provider_credentials(&fixture.storage, PROVIDER).is_none());
+    }
+
+    #[test]
+    fn native_choices_include_codex_and_skip_registered() {
+        let fixture = Fixture::new();
+        let ids: Vec<String> =
+            native_login_choices(&fixture.storage, &fixture.picker.providers, None)
+                .into_iter()
+                .map(|choice| choice.id)
+                .collect();
+        assert!(ids.iter().any(|id| id == OPENAI_CODEX_SLUG));
+        assert!(ids.iter().any(|id| id == OPENAI_SLUG));
+        assert!(!ids.iter().any(|id| id == PROVIDER));
     }
 
     #[test]
     fn vertex_picker_instructions_render_completely() {
-        let mut picker = LoginPicker {
-            step: Step::Instructions {
-                display_name: "Google Vertex AI".into(),
-                message: VERTEX_LOGIN_INSTRUCTIONS,
-            },
-            provider_items: Vec::new(),
-            storage: None,
-        };
+        let mut picker = picker_with(Step::Instructions {
+            display_name: "Google Vertex AI".into(),
+            message: VERTEX_LOGIN_INSTRUCTIONS,
+        });
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal
@@ -1057,41 +1433,23 @@ mod tests {
 
     #[test]
     fn vertex_picker_shows_adc_instructions() {
-        let mut picker = LoginPicker {
-            step: Step::PickProvider(ListPicker::new()),
-            provider_items: Vec::new(),
-            storage: None,
-        };
-        picker.transition(StepAction::GoInstructions {
-            display_name: "Google Vertex AI".into(),
-            message: VERTEX_LOGIN_INSTRUCTIONS,
-        });
+        let mut picker = picker_with(Step::Waiting);
+        picker.select_native("vertex".into());
         assert!(matches!(
             picker.step,
             Step::Instructions { message, .. } if message == VERTEX_LOGIN_INSTRUCTIONS
         ));
     }
 
-    #[test]
-    fn provider_list_includes_codex_row() {
-        let slugs = provider_slugs();
-        assert!(slugs.iter().any(|s| s == OPENAI_CODEX_SLUG));
-        assert!(slugs.iter().any(|s| s == OPENAI_SLUG));
-    }
-
     fn codex_picker_with(event: CodexEvent) -> LoginPicker {
         let (tx, rx) = flume::unbounded();
         tx.send(event).unwrap();
-        LoginPicker {
-            step: Step::CodexWaiting {
-                display_name: "OpenAI".into(),
-                codex_rx: rx,
-                user_code: None,
-                abort: Arc::new(AtomicBool::new(false)),
-            },
-            provider_items: Vec::new(),
-            storage: None,
-        }
+        picker_with(Step::CodexWaiting {
+            display_name: "OpenAI".into(),
+            codex_rx: rx,
+            user_code: None,
+            abort: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     #[test_case(true; "codex done ok")]
@@ -1126,16 +1484,12 @@ mod tests {
     #[test]
     fn poll_codex_started_records_user_code() {
         let (tx, rx) = flume::unbounded();
-        let mut picker = LoginPicker {
-            step: Step::CodexWaiting {
-                display_name: "OpenAI".into(),
-                codex_rx: rx,
-                user_code: None,
-                abort: Arc::new(AtomicBool::new(false)),
-            },
-            provider_items: Vec::new(),
-            storage: None,
-        };
+        let mut picker = picker_with(Step::CodexWaiting {
+            display_name: "OpenAI".into(),
+            codex_rx: rx,
+            user_code: None,
+            abort: Arc::new(AtomicBool::new(false)),
+        });
         tx.send(CodexEvent::Started {
             user_code: "ABCD-EFGH".into(),
         })

@@ -12,6 +12,7 @@ mod color_compat;
 mod command_runtime;
 mod components;
 pub use components::keybindings;
+pub use components::login_picker::{CUSTOM_SLUG, OPENAI_CODEX_SLUG, native_login_choices};
 mod highlight;
 pub use highlight::highlight_ansi;
 pub mod image;

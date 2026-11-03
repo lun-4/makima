@@ -59,12 +59,16 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Some(Command::Auth { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
+            let (_host, providers, _) =
+                subcmd::provider_host(&startup_cwd()?, cli.no_plugins, cli.no_jit, trust_mode)?;
             match action {
                 AuthAction::Login { provider } => {
-                    subcmd::auth_login(provider.as_deref(), &storage)?
+                    subcmd::auth_login(provider.as_deref(), &storage, &providers)?
                 }
-                AuthAction::Logout { provider } => subcmd::auth_logout(&provider, &storage)?,
-                AuthAction::Status => subcmd::auth_status(&storage)?,
+                AuthAction::Logout { provider } => {
+                    subcmd::auth_logout(&provider, &storage, &providers)?
+                }
+                AuthAction::Status => subcmd::auth_status(&storage, &providers)?,
             }
         }
         Some(Command::Index { path }) => {
