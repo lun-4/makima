@@ -38,6 +38,11 @@ const UNKNOWN_FIELD_ERR: &str = "unknown field `colour`";
 const PREPARE_REQUIRED_ERR: &str = "prepare is required";
 const EXPECTED_FUNCTION_ERR: &str = "expected a function";
 const BAD_ID_ERR: &str = "must be non-empty ASCII letters, digits";
+const LOGIN_REQUIRED_ERR: &str = "login is required";
+const UNKNOWN_METHOD_ERR: &str = "names unknown auth method";
+const BAD_ALIAS_ERR: &str = "must be a valid provider id";
+const DUPLICATE_METHOD_ERR: &str = "is listed twice";
+const CONFIG_KEY_ERR: &str = "config key \"discover_models\"";
 const TOP_LEVEL_ERR: &str = "may only be called at the top level during plugin load";
 const CALL_LOG: &str =
     "c-cancelled:cancelled,c-closed:closed,c-compacted:compacted,c-rewound:rewound,rotate";
@@ -152,6 +157,12 @@ fn text(message: &Message) -> &str {
 
 #[test_case(r#"colour = "red","# , UNKNOWN_FIELD_ERR ; "unknown field")]
 #[test_case(r#"discover = 42,"# , EXPECTED_FUNCTION_ERR ; "callback of wrong type")]
+#[test_case(r#"auth = { { id = "k", label = "K" } },"# , LOGIN_REQUIRED_ERR ; "login missing")]
+#[test_case(r#"auth = { { id = "k", label = "K", login = print }, { id = "k", label = "K", login = print } },"# , DUPLICATE_METHOD_ERR ; "duplicate method")]
+#[test_case(r#"auth = { { id = "k", label = "K", login = print } }, aliases = { { id = "a", label = "A", method = "x" } },"# , UNKNOWN_METHOD_ERR ; "alias naming unknown method")]
+#[test_case(r#"auth = { { id = "k", label = "K", login = print } }, aliases = { { id = "a/b", label = "A", method = "k" } },"# , BAD_ALIAS_ERR ; "alias with bad id")]
+#[test_case(r#"config = { { key = "discover_models", prompt = "Discover" } },"# , CONFIG_KEY_ERR ; "non string config key")]
+#[test_case(r#"auth_status = 1,"# , EXPECTED_FUNCTION_ERR ; "auth_status of wrong type")]
 fn invalid_spec_fields_are_rejected(extra: &str, expected: &str) {
     let error = host()
         .load_source(PLUGIN, &spec_source(PROVIDER, extra, "return {}"))

@@ -1,8 +1,10 @@
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use maki_config::providers::ProviderDef;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::ModelInfo;
+use maki_providers::login::{AuthMethod, AuthSpec, ConfigField, LoginAlias};
 use mlua::{DeserializeOptions, Function, Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 use serde::Deserialize;
 use serde::de::{Deserializer, Error, Visitor};
@@ -12,6 +14,7 @@ use crate::runtime::require_plugin_load;
 const ID_PUNCTUATION: &str = "-_.";
 const BAD_ID_ERR: &str =
     "must be non-empty ASCII letters, digits, '-', '_' or '.', and not start with '.'";
+const BAD_ALIAS_ERR: &str = "must be a valid provider id other than the provider's own";
 
 pub(crate) struct ProviderSpec {
     pub(crate) plugin: Arc<str>,
@@ -20,6 +23,11 @@ pub(crate) struct ProviderSpec {
     pub(crate) models: Vec<ModelInfo>,
     pub(crate) prepare: Function,
     pub(crate) discover: Option<Function>,
+    pub(crate) auth: AuthSpec,
+    /// The `login` of each of `auth.methods`, in the same order.
+    pub(crate) logins: Vec<Function>,
+    pub(crate) auth_status: Option<Function>,
+    pub(crate) logout: Option<Function>,
     /// The registering plugin's `maki.net.send`, carrying its permissions.
     pub(crate) send: Function,
 }
@@ -92,6 +100,16 @@ struct SpecFields {
     _prepare: Callback,
     #[serde(default, rename = "discover")]
     _discover: Callback,
+    #[serde(default)]
+    auth: Vec<AuthMethod>,
+    #[serde(default)]
+    aliases: Vec<LoginAlias>,
+    #[serde(default)]
+    config: Vec<ConfigField>,
+    #[serde(default, rename = "auth_status")]
+    _auth_status: Callback,
+    #[serde(default, rename = "logout")]
+    _logout: Callback,
 }
 
 /// The id names the provider's credentials file, so it must be a plain file name.
@@ -101,6 +119,33 @@ fn valid_id(id: &str) -> bool {
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || ID_PUNCTUATION.contains(c))
+}
+
+/// Checks what serde cannot: references between methods, aliases and config.
+fn validate_auth(id: &str, auth: &AuthSpec) -> Result<(), String> {
+    let methods: Vec<&str> = auth.methods.iter().map(|method| &*method.id).collect();
+    for (i, method) in methods.iter().enumerate() {
+        if methods[..i].contains(method) {
+            return Err(format!("auth method {method:?} is listed twice"));
+        }
+    }
+    for alias in &auth.aliases {
+        if !valid_id(&alias.id) || alias.id == id {
+            return Err(format!("alias {:?} {BAD_ALIAS_ERR}", alias.id));
+        }
+        if !methods.contains(&&*alias.method) {
+            return Err(format!(
+                "alias {:?} names unknown auth method {:?}",
+                alias.id, alias.method
+            ));
+        }
+    }
+    for field in &auth.config {
+        ProviderDef::default()
+            .with_answers(&[(field.key.clone(), String::new())])
+            .map_err(|error| format!("config key {:?}: {error}", field.key))?;
+    }
+    Ok(())
 }
 
 fn spec_error(message: impl fmt::Display) -> mlua::Error {
@@ -125,6 +170,26 @@ fn spec_error(message: impl fmt::Display) -> mlua::Error {
 ///   with the same id, or nil plus an error.
 ///   `discover` (function) Optional. `discover(ctx)` returns the descriptors
 ///   the provider offers now.
+///   `config` (table) Optional. `providers.toml` fields asked before login:
+///   `{ key, prompt, default?, secret?, optional?, choices? }`, where
+///   `choices` is a list of `{ id, label, detail? }`. Keys are the text
+///   fields of a provider section, such as `base_url` or `plan`.
+///   `auth` (table) Login methods: `{ id, label, login }`.
+///   `login(ctx, ui, config)` gets a `maki.provider.LoginUi` and the
+///   provider's section with this login's answers applied, not yet saved.
+///   It returns a truthy value, optionally a table with `model` to choose
+///   the default model, or nil plus an error.
+///   `aliases` (table) Optional. `{ id, label, method }` names that log in
+///   with a preset method.
+///   `auth_status` (function) Optional. `auth_status(ctx, config)` returns
+///   `{ state, detail? }`, where `state` is `saved`, `env`, `configured` or
+///   `missing`. It must work without credentials. Without it, the
+///   provider counts as logged in while its credentials file exists.
+///   `logout` (function) Optional. `logout(ctx)`. Without it, logout
+///   deletes the credentials file.
+///
+/// Config is saved and the default model chosen only after `login`
+/// succeeds and `auth_status` no longer reports `missing`.
 ///
 /// `ctx` is `{ id, send, credentials }`, where `send` is `maki.net.send` and
 /// `credentials` is the provider's `maki.provider.Credentials`. Only the
@@ -153,6 +218,13 @@ fn spec_error(message: impl fmt::Display) -> mlua::Error {
 ///   id = "echo",
 ///   display_name = "Echo",
 ///   models = { { id = "echo-1", tier = "strong" } },
+///   auth = {
+///     { id = "api_key", label = "API key", login = function(ctx, ui, config)
+///       local key, err = ui:input("API key", true)
+///       if not key then return nil, err end
+///       return ctx.credentials:write({ api_key = key })
+///     end },
+///   },
 ///   prepare = function(ctx, model)
 ///     return {
 ///       stream = function(ctx, request, emit)
@@ -187,6 +259,24 @@ fn register_provider(
         .get::<Option<Function>>("prepare")?
         .ok_or_else(|| spec_error(format!("provider {:?}: prepare is required", fields.id)))?;
     let discover = spec.get::<Option<Function>>("discover")?;
+    let auth = AuthSpec {
+        methods: fields.auth,
+        aliases: fields.aliases,
+        config: fields.config,
+    };
+    validate_auth(&fields.id, &auth).map_err(spec_error)?;
+    let logins = match spec.get::<Option<Table>>("auth")? {
+        Some(methods) => methods
+            .sequence_values::<Table>()
+            .zip(&auth.methods)
+            .map(|(method, fields)| {
+                method?.get::<Option<Function>>("login")?.ok_or_else(|| {
+                    spec_error(format!("auth method {:?}: login is required", fields.id))
+                })
+            })
+            .collect::<LuaResult<_>>()?,
+        None => Vec::new(),
+    };
 
     let mut pending = lock(&pending);
     let owner = lua
@@ -211,6 +301,10 @@ fn register_provider(
         models: fields.models,
         prepare,
         discover,
+        auth,
+        logins,
+        auth_status: spec.get("auth_status")?,
+        logout: spec.get("logout")?,
         send,
     });
     Ok(())

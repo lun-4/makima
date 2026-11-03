@@ -4,12 +4,14 @@
 
 use std::future::Future;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use flume::Sender;
 use futures::future::LocalBoxFuture;
 use maki_agent::cancel::CancelToken;
+use maki_providers::login::{AuthStatus, InteractionService};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
     AgentError, ConversationEnd, Invocation, Message, Model, ModelInfo, PreparedProvider,
@@ -27,11 +29,13 @@ use tracing::warn;
 
 use crate::api::provider::{ProviderSpec, ProviderStore};
 use crate::credentials::Credentials;
+use crate::login_ui::LoginUi;
 use crate::runtime::{Request, strip_traceback};
 
 pub(crate) const HOST_STOPPED: &str = "plugin host stopped";
 const NO_STREAM: &str = "provider instance has no stream function";
 const DEFAULT_KEY_COUNT: usize = 1;
+const LOGIN_INCOMPLETE: &str = "login did not complete";
 
 pub(crate) type ProviderJob = Box<dyn FnOnce(Lua) -> LocalBoxFuture<'static, ()> + Send>;
 /// The outer error is raised Lua; the inner one is what the provider returned.
@@ -69,22 +73,37 @@ fn registered(
     let callbacks = Callbacks {
         id: Arc::clone(&spec.id),
         prepare: lua.create_registry_value(spec.prepare.clone())?,
-        discover: spec
-            .discover
-            .clone()
-            .map(|discover| lua.create_registry_value(discover))
-            .transpose()?,
+        discover: optional_key(lua, &spec.discover)?,
+        logins: spec
+            .auth
+            .methods
+            .iter()
+            .zip(&spec.logins)
+            .map(|(method, login)| {
+                Ok((method.id.clone(), lua.create_registry_value(login.clone())?))
+            })
+            .collect::<mlua::Result<_>>()?,
+        auth_status: optional_key(lua, &spec.auth_status)?,
+        logout: optional_key(lua, &spec.logout)?,
         send: lua.create_registry_value(spec.send.clone())?,
     };
     Ok(RegisteredProvider {
         id: Arc::clone(&spec.id),
         display_name: Arc::clone(&spec.display_name),
         models: spec.models.clone(),
+        auth: spec.auth.clone(),
         backend: Arc::new(LuaBackend {
             requests: requests.clone(),
             callbacks: Arc::new(callbacks),
         }),
     })
+}
+
+fn optional_key(lua: &Lua, function: &Option<Function>) -> mlua::Result<Option<RegistryKey>> {
+    function
+        .clone()
+        .map(|function| lua.create_registry_value(function))
+        .transpose()
 }
 
 /// Runs {call} on the Lua thread. Dropping the returned future cancels the
@@ -156,6 +175,27 @@ fn first(values: MultiValue) -> LuaValue {
     values.into_iter().next().unwrap_or(LuaValue::Nil)
 }
 
+/// Calls {function} with ctx and {args}. {decode} gets the result, or `None`
+/// when there is no function to call.
+async fn call_with_ctx<T>(
+    lua: &Lua,
+    callbacks: &Callbacks,
+    function: Option<Function>,
+    args: impl FnOnce(&Lua) -> mlua::Result<MultiValue>,
+    decode: impl FnOnce(&Lua, Option<LuaValue>) -> JobResult<T>,
+) -> JobResult<T> {
+    let Some(function) = function else {
+        return decode(lua, None);
+    };
+    let mut call_args = args(lua)?;
+    call_args.push_front(LuaValue::Table(callbacks.ctx(lua)?));
+    let values = function.call_async::<MultiValue>(call_args).await?;
+    match returned(values) {
+        Ok(values) => decode(lua, Some(first(values))),
+        Err(error) => Ok(Err(error)),
+    }
+}
+
 pub(crate) fn serialize_options() -> SerializeOptions {
     SerializeOptions::new().serialize_none_to_null(false)
 }
@@ -164,6 +204,9 @@ struct Callbacks {
     id: Arc<str>,
     prepare: RegistryKey,
     discover: Option<RegistryKey>,
+    logins: Vec<(String, RegistryKey)>,
+    auth_status: Option<RegistryKey>,
+    logout: Option<RegistryKey>,
     send: RegistryKey,
 }
 
@@ -185,6 +228,31 @@ impl Callbacks {
 struct LuaBackend {
     requests: Sender<Request>,
     callbacks: Arc<Callbacks>,
+}
+
+impl LuaBackend {
+    /// Calls the callback {key} picks with ctx and {args}. {decode} gets the
+    /// result, or `None` when the provider has no such callback.
+    fn call_callback<T: Send + 'static>(
+        &self,
+        key: impl FnOnce(&Callbacks) -> Option<&RegistryKey> + Send + 'static,
+        args: impl FnOnce(&Lua) -> mlua::Result<MultiValue> + Send + 'static,
+        decode: impl FnOnce(&Lua, Option<LuaValue>) -> JobResult<T> + Send + 'static,
+    ) -> BoxFuture<'static, Result<T, AgentError>> {
+        let requests = self.requests.clone();
+        let callbacks = Arc::clone(&self.callbacks);
+        Box::pin(async move {
+            invoke(&requests, move |lua| {
+                Box::pin(async move {
+                    let function = key(&callbacks)
+                        .map(|key| lua.registry_value::<Function>(key))
+                        .transpose()?;
+                    call_with_ctx(&lua, &callbacks, function, args, decode).await
+                })
+            })
+            .await
+        })
+    }
 }
 
 impl ProviderBackend for LuaBackend {
@@ -225,26 +293,77 @@ impl ProviderBackend for LuaBackend {
 
     fn discover(&self) -> Option<BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>> {
         self.callbacks.discover.as_ref()?;
-        let requests = self.requests.clone();
-        let callbacks = Arc::clone(&self.callbacks);
-        Some(Box::pin(async move {
-            invoke(&requests, move |lua| {
-                Box::pin(async move {
-                    let Some(discover) = &callbacks.discover else {
-                        return Ok(Ok(Vec::new()));
-                    };
-                    let discover: Function = lua.registry_value(discover)?;
-                    let values = discover
-                        .call_async::<MultiValue>(callbacks.ctx(&lua)?)
-                        .await?;
-                    Ok(match returned(values) {
-                        Ok(values) => Ok(lua.from_value(first(values))?),
-                        Err(error) => Err(error),
-                    })
+        Some(self.call_callback(
+            |callbacks| callbacks.discover.as_ref(),
+            no_args,
+            |lua, models| Ok(Ok(lua.from_value(models.unwrap_or(LuaValue::Nil))?)),
+        ))
+    }
+
+    fn login(
+        &self,
+        method: String,
+        config: Value,
+        ui: Arc<dyn InteractionService>,
+    ) -> BoxFuture<'static, Result<Option<String>, AgentError>> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let login_ui = LoginUi {
+            service: ui,
+            cancelled: Arc::clone(&cancelled),
+        };
+        let unknown = format!("unknown login method {method:?}");
+        let call = self.call_callback(
+            move |callbacks| {
+                let (_, login) = callbacks.logins.iter().find(|(id, _)| *id == method)?;
+                Some(login)
+            },
+            move |lua| {
+                let config = lua.to_value_with(&config, serialize_options())?;
+                (login_ui, config).into_lua_multi(lua)
+            },
+            |_, result| {
+                Ok(match result {
+                    None => Err(config_error(unknown)),
+                    Some(LuaValue::Nil | LuaValue::Boolean(false)) => {
+                        Err(config_error(LOGIN_INCOMPLETE))
+                    }
+                    Some(LuaValue::Table(result)) => Ok(result.get("model")?),
+                    Some(_) => Ok(None),
                 })
-            })
-            .await
-        }))
+            },
+        );
+        Box::pin(async move {
+            let result = call.await;
+            // A login that swallowed the cancel must not report a failure.
+            if cancelled.load(Ordering::SeqCst) {
+                return Err(AgentError::Cancelled);
+            }
+            result
+        })
+    }
+
+    fn auth_status(
+        &self,
+        config: Value,
+    ) -> Option<BoxFuture<'static, Result<AuthStatus, AgentError>>> {
+        self.callbacks.auth_status.as_ref()?;
+        Some(self.call_callback(
+            |callbacks| callbacks.auth_status.as_ref(),
+            move |lua| {
+                lua.to_value_with(&config, serialize_options())?
+                    .into_lua_multi(lua)
+            },
+            |lua, status| Ok(Ok(lua.from_value(status.unwrap_or(LuaValue::Nil))?)),
+        ))
+    }
+
+    fn logout(&self) -> Option<BoxFuture<'static, Result<(), AgentError>>> {
+        self.callbacks.logout.as_ref()?;
+        Some(self.call_callback(
+            |callbacks| callbacks.logout.as_ref(),
+            no_args,
+            |_, _| Ok(Ok(())),
+        ))
     }
 }
 
@@ -366,16 +485,8 @@ impl LuaProvider {
             invoke(&requests, move |lua| {
                 Box::pin(async move {
                     let instance: Table = lua.registry_value(&instance)?;
-                    let Some(function) = instance.get::<Option<Function>>(name)? else {
-                        return decode(&lua, None);
-                    };
-                    let mut call_args = args(&lua)?;
-                    call_args.push_front(LuaValue::Table(callbacks.ctx(&lua)?));
-                    let values = function.call_async::<MultiValue>(call_args).await?;
-                    match returned(values) {
-                        Ok(values) => decode(&lua, Some(first(values))),
-                        Err(error) => Ok(Err(error)),
-                    }
+                    let function = instance.get::<Option<Function>>(name)?;
+                    call_with_ctx(&lua, &callbacks, function, args, decode).await
                 })
             })
             .await

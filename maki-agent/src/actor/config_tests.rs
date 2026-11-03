@@ -1,11 +1,13 @@
 use std::sync::Arc;
 
+use maki_providers::login::{AuthSpec, AuthStatus, InteractionService};
 use maki_providers::provider::{self, BoxFuture};
 use maki_providers::{
     AgentError, Model, ModelInfo, PreparedProvider, ProviderBackend, ProviderRegistry,
     RegisteredProvider, Timeouts,
 };
 use maki_storage::checkpoint::CheckpointPublication;
+use serde_json::Value;
 use test_case::test_case;
 
 use super::{ScriptedBackend, input, policy, spawn, until};
@@ -1587,6 +1589,26 @@ impl ProviderBackend for EchoBackend {
     fn discover(&self) -> Option<BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>> {
         None
     }
+
+    fn login(
+        &self,
+        _method: String,
+        _config: Value,
+        _ui: Arc<dyn InteractionService>,
+    ) -> BoxFuture<'static, Result<Option<String>, AgentError>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn auth_status(
+        &self,
+        _config: Value,
+    ) -> Option<BoxFuture<'static, Result<AuthStatus, AgentError>>> {
+        None
+    }
+
+    fn logout(&self) -> Option<BoxFuture<'static, Result<(), AgentError>>> {
+        None
+    }
 }
 
 /// A registry whose provider lists only {DISCOVERED_MODEL_ID}, with a
@@ -1601,6 +1623,7 @@ fn discovery_registry() -> ProviderRegistry {
                 ..ModelInfo::id_only(DISCOVERED_MODEL_ID.into())
             }],
             backend: Arc::new(EchoBackend),
+            auth: AuthSpec::default(),
         }],
         Timeouts::default(),
     )

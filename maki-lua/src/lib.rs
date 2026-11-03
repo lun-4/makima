@@ -9,6 +9,7 @@ mod error;
 pub(crate) mod hook;
 pub mod language;
 mod loader;
+mod login_ui;
 pub mod orchestration;
 pub use runtime::current_managed_turn;
 pub(crate) mod plugin_permissions;

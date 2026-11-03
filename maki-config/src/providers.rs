@@ -13,6 +13,7 @@ const PROVIDERS_FILE: &str = "providers.toml";
 const BAD_CONFIG_EXIT_CODE: i32 = 2;
 /// The only built-in that reads `enable_free_models`.
 const OPENCODE_SLUG: &str = "opencode";
+const NOT_TEXT_FIELD_ERR: &str = "is not a text field of a provider";
 
 /// Coarse capability classification used by maki-providers to dispatch tiered
 /// requests. Mirrors `maki_providers::ModelTier` shape but lives here so the
@@ -218,6 +219,28 @@ pub struct ProviderDef {
     pub models: Vec<ModelDef>,
 }
 
+impl ProviderDef {
+    /// {answers} applied as string fields. Fails when a key is not a string
+    /// field of `ProviderDef`, so a misspelt key cannot vanish on save.
+    pub fn with_answers(&self, answers: &[(String, String)]) -> Result<Self, String> {
+        let mut table = toml::Table::try_from(self).map_err(|e| e.to_string())?;
+        for (key, value) in answers {
+            table.insert(key.clone(), toml::Value::String(value.clone()));
+        }
+        let def: Self = table
+            .try_into()
+            .map_err(|e: toml::de::Error| e.to_string())?;
+        let stored = toml::Table::try_from(&def).map_err(|e| e.to_string())?;
+        match answers
+            .iter()
+            .find(|(key, value)| stored.get(key).and_then(toml::Value::as_str) != Some(value))
+        {
+            Some((key, _)) => Err(format!("{key:?} {NOT_TEXT_FIELD_ERR}")),
+            None => Ok(def),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProvidersConfig {
     #[serde(flatten)]
@@ -229,7 +252,7 @@ impl ProvidersConfig {
     /// in tier or pricing surfaces immediately instead of silently dropping
     /// every provider and starting maki with an empty registry.
     pub fn load() -> Self {
-        Self::read().unwrap_or_else(|e| {
+        Self::try_load().unwrap_or_else(|e| {
             eprintln!("error: {e}");
             process::exit(BAD_CONFIG_EXIT_CODE);
         })
@@ -238,13 +261,15 @@ impl ProvidersConfig {
     /// Same read, but a typo only costs the answer. For callers past startup,
     /// where taking the process down mid-session is never the right trade.
     pub fn load_or_default() -> Self {
-        Self::read().unwrap_or_else(|e| {
+        Self::try_load().unwrap_or_else(|e| {
             tracing::warn!(error = %e, "ignoring providers.toml");
             Self::default()
         })
     }
 
-    fn read() -> Result<Self, String> {
+    /// Fails on a file that does not parse, so a caller about to save cannot
+    /// overwrite it.
+    pub fn try_load() -> Result<Self, String> {
         let path = providers_file_path();
         if !path.exists() {
             return Ok(Self::default());
@@ -630,5 +655,26 @@ tier = "{input}"
     #[test_case("My.Cool@Provider!", "my-cool-provider"; "special_chars")]
     fn slugify_tests(input: &str, expected: &str) {
         assert_eq!(slugify(input), expected);
+    }
+
+    #[test_case("base_url", "https://example.com" ; "string_field")]
+    #[test_case("protocol", "anthropic" ; "enum_field")]
+    fn with_answers_sets_fields(key: &str, value: &str) {
+        let def = ProviderDef::default()
+            .with_answers(&[(key.into(), value.into())])
+            .unwrap();
+        let stored = toml::Table::try_from(&def).unwrap();
+        assert_eq!(stored[key].as_str(), Some(value));
+    }
+
+    #[test_case("base_urll", Some(NOT_TEXT_FIELD_ERR) ; "unknown_key")]
+    #[test_case("discover_models", None ; "non_string_key")]
+    fn with_answers_rejects_unknown_and_non_string_keys(key: &str, expected: Option<&str>) {
+        let error = ProviderDef::default()
+            .with_answers(&[(key.into(), String::new())])
+            .unwrap_err();
+        if let Some(expected) = expected {
+            assert!(error.contains(expected), "{error}");
+        }
     }
 }

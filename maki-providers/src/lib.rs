@@ -1,5 +1,6 @@
 pub(crate) mod error;
 pub(crate) mod image;
+pub mod login;
 pub mod manifest;
 pub mod model;
 pub mod model_registry;

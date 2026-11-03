@@ -17,13 +17,15 @@ use crate::plugin_permissions::PluginPermissions;
 /// local ok, err = maki.host.open("https://example.com/login")
 #[lua_fn(guard = Run)]
 async fn open(_lua: Lua, url: String) -> LuaResult<Pair<bool>> {
-    let url = try_pair!(parse_http_url(&url));
-    try_pair!(
-        unblock(move || ::open::that_detached(url.as_str()))
-            .await
-            .map_err(|e| format!("cannot open browser: {e}"))
-    );
+    try_pair!(open_url(&url).await);
     Ok((Some(true), None))
+}
+
+pub(crate) async fn open_url(url: &str) -> Result<(), String> {
+    let url = parse_http_url(url)?;
+    unblock(move || ::open::that_detached(url.as_str()))
+        .await
+        .map_err(|e| format!("cannot open browser: {e}"))
 }
 
 lua_table! {

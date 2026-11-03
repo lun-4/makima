@@ -118,6 +118,7 @@ The rules:
 | [`maki.net.Response`](#maki-net-Response) | A streaming HTTP response from `maki.net.send`. |
 | [`maki.session`](#maki-session) | Host session primitives. |
 | [`maki.provider.Credentials`](#maki-provider-Credentials) | The calling provider's stored credentials, `ctx.credentials`. |
+| [`maki.provider.LoginUi`](#maki-provider-LoginUi) | The `ui` a provider's `login(ctx, ui, config)` receives. |
 | [`maki.usage`](#maki-usage) | Provider-side quota snapshots. |
 | [`maki.text`](#maki-text) | Text transformation utilities. |
 | [`maki.time`](#maki-time) | Wall-clock timestamps and relative-age formatting. |
@@ -1201,6 +1202,26 @@ already owns fails and names both plugins.
   with the same id, or nil plus an error.
   `discover` (function) Optional. `discover(ctx)` returns the descriptors
   the provider offers now.
+  `config` (table) Optional. `providers.toml` fields asked before login:
+  `{ key, prompt, default?, secret?, optional?, choices? }`, where
+  `choices` is a list of `{ id, label, detail? }`. Keys are the text
+  fields of a provider section, such as `base_url` or `plan`.
+  `auth` (table) Login methods: `{ id, label, login }`.
+  `login(ctx, ui, config)` gets a `maki.provider.LoginUi` and the
+  provider's section with this login's answers applied, not yet saved.
+  It returns a truthy value, optionally a table with `model` to choose
+  the default model, or nil plus an error.
+  `aliases` (table) Optional. `{ id, label, method }` names that log in
+  with a preset method.
+  `auth_status` (function) Optional. `auth_status(ctx, config)` returns
+  `{ state, detail? }`, where `state` is `saved`, `env`, `configured` or
+  `missing`. It must work without credentials. Without it, the
+  provider counts as logged in while its credentials file exists.
+  `logout` (function) Optional. `logout(ctx)`. Without it, logout
+  deletes the credentials file.
+
+Config is saved and the default model chosen only after `login`
+succeeds and `auth_status` no longer reports `missing`.
 
 `ctx` is `{ id, send, credentials }`, where `send` is `maki.net.send` and
 `credentials` is the provider's `maki.provider.Credentials`. Only the
@@ -1233,6 +1254,13 @@ maki.api.register_provider({
   id = "echo",
   display_name = "Echo",
   models = { { id = "echo-1", tier = "strong" } },
+  auth = {
+    { id = "api_key", label = "API key", login = function(ctx, ui, config)
+      local key, err = ui:input("API key", true)
+      if not key then return nil, err end
+      return ctx.credentials:write({ api_key = key })
+    end },
+  },
   prepare = function(ctx, model)
     return {
       stream = function(ctx, request, emit)
@@ -4647,6 +4675,130 @@ local tokens, err = ctx.credentials:refresh(function(current)
   if current and current.expires > maki.time.now().secs * 1000 + 60000 then return nil end
   return exchange(current.refresh)
 end)
+```
+
+
+## maki.provider.LoginUi {#maki-provider-LoginUi}
+
+The `ui` a provider's `login(ctx, ui, config)` receives.
+
+The CLI or the TUI shows it. `input` and `choice` wait for the user. The notices `instructions`,
+`device_code` and `open_browser` return at once.
+
+---
+
+### `LoginUi:input()` {#LoginUi-input}
+
+```lua
+LoginUi:input({prompt}, {secret?}, {default?})
+```
+
+Ask the user for text.
+
+**Parameters:**
+
+- `{prompt}` (`string`) What to ask for.
+- `{secret?}` (`boolean?`) Hide the input, for keys and passwords.
+- `{default?}` (`string?`) Text offered for editing.
+
+**Returns:** (`string?`, `string?`) The entered text, or nil plus an error (`"cancelled"` when the user backed out).
+
+**Example:**
+
+```lua
+local key, err = ui:input("API key", true)
+```
+
+---
+
+### `LoginUi:choice()` {#LoginUi-choice}
+
+```lua
+LoginUi:choice({prompt}, {options})
+```
+
+Ask the user to choose one of {options}.
+
+**Parameters:**
+
+- `{prompt}` (`string`) What the choice is about.
+- `{options}` (`table`) List of `{ id, label, detail? }`.
+
+**Returns:** (`string?`, `string?`) The chosen id, or nil plus an error.
+
+**Example:**
+
+```lua
+local plan = ui:choice("Plan", { { id = "standard", label = "Standard" } })
+```
+
+---
+
+### `LoginUi:instructions()` {#LoginUi-instructions}
+
+```lua
+LoginUi:instructions({text})
+```
+
+Show {text} to the user. Returns at once.
+
+**Parameters:**
+
+- `{text}` (`string`) Instructions to show.
+
+**Returns:** (`boolean?`, `string?`) true, or nil plus an error.
+
+**Example:**
+
+```lua
+ui:instructions("Create a key in the dashboard first.")
+```
+
+---
+
+### `LoginUi:device_code()` {#LoginUi-device_code}
+
+```lua
+LoginUi:device_code({url}, {code})
+```
+
+Show a device login: the user opens {url} and enters {code}. Returns at
+once, so the provider can poll while the code is on screen.
+
+**Parameters:**
+
+- `{url}` (`string`) Verification URL.
+- `{code}` (`string`) Code the user enters.
+
+**Returns:** (`boolean?`, `string?`) true, or nil plus an error.
+
+**Example:**
+
+```lua
+ui:device_code("https://example.com/device", "ABCD-1234")
+```
+
+---
+
+### `LoginUi:open_browser()` {#LoginUi-open_browser}
+
+```lua
+LoginUi:open_browser({url})
+```
+
+Show {url} and open it in the user's browser, like `maki.host.open`. The
+URL stays on screen in case the browser does not open. Returns at once.
+
+**Parameters:**
+
+- `{url}` (`string`) An `http` or `https` URL.
+
+**Returns:** (`boolean?`, `string?`) true, or nil plus an error.
+
+**Example:**
+
+```lua
+ui:open_browser("https://example.com/keys")
 ```
 
 

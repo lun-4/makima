@@ -8,9 +8,11 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use maki_config::ModelPolicy;
+use serde_json::Value;
 use tracing::warn;
 
 use crate::error::AgentError;
+use crate::login::{AuthSpec, AuthStatus, InteractionService};
 use crate::manifest::ManifestRegistry;
 use crate::model::{Model, ModelError, ModelInfo, ModelTier};
 use crate::model_registry;
@@ -29,6 +31,25 @@ pub trait ProviderBackend: Send + Sync {
     /// Lists the models the provider offers right now; `None` when it only
     /// offers its curated descriptors.
     fn discover(&self) -> Option<BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>>;
+
+    /// Logs in with {method}, given the provider's `providers.toml` section
+    /// with this login's answers applied. Returns the model id to default to.
+    fn login(
+        &self,
+        method: String,
+        config: Value,
+        ui: Arc<dyn InteractionService>,
+    ) -> BoxFuture<'static, Result<Option<String>, AgentError>>;
+
+    /// `None` when the provider has no check of its own and its credentials
+    /// file decides.
+    fn auth_status(
+        &self,
+        config: Value,
+    ) -> Option<BoxFuture<'static, Result<AuthStatus, AgentError>>>;
+
+    /// `None` when deleting the credentials file is all a logout takes.
+    fn logout(&self) -> Option<BoxFuture<'static, Result<(), AgentError>>>;
 }
 
 #[derive(Clone)]
@@ -42,11 +63,13 @@ pub struct RegisteredProvider {
     pub display_name: Arc<str>,
     pub models: Vec<ModelInfo>,
     pub backend: Arc<dyn ProviderBackend>,
+    pub auth: AuthSpec,
 }
 
-struct Entry {
-    display_name: Arc<str>,
-    backend: Arc<dyn ProviderBackend>,
+pub(crate) struct Entry {
+    pub(crate) display_name: Arc<str>,
+    pub(crate) backend: Arc<dyn ProviderBackend>,
+    pub(crate) auth: AuthSpec,
     models: RwLock<Arc<[ModelInfo]>>,
 }
 
@@ -93,12 +116,29 @@ impl ProviderRegistry {
                 let entry = Entry {
                     display_name: provider.display_name,
                     backend: provider.backend,
+                    auth: provider.auth,
                     models: RwLock::new(provider.models.into()),
                 };
                 (provider.id, entry)
             })
             .collect();
         Self { entries, timeouts }
+    }
+
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (&Arc<str>, &Entry)> {
+        self.entries.iter()
+    }
+
+    /// A provider id, or else the first alias named {name}, with the
+    /// alias's preset method.
+    pub(crate) fn login_target(&self, name: &str) -> Option<(&Arc<str>, &Entry, Option<&str>)> {
+        if let Some((id, entry)) = self.entries.get_key_value(name) {
+            return Some((id, entry, None));
+        }
+        self.entries.iter().find_map(|(id, entry)| {
+            let alias = entry.auth.aliases.iter().find(|alias| alias.id == name)?;
+            Some((id, entry, Some(alias.method.as_str())))
+        })
     }
 
     fn registered(&self, spec: &str) -> bool {
@@ -314,6 +354,26 @@ mod tests {
                 result.map_err(|message| AgentError::Config { message })
             }))
         }
+
+        fn login(
+            &self,
+            _method: String,
+            _config: Value,
+            _ui: Arc<dyn InteractionService>,
+        ) -> BoxFuture<'static, Result<Option<String>, AgentError>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn auth_status(
+            &self,
+            _config: Value,
+        ) -> Option<BoxFuture<'static, Result<AuthStatus, AgentError>>> {
+            None
+        }
+
+        fn logout(&self) -> Option<BoxFuture<'static, Result<(), AgentError>>> {
+            None
+        }
     }
 
     fn info(id: &str, tier: Option<ModelTier>) -> ModelInfo {
@@ -342,6 +402,7 @@ mod tests {
                     info(WEAK, Some(ModelTier::Weak)),
                 ],
                 backend: Arc::clone(&backend) as Arc<dyn ProviderBackend>,
+                auth: AuthSpec::default(),
             }],
             Timeouts::default(),
         );
