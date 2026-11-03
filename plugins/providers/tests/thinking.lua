@@ -12,10 +12,10 @@ local function budget(tokens)
   return { kind = "budget", tokens = tokens }
 end
 
-t.case("max_budget_is_half_the_window_at_least_the_minimum", function()
-  t.eq(thinking.max_budget({ thinking_ceiling = 500 }), thinking.MIN_BUDGET)
-  t.eq(thinking.max_budget({ thinking_ceiling = 4096 }), 4096)
-  t.eq(thinking.max_budget({}), nil)
+t.case("max_budget_is_half_the_declared_window_at_least_the_minimum", function()
+  t.eq(thinking.max_budget({ max_output_tokens = 1000 }), thinking.MIN_BUDGET)
+  t.eq(thinking.max_budget({ max_output_tokens = 8193, output_tokens = 2000 }), 4096)
+  t.eq(thinking.max_budget({ output_tokens = 8192 }), nil)
 end)
 
 t.case("budget", function()

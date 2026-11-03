@@ -64,8 +64,15 @@ export type Invocation = {
 }
 
 -- `tools` holds `{ name, description, input_schema, input_examples? }`.
+-- `model.max_output_tokens` is the declared cap; `output_tokens` trims it to
+-- this request's turn budget.
 export type Request = {
-  model: { id: string, output_tokens: number?, thinking_ceiling: number?, context_window: number },
+  model: {
+    id: string,
+    output_tokens: number?,
+    max_output_tokens: number?,
+    context_window: number,
+  },
   system: string,
   messages: { Message },
   tools: { Json },

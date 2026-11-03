@@ -28,11 +28,11 @@ M.dialects = {
   tensorx = { supported = { "low", "medium", "high" }, adaptive = "high", off = "none" },
 }
 
--- The most thinking one request may spend: half its output window, at least
--- `MIN_BUDGET`. Nil when the window is unknown.
+-- The most thinking one request may spend: half the model's declared output
+-- window, at least `MIN_BUDGET`. Nil when the window is unknown.
 function M.max_budget(model)
-  local ceiling = model.thinking_ceiling
-  return ceiling and math.max(ceiling, M.MIN_BUDGET)
+  local window = model.max_output_tokens
+  return window and math.max(math.floor(window / 2), M.MIN_BUDGET)
 end
 
 function M.level_budget(level, max)

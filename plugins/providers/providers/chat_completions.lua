@@ -89,8 +89,8 @@ function M.build_request(request, options)
     messages = M.convert_messages(request.messages, request.system),
     stream = true,
   }
-  if request.model.output_tokens then
-    body[options.max_tokens_field] = request.model.output_tokens
+  if request.model.max_output_tokens then
+    body[options.max_tokens_field] = request.model.max_output_tokens
   end
   if options.include_stream_usage then
     body.stream_options = { include_usage = true }

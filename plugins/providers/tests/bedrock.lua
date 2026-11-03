@@ -54,7 +54,12 @@ end
 
 local function request(id, tools)
   return {
-    model = { id = id, output_tokens = 64000, thinking_ceiling = 32000, context_window = 200000 },
+    model = {
+      id = id,
+      output_tokens = 8000,
+      max_output_tokens = 64000,
+      context_window = 200000,
+    },
     system = "sys",
     messages = { { role = "user", content = { { type = "text", text = "hi" } } } },
     tools = tools or {},
@@ -202,6 +207,7 @@ t.case("body_and_url_differ_from_the_direct_api", function()
   t.eq(body.model, nil)
   t.eq(body.stream, nil)
   t.eq(body.speed, nil)
+  t.eq(body.max_tokens, 64000)
   t.eq(body.system[1].text, "sys")
 end)
 

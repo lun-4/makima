@@ -117,7 +117,7 @@ function M.convert_tools(tools)
 end
 
 -- The thinking budget cap: the model family's documented limit, lowered to
--- what this request's output window allows.
+-- what the model's output window allows.
 function M.max_thinking(model)
   local cap = model.id:find("flash", 1, true) and FLASH_MAX_THINKING or PRO_MAX_THINKING
   local max = thinking.max_budget(model)
@@ -136,7 +136,7 @@ function M.build_request(request)
   elseif budget ~= "off" then
     config.thinkingConfig = { thinkingBudget = budget, includeThoughts = true }
   end
-  config.maxOutputTokens = request.model.output_tokens
+  config.maxOutputTokens = request.model.max_output_tokens
   if next(config) then
     body.generationConfig = config
   end

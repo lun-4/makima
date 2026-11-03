@@ -13,7 +13,7 @@ end
 
 t.case("build_request", function()
   local body = chat.build_request({
-    model = { id = "m", output_tokens = 100 },
+    model = { id = "m", output_tokens = 100, max_output_tokens = 4096 },
     system = "sys",
     messages = {
       {
@@ -39,7 +39,7 @@ t.case("build_request", function()
   t.same(body, {
     model = "m",
     stream = true,
-    max_completion_tokens = 100,
+    max_completion_tokens = 4096,
     stream_options = { include_usage = true },
     messages = {
       { role = "system", content = "sys" },

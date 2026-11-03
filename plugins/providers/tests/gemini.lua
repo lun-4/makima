@@ -54,7 +54,7 @@ end)
 
 t.case("build_request", function()
   local body = gemini.build_request({
-    model = { id = "gemini-2.5-flash", output_tokens = 65536, thinking_ceiling = 32768 },
+    model = { id = "gemini-2.5-flash", output_tokens = 8000, max_output_tokens = 65536 },
     system = "sys",
     messages = {},
     thinking = { kind = "effort", level = "max" },
@@ -87,6 +87,18 @@ t.case("build_request", function()
   local adaptive =
     gemini.build_request({ model = { id = "gemini-2.5-pro" }, messages = {}, thinking = { kind = "adaptive" } })
   t.same(adaptive.generationConfig, { thinkingConfig = { includeThoughts = true } })
+end)
+
+t.case("thinking_budget_scales_off_the_declared_window", function()
+  local body = gemini.build_request({
+    model = { id = "gemini-2.5-pro", output_tokens = 4000, max_output_tokens = 8192 },
+    messages = {},
+    thinking = { kind = "effort", level = "max" },
+  })
+  t.same(
+    body.generationConfig,
+    { maxOutputTokens = 8192, thinkingConfig = { thinkingBudget = 4096, includeThoughts = true } }
+  )
 end)
 
 t.case("stream_merges_parts_and_ends_thinking", function()

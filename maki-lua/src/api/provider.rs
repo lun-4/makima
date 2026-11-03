@@ -202,17 +202,18 @@ fn spec_error(message: impl fmt::Display) -> mlua::Error {
 /// `refresh_auth(ctx)`, `reload_auth(ctx)`, `rotate_key(ctx)`,
 /// `end_conversation(ctx, conversation_id, reason)` and `key_count` (a
 /// number, or a function read once at prepare). `request` has `model`
-/// (`id`, `output_tokens`, `thinking_ceiling`, `context_window`), `system`,
-/// `messages`, `tools`, `thinking`, `fast`, `session_id` and `invocation`
-/// (`conversation_id`, `operation_id`, `attempt`, `purpose`, `agent_id`).
-/// `reason` is `cancelled`, `closed`, `compacted` or `rewound`; the host
-/// never uses an ended conversation id again. `emit(event)` takes
-/// `{ type = "text_delta", text }` and the other provider events, and
-/// returns false once the call is over. `stream` returns
-/// `{ message, usage, stop_reason }`. A failure returns nil plus an error:
-/// a table with `status`, `message` and optional `retry_after` seconds is
-/// an API error, anything else a retryable transport error. A raised error
-/// is not retried.
+/// (`id`, `output_tokens`, `max_output_tokens`, `context_window`), `system`, `messages`, `tools`, `thinking`, `fast`,
+/// `session_id` and `invocation` (`conversation_id`, `operation_id`,
+/// `attempt`, `purpose`, `agent_id`). `max_output_tokens` is what the model
+/// declares; `output_tokens` is that cap trimmed to this request's turn
+/// budget. `reason` is `cancelled`,
+/// `closed`, `compacted` or `rewound`; the host never uses an ended
+/// conversation id again. `emit(event)` takes `{ type = "text_delta", text }`
+/// and the other provider events, and returns false once the call is over.
+/// `stream` returns `{ message, usage, stop_reason }`. A failure returns nil
+/// plus an error: a table with `status`, `message` and optional
+/// `retry_after` seconds is an API error, anything else a retryable
+/// transport error. A raised error is not retried.
 ///
 /// @param spec table Provider definition (see above).
 /// @return

@@ -3,6 +3,8 @@ local t = require("maki.test_helpers")
 
 local EPHEMERAL = { type = "ephemeral" }
 local UNPARSED_ERROR = "upstream exploded"
+local FALLBACK_MAX_TOKENS = 32000
+local FALLBACK_HIGH_BUDGET = 19660
 
 local function sse(events)
   local frames = {}
@@ -14,7 +16,7 @@ end
 
 local function request(id, thinking, extra)
   local base = {
-    model = { id = id, output_tokens = 16000, thinking_ceiling = 8000 },
+    model = { id = id, output_tokens = 16000, max_output_tokens = 64000 },
     system = "sys",
     messages = {},
     thinking = thinking or { kind = "off" },
@@ -92,9 +94,9 @@ t.case("build_request", function()
   t.eq(body.model, "claude-sonnet-4-5")
   t.eq(body.stream, true)
   t.eq(body.speed, "fast")
-  t.eq(body.max_tokens, 16000)
+  t.eq(body.max_tokens, 64000)
   t.same(body.system, { { type = "text", text = "sys", cache_control = EPHEMERAL } })
-  t.same(body.thinking, { type = "enabled", budget_tokens = 4800 })
+  t.same(body.thinking, { type = "enabled", budget_tokens = 19200 })
   t.same(body.tools[2], { name = "b", input_schema = {}, cache_control = EPHEMERAL })
   t.eq(body.tools[1].cache_control, nil)
   t.eq(
@@ -102,6 +104,14 @@ t.case("build_request", function()
     "fast-mode-2026-02-01,context-1m-2025-08-07"
   )
   t.eq(anthropic.beta_header(request("claude-sonnet-4-5")), nil)
+end)
+
+t.case("unknown_window_falls_back", function()
+  local body = anthropic.build_body(request("claude-sonnet-4-5", { kind = "effort", level = "high" }, {
+    model = { id = "claude-sonnet-4-5", output_tokens = 8000 },
+  }))
+  t.eq(body.max_tokens, FALLBACK_MAX_TOKENS)
+  t.same(body.thinking, { type = "enabled", budget_tokens = FALLBACK_HIGH_BUDGET })
 end)
 
 t.case("adaptive_models_send_effort", function()

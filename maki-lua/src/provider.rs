@@ -428,7 +428,7 @@ async fn prepare_instance(
 struct RequestModel {
     id: String,
     output_tokens: Option<u32>,
-    thinking_ceiling: Option<u32>,
+    max_output_tokens: Option<u32>,
     context_window: u32,
 }
 
@@ -537,7 +537,7 @@ impl Provider for LuaProvider {
             model: RequestModel {
                 id: model.id.clone(),
                 output_tokens: model.output_tokens(),
-                thinking_ceiling: model.thinking_ceiling(),
+                max_output_tokens: model.max_output_tokens,
                 context_window: model.context_window,
             },
             system: system.to_owned(),

@@ -132,7 +132,7 @@ function M.build_body(request, system_prefix)
   end
   system[#system + 1] = { type = "text", text = request.system or "", cache_control = EPHEMERAL }
   local body = {
-    max_tokens = request.model.output_tokens or FALLBACK_MAX_TOKENS,
+    max_tokens = request.model.max_output_tokens or FALLBACK_MAX_TOKENS,
     system = system,
     messages = M.convert_messages(request.messages),
     tools = M.convert_tools(request.tools),

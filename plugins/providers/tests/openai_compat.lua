@@ -42,7 +42,7 @@ end
 
 local function request(overrides)
   local result = {
-    model = { id = "row-1", output_tokens = 100, thinking_ceiling = 50, context_window = 2000 },
+    model = { id = "row-1", output_tokens = 100, max_output_tokens = 512, context_window = 2000 },
     system = "sys",
     messages = { { role = "user", content = { { type = "text", text = "hi" } } } },
     tools = {},
@@ -175,6 +175,7 @@ t.case("stream_rotates_keys_and_reclassifies_errors", function()
     t.eq(ctx.requests[2].headers.Authorization, "Bearer b")
     t.eq(ctx.requests[2].url, BASE .. "/chat/completions")
     t.eq(ctx.requests[2].method, "POST")
+    t.eq(maki.json.decode(ctx.requests[2].body).max_tokens, 512)
   end)
 end)
 

@@ -15,7 +15,7 @@ end
 
 t.case("build_request", function()
   local body = responses.build_request({
-    model = { id = "gpt" },
+    model = { id = "gpt", output_tokens = 100, max_output_tokens = 4096 },
     system = "sys",
     messages = {
       {

@@ -33,7 +33,12 @@ end
 
 local function request(id, extra)
   local result = {
-    model = { id = id, output_tokens = 64000, thinking_ceiling = 32000, context_window = 200000 },
+    model = {
+      id = id,
+      output_tokens = 8000,
+      max_output_tokens = 64000,
+      context_window = 200000,
+    },
     system = "sys",
     messages = { { role = "user", content = { { type = "text", text = "hi" } } } },
     tools = {},
@@ -97,6 +102,7 @@ t.case("stream_sends_key_version_and_body", function()
   t.eq(body.model, "claude-sonnet-4-5")
   t.eq(body.stream, true)
   t.eq(body.speed, nil)
+  t.eq(body.max_tokens, 64000)
 end)
 
 t.case("base_url_override_keeps_the_messages_path_once", function()
