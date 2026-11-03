@@ -616,7 +616,7 @@ mod tests {
         dialect: &EffortDialect<'_>,
         expected: Option<Value>,
     ) {
-        let model = Model::from_spec("copilot/gpt-5.4").unwrap();
+        let model = Model::from_spec("openai/gpt-5.4").unwrap();
         let body = build_body(ResponsesRequestArgs {
             model: &model,
             messages: &[],

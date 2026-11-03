@@ -26,10 +26,9 @@ use crate::{
 use super::ResolvedAuth;
 use super::anthropic::Anthropic;
 use super::aperture::Aperture;
-use super::copilot::Copilot;
 use super::google::Google;
 use super::local::{LLAMACPP, LocalEndpoint, OLLAMA};
-use super::openai::OpenAi;
+use super::openai::OpenAiProtocol;
 use super::opencode::Opencode;
 
 const INFO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -552,7 +551,7 @@ pub(crate) fn create(
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
         ProviderKind::OpenAi => Box::new(
-            OpenAi::with_auth(auth.clone(), timeouts)
+            OpenAiProtocol::with_auth(auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
         ProviderKind::Google => Box::new(Google::with_auth(auth.clone(), timeouts)),
@@ -561,10 +560,6 @@ pub(crate) fn create(
                 message: "Vertex cannot be used as a dynamic provider base".into(),
             });
         }
-        ProviderKind::Copilot => Box::new(
-            Copilot::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
         ProviderKind::Ollama => Box::new(
             LocalEndpoint::with_auth(&OLLAMA, auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),

@@ -9,17 +9,13 @@ use isahc::config::Configurable;
 use isahc::http::request::Builder;
 use serde::Deserialize;
 use serde_json::Value;
-use tracing::{debug, warn};
-
-use maki_storage::StateDir;
-use maki_storage::auth::{OAuthTokens, load_tokens, lock_tokens, save_tokens};
+use tracing::debug;
 
 use crate::AgentError;
 
 pub(crate) mod anthropic;
 pub(crate) mod aperture;
 pub(crate) mod catalog;
-pub(crate) mod copilot;
 pub mod custom;
 pub mod dynamic;
 pub(crate) mod google;
@@ -34,7 +30,6 @@ pub(crate) mod vertex;
 const LOW_SPEED_BYTES_PER_SEC: u32 = 1;
 const UNMAPPED_SSE_ERROR_STATUS: u16 = 400;
 const EMPTY_SSE_ERROR_MESSAGE: &str = "provider sent an error frame with no detail";
-const UNAUTHORIZED_STATUS: u16 = 401;
 const AUTHORIZATION_HEADER: &str = "authorization";
 
 pub(crate) fn user_agent() -> &'static str {
@@ -78,36 +73,6 @@ impl From<&maki_config::ProviderConfig> for Timeouts {
             retry: crate::retry::RetryPolicy::from(config),
         }
     }
-}
-
-/// Reading, refreshing and writing tokens has to happen as one turn. Whoever
-/// queued behind a peer here is holding a copy the peer already spent, and
-/// replaying a rotated refresh token gets the whole family revoked, so the
-/// tokens are loaded again once the lock is in hand.
-pub(crate) fn refreshed_tokens(
-    dir: &StateDir,
-    provider: &str,
-    refresh: impl FnOnce(&OAuthTokens) -> Result<OAuthTokens, AgentError>,
-) -> Result<OAuthTokens, AgentError> {
-    let _lock = lock_tokens(dir, provider);
-    let current = load_tokens(dir, provider).ok_or_else(|| {
-        AgentError::api(
-            UNAUTHORIZED_STATUS,
-            format!("{provider} OAuth tokens not found on disk"),
-        )
-    })?;
-    if !current.is_expired() {
-        return Ok(current);
-    }
-    let fresh = refresh(&current)?;
-    // Not `?`: every caller reads an error here as "these credentials are
-    // dead" and deletes the token file, so a full disk would log the user out
-    // over a refresh that actually succeeded. The run keeps the token it just
-    // got and the next start refreshes again.
-    if let Err(e) = save_tokens(dir, provider, &fresh) {
-        warn!(provider, error = %e, "could not persist refreshed OAuth tokens");
-    }
-    Ok(fresh)
 }
 
 #[derive(Clone)]

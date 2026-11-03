@@ -8,6 +8,7 @@ local M = {}
 M.MIN_BUDGET = 1024
 M.FALLBACK_MAX_BUDGET = 32768
 M.LEVELS = { "minimal", "low", "medium", "high", "xhigh", "max" }
+M.OFF = "none"
 
 local BUDGET_FIELD = "thinking_budget_tokens"
 local PERCENT = { minimal = 10, low = 20, medium = 40, high = 60, xhigh = 80, max = 100 }
@@ -48,6 +49,18 @@ function M.budget_level(tokens, max)
     end
   end
   return "max"
+end
+
+-- The effort levels among {values}, ascending and without repeats, and
+-- whether {values} also names `none`, an explicit off.
+function M.parse_levels(values)
+  local levels = {}
+  for _, level in ipairs(M.LEVELS) do
+    if table.find(values, level) then
+      levels[#levels + 1] = level
+    end
+  end
+  return levels, table.find(values, M.OFF) ~= nil
 end
 
 -- The closest of {supported} at or below {level}, else the lowest supported.

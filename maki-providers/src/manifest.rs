@@ -1,6 +1,6 @@
 use crate::model::{ModelEntry, ModelFamily, ModelTier};
 use crate::providers::{
-    anthropic, aperture, copilot, custom, dynamic, google, llama_cpp, ollama, openai, vertex,
+    anthropic, aperture, custom, dynamic, google, llama_cpp, ollama, openai, vertex,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -59,17 +59,6 @@ const VERTEX: ProviderManifest = ProviderManifest {
     models: vertex::models(),
 };
 
-const COPILOT: ProviderManifest = ProviderManifest {
-    slug: "copilot",
-    display_name: "Copilot",
-    family: ModelFamily::Generic,
-    supports_thinking: false,
-    accepts_arbitrary_models: true,
-    fallback_max_output: Some(100_000),
-    fallback_context_window: 200_000,
-    models: copilot::models(),
-};
-
 const OLLAMA: ProviderManifest = ProviderManifest {
     slug: "ollama",
     display_name: "Ollama",
@@ -126,10 +115,8 @@ const APERTURE: ProviderManifest = ProviderManifest {
 };
 
 const BUILTINS: &[ProviderManifest] = &[
-    OPENAI,
     GOOGLE,
     VERTEX,
-    COPILOT,
     OLLAMA,
     LLAMA_CPP,
     OPENCODE,
@@ -139,7 +126,7 @@ const BUILTINS: &[ProviderManifest] = &[
 
 /// Protocols the native gateways still route to after their provider moved
 /// to Lua. They resolve by slug but are not native providers themselves.
-const PROTOCOL_BASES: &[ProviderManifest] = &[ANTHROPIC];
+const PROTOCOL_BASES: &[ProviderManifest] = &[ANTHROPIC, OPENAI];
 
 pub struct ManifestRegistry;
 
@@ -227,9 +214,9 @@ mod tests {
     fn builtin_count_covers_provider_kind_variants() {
         let kind_count = ProviderKind::iter().count();
         assert!(
-            BUILTINS.len() >= kind_count,
-            "BUILTINS has {} manifests but ProviderKind has {} variants",
-            BUILTINS.len(),
+            BUILTINS.len() + PROTOCOL_BASES.len() >= kind_count,
+            "BUILTINS and PROTOCOL_BASES have {} manifests but ProviderKind has {} variants",
+            BUILTINS.len() + PROTOCOL_BASES.len(),
             kind_count,
         );
         for kind in ProviderKind::iter() {

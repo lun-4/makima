@@ -103,7 +103,7 @@ The rules:
 | [`maki.env`](#maki-env) | Paths to makima's own directories (config, state, logs), and whether |
 | [`maki.fn`](#maki-fn) | Process and environment helpers, modeled after Neovim's `vim.fn` job |
 | [`maki.fs`](#maki-fs) | File-system utilities, modelled after `vim.fs` and `vim.uv`. |
-| [`maki.host`](#maki-host) | Actions on the host machine, such as opening a browser for a login. |
+| [`maki.host`](#maki-host) | Actions on the host machine: opening a browser, reading the keyring. |
 | [`maki.image`](#maki-image) | Small building blocks for working with images: probe metadata, decode |
 | [`maki.image.Image`](#maki-image-Image) | A decoded image you can inspect, resize, and re-encode. |
 | [`maki.interpreter`](#maki-interpreter) | Run Python code in a memory-safe, time-limited sandbox. |
@@ -3389,7 +3389,7 @@ end
 
 ## maki.host {#maki-host}
 
-Actions on the host machine, such as opening a browser for a login.
+Actions on the host machine: opening a browser, reading the keyring.
 
 ```lua
 maki.host.open("https://example.com")
@@ -3418,6 +3418,32 @@ Requires the `run` [plugin permission](#plugin-permissions).
 
 ```lua
 local ok, err = maki.host.open("https://example.com/login")
+```
+
+---
+
+### `maki.host.keyring_get()` {#maki-host-keyring_get}
+
+```lua
+maki.host.keyring_get({service}, {account})
+```
+
+Read a secret another program stored in the system keyring, such as the
+token the GitHub CLI keeps there.
+
+Requires the `env` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{service}` (`string`) Keyring service name, such as `gh:github.com`.
+- `{account}` (`string`) Account name within the service; may be empty.
+
+**Returns:** (`string?`, `string?`) The secret, nil when there is no such entry, or nil plus an error when the keyring cannot be read.
+
+**Example:**
+
+```lua
+local token, err = maki.host.keyring_get("gh:github.com", "octocat")
 ```
 
 
@@ -7655,7 +7681,8 @@ function M.rmtree(dir)
 function M.response(chunks, opts)
 
 -- A provider `ctx` whose `send` records each request and returns the next of
--- {responses}, and whose credentials live in memory.
+-- {responses}, and whose credentials live in memory. `refresh` runs its
+-- function at once, without a lock.
 function M.provider_ctx(responses, saved)
 
 -- An `emit` for provider streams, plus the list it records into.

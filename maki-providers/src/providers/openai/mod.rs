@@ -1,27 +1,130 @@
-pub mod auth;
-mod platform;
+//! The OpenAI protocol that dynamic providers with an `openai` base and the
+//! custom and local providers still route through: Chat Completions, and
+//! Responses for Codex models. The `openai` provider itself is registered by
+//! `plugins/providers`.
+
 pub(crate) mod responses;
 
-pub use platform::OpenAi;
+use std::sync::{Arc, Mutex};
 
-use crate::model::{ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use flume::Sender;
+use maki_storage::id::SessionRef;
+use serde_json::Value;
+
+use crate::model::{Model, ModelEntry, ModelFamily, ModelInfo, ModelPricing, ModelTier};
+use crate::provider::{BoxFuture, NativeProvider, Provider};
+use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use crate::providers::{ResolvedAuth, Timeouts, with_prefix};
+use crate::types::ThinkingConfigExt;
+use crate::{
+    AgentError, Invocation, Message, ProviderEvent, RequestOptions, StreamResponse, dialect,
+};
 
 const GPT_5_6_CONTEXT_WINDOW: u32 = 372_000;
 const GPT_6_1_CONTEXT_WINDOW: u32 = 500_000;
 const GPT_6_CONTEXT_WINDOW: u32 = 272_000;
 const GPT_5_6_MAX_OUTPUT_TOKENS: u32 = 128_000;
+const CODEX_MARKER: &str = "-codex";
+/// ChatGPT plan models that speak Responses besides the `-codex` ones.
+const PLAN_MODELS: &[&str] = &[
+    "gpt-6.1-sol",
+    "gpt-6.1-terra",
+    "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
+    "gpt-5.6-luna",
+    "gpt-5.6-terra",
+    "gpt-5.6-sol",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.2",
+];
 
-inventory::submit!(maki_config::providers::BuiltInProvider {
+static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "openai",
-    display_name: "OpenAI",
-    protocol: maki_config::providers::Protocol::Openai,
-    default_base_url: "https://api.openai.com/v1",
-    default_api_key_env: "OPENAI_API_KEY",
-    default_model: "openai/gpt-5.5",
-    plans: None,
-    login_url: Some("https://platform.openai.com/api-keys"),
-    needs_url: false,
-});
+    base_url: "https://api.openai.com/v1",
+    max_tokens_field: "max_completion_tokens",
+    include_stream_usage: true,
+    provider_name: "OpenAI",
+};
+
+fn speaks_responses(model_id: &str) -> bool {
+    model_id.contains(CODEX_MARKER) || PLAN_MODELS.contains(&model_id)
+}
+
+pub(crate) struct OpenAiProtocol {
+    compat: OpenAiCompatProvider,
+    auth: Arc<Mutex<ResolvedAuth>>,
+    system_prefix: Option<String>,
+}
+
+impl OpenAiProtocol {
+    pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: Timeouts) -> Self {
+        Self {
+            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
+            auth,
+            system_prefix: None,
+        }
+    }
+
+    pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
+        self.system_prefix = prefix;
+        self
+    }
+}
+
+impl Provider for OpenAiProtocol {
+    fn stream_message<'a>(
+        &'a self,
+        model: &'a Model,
+        messages: &'a [Message],
+        system: &'a str,
+        tools: &'a Value,
+        event_tx: &'a Sender<ProviderEvent>,
+        opts: RequestOptions,
+        _session_id: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        Box::pin(async move {
+            let mut buf = String::new();
+            let system = with_prefix(&self.system_prefix, system, &mut buf);
+            let mut auth = self.auth.lock().unwrap().clone();
+            if speaks_responses(&model.id) {
+                auth.base_url = Some(self.compat.base_url(&auth));
+                let body = responses::build_body(responses::ResponsesRequestArgs {
+                    model,
+                    messages,
+                    system,
+                    tools,
+                    thinking: Some((opts.thinking, &dialect::STANDARD)),
+                });
+                return responses::do_stream(
+                    self.compat.client(),
+                    model,
+                    &body,
+                    event_tx,
+                    &auth,
+                    self.compat.stream_timeout(),
+                )
+                .await;
+            }
+            let mut body = self.compat.build_body(model, messages, system, tools);
+            opts.thinking
+                .apply_reasoning_effort(&mut body, &dialect::STANDARD, model);
+            self.compat
+                .do_stream(model, &[], &body, event_tx, &auth)
+                .await
+        })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        let auth = self.auth.lock().unwrap().clone();
+        Box::pin(async move { self.compat.do_list_models(&auth).await })
+    }
+}
+
+impl NativeProvider for OpenAiProtocol {}
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
     &[
@@ -378,105 +481,4 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             context_window: 400_000,
         },
     ]
-}
-
-#[cfg(test)]
-mod tests {
-    use test_case::test_case;
-
-    use super::*;
-
-    #[test_case(
-        "gpt-5.6-luna",
-        ModelTier::Weak,
-        1.0,
-        0.1,
-        1.25,
-        6.0,
-        GPT_5_6_CONTEXT_WINDOW
-    )]
-    #[test_case(
-        "gpt-5.6-terra",
-        ModelTier::Medium,
-        2.5,
-        0.25,
-        3.125,
-        15.0,
-        GPT_5_6_CONTEXT_WINDOW
-    )]
-    #[test_case(
-        "gpt-5.6-sol",
-        ModelTier::Strong,
-        5.0,
-        0.5,
-        6.25,
-        30.0,
-        GPT_5_6_CONTEXT_WINDOW
-    )]
-    #[test_case(
-        "gpt-6.1-sol",
-        ModelTier::Medium,
-        2.0,
-        0.1,
-        2.5,
-        10.0,
-        GPT_6_1_CONTEXT_WINDOW
-    )]
-    #[test_case(
-        "gpt-6.1-terra",
-        ModelTier::Medium,
-        1.0,
-        0.05,
-        1.25,
-        5.0,
-        GPT_6_1_CONTEXT_WINDOW
-    )]
-    #[test_case(
-        "gpt-6-astra",
-        ModelTier::Strong,
-        10.0,
-        1.0,
-        12.5,
-        50.0,
-        GPT_6_CONTEXT_WINDOW
-    )]
-    #[test_case(
-        "gpt-6-sol",
-        ModelTier::Medium,
-        2.0,
-        0.2,
-        2.5,
-        10.0,
-        GPT_6_CONTEXT_WINDOW
-    )]
-    #[test_case(
-        "gpt-6-luna",
-        ModelTier::Weak,
-        0.1,
-        0.01,
-        0.125,
-        0.5,
-        GPT_6_CONTEXT_WINDOW
-    )]
-    fn gpt_models_have_expected_tier_and_short_context_pricing(
-        model_id: &str,
-        tier: ModelTier,
-        input: f64,
-        cache_read: f64,
-        cache_write: f64,
-        output: f64,
-        context_window: u32,
-    ) {
-        let model = models()
-            .iter()
-            .find(|model| model.prefixes.contains(&model_id))
-            .expect("model should be registered");
-
-        assert_eq!(model.tier, tier);
-        assert_eq!(model.context_window, context_window);
-        assert_eq!(model.pricing.input, input);
-        assert_eq!(model.pricing.cache_read, cache_read);
-        assert_eq!(model.pricing.cache_write, cache_write);
-        assert_eq!(model.pricing.output, output);
-    }
 }

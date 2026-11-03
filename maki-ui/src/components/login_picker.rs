@@ -2,7 +2,6 @@ use std::env;
 use std::io;
 use std::iter;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use flume::{Receiver, Sender};
@@ -20,12 +19,11 @@ use maki_providers::login::{
     AuthState, ChoiceOption, InteractionRequest, InteractionService, LoginOutcome, LoginRequest,
     drive_login,
 };
-use maki_providers::openai_auth;
 use maki_providers::provider::BoxFuture;
 use maki_providers::{AgentError, ProviderData, ProviderRegistry};
 use maki_storage::StateDir;
 use maki_storage::auth::{
-    ProviderCredentials, load_provider_credentials, load_tokens, save_provider_credentials,
+    ProviderCredentials, load_provider_credentials, save_provider_credentials,
 };
 use maki_storage::model::persist_model;
 
@@ -43,12 +41,6 @@ const CATALOG_SECTION: &str = "Providers from Models.dev";
 pub const CUSTOM_SLUG: &str = "custom";
 const CUSTOM_LABEL: &str = "Custom provider...";
 const OPENCODE_SLUG: &str = "opencode";
-const OPENAI_SLUG: &str = "openai";
-pub const OPENAI_CODEX_SLUG: &str = "openai-codex";
-const OPENAI_CODEX_DISPLAY: &str = "OpenAI Codex";
-const OPENAI_CODEX_LABEL: &str = "OpenAI Codex (ChatGPT login)";
-const CODEX_DONE_MESSAGE: &str = "Authenticated: OpenAI";
-const CODEX_ERROR_MESSAGE: &str = "Codex login failed: ";
 const INSTRUCTIONS_HEIGHT: u16 = 4;
 const INSTRUCTIONS_DISMISS: &str = "Press Enter or Esc to return";
 const WAITING_MESSAGE: &str = "Waiting... (Esc to cancel)";
@@ -130,11 +122,6 @@ struct CustomInfo {
     protocol: String,
 }
 
-enum CodexEvent {
-    Started { user_code: String },
-    Done(Result<(), String>),
-}
-
 enum Step {
     Closed,
     /// The login driver is busy off the UI thread.
@@ -169,12 +156,6 @@ enum Step {
         input: TextBuffer,
         slug: String,
         display_name: String,
-    },
-    CodexWaiting {
-        display_name: String,
-        codex_rx: flume::Receiver<CodexEvent>,
-        user_code: Option<String>,
-        abort: Arc<AtomicBool>,
     },
     EnterKey {
         input: TextBuffer,
@@ -220,9 +201,6 @@ enum StepAction {
         slug: String,
         display_name: String,
     },
-    GoCodex {
-        display_name: String,
-    },
     GoDone {
         message: String,
         model_spec: Option<String>,
@@ -258,8 +236,7 @@ pub fn native_login_choices(
 ) -> Vec<ChoiceOption> {
     let config = ProvidersConfig::load();
     let builtins = providers::all_builtins().into_iter().map(|b| {
-        let has_key = load_provider_credentials(storage, b.slug).is_some()
-            || load_tokens(storage, b.slug).is_some();
+        let has_key = load_provider_credentials(storage, b.slug).is_some();
         let has_env = env::var(b.default_api_key_env).is_ok();
         let configured = config.get(b.slug).is_some_and(|d| d.base_url.is_some());
         native_choice(
@@ -282,12 +259,6 @@ pub fn native_login_choices(
             let label = def.display_name.as_deref().unwrap_or(slug);
             native_choice(slug, label, None, found_state(has_key, has_env, false))
         });
-    let codex = native_choice(
-        OPENAI_CODEX_SLUG,
-        OPENAI_CODEX_LABEL,
-        None,
-        AuthState::Missing,
-    );
     let catalog: Vec<ChoiceOption> = match catalog {
         Some(catalog) => catalog
             .iter()
@@ -308,7 +279,6 @@ pub fn native_login_choices(
     let custom_choice = native_choice(CUSTOM_SLUG, CUSTOM_LABEL, None, AuthState::Missing);
     builtins
         .chain(custom)
-        .chain(iter::once(codex))
         .chain(catalog)
         .chain(iter::once(custom_choice))
         .filter(|choice| !registry.contains(&choice.id))
@@ -385,9 +355,6 @@ impl LoginPicker {
     }
 
     pub fn poll(&mut self) -> (Dirty, Option<LoginPickerAction>) {
-        if let Some(action) = self.poll_codex() {
-            return (Dirty::YES, Some(action));
-        }
         let mut dirty = Dirty::NO;
         let mut action = None;
         while let Some(event) = self.login.as_ref().and_then(|l| l.events.try_recv().ok()) {
@@ -468,9 +435,6 @@ impl LoginPicker {
         let action = match slug.as_str() {
             CATALOG_UNAVAILABLE_SLUG => StepAction::Back,
             CUSTOM_SLUG => StepAction::GoCustomName,
-            OPENAI_CODEX_SLUG => StepAction::GoCodex {
-                display_name: OPENAI_CODEX_DISPLAY.into(),
-            },
             _ => {
                 let config = providers::ProvidersConfig::load();
                 let def = config.get(&slug);
@@ -747,13 +711,6 @@ impl LoginPicker {
                     return LoginPickerAction::Consumed;
                 }
             },
-            Step::CodexWaiting { abort, .. } => match key.code {
-                KeyCode::Esc => {
-                    abort.store(true, Ordering::Relaxed);
-                    StepAction::Back
-                }
-                _ => StepAction::None,
-            },
             Step::BuiltinUrl {
                 input,
                 slug,
@@ -826,39 +783,6 @@ impl LoginPicker {
                     input: TextBuffer::new(default),
                     slug,
                     display_name,
-                };
-                LoginPickerAction::Consumed
-            }
-            StepAction::GoCodex { display_name } => {
-                self.open_browser(openai_auth::CODEX_DEVICE_URL);
-                let (tx, rx) = flume::unbounded();
-                let abort = Arc::new(AtomicBool::new(false));
-                let thread_abort = abort.clone();
-                let storage = self.storage.clone();
-                std::thread::spawn(move || {
-                    let session = match openai_auth::start_device_login() {
-                        Ok(session) => session,
-                        Err(e) => {
-                            let _ = tx.send(CodexEvent::Done(Err(e.to_string())));
-                            return;
-                        }
-                    };
-                    let _ = tx.send(CodexEvent::Started {
-                        user_code: session.user_code.clone(),
-                    });
-                    let result =
-                        openai_auth::wait_device_login(&storage, &session, Some(&thread_abort));
-                    let event = match result {
-                        Ok(()) => CodexEvent::Done(Ok(())),
-                        Err(e) => CodexEvent::Done(Err(e.to_string())),
-                    };
-                    let _ = tx.send(event);
-                });
-                self.step = Step::CodexWaiting {
-                    display_name,
-                    codex_rx: rx,
-                    user_code: None,
-                    abort,
                 };
                 LoginPickerAction::Consumed
             }
@@ -943,50 +867,6 @@ impl LoginPicker {
         }
     }
 
-    pub fn poll_codex(&mut self) -> Option<LoginPickerAction> {
-        let event = {
-            let Step::CodexWaiting { codex_rx, .. } = &self.step else {
-                return None;
-            };
-            match codex_rx.try_recv() {
-                Ok(event) => event,
-                Err(_) => return None,
-            }
-        };
-        if let CodexEvent::Started { user_code } = &event {
-            if let Step::CodexWaiting {
-                user_code: slot, ..
-            } = &mut self.step
-            {
-                *slot = Some(user_code.clone());
-            }
-            return None;
-        }
-        match event {
-            CodexEvent::Done(Ok(())) => {
-                self.step = Step::Done {
-                    message: CODEX_DONE_MESSAGE.into(),
-                };
-                Some(LoginPickerAction::Configured {
-                    slug: OPENAI_SLUG.into(),
-                })
-            }
-            CodexEvent::Done(Err(e)) => {
-                self.step = Step::Done {
-                    message: format!("{CODEX_ERROR_MESSAGE}{e}"),
-                };
-                Some(LoginPickerAction::Consumed)
-            }
-            CodexEvent::Started { .. } => None,
-        }
-    }
-
-    fn abort_codex(&mut self) {
-        if let Step::CodexWaiting { abort, .. } = &self.step {
-            abort.store(true, Ordering::Relaxed);
-        }
-    }
-
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
         match &mut self.step {
             Step::Closed => Rect::default(),
@@ -1012,34 +892,6 @@ impl LoginPicker {
                 notes_modal(frame, area, lines)
             }
             Step::PickPlan { picker, .. } => picker.view(frame, area),
-            Step::CodexWaiting {
-                display_name,
-                user_code,
-                ..
-            } => {
-                let modal = Modal {
-                    title: &format!(" {display_name} "),
-                    width_percent: 70,
-                    max_height_percent: 45,
-                };
-                let (popup, inner) = modal.render(frame, area, 2);
-                let t = theme::current();
-                let mut lines: Vec<Line> = Vec::new();
-                lines.push(Line::from(Span::raw(openai_auth::CODEX_DEVICE_URL)));
-                if let Some(code) = user_code.as_deref() {
-                    lines.push(Line::from(Span::styled(format!("Code: {code}"), t.bold)));
-                }
-                lines.push(Line::from(Span::raw(
-                    "Waiting for authorization... (press Esc to cancel)",
-                )));
-                frame.render_widget(
-                    ratatui::widgets::Paragraph::new(lines)
-                        .style(Style::new().bg(t.background))
-                        .wrap(Wrap { trim: true }),
-                    inner,
-                );
-                popup
-            }
             Step::CustomName { input } => {
                 let modal = Modal {
                     title: " Provider name ",
@@ -1167,7 +1019,6 @@ impl Overlay for LoginPicker {
     }
 
     fn close(&mut self) {
-        self.abort_codex();
         self.login = None;
         self.step = Step::Closed;
     }
@@ -1240,7 +1091,6 @@ mod tests {
     use maki_providers::Timeouts;
     use maki_storage::model::read_model;
     use tempfile::TempDir;
-    use test_case::test_case;
 
     use super::*;
     use crate::components::key;
@@ -1419,15 +1269,14 @@ mod tests {
     }
 
     #[test]
-    fn native_choices_include_codex_and_skip_registered() {
+    fn native_choices_skip_registered() {
         let fixture = Fixture::new();
         let ids: Vec<String> =
             native_login_choices(&fixture.storage, &fixture.picker.providers, None)
                 .into_iter()
                 .map(|choice| choice.id)
                 .collect();
-        assert!(ids.iter().any(|id| id == OPENAI_CODEX_SLUG));
-        assert!(ids.iter().any(|id| id == OPENAI_SLUG));
+        assert!(ids.iter().any(|id| id == CUSTOM_SLUG));
         assert!(!ids.iter().any(|id| id == PROVIDER));
     }
 
@@ -1457,65 +1306,5 @@ mod tests {
             picker.step,
             Step::Instructions { message, .. } if message == VERTEX_LOGIN_INSTRUCTIONS
         ));
-    }
-
-    fn codex_picker_with(event: CodexEvent) -> LoginPicker {
-        let (tx, rx) = flume::unbounded();
-        tx.send(event).unwrap();
-        picker_with(Step::CodexWaiting {
-            display_name: "OpenAI".into(),
-            codex_rx: rx,
-            user_code: None,
-            abort: Arc::new(AtomicBool::new(false)),
-        })
-    }
-
-    #[test_case(true; "codex done ok")]
-    #[test_case(false; "codex done err")]
-    fn poll_codex_done(success: bool) {
-        let event = if success {
-            CodexEvent::Done(Ok(()))
-        } else {
-            CodexEvent::Done(Err("boom".into()))
-        };
-        let mut picker = codex_picker_with(event);
-        let expected_message = if success {
-            CODEX_DONE_MESSAGE.to_string()
-        } else {
-            format!("{CODEX_ERROR_MESSAGE}boom")
-        };
-        let action = picker.poll_codex().expect("poll_codex should act");
-        match action {
-            LoginPickerAction::Configured { slug } => {
-                assert!(success);
-                assert_eq!(slug, OPENAI_SLUG);
-            }
-            LoginPickerAction::Consumed => assert!(!success),
-            _ => panic!("unexpected action"),
-        }
-        assert!(matches!(
-            &picker.step,
-            Step::Done { message } if message == &expected_message
-        ));
-    }
-
-    #[test]
-    fn poll_codex_started_records_user_code() {
-        let (tx, rx) = flume::unbounded();
-        let mut picker = picker_with(Step::CodexWaiting {
-            display_name: "OpenAI".into(),
-            codex_rx: rx,
-            user_code: None,
-            abort: Arc::new(AtomicBool::new(false)),
-        });
-        tx.send(CodexEvent::Started {
-            user_code: "ABCD-EFGH".into(),
-        })
-        .unwrap();
-        assert!(picker.poll_codex().is_none());
-        let Step::CodexWaiting { user_code, .. } = &picker.step else {
-            panic!("expected codex waiting");
-        };
-        assert_eq!(user_code.as_deref(), Some("ABCD-EFGH"));
     }
 }

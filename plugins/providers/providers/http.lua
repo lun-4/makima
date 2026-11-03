@@ -6,6 +6,8 @@ local M = {}
 local MAX_ERROR_BYTES = 64 * 1024
 local MAX_JSON_BYTES = 16 * 1024 * 1024
 local RETRY_AFTER_HEADER = "retry-after"
+local CONTENT_TYPE = "Content-Type"
+local JSON_TYPE = "application/json"
 
 local function trim(text)
   return text:match("^%s*(.-)%s*$")
@@ -152,6 +154,21 @@ function M.send(ctx, request)
     return nil, M.error(response)
   end
   return response
+end
+
+-- POSTs {body} as JSON to {url} and decodes the reply with the codec
+-- {stream}`(response, emit)`, closing the response either way.
+function M.post_stream(ctx, url, headers, body, stream, emit)
+  headers = table.clone(headers)
+  M.set_header(headers, CONTENT_TYPE, JSON_TYPE)
+  local response, err =
+    M.send(ctx, { url = url, method = "POST", headers = headers, body = assert(maki.json.encode(body)) })
+  if not response then
+    return nil, err
+  end
+  local result, stream_err = stream(response, emit)
+  response:close()
+  return result, stream_err
 end
 
 -- Reads the rest of the body, or nil plus an error once it passes {max_bytes}.

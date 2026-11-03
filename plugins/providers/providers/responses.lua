@@ -3,9 +3,11 @@
 local chat_completions = require("providers.chat_completions")
 local codec = require("providers.codec")
 local sse = require("providers.sse")
+local thinking = require("providers.thinking")
 
 local M = {}
 
+local SUMMARY = "auto"
 local UNKNOWN_ERROR_STATUS = 500
 local FAILED_MESSAGE = "response generation failed"
 
@@ -72,6 +74,16 @@ function M.convert_tools(tools)
     }
   end
   return out
+end
+
+-- The `reasoning` object for {setting} in {dialect}: the effort, plus a
+-- summary request whenever thinking is on. Nil when there is nothing to say.
+function M.reasoning(setting, dialect, max)
+  local effort = thinking.effort(setting, dialect, max)
+  local summary = setting.kind ~= "off" and SUMMARY or nil
+  if effort or summary then
+    return { effort = effort, summary = summary }
+  end
 end
 
 -- {reasoning} is the provider's encoded `reasoning` object, if any.

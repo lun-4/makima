@@ -1,5 +1,6 @@
 //! Actions on the machine running maki, outside the terminal.
 
+use keyring::{Entry, Error as KeyringError};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult};
 use smol::unblock;
@@ -21,6 +22,26 @@ async fn open(_lua: Lua, url: String) -> LuaResult<Pair<bool>> {
     Ok((Some(true), None))
 }
 
+/// Read a secret another program stored in the system keyring, such as the
+/// token the GitHub CLI keeps there.
+///
+/// @param service string Keyring service name, such as `gh:github.com`.
+/// @param account string Account name within the service; may be empty.
+/// @return (string?, string?) The secret, nil when there is no such entry, or nil plus an error when the keyring cannot be read.
+/// @example
+/// local token, err = maki.host.keyring_get("gh:github.com", "octocat")
+#[lua_fn(guard = Env)]
+async fn keyring_get(_lua: Lua, service: String, account: String) -> LuaResult<Pair<String>> {
+    let Ok(entry) = Entry::new(&service, &account) else {
+        return Ok((None, None));
+    };
+    Ok(match unblock(move || entry.get_password()).await {
+        Ok(secret) => (Some(secret), None),
+        Err(KeyringError::NoEntry) => (None, None),
+        Err(error) => (None, Some(error.to_string())),
+    })
+}
+
 pub(crate) async fn open_url(url: &str) -> Result<(), String> {
     let url = parse_http_url(url)?;
     unblock(move || ::open::that_detached(url.as_str()))
@@ -29,13 +50,14 @@ pub(crate) async fn open_url(url: &str) -> Result<(), String> {
 }
 
 lua_table! {
-    /// Actions on the host machine, such as opening a browser for a login.
+    /// Actions on the host machine: opening a browser, reading the keyring.
     ///
     /// ```lua
     /// maki.host.open("https://example.com")
     /// ```
     "maki.host" => pub(crate) fn create_host_table(perms: &PluginPermissions), DOCS [
         open(perms),
+        keyring_get(perms),
     ]
 }
 

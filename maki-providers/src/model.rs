@@ -1344,7 +1344,6 @@ mod tests {
     #[test_case("anthropic/claude-opus-4-8",       true  ; "claude")]
     #[test_case("openai/gpt-5.4",                   true  ; "gpt")]
     #[test_case("google/gemini-2.5-pro",            true  ; "gemini")]
-    #[test_case("copilot/claude-opus-4.7",          true  ; "copilot_entry_beats_generic_family")]
     #[test_case("anthropic/claude-nonexistent-99",  true  ; "unknown_model_uses_family_fallback")]
     #[test_case("ollama/my-custom-model",           false ; "unknown_generic_defaults_off")]
     fn vision_resolved_from_entry_or_family(spec: &str, expected: bool) {

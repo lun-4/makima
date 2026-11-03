@@ -105,10 +105,8 @@ fn merged_override(overrides: &Overrides, provider_id: &str, model_id: &str) -> 
 /// Native providers Aperture's gateway can proxy onto. The gateway speaks
 /// OpenAI chat/responses, Anthropic messages, and Gemini generateContent, so
 /// each routes to its native provider kind and lets it build the right path.
-/// OpenAI itself is excluded: routing to the native `OpenAi` provider would
-/// hit its codex responses-API path for `gpt-*-codex` models and bypass the
-/// gateway. Copilot is excluded: its auth is GraphQL-discovered, not a clean
-/// proxy target.
+/// OpenAI itself is excluded: routing to the OpenAI protocol would hit its
+/// codex responses-API path for `gpt-*-codex` models and bypass the gateway.
 fn compat_kind(kind: ProviderKind) -> Option<ProviderKind> {
     match kind {
         ProviderKind::Anthropic
@@ -160,7 +158,6 @@ fn default_path_prefix(kind: Option<ProviderKind>) -> &'static str {
             ProviderKind::Ollama
             | ProviderKind::LlamaCpp
             | ProviderKind::OpenAi
-            | ProviderKind::Copilot
             | ProviderKind::Opencode
             | ProviderKind::Aperture,
         )

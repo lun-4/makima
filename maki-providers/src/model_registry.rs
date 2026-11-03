@@ -375,7 +375,7 @@ mod tests {
     fn make_tiered(models: &[(&str, ModelTier)]) -> ModelRegistry {
         let mut reg = ModelRegistry::default();
         reg.set_known_models(
-            "copilot",
+            "google",
             models
                 .iter()
                 .map(|&(id, tier)| ModelInfo {
@@ -396,33 +396,29 @@ mod tests {
         ]);
 
         assert_eq!(
-            reg.tier_for("copilot/gpt-5.6-sol", "copilot", Some(ModelTier::Medium)),
+            reg.tier_for("google/gpt-5.6-sol", "google", Some(ModelTier::Medium)),
             ModelTier::Strong
         );
         assert_eq!(
-            reg.tier_for("copilot/terra", "copilot", None),
+            reg.tier_for("google/terra", "google", None),
             ModelTier::Medium
         );
+        assert_eq!(reg.tier_for("google/luna", "google", None), ModelTier::Weak);
         assert_eq!(
-            reg.tier_for("copilot/luna", "copilot", None),
-            ModelTier::Weak
-        );
-        assert_eq!(
-            reg.spec_for_tier("copilot", ModelTier::Strong),
-            Some("copilot/gpt-5.6-sol".into())
+            reg.spec_for_tier("google", ModelTier::Strong),
+            Some("google/gpt-5.6-sol".into())
         );
     }
 
-    #[test_case(&[("gpt-5.4", ModelTier::Strong), ("claude-opus-4.7", ModelTier::Strong)], "copilot/claude-opus-4.7"; "curated default beats discovered tier")]
-    #[test_case(&[("claude-opus-4.6", ModelTier::Strong), ("alpha", ModelTier::Strong)], "copilot/claude-opus-4.6"; "later curated prefix when first is unavailable")]
-    #[test_case(&[("zeta", ModelTier::Strong), ("alpha", ModelTier::Strong)], "copilot/alpha"; "lowest id when no curated default is entitled")]
+    #[test_case(&[("gemini-3-pro", ModelTier::Strong), ("gemini-2.5-pro", ModelTier::Strong)], "google/gemini-2.5-pro"; "curated default beats discovered tier")]
+    #[test_case(&[("zeta", ModelTier::Strong), ("alpha", ModelTier::Strong)], "google/alpha"; "lowest id when no curated default is entitled")]
     fn spec_for_tier_prefers_entitled_curated_default(
         models: &[(&str, ModelTier)],
         expected: &str,
     ) {
         let reg = make_tiered(models);
         assert_eq!(
-            reg.spec_for_tier("copilot", ModelTier::Strong),
+            reg.spec_for_tier("google", ModelTier::Strong),
             Some(expected.into())
         );
     }
@@ -438,8 +434,8 @@ mod tests {
         reversed.reverse();
 
         assert_eq!(
-            make_tiered(&models).spec_for_tier("copilot", ModelTier::Strong),
-            make_tiered(&reversed).spec_for_tier("copilot", ModelTier::Strong)
+            make_tiered(&models).spec_for_tier("google", ModelTier::Strong),
+            make_tiered(&reversed).spec_for_tier("google", ModelTier::Strong)
         );
     }
 

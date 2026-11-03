@@ -48,16 +48,6 @@ enable_free_models = true
 
 The default is `false`."#;
 
-const OPENAI_AUTH_NOTE: &str = r#"#### Auth
-
-You can use OpenAI two ways.
-
-**API key** — Set `OPENAI_API_KEY` or pick `OpenAI (API key)` in `/login` and paste a key from [platform.openai.com/api-keys](https://platform.openai.com/api-keys).
-
-**ChatGPT subscription** — Use OpenAI Codex through your ChatGPT login instead. Run `makima auth login openai` or pick `OpenAI Codex (ChatGPT login)` in `/login`. Makima guides you through the OAuth device flow at [auth.openai.com/codex](https://auth.openai.com/codex) and stores your OAuth tokens, which take precedence over the API key."#;
-
-const OPENAI_OAUTH_NOTE: &str = r#"With ChatGPT OAuth (`makima auth login openai`) the model list comes from the Codex backend's own `/models` endpoint, so a model your plan gains shows up without a Makima update, with the context window and reasoning levels the backend declares for it. The table above is the offline fallback. The endpoint hides models newer than the Codex CLI version Makima reports, so a brand new release can lag until that version is bumped."#;
-
 const OPENCODE_GO_SECTION: &str = r#"### Opencode Go
 
 - **Env var**: `OPENCODE_API_KEY`
@@ -377,31 +367,8 @@ fn build_sections() -> Vec<ProviderSection> {
 
     for kind in ProviderKind::iter() {
         match kind {
-            // Registered from Lua; the variant is only a protocol base.
-            ProviderKind::Anthropic => {}
-            ProviderKind::OpenAi => {
-                sections.push(ProviderSection {
-                    kind,
-                    name: kind.display_name(),
-                    auth_line: format!("{} (also supports OAuth device flow)", format_auth(kind)),
-                    urls: vec![kind.base_url()],
-                    features: kind.features(),
-                    entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
-                });
-            }
-            ProviderKind::Copilot => {
-                sections.push(ProviderSection {
-                    kind,
-                    name: kind.display_name(),
-                    auth_line: format!(
-                        "{} (or run `makima auth login copilot` to import a token from gh CLI, the Copilot client, or the system keyring)",
-                        format_auth(kind)
-                    ),
-                    urls: vec![kind.base_url()],
-                    features: kind.features(),
-                    entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
-                });
-            }
+            // Registered from Lua; the variants are only protocol bases.
+            ProviderKind::Anthropic | ProviderKind::OpenAi => {}
             _ => {
                 sections.push(ProviderSection {
                     kind,
@@ -513,11 +480,6 @@ fn write_section(out: &mut String, section: &ProviderSection) {
 
     if section.kind == ProviderKind::Opencode {
         let _ = writeln!(out, "\n{OPENCODE_FREE_MODELS_NOTE}");
-    }
-
-    if section.kind == ProviderKind::OpenAi {
-        let _ = writeln!(out, "\n{OPENAI_AUTH_NOTE}");
-        let _ = writeln!(out, "\n{OPENAI_OAUTH_NOTE}");
     }
 }
 

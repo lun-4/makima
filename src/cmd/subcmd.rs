@@ -17,20 +17,20 @@ use maki_config::providers::{
 use maki_config::{Config, load_env_files, load_permissions};
 use maki_lua::PluginHost;
 use maki_lua::ui_sink::{HeadlessUi, HostUi};
+use maki_providers::dynamic;
 use maki_providers::login::{
     self, AuthState, AuthStatus, InteractionRequest, InteractionService, LoginOutcome,
     LoginRequest, ProviderStatus, drive_login,
 };
 use maki_providers::provider::BoxFuture;
 use maki_providers::{AgentError, ProviderData, ProviderRegistry, Timeouts, catalog_providers};
-use maki_providers::{copilot_auth, dynamic, openai_auth};
 use maki_storage::StateDir;
 use maki_storage::auth::ProviderCredentials;
 use maki_storage::auth::{
-    delete_provider_credentials, load_provider_credentials, load_tokens, save_provider_credentials,
+    delete_provider_credentials, load_provider_credentials, save_provider_credentials,
 };
 use maki_storage::model::persist_model;
-use maki_ui::{AppSession, CUSTOM_SLUG, OPENAI_CODEX_SLUG, native_login_choices};
+use maki_ui::{AppSession, CUSTOM_SLUG, native_login_choices};
 
 const SESSIONS_JSON_ONLY_ERR: &str =
     "the sessions command only supports --json; use `makima sessions --json`";
@@ -71,18 +71,13 @@ pub fn auth_login(
                 println!("  Default model: {model}");
             }
         }
-        LoginOutcome::Native(name) => login_native(&slugify(&name), storage, provider.is_none())?,
+        LoginOutcome::Native(name) => login_native(&slugify(&name), storage)?,
     }
     Ok(())
 }
 
-/// {picked} from the list rather than named: the listed OpenAI row asks for
-/// an API key, while `auth login openai` runs the ChatGPT device login.
-fn login_native(slug: &str, storage: &StateDir, picked: bool) -> Result<()> {
+fn login_native(slug: &str, storage: &StateDir) -> Result<()> {
     match slug {
-        "openai" if picked => login_provider(slug, storage)?,
-        "openai" | OPENAI_CODEX_SLUG => openai_auth::login(storage)?,
-        "copilot" => copilot_auth::login(storage)?,
         "vertex" => println!("{VERTEX_LOGIN_INSTRUCTIONS}"),
         CUSTOM_SLUG => login_custom(storage)?,
         slug => {
@@ -473,23 +468,16 @@ pub fn auth_logout(provider: &str, storage: &StateDir, registry: &ProviderRegist
         return Ok(());
     }
     let slug = slugify(provider);
-    match provider {
-        "openai" => openai_auth::logout(storage)?,
-        "copilot" => copilot_auth::logout(storage)?,
-        _ => {
-            let mut config = ProvidersConfig::load();
-            let deleted =
-                delete_provider_credentials(storage, &slug).context("delete credentials")?;
-            if deleted {
-                println!("Removed credentials for '{}'.", slug);
-            }
-            if config.remove(&slug) {
-                config.save().context("save providers.toml")?;
-            }
-            if !deleted && builtin_provider(&slug).is_none() {
-                dynamic::logout(&slug)?;
-            }
-        }
+    let mut config = ProvidersConfig::load();
+    let deleted = delete_provider_credentials(storage, &slug).context("delete credentials")?;
+    if deleted {
+        println!("Removed credentials for '{}'.", slug);
+    }
+    if config.remove(&slug) {
+        config.save().context("save providers.toml")?;
+    }
+    if !deleted && builtin_provider(&slug).is_none() {
+        dynamic::logout(&slug)?;
     }
     Ok(())
 }
@@ -506,9 +494,7 @@ pub fn auth_status(storage: &StateDir, registry: &ProviderRegistry) -> Result<()
         let def = config.get(b.slug);
         let display = resolve_display_name(b.slug, def);
 
-        if load_tokens(storage, b.slug).is_some() {
-            println!("  \x1b[32m✓\x1b[0m {:<14} {} (oauth)", b.slug, display);
-        } else if let Some(creds) = load_provider_credentials(storage, b.slug) {
+        if let Some(creds) = load_provider_credentials(storage, b.slug) {
             let plan_info = def
                 .and_then(|d| d.plan.as_deref())
                 .map(|p| format!(" ({})", p))

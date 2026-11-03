@@ -26,9 +26,7 @@ pub use providers::catalog::{
     catalog_provider, catalog_provider_if_available, catalog_providers,
     catalog_providers_if_available, refresh_catalog, warm_catalog,
 };
-pub use providers::copilot::auth as copilot_auth;
 pub use providers::dynamic;
-pub use providers::openai::auth as openai_auth;
 pub use providers::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
 pub use registry::{PreparedProvider, ProviderBackend, ProviderRegistry, RegisteredProvider};
 pub use retry::{RetryKind, RetryPolicy, RetryState};

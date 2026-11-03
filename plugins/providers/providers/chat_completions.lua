@@ -81,15 +81,15 @@ function M.convert_tools(tools)
   return out
 end
 
--- {options}: `max_tokens_field` names the output limit field;
--- `include_stream_usage` asks for usage in the final chunk.
+-- {options}: `max_tokens_field` names the output limit field, if the API
+-- takes one; `include_stream_usage` asks for usage in the final chunk.
 function M.build_request(request, options)
   local body = {
     model = request.model.id,
     messages = M.convert_messages(request.messages, request.system),
     stream = true,
   }
-  if request.model.max_output_tokens then
+  if options.max_tokens_field and request.model.max_output_tokens then
     body[options.max_tokens_field] = request.model.max_output_tokens
   end
   if options.include_stream_usage then

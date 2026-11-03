@@ -38,48 +38,6 @@ The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discov
 
 ## Built-in Providers
 
-### OpenAI
-
-- **Env var**: `OPENAI_API_KEY` (also supports OAuth device flow)
-- **API**: `https://api.openai.com/v1`
-
-| Tier | Models | Pricing (in/out per 1M tokens) | Context |
-|------|--------|-------------------------------|---------|
-| Weak | gpt-6-luna | $0.10 / $0.50 | 272K ctx / 128K out |
-| Weak | **gpt-5.6-luna** (default) | $1.00 / $6.00 | 372K ctx / 128K out |
-| Weak | gpt-5.4-nano | $0.20 / $1.25 | 400K ctx / 128K out |
-| Weak | gpt-5.4-mini | $0.75 / $4.50 | 400K ctx / 128K out |
-| Weak | gpt-4.1-nano | $0.10 / $0.40 | 1047K ctx / 32K out |
-| Medium | gpt-6.1-sol | $2.00 / $10.00 | 500K ctx / 128K out |
-| Medium | gpt-6.1-terra | $1.00 / $5.00 | 500K ctx / 128K out |
-| Medium | gpt-6-sol | $2.00 / $10.00 | 272K ctx / 128K out |
-| Medium | **gpt-5.6-terra** (default) | $2.50 / $15.00 | 372K ctx / 128K out |
-| Medium | gpt-4.1-mini | $0.40 / $1.60 | 1047K ctx / 32K out |
-| Medium | gpt-4.1 | $2.00 / $8.00 | 1047K ctx / 32K out |
-| Medium | o4-mini | $1.10 / $4.40 | 200K ctx / 100K out |
-| Medium | gpt-5.1-codex-mini | $0.25 / $2.00 | 400K ctx / 128K out |
-| Strong | gpt-6-astra | $10.00 / $50.00 | 272K ctx / 128K out |
-| Strong | **gpt-5.6-sol** (default) | $5.00 / $30.00 | 372K ctx / 128K out |
-| Strong | gpt-5.5 | $5.00 / $30.00 | 1050K ctx / 128K out |
-| Strong | gpt-5.4 | $2.50 / $15.00 | 1050K ctx / 128K out |
-| Strong | o3 | $2.00 / $8.00 | 200K ctx / 100K out |
-| Strong | gpt-5.3-codex | $1.75 / $14.00 | 400K ctx / 128K out |
-| Strong | gpt-5.2-codex | $1.75 / $14.00 | 400K ctx / 128K out |
-| Strong | gpt-5.1-codex-max | $1.25 / $10.00 | 400K ctx / 128K out |
-| Strong | gpt-5.1-codex | $1.25 / $10.00 | 400K ctx / 128K out |
-
-Defaults: gpt-5.6-luna (weak), gpt-5.6-terra (medium), gpt-5.6-sol (strong)
-
-#### Auth
-
-You can use OpenAI two ways.
-
-**API key** — Set `OPENAI_API_KEY` or pick `OpenAI (API key)` in `/login` and paste a key from [platform.openai.com/api-keys](https://platform.openai.com/api-keys).
-
-**ChatGPT subscription** — Use OpenAI Codex through your ChatGPT login instead. Run `makima auth login openai` or pick `OpenAI Codex (ChatGPT login)` in `/login`. Makima guides you through the OAuth device flow at [auth.openai.com/codex](https://auth.openai.com/codex) and stores your OAuth tokens, which take precedence over the API key.
-
-With ChatGPT OAuth (`makima auth login openai`) the model list comes from the Codex backend's own `/models` endpoint, so a model your plan gains shows up without a Makima update, with the context window and reasoning levels the backend declares for it. The table above is the offline fallback. The endpoint hides models newer than the Codex CLI version Makima reports, so a brand new release can lag until that version is bumped.
-
 ### Google
 
 - **Env var**: `GEMINI_API_KEY`
@@ -114,40 +72,6 @@ Defaults: gemini-2.5-pro (strong), gemini-2.5-flash (medium), gemini-2.0-flash-l
 | Strong | **gemini-2.5-pro** (default) | $1.25 / $10.00 | 1048K ctx / 65K out |
 
 Defaults: gemini-2.5-pro (strong), gemini-2.5-flash (medium), gemini-2.5-flash-lite (weak)
-
-### Copilot
-
-- **Env var**: `GH_COPILOT_TOKEN` (or run `makima auth login copilot` to import a token from gh CLI, the Copilot client, or the system keyring)
-- **API**: `https://api.githubcopilot.com (or GraphQL-discovered Copilot API endpoint)`
-- **Features**: Native Copilot Chat HTTP API with model endpoint discovery
-
-| Tier | Models | Pricing (in/out per 1M tokens) | Context |
-|------|--------|-------------------------------|---------|
-| Weak | gpt-5-mini | $0.25 / $2.00 | 200K ctx / 100K out |
-| Weak | gpt-5.4-mini | $0.75 / $4.50 | 200K ctx / 100K out |
-| Weak | gpt-5.4-nano | $0.20 / $1.25 | 200K ctx / 100K out |
-| Weak | claude-haiku-4.5 | $1.00 / $5.00 | 200K ctx / 64K out |
-| Weak | gemini-3.5-flash | $1.50 / $9.00 | 200K ctx / 65K out |
-| Weak | mai-code-1-flash-picker | $0.75 / $4.50 | 200K ctx / 100K out |
-| Weak | **gpt-5.6-luna** (default) | $0.20 / $1.20 | 200K ctx / 100K out |
-| Medium | gemini-3.6-flash | $0.75 / $3.75 | 200K ctx / 65K out |
-| Medium | gemini-3.7-flash | $0.75 / $3.75 | 200K ctx / 65K out |
-| Medium | claude-sonnet-4.5, claude-sonnet-4.6 | $3.00 / $15.00 | 200K ctx / 64K out |
-| Medium | claude-sonnet-5 | $2.00 / $10.00 | 200K ctx / 100K out |
-| Medium | kimi-k2.7-code | $0.95 / $4.00 | 200K ctx / 100K out |
-| Medium | gemini-3.1-pro-preview | $2.00 / $12.00 | 200K ctx / 65K out |
-| Medium | **gpt-5.6-terra** (default) | $2.00 / $12.00 | 200K ctx / 100K out |
-| Medium | grok-4.5 | $2.00 / $6.00 | 200K ctx / 100K out |
-| Medium | grok-4.6 | $2.00 / $6.00 | 200K ctx / 100K out |
-| Strong | gpt-5.5 | $5.00 / $30.00 | 200K ctx / 100K out |
-| Strong | kimi-k3 | $3.00 / $15.00 | 200K ctx / 100K out |
-| Strong | gpt-5.4 | $2.50 / $15.00 | 200K ctx / 100K out |
-| Strong | gpt-5.6-sol | $5.00 / $30.00 | 200K ctx / 100K out |
-| Strong | gpt-5.3-codex | $1.75 / $14.00 | 200K ctx / 100K out |
-| Strong | **claude-opus-5, claude-opus-4.8, claude-opus-4.7, claude-opus-4.6, claude-opus-4.5** (default) | $5.00 / $25.00 | 200K ctx / 64K out |
-| Strong | claude-opus-4.8-fast, claude-fable-5 | $10.00 / $50.00 | 200K ctx / 100K out |
-
-Defaults: gpt-5.6-luna (weak), gpt-5.6-terra (medium), claude-opus-5 (strong)
 
 ### Ollama
 
@@ -341,7 +265,7 @@ To add a custom provider or proxy, drop an executable script into the config `pr
 
 `resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
 
-The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `opencode`, `aperture`.
+The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `ollama`, `llama-cpp`, `opencode`, `aperture`.
 
 If your provider serves models not in the base catalog, add a `models` subcommand returning:
 
