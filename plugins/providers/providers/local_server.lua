@@ -76,7 +76,9 @@ function M.client(ctx, def, config)
   return client
 end
 
-local function stream(def, client, config, ctx, request, emit)
+-- Streams {request} through {client} (`base` and `headers(extra)`), with
+-- the Responses API when {config} asks for it.
+function M.stream(def, client, config, ctx, request, emit)
   local max = thinking.max_budget(request.model)
   if config.protocol == RESPONSES_PROTOCOL then
     local body =
@@ -134,7 +136,7 @@ function M.provider(def)
     end
     local instance = {
       stream = function(call_ctx, request, emit)
-        return stream(def, client, config, call_ctx, request, emit)
+        return M.stream(def, client, config, call_ctx, request, emit)
       end,
     }
     if client.pool then

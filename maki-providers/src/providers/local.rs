@@ -1,5 +1,5 @@
-//! The OpenAI-compatible local endpoint client that Aperture and dynamic
-//! providers still route through for the `ollama` and `llama-cpp` bases.
+//! The OpenAI-compatible local endpoint client that dynamic providers still
+//! route through for the `ollama` and `llama-cpp` bases.
 //! The `ollama` and `llama-cpp` providers themselves are registered by
 //! `plugins/providers`.
 

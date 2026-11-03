@@ -98,7 +98,7 @@ impl ModelCatalog {
     ) -> Discovery {
         let providers = Arc::clone(&self.providers);
         self.discover_from(
-            async move |on_ready| providers.fetch_all(&policy, on_ready).await,
+            async move |on_ready| providers.fetch_all(&policy, false, on_ready).await,
             active,
             applied,
         )

@@ -269,6 +269,7 @@ mod tests {
             turn_output_tokens: None,
             context_window: 0,
             thinking_fields: None,
+            free: false,
         }
     }
 

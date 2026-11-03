@@ -282,8 +282,6 @@ fn parse_model_entry(spec: &str, providers: &ProviderRegistry) -> Option<ModelEn
         kind.display_name().to_string()
     } else if let Some(name) = dynamic::display_name(provider_str) {
         name.to_string()
-    } else if let Some(info) = maki_providers::catalog_provider_if_available(provider_str) {
-        info.display_name.clone()
     } else if let Some(builtin) = maki_config::providers::builtin_provider(provider_str) {
         builtin.display_name.to_string()
     } else {
@@ -296,7 +294,7 @@ fn parse_model_entry(spec: &str, providers: &ProviderRegistry) -> Option<ModelEn
 
     let override_tiers = model_registry::override_tiers(spec);
     let (tier, free) = match providers.model(spec) {
-        Ok(m) => (m.tier.to_string(), m.is_free()),
+        Ok(m) => (m.tier.to_string(), m.free),
         Err(_) => (String::new(), false),
     };
     let tier = if override_tiers.is_empty() {

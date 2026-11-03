@@ -660,12 +660,6 @@ pub mod dialect {
         adaptive: Some(Medium),
         off: None,
     };
-    /// opencode chat-completions.
-    pub const PREFER_HIGH: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High],
-        adaptive: Some(High),
-        off: None,
-    };
     /// `output_config.effort` on Anthropic adaptive-thinking models. The API
     /// has native adaptive mode, so Adaptive sends no effort.
     pub const ANTHROPIC_ADAPTIVE: EffortDialect = EffortDialect {
@@ -1249,11 +1243,7 @@ mod tests {
 
     #[test]
     fn dialects_have_non_empty_ascending_supported() {
-        let all = [
-            &dialect::STANDARD,
-            &dialect::PREFER_HIGH,
-            &dialect::ANTHROPIC_ADAPTIVE,
-        ];
+        let all = [&dialect::STANDARD, &dialect::ANTHROPIC_ADAPTIVE];
         for d in all {
             assert!(!d.supported.is_empty());
             for pair in d.supported.windows(2) {
@@ -1292,7 +1282,6 @@ mod tests {
     #[test_case(&dialect::STANDARD, ThinkingConfig::Effort(Minimal), Some("minimal") ; "standard_minimal_passthrough")]
     #[test_case(&dialect::STANDARD, ThinkingConfig::Effort(Max),     Some("high")    ; "standard_max_snaps_down")]
     #[test_case(&dialect::STANDARD, ThinkingConfig::Budget(1024),    Some("medium")  ; "standard_quarter_budget")]
-    #[test_case(&dialect::PREFER_HIGH, ThinkingConfig::Adaptive,        Some("high") ; "prefer_high_adaptive")]
     #[test_case(&dialect::ANTHROPIC_ADAPTIVE, ThinkingConfig::Adaptive,      None         ; "anthropic_adaptive_is_native")]
     #[test_case(&dialect::ANTHROPIC_ADAPTIVE, ThinkingConfig::Effort(XHigh), Some("high") ; "anthropic_xhigh_snaps_down")]
     fn thinking_apply_reasoning_effort(
@@ -1431,6 +1420,7 @@ mod tests {
             turn_output_tokens: None,
             context_window: 200_000,
             thinking_fields: None,
+            free: false,
         }
     }
 

@@ -14,12 +14,7 @@ use maki_storage::id::SessionRef;
 use crate::model::{Model, ModelFamily, ModelInfo};
 use crate::providers::KeyRotation;
 use crate::providers::Timeouts;
-use crate::providers::aperture::Aperture;
-use crate::providers::catalog::{
-    OPENCODE_FAMILY_SLUGS, available_if_warm, catalog_providers, catalog_providers_if_available,
-};
 use crate::providers::dynamic;
-use crate::providers::opencode::Opencode;
 use crate::{
     AgentError, ConversationEnd, Invocation, Message, ProviderEvent, ProviderUsage, RequestOptions,
     StreamResponse,
@@ -28,25 +23,22 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, EnumString, EnumIter)]
 #[strum(serialize_all = "kebab-case")]
 pub enum ProviderKind {
-    /// Only the protocol base that Aperture routes and dynamic and custom
-    /// providers name. The `anthropic` provider is registered from Lua.
+    /// Only the protocol base that dynamic and custom providers name. The
+    /// `anthropic` provider is registered from Lua.
     Anthropic,
     /// Only the protocol base that dynamic and custom providers name. The
     /// `openai` provider is registered from Lua.
     #[strum(serialize = "openai")]
     OpenAi,
-    /// Only the protocol base that Aperture routes and dynamic and custom
-    /// providers name. The `google` provider is registered from Lua.
+    /// Only the protocol base that dynamic and custom providers name. The
+    /// `google` provider is registered from Lua.
     Google,
-    /// Only the protocol base that Aperture routes and dynamic providers
-    /// name. The `ollama` provider is registered from Lua.
+    /// Only the protocol base that dynamic providers name. The `ollama`
+    /// provider is registered from Lua.
     Ollama,
-    /// Only the protocol base that Aperture routes and dynamic providers
-    /// name. The `llama-cpp` provider is registered from Lua.
+    /// Only the protocol base that dynamic providers name. The `llama-cpp`
+    /// provider is registered from Lua.
     LlamaCpp,
-    #[strum(serialize = "opencode")]
-    Opencode,
-    Aperture,
 }
 
 impl ProviderKind {
@@ -57,8 +49,6 @@ impl ProviderKind {
             Self::Google => "Google",
             Self::Ollama => "Ollama",
             Self::LlamaCpp => "LlamaCpp",
-            Self::Opencode => "Opencode Zen",
-            Self::Aperture => "Aperture",
         }
     }
 
@@ -69,8 +59,6 @@ impl ProviderKind {
             Self::Google => "GEMINI_API_KEY",
             Self::Ollama => "OLLAMA_API_KEY",
             Self::LlamaCpp => "LLAMA_CPP_API_KEY",
-            Self::Opencode => "OPENCODE_API_KEY",
-            Self::Aperture => "",
         }
     }
 
@@ -81,8 +69,6 @@ impl ProviderKind {
             Self::Google => "https://generativelanguage.googleapis.com/v1beta",
             Self::Ollama => "http://localhost:11434/v1",
             Self::LlamaCpp => "http://localhost:8080/v1",
-            Self::Opencode => "https://opencode.ai/zen/v1",
-            Self::Aperture => "Aperture gateway (set APERTURE_HOST)",
         }
     }
 
@@ -92,12 +78,6 @@ impl ProviderKind {
                 Some("Prompt caching, thinking mode (adaptive/budgeted), advanced tool use")
             }
             Self::Google => Some("Native Gemini API with thinking support"),
-            Self::Opencode => Some(
-                "Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Zen API",
-            ),
-            Self::Aperture => Some(
-                "Tailscale Aperture LLM gateway; set APERTURE_HOST or configure in providers.toml",
-            ),
             _ => None,
         }
     }
@@ -109,8 +89,6 @@ impl ProviderKind {
             Self::Google => ModelFamily::Gemini,
             Self::Ollama => ModelFamily::Generic,
             Self::LlamaCpp => ModelFamily::Generic,
-            Self::Opencode => ModelFamily::Generic,
-            Self::Aperture => ModelFamily::Generic,
         }
     }
 
@@ -125,8 +103,6 @@ impl ProviderKind {
             Self::Google => Some(65_536),
             Self::Ollama => Some(16_384),
             Self::LlamaCpp => None,
-            Self::Opencode => Some(128_000),
-            Self::Aperture => Some(16_384),
         }
     }
 
@@ -137,21 +113,13 @@ impl ProviderKind {
             Self::Google => 1_000_000,
             Self::Ollama => 128_000,
             Self::LlamaCpp => 128_000,
-            Self::Opencode => 256_000,
-            Self::Aperture => 128_000,
         }
     }
 
-    pub(crate) fn create(self, timeouts: Timeouts) -> Result<Box<dyn NativeProvider>, AgentError> {
-        match self {
-            Self::Anthropic | Self::OpenAi | Self::Google | Self::Ollama | Self::LlamaCpp => {
-                Err(AgentError::Config {
-                    message: format!("provider '{self}' is registered by the providers plugin"),
-                })
-            }
-            Self::Opencode => Ok(Box::new(Opencode::new(timeouts)?)),
-            Self::Aperture => Ok(Box::new(Aperture::new(timeouts)?)),
-        }
+    fn create(self) -> Result<Box<dyn NativeProvider>, AgentError> {
+        Err(AgentError::Config {
+            message: format!("provider '{self}' is registered by the providers plugin"),
+        })
     }
 }
 
@@ -212,8 +180,6 @@ pub trait Provider: Send + Sync {
 }
 
 pub(crate) trait NativeProvider: Provider {
-    fn adjust_model(&self, _model: &mut Model) {}
-
     /// The keys this provider rotates through, and where the current one lives.
     /// `None` is one fixed credential that never changes. Both the count and
     /// the swap come off it, so they can never describe different pools.
@@ -272,16 +238,13 @@ pub(crate) fn provider_for_slug(
     timeouts: Timeouts,
 ) -> Result<Box<dyn NativeProvider>, AgentError> {
     if let Ok(kind) = ProviderKind::from_str(slug) {
-        return kind.create(timeouts);
+        return kind.create();
     }
     if dynamic::display_name(slug).is_some() {
         return dynamic::create(slug, timeouts);
     }
     if crate::providers::custom::base_kind(slug).is_some() {
         return crate::providers::custom::create(slug, timeouts);
-    }
-    if let Some(catalog) = crate::providers::catalog::try_create(slug, timeouts) {
-        return catalog;
     }
     Err(AgentError::Config {
         message: format!("unknown provider '{slug}'"),
@@ -292,22 +255,8 @@ pub fn provider_available(slug: &str) -> bool {
     provider_for_slug(slug, Timeouts::default()).is_ok()
 }
 
-/// Non-blocking variant of [`provider_available`] for offline model discovery:
-/// catalog-backed slugs consult only the already-warm catalog, so a cold cache
-/// reports them unavailable instead of blocking on a network fetch.
-fn provider_available_offline(slug: &str) -> bool {
-    if ProviderKind::from_str(slug).is_ok()
-        || dynamic::display_name(slug).is_some()
-        || crate::providers::custom::base_kind(slug).is_some()
-    {
-        return provider_available(slug);
-    }
-    available_if_warm(slug)
-}
-
 pub fn from_model(model: &mut Model, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
     let provider = provider_for_slug(&model.provider, timeouts)?;
-    provider.adjust_model(model);
     debug!(provider = %model.provider, model = %model.id, "provider created");
     Ok(Box::new(Native(provider)))
 }
@@ -366,7 +315,6 @@ pub async fn from_model_async(
     let slug = Arc::clone(&model.provider);
     let id = model.id.clone();
     let provider = smol::unblock(move || provider_for_slug(&slug, timeouts)).await?;
-    provider.adjust_model(model);
     debug!(provider = %model.provider, model = %id, "provider created");
     Ok(Box::new(Native(provider)))
 }
@@ -378,54 +326,23 @@ pub struct ModelBatch {
     pub warnings: Vec<String>,
 }
 
-/// Offline version of model discovery: returns specs from static tables
-/// and configured dynamic providers. See [`fetch_all_models`] for live lookups.
-/// Never blocks on catalog download; catalog-backed providers appear only once
-/// the catalog has warmed in the background.
+/// Offline version of model discovery: returns specs from configured dynamic
+/// and custom providers. See [`fetch_all_models`] for live lookups.
 pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
-    let mut specs: Vec<String> = crate::manifest::ManifestRegistry::builtins()
-        .iter()
-        .filter(|m| provider_available_offline(m.slug))
-        .flat_map(|m| {
-            m.models
-                .iter()
-                .flat_map(|entry| entry.prefixes.iter())
-                .map(move |p| format!("{}/{}", m.slug, p))
-        })
+    let mut specs: Vec<String> = dynamic::discovered_slugs()
+        .into_iter()
+        .flat_map(dynamic::dynamic_model_specs_for)
         .collect();
-    for slug in dynamic::discovered_slugs() {
-        specs.extend(dynamic::dynamic_model_specs_for(slug));
-    }
     for spec in crate::providers::custom::declared_model_specs() {
         if !specs.contains(&spec) {
             specs.push(spec);
-        }
-    }
-    if let Some(catalog) = catalog_providers_if_available() {
-        for cat in catalog {
-            if ProviderKind::from_str(&cat.slug).is_ok()
-                || dynamic::base_for_slug(&cat.slug).is_some()
-                || crate::providers::custom::base_kind(&cat.slug).is_some()
-                || OPENCODE_FAMILY_SLUGS.contains(&cat.slug.as_str())
-            {
-                continue;
-            }
-            if !provider_available(&cat.slug) {
-                continue;
-            }
-            for model_id in cat.models.keys() {
-                let spec = format!("{}/{}", cat.slug, model_id);
-                if !specs.contains(&spec) {
-                    specs.push(spec);
-                }
-            }
         }
     }
     specs.retain(|spec| {
         policy.allows(spec)
             && spec
                 .split_once('/')
-                .is_some_and(|(slug, _)| provider_available_offline(slug))
+                .is_some_and(|(slug, _)| provider_available(slug))
     });
     specs
 }
@@ -433,56 +350,6 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
 pub async fn fetch_all_models(policy: &ModelPolicy, mut on_ready: impl FnMut(ModelBatch)) {
     let (tx, rx) = flume::unbounded();
     let timeouts = Timeouts::default();
-
-    for manifest in crate::manifest::ManifestRegistry::builtins() {
-        let slug = manifest.slug;
-        let Ok(provider) = smol::unblock(move || provider_for_slug(slug, timeouts)).await else {
-            warn!(provider = slug, "failed to create provider, skipping");
-            continue;
-        };
-        let display_name = manifest.display_name;
-        let tx = tx.clone();
-        smol::spawn(async move {
-            let batch = match provider.list_models().await {
-                Ok(models) => {
-                    let mut specs: Vec<String> =
-                        models.iter().map(|m| format!("{slug}/{}", m.id)).collect();
-                    crate::model_registry::set_known_models(slug, models);
-                    for entry in manifest.models {
-                        for prefix in entry.prefixes {
-                            let spec = format!("{slug}/{prefix}");
-                            if !specs.contains(&spec) {
-                                specs.push(spec);
-                            }
-                        }
-                    }
-                    ModelBatch {
-                        provider: Some(Arc::from(slug)),
-                        models: specs,
-                        warnings: Vec::new(),
-                    }
-                }
-                Err(e) => {
-                    warn!(provider = slug, error = %e, "failed to list models, using static fallback");
-                    let fallback: Vec<String> = manifest
-                        .models
-                        .iter()
-                        .flat_map(|entry| entry.prefixes.iter())
-                        .map(|p| format!("{slug}/{p}"))
-                        .collect();
-                    ModelBatch {
-                        provider: Some(Arc::from(slug)),
-                        models: fallback,
-                        warnings: vec![format!(
-                            "{display_name}: {e} (using static fallback)"
-                        )],
-                    }
-                }
-            };
-            let _ = tx.send_async(batch).await;
-        })
-        .detach();
-    }
 
     for listed in dynamic::discovered_slugs() {
         let tx = tx.clone();
@@ -515,32 +382,6 @@ pub async fn fetch_all_models(policy: &ModelPolicy, mut on_ready: impl FnMut(Mod
         })
         .detach();
     }
-
-    let tx_catalog = tx.clone();
-    smol::spawn(async move {
-        let catalog = smol::unblock(catalog_providers).await;
-        for cat in catalog {
-            if ProviderKind::from_str(&cat.slug).is_ok()
-                || dynamic::base_for_slug(&cat.slug).is_some()
-                || OPENCODE_FAMILY_SLUGS.contains(&cat.slug.as_str())
-            {
-                continue;
-            }
-            if !provider_available(&cat.slug) {
-                continue;
-            }
-            let slug = cat.slug;
-            let models: Vec<String> = cat.models.keys().map(|id| format!("{slug}/{id}")).collect();
-            let _ = tx_catalog
-                .send_async(ModelBatch {
-                    provider: None,
-                    models,
-                    warnings: Vec::new(),
-                })
-                .await;
-        }
-    })
-    .detach();
 
     let custom_timeouts = timeouts;
     let tx_custom = tx.clone();
@@ -615,10 +456,6 @@ mod tests {
 
     #[test]
     fn provider_for_slug_unknown_returns_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _catalog = crate::providers::catalog::warm_empty_catalog_for_tests(
-            maki_storage::StateDir::from_path(tmp.path().to_path_buf()),
-        );
         let result = provider_for_slug("nonexistent-provider-xyz", Timeouts::default());
         match result {
             Err(e) => {

@@ -1,6 +1,4 @@
 use maki_providers::Effort;
-use maki_providers::manifest::ManifestRegistry;
-use maki_providers::model::{ModelEntry, ModelTier};
 use maki_providers::provider::ProviderKind;
 use std::fmt::Write;
 use strum::IntoEnumIterator;
@@ -38,24 +36,6 @@ base_url = "http://xxxx:1234/v1"
 ```
 
 The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discover_models` and `models` are ignored with a warning. Use a custom slug if you need those."#;
-
-const OPENCODE_FREE_MODELS_NOTE: &str = r#"By default Makima hides free models from the Opencode catalog. To list free models (they use a public fallback, no API key needed), add this to `~/.config/makima/providers.toml`:
-
-```toml
-[opencode]
-enable_free_models = true
-```
-
-The default is `false`."#;
-
-const OPENCODE_GO_SECTION: &str = r#"### Opencode Go
-
-- **Env var**: `OPENCODE_API_KEY`
-- **API**: `https://opencode.ai/zen/go/v1`
-- **Features**: Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Go API
-
-No hardcoded model catalog. Use any model ID supported by this provider. An API key is required.
-"#;
 
 const MODEL_IDENTIFIERS: &str = r#"## Model Identifiers
 
@@ -318,160 +298,6 @@ Dynamic provider models are namespaced as `{{slug}}/{{model_id}}` (e.g. `myproxy
     )
 }
 
-fn tier_label(tier: ModelTier) -> &'static str {
-    match tier {
-        ModelTier::Weak => "Weak",
-        ModelTier::Medium => "Medium",
-        ModelTier::Strong => "Strong",
-        ModelTier::Compaction => "Compaction",
-    }
-}
-
-fn format_pricing(entry: &ModelEntry) -> String {
-    format!("${:.2} / ${:.2}", entry.pricing.input, entry.pricing.output)
-}
-
-fn format_context(entry: &ModelEntry) -> String {
-    let ctx_k = entry.context_window / 1_000;
-    match entry.max_output_tokens {
-        Some(out) => format!("{ctx_k}K ctx / {}K out", out / 1_000),
-        None => format!("{ctx_k}K ctx"),
-    }
-}
-
-struct ProviderSection {
-    kind: ProviderKind,
-    name: &'static str,
-    auth_line: String,
-    urls: Vec<&'static str>,
-    features: Option<&'static str>,
-    entries: &'static [ModelEntry],
-}
-
-fn format_auth(kind: ProviderKind) -> String {
-    let env = kind.api_key_env();
-    if kind == ProviderKind::Aperture {
-        "`APERTURE_HOST` (e.g. `https://your-host.tailnet.ts.net`)".into()
-    } else {
-        format!("`{env}`")
-    }
-}
-
-fn build_sections() -> Vec<ProviderSection> {
-    let mut sections = Vec::new();
-
-    for kind in ProviderKind::iter() {
-        match kind {
-            // Registered from Lua; the variants are only protocol bases.
-            ProviderKind::Anthropic
-            | ProviderKind::OpenAi
-            | ProviderKind::Google
-            | ProviderKind::Ollama
-            | ProviderKind::LlamaCpp => {}
-            _ => {
-                sections.push(ProviderSection {
-                    kind,
-                    name: kind.display_name(),
-                    auth_line: format_auth(kind),
-                    urls: vec![kind.base_url()],
-                    features: kind.features(),
-                    entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
-                });
-            }
-        }
-    }
-
-    sections
-}
-
-fn write_model_table(out: &mut String, entries: &[ModelEntry]) {
-    let _ = writeln!(
-        out,
-        "| Tier | Models | Pricing (in/out per 1M tokens) | Context |"
-    );
-    let _ = writeln!(
-        out,
-        "|------|--------|-------------------------------|---------|"
-    );
-
-    // A row per model, not per tier: prices and context sizes differ inside a
-    // tier, so one merged row would quote a single model's numbers for all.
-    for tier in [ModelTier::Weak, ModelTier::Medium, ModelTier::Strong] {
-        for entry in entries.iter().filter(|e| e.tier == tier) {
-            let names = entry.prefixes.join(", ");
-            let _ = writeln!(
-                out,
-                "| {} | {} | {} | {} |",
-                tier_label(tier),
-                if entry.default {
-                    format!("**{names}** (default)")
-                } else {
-                    names
-                },
-                format_pricing(entry),
-                format_context(entry),
-            );
-        }
-    }
-
-    let defaults: Vec<String> = entries
-        .iter()
-        .filter(|e| e.default)
-        .map(|e| {
-            format!(
-                "{} ({})",
-                e.prefixes.first().unwrap_or(&"?"),
-                tier_label(e.tier).to_lowercase(),
-            )
-        })
-        .collect();
-
-    if !defaults.is_empty() {
-        let _ = writeln!(out);
-        let _ = writeln!(out, "Defaults: {}", defaults.join(", "));
-    }
-}
-
-fn no_catalog_note(kind: ProviderKind) -> &'static str {
-    match kind {
-        ProviderKind::Aperture => {
-            "Aperture discovers models from your gateway. Set `APERTURE_HOST` to your Tailscale Aperture \
-             endpoint (e.g. `https://your-host.tailnet.ts.net`). No API key needed, Tailscale handles auth."
-        }
-        _ => "No hardcoded model catalog. Use any model ID supported by this provider.",
-    }
-}
-
-fn write_section(out: &mut String, section: &ProviderSection) {
-    let _ = writeln!(out, "### {}\n", section.name);
-    let _ = writeln!(out, "- **Env var**: {}", section.auth_line);
-
-    if section.urls.len() == 1 {
-        let _ = writeln!(out, "- **API**: `{}`", section.urls[0]);
-    } else {
-        let _ = writeln!(out, "- **API endpoints**:");
-        for url in &section.urls {
-            let _ = writeln!(out, "  - `{url}`");
-        }
-    }
-
-    if let Some(features) = section.features {
-        let _ = writeln!(out, "- **Features**: {features}");
-    }
-
-    let _ = writeln!(out);
-
-    if section.entries.is_empty() {
-        let _ = writeln!(out, "{}", no_catalog_note(section.kind));
-    } else {
-        write_model_table(out, section.entries);
-    }
-
-    if section.kind == ProviderKind::Opencode {
-        let _ = writeln!(out, "\n{OPENCODE_FREE_MODELS_NOTE}");
-    }
-}
-
 pub fn generate() -> String {
     let mut out = String::with_capacity(4096);
 
@@ -487,17 +313,6 @@ pub fn generate() -> String {
     let _ = writeln!(out, "{TIER_PICKER_NOTE}\n");
     let _ = writeln!(out, "{AUTH_RELOADING}\n");
     let _ = writeln!(out, "{BASE_URL_OVERRIDES}\n");
-    let _ = writeln!(out, "## Built-in Providers\n");
-
-    for section in &build_sections() {
-        write_section(&mut out, section);
-        let _ = writeln!(out);
-    }
-
-    // Opencode Go is catalog-backed (no ProviderKind), so it gets a static
-    // section right after Opencode Zen, which is the last built-in section.
-    let _ = writeln!(out, "{OPENCODE_GO_SECTION}\n");
-
     let _ = writeln!(out, "{MODEL_IDENTIFIERS}\n");
     let _ = writeln!(out, "{}\n", providers_toml_section());
     let _ = writeln!(out, "{}", dynamic_providers_section());

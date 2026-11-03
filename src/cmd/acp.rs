@@ -81,7 +81,6 @@ pub fn run(
 
     setup::init_logging(&config.storage);
     setup::install_panic_log_hook();
-    setup::warn_ignored_provider_fields();
     for warning in super::unmatched_permission_rules(&config.permissions) {
         eprintln!("warning: {warning}");
     }

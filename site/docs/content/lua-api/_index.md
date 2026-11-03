@@ -100,7 +100,7 @@ The rules:
 | [`maki.async.Permit`](#maki-async-Permit) | One slot in a semaphore, obtained from `Semaphore:acquire()`. |
 | [`maki.base64`](#maki-base64) | Base64 encoding and decoding, modelled after `vim.base64`. |
 | [`maki.crypto`](#maki-crypto) | Hashing on binary strings. |
-| [`maki.env`](#maki-env) | Paths to makima's own directories (config, state, logs), and whether |
+| [`maki.env`](#maki-env) | Paths to makima's own directories (config, state, logs, cache), and whether |
 | [`maki.fn`](#maki-fn) | Process and environment helpers, modeled after Neovim's `vim.fn` job |
 | [`maki.fs`](#maki-fs) | File-system utilities, modelled after `vim.fs` and `vim.uv`. |
 | [`maki.host`](#maki-host) | Actions on the host machine: opening a browser, reading the keyring. |
@@ -1197,14 +1197,16 @@ already owns fails and names both plugins.
   (`{ windows = { { start, end } }, weekdays_only?, multiplier }`, whole
   UTC hours that scale `pricing` by `multiplier`), `supports_thinking`,
   `requires_thinking`, `supports_vision`, `supports_fast`,
-  `supports_tool_examples`, `tier` and `provider_data`. The first
-  descriptor with a tier is that tier's default.
+  `supports_tool_examples`, `tier`, `free` (offered at no charge, marked
+  in the model picker) and `provider_data`. The first descriptor with a
+  tier is that tier's default.
   `prepare` (function) Required. `prepare(ctx, model, config)` returns an
   instance for one model descriptor, optionally followed by an adjusted
   descriptor with the same id, or nil plus an error. `config` is the
   provider's `providers.toml` section as a table, read at each call.
-  `discover` (function) Optional. `discover(ctx, config)` returns the
-  descriptors the provider offers now.
+  `discover` (function) Optional. `discover(ctx, config, refresh)`
+  returns the descriptors the provider offers now. `refresh` is true when
+  the user asked to bypass caches (`maki models --refresh`).
   `config` (table) Optional. `providers.toml` fields asked before login:
   `{ key, prompt, default?, secret?, optional?, choices? }`, where
   `choices` is a list of `{ id, label, detail? }`. Keys are the text
@@ -1216,6 +1218,8 @@ already owns fails and names both plugins.
   the default model, or nil plus an error.
   `aliases` (table) Optional. `{ id, label, method }` names that log in
   with a preset method.
+  `section` (string) Optional. The heading the provider is listed under
+  in the login picker, after the providers without one.
   `auth_status` (function) Optional. `auth_status(ctx, config)` returns
   `{ state, detail? }`, where `state` is `saved`, `env`, `configured` or
   `missing`. It must work without credentials. Without it, the
@@ -2583,7 +2587,7 @@ local mac = maki.crypto.hmac_sha256("secret", "message")
 
 ## maki.env {#maki-env}
 
-Paths to makima's own directories (config, state, logs), and whether
+Paths to makima's own directories (config, state, logs, cache), and whether
 the project's `.makima` directory is off limits.
 
 Use these to locate config files or persistent state without hard-coding paths.
@@ -2653,6 +2657,27 @@ Requires the `env` [plugin permission](#plugin-permissions).
 
 ```lua
 local dir = maki.env.logs_dir()
+```
+
+---
+
+### `maki.env.cache_dir()` {#maki-env-cache_dir}
+
+```lua
+maki.env.cache_dir()
+```
+
+Return the directory where makima keeps caches it can rebuild, such as
+downloaded catalogs. Typically something like `~/.cache/makima`.
+
+Requires the `env` [plugin permission](#plugin-permissions).
+
+**Returns:** (`string?`) Cache directory path, or nil if it cannot be determined.
+
+**Example:**
+
+```lua
+local dir = maki.env.cache_dir()
 ```
 
 ---

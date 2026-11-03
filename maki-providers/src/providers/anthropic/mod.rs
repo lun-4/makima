@@ -1,5 +1,5 @@
-//! The Anthropic Messages client the native gateways (Aperture, dynamic and
-//! custom providers, the catalog) still route through. The
+//! The Anthropic Messages client the native dynamic and custom providers
+//! still route through. The
 //! `anthropic` provider itself is registered by `plugins/providers`.
 //!
 //! Anthropic allows 4 cache breakpoints per request. We place them on: the last tool

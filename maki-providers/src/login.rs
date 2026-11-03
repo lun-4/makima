@@ -68,6 +68,8 @@ pub struct AuthSpec {
     pub methods: Vec<AuthMethod>,
     pub aliases: Vec<LoginAlias>,
     pub config: Vec<ConfigField>,
+    /// The login picker heading, after the providers without one.
+    pub section: Option<String>,
 }
 
 /// Decoded from a table that also holds the `login` function.
@@ -135,6 +137,7 @@ pub struct AuthStatus {
 pub struct ProviderStatus {
     pub id: Arc<str>,
     pub display_name: Arc<str>,
+    pub section: Option<String>,
     pub status: AuthStatus,
 }
 
@@ -266,7 +269,7 @@ async fn provider_options(
             id: provider.id.to_string(),
             label: provider.display_name.to_string(),
             detail: provider.status.state.label().map(str::to_owned),
-            section: None,
+            section: provider.section,
         })
         .chain(aliases)
         .chain(native)
@@ -358,11 +361,12 @@ fn restore(storage: &StateDir, id: &str, snapshot: Option<Value>) {
     }
 }
 
-/// Every registered provider's status, in registry order. A failing check
-/// is reported as `Failed` and the listing continues.
+/// Every registered provider's status, in registry order with sectioned
+/// providers last. A failing check is reported as `Failed` and the listing
+/// continues.
 pub async fn auth_status(registry: &ProviderRegistry, storage: &StateDir) -> Vec<ProviderStatus> {
     let providers = ProvidersConfig::load_or_default();
-    join_all(registry.entries().map(|(id, entry)| {
+    let mut statuses = join_all(registry.entries().map(|(id, entry)| {
         let section = providers.get(id).cloned().unwrap_or_default();
         async move {
             let status = match serde_json::to_value(section) {
@@ -379,11 +383,14 @@ pub async fn auth_status(registry: &ProviderRegistry, storage: &StateDir) -> Vec
             ProviderStatus {
                 id: Arc::clone(id),
                 display_name: Arc::clone(&entry.display_name),
+                section: entry.auth.section.clone(),
                 status,
             }
         }
     }))
-    .await
+    .await;
+    statuses.sort_by_key(|status| status.section.is_some());
+    statuses
 }
 
 /// Logs out of a registered provider or alias and removes its
@@ -445,6 +452,7 @@ mod tests {
     const NATIVE: &str = "native-provider";
     const STATUS_ERR: &str = "status exploded";
     const LOGIN_ERR: &str = "login exploded";
+    const SECTION: &str = "More providers";
 
     #[derive(Default)]
     struct ScriptedInteraction {
@@ -513,7 +521,10 @@ mod tests {
             Box::pin(async { Err(config_error("not used")) })
         }
 
-        fn discover(&self) -> Option<BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>> {
+        fn discover(
+            &self,
+            _refresh: bool,
+        ) -> Option<BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>> {
             None
         }
 
@@ -642,6 +653,7 @@ mod tests {
                     optional: true,
                     choices: Vec::new(),
                 }],
+                section: None,
             },
         }
     }
@@ -783,6 +795,31 @@ mod tests {
                 options: vec![provider, alias, option(NATIVE)],
             }]
         );
+    }
+
+    #[test]
+    fn sectioned_providers_follow_the_rest() {
+        let fixture = Fixture::new();
+        let backend = || FakeAuthBackend::new(&fixture.storage, Status::Missing);
+        let mut sectioned = registered(FAILING, backend(), &[KEY_METHOD]);
+        sectioned.auth.section = Some(SECTION.into());
+        let registry = ProviderRegistry::new(
+            vec![sectioned, registered(PROVIDER, backend(), &[KEY_METHOD])],
+            Timeouts::default(),
+        );
+        let ui = ScriptedInteraction::new(&[NATIVE]);
+
+        fixture.login(&registry, Arc::clone(&ui), None).unwrap();
+
+        let InteractionRequest::Choice { options, .. } = &ui.asked()[0] else {
+            panic!("expected the provider choice");
+        };
+        let listed: Vec<_> = options
+            .iter()
+            .take(2)
+            .map(|option| (option.id.as_str(), option.section.as_deref()))
+            .collect();
+        assert_eq!(listed, [(PROVIDER, None), (FAILING, Some(SECTION))]);
     }
 
     #[test_case(true, Status::CredentialsFile, &[ANSWERED_URL, KEY], false ; "login_fails")]

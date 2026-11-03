@@ -25,11 +25,9 @@ use crate::{
 
 use super::ResolvedAuth;
 use super::anthropic::Anthropic;
-use super::aperture::Aperture;
 use super::google::Google;
 use super::local::{LLAMACPP, LocalEndpoint, OLLAMA};
 use super::openai::OpenAiProtocol;
-use super::opencode::Opencode;
 
 const INFO_TIMEOUT: Duration = Duration::from_secs(5);
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -101,6 +99,7 @@ impl ScriptModel {
             turn_output_tokens: None,
             context_window: self.context_window,
             thinking_fields: self.thinking_fields.clone().map(Box::new),
+            free: false,
         }
     }
 }
@@ -561,14 +560,6 @@ pub(crate) fn create(
         ),
         ProviderKind::LlamaCpp => Box::new(
             LocalEndpoint::with_auth(&LLAMACPP, auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::Opencode => Box::new(
-            Opencode::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::Aperture => Box::new(
-            Aperture::with_auth(auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
     };
@@ -1120,7 +1111,6 @@ esac
     #[cfg(unix)]
     #[test_case("ollama", ProviderKind::Ollama ; "base_ollama")]
     #[test_case("llama-cpp", ProviderKind::LlamaCpp ; "base_llama_cpp")]
-    #[test_case("opencode", ProviderKind::Opencode ; "base_opencode")]
     fn discover_accepts_all_bases(base: &str, expected: ProviderKind) {
         let tmp = TempDir::new().unwrap();
         let info = format!(r#"{{"display_name": "Test", "base": "{base}", "has_auth": false}}"#);

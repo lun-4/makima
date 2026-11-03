@@ -14,15 +14,12 @@ use tracing::debug;
 use crate::AgentError;
 
 pub(crate) mod anthropic;
-pub(crate) mod aperture;
-pub(crate) mod catalog;
 pub mod custom;
 pub mod dynamic;
 pub(crate) mod google;
 pub(crate) mod local;
 pub(crate) mod openai;
 pub(crate) mod openai_compat;
-pub mod opencode;
 
 const LOW_SPEED_BYTES_PER_SEC: u32 = 1;
 const UNMAPPED_SSE_ERROR_STATUS: u16 = 400;

@@ -12,7 +12,6 @@ use maki_storage::paths;
 const PROVIDERS_FILE: &str = "providers.toml";
 const BAD_CONFIG_EXIT_CODE: i32 = 2;
 /// The only built-in that reads `enable_free_models`.
-const OPENCODE_SLUG: &str = "opencode";
 const NOT_TEXT_FIELD_ERR: &str = "is not a text field of a provider";
 
 /// Coarse capability classification used by maki-providers to dispatch tiered
@@ -205,12 +204,12 @@ pub struct ProviderDef {
     /// missing name instead of a silent 401.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
-    /// Opencode-only: when `Some(false)`, free catalog models are hidden
-    /// entirely. Defaults to `false` when `None`.
+    /// Opencode Zen and Go: show free catalog models, reachable without a
+    /// key through the public fallback. Defaults to `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_free_models: Option<bool>,
-    /// Aperture-only: per-gateway-provider overrides for the routed native
-    /// providers.
+    /// Aperture-only: per-gateway-provider overrides for the providers it
+    /// routes to.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub overrides: HashMap<String, ProviderOverride>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -376,30 +375,6 @@ pub fn configured_base_url(slug: &str, def: Option<&ProviderDef>) -> Option<Stri
 pub fn resolve_base_url(slug: &str, def: Option<&ProviderDef>) -> Option<String> {
     configured_base_url(slug, def)
         .or_else(|| builtin_provider(slug).map(|b| b.default_base_url.to_string()))
-}
-
-/// Fields a `providers.toml` entry sets that a built-in slug ignores, because
-/// built-ins keep their compiled protocol, model catalog and auth wiring.
-/// Callers decide what counts as built-in (the inventory misses the `opencode`
-/// slugs) and when to report it.
-pub fn ignored_builtin_fields(slug: &str, def: &ProviderDef) -> Vec<&'static str> {
-    let mut ignored = Vec::new();
-    if def.protocol.is_some() {
-        ignored.push("protocol");
-    }
-    if def.api_key_env.is_some() {
-        ignored.push("api_key_env");
-    }
-    if def.discover_models {
-        ignored.push("discover_models");
-    }
-    if !def.models.is_empty() {
-        ignored.push("models");
-    }
-    if def.enable_free_models.is_some() && slug != OPENCODE_SLUG {
-        ignored.push("enable_free_models");
-    }
-    ignored
 }
 
 pub fn resolve_protocol(slug: &str, def: Option<&ProviderDef>) -> Option<Protocol> {
@@ -614,34 +589,6 @@ tier = "{input}"
             std::env::remove_var(&env_var);
         }
         assert_eq!(got.as_deref(), Some("http://env.local/v1"));
-    }
-
-    #[test]
-    fn ignored_builtin_fields_lists_custom_only_fields() {
-        let def = ProviderDef {
-            base_url: Some("http://proxy.local/v1".into()),
-            protocol: Some(Protocol::Openai),
-            api_key_env: Some("MY_KEY".into()),
-            discover_models: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            ignored_builtin_fields("anthropic", &def),
-            ["protocol", "api_key_env", "discover_models"]
-        );
-    }
-
-    #[test]
-    fn ignored_builtin_fields_keeps_opencode_free_models() {
-        let def = ProviderDef {
-            enable_free_models: Some(false),
-            ..Default::default()
-        };
-        assert!(ignored_builtin_fields(OPENCODE_SLUG, &def).is_empty());
-        assert_eq!(
-            ignored_builtin_fields("openrouter", &def),
-            ["enable_free_models"]
-        );
     }
 
     #[test_case("MyProvider", "myprovider"; "mixed_case")]

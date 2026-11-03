@@ -1586,7 +1586,10 @@ impl ProviderBackend for EchoBackend {
         })
     }
 
-    fn discover(&self) -> Option<BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>> {
+    fn discover(
+        &self,
+        _refresh: bool,
+    ) -> Option<BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>> {
         None
     }
 

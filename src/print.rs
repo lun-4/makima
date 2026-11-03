@@ -842,10 +842,8 @@ mod tests {
     const CHILD_RESPONSE: &str = "print child response";
     const GRANDCHILD_RESPONSE: &str = "print grandchild response";
     const COMMAND_CHILD_PROMPT: &str = "print command child request";
-    /// Re-preparing needs a constructible provider; aperture needs only a host.
-    const DISCOVERY_PROVIDER: &str = "aperture";
-    const DISCOVERY_HOST_ENV: &str = "APERTURE_HOST";
-    const UNREACHABLE_HOST: &str = "http://127.0.0.1:1";
+    /// Re-preparing needs a constructible native provider.
+    const DISCOVERY_PROVIDER: &str = "print-discovery";
     const DISCOVERY_MODEL_ID: &str = "print-discovery-root";
     const DISCOVERED_WINDOW: u32 = 777_000;
     const MODELS_COMMAND: &str = "/print_models";
@@ -1397,9 +1395,9 @@ mod tests {
     /// plugins read already has the provider's models.
     #[test]
     fn print_root_starts_on_its_discovered_provider() {
-        // SAFETY: nextest runs each test in its own process.
-        unsafe { std::env::set_var(DISCOVERY_HOST_ENV, UNREACHABLE_HOST) };
         let state = tempfile::tempdir().unwrap();
+        maki_storage::paths::init_at(state.path().to_path_buf()).unwrap();
+        maki_lua::test_support::save_custom_provider(DISCOVERY_PROVIDER);
         let spec = format!("{DISCOVERY_PROVIDER}/{DISCOVERY_MODEL_ID}");
         let registry = CommandRegistry::new();
         let (ui, notices) = maki_lua::test_support::RecordingUi::new();

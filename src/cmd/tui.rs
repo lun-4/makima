@@ -364,7 +364,6 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
 
     setup::init_logging(&stack.config.storage);
     setup::install_panic_log_hook();
-    setup::warn_ignored_provider_fields();
     startup_warnings.extend(super::unmatched_permission_rules(&stack.config.permissions));
 
     if cli.is_sdk_mode() || cli.print {

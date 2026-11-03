@@ -106,6 +106,8 @@ struct SpecFields {
     aliases: Vec<LoginAlias>,
     #[serde(default)]
     config: Vec<ConfigField>,
+    #[serde(default)]
+    section: Option<String>,
     #[serde(default, rename = "auth_status")]
     _auth_status: Callback,
     #[serde(default, rename = "logout")]
@@ -165,14 +167,16 @@ fn spec_error(message: impl fmt::Display) -> mlua::Error {
 ///   (`{ windows = { { start, end } }, weekdays_only?, multiplier }`, whole
 ///   UTC hours that scale `pricing` by `multiplier`), `supports_thinking`,
 ///   `requires_thinking`, `supports_vision`, `supports_fast`,
-///   `supports_tool_examples`, `tier` and `provider_data`. The first
-///   descriptor with a tier is that tier's default.
+///   `supports_tool_examples`, `tier`, `free` (offered at no charge, marked
+///   in the model picker) and `provider_data`. The first descriptor with a
+///   tier is that tier's default.
 ///   `prepare` (function) Required. `prepare(ctx, model, config)` returns an
 ///   instance for one model descriptor, optionally followed by an adjusted
 ///   descriptor with the same id, or nil plus an error. `config` is the
 ///   provider's `providers.toml` section as a table, read at each call.
-///   `discover` (function) Optional. `discover(ctx, config)` returns the
-///   descriptors the provider offers now.
+///   `discover` (function) Optional. `discover(ctx, config, refresh)`
+///   returns the descriptors the provider offers now. `refresh` is true when
+///   the user asked to bypass caches (`maki models --refresh`).
 ///   `config` (table) Optional. `providers.toml` fields asked before login:
 ///   `{ key, prompt, default?, secret?, optional?, choices? }`, where
 ///   `choices` is a list of `{ id, label, detail? }`. Keys are the text
@@ -184,6 +188,8 @@ fn spec_error(message: impl fmt::Display) -> mlua::Error {
 ///   the default model, or nil plus an error.
 ///   `aliases` (table) Optional. `{ id, label, method }` names that log in
 ///   with a preset method.
+///   `section` (string) Optional. The heading the provider is listed under
+///   in the login picker, after the providers without one.
 ///   `auth_status` (function) Optional. `auth_status(ctx, config)` returns
 ///   `{ state, detail? }`, where `state` is `saved`, `env`, `configured` or
 ///   `missing`. It must work without credentials. Without it, the
@@ -270,6 +276,7 @@ fn register_provider(
         methods: fields.auth,
         aliases: fields.aliases,
         config: fields.config,
+        section: fields.section,
     };
     validate_auth(&fields.id, &auth).map_err(spec_error)?;
     let logins = match spec.get::<Option<Table>>("auth")? {

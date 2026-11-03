@@ -12,7 +12,7 @@ local M = {}
 
 M.LONG_CONTEXT_WINDOW = 1000000
 
-local API_VERSION = "2023-06-01"
+M.API_VERSION = "2023-06-01"
 local MESSAGES_PATH = "/v1/messages"
 local MODELS_PATH = "/v1/models?limit=1000"
 local USAGE_PATH = "/api/oauth/usage"
@@ -105,14 +105,15 @@ local function client(ctx, config)
   function api.headers(extra)
     local headers = table.clone(extra or {})
     headers["x-api-key"] = api.pool.current()
-    headers["anthropic-version"] = API_VERSION
     for name, value in pairs(configured) do
       http.set_header(headers, name, value)
     end
     return headers
   end
   function api.get_json(call_ctx, url, extra)
-    local response, send_err = http.send(call_ctx, { url = url, headers = api.headers(extra) })
+    local headers = table.clone(extra or {})
+    headers["anthropic-version"] = M.API_VERSION
+    local response, send_err = http.send(call_ctx, { url = url, headers = api.headers(headers) })
     if not response then
       return nil, send_err
     end
@@ -234,13 +235,19 @@ local function authorized(headers)
   return false
 end
 
-local function stream(api, model, ctx, request, emit)
+-- Streams {request} to the Messages API at {api} (`base` origin and
+-- `headers(extra)`) for descriptor {model}.
+function M.stream(api, model, ctx, request, emit)
   -- A stale fast flag must never bill an ineligible model at the fast rate.
   request.fast = request.fast and model.supports_fast == true
   local response, err = http.send(ctx, {
     url = api.base .. MESSAGES_PATH,
     method = "POST",
-    headers = api.headers({ ["Content-Type"] = JSON_TYPE, ["anthropic-beta"] = codec.beta_header(request) }),
+    headers = api.headers({
+      ["Content-Type"] = JSON_TYPE,
+      ["anthropic-beta"] = codec.beta_header(request),
+      ["anthropic-version"] = M.API_VERSION,
+    }),
     body = assert(maki.json.encode(codec.build_request(request))),
   })
   if not response then
@@ -269,7 +276,7 @@ local function api_instance(ctx, model, config)
       api.pool = http.key_pool(keys)
     end,
     stream = function(call_ctx, request, emit)
-      return stream(api, model, call_ctx, request, emit)
+      return M.stream(api, model, call_ctx, request, emit)
     end,
     -- Subscription quota exists only for OAuth tokens, which arrive as a
     -- configured `Authorization` header; API keys have none.

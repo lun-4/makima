@@ -29,8 +29,11 @@ pub trait ProviderBackend: Send + Sync {
     ) -> BoxFuture<'static, Result<PreparedProvider, AgentError>>;
 
     /// Lists the models the provider offers right now; `None` when it only
-    /// offers its curated descriptors.
-    fn discover(&self) -> Option<BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>>;
+    /// offers its curated descriptors. {refresh} asks it to bypass any cache.
+    fn discover(
+        &self,
+        refresh: bool,
+    ) -> Option<BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>>;
 
     /// Logs in with {method}, given the provider's `providers.toml` section
     /// with this login's answers applied. Returns the model id to default to.
@@ -245,14 +248,19 @@ impl ProviderRegistry {
     }
 
     /// Native discovery plus every registered provider's own, each batch
-    /// delivered as it arrives.
-    pub async fn fetch_all(&self, policy: &ModelPolicy, on_ready: impl FnMut(ModelBatch) + Send) {
+    /// delivered as it arrives. {refresh} asks providers to bypass caches.
+    pub async fn fetch_all(
+        &self,
+        policy: &ModelPolicy,
+        refresh: bool,
+        on_ready: impl FnMut(ModelBatch) + Send,
+    ) {
         let on_ready = Mutex::new(on_ready);
         let native = provider::fetch_all_models(policy, |mut batch| {
             batch.models.retain(|spec| !self.registered(spec));
             (on_ready.lock().unwrap())(batch);
         });
-        let registered = self.discover_registered(policy, |batch| {
+        let registered = self.discover_registered(policy, refresh, |batch| {
             (on_ready.lock().unwrap())(batch);
         });
         futures_lite::future::zip(native, registered).await;
@@ -261,11 +269,12 @@ impl ProviderRegistry {
     async fn discover_registered(
         &self,
         policy: &ModelPolicy,
+        refresh: bool,
         mut on_ready: impl FnMut(ModelBatch),
     ) {
         let (tx, rx) = flume::unbounded();
         for (provider, entry) in &self.entries {
-            let Some(discovery) = entry.backend.discover() else {
+            let Some(discovery) = entry.backend.discover(refresh) else {
                 continue;
             };
             let tx = tx.clone();
@@ -327,10 +336,6 @@ mod tests {
     const CONTEXT_WINDOW: u32 = 42_000;
     const NATIVE_SPEC: &str = "anthropic/claude-sonnet-4-5";
     const DISCOVERY_FAILURE: &str = "listing failed";
-    const APERTURE_HOST_ENV: &str = "APERTURE_HOST";
-    const APERTURE_HOST: &str = "https://example.com";
-    /// Routed through aperture, it inherits anthropic's thinking support.
-    const ROUTED_SPEC: &str = "aperture/anthropic/claude-sonnet-4-5";
 
     struct FakeBackend {
         discovered: Option<Result<Vec<ModelInfo>, String>>,
@@ -352,7 +357,10 @@ mod tests {
             })
         }
 
-        fn discover(&self) -> Option<BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>> {
+        fn discover(
+            &self,
+            _refresh: bool,
+        ) -> Option<BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>> {
             let result = self.discovered.clone()?;
             Some(Box::pin(async move {
                 result.map_err(|message| AgentError::Config { message })
@@ -486,17 +494,6 @@ mod tests {
     }
 
     #[test]
-    fn native_prepare_applies_provider_adjustments() {
-        // SAFETY: nextest runs each test in its own process.
-        unsafe { std::env::set_var(APERTURE_HOST_ENV, APERTURE_HOST) };
-        let registry = ProviderRegistry::default();
-        let model = registry.model(ROUTED_SPEC).unwrap();
-        assert!(!model.supports_thinking());
-        let prepared = smol::block_on(registry.prepare(model)).unwrap();
-        assert!(prepared.model.supports_thinking());
-    }
-
-    #[test]
     fn offline_specs_respect_policy() {
         let (registry, _) = registry_with(FAKE, None);
         let allowed = format!("{FAKE}/{WEAK}");
@@ -508,7 +505,7 @@ mod tests {
         let (registry, _) = registry_with(FAKE, Some(Ok(vec![info(DISCOVERED, None)])));
         let mut batches = Vec::new();
         smol::block_on(
-            registry.discover_registered(&ModelPolicy::default(), |batch| {
+            registry.discover_registered(&ModelPolicy::default(), false, |batch| {
                 batches.push(batch.models);
             }),
         );
@@ -526,7 +523,7 @@ mod tests {
         let (registry, _) = registry_with(FAKE, Some(Err(DISCOVERY_FAILURE.into())));
         let mut warnings = Vec::new();
         smol::block_on(
-            registry.discover_registered(&ModelPolicy::default(), |batch| {
+            registry.discover_registered(&ModelPolicy::default(), false, |batch| {
                 warnings.extend(batch.warnings);
             }),
         );

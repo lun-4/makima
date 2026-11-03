@@ -526,12 +526,11 @@ fn rejected_session_prompt_preserves_shell_context(oversized: bool) {
     });
 }
 
-const GLM_4: &str = "aperture/glm-4";
-const GLM_5: &str = "aperture/glm-5";
+const GLM_4: &str = "tui-discovery/glm-4";
+const GLM_5: &str = "tui-discovery/glm-5";
 const OTHER_PROVIDER: &str = "google/glm-5";
-const UNREACHABLE_HOST: &str = "http://127.0.0.1:1";
 
-#[test_case(&[GLM_5, OTHER_PROVIDER], "aperture", Ok(GLM_5) ; "provider_section_switches")]
+#[test_case(&[GLM_5, OTHER_PROVIDER], "tui-discovery", Ok(GLM_5) ; "provider_section_switches")]
 #[test_case(&[GLM_5], "glm", Ok(GLM_5) ; "unique_fragment_switches")]
 #[test_case(&[GLM_4, GLM_5], "glm", Err("command failed: ambiguous model: glm") ; "ambiguous_fragment_fails")]
 #[test_case(&[GLM_5], "xyz", Err("command failed: no model matches: xyz") ; "unknown_fragment_fails")]
@@ -540,8 +539,7 @@ fn model_argument_resolves_against_the_catalog(
     argument: &str,
     expected: Result<&str, &str>,
 ) {
-    // SAFETY: nextest runs each test in its own process.
-    unsafe { std::env::set_var("APERTURE_HOST", UNREACHABLE_HOST) };
+    let _providers = super::tests::configure_discovery_provider();
     with_event_loop(|event_loop| {
         event_loop.ctx.catalog.specs().store(Some(Arc::new(
             catalog.iter().map(|spec| spec.to_string()).collect(),

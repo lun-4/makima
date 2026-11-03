@@ -22,7 +22,7 @@ use maki_providers::login::{
     LoginRequest, ProviderStatus, drive_login,
 };
 use maki_providers::provider::BoxFuture;
-use maki_providers::{AgentError, ProviderData, ProviderRegistry, Timeouts, catalog_providers};
+use maki_providers::{AgentError, ProviderRegistry, Timeouts};
 use maki_storage::StateDir;
 use maki_storage::auth::ProviderCredentials;
 use maki_storage::auth::{
@@ -51,7 +51,7 @@ pub fn auth_login(
 ) -> Result<()> {
     let native = match provider {
         Some(_) => Vec::new(),
-        None => native_login_choices(storage, registry, Some(catalog_providers())),
+        None => native_login_choices(storage, registry),
     };
     let request = LoginRequest {
         provider: provider.map(str::to_owned),
@@ -78,17 +78,7 @@ pub fn auth_login(
 fn login_native(slug: &str, storage: &StateDir) -> Result<()> {
     match slug {
         CUSTOM_SLUG => login_custom(storage)?,
-        slug => {
-            if builtin_provider(slug).is_none()
-                && dynamic::display_name(slug).is_none()
-                && ProvidersConfig::load().get(slug).is_none()
-                && let Some(provider_data) = maki_providers::catalog_provider(slug)
-            {
-                login_catalog_provider(&provider_data, storage)?;
-            } else {
-                login_provider(slug, storage)?;
-            }
-        }
+        slug => login_provider(slug, storage)?,
     }
     Ok(())
 }
@@ -265,43 +255,6 @@ fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
         );
     }
 
-    Ok(())
-}
-
-fn login_catalog_provider(provider: &ProviderData, storage: &StateDir) -> Result<()> {
-    println!();
-    if let Some(ref var) = provider.env_keys.first() {
-        println!("  Provider: {} (env: {var})", provider.slug);
-    } else {
-        println!("  Provider: {}", provider.slug);
-    }
-    print!("  API key: ");
-    io::stdout().flush()?;
-    let mut key = String::new();
-    io::stdin().read_line(&mut key)?;
-    let key = key.trim().to_string();
-    if key.is_empty() {
-        println!("  Skipped (no key entered)");
-        return Ok(());
-    }
-    let creds = ProviderCredentials {
-        api_key: key,
-        host: None,
-    };
-    save_provider_credentials(storage, &provider.slug, &creds).context("save credentials")?;
-    println!("  \x1b[32m✓\x1b[0m Saved credentials for {}", provider.slug);
-    println!(
-        "  Credentials: ~/.local/state/makima/auth/{}.json",
-        provider.slug
-    );
-    println!(
-        "  You can also set via: {}",
-        provider
-            .env_keys
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "API key environment variable".to_string())
-    );
     Ok(())
 }
 
@@ -485,7 +438,14 @@ pub fn auth_status(storage: &StateDir, registry: &ProviderRegistry) -> Result<()
     let builtins = all_builtins();
 
     println!();
+    let mut section = None;
     for provider in smol::block_on(login::auth_status(registry, storage)) {
+        if let Some(heading) = provider.section.as_deref()
+            && section != Some(heading.to_owned())
+        {
+            println!("  \x1b[1m{heading}:\x1b[0m");
+            section = provider.section.clone();
+        }
         println!("{}", status_line(&provider));
     }
     for b in builtins.iter().filter(|b| !registry.contains(b.slug)) {
@@ -526,11 +486,7 @@ pub fn auth_status(storage: &StateDir, registry: &ProviderRegistry) -> Result<()
     }
 
     for (slug, def) in &config.providers {
-        // 'opencode' could show up here, when the user configured free models on that provider.
-        if builtin_provider(slug).is_some()
-            || registry.contains(slug)
-            || (slug == "opencode" && def.enable_free_models.is_some())
-        {
+        if builtin_provider(slug).is_some() || registry.contains(slug) {
             continue;
         }
         let display = def.display_name.as_deref().unwrap_or(slug);
@@ -557,36 +513,6 @@ pub fn auth_status(storage: &StateDir, registry: &ProviderRegistry) -> Result<()
             }
         }
     }
-    // Catalog providers from models.dev
-    let catalog_entries: Vec<_> = catalog_providers()
-        .into_iter()
-        .filter(|entry| !registry.contains(&entry.slug))
-        .collect();
-    if !catalog_entries.is_empty() {
-        println!("  \x1b[1mCatalog Providers (models.dev):\x1b[0m");
-        for entry in &catalog_entries {
-            if let Some(creds) = load_provider_credentials(storage, &entry.slug) {
-                println!(
-                    "  \x1b[32m✓\x1b[0m {:<14} {} (key: {})",
-                    entry.slug,
-                    entry.display_name,
-                    creds.masked_api_key()
-                );
-            } else if let Some(env) = entry.env_key_set() {
-                println!(
-                    "  \x1b[33m~\x1b[0m {:<14} {} (via {})",
-                    entry.slug, entry.display_name, env
-                );
-            } else {
-                println!(
-                    "  \x1b[31m✗\x1b[0m {:<14} {} (run: makima auth login {})",
-                    entry.slug, entry.display_name, entry.slug
-                );
-            }
-        }
-        println!();
-    }
-
     Ok(())
 }
 
@@ -643,26 +569,16 @@ pub fn models(
 ) -> Result<()> {
     let (_host, providers, config) = provider_host(cwd, no_plugins, no_jit, trust_mode)?;
 
-    let mut refresh_failure = None;
-    if refresh {
-        match maki_providers::refresh_catalog() {
-            Ok(()) => eprintln!("models.dev catalog has been refreshed"),
-            Err(e) => refresh_failure = Some(e),
-        }
-    }
-
-    smol::block_on(providers.fetch_all(&config.provider.model_policy, |batch| {
-        for model in batch.models {
-            println!("{model}");
-        }
-        for warning in batch.warnings {
-            eprintln!("warning: {warning}");
-        }
-    }));
-
-    if let Some(e) = refresh_failure {
-        bail!("catalog refresh failed, keeping existing cache: {e}");
-    }
+    smol::block_on(
+        providers.fetch_all(&config.provider.model_policy, refresh, |batch| {
+            for model in batch.models {
+                println!("{model}");
+            }
+            for warning in batch.warnings {
+                eprintln!("warning: {warning}");
+            }
+        }),
+    );
     Ok(())
 }
 

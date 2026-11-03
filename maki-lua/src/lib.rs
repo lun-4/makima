@@ -61,12 +61,33 @@ pub mod test_support {
         CommandContent, CommandError, CommandFuture, CommandHost, CommandOutcome, CommandRegistry,
         HostRequest, HostResponse, TargetCapabilities,
     };
+    use maki_config::providers::{Protocol, ProviderDef, ProvidersConfig};
     use std::sync::Arc;
     use std::time::Duration;
 
     pub use crate::api::util::dispatch::MAX_HOOK_DEPTH;
 
     pub const COMMAND_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+    const UNREACHABLE_HOST: &str = "http://127.0.0.1:1";
+    const CUSTOM_PROVIDER_KEY: &str = "test-key";
+
+    /// Saves a native custom provider {slug} into `providers.toml` of the
+    /// initialised config directory, for tests that need a native provider
+    /// to resolve and prepare any model without the network.
+    pub fn save_custom_provider(slug: &str) {
+        let mut providers = ProvidersConfig::try_load().unwrap();
+        providers.upsert(
+            slug.into(),
+            ProviderDef {
+                protocol: Some(Protocol::Openai),
+                base_url: Some(UNREACHABLE_HOST.into()),
+                api_key: Some(CUSTOM_PROVIDER_KEY.into()),
+                ..ProviderDef::default()
+            },
+        );
+        providers.save().unwrap();
+    }
 
     struct DetachedCommandHost;
 

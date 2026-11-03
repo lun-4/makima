@@ -66,6 +66,19 @@ const CONFIG_SOURCE: &str = r#"
     })
 "#;
 
+const REFRESH_SOURCE: &str = r#"
+    maki.api.register_provider({
+        id = "fake",
+        display_name = "Fake Provider",
+        discover = function(ctx, config, refresh)
+            return { { id = tostring(refresh) } }
+        end,
+        prepare = function()
+            return { stream = function() end }
+        end,
+    })
+"#;
+
 fn host() -> PluginHost {
     PluginHost::new(Arc::new(ToolRegistry::new())).unwrap()
 }
@@ -468,9 +481,11 @@ fn prepare_and_discover_read_the_provider_config_at_call_time() {
     config.save().unwrap();
 
     let mut batches = Vec::new();
-    smol::block_on(bounded(
-        providers.fetch_all(&Default::default(), |batch| batches.extend(batch.models)),
-    ));
+    smol::block_on(bounded(providers.fetch_all(
+        &Default::default(),
+        false,
+        |batch| batches.extend(batch.models),
+    )));
     let spec = format!("{PROVIDER}/{CONFIGURED_URL}");
     assert!(batches.contains(&spec), "{batches:?}");
 
@@ -478,6 +493,22 @@ fn prepare_and_discover_read_the_provider_config_at_call_time() {
     let prepared = smol::block_on(bounded(providers.prepare(model))).unwrap();
     assert_eq!(prepared.model.id, CONFIGURED_URL);
     assert_eq!(prepared.model.context_window as usize, CONFIGURED_URL.len());
+}
+
+#[test_case(false ; "cached")]
+#[test_case(true ; "refreshed")]
+fn discover_receives_the_refresh_request(refresh: bool) {
+    let host = host();
+    host.load_source(PLUGIN, REFRESH_SOURCE).unwrap();
+    let providers = registry(&host);
+    let mut batches = Vec::new();
+    smol::block_on(bounded(providers.fetch_all(
+        &Default::default(),
+        refresh,
+        |batch| batches.extend(batch.models),
+    )));
+    let spec = format!("{PROVIDER}/{refresh}");
+    assert!(batches.contains(&spec), "{batches:?}");
 }
 
 #[test]

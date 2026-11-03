@@ -67,6 +67,13 @@ function M.def.list_models(ctx, client)
   return rows
 end
 
+-- Streams {request} to the Gemini API at {client} (`base` and
+-- `headers(extra)`).
+function M.stream(client, ctx, request, emit)
+  local url = client.base .. "/models/" .. http.urlencode(request.model.id) .. STREAM_SUFFIX
+  return http.post_stream(ctx, url, client.headers(), gemini.build_request(request), gemini.stream, emit)
+end
+
 function M.provider()
   local spec = compat.provider(M.def)
 
@@ -88,8 +95,7 @@ function M.provider()
         client.pool = http.key_pool(keys)
       end,
       stream = function(call_ctx, request, emit)
-        local url = client.base .. "/models/" .. http.urlencode(request.model.id) .. STREAM_SUFFIX
-        return http.post_stream(call_ctx, url, client.headers(), gemini.build_request(request), gemini.stream, emit)
+        return M.stream(client, call_ctx, request, emit)
       end,
     },
       compat.describe(M.def, info)

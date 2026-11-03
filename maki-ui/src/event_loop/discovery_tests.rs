@@ -1,25 +1,84 @@
-use super::{EventLoop, tests::with_event_loop};
+use super::{EventLoop, tests::with_event_loop_providers};
 use crate::components::{Action, key, model_picker::ModelPickerAction};
 use crossterm::event::KeyCode;
-use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
-use maki_config::{
-    ModelPolicy,
-    providers::{ProviderDef, ProvidersConfig},
+use maki_config::ModelPolicy;
+use maki_providers::login::{AuthSpec, AuthStatus, InteractionService};
+use maki_providers::provider::{self, BoxFuture};
+use maki_providers::{
+    AgentError, Model, ModelInfo, PreparedProvider, ProviderBackend, ProviderRegistry,
+    RegisteredProvider, Timeouts,
 };
-use maki_storage::paths;
 use ratatui::{Terminal, backend::TestBackend};
-use smol::Async;
+use serde_json::Value;
 use std::{
-    net::TcpListener,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 const TIMEOUT: Duration = Duration::from_secs(5);
-const RECENT: &str = "aperture/discovery-recent";
-const CATALOG: &str = "aperture/discovery-catalog";
-const FAILURE_RESPONSE: &[u8] =
-    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const PROVIDER: &str = "gateway";
+const DISPLAY_NAME: &str = "Gateway";
+const RECENT: &str = "gateway/discovery-recent";
+const CATALOG: &str = "gateway/discovery-catalog";
+const FAILURE_STATUS: u16 = 503;
+const FAILURE_MESSAGE: &str = "listing unavailable";
+
+/// Discovery that waits for the test to release it, then fails.
+struct SlowFailingBackend {
+    entered: flume::Sender<()>,
+    release: flume::Receiver<()>,
+}
+
+impl ProviderBackend for SlowFailingBackend {
+    fn prepare(
+        &self,
+        model: Model,
+        _info: ModelInfo,
+    ) -> BoxFuture<'static, Result<PreparedProvider, AgentError>> {
+        Box::pin(async move {
+            Ok(PreparedProvider {
+                model,
+                provider: provider::unconfigured(),
+            })
+        })
+    }
+
+    fn discover(
+        &self,
+        _refresh: bool,
+    ) -> Option<BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>> {
+        let (entered, release) = (self.entered.clone(), self.release.clone());
+        Some(Box::pin(async move {
+            entered.send_async(()).await.unwrap();
+            let _ = release.recv_async().await;
+            Err(AgentError::Api {
+                status: FAILURE_STATUS,
+                message: FAILURE_MESSAGE.into(),
+                retry_after: None,
+            })
+        }))
+    }
+
+    fn login(
+        &self,
+        _method: String,
+        _config: Value,
+        _ui: Arc<dyn InteractionService>,
+    ) -> BoxFuture<'static, Result<Option<String>, AgentError>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn auth_status(
+        &self,
+        _config: Value,
+    ) -> Option<BoxFuture<'static, Result<AuthStatus, AgentError>>> {
+        None
+    }
+
+    fn logout(&self) -> Option<BoxFuture<'static, Result<(), AgentError>>> {
+        None
+    }
+}
 
 fn picker_text(event_loop: &mut EventLoop<'_>) -> String {
     let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
@@ -45,7 +104,7 @@ fn assert_picker_usable(event_loop: &mut EventLoop<'_>) {
     picker.open(RECENT);
     let text = picker_text(event_loop);
     assert!(text.contains("Recent"), "{text}");
-    assert!(text.contains("Aperture"), "{text}");
+    assert!(text.contains(DISPLAY_NAME), "{text}");
     assert!(text.contains("discovery-recent"), "{text}");
     assert!(text.contains("discovery-catalog"), "{text}");
     for spec in [RECENT, CATALOG] {
@@ -60,41 +119,23 @@ fn assert_picker_usable(event_loop: &mut EventLoop<'_>) {
 
 #[test]
 fn refresh_keeps_catalog_and_recents_through_slow_provider_failure() {
-    let root = tempfile::tempdir().unwrap();
-    paths::init_at(root.path().to_path_buf()).unwrap();
-    std::fs::write(root.path().join("models-dev-catalog.json"), "{}").unwrap();
-    let listener = Async::new(TcpListener::bind(("127.0.0.1", 0)).unwrap()).unwrap();
-    let mut providers = ProvidersConfig::default();
-    providers.upsert(
-        "aperture".into(),
-        ProviderDef {
-            base_url: Some(format!(
-                "http://{}",
-                listener.get_ref().local_addr().unwrap()
-            )),
-            ..ProviderDef::default()
-        },
-    );
-    providers.save().unwrap();
     let (entered_tx, entered_rx) = flume::bounded(1);
     let (release_tx, release_rx) = flume::bounded(1);
-    let server = smol::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = Vec::new();
-        let mut byte = [0];
-        while !request.ends_with(b"\r\n\r\n") {
-            assert_eq!(stream.read(&mut byte).await.unwrap(), 1);
-            request.push(byte[0]);
-        }
-        assert!(request.starts_with(b"GET /v1/models "));
-        entered_tx.send_async(()).await.unwrap();
-        if release_rx.recv_async().await.is_ok() {
-            stream.write_all(FAILURE_RESPONSE).await.unwrap();
-            stream.flush().await.unwrap();
-        }
-    });
+    let providers = Arc::new(ProviderRegistry::new(
+        vec![RegisteredProvider {
+            id: PROVIDER.into(),
+            display_name: DISPLAY_NAME.into(),
+            models: Vec::new(),
+            backend: Arc::new(SlowFailingBackend {
+                entered: entered_tx,
+                release: release_rx,
+            }),
+            auth: AuthSpec::default(),
+        }],
+        Timeouts::default(),
+    ));
 
-    with_event_loop(|event_loop| {
+    with_event_loop_providers(providers, |event_loop| {
         let policy = Arc::new(ModelPolicy::new(&[RECENT.into(), CATALOG.into()], &[]).unwrap());
         event_loop.ctx.model_policy = Arc::clone(&policy);
         event_loop.sessions[0]
@@ -160,9 +201,8 @@ fn refresh_keeps_catalog_and_recents_through_slow_provider_failure() {
                 .warn_rx
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                 .unwrap();
-            if warning.starts_with("Aperture:") {
-                assert!(warning.contains("503"), "{warning}");
-                assert!(warning.contains("using static fallback"), "{warning}");
+            if warning.starts_with(&format!("{DISPLAY_NAME}:")) {
+                assert!(warning.contains(FAILURE_MESSAGE), "{warning}");
                 break;
             }
         }
@@ -192,5 +232,4 @@ fn refresh_keeps_catalog_and_recents_through_slow_provider_failure() {
             ModelPickerAction::Consumed
         ));
     });
-    smol::block_on(server);
 }

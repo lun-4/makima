@@ -1,5 +1,5 @@
-//! The Gemini generateContent client the native gateways (Aperture, dynamic
-//! and custom providers, the catalog) still route through. The `google` and
+//! The Gemini generateContent client the native dynamic and custom providers
+//! still route through. The `google` and
 //! `vertex` providers themselves are registered by `plugins/providers`.
 
 use crate::types::ThinkingConfigExt;
@@ -695,6 +695,7 @@ mod tests {
             turn_output_tokens: None,
             context_window: 1_048_576,
             thinking_fields: None,
+            free: false,
         }
     }
 

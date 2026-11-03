@@ -8,7 +8,7 @@ local SECONDS_PER_MINUTE = 60
 local MILLIS = 1000
 local DAYS_PER_ERA = 146097
 local DAYS_TO_EPOCH = 719468
-local RFC3339 = "^(%d%d%d%d)-(%d%d)-(%d%d)[Tt ](%d%d):(%d%d):(%d%d)%.?%d*(.*)$"
+local RFC3339 = "^(%d%d%d%d)-(%d%d)-(%d%d)[Tt ](%d%d):(%d%d):(%d%d)(%.?%d*)(.*)$"
 
 -- Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's
 -- days_from_civil).
@@ -38,7 +38,7 @@ function M.parse_rfc3339(text)
   if type(text) ~= "string" then
     return nil
   end
-  local year, month, day, hour, minute, second, zone = text:match(RFC3339)
+  local year, month, day, hour, minute, second, fraction, zone = text:match(RFC3339)
   if not year then
     return nil
   end
@@ -57,7 +57,7 @@ function M.parse_rfc3339(text)
     + tonumber(minute) * SECONDS_PER_MINUTE
     + tonumber(second)
     - offset
-  return seconds * MILLIS
+  return seconds * MILLIS + math.floor((tonumber("0" .. fraction) or 0) * MILLIS)
 end
 
 -- `YYYY-MM-DD` of the UTC day containing {secs}.

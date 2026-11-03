@@ -466,6 +466,7 @@ pub(crate) fn test_model() -> maki_providers::Model {
         turn_output_tokens: None,
         context_window: TEST_CONTEXT_WINDOW,
         thinking_fields: None,
+        free: false,
     }
 }
 

@@ -1,5 +1,5 @@
 use crate::model::{ModelEntry, ModelFamily, ModelTier};
-use crate::providers::{anthropic, aperture, custom, dynamic, google, openai};
+use crate::providers::{anthropic, custom, dynamic, google, openai};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ProviderManifest {
@@ -68,53 +68,16 @@ const LLAMA_CPP: ProviderManifest = ProviderManifest {
     models: &[],
 };
 
-const OPENCODE: ProviderManifest = ProviderManifest {
-    slug: "opencode",
-    display_name: "Opencode Zen",
-    family: ModelFamily::Generic,
-    supports_thinking: true,
-    accepts_arbitrary_models: true,
-    fallback_max_output: Some(128_000),
-    fallback_context_window: 256_000,
-    models: &[],
-};
-
-const OPENCODE_GO: ProviderManifest = ProviderManifest {
-    slug: "opencode-go",
-    display_name: "Opencode Go",
-    family: ModelFamily::Generic,
-    supports_thinking: false,
-    accepts_arbitrary_models: true,
-    fallback_max_output: Some(64_000),
-    fallback_context_window: 128_000,
-    models: &[],
-};
-
-const APERTURE: ProviderManifest = ProviderManifest {
-    slug: "aperture",
-    display_name: "Aperture",
-    family: ModelFamily::Generic,
-    supports_thinking: false,
-    accepts_arbitrary_models: true,
-    fallback_max_output: Some(16_384),
-    fallback_context_window: 128_000,
-    models: aperture::models(),
-};
-
-const BUILTINS: &[ProviderManifest] = &[OPENCODE, OPENCODE_GO, APERTURE];
-
-/// Protocols the native gateways still route to after their provider moved
-/// to Lua. They resolve by slug but are not native providers themselves.
+/// Protocols the native custom and dynamic providers still route to after
+/// their provider moved to Lua. They resolve by slug but are not native
+/// providers themselves.
 const PROTOCOL_BASES: &[ProviderManifest] = &[ANTHROPIC, OPENAI, GOOGLE, OLLAMA, LLAMA_CPP];
 
 pub struct ManifestRegistry;
 
 impl ManifestRegistry {
     pub fn get(slug: &str) -> Option<&'static ProviderManifest> {
-        BUILTINS
-            .iter()
-            .chain(PROTOCOL_BASES)
-            .find(|m| m.slug == slug)
+        PROTOCOL_BASES.iter().find(|m| m.slug == slug)
     }
 
     /// Like `get`, but resolves dynamic and custom (providers.toml) slugs to
@@ -126,10 +89,6 @@ impl ManifestRegistry {
         Self::get(slug)
             .or_else(|| dynamic::base_for_slug(slug).and_then(|base| Self::get(&base.to_string())))
             .or_else(|| custom::base_kind(slug).and_then(|base| Self::get(&base.to_string())))
-    }
-
-    pub fn builtins() -> &'static [ProviderManifest] {
-        BUILTINS
     }
 
     pub fn find_default_for_tier(slug: &str, tier: ModelTier) -> Option<&'static ModelEntry> {
@@ -144,38 +103,7 @@ impl ManifestRegistry {
 mod tests {
     use super::*;
     use crate::provider::ProviderKind;
-    use maki_config::providers::BuiltInProvider;
-    use std::str::FromStr;
     use strum::IntoEnumIterator;
-
-    #[test]
-    fn every_builtin_manifest_with_provider_kind_matches_kind_fields() {
-        for manifest in BUILTINS {
-            let Some(kind) = ProviderKind::from_str(manifest.slug).ok() else {
-                continue;
-            };
-            assert_eq!(kind.to_string(), manifest.slug, "{}", manifest.slug);
-            assert_eq!(
-                manifest.display_name,
-                kind.display_name(),
-                "{}",
-                manifest.slug
-            );
-            assert_eq!(manifest.family, kind.family(), "{}", manifest.slug);
-            assert_eq!(
-                manifest.fallback_max_output,
-                kind.fallback_max_output(),
-                "{}",
-                manifest.slug,
-            );
-            assert_eq!(
-                manifest.fallback_context_window,
-                kind.fallback_context_window(),
-                "{}",
-                manifest.slug,
-            );
-        }
-    }
 
     #[test]
     fn for_slug_returns_none_for_unknown_slug() {
@@ -190,58 +118,16 @@ mod tests {
     }
 
     #[test]
-    fn builtin_count_covers_provider_kind_variants() {
-        let kind_count = ProviderKind::iter().count();
-        assert!(
-            BUILTINS.len() + PROTOCOL_BASES.len() >= kind_count,
-            "BUILTINS and PROTOCOL_BASES have {} manifests but ProviderKind has {} variants",
-            BUILTINS.len() + PROTOCOL_BASES.len(),
-            kind_count,
-        );
+    fn every_provider_kind_has_a_manifest() {
         for kind in ProviderKind::iter() {
-            assert!(
-                ManifestRegistry::get(&kind.to_string()).is_some(),
-                "ProviderKind variant {:?} has no manifest",
-                kind,
-            );
-        }
-    }
-
-    /// Opencode Zen and Opencode Go come from the fetched catalog and stay
-    /// hidden until the user is authed, so they never join the inventory.
-    const CATALOG_ONLY_SLUGS: &[&str] = &["opencode", "opencode-go"];
-
-    /// The picker lists the inventory, so a manifest without an entry is a
-    /// provider the user cannot reach. OpenRouter shipped that way for months.
-    #[test]
-    fn every_builtin_manifest_has_inventory_entry() {
-        for manifest in BUILTINS {
-            if CATALOG_ONLY_SLUGS.contains(&manifest.slug) {
-                continue;
-            }
-            assert!(
-                inventory::iter::<BuiltInProvider>()
-                    .into_iter()
-                    .any(|b| b.slug == manifest.slug),
-                "manifest {:?} has no BuiltInProvider entry, so it never shows in the picker",
-                manifest.slug,
-            );
-        }
-    }
-
-    #[test]
-    fn every_builtin_provider_inventory_entry_has_matching_manifest() {
-        for builtin in inventory::iter::<BuiltInProvider>() {
-            let manifest = ManifestRegistry::get(builtin.slug).unwrap_or_else(|| {
-                panic!(
-                    "BuiltInProvider slug {:?} has no ProviderManifest",
-                    builtin.slug,
-                )
-            });
+            let manifest = ManifestRegistry::get(&kind.to_string())
+                .unwrap_or_else(|| panic!("ProviderKind variant {kind:?} has no manifest"));
+            assert_eq!(manifest.display_name, kind.display_name());
+            assert_eq!(manifest.family, kind.family());
+            assert_eq!(manifest.fallback_max_output, kind.fallback_max_output());
             assert_eq!(
-                manifest.display_name, builtin.display_name,
-                "display_name mismatch between manifest and BuiltInProvider for slug {:?}",
-                builtin.slug,
+                manifest.fallback_context_window,
+                kind.fallback_context_window()
             );
         }
     }

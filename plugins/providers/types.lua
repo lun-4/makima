@@ -34,6 +34,7 @@ export type ModelDescriptor = {
   supports_fast: boolean?,
   supports_tool_examples: boolean?,
   tier: ("weak" | "medium" | "strong")?,
+  free: boolean?,
   provider_data: Json?,
 }
 
@@ -194,6 +195,7 @@ export type Provider = {
   auth: { AuthMethod }?,
   aliases: { { id: string, label: string, method: string } }?,
   config: { ConfigField }?,
+  section: string?,
   auth_status: ((
     ctx: Context,
     config: { [string]: Json }
@@ -202,7 +204,7 @@ export type Provider = {
     detail: string?,
   })?,
   logout: ((ctx: Context) -> ())?,
-  discover: ((ctx: Context, config: { [string]: Json }) -> ({ ModelDescriptor }?, Error?))?,
+  discover: ((ctx: Context, config: { [string]: Json }, refresh: boolean) -> ({ ModelDescriptor }?, Error?))?,
   prepare: (
     ctx: Context,
     model: ModelDescriptor,

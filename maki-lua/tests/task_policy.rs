@@ -401,7 +401,7 @@ fn spawn_and_wait_stub(reg: &ToolRegistry, input: Value) -> Result<Value, String
     spawn_and_wait(reg, &stub_ctx(&AgentMode::Build), input)
 }
 
-const FULL_MODEL_SPEC: &str = "aperture/ollama/glm-5.2";
+const FULL_MODEL_SPEC: &str = "gateway/ollama/glm-5.2";
 
 #[test]
 fn model_spec_forwards_full_spec_to_resolve_model() {

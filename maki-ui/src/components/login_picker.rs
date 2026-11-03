@@ -18,7 +18,7 @@ use maki_providers::login::{
     drive_login,
 };
 use maki_providers::provider::BoxFuture;
-use maki_providers::{AgentError, ProviderData, ProviderRegistry};
+use maki_providers::{AgentError, ProviderRegistry};
 use maki_storage::StateDir;
 use maki_storage::auth::{
     ProviderCredentials, load_provider_credentials, save_provider_credentials,
@@ -33,12 +33,8 @@ use crate::text_buffer::TextBuffer;
 use crate::theme;
 
 const TITLE: &str = " Login ";
-const CATALOG_UNAVAILABLE_SLUG: &str = "catalog-unavailable";
-const CATALOG_UNAVAILABLE_LABEL: &str = "Models.dev providers (not yet downloaded)";
-const CATALOG_SECTION: &str = "Providers from Models.dev";
 pub const CUSTOM_SLUG: &str = "custom";
 const CUSTOM_LABEL: &str = "Custom provider...";
-const OPENCODE_SLUG: &str = "opencode";
 const WAITING_MESSAGE: &str = "Waiting... (Esc to cancel)";
 const SECRET_MASK: &str = "*";
 
@@ -217,11 +213,7 @@ pub struct LoginPicker {
 
 /// Native providers a frontend logs in to itself, skipping any the registry
 /// now owns. Goes away with the native providers in commit 9.
-pub fn native_login_choices(
-    storage: &StateDir,
-    registry: &ProviderRegistry,
-    catalog: Option<Vec<ProviderData>>,
-) -> Vec<ChoiceOption> {
+pub fn native_login_choices(storage: &StateDir, registry: &ProviderRegistry) -> Vec<ChoiceOption> {
     let config = ProvidersConfig::load();
     let builtins = providers::all_builtins().into_iter().map(|b| {
         let has_key = load_provider_credentials(storage, b.slug).is_some();
@@ -230,14 +222,13 @@ pub fn native_login_choices(
         native_choice(
             b.slug,
             b.display_name,
-            None,
             found_state(has_key, has_env, configured),
         )
     });
     let custom = config
         .providers
         .iter()
-        .filter(|(slug, _)| *slug != OPENCODE_SLUG && providers::builtin_provider(slug).is_none())
+        .filter(|(slug, _)| providers::builtin_provider(slug).is_none())
         .map(|(slug, def)| {
             let has_key = load_provider_credentials(storage, slug).is_some();
             let has_env = def
@@ -245,29 +236,11 @@ pub fn native_login_choices(
                 .as_deref()
                 .is_some_and(|e| env::var(e).is_ok());
             let label = def.display_name.as_deref().unwrap_or(slug);
-            native_choice(slug, label, None, found_state(has_key, has_env, false))
+            native_choice(slug, label, found_state(has_key, has_env, false))
         });
-    let catalog: Vec<ChoiceOption> = match catalog {
-        Some(catalog) => catalog
-            .iter()
-            .map(|cat| {
-                let has_key = cat.load_key_from_storage(storage).is_some();
-                let has_env = cat.env_key_set().is_some();
-                let state = found_state(has_key, has_env, false);
-                native_choice(&cat.slug, &cat.display_name, Some(CATALOG_SECTION), state)
-            })
-            .collect(),
-        None => vec![native_choice(
-            CATALOG_UNAVAILABLE_SLUG,
-            CATALOG_UNAVAILABLE_LABEL,
-            Some(CATALOG_SECTION),
-            AuthState::Missing,
-        )],
-    };
-    let custom_choice = native_choice(CUSTOM_SLUG, CUSTOM_LABEL, None, AuthState::Missing);
+    let custom_choice = native_choice(CUSTOM_SLUG, CUSTOM_LABEL, AuthState::Missing);
     builtins
         .chain(custom)
-        .chain(catalog)
         .chain(iter::once(custom_choice))
         .filter(|choice| !registry.contains(&choice.id))
         .collect()
@@ -282,12 +255,12 @@ fn found_state(has_key: bool, has_env: bool, configured: bool) -> AuthState {
     }
 }
 
-fn native_choice(id: &str, label: &str, section: Option<&str>, state: AuthState) -> ChoiceOption {
+fn native_choice(id: &str, label: &str, state: AuthState) -> ChoiceOption {
     ChoiceOption {
         id: id.into(),
         label: label.into(),
         detail: state.label().map(str::to_owned),
-        section: section.map(str::to_owned),
+        section: None,
     }
 }
 
@@ -317,11 +290,7 @@ impl LoginPicker {
     /// Starts the shared login driver in the background; its questions
     /// arrive through `poll`.
     pub fn open(&mut self) {
-        self.native = native_login_choices(
-            &self.storage,
-            &self.providers,
-            maki_providers::catalog_providers_if_available(),
-        );
+        self.native = native_login_choices(&self.storage, &self.providers);
         let (events_tx, events) = flume::unbounded();
         let providers = Arc::clone(&self.providers);
         let storage = self.storage.clone();
@@ -421,7 +390,6 @@ impl LoginPicker {
 
     fn select_native(&mut self, slug: String) -> LoginPickerAction {
         let action = match slug.as_str() {
-            CATALOG_UNAVAILABLE_SLUG => StepAction::Back,
             CUSTOM_SLUG => StepAction::GoCustomName,
             _ => {
                 let config = providers::ProvidersConfig::load();
@@ -1207,11 +1175,10 @@ mod tests {
     #[test]
     fn native_choices_skip_registered() {
         let fixture = Fixture::new();
-        let ids: Vec<String> =
-            native_login_choices(&fixture.storage, &fixture.picker.providers, None)
-                .into_iter()
-                .map(|choice| choice.id)
-                .collect();
+        let ids: Vec<String> = native_login_choices(&fixture.storage, &fixture.picker.providers)
+            .into_iter()
+            .map(|choice| choice.id)
+            .collect();
         assert!(ids.iter().any(|id| id == CUSTOM_SLUG));
         assert!(!ids.iter().any(|id| id == PROVIDER));
     }

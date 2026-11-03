@@ -4958,10 +4958,8 @@ mod tests {
     const OBSERVATION: &str = "failed";
     const PENDING_FAST_MODEL: &str = "pending-fast-model";
     const SWITCHED_FAST_MODEL: &str = "switched-fast-model";
-    /// Re-preparing needs a constructible provider; aperture needs only a host.
-    const DISCOVERY_PROVIDER: &str = "aperture";
-    const DISCOVERY_HOST_ENV: &str = "APERTURE_HOST";
-    const UNREACHABLE_HOST: &str = "http://127.0.0.1:1";
+    /// Re-preparing needs a constructible native provider.
+    const DISCOVERY_PROVIDER: &str = "tui-discovery";
     const STARTUP_MODEL_ID: &str = "tui-discovery-startup";
     const RESUMED_MODEL_ID: &str = "tui-discovery-resumed";
     const UNRELATED_MODEL_ID: &str = "tui-discovery-unrelated";
@@ -5643,8 +5641,7 @@ mod tests {
         discovered: &str,
         refreshed: bool,
     ) {
-        // SAFETY: nextest runs each test in its own process.
-        unsafe { std::env::set_var(DISCOVERY_HOST_ENV, UNREACHABLE_HOST) };
+        let _providers = configure_discovery_provider();
         let spec = |id: &str| format!("{DISCOVERY_PROVIDER}/{id}");
         with_event_loop_runtime(
             |harness| {
@@ -5707,8 +5704,7 @@ mod tests {
     #[test_case(true ; "idle_guard")]
     #[test_case(false ; "session_lease")]
     fn busy_discovery_refresh_applies_once_released(idle_guard: bool) {
-        // SAFETY: nextest runs each test in its own process.
-        unsafe { std::env::set_var(DISCOVERY_HOST_ENV, UNREACHABLE_HOST) };
+        let _providers = configure_discovery_provider();
         let spec = format!("{DISCOVERY_PROVIDER}/{BUSY_MODEL_ID}");
         with_event_loop_runtime(
             |harness| {
@@ -5936,15 +5932,42 @@ mod tests {
     }
     const TEST_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
+    pub(super) fn configure_discovery_provider() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        maki_storage::paths::init_at(root.path().to_path_buf()).unwrap();
+        maki_lua::test_support::save_custom_provider(DISCOVERY_PROVIDER);
+        root
+    }
+
     pub(super) fn with_event_loop(test: impl FnOnce(&mut EventLoop<'_>)) {
         with_event_loop_runtime(|harness| harness.runtime(harness.session()), test);
+    }
+
+    /// Like `with_event_loop`, with {providers} as the registry.
+    pub(super) fn with_event_loop_providers(
+        providers: Arc<ProviderRegistry>,
+        test: impl FnOnce(&mut EventLoop<'_>),
+    ) {
+        let catalog = ModelCatalog::offline(Arc::clone(&providers), &ModelPolicy::default());
+        run_event_loop(
+            RuntimeHarness::with(PermissionsConfig::default(), providers, catalog),
+            |harness| harness.runtime(harness.session()),
+            test,
+        );
     }
 
     fn with_event_loop_runtime(
         runtime: impl FnOnce(&mut RuntimeHarness) -> SessionRuntime,
         test: impl FnOnce(&mut EventLoop<'_>),
     ) {
-        let mut harness = RuntimeHarness::new();
+        run_event_loop(RuntimeHarness::new(), runtime, test);
+    }
+
+    fn run_event_loop(
+        mut harness: RuntimeHarness,
+        runtime: impl FnOnce(&mut RuntimeHarness) -> SessionRuntime,
+        test: impl FnOnce(&mut EventLoop<'_>),
+    ) {
         let runtime = runtime(&mut harness);
         let ctx = harness.ctx.take().unwrap();
         let initial_provider = ctx.model_slot.load().provider.identity();
@@ -6128,10 +6151,17 @@ mod tests {
 
     impl RuntimeHarness {
         fn with_permissions_config(permissions_config: PermissionsConfig) -> Self {
+            Self::with(permissions_config, Arc::default(), ModelCatalog::default())
+        }
+
+        fn with(
+            permissions_config: PermissionsConfig,
+            providers: Arc<ProviderRegistry>,
+            catalog: ModelCatalog,
+        ) -> Self {
             let temp_dir = tempfile::tempdir().unwrap();
             let storage = StateDir::from_path(temp_dir.path().to_path_buf());
             let sessions_dir = storage.ensure_subdir(SESSIONS_DIR).unwrap();
-            let catalog = ModelCatalog::default();
             let command_registry = maki_commands::CommandRegistry::new();
             let command_runtime = Arc::new(CommandRuntime::new_for_test(
                 &[],
@@ -6153,8 +6183,8 @@ mod tests {
             let storage_writer =
                 Arc::new(StorageWriter::new(storage.clone(), flume::unbounded().0));
             let ctx = SpawnCtx {
-                prepare_provider: default_model_preparer(Arc::default()),
-                providers: Arc::default(),
+                prepare_provider: default_model_preparer(Arc::clone(&providers)),
+                providers,
                 storage,
                 sessions_dir,
                 config: AgentConfig::default(),

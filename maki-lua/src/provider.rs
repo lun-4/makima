@@ -303,12 +303,17 @@ impl ProviderBackend for LuaBackend {
         })
     }
 
-    fn discover(&self) -> Option<BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>> {
+    fn discover(
+        &self,
+        refresh: bool,
+    ) -> Option<BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>> {
         self.callbacks.discover.as_ref()?;
         let config = provider_config(&self.callbacks.id);
         Some(self.call_callback(
             |callbacks| callbacks.discover.as_ref(),
-            move |lua| config_arg(lua, &config),
+            move |lua| {
+                (lua.to_value_with(&config, serialize_options())?, refresh).into_lua_multi(lua)
+            },
             |lua, models| Ok(Ok(lua.from_value(models.unwrap_or(LuaValue::Nil))?)),
         ))
     }

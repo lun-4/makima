@@ -236,7 +236,9 @@ local function reclassify(def, err)
   return err
 end
 
-local function stream(def, client, model, ctx, request, emit)
+-- Streams {request} through {client} (`base` and `headers(extra)`) with
+-- {def}'s request quirks applied for descriptor {model}.
+function M.stream(def, client, model, ctx, request, emit)
   local body = chat.build_request(request, {
     max_tokens_field = def.max_tokens_field or DEFAULT_MAX_TOKENS_FIELD,
     include_stream_usage = def.include_stream_usage,
@@ -365,7 +367,7 @@ function M.provider(def)
         return client.pool.rotate()
       end,
       stream = function(call_ctx, request, emit)
-        return stream(def, client, model, call_ctx, request, emit)
+        return M.stream(def, client, model, call_ctx, request, emit)
       end,
     }
     if def.fetch_usage then

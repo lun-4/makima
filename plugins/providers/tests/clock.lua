@@ -7,6 +7,7 @@ local AUGUST_26_MIDNIGHT_MS = 1787702400000
 
 t.case("parse_rfc3339", function()
   t.eq(clock.parse_rfc3339("2000-01-01T00:00:00.000Z"), Y2K_MS)
+  t.eq(clock.parse_rfc3339("2000-01-01T00:00:00.964Z"), Y2K_MS + 964)
   t.eq(clock.parse_rfc3339("2026-09-01T00:00:00Z"), 1788220800000)
   t.eq(clock.parse_rfc3339("2000-01-01T01:30:00+01:30"), Y2K_MS)
   t.eq(clock.parse_rfc3339("1999-12-31T23:00:00-01:00"), Y2K_MS)

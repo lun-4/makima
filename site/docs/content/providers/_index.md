@@ -36,42 +36,6 @@ base_url = "http://xxxx:1234/v1"
 
 The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discover_models` and `models` are ignored with a warning. Use a custom slug if you need those.
 
-## Built-in Providers
-
-### Opencode Zen
-
-- **Env var**: `OPENCODE_API_KEY`
-- **API**: `https://opencode.ai/zen/v1`
-- **Features**: Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Zen API
-
-No hardcoded model catalog. Use any model ID supported by this provider.
-
-By default Makima hides free models from the Opencode catalog. To list free models (they use a public fallback, no API key needed), add this to `~/.config/makima/providers.toml`:
-
-```toml
-[opencode]
-enable_free_models = true
-```
-
-The default is `false`.
-
-### Aperture
-
-- **Env var**: `APERTURE_HOST` (e.g. `https://your-host.tailnet.ts.net`)
-- **API**: `Aperture gateway (set APERTURE_HOST)`
-- **Features**: Tailscale Aperture LLM gateway; set APERTURE_HOST or configure in providers.toml
-
-Aperture discovers models from your gateway. Set `APERTURE_HOST` to your Tailscale Aperture endpoint (e.g. `https://your-host.tailnet.ts.net`). No API key needed, Tailscale handles auth.
-
-### Opencode Go
-
-- **Env var**: `OPENCODE_API_KEY`
-- **API**: `https://opencode.ai/zen/go/v1`
-- **Features**: Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Go API
-
-No hardcoded model catalog. Use any model ID supported by this provider. An API key is required.
-
-
 ## Model Identifiers
 
 Models are referenced as `provider/model_id`:
@@ -214,7 +178,7 @@ To add a custom provider or proxy, drop an executable script into the config `pr
 
 `resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
 
-The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `ollama`, `llama-cpp`, `opencode`, `aperture`.
+The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `ollama`, `llama-cpp`.
 
 If your provider serves models not in the base catalog, add a `models` subcommand returning:
 

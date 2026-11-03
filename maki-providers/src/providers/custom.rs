@@ -39,7 +39,7 @@ fn protocol_kind(protocol: Protocol) -> ProviderKind {
 
 /// Builtins win their slug in `from_spec`/`create`, so every custom path skips
 /// them. Key off the manifest (every builtin), not `builtin_provider`, which
-/// omits the `opencode` slugs and would let them shadow the builtin.
+/// omits the protocol bases and would let them shadow the builtin.
 fn is_builtin_slug(slug: &str) -> bool {
     ManifestRegistry::get(slug).is_some()
 }
@@ -159,6 +159,7 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
         turn_output_tokens: None,
         context_window,
         thinking_fields: None,
+        free: false,
     }
 }
 
@@ -339,26 +340,25 @@ mod tests {
         .unwrap()
     }
 
-    // `opencode` is a builtin whose slug is absent from the `builtin_provider`
-    // inventory; the old guard leaked it into the picker, where it then resolved
-    // as the builtin and silently dropped the custom model. Listing must skip
-    // every builtin slug so a providers.toml entry can never shadow one.
+    // Listing must skip every builtin slug, including those absent from the
+    // `builtin_provider` inventory, so a providers.toml entry can never
+    // shadow one.
     #[test]
     fn declared_specs_skip_builtin_named_entries_but_keep_custom() {
         let mut config = ProvidersConfig::default();
-        config.upsert("opencode".to_string(), openai_def("shadow-model"));
+        config.upsert("ollama".to_string(), openai_def("shadow-model"));
         config.upsert("my-custom".to_string(), openai_def("real-model"));
 
         let specs = declared_specs_from(&config);
         assert!(
-            !specs.iter().any(|s| s.starts_with("opencode/")),
+            !specs.iter().any(|s| s.starts_with("ollama/")),
             "builtin slug must be skipped in custom listing: {specs:?}"
         );
         assert!(specs.contains(&"my-custom/real-model".to_string()));
 
         // Resolution owns the builtin slug regardless of the providers.toml entry.
-        let model = Model::from_spec("opencode/shadow-model").unwrap();
-        assert_eq!(model.provider.as_ref(), "opencode");
+        let model = Model::from_spec("ollama/shadow-model").unwrap();
+        assert_eq!(model.provider.as_ref(), "ollama");
     }
 
     // The exact regression this fixes: discovery parsed context_window but
