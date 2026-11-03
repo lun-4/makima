@@ -1632,8 +1632,17 @@ fn handle_control_request(
             }
         }
         InboundControlRequestType::SetModel => {
-            let current_model = coordinator.read().model().unwrap_or_default();
-            match resolve_set_model(cr.request.extra.get("model"), &current_model) {
+            let read = coordinator.read();
+            let current_model = read.model().unwrap_or_default();
+            let options = read.options();
+            let known: Vec<&str> = options
+                .options
+                .iter()
+                .filter(|option| option.definition.id.as_ref() == MODEL_OPTION_ID)
+                .flat_map(|option| option.definition.values.iter())
+                .map(|value| value.value.as_ref())
+                .collect();
+            match resolve_set_model(cr.request.extra.get("model"), &current_model, &known) {
                 Some(spec) => match smol::block_on(coordinator.set_option(MODEL_OPTION_ID, spec)) {
                     Ok(_) => writer.emit_control_response(&cr.request_id, ok, None),
                     Err(error) => {
@@ -1654,22 +1663,28 @@ fn handle_control_request(
 }
 
 /// The spec a `set_model` request names; the coordinator validates it.
-fn resolve_set_model(model_val: Option<&Value>, current_model: &str) -> Option<String> {
+fn resolve_set_model(
+    model_val: Option<&Value>,
+    current_model: &str,
+    known: &[&str],
+) -> Option<String> {
     match model_val? {
         Value::Null => Some(current_model.to_owned()),
-        Value::String(model_str) => Some(resolve_model_spec(model_str)),
+        Value::String(model_str) => Some(resolve_model_spec(model_str, known)),
         _ => None,
     }
 }
 
-fn resolve_model_spec(model_id: &str) -> String {
+/// A bare model id names the first {known} spec with that id, the way SDK
+/// clients send ids without a provider.
+fn resolve_model_spec(model_id: &str, known: &[&str]) -> String {
     if model_id.contains('/') {
         return model_id.to_string();
     }
-    if model_id.starts_with("claude-") {
-        return format!("anthropic/{model_id}");
-    }
-    model_id.to_string()
+    known
+        .iter()
+        .find(|spec| spec.split_once('/').is_some_and(|(_, id)| id == model_id))
+        .map_or_else(|| model_id.to_string(), |spec| spec.to_string())
 }
 
 fn decode_permission_response(data: &Value) -> PermissionAnswer {
@@ -2065,7 +2080,7 @@ mod tests {
     use maki_lua::orchestration::{OrchestrationServices, TrustedTarget};
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        ContentBlock, Invocation, ModelInfo, ProviderEvent, RequestOptions, Role, StreamResponse,
+        ContentBlock, Invocation, ProviderEvent, RequestOptions, Role, StreamResponse,
     };
     use maki_storage::checkpoint::{CheckpointWriter, ClaimingWriter};
     use maki_storage::sessions::Prefs;
@@ -2094,6 +2109,14 @@ mod tests {
     const SDK_LATE_MODEL: &str = "openai/sdk-discovered-late";
     const RESTORED_MODEL: &str = "anthropic/claude-opus-4-6";
 
+    /// {spec} without fast mode, which none of these models offer.
+    fn sdk_model(spec: &str) -> Model {
+        Model {
+            supports_fast_override: Some(maki_providers::model::FastSupport::Unsupported),
+            ..Model::from_spec(spec).unwrap()
+        }
+    }
+
     #[test_case(false, RESTORED_MODEL; "restores_persisted_model_without_explicit_flag")]
     #[test_case(true, STARTUP_MODEL; "explicit_model_overrides_persisted_model")]
     fn sdk_startup_model_precedence(explicit_model: bool, expected: &str) {
@@ -2104,7 +2127,7 @@ mod tests {
             meta: SessionMeta::default(),
         };
         let resolved = startup_model(
-            &ProviderRegistry::default(),
+            &maki_providers::test_util::offline_ids(&["anthropic", "openai"]),
             Model::from_spec(STARTUP_MODEL).unwrap(),
             &restored,
             explicit_model,
@@ -2222,7 +2245,10 @@ mod tests {
             append_system_prompt: None,
             defaults: SessionDefaults::default(),
             model_policy: Arc::default(),
-            providers: Arc::default(),
+            providers: Arc::new(maki_providers::test_util::offline_ids(&[
+                "anthropic",
+                "openai",
+            ])),
             modes: Arc::new(maki_agent::ModeRegistry::builtin()),
             question_mode: QuestionMode::Headless,
             plugin_rules: Arc::default(),
@@ -2268,10 +2294,6 @@ mod tests {
                     stop_reason: Some(StopReason::EndTurn),
                 })
             })
-        }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-            Box::pin(async { Ok(Vec::new()) })
         }
     }
 
@@ -2964,10 +2986,6 @@ mod tests {
                 })
             })
         }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-            Box::pin(async { Ok(Vec::new()) })
-        }
     }
 
     fn commit_patch(
@@ -3115,7 +3133,10 @@ mod tests {
                 append_system_prompt: None,
                 defaults,
                 model_policy: Arc::default(),
-                providers: Arc::default(),
+                providers: Arc::new(maki_providers::test_util::offline_ids(&[
+                    "anthropic",
+                    "openai",
+                ])),
                 modes: lua_handle.mode_registry(),
                 question_mode: QuestionMode::Headless,
                 plugin_rules: Arc::default(),
@@ -3192,7 +3213,7 @@ mod tests {
                 let provider = Arc::clone(&provider);
                 move |spec: Arc<str>| {
                     let provider = Arc::clone(&provider);
-                    let model = Model::from_spec(&spec).unwrap();
+                    let model = sdk_model(&spec);
                     Box::pin(async move { Ok(PreparedModel { model, provider }) })
                 }
             }),
@@ -3443,7 +3464,7 @@ mod tests {
             &child_ref,
             ConfigPatch {
                 model: Some(PreparedModel {
-                    model: Model::from_spec(TARGET_MODEL).unwrap(),
+                    model: sdk_model(TARGET_MODEL),
                     provider: Arc::clone(&provider),
                 }),
                 ..Default::default()
@@ -4302,11 +4323,12 @@ mod tests {
         assert_eq!(json["request"]["tool_name"], "Read");
     }
 
-    #[test_case("claude-opus-4-6", "anthropic/claude-opus-4-6"; "claude_prefix")]
+    #[test_case("claude-opus-4-6", "anthropic/claude-opus-4-6"; "bare_id_of_a_known_spec")]
     #[test_case("openai/gpt-4", "openai/gpt-4"; "explicit_provider")]
     #[test_case("gpt-4o", "gpt-4o"; "unknown_passthrough")]
     fn resolve_model_spec_cases(input: &str, expected: &str) {
-        assert_eq!(resolve_model_spec(input), expected);
+        let known = ["openai/gpt-5", "anthropic/claude-opus-4-6"];
+        assert_eq!(resolve_model_spec(input, &known), expected);
     }
 
     #[test]
@@ -4340,7 +4362,7 @@ mod tests {
     #[test]
     fn resolve_set_model_null_keeps_current_model() {
         let current = "openai/gpt-5";
-        let result = resolve_set_model(Some(&Value::Null), current).unwrap();
+        let result = resolve_set_model(Some(&Value::Null), current, &[]).unwrap();
         assert_eq!(result, current);
     }
 

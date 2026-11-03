@@ -97,6 +97,17 @@ local GPT_6_WINDOW = 272000
 local CODEX_MAX_OUTPUT = 128000
 local CODEX_API_WINDOW = 400000
 
+local NOTES = [[
+#### Auth
+
+You can use OpenAI two ways.
+
+**API key**: set `OPENAI_API_KEY`, or pick the API key method in `/login` and paste a key from [platform.openai.com/api-keys](https://platform.openai.com/api-keys).
+
+**ChatGPT subscription**: use Codex through your ChatGPT login. Run `makima auth login openai-codex`, or pick the ChatGPT login method in `/login`. Makima walks you through the device flow at [auth.openai.com/codex](https://auth.openai.com/codex) and saves the tokens, which win over the API key. `OPENAI_BASE_URL` only redirects the API key path, never the ChatGPT backend.
+
+With a ChatGPT login the model list comes from the Codex backend's own `/models`, so a model your plan gains shows up without a Makima update, with the context window and reasoning levels the backend declares. The table above is the offline fallback. The backend hides models newer than the Codex CLI version Makima reports, so a brand new release can lag until that version is bumped.]]
+
 -- The first row of a tier is its default.
 M.def = {
   id = "openai",
@@ -105,6 +116,7 @@ M.def = {
   base_url = "https://api.openai.com/v1",
   login_url = "https://platform.openai.com/api-keys",
   model = "gpt-5.5",
+  notes = NOTES,
   max_tokens_field = MAX_TOKENS_FIELD,
   include_stream_usage = true,
   defaults = {

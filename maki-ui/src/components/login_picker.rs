@@ -551,7 +551,7 @@ mod tests {
         assert_eq!(saved.host.as_deref(), Some(ANSWERED_URL));
         let section = ProvidersConfig::try_load().unwrap();
         assert_eq!(
-            section.get(PROVIDER).unwrap().base_url.as_deref(),
+            section.get(PROVIDER).unwrap().0["base_url"].as_str(),
             Some(ANSWERED_URL)
         );
         assert_eq!(read_model(&fixture.storage).as_deref(), Some(MODEL_SPEC));

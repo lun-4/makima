@@ -153,15 +153,6 @@ impl maki_providers::provider::Provider for DetachedProvider {
     > {
         Box::pin(async { std::future::pending().await })
     }
-
-    fn list_models(
-        &self,
-    ) -> maki_providers::provider::BoxFuture<
-        '_,
-        Result<Vec<maki_providers::ModelInfo>, maki_agent::AgentError>,
-    > {
-        Box::pin(async { Ok(Vec::new()) })
-    }
 }
 pub(crate) const NOTHING_TO_TRUST_MSG: &str = "nothing to trust in this folder";
 const TRUSTED_PREFIX: &str = "Trusted this folder: ";

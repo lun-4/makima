@@ -353,6 +353,7 @@ mod tests {
         let mut session = session_with_counters();
         session.meta.fast = fast;
         let model = Model {
+            supports_fast_override: Some(FastSupport::Supported),
             pricing: ModelPricing {
                 fast: Some(FastPricing {
                     input: FAST_INPUT_RATE,

@@ -134,6 +134,7 @@ pub mod test_support {
             models: listed,
             backend: Arc::new(OfflineBackend(models)),
             auth: AuthSpec::default(),
+            docs: None,
         }]))
     }
 

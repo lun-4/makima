@@ -76,9 +76,14 @@ lua_table! {
 mod tests {
     use super::*;
     use crate::api::util::convert::lua_to_json;
+    use maki_providers::test_util::offline_registry;
+    use maki_providers::{ModelInfo, ModelPricing};
     use mlua::Value;
 
-    const SPEC: &str = "anthropic/claude-opus-4-6";
+    const SPEC: &str = "priced/model";
+    const CONTEXT_WINDOW: u32 = 42_000;
+    const INPUT_RATE: f64 = 5.0;
+    const CACHE_READ_RATE: f64 = 0.5;
 
     #[test]
     fn info_without_registry_reports_it_unavailable() {
@@ -98,11 +103,25 @@ mod tests {
     #[test]
     fn info_describes_the_model_registry_entry() {
         let lua = Lua::new();
-        lua.set_app_data(Arc::new(ProviderRegistry::default()));
+        let (provider, id) = Model::parse_spec(SPEC).unwrap();
+        let registry = offline_registry(vec![(
+            provider,
+            vec![ModelInfo {
+                context_window: Some(CONTEXT_WINDOW),
+                supports_fast: Some(true),
+                pricing: Some(ModelPricing {
+                    input: INPUT_RATE,
+                    cache_read: CACHE_READ_RATE,
+                    ..ModelPricing::ZERO
+                }),
+                ..ModelInfo::id_only(id.into())
+            }],
+        )]);
+        let model = registry.model(SPEC).unwrap();
+        lua.set_app_data(Arc::new(registry));
         lua.globals()
             .set("model", create_model_table(&lua).unwrap())
             .unwrap();
-        let model = Model::from_spec(SPEC).unwrap();
         let (info, err): (Value, Option<String>) = smol::block_on(
             lua.load(format!("return model.info({SPEC:?})"))
                 .eval_async(),

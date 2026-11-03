@@ -1209,8 +1209,8 @@ already owns fails and names both plugins.
   the user asked to bypass caches (`maki models --refresh`).
   `config` (table) Optional. `providers.toml` fields asked before login:
   `{ key, prompt, default?, secret?, optional?, choices? }`, where
-  `choices` is a list of `{ id, label, detail? }`. Keys are the text
-  fields of a provider section, such as `base_url` or `plan`.
+  `choices` is a list of `{ id, label, detail? }`. Each answer is saved
+  as a text field of the provider's section, such as `base_url`.
   `auth` (table) Login methods: `{ id, label, login }`.
   `login(ctx, ui, config)` gets a `maki.provider.LoginUi` and the
   provider's section with this login's answers applied, not yet saved.
@@ -1226,6 +1226,10 @@ already owns fails and names both plugins.
   provider counts as logged in while its credentials file exists.
   `logout` (function) Optional. `logout(ctx)`. Without it, logout
   deletes the credentials file.
+  `docs` (table) Optional. What the providers reference page says
+  beyond models, login methods and config fields: `env` (the
+  environment variables it reads), `endpoint` (its default endpoint) and
+  `notes` (Markdown). Providers without it are left off that page.
 
 Config is saved and the default model chosen only after `login`
 succeeds and `auth_status` no longer reports `missing`.
@@ -1238,11 +1242,10 @@ credentials belong to the plugin that registered it. An instance has
 `refresh_auth(ctx)`, `reload_auth(ctx)`, `rotate_key(ctx)`,
 `end_conversation(ctx, conversation_id, reason)` and `key_count` (a
 number, or a function read once at prepare). `request` has `model`
-(`id`, `output_tokens`, `max_output_tokens`, `context_window`), `system`, `messages`, `tools`, `thinking`, `fast`,
-`session_id` and `invocation` (`conversation_id`, `operation_id`,
-`attempt`, `purpose`, `agent_id`). `max_output_tokens` is what the model
-declares; `output_tokens` is that cap trimmed to this request's turn
-budget. `reason` is `cancelled`,
+(`id`, `max_output_tokens`, `context_window`), `system`, `messages`,
+`tools`, `thinking`, `fast`, `session_id` and `invocation`
+(`conversation_id`, `operation_id`, `attempt`, `purpose`, `agent_id`).
+`max_output_tokens` is what the model declares. `reason` is `cancelled`,
 `closed`, `compacted` or `rewound`; the host never uses an ended
 conversation id again. `emit(event)` takes `{ type = "text_delta", text }`
 and the other provider events, and returns false once the call is over.

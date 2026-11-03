@@ -2862,7 +2862,6 @@ dependencies = [
  "maki-ui",
  "regex",
  "serde_json",
- "strum 0.27.2",
  "tempfile",
  "test-case",
  "tree-sitter",
@@ -3043,7 +3042,6 @@ dependencies = [
  "tempfile",
  "test-case",
  "thiserror 2.0.20",
- "toml",
  "tracing",
 ]
 

@@ -3,6 +3,9 @@ name = "maki-providers"
 version.workspace = true
 edition.workspace = true
 
+[features]
+test-util = []
+
 [dependencies]
 maki-domain = { workspace = true }
 serde = { workspace = true }
@@ -24,4 +27,3 @@ image = { workspace = true, features = ["jpeg", "gif", "webp"] }
 [dev-dependencies]
 test-case = { workspace = true }
 tempfile = { workspace = true }
-toml = { workspace = true }

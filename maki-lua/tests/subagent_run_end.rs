@@ -21,8 +21,7 @@ use maki_lua::orchestration::{OrchestrationServices, TrustedTarget};
 use maki_lua::test_support::run_command;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    AgentError, Invocation, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
-    StreamResponse,
+    AgentError, Invocation, Message, Model, ProviderEvent, RequestOptions, Role, StreamResponse,
 };
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
@@ -242,10 +241,6 @@ impl Provider for GatedProvider {
             Ok(common::canned_reply(reply))
         })
     }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { unimplemented!() })
-    }
 }
 
 struct CancelThenRecoverProvider {
@@ -281,10 +276,6 @@ impl Provider for CancelThenRecoverProvider {
             }
         })
     }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { unimplemented!() })
-    }
 }
 
 impl Provider for FailOnceProvider {
@@ -309,10 +300,6 @@ impl Provider for FailOnceProvider {
             }
         })
     }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { unimplemented!() })
-    }
 }
 
 impl Provider for PendingProvider {
@@ -332,10 +319,6 @@ impl Provider for PendingProvider {
             std::future::pending::<()>().await;
             unreachable!()
         })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { unimplemented!() })
     }
 }
 

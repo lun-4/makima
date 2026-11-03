@@ -65,12 +65,6 @@ impl Provider for PolicyTestProvider {
     ) -> BoxFuture<'a, Result<StreamResponse, maki_providers::AgentError>> {
         Box::pin(async { unreachable!() })
     }
-
-    fn list_models(
-        &self,
-    ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
 }
 
 fn fast_change(fast: bool) -> super::ConfigChange {

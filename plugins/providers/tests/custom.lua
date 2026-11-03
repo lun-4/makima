@@ -197,7 +197,7 @@ t.case("creator_saves_a_section", function()
       return true
     end,
   }
-  local creator = custom.creator()
+  local creator = custom.creator("")
   t.eq(creator.auth_status().state, "missing")
   local ok = creator.auth[1].login(t.provider_ctx({}), ui)
   maki.api.save_provider_config = save
@@ -219,7 +219,7 @@ t.case("creator_rejects_an_empty_name", function()
       return " ... "
     end,
   }
-  local ok, err = custom.creator().auth[1].login(t.provider_ctx({}), ui)
+  local ok, err = custom.creator("").auth[1].login(t.provider_ctx({}), ui)
   t.eq(ok, nil)
   t.eq(err.message, custom.EMPTY_NAME)
 end)

@@ -125,6 +125,7 @@ M.def = {
   env = "LLAMA_CPP_API_KEY",
   host_env = "LLAMA_CPP_HOST",
   default_host = "http://localhost:8080",
+  notes = "Talks to the server at the `base_url` saved by `makima auth login llama-cpp`, else at `LLAMA_CPP_HOST`. Models come from the server: a router lists many, a single-model server one. The key is optional.",
   defaults = {
     context_window = M.DEFAULT_CONTEXT,
     supports_thinking = true,

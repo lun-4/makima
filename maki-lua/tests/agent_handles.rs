@@ -34,8 +34,8 @@ use maki_lua::{
     test_support::{InMemoryFs, run_command},
 };
 use maki_providers::{
-    AgentError, ContentBlock, Effort, Invocation, Message, Model, ModelInfo, ObservationSource,
-    ProviderEvent, RequestOptions, Role, StreamResponse, ThinkingConfig,
+    AgentError, ContentBlock, Effort, Invocation, Message, Model, ObservationSource, ProviderEvent,
+    RequestOptions, Role, StreamResponse, ThinkingConfig,
     provider::{BoxFuture, Provider},
 };
 use maki_storage::StateDir;
@@ -395,10 +395,6 @@ impl Provider for ScriptedProvider {
                 message: "scripted response gate closed".into(),
             })
         })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
     }
 }
 

@@ -315,6 +315,11 @@ function M.provider()
   return {
     id = M.def.id,
     display_name = M.def.display_name,
+    docs = {
+      env = { "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION", "GOOGLE_APPLICATION_CREDENTIALS" },
+      endpoint = GLOBAL_HOST,
+      notes = "Authenticates with Application Default Credentials: an `authorized_user` file from `gcloud auth application-default login`, or the metadata server of the machine Makima runs on. Service account files are rejected. The project comes from `GOOGLE_CLOUD_PROJECT` or `project` in `providers.toml`, the location from `GOOGLE_CLOUD_LOCATION` or `location` (default `global`).",
+    },
     models = compat.descriptors(M.def),
     auth = { { id = "adc", label = "Application Default Credentials", login = login } },
     auth_status = auth_status,

@@ -34,7 +34,7 @@ const STANDARD_COMMANDS_ALREADY_REGISTERED: &str = "standard commands are alread
 const LOCAL_COMMAND_ATTACHMENTS: &str = "local commands cannot include non-text content";
 pub const NONINTERACTIVE_MODEL_USAGE: &str =
     "Usage: /model [spec] [thinking=value] [fast=true|false]";
-pub const FAST_UNSUPPORTED: &str = "Fast mode needs Anthropic Opus 4.6+ with an API key, or an eligible Codex model with a ChatGPT subscription";
+pub const FAST_UNSUPPORTED: &str = "Fast mode is unsupported by the current model";
 
 pub fn command_images(attachments: &[CommandAttachment]) -> Result<Vec<ImageSource>, String> {
     attachments

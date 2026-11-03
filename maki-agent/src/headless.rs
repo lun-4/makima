@@ -1222,12 +1222,6 @@ pub(crate) mod tests {
                 }
             })
         }
-
-        fn list_models(
-            &self,
-        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, crate::AgentError>> {
-            Box::pin(async { Ok(Vec::new()) })
-        }
     }
 
     struct RecordingProvider {
@@ -1253,12 +1247,6 @@ pub(crate) mod tests {
                     .send((self.name, model.spec(), system.into(), options.fast));
                 Ok(response(self.name))
             })
-        }
-
-        fn list_models(
-            &self,
-        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, crate::AgentError>> {
-            Box::pin(async { Ok(Vec::new()) })
         }
     }
 

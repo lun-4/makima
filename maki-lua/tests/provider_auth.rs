@@ -212,7 +212,7 @@ fn drive_login_through_lua_provider() {
     assert_eq!(saved.host.as_deref(), Some(ANSWERED_URL));
     let section = ProvidersConfig::try_load().unwrap();
     assert_eq!(
-        section.get(PROVIDER).unwrap().base_url.as_deref(),
+        section.get(PROVIDER).unwrap().0["base_url"].as_str(),
         Some(ANSWERED_URL)
     );
 }
@@ -320,7 +320,7 @@ fn bundled_provider_logs_in_with_its_plan() {
     assert_eq!(saved.api_key, BUNDLED_KEY);
     let config = ProvidersConfig::try_load().unwrap();
     assert_eq!(
-        config.get(PLAN_PROVIDER).unwrap().plan.as_deref(),
+        config.get(PLAN_PROVIDER).unwrap().0["plan"].as_str(),
         Some(PLAN)
     );
     let status = fixture

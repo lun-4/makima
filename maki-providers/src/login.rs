@@ -143,6 +143,9 @@ pub struct ProviderStatus {
     pub display_name: Arc<str>,
     pub section: Option<String>,
     pub status: AuthStatus,
+    /// False for a provider that only adds others, which has no status of
+    /// its own worth listing.
+    pub offers_models: bool,
 }
 
 pub struct LoginRequest {
@@ -192,7 +195,7 @@ pub async fn drive_login(
         .cloned()
         .unwrap_or_default();
     let answers = ask_config(&*ui, &entry.auth.config, &serde_json::to_value(&current)?).await?;
-    let pending = current.with_answers(&answers).map_err(config_error)?;
+    let pending = current.with_answers(&answers);
     let method = match (preset, entry.auth.methods.as_slice()) {
         (Some(method), _) => method.to_owned(),
         (None, []) => {
@@ -378,6 +381,7 @@ pub async fn auth_status(registry: &ProviderRegistry, storage: &StateDir) -> Vec
                 display_name: Arc::clone(&entry.display_name),
                 section: entry.auth.section.clone(),
                 status,
+                offers_models: entry.offers_models(),
             }
         }
     }))
@@ -643,6 +647,7 @@ mod tests {
                 }],
                 section: None,
             },
+            docs: None,
         }
     }
 
@@ -664,9 +669,7 @@ mod tests {
 
     fn save_section(base_url: &str) {
         let mut providers = ProvidersConfig::default();
-        let def = ProviderDef::default()
-            .with_answers(&[(BASE_URL_KEY.into(), base_url.into())])
-            .unwrap();
+        let def = ProviderDef::default().with_answers(&[(BASE_URL_KEY.into(), base_url.into())]);
         providers.upsert(PROVIDER.into(), def);
         providers.save().unwrap();
     }
@@ -675,7 +678,7 @@ mod tests {
         ProvidersConfig::try_load()
             .unwrap()
             .get(PROVIDER)
-            .and_then(|def| def.base_url.clone())
+            .and_then(|def| def.0.get(BASE_URL_KEY)?.as_str().map(str::to_owned))
     }
 
     fn logged_in(model: &str) -> LoginOutcome {

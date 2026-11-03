@@ -1714,7 +1714,7 @@ mod tests {
     use maki_domain::{Post, PostLevel};
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        AgentError, Invocation, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
+        AgentError, Invocation, Model, ProviderEvent, RequestOptions, StreamResponse,
     };
     use maki_providers::{Effort, Message};
     use maki_storage::id::SessionRef;
@@ -1760,10 +1760,6 @@ mod tests {
             _invocation: &'a Invocation,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(std::future::pending())
-        }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-            Box::pin(async { Ok(Vec::new()) })
         }
     }
 

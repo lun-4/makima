@@ -18,16 +18,6 @@ const LOG_ENV: &str = "MAKI_LOG";
 const LOG_ENV_SHARED: &str = "RUST_LOG";
 const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::INFO;
 
-const PROVIDER_PRIORITY: &[&str] = &[
-    "anthropic",
-    "openai",
-    "copilot",
-    "zai",
-    "synthetic",
-    "deepseek",
-    "regolo",
-];
-
 pub fn resolve_model(
     providers: &ProviderRegistry,
     explicit: Option<&str>,
@@ -71,36 +61,34 @@ pub fn resolve_model(
             ""
         };
         color_eyre::eyre::eyre!(
-            "no provider available - set an API key (e.g. ANTHROPIC_API_KEY), run `makima auth login`, or use -m to specify a model{policy_note}\n\nSee https://makima.ln4.net/docs/providers/ for setup instructions"
+            "no provider available - set a provider's API key, run `makima auth login`, or use -m to specify a model{policy_note}\n\nSee https://makima.ln4.net/docs/providers/ for setup instructions"
         )
     })
 }
 
-/// A registered provider counts once it reports credentials; a native one
-/// once it can be built.
+/// The first provider, in auth status order, that reports credentials and
+/// has a model for the tier.
 fn auto_detect_model(
     providers: &ProviderRegistry,
     policy: &maki_config::ModelPolicy,
     storage: &StateDir,
 ) -> Option<Model> {
-    let statuses = smol::block_on(auth_status(providers, storage));
-    let usable = |slug: &str| match statuses.iter().find(|provider| *provider.id == *slug) {
-        Some(provider) => !matches!(
-            provider.status.state,
-            AuthState::Missing | AuthState::Failed
-        ),
-        None => providers.available(slug),
-    };
-    for tier in [ModelTier::Strong, ModelTier::Medium] {
-        for &slug in PROVIDER_PRIORITY {
-            if usable(slug)
-                && let Ok(model) = providers.model_for_tier(slug, tier, policy)
-            {
-                return Some(model);
-            }
-        }
-    }
-    None
+    let usable: Vec<_> = smol::block_on(auth_status(providers, storage))
+        .into_iter()
+        .filter(|provider| {
+            !matches!(
+                provider.status.state,
+                AuthState::Missing | AuthState::Failed
+            )
+        })
+        .collect();
+    [ModelTier::Strong, ModelTier::Medium]
+        .into_iter()
+        .find_map(|tier| {
+            usable
+                .iter()
+                .find_map(|provider| providers.model_for_tier(&provider.id, tier, policy).ok())
+        })
 }
 
 pub fn install_panic_log_hook() {

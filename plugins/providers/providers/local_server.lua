@@ -11,6 +11,7 @@
 --   `defaults`: descriptor fields every model starts from.
 --   `local_thinking`: Chat requests carry the local thinking fields.
 --   `list_models(ctx, client)`: the discovered descriptors, sorted by id.
+--   `notes`: Markdown for the providers reference page.
 
 local chat = require("providers.chat_completions")
 local compat = require("providers.openai_compat")
@@ -112,6 +113,7 @@ function M.provider(def)
     config = { { key = BASE_URL_KEY, prompt = HOST_PROMPT:format(def.display_name), default = def.default_host } },
     auth = compat.api_key_auth({ display_name = def.display_name, key_optional = true }),
     auth_status = auth_status(def),
+    docs = { env = { def.host_env, def.env }, endpoint = def.default_host .. API_SUFFIX, notes = def.notes },
   }
 
   function spec.discover(ctx, config)

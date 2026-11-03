@@ -1593,14 +1593,6 @@ mod tests {
                     })
                 })
             }
-            fn list_models(
-                &self,
-            ) -> maki_providers::provider::BoxFuture<
-                '_,
-                Result<Vec<maki_providers::ModelInfo>, AgentError>,
-            > {
-                Box::pin(async { Ok(Vec::new()) })
-            }
         }
     }
 
@@ -1730,15 +1722,6 @@ mod tests {
                     stop_reason: Some(maki_providers::StopReason::EndTurn),
                 })
             })
-        }
-
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, AgentError>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
         }
     }
 
@@ -2157,14 +2140,6 @@ mod tests {
                 })
             })
         }
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, AgentError>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
-        }
     }
 
     #[test_case(false; "idle_continuation")]
@@ -2436,15 +2411,6 @@ mod tests {
                 })
             })
         }
-
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, AgentError>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
-        }
     }
 
     struct CompletionProvider {
@@ -2471,15 +2437,6 @@ mod tests {
             self.inner.stream_message(
                 model, messages, system, tools, events, options, session, invocation,
             )
-        }
-
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, AgentError>,
-        > {
-            self.inner.list_models()
         }
     }
 
@@ -2523,14 +2480,6 @@ mod tests {
                     stop_reason: Some(maki_providers::StopReason::EndTurn),
                 })
             })
-        }
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, AgentError>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
         }
     }
 
@@ -2951,15 +2900,6 @@ mod tests {
             Result<maki_providers::StreamResponse, AgentError>,
         > {
             Box::pin(std::future::pending())
-        }
-
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, AgentError>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
         }
     }
 }

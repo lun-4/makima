@@ -92,6 +92,7 @@ M.def = {
   host_env = "OLLAMA_HOST",
   default_host = "http://localhost:11434",
   cloud_url = "https://ollama.com/v1",
+  notes = "Talks to the server at the `base_url` saved by `makima auth login ollama`, else at `OLLAMA_HOST`, or to Ollama Cloud when only `OLLAMA_API_KEY` is set. Models come from the server, with the context window and vision support it reports for each.",
   defaults = {
     context_window = 128000,
     max_output_tokens = 16384,

@@ -200,9 +200,8 @@ pub fn model_cost(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::ManifestRegistry;
-    use crate::model::{FastPricing, ModelFamily, ModelPricing, ModelTier};
-    use std::sync::Arc;
+    use crate::model::{FastPricing, FastSupport, ModelInfo, ModelPricing};
+    use crate::test_util::offline_registry;
     use test_case::test_case;
 
     const SECONDS_PER_MINUTE: i64 = 60;
@@ -229,8 +228,9 @@ mod tests {
     const FAST_INPUT_RATE: f64 = 12.0;
     /// [`ONE_MILLION`] input tokens at [`FAST_INPUT_RATE`].
     const FAST_LIST_PRICE: f64 = 12.0;
-    /// A real spec, so the bare-id fallback runs against the real tables.
-    const NATIVE_SPEC: &str = "anthropic/claude-sonnet-4-5";
+    const PROVIDER: &str = "priced";
+    const SIBLING: &str = "sibling";
+    const SIBLING_INPUT_RATE: f64 = 7.0;
 
     fn schedule(windows: &[(u8, u8)], weekdays_only: bool) -> Result<PricingSchedule, String> {
         PricingSchedule::try_from(ScheduleFields {
@@ -252,24 +252,11 @@ mod tests {
 
     fn model(id: &str, input_rate: f64) -> Model {
         Model {
-            id: id.into(),
-            provider: Arc::from("anthropic"),
-            tier: ModelTier::Medium,
-            family: ModelFamily::Claude,
-            supports_tool_examples_override: None,
-            thinking_override: None,
-            supports_vision_override: None,
-            supports_fast_override: None,
             pricing: ModelPricing {
                 input: input_rate,
                 ..ModelPricing::ZERO
             },
-            pricing_schedule: None,
-            max_output_tokens: None,
-            turn_output_tokens: None,
-            context_window: 0,
-            thinking_fields: None,
-            free: false,
+            ..Model::from_spec(&format!("{PROVIDER}/{id}")).unwrap()
         }
     }
 
@@ -453,24 +440,25 @@ mod tests {
     /// `current`'s rates leaking through.
     #[test]
     fn bare_ids_resolve_against_the_current_provider() {
-        let current = Model::from_spec(NATIVE_SPEC).unwrap();
-        let sibling_id = ManifestRegistry::for_slug(&current.provider)
-            .expect("a builtin provider")
-            .models
-            .iter()
-            .find_map(|e| (e.pricing.input != current.pricing.input).then_some(e.prefixes[0]))
-            .expect("a sibling model the table prices differently");
-        let sibling = Model::from_spec(&format!("{}/{sibling_id}", current.provider)).unwrap();
+        let current = model(CURRENT, INPUT_RATE);
+        let pricing = |input| ModelPricing {
+            input,
+            ..ModelPricing::ZERO
+        };
+        let registry = offline_registry(vec![(
+            PROVIDER,
+            vec![ModelInfo {
+                pricing: Some(pricing(SIBLING_INPUT_RATE)),
+                ..ModelInfo::id_only(SIBLING.into())
+            }],
+        )]);
         let usage = stored(None);
 
-        let cost = model_cost(
-            sibling_id,
-            &usage,
-            &current,
-            false,
-            &ProviderRegistry::default(),
+        let cost = model_cost(SIBLING, &usage, &current, false, &registry);
+        assert_eq!(
+            cost,
+            model(SIBLING, SIBLING_INPUT_RATE).list_cost(&usage.into(), false)
         );
-        assert_eq!(cost, sibling.list_cost(&usage.into(), false));
         assert_ne!(cost, current.list_cost(&usage.into(), false));
     }
 
@@ -500,6 +488,7 @@ mod tests {
         entries: &[(&str, Option<f64>)],
     ) -> Option<f64> {
         let mut current = model(CURRENT, INPUT_RATE);
+        current.supports_fast_override = Some(FastSupport::Supported);
         current.pricing.fast = Some(FastPricing {
             input: FAST_INPUT_RATE,
             output: 0.0,

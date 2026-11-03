@@ -30,9 +30,10 @@ use maki_agent::{
 use maki_lua::PluginHost;
 use maki_lua::orchestration::{AgentOrchestration, CommandRunner, TrustedTarget};
 use maki_providers::provider::{BoxFuture, Provider};
+use maki_providers::test_util::offline_registry;
 use maki_providers::{
-    AgentError, ContentBlock, Invocation, Message, Model, ModelInfo, ProviderEvent, RequestOptions,
-    Role, StopReason, StreamResponse, ThinkingConfig, TokenUsage,
+    AgentError, ContentBlock, Invocation, Message, Model, ModelInfo, ModelTier, ProviderEvent,
+    ProviderRegistry, RequestOptions, Role, StopReason, StreamResponse, ThinkingConfig, TokenUsage,
 };
 use maki_storage::id::SessionRef;
 use serde_json::Value;
@@ -103,14 +104,39 @@ impl Provider for CannedProvider {
             Ok(replies.remove(0))
         })
     }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { unimplemented!() })
-    }
 }
 
+const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+
 pub fn default_model() -> Model {
-    Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap()
+    Model::from_spec(DEFAULT_MODEL).unwrap()
+}
+
+/// The providers of the specs these tests name, each model with every
+/// capability: a weak, a medium and a strong model of the default model's
+/// provider, plus the other providers' models without curated rows.
+pub fn test_providers() -> Arc<ProviderRegistry> {
+    let model = |id: &str, tier| ModelInfo {
+        tier: Some(tier),
+        supports_thinking: Some(true),
+        supports_vision: Some(true),
+        supports_fast: Some(true),
+        supports_tool_examples: Some(true),
+        ..ModelInfo::id_only(id.into())
+    };
+    let (provider, default_id) = Model::parse_spec(DEFAULT_MODEL).unwrap();
+    Arc::new(offline_registry(vec![
+        (
+            provider,
+            vec![
+                model("claude-haiku-4-5", ModelTier::Weak),
+                model(default_id, ModelTier::Medium),
+                model("claude-opus-4-8", ModelTier::Strong),
+            ],
+        ),
+        ("openai", Vec::new()),
+        ("ollama", Vec::new()),
+    ]))
 }
 
 pub fn canned_reply(text: &str) -> StreamResponse {
@@ -174,6 +200,7 @@ where
     ctx.event_tx = event_tx;
     ctx.provider = provider;
     ctx.model = Arc::new(default_model());
+    ctx.providers = test_providers();
     (ctx, rx, run_trigger)
 }
 
@@ -191,6 +218,7 @@ pub fn production_like_ctx() -> (ToolContext, CancelTrigger) {
     let (run_trigger, run_cancel) = CancelToken::new();
     ctx.cancel = run_cancel;
     ctx.subagent_cancels = Arc::new(CancelMap::new());
+    ctx.providers = test_providers();
     (ctx, run_trigger)
 }
 

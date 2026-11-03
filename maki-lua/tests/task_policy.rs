@@ -15,8 +15,8 @@ use maki_agent::{AgentLimits, AgentMode, ModeDef, ModeId, ToolOutput};
 use maki_lua::{PluginHost, agent_errors::OUTPUT_SCHEMA_NOT_OBJECT};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    AgentError, ContentBlock, Invocation, Message, Model, ModelInfo, ProviderEvent, RequestOptions,
-    Role, StopReason, StreamResponse, TokenUsage,
+    AgentError, ContentBlock, Invocation, Message, Model, ProviderEvent, RequestOptions, Role,
+    StopReason, StreamResponse, TokenUsage,
 };
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
@@ -1049,10 +1049,6 @@ impl Provider for GatedProvider {
             Ok(common::canned_reply("done"))
         })
     }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { unimplemented!() })
-    }
 }
 
 struct SteeringReportProvider {
@@ -1105,10 +1101,6 @@ impl Provider for SteeringReportProvider {
                 _ => Ok(common::canned_reply(PLAIN_TEXT)),
             }
         })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { unimplemented!() })
     }
 }
 
@@ -1772,10 +1764,6 @@ impl Provider for NestedTaskProvider {
         _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move { Ok(Self::reply(messages)) })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { unimplemented!() })
     }
 }
 

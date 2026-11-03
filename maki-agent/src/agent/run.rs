@@ -1258,10 +1258,6 @@ mod tests {
                 Ok(responses.remove(0))
             })
         }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
-            Box::pin(async { unimplemented!() })
-        }
     }
 
     struct MutatingModeProvider {
@@ -1299,10 +1295,6 @@ mod tests {
                 }
             })
         }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
-            Box::pin(async { unimplemented!() })
-        }
     }
 
     struct ScriptedProvider {
@@ -1328,10 +1320,6 @@ mod tests {
                     .pop_front()
                     .expect("ScriptedProvider: no more results")
             })
-        }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
-            Box::pin(async { unimplemented!() })
         }
     }
 
@@ -1369,10 +1357,6 @@ mod tests {
                     None => futures_lite::future::pending().await,
                 }
             })
-        }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
-            Box::pin(async { unimplemented!() })
         }
     }
 

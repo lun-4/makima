@@ -28,7 +28,7 @@ The active registry combines built-ins, custom Markdown commands, MCP prompts, a
 | `/cd` | Change working directory. Quote paths containing spaces. | typed | [path] | all |
 | `/btw` | Ask a quick question (no tools, no history pollution) | raw (required) | <question> | all |
 | `/yolo` | Toggle YOLO mode (skip all permission prompts) | none |  | all |
-| `/fast` | Toggle fast mode (Anthropic Opus or Codex subscription models) | none |  | all |
+| `/fast` | Toggle fast mode on models that offer it | none |  | all |
 | `/workflow` | Toggle workflow mode (task tools callable inside code_execution) | none |  | all |
 | `/exit` | Exit the application | none |  | TUI only |
 | `/reload` | Reload plugins and config | none |  | TUI only |

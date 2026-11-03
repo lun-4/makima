@@ -86,6 +86,7 @@ M.def = {
   display_name = "OpenRouter",
   env = "OPENROUTER_API_KEY",
   base_url = "https://openrouter.ai/api/v1",
+  notes = "OpenRouter serves models from many providers behind one key. Browse them at [openrouter.ai/models](https://openrouter.ai/models) and use any id directly, like `openrouter/anthropic/claude-sonnet-4`.",
   login_url = "https://openrouter.ai/keys",
   model = "openai/gpt-5.5",
   include_stream_usage = true,

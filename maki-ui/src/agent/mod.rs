@@ -19,8 +19,8 @@ use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    AgentError, ConversationEnd, Invocation, Message, Model, ModelInfo, ProviderEvent,
-    ProviderRegistry, ProviderUsage, RequestOptions, StreamResponse,
+    AgentError, ConversationEnd, Invocation, Message, Model, ProviderEvent, ProviderRegistry,
+    ProviderUsage, RequestOptions, StreamResponse,
 };
 use maki_storage::id::SessionRef;
 use tracing::{info, warn};
@@ -96,10 +96,6 @@ impl Provider for TrackedProvider {
         self.inner.stream_message(
             model, messages, system, tools, event_tx, opts, session_id, invocation,
         )
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        self.inner.list_models()
     }
 
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
@@ -640,9 +636,7 @@ mod tests {
 
     use maki_config::PermissionsConfig;
     use maki_providers::provider::BoxFuture;
-    use maki_providers::{
-        AgentError, Invocation, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
-    };
+    use maki_providers::{AgentError, Invocation, ProviderEvent, RequestOptions, StreamResponse};
 
     use super::*;
 
@@ -666,10 +660,6 @@ mod tests {
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(std::future::pending())
         }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-            Box::pin(async { Ok(Vec::new()) })
-        }
     }
 
     struct AuthProvider {
@@ -689,10 +679,6 @@ mod tests {
             _invocation: &'a Invocation,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(std::future::pending())
-        }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-            Box::pin(async { Ok(Vec::new()) })
         }
 
         fn refresh_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {

@@ -90,6 +90,7 @@ fn registered(
         display_name: Arc::clone(&spec.display_name),
         models: spec.models.clone(),
         auth: spec.auth.clone(),
+        docs: spec.docs.clone(),
         backend: Arc::new(LuaBackend {
             requests: requests.clone(),
             callbacks: Arc::new(callbacks),
@@ -299,6 +300,10 @@ impl ProviderBackend for LuaBackend {
         })
     }
 
+    fn discovers(&self) -> bool {
+        self.callbacks.discover.is_some()
+    }
+
     fn discover(
         &self,
         refresh: bool,
@@ -436,7 +441,6 @@ async fn prepare_instance(
 #[derive(Serialize)]
 struct RequestModel {
     id: String,
-    output_tokens: Option<u32>,
     max_output_tokens: Option<u32>,
     context_window: u32,
 }
@@ -545,7 +549,6 @@ impl Provider for LuaProvider {
         let request = StreamRequest {
             model: RequestModel {
                 id: model.id.clone(),
-                output_tokens: model.output_tokens(),
                 max_output_tokens: model.max_output_tokens,
                 context_window: model.context_window,
             },

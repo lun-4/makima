@@ -196,6 +196,7 @@ export type Provider = {
   aliases: { { id: string, label: string, method: string } }?,
   config: { ConfigField }?,
   section: string?,
+  docs: { env: { string }?, endpoint: string?, notes: string? }?,
   auth_status: ((
     ctx: Context,
     config: { [string]: Json }

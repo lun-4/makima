@@ -177,14 +177,15 @@ pub fn auth_logout(provider: &str, storage: &StateDir, registry: &ProviderRegist
 pub fn auth_status(storage: &StateDir, registry: &ProviderRegistry) -> Result<()> {
     println!();
     let mut section = None;
-    for provider in smol::block_on(login::auth_status(registry, storage)) {
+    let statuses = smol::block_on(login::auth_status(registry, storage));
+    for provider in statuses.iter().filter(|provider| provider.offers_models) {
         if let Some(heading) = provider.section.as_deref()
             && section != Some(heading.to_owned())
         {
             println!("  \x1b[1m{heading}:\x1b[0m");
             section = provider.section.clone();
         }
-        println!("{}", status_line(&provider));
+        println!("{}", status_line(provider));
     }
     Ok(())
 }

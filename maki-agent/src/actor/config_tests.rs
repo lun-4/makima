@@ -1626,6 +1626,7 @@ fn discovery_registry() -> ProviderRegistry {
         }],
         backend: Arc::new(EchoBackend),
         auth: AuthSpec::default(),
+        docs: None,
     }])
 }
 

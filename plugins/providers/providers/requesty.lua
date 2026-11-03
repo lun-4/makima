@@ -126,6 +126,7 @@ M.def = {
   display_name = "Requesty",
   env = "REQUESTY_API_KEY",
   base_url = "https://router.requesty.ai/v1",
+  notes = "Requesty routes across many models with one key, including managed routing policies (`requesty/claude-sonnet-4-5`) and the full `<vendor>/<model>` catalog (`requesty/openai/gpt-4o-mini`). Get a key at [app.requesty.ai/api-keys](https://app.requesty.ai/api-keys). Set `REQUESTY_BASE_URL=https://router.eu.requesty.ai/v1` to keep all traffic in the EU.",
   login_url = "https://app.requesty.ai/api-keys",
   model = "openai/gpt-5.5",
   include_stream_usage = true,

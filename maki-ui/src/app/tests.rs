@@ -5,7 +5,7 @@ use crate::components::btw_modal::BtwEvent;
 use crate::components::command::ParsedCommand;
 use crate::components::file_picker::EMPTY_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
-use crate::components::{ExitRequest, buffer_text, key, test_model};
+use crate::components::{ExitRequest, TEST_MODEL_PROVIDER, buffer_text, key, test_model};
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
 use arc_swap::ArcSwap;
@@ -26,6 +26,7 @@ use maki_commands::ModelSelection;
 use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{BuiltinAction, CommandArgumentItem, HintReader, KeymapReader};
+use maki_providers::test_util::offline_ids;
 use maki_providers::{ContentBlock, Effort, Message, Role, ThinkingConfig, TokenUsage};
 use maki_storage::sessions::{StoredMode, StoredPost, StoredSubagent};
 use ratatui::layout::Rect;
@@ -676,7 +677,10 @@ fn app_with_model_slot() -> (App, Arc<ArcSwapOption<Vec<String>>>) {
 
 fn install_model_slot(app: &mut App) -> Arc<ArcSwapOption<Vec<String>>> {
     let models = Arc::new(ArcSwapOption::empty());
-    app.model_picker = ModelPicker::new(Arc::clone(&models), Arc::default());
+    app.model_picker = ModelPicker::new(
+        Arc::clone(&models),
+        Arc::new(offline_ids(&[TEST_MODEL_PROVIDER, "ollama", "openai"])),
+    );
     app.available_models = Arc::clone(&models);
     models
 }
@@ -3583,7 +3587,10 @@ fn malformed_model_arg_flashes_invalid_model() {
     assert_eq!(app.root_config().model.spec(), before);
     assert_eq!(
         app.status_bar.flash_text().unwrap(),
-        "command failed: model must be in 'provider/model' format (e.g. anthropic/claude-sonnet-4-20250514)"
+        format!(
+            "command failed: {}",
+            maki_providers::ModelError::InvalidFormat
+        )
     );
 }
 
@@ -7470,9 +7477,7 @@ fn model_switch_updates_active_run_status() {
     app.status = Status::Streaming;
     app.run_context_window = Some(INITIAL_CONTEXT_WINDOW);
 
-    let expected_context_window = maki_providers::Model::from_spec(SWITCHED_MODEL_SPEC)
-        .unwrap()
-        .context_window;
+    let expected_context_window = crate::components::TEST_CONTEXT_WINDOW;
     app.update(agent_msg_with_run_id(
         AgentEvent::ModelSwitched {
             spec: SWITCHED_MODEL_SPEC.into(),

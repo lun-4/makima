@@ -43,7 +43,12 @@ local cache = catalog.new(catalog.cache_dir())
 cache:load()
 register(opencode.provider(cache, opencode.ZEN))
 register(opencode.provider(cache, opencode.GO))
-register(custom.creator())
+
+-- The providers a script can name as its base.
+local bases = table.clone(routes.ROUTES)
+bases.aperture = aperture.delegated()
+bases.opencode = opencode.delegated(cache)
+register(custom.creator(executable.notes(bases)))
 
 -- Sections with a protocol, then scripts, each win over a models.dev
 -- provider of the same id but never over a built-in one. A built-in
@@ -64,9 +69,6 @@ end
 
 local config_dir, state_dir = maki.env.config_dir(), maki.env.state_dir()
 if config_dir then
-  local bases = table.clone(routes.ROUTES)
-  bases.aperture = aperture.delegated()
-  bases.opencode = opencode.delegated(cache)
   local cache_path = state_dir and maki.fs.joinpath(state_dir, executable.CACHE_FILE)
   for _, script in ipairs(executable.scan(maki.fs.joinpath(config_dir, executable.DIR), cache_path, bases)) do
     if registered[script.slug] then

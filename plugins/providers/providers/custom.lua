@@ -5,7 +5,8 @@
 -- token. Declared `models` win over discovered metadata field by field;
 -- `discover_models = true` also lists the server's models.
 -- `M.provider(id, section)` returns a `register_provider` spec, and
--- `M.creator()` the spec whose login adds a section.
+-- `M.creator(notes)` the spec whose login adds a section, with {notes}
+-- after its own on the providers reference page.
 
 local chat = require("providers.chat_completions")
 local compat = require("providers.openai_compat")
@@ -34,6 +35,41 @@ local MODEL_FIELDS = {
   "supports_vision",
 }
 local PRICING_FIELDS = { "input", "output", "cache_write", "cache_read" }
+local NOTES = [==[
+Run `makima auth login custom` to add a provider of your own, or write its section in `providers.toml` (`~/.config/makima/providers.toml` on Linux and macOS, `%APPDATA%\makima\providers.toml` on Windows). A section with a `protocol` is a provider named after the section, used as the `provider/` part of its model specs:
+
+```toml
+[my-proxy]
+display_name = "My Proxy"
+protocol = "openai"            # openai | openai-responses | anthropic | google
+base_url = "https://llm.example.com/v1"
+api_key_env = "MY_PROXY_API_KEY"
+discover_models = true         # also list the server's models
+
+[[my-proxy.models]]
+id = "fast-v1"
+tier = "weak"
+context_window = 128000
+max_output_tokens = 16384
+pricing_input = 0.5
+pricing_output = 1.5
+```
+
+| Field | Notes |
+|-------|-------|
+| `display_name` | Shown in pickers and auth status |
+| `protocol` | `openai`, `openai-responses`, `anthropic` or `google` |
+| `base_url` | Origin of the API. `<ID>_BASE_URL` wins over it |
+| `api_key_env` | Env var that holds the key, by default `<ID>_API_KEY` |
+| `api_key` | Inline key (prefer the env var or `makima auth login <id>`) |
+| `headers` | Extra headers sent with every request; values expand `${VAR}` |
+| `discover_models` | Also list the server's models (default false) |
+| `models` | Declared models, which win over discovered metadata field by field |
+
+Model fields: `id` (required), `tier` (`weak`, `medium`, `strong` or `compaction`, default `medium`), `context_window`, `max_output_tokens`, `supports_tool_examples`, `supports_thinking`, `requires_thinking` (for APIs that refuse thinking off; raises it to minimal effort, compaction included), `supports_vision` (false turns off image input and `view_image`), and `pricing_input`, `pricing_output`, `pricing_cache_write`, `pricing_cache_read`, `pricing_fast_input`, `pricing_fast_output` in USD per 1M tokens.
+
+A section never takes over a built-in provider's id. A section that fails to register is logged and left out, and a file that does not parse stops Makima at startup with exit code 2.]==]
+
 local CHOICES = {
   { id = "openai", label = "OpenAI-compatible chat completions" },
   { id = "anthropic", label = "Anthropic messages API" },
@@ -269,11 +305,12 @@ local function create(ui)
   return id
 end
 
-function M.creator()
+function M.creator(notes)
   local created = false
   return {
     id = M.CREATOR_ID,
     display_name = "Custom provider...",
+    docs = { notes = NOTES .. "\n\n" .. notes },
     auth = {
       {
         id = "create",

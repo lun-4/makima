@@ -228,15 +228,12 @@ fn same_model(left: &Model, right: &Model) -> bool {
     left.id == right.id
         && left.provider == right.provider
         && left.tier == right.tier
-        && left.family == right.family
         && left.supports_tool_examples_override == right.supports_tool_examples_override
         && left.thinking_override == right.thinking_override
         && left.supports_vision_override == right.supports_vision_override
         && left.supports_fast_override == right.supports_fast_override
         && left.max_output_tokens == right.max_output_tokens
-        && left.turn_output_tokens == right.turn_output_tokens
         && left.context_window == right.context_window
-        && left.thinking_fields == right.thinking_fields
         && left.pricing.input == right.pricing.input
         && left.pricing.output == right.pricing.output
         && left.pricing.cache_write == right.pricing.cache_write

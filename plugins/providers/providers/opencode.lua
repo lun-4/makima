@@ -14,8 +14,23 @@ local M = {}
 M.SESSION_HEADER = "x-opencode-session"
 M.PUBLIC_KEY = "public"
 M.EMPTY_USAGE_ERROR = "Opencode Go usage response contained no usage lanes; the endpoint schema likely changed"
-M.ZEN = { id = "opencode", display_name = "Opencode Zen", delegates = true }
-M.GO = { id = "opencode-go", display_name = "Opencode Go", usage = true }
+local FREE_MODELS_NOTE = [[
+Models come from the provider's models.dev catalog entry. Free models stay hidden until you turn them on in `~/.config/makima/providers.toml`; they then work without a key through the public key:
+
+```toml
+[opencode]
+enable_free_models = true
+```
+
+Zen and Go both read it from `[opencode]`.]]
+
+M.ZEN = {
+  id = "opencode",
+  display_name = "Opencode Zen",
+  delegates = true,
+  notes = FREE_MODELS_NOTE .. "\n\nZen also takes `<catalog provider>/<model>` ids and sends them to that provider.",
+}
+M.GO = { id = "opencode-go", display_name = "Opencode Go", usage = true, notes = FREE_MODELS_NOTE }
 
 -- Stands in for the catalog entry until the catalog is downloaded.
 local FALLBACK_ENTRY = { env = { "OPENCODE_API_KEY" } }
@@ -142,6 +157,7 @@ function M.provider(cache, member)
   local spec = {
     id = id,
     display_name = member.display_name,
+    docs = { env = FALLBACK_ENTRY.env, notes = member.notes },
     auth = compat.api_key_auth({ display_name = member.display_name }),
     auth_status = function(ctx, config)
       return catalog.auth_status(ctx, config, entry() or FALLBACK_ENTRY)

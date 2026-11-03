@@ -1,9 +1,6 @@
-//! Model registry with prefix-based lookup and token accounting.
-//! Lookup is prefix-based: `claude-sonnet-4-20250514` matches the `claude-sonnet-4` entry,
-//! so dated snapshots resolve without registry churn. `context_tokens()` sums input + output
+//! Resolved models and token accounting. `context_tokens()` sums input + output
 //! + cache reads/writes because the context window limit applies to all of them combined.
 
-use std::any::Any;
 use std::cmp::Ordering;
 use std::fmt;
 use std::ops::AddAssign;
@@ -11,23 +8,19 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use jiff::Timestamp;
-use maki_config::ModelPolicy;
-use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredTokenUsage};
+use maki_storage::sessions::StoredTokenUsage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model_registry;
 use crate::pricing::PricingSchedule;
-use crate::providers::anthropic;
-use crate::types::ThinkingFields;
 
 const PER_MILLION: f64 = 1_000_000.0;
 pub const UNKNOWN_CONTEXT_WINDOW: u32 = 128_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
-    #[error("model must be in 'provider/model' format (e.g. anthropic/claude-sonnet-4-20250514)")]
+    #[error("model must be in 'provider/model' format")]
     InvalidFormat,
     #[error("unsupported provider '{0}'")]
     UnsupportedProvider(String),
@@ -49,7 +42,7 @@ pub struct ModelPricing {
     pub output: f64,
     pub cache_write: f64,
     pub cache_read: f64,
-    /// Anthropic fast mode charges a premium that differs per model. `None`
+    /// Fast mode charges a premium that differs per model. `None`
     /// means the model has no fast tier, so asking for fast mode quietly falls
     /// back to standard rates instead of overcharging.
     #[serde(default)]
@@ -88,9 +81,6 @@ pub struct ModelInfo {
     pub free: Option<bool>,
     #[serde(default)]
     pub provider_data: Option<Value>,
-    /// Store of additional metadata from the provider.
-    #[serde(skip)]
-    pub provider_info: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl ModelInfo {
@@ -102,9 +92,9 @@ impl ModelInfo {
     }
 }
 
-/// Cache rates are missing on purpose: Anthropic derives them from `input` with
-/// the same multipliers it uses for standard pricing, so storing them would just
-/// invite the two copies to drift apart.
+/// Cache rates are missing on purpose: they derive from `input` with the same
+/// multipliers as standard pricing, so storing them would just invite the two
+/// copies to drift apart.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FastPricing {
     pub input: f64,
@@ -124,19 +114,9 @@ impl ModelPricing {
         self.input == 0.0 && self.output == 0.0 && self.cache_write == 0.0 && self.cache_read == 0.0
     }
 
-    /// Cache multipliers Anthropic applies on top of the base input rate.
+    /// Cache multipliers applied on top of the fast input rate.
     const CACHE_WRITE_MULTIPLIER: f64 = 1.25;
     const CACHE_READ_MULTIPLIER: f64 = 0.10;
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelFamily {
-    Claude,
-    Generic,
-    Gemini,
-    Glm,
-    Gpt,
-    Synthetic,
 }
 
 /// Ordering is a cost guarantee (a subagent may never run on a pricier tier
@@ -216,61 +196,6 @@ impl FromStr for ModelTier {
     }
 }
 
-impl From<maki_config::providers::Tier> for ModelTier {
-    fn from(t: maki_config::providers::Tier) -> Self {
-        use maki_config::providers::Tier;
-        match t {
-            Tier::Weak => Self::Weak,
-            Tier::Medium => Self::Medium,
-            Tier::Strong => Self::Strong,
-            Tier::Compaction => Self::Compaction,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct ModelEntry {
-    pub prefixes: &'static [&'static str],
-    pub tier: ModelTier,
-    pub family: ModelFamily,
-    /// Gates vision-only tools (`view_image`) and image blocks at request time.
-    pub vision: bool,
-    pub default: bool,
-    pub pricing: ModelPricing,
-    pub max_output_tokens: Option<u32>,
-    pub context_window: u32,
-}
-
-pub(crate) fn lookup_entry<'a>(
-    entries: &'a [ModelEntry],
-    model_id: &str,
-) -> Result<&'a ModelEntry, ModelError> {
-    entries
-        .iter()
-        .flat_map(|e| e.prefixes.iter().map(move |p| (p, e)))
-        .filter(|(p, _)| model_id.starts_with(*p))
-        .max_by_key(|(p, _)| p.len())
-        .map(|(_, e)| e)
-        .ok_or_else(|| ModelError::UnknownModel(model_id.to_string()))
-}
-
-impl ModelFamily {
-    pub fn supports_tool_examples(self) -> bool {
-        match self {
-            ModelFamily::Claude | ModelFamily::Gpt | ModelFamily::Synthetic => true,
-            ModelFamily::Generic | ModelFamily::Gemini | ModelFamily::Glm => false,
-        }
-    }
-
-    /// Fallback for models missing from the static tables; per-model truth
-    /// lives in `ModelEntry::vision`.
-    pub fn supports_vision(self) -> bool {
-        matches!(self, Self::Claude | Self::Gpt | Self::Gemini)
-    }
-}
-
-const FAST_PROVIDER: &str = "anthropic";
-
 /// `Required` marks APIs that reject requests with thinking disabled;
 /// [`crate::RequestOptions::clamped`] raises `Off` to minimal effort for them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,87 +230,29 @@ pub struct Model {
     pub id: String,
     pub provider: Arc<str>,
     pub tier: ModelTier,
-    pub family: ModelFamily,
     pub supports_tool_examples_override: Option<bool>,
-    /// Resolved thinking support, used by gateway providers (e.g. Aperture)
-    /// that stream through a native provider chosen at runtime. `None` falls
-    /// back to discovery, then the provider manifest.
+    /// `None` when the descriptor does not say, which reads as no thinking.
     pub thinking_override: Option<ThinkingSupport>,
     pub supports_vision_override: Option<bool>,
     pub supports_fast_override: Option<FastSupport>,
     pub pricing: ModelPricing,
     pub pricing_schedule: Option<PricingSchedule>,
-    /// What the model declares it can generate, `None` when unknown (see
-    /// [`ProviderKind::fallback_max_output`]). Stays the same across requests,
-    /// because [`Self::max_thinking_budget`] scales effort levels off it.
+    /// What the model declares it can generate, `None` when unknown.
     pub max_output_tokens: Option<u32>,
-    /// What this one request may generate, when a caller trimmed the cap to a
-    /// turn budget. `None` leaves the declared cap standing.
-    pub turn_output_tokens: Option<u32>,
     pub context_window: u32,
-    pub thinking_fields: Option<Box<ThinkingFields>>,
     /// Offered at no charge, as the provider's descriptor says.
     pub free: bool,
 }
 
 impl Model {
-    /// Rates and limits come from the most specific source that names this
-    /// model: live discovery, then the curated row, then provider defaults.
-    /// Family and tier are about which dialect a model speaks and what role it
-    /// plays, which a relative answers just as well, so they read the curated
-    /// row whether or not it was an exact match.
-    fn from_base(manifest: &ProviderManifest, slug: &str, model_id: &str) -> Self {
-        let entry = lookup_entry(manifest.models, model_id).ok();
-        let spec = format!("{slug}/{model_id}");
-        // Discovery keys `known_models` by the builtin slug, so a dynamic or
-        // custom slug reads positional tiers and metadata through its base.
-        let discovered = model_registry::discovered(manifest.slug, model_id);
-        let discovered = discovered.as_ref();
-        let tier = model_registry::tier_for(&spec, manifest.slug, entry.map(|e| e.tier));
-        let family = entry.map_or(manifest.family, |entry| entry.family);
-        let discovered_pricing = discovered.and_then(|info| info.pricing.as_ref());
-        let pricing = discovered_pricing
-            .cloned()
-            .or_else(|| entry.map(|entry| entry.pricing.clone()))
-            .unwrap_or_default();
-        let max_output_tokens = discovered
-            .and_then(|info| info.max_output_tokens)
-            .or_else(|| entry.and_then(|entry| entry.max_output_tokens))
-            .or(manifest.fallback_max_output);
-        let context_window = discovered
-            .and_then(|info| info.context_window)
-            .or_else(|| anthropic::shared::long_context_window(model_id))
-            .or_else(|| entry.map(|entry| entry.context_window))
-            .unwrap_or(manifest.fallback_context_window);
-        Self {
-            id: model_id.to_string(),
-            provider: Arc::from(slug),
-            tier,
-            family,
-            supports_tool_examples_override: None,
-            thinking_override: None,
-            supports_vision_override: None,
-            supports_fast_override: None,
-            pricing,
-            pricing_schedule: None,
-            max_output_tokens,
-            turn_output_tokens: None,
-            context_window,
-            thinking_fields: None,
-            free: false,
-        }
-    }
-
-    /// A model described by a registered provider's descriptor. Every
-    /// capability the descriptor states becomes an override, so nothing falls
-    /// back to the native tables.
+    /// A model described by a registered provider's descriptor. A capability
+    /// the descriptor leaves out reads as unsupported.
     pub fn from_info(provider: &str, info: &ModelInfo) -> Self {
         let spec = format!("{provider}/{}", info.id);
         Self {
             id: info.id.clone(),
             provider: Arc::from(provider),
-            tier: model_registry::tier_for(&spec, provider, info.tier),
-            family: ModelFamily::Generic,
+            tier: model_registry::tier_for(&spec, info.tier),
             supports_tool_examples_override: info.supports_tool_examples,
             thinking_override: ThinkingSupport::from_flags(
                 info.supports_thinking,
@@ -402,111 +269,30 @@ impl Model {
             pricing: info.pricing.clone().unwrap_or_default(),
             pricing_schedule: info.pricing_schedule.clone(),
             max_output_tokens: info.max_output_tokens,
-            turn_output_tokens: None,
             context_window: info.context_window.unwrap_or(UNKNOWN_CONTEXT_WINDOW),
-            thinking_fields: None,
             free: info.free == Some(true),
         }
     }
 
     pub fn supports_thinking(&self) -> bool {
-        if let Some(thinking) = self.thinking_override {
-            return thinking != ThinkingSupport::No;
-        }
-        // Discovery keys `known_models` by the builtin slug; resolve dynamic
-        // and custom slugs through their base manifest before looking up.
-        let Some(manifest) = ManifestRegistry::for_slug(&self.provider) else {
-            return false;
-        };
-        model_registry::discovered(manifest.slug, &self.id)
-            .and_then(|d| d.supports_thinking)
-            .unwrap_or(manifest.supports_thinking)
+        self.thinking_override
+            .is_some_and(|thinking| thinking != ThinkingSupport::No)
     }
 
     pub fn requires_thinking(&self) -> bool {
         self.thinking_override == Some(ThinkingSupport::Required)
     }
 
-    /// Vision support, most specific first: per-model override, discovery,
-    /// the curated row, the family default.
     pub fn supports_vision(&self) -> bool {
-        if let Some(vision) = self.supports_vision_override {
-            return vision;
-        }
-        let Some(manifest) = ManifestRegistry::for_slug(&self.provider) else {
-            return self.family.supports_vision();
-        };
-        model_registry::discovered(manifest.slug, &self.id)
-            .and_then(|d| d.supports_vision)
-            .or_else(|| {
-                lookup_entry(manifest.models, &self.id)
-                    .ok()
-                    .map(|entry| entry.vision)
-            })
-            .unwrap_or_else(|| self.family.supports_vision())
+        self.supports_vision_override == Some(true)
     }
 
     pub fn supports_tool_examples(&self) -> bool {
-        self.supports_tool_examples_override
-            .unwrap_or_else(|| self.family.supports_tool_examples())
+        self.supports_tool_examples_override == Some(true)
     }
 
-    /// The `max_tokens` this request should carry.
-    ///
-    /// The turn budget is clamped on read rather than where it is set, because
-    /// providers that resolve limits per request rewrite
-    /// `max_output_tokens` on the way out, long after the budget was sized.
-    /// Doing it here means such a provider only has to report the cap it knows,
-    /// and cannot send a budget its endpoint never offered by forgetting to
-    /// re-apply the trim.
-    pub fn output_tokens(&self) -> Option<u32> {
-        [self.turn_output_tokens, self.max_output_tokens]
-            .into_iter()
-            .flatten()
-            .min()
-    }
-
-    /// Half the output window, so the answer always has room after the
-    /// thinking. `None` when the window is unknown: callers must then let
-    /// budgets through unclamped. Providers cap further only where the API
-    /// documents a hard limit (currently just Google).
-    pub fn max_thinking_budget(&self) -> Option<u32> {
-        self.max_output_tokens
-            .map(|n| (n / 2).max(MIN_THINKING_BUDGET))
-    }
-
-    /// This model carrying one request's output budget, leaving the declared
-    /// cap to say what the model can do.
-    pub fn with_turn_output(&self, budget: u32) -> Self {
-        Self {
-            turn_output_tokens: Some(budget),
-            ..self.clone()
-        }
-    }
-
-    /// Ceiling for the thinking one *request* may ask for: half the
-    /// `max_tokens` it carries, so the answer always has room after the
-    /// thinking, and no dialect is handed a budget its own `max_tokens` refuses
-    /// (Anthropic 400s when the two meet).
-    pub fn thinking_ceiling(&self) -> Option<u32> {
-        self.output_tokens().map(|n| n / 2)
-    }
-
-    /// A provider that knows its own plan speaks through the override: a Codex
-    /// subscription bills a flat rate, so there is no fast per-token price to
-    /// read. Everyone else falls back to fast-tier pricing, so capability and
-    /// billing can never disagree. The provider gate keeps that path to
-    /// Anthropic-based providers, resolved through the base manifest so oauth
-    /// scripts keep it; Bedrock separately ignores `opts.fast` at request time.
     pub fn supports_fast(&self) -> bool {
-        match self.supports_fast_override {
-            Some(support) => support == FastSupport::Supported,
-            None => {
-                self.pricing.fast.is_some()
-                    && ManifestRegistry::for_slug(&self.provider)
-                        .is_some_and(|m| m.slug == FAST_PROVIDER)
-            }
-        }
+        self.supports_fast_override == Some(FastSupport::Supported)
     }
 
     /// Discovery has not answered yet, so the `false` from [`Self::supports_fast`]
@@ -543,49 +329,6 @@ impl Model {
         (!self.pricing.is_zero()).then(|| usage.cost(&self.pricing, fast && self.supports_fast()))
     }
 
-    pub fn from_tier(slug: &str, tier: ModelTier) -> Result<Self, ModelError> {
-        if let Some(spec) = model_registry::spec_for_tier(slug, tier) {
-            return Self::from_spec(&spec);
-        }
-        let entry = ManifestRegistry::find_default_for_tier(slug, tier)
-            .ok_or_else(|| ModelError::NoDefault(slug.to_string(), tier))?;
-        let model_id = entry.prefixes[0];
-        Self::from_spec(&format!("{slug}/{model_id}"))
-    }
-
-    pub fn from_tier_with_policy(
-        slug: &str,
-        tier: ModelTier,
-        policy: &ModelPolicy,
-    ) -> Result<Self, ModelError> {
-        if let Ok(model) = Self::from_tier_dynamic(slug, tier)
-            && policy.allows(&model.spec())
-        {
-            return Ok(model);
-        }
-
-        let Some(manifest) = ManifestRegistry::for_slug(slug) else {
-            return Err(ModelError::NoAllowedModel(slug.to_string(), tier));
-        };
-        manifest
-            .models
-            .iter()
-            .filter(|entry| entry.tier == tier)
-            .flat_map(|entry| entry.prefixes)
-            .map(|model_id| format!("{slug}/{model_id}"))
-            .find(|spec| policy.allows(spec))
-            .map(|spec| Self::from_spec(&spec))
-            .transpose()?
-            .ok_or_else(|| ModelError::NoAllowedModel(slug.to_string(), tier))
-    }
-
-    pub fn from_tier_dynamic(slug: &str, tier: ModelTier) -> Result<Self, ModelError> {
-        if ManifestRegistry::get(slug).is_some() {
-            return Self::from_tier(slug, tier);
-        }
-        Err(ModelError::UnsupportedProvider(slug.to_string()))
-    }
-
     pub fn parse_spec(spec: &str) -> Result<(&str, &str), ModelError> {
         let (slug, model_id) = spec.split_once('/').ok_or(ModelError::InvalidFormat)?;
         if slug.is_empty() || model_id.is_empty() {
@@ -594,14 +337,22 @@ impl Model {
         Ok((slug, model_id))
     }
 
+    /// A model that supports thinking, vision, fast mode and tool examples,
+    /// for tests that need one without a registry. Production code resolves
+    /// through `ProviderRegistry`.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn from_spec(spec: &str) -> Result<Self, ModelError> {
-        let (slug, model_id) = Self::parse_spec(spec)?;
-
-        if let Some(manifest) = ManifestRegistry::get(slug) {
-            return Ok(Self::from_base(manifest, slug, model_id));
-        }
-
-        Err(ModelError::UnsupportedProvider(slug.to_string()))
+        let (provider, model_id) = Self::parse_spec(spec)?;
+        Ok(Self::from_info(
+            provider,
+            &ModelInfo {
+                supports_thinking: Some(true),
+                supports_vision: Some(true),
+                supports_fast: Some(true),
+                supports_tool_examples: Some(true),
+                ..ModelInfo::id_only(model_id.to_string())
+            },
+        ))
     }
 }
 
@@ -734,20 +485,6 @@ mod tests {
     use serde_json::json;
     use test_case::test_case;
 
-    fn policy(allowed: &[&str], excluded: &[&str]) -> ModelPolicy {
-        ModelPolicy::new(
-            &allowed
-                .iter()
-                .map(|pattern| (*pattern).into())
-                .collect::<Vec<_>>(),
-            &excluded
-                .iter()
-                .map(|pattern| (*pattern).into())
-                .collect::<Vec<_>>(),
-        )
-        .unwrap()
-    }
-
     const TIERS: [ModelTier; 4] = [
         ModelTier::Weak,
         ModelTier::Medium,
@@ -778,6 +515,7 @@ mod tests {
         cache_read: 44,
     };
     const RECORDED_COST: f64 = 0.25;
+    const FAST_RATE: f64 = 30.0;
 
     #[test_case(999, "999"         ; "under_thousand")]
     #[test_case(1_000, "1.0k"      ; "thousand")]
@@ -809,60 +547,12 @@ mod tests {
     #[test_case("no-slash-here", ModelError::InvalidFormat ; "invalid_format")]
     #[test_case("/gpt-4", ModelError::InvalidFormat ; "missing_provider")]
     #[test_case("foobar/", ModelError::InvalidFormat ; "missing_model")]
-    #[test_case("foobar/gpt-4", ModelError::UnsupportedProvider("foobar".into()) ; "unsupported_provider")]
     fn from_spec_errors(spec: &str, expected: ModelError) {
         let err = Model::from_spec(spec).unwrap_err();
         assert_eq!(
             std::mem::discriminant(&err),
             std::mem::discriminant(&expected)
         );
-    }
-
-    const SMALL_CAP: u32 = 8_192;
-    const TURN_BUDGET: u32 = 32_768;
-
-    /// Providers that resolve limits per request rewrite `max_output_tokens`
-    /// after the agent sized the turn, so a budget above the cap they report
-    /// must not survive to the wire.
-    #[test_case(Some(TURN_BUDGET), Some(SMALL_CAP), Some(SMALL_CAP) ; "a_lowered_cap_clamps_the_budget")]
-    #[test_case(Some(SMALL_CAP), Some(TURN_BUDGET), Some(SMALL_CAP) ; "a_trimmed_turn_is_what_the_request_carries")]
-    #[test_case(None, Some(SMALL_CAP), Some(SMALL_CAP) ; "an_untrimmed_turn_leaves_the_cap_standing")]
-    #[test_case(Some(TURN_BUDGET), None, Some(TURN_BUDGET) ; "an_undeclared_cap_keeps_the_budget")]
-    #[test_case(None, None, None ; "nothing_to_send")]
-    fn output_tokens_never_exceeds_the_declared_cap(
-        turn_output_tokens: Option<u32>,
-        max_output_tokens: Option<u32>,
-        expected: Option<u32>,
-    ) {
-        let model = Model {
-            turn_output_tokens,
-            max_output_tokens,
-            ..Model::from_spec("openai/gpt-5.6-sol").unwrap()
-        };
-
-        assert_eq!(model.output_tokens(), expected);
-    }
-
-    #[test]
-    fn tier_with_policy_uses_allowed_alternative() {
-        let policy = policy(&["openai/gpt-5.4-nano"], &[]);
-
-        let model = Model::from_tier_with_policy("openai", ModelTier::Weak, &policy).unwrap();
-
-        assert_eq!(model.spec(), "openai/gpt-5.4-nano");
-        assert_eq!(model.tier, ModelTier::Weak);
-    }
-
-    #[test]
-    fn tier_with_policy_errors_without_allowed_candidate() {
-        let policy = policy(&["anthropic/*"], &[]);
-
-        let error = Model::from_tier_with_policy("openai", ModelTier::Weak, &policy).unwrap_err();
-
-        assert!(matches!(
-            error,
-            ModelError::NoAllowedModel(provider, ModelTier::Weak) if provider == "openai"
-        ));
     }
 
     #[test]
@@ -938,21 +628,12 @@ mod tests {
         assert_eq!(usage.cost(&pricing, true), usage.cost(&pricing, false));
     }
 
-    #[test]
-    fn from_spec_keeps_nested_model_ids_with_four_levels() {
-        let spec = "ollama/nvidia/openai/gpt-oss-120b";
+    #[test_case("p/nvidia/openai/gpt-oss-120b", "nvidia/openai/gpt-oss-120b" ; "four_levels")]
+    #[test_case("p/opencode/big-pickle", "opencode/big-pickle" ; "three_levels")]
+    fn from_spec_keeps_nested_model_ids(spec: &str, expected_id: &str) {
         let model = Model::from_spec(spec).unwrap();
-        assert_eq!(model.provider, Arc::<str>::from("ollama"));
-        assert_eq!(model.id, "nvidia/openai/gpt-oss-120b");
-        assert_eq!(model.spec(), spec);
-    }
-
-    #[test]
-    fn from_spec_keeps_nested_model_ids_with_three_levels() {
-        let spec = "ollama/opencode/big-pickle";
-        let model = Model::from_spec(spec).unwrap();
-        assert_eq!(model.provider, Arc::<str>::from("ollama"));
-        assert_eq!(model.id, "opencode/big-pickle");
+        assert_eq!(model.provider, Arc::<str>::from("p"));
+        assert_eq!(model.id, expected_id);
         assert_eq!(model.spec(), spec);
     }
 
@@ -1012,153 +693,41 @@ mod tests {
         ));
     }
 
-    #[test_case("anthropic/claude-99-turbo", "anthropic", "claude-99-turbo" ; "unknown_anthropic_model_accepted")]
-    #[test_case("openai/gpt-99", "openai", "gpt-99" ; "unknown_openai_model_accepted")]
-    #[test_case("ollama/my-custom-model", "ollama", "my-custom-model" ; "unknown_ollama_model_accepted")]
-    fn unknown_model_accepted(spec: &str, expected_slug: &str, expected_id: &str) {
-        let model = Model::from_spec(spec).unwrap();
-        assert_eq!(model.provider, Arc::<str>::from(expected_slug));
-        assert_eq!(model.id, expected_id);
-        let manifest = ManifestRegistry::get(expected_slug).unwrap();
-        assert_eq!(model.family, manifest.family);
+    #[test_case(None, false ; "undeclared_is_unsupported")]
+    #[test_case(Some(true), true ; "declared")]
+    #[test_case(Some(false), false ; "declared_off")]
+    fn fast_follows_the_descriptor(declared: Option<bool>, expected: bool) {
+        let info = ModelInfo {
+            supports_fast: declared,
+            pricing: Some(ModelPricing {
+                fast: Some(FastPricing {
+                    input: FAST_RATE,
+                    output: FAST_RATE,
+                }),
+                ..ModelPricing::ZERO
+            }),
+            ..ModelInfo::id_only(SCHEDULED_MODEL.into())
+        };
+        assert_eq!(
+            Model::from_info(SCHEDULED_PROVIDER, &info).supports_fast(),
+            expected
+        );
     }
 
     #[test]
-    fn from_base_unknown_model_uses_provider_fallbacks() {
-        // Deliberately fake id so this stays valid when the model table changes.
-        let model = Model::from_base(
-            ManifestRegistry::get("anthropic").unwrap(),
-            "anthropic",
-            "claude-nonexistent-99",
-        );
-        assert_eq!(model.provider, Arc::<str>::from("anthropic"));
-        assert_eq!(model.id, "claude-nonexistent-99");
-        assert_eq!(model.spec(), "anthropic/claude-nonexistent-99");
-        assert_eq!(model.family, ModelFamily::Claude);
-        assert_eq!(model.max_output_tokens, Some(128_000));
-        assert_eq!(model.context_window, 200_000);
-        let p = &model.pricing;
-        assert_eq!(
-            (p.input, p.output, p.cache_write, p.cache_read),
-            (0.0, 0.0, 0.0, 0.0)
-        );
-    }
-
-    #[test_case("anthropic/claude-opus-4-8",       true  ; "claude")]
-    #[test_case("openai/gpt-5.4",                   true  ; "gpt")]
-    #[test_case("google/gemini-2.5-pro",            true  ; "gemini")]
-    #[test_case("anthropic/claude-nonexistent-99",  true  ; "unknown_model_uses_family_fallback")]
-    #[test_case("ollama/my-custom-model",           false ; "unknown_generic_defaults_off")]
-    fn vision_resolved_from_entry_or_family(spec: &str, expected: bool) {
-        assert_eq!(Model::from_spec(spec).unwrap().supports_vision(), expected);
-    }
-
-    #[test_case("claude-opus-5",    true  ; "entry_with_fast_pricing")]
-    #[test_case("claude-opus-5-1m", true  ; "long_context_suffix_still_matches_prefix")]
-    #[test_case("claude-opus-4-7",  false ; "fast_withdrawn_from_the_table")]
-    #[test_case("claude-sonnet-5",  false ; "entry_without_fast_pricing")]
-    #[test_case("claude-opus-99",   false ; "no_entry_at_all")]
-    fn supports_fast_follows_anthropic_table(model_id: &str, expected: bool) {
-        let model = Model::from_base(
-            ManifestRegistry::get("anthropic").unwrap(),
-            "anthropic",
-            model_id,
-        );
-        assert_eq!(model.supports_fast(), expected);
-    }
-
-    #[test_case("google/gemini-2.5-pro", Some(FastSupport::Supported), true ; "override_enables_without_fast_pricing")]
-    #[test_case("anthropic/claude-opus-5", Some(FastSupport::Unsupported), false ; "override_disables_native_support")]
-    #[test_case("anthropic/claude-opus-5", None, true ; "no_override_falls_back_to_pricing")]
-    #[test_case("anthropic/claude-opus-5", Some(FastSupport::Pending), false ; "pending_disables_native_support")]
-    fn supports_fast_respects_override(
-        spec: &str,
-        fast_override: Option<FastSupport>,
-        expected: bool,
-    ) {
-        let mut model = Model::from_spec(spec).unwrap();
-        model.supports_fast_override = fast_override;
-        assert_eq!(model.supports_fast(), expected);
-    }
-
-    #[test_case("google/gemini-2.5-pro" ; "non_anthropic")]
-    #[test_case("anthropic/claude-sonnet-5" ; "anthropic")]
-    fn fast_override_without_fast_pricing_uses_standard_rates(spec: &str) {
-        let mut model = Model::from_spec(spec).unwrap();
-        model.supports_fast_override = Some(FastSupport::Supported);
-        assert!(model.supports_fast());
-        assert!(model.pricing.fast.is_none());
-        assert!(!model.pricing.is_zero());
+    fn fast_without_fast_pricing_uses_standard_rates() {
+        let model = Model {
+            supports_fast_override: Some(FastSupport::Supported),
+            pricing: ModelPricing {
+                input: SCHEDULED_INPUT_RATE,
+                ..ModelPricing::ZERO
+            },
+            ..Model::from_spec("p/m").unwrap()
+        };
         assert_eq!(
             model.list_cost(&COUNTERS, true),
             Some(COUNTERS.cost(&model.pricing, false))
         );
-    }
-
-    /// Without an override, fast mode is Anthropic-only, so a fast rate that
-    /// lands on anyone else is dead weight: nobody can turn it on, and an
-    /// `always_fast` carried in from config must not quietly reprice the
-    /// session with it.
-    #[test]
-    fn supports_fast_false_for_non_anthropic_even_with_fast_pricing() {
-        let mut model = Model::from_base(
-            ManifestRegistry::get("google").unwrap(),
-            "google",
-            "gemini-2.5-pro",
-        );
-        model.pricing.fast = Some(FastPricing {
-            input: 30.0,
-            output: 150.0,
-        });
-        assert!(!model.supports_fast());
-    }
-
-    #[test]
-    fn discovered_vision_flows_into_curated_provider_model() {
-        use crate::model::ModelInfo;
-
-        model_registry::set_known_models(
-            "google",
-            vec![
-                ModelInfo {
-                    supports_vision: Some(false),
-                    ..ModelInfo::id_only("gem:test-blind".into())
-                },
-                ModelInfo::id_only("gem:test-family".into()),
-            ],
-        );
-
-        let vision = |id| Model::from_spec(id).unwrap().supports_vision();
-        assert!(!vision("google/gem:test-blind"));
-        assert!(vision("google/gem:test-family"));
-    }
-
-    #[test]
-    fn discovered_context_window_flows_into_from_base_for_unknown_model() {
-        use crate::model::ModelInfo;
-
-        let model_id = "test-discovered-context-window-model";
-        let expected_window: u32 = 131_072;
-
-        model_registry::set_known_models(
-            "ollama",
-            vec![ModelInfo {
-                context_window: Some(expected_window),
-                ..ModelInfo::id_only(model_id.to_string())
-            }],
-        );
-
-        let model = Model::from_base(ManifestRegistry::get("ollama").unwrap(), "ollama", model_id);
-        assert_eq!(model.context_window, expected_window);
-
-        // A dynamic/custom slug shares its base provider's discovery.
-        let wrapped = Model::from_base(
-            ManifestRegistry::get("ollama").unwrap(),
-            "my-ollama-wrap",
-            model_id,
-        );
-        assert_eq!(wrapped.spec(), format!("my-ollama-wrap/{model_id}"));
-        assert_eq!(wrapped.context_window, expected_window);
     }
 
     /// A descriptor quoting off-peak rates with a peak-hours schedule.

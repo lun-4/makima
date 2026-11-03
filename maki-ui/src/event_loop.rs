@@ -5834,18 +5834,12 @@ mod tests {
         > {
             Box::pin(std::future::pending())
         }
-
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
-        }
     }
 
     struct FocusedProvider;
+
+    /// Tells [`FocusedProvider`] apart from every other test provider.
+    const FOCUSED_KEY_COUNT: usize = 7;
 
     impl Provider for FocusedProvider {
         fn stream_message<'a>(
@@ -5865,13 +5859,8 @@ mod tests {
             Box::pin(std::future::pending())
         }
 
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>,
-        > {
-            Box::pin(async { Ok(vec![maki_providers::ModelInfo::id_only("focused".into())]) })
+        fn key_count(&self) -> usize {
+            FOCUSED_KEY_COUNT
         }
     }
 
@@ -6151,7 +6140,12 @@ mod tests {
 
     impl RuntimeHarness {
         fn with_permissions_config(permissions_config: PermissionsConfig) -> Self {
-            Self::with(permissions_config, Arc::default(), ModelCatalog::default())
+            let providers = Arc::new(maki_providers::test_util::offline_ids(&[
+                crate::components::TEST_MODEL_PROVIDER,
+                "openai",
+                "ollama",
+            ]));
+            Self::with(permissions_config, providers, ModelCatalog::default())
         }
 
         fn with(
@@ -6474,15 +6468,6 @@ mod tests {
                     std::future::pending().await
                 })
             }
-
-            fn list_models(
-                &self,
-            ) -> maki_providers::provider::BoxFuture<
-                '_,
-                Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>,
-            > {
-                Box::pin(async { Ok(Vec::new()) })
-            }
         }
 
         with_event_loop(|event_loop| {
@@ -6731,14 +6716,7 @@ mod tests {
         let (focused_slot, _) = ProviderSlot::new(focused_model, Arc::new(FocusedProvider));
 
         let (session, provider) = new_session_from_slot(&focused_slot, "/tmp");
-        assert_eq!(
-            smol::block_on(provider.provider.list_models())
-                .unwrap()
-                .first()
-                .unwrap()
-                .id,
-            "focused"
-        );
+        assert_eq!(provider.provider.key_count(), FOCUSED_KEY_COUNT);
         let runtime = harness
             .ctx()
             .spawn_runtime_with_provider(session, Some(provider))
@@ -6803,20 +6781,12 @@ mod tests {
                     })
                 })
             }
-
-            fn list_models(
-                &self,
-            ) -> maki_providers::provider::BoxFuture<
-                '_,
-                Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>,
-            > {
-                Box::pin(async { Ok(Vec::new()) })
-            }
         }
 
         fn model(spec: &str) -> Model {
             let mut model = Model::from_spec(spec).unwrap();
             model.supports_fast_override = Some(FastSupport::Supported);
+            model.thinking_override = Some(maki_providers::ThinkingSupport::Yes);
             model
         }
 
@@ -7191,8 +7161,8 @@ mod tests {
 
         assert_eq!(runtime.model_slot.load().model.spec(), STORED_MODEL);
         assert_eq!(
-            smol::block_on(runtime.model_slot.load().provider.list_models()).unwrap()[0].id,
-            "focused"
+            runtime.model_slot.load().provider.key_count(),
+            FOCUSED_KEY_COUNT
         );
         assert_eq!(
             runtime.coordinator.read().model().unwrap().as_ref(),

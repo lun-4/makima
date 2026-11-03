@@ -6,8 +6,8 @@ use std::sync::Arc;
 use async_lock::OnceCell;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    AgentError, ConversationEnd, Invocation, Message, Model, ModelInfo, ProviderEvent,
-    ProviderUsage, RequestOptions, StreamResponse,
+    AgentError, ConversationEnd, Invocation, Message, Model, ProviderEvent, ProviderUsage,
+    RequestOptions, StreamResponse,
 };
 use maki_storage::id::SessionRef;
 use serde_json::Value;
@@ -55,10 +55,6 @@ impl Provider for PendingProvider {
                 )
                 .await
         })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { self.provider().await?.list_models().await })
     }
 
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {

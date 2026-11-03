@@ -2470,6 +2470,25 @@ mod tests {
     const DISCOVERED_WINDOW: u32 = 524_000;
     const NEW_SESSION_REQUEST: i64 = 91;
     static MANAGED_PLUGIN_TEST: Mutex<()> = Mutex::new(());
+
+    /// The providers of the specs above: only [`FAST_SPEC`] supports fast mode.
+    fn spec_providers() -> Arc<ProviderRegistry> {
+        let model = |spec: &'static str, fast| {
+            let (provider, id) = Model::parse_spec(spec).unwrap();
+            let info = ModelInfo {
+                supports_thinking: Some(true),
+                supports_vision: Some(true),
+                supports_fast: Some(fast),
+                ..ModelInfo::id_only(id.into())
+            };
+            (provider, vec![info])
+        };
+        Arc::new(maki_providers::test_util::offline_registry(vec![
+            model(FAST_SPEC, true),
+            model(OFFLINE_SPEC, false),
+            model(SPAWN_TEST_SPEC, false),
+        ]))
+    }
     const ACP_TURN_END: &str = "turn end ";
     const PARKED_THOUGHT: &str = "parked thought";
     const PARKED_REPLY: &str = "parked reply";
@@ -2638,15 +2657,6 @@ mod tests {
                 invocation,
             )
         }
-
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, maki_agent::AgentError>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
-        }
     }
 
     async fn managed_test_session(
@@ -2742,7 +2752,7 @@ mod tests {
         let (binding, root_target) = maki_lua::orchestration::root_binding();
         let handle = headless::spawn_interactive_with_binding(
             InteractiveParams {
-                model: Model::from_spec(FAST_SPEC).unwrap(),
+                model: spec_providers().model(FAST_SPEC).unwrap(),
                 config: maki_agent::AgentConfig {
                     max_concurrent_agent_turns: 1,
                     ..Default::default()
@@ -2763,7 +2773,7 @@ mod tests {
                 append_system_prompt: None,
                 defaults: Default::default(),
                 model_policy: Arc::default(),
-                providers: Arc::default(),
+                providers: spec_providers(),
                 modes: Arc::new(maki_agent::ModeRegistry::builtin()),
                 question_mode: QuestionMode::Headless,
                 plugin_rules: Arc::default(),
@@ -2802,7 +2812,7 @@ mod tests {
             &root_target,
             Arc::new(move |spec| {
                 let provider = Arc::clone(&replacement);
-                let model = Model::from_spec(&spec).unwrap();
+                let model = spec_providers().model(&spec).unwrap();
                 Box::pin(async move { Ok(maki_agent::actor::PreparedModel { provider, model }) })
             }),
         )
@@ -2941,15 +2951,6 @@ mod tests {
                 })
             })
         }
-
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, maki_agent::AgentError>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
-        }
     }
 
     /// Records the last user message of every request and parks it until
@@ -3005,15 +3006,6 @@ mod tests {
                     stop_reason: Some(maki_providers::StopReason::EndTurn),
                 })
             })
-        }
-
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, maki_agent::AgentError>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
         }
     }
 
@@ -3163,7 +3155,7 @@ mod tests {
                     maki_agent::command::SessionCommandHost::new(
                         control_tx,
                         coordinator,
-                        Arc::default(),
+                        spec_providers(),
                     )
                     .with_reset_session_guidance(NEW_SESSION_GUIDANCE),
                 ),
@@ -3290,7 +3282,7 @@ mod tests {
         let session_id = MakiId::generate();
         let mut handle = headless::spawn_interactive_with_binding(
             InteractiveParams {
-                model: Model::from_spec(OFFLINE_SPEC).unwrap(),
+                model: spec_providers().model(OFFLINE_SPEC).unwrap(),
                 config: Default::default(),
                 permissions_config: Default::default(),
                 timeouts: Default::default(),
@@ -3306,7 +3298,7 @@ mod tests {
                 append_system_prompt: None,
                 defaults: Default::default(),
                 model_policy: Arc::default(),
-                providers: Arc::default(),
+                providers: spec_providers(),
                 question_mode: QuestionMode::Headless,
                 plugin_rules: Arc::default(),
                 project_config: ProjectConfig::for_project(Path::new("/project")),
@@ -3343,7 +3335,8 @@ mod tests {
                 root.clone(),
                 Arc::new(move |spec| {
                     let provider = Arc::clone(&provider);
-                    let model = Model::from_spec(&spec)
+                    let model = spec_providers()
+                        .model(&spec)
                         .map_err(maki_agent::config_change::unresolved_model);
                     Box::pin(async move {
                         Ok(maki_agent::actor::PreparedModel {
@@ -3372,7 +3365,7 @@ mod tests {
                 maki_agent::command::SessionCommandHost::new(
                     handle.control_tx.clone(),
                     coordinator.clone(),
-                    Arc::default(),
+                    spec_providers(),
                 )
                 .with_reset_session_guidance(NEW_SESSION_GUIDANCE),
             ),
@@ -3429,7 +3422,7 @@ mod tests {
             let cwd = TempDir::new().unwrap();
             let state_path = cwd.path().join("not-a-directory");
             std::fs::write(&state_path, "file").unwrap();
-            let params = test_params(Model::from_spec(OFFLINE_SPEC).unwrap(), state_path);
+            let params = test_params(spec_providers().model(OFFLINE_SPEC).unwrap(), state_path);
             let (out_tx, _) = flume::unbounded();
             let mut srv = Server {
                 out_tx,
@@ -3492,7 +3485,7 @@ mod tests {
         smol::block_on(async {
             let cwd = TempDir::new().unwrap();
             let params = test_params(
-                Model::from_spec(OFFLINE_SPEC).unwrap(),
+                spec_providers().model(OFFLINE_SPEC).unwrap(),
                 cwd.path().to_path_buf(),
             );
             let (out_tx, _) = flume::unbounded();
@@ -4482,7 +4475,7 @@ mod tests {
             let (mut srv, _, out_rx, turns) = server_awaiting_answer();
             let old_session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
             let params = test_params(
-                Model::from_spec(OFFLINE_SPEC).unwrap(),
+                spec_providers().model(OFFLINE_SPEC).unwrap(),
                 PathBuf::from("/project"),
             );
             handle_prompt(
@@ -4533,7 +4526,7 @@ mod tests {
 
             let cwd = TempDir::new().unwrap();
             let params = test_params(
-                Model::from_spec(OFFLINE_SPEC).unwrap(),
+                spec_providers().model(OFFLINE_SPEC).unwrap(),
                 cwd.path().to_owned(),
             );
             handle_line(
@@ -6054,7 +6047,7 @@ mod tests {
                     maki_agent::actor::ConfigPatch {
                         model: Some(maki_agent::actor::PreparedModel {
                             provider: Arc::new(EndTurnProvider),
-                            model: Model::from_spec(OFFLINE_SPEC).unwrap(),
+                            model: spec_providers().model(OFFLINE_SPEC).unwrap(),
                         }),
                         ..Default::default()
                     },
@@ -6657,7 +6650,7 @@ mod tests {
                     maki_agent::actor::ConfigPatch {
                         model: Some(maki_agent::actor::PreparedModel {
                             provider: Arc::new(EndTurnProvider),
-                            model: Model::from_spec(OFFLINE_SPEC).unwrap(),
+                            model: spec_providers().model(OFFLINE_SPEC).unwrap(),
                         }),
                         ..Default::default()
                     },
@@ -7219,7 +7212,7 @@ mod tests {
             session.save(&storage).unwrap();
             let coordinator = test_coordinator(session.id, OFFLINE_SPEC);
             let params = test_params(
-                Model::from_spec(OFFLINE_SPEC).unwrap(),
+                spec_providers().model(OFFLINE_SPEC).unwrap(),
                 tmp.path().to_path_buf(),
             );
             let (out_tx, out_rx) = flume::unbounded();

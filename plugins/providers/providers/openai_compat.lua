@@ -21,6 +21,7 @@
 --   `parse_model(row)`: one `/models` row to a descriptor, or nil.
 --   `list_models(ctx, client)`: replaces the `/models` listing.
 --   `fetch_usage(ctx, client)`: the instance's `fetch_usage`.
+--   `notes`: Markdown for the providers reference page.
 
 local chat = require("providers.chat_completions")
 local http = require("providers.http")
@@ -54,10 +55,14 @@ local function plan(def, config)
   return config.plan and find(def.plans, config.plan)
 end
 
+function M.base_url_env(def)
+  return (def.id:upper():gsub("-", "_")) .. BASE_URL_SUFFIX
+end
+
 -- `<ID>_BASE_URL`, then `base_url` and the plan's from `providers.toml`,
 -- then the default.
 function M.base_url(def, config)
-  local override = maki.uv.os_getenv((def.id:upper():gsub("-", "_")) .. BASE_URL_SUFFIX)
+  local override = maki.uv.os_getenv(M.base_url_env(def))
   if override and override ~= "" then
     return override
   end
@@ -327,6 +332,12 @@ function M.auth_status(def)
   end
 end
 
+-- The providers reference page entry: the key and base URL variables, the
+-- default base URL and `def.notes`.
+function M.docs(def)
+  return { env = { def.env, M.base_url_env(def) }, endpoint = def.base_url, notes = def.notes }
+end
+
 function M.provider(def)
   local spec = {
     id = def.id,
@@ -334,6 +345,7 @@ function M.provider(def)
     models = M.descriptors(def),
     auth = M.api_key_auth(def),
     auth_status = M.auth_status(def),
+    docs = M.docs(def),
   }
   if def.plans then
     local choices = {}

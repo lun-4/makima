@@ -425,15 +425,6 @@ mod tests {
                 })
             })
         }
-
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, AgentError>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
-        }
     }
 
     #[test]
@@ -516,8 +507,8 @@ mod tests {
     }
 
     struct PooledServer {
-        pool: maki_providers::KeyPool,
-        auth: std::sync::Mutex<maki_providers::ResolvedAuth>,
+        keys: &'static [&'static str],
+        current: std::sync::atomic::AtomicUsize,
         status: u16,
         relents_for: Option<&'static str>,
         seen: std::sync::Mutex<Vec<String>>,
@@ -525,13 +516,9 @@ mod tests {
 
     impl PooledServer {
         fn new(keys: usize, status: u16, relents_for: Option<&'static str>) -> Self {
-            let pool = maki_providers::KeyPool::from_keys(
-                POOL_KEYS[..keys].iter().map(|k| (*k).into()).collect(),
-            );
-            let auth = maki_providers::ResolvedAuth::bearer("test", pool.current()).unwrap();
             Self {
-                pool,
-                auth: std::sync::Mutex::new(auth),
+                keys: &POOL_KEYS[..keys],
+                current: std::sync::atomic::AtomicUsize::new(0),
                 status,
                 relents_for,
                 seen: std::sync::Mutex::default(),
@@ -556,7 +543,8 @@ mod tests {
             _invocation: &'a Invocation,
         ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
-                let key = self.pool.current().to_owned();
+                let index = self.current.load(std::sync::atomic::Ordering::Relaxed);
+                let key = self.keys[index % self.keys.len()].to_owned();
                 let relents = self.relents_for == Some(key.as_str());
                 self.seen.lock().unwrap().push(key);
                 if !relents {
@@ -570,26 +558,16 @@ mod tests {
             })
         }
 
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, AgentError>,
-        > {
-            Box::pin(async { unimplemented!() })
-        }
-
         fn key_count(&self) -> usize {
-            self.pool.len()
+            self.keys.len()
         }
 
         fn rotate_key(&self) -> maki_providers::provider::BoxFuture<'_, bool> {
-            let rotated = maki_providers::KeyRotation::new(
-                &self.pool,
-                &self.auth,
-                maki_providers::KeyHeader::Bearer,
-            )
-            .rotate();
+            let rotated = self.keys.len() > 1;
+            if rotated {
+                self.current
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             Box::pin(async move { rotated })
         }
     }

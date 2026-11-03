@@ -1,19 +1,18 @@
-//! Providers registered by plugins, consulted before the native ones.
+//! Providers registered by plugins.
 //!
 //! Resolution reads descriptors held here and never calls into a backend, so
-//! it stays cheap enough for the UI thread. A provider id the registry does
-//! not know falls back to the native tables until those are removed.
+//! it stays cheap enough for the UI thread.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
 use maki_config::ModelPolicy;
+use serde::Deserialize;
 use serde_json::Value;
 use tracing::warn;
 
 use crate::error::AgentError;
 use crate::login::{AuthSpec, AuthStatus, InteractionService};
-use crate::manifest::ManifestRegistry;
 use crate::model::{Model, ModelError, ModelInfo, ModelTier};
 use crate::model_registry;
 use crate::provider::{BoxFuture, ModelBatch, Provider};
@@ -33,6 +32,11 @@ pub trait ProviderBackend: Send + Sync {
         &self,
         refresh: bool,
     ) -> Option<BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>>;
+
+    /// Whether `discover` can list models, without starting it.
+    fn discovers(&self) -> bool {
+        false
+    }
 
     /// Logs in with {method}, given the provider's `providers.toml` section
     /// with this login's answers applied. Returns the model id to default to.
@@ -60,22 +64,54 @@ pub struct PreparedProvider {
     pub provider: Arc<dyn Provider>,
 }
 
+/// What the providers reference page says about a provider beyond its
+/// models, login methods and config fields.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderDocs {
+    /// Environment variables the provider reads.
+    #[serde(default)]
+    pub env: Vec<String>,
+    /// The endpoint it talks to by default.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Markdown shown under its heading.
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
 pub struct RegisteredProvider {
     pub id: Arc<str>,
     pub display_name: Arc<str>,
     pub models: Vec<ModelInfo>,
     pub backend: Arc<dyn ProviderBackend>,
     pub auth: AuthSpec,
+    pub docs: Option<ProviderDocs>,
+}
+
+/// A registered provider as the reference docs read it.
+pub struct ProviderListing<'a> {
+    pub id: &'a str,
+    pub display_name: &'a str,
+    pub models: Arc<[ModelInfo]>,
+    pub auth: &'a AuthSpec,
+    pub docs: Option<&'a ProviderDocs>,
 }
 
 pub(crate) struct Entry {
     pub(crate) display_name: Arc<str>,
     pub(crate) backend: Arc<dyn ProviderBackend>,
     pub(crate) auth: AuthSpec,
+    docs: Option<ProviderDocs>,
     models: RwLock<Arc<[ModelInfo]>>,
 }
 
 impl Entry {
+    /// Whether the provider serves any model, curated or discovered.
+    pub(crate) fn offers_models(&self) -> bool {
+        !self.models().is_empty() || self.backend.discovers()
+    }
+
     fn models(&self) -> Arc<[ModelInfo]> {
         Arc::clone(&self.models.read().unwrap())
     }
@@ -118,6 +154,7 @@ impl ProviderRegistry {
                     display_name: provider.display_name,
                     backend: provider.backend,
                     auth: provider.auth,
+                    docs: provider.docs,
                     models: RwLock::new(provider.models.into()),
                 };
                 (provider.id, entry)
@@ -126,12 +163,19 @@ impl ProviderRegistry {
         Self { entries }
     }
 
-    pub fn contains(&self, id: &str) -> bool {
-        self.entries.contains_key(id)
-    }
-
     pub(crate) fn entries(&self) -> impl Iterator<Item = (&Arc<str>, &Entry)> {
         self.entries.iter()
+    }
+
+    /// Every provider, ordered by id.
+    pub fn listings(&self) -> impl Iterator<Item = ProviderListing<'_>> {
+        self.entries.iter().map(|(id, entry)| ProviderListing {
+            id,
+            display_name: &entry.display_name,
+            models: entry.models(),
+            auth: &entry.auth,
+            docs: entry.docs.as_ref(),
+        })
     }
 
     /// A provider id, or else the first alias named {name}, with the
@@ -148,18 +192,17 @@ impl ProviderRegistry {
 
     pub fn model(&self, spec: &str) -> Result<Model, ModelError> {
         let (provider, model_id) = Model::parse_spec(spec)?;
-        match self.entries.get(provider) {
-            Some(entry) => Ok(Model::from_info(provider, &entry.info(model_id))),
-            None => Model::from_spec(spec),
-        }
+        let entry = self
+            .entries
+            .get(provider)
+            .ok_or_else(|| ModelError::UnsupportedProvider(provider.to_string()))?;
+        Ok(Model::from_info(provider, &entry.info(model_id)))
     }
 
     /// User overrides first, then the first descriptor declaring the tier
     /// that no override already gave to another tier.
     pub fn spec_for_tier(&self, provider: &str, tier: ModelTier) -> Option<String> {
-        let Some(entry) = self.entries.get(provider) else {
-            return model_registry::spec_for_tier(provider, tier);
-        };
+        let entry = self.entries.get(provider)?;
         let prefix = format!("{provider}/");
         model_registry::tier_override(tier)
             .filter(|spec| spec.starts_with(&prefix))
@@ -173,7 +216,7 @@ impl ProviderRegistry {
     }
 
     pub fn spec_for_tier_any(&self, tier: ModelTier) -> Option<String> {
-        model_registry::spec_for_tier_any(tier).or_else(|| {
+        model_registry::tier_override(tier).or_else(|| {
             self.entries
                 .keys()
                 .find_map(|provider| self.spec_for_tier(provider, tier))
@@ -186,9 +229,10 @@ impl ProviderRegistry {
         tier: ModelTier,
         policy: &ModelPolicy,
     ) -> Result<Model, ModelError> {
-        let Some(entry) = self.entries.get(provider) else {
-            return Model::from_tier_with_policy(provider, tier, policy);
-        };
+        let entry = self
+            .entries
+            .get(provider)
+            .ok_or_else(|| ModelError::UnsupportedProvider(provider.to_string()))?;
         self.spec_for_tier(provider, tier)
             .filter(|spec| policy.allows(spec))
             .or_else(|| {
@@ -201,17 +245,10 @@ impl ProviderRegistry {
             .and_then(|spec| self.model(&spec))
     }
 
-    pub fn available(&self, provider: &str) -> bool {
-        self.entries.contains_key(provider)
-    }
-
     pub fn display_name(&self, provider: &str) -> Option<Arc<str>> {
-        match self.entries.get(provider) {
-            Some(entry) => Some(Arc::clone(&entry.display_name)),
-            None => {
-                ManifestRegistry::for_slug(provider).map(|manifest| manifest.display_name.into())
-            }
-        }
+        self.entries
+            .get(provider)
+            .map(|entry| Arc::clone(&entry.display_name))
     }
 
     pub async fn prepare(&self, model: Model) -> Result<PreparedProvider, AgentError> {
@@ -297,13 +334,11 @@ mod tests {
     use super::*;
 
     const FAKE: &str = "fake-registered";
-    const SHADOWED: &str = "anthropic";
     const STRONG_FIRST: &str = "strong-first";
     const STRONG_SECOND: &str = "strong-second";
     const WEAK: &str = "weak-only";
     const DISCOVERED: &str = "discovered";
     const CONTEXT_WINDOW: u32 = 42_000;
-    const NATIVE_SPEC: &str = "anthropic/claude-sonnet-4-5";
     const DISCOVERY_FAILURE: &str = "listing failed";
 
     struct FakeBackend {
@@ -383,6 +418,7 @@ mod tests {
             ],
             backend: Arc::clone(&backend) as Arc<dyn ProviderBackend>,
             auth: AuthSpec::default(),
+            docs: None,
         }]);
         (registry, backend)
     }
@@ -393,22 +429,15 @@ mod tests {
     }
 
     #[test]
-    fn registered_id_shadows_native_provider() {
-        let (registry, backend) = registry_with(SHADOWED, None);
-        let model = registry
-            .model(&format!("{SHADOWED}/{STRONG_FIRST}"))
-            .unwrap();
+    fn registered_provider_resolves_and_prepares() {
+        let (registry, backend) = registry_with(FAKE, None);
+        let model = registry.model(&format!("{FAKE}/{STRONG_FIRST}")).unwrap();
         assert_eq!(model.context_window, CONTEXT_WINDOW);
         assert_eq!(model.tier, ModelTier::Strong);
 
         let prepared = smol::block_on(registry.prepare(model)).unwrap();
         assert!(backend.prepared.load(Ordering::SeqCst));
         assert_eq!(prepared.model.id, STRONG_FIRST);
-        assert!(
-            !registry
-                .offline_specs(&ModelPolicy::default())
-                .contains(&NATIVE_SPEC.into())
-        );
     }
 
     #[test]
@@ -447,16 +476,13 @@ mod tests {
     }
 
     #[test]
-    fn unregistered_provider_falls_back_to_native() {
+    fn unregistered_provider_does_not_resolve() {
         let registry = ProviderRegistry::default();
-        let native = Model::from_spec(NATIVE_SPEC).unwrap();
-        let resolved = registry.model(NATIVE_SPEC).unwrap();
-        assert_eq!(resolved.spec(), native.spec());
-        assert_eq!(resolved.context_window, native.context_window);
-        assert_eq!(
-            registry.display_name(SHADOWED).as_deref(),
-            ManifestRegistry::for_slug(SHADOWED).map(|manifest| manifest.display_name)
-        );
+        assert!(matches!(
+            registry.model(&format!("{FAKE}/{WEAK}")),
+            Err(ModelError::UnsupportedProvider(_))
+        ));
+        assert!(registry.display_name(FAKE).is_none());
     }
 
     #[test]

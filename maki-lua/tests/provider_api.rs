@@ -35,6 +35,7 @@ const RETRY_AFTER_SECS: f64 = 1.5;
 const TRANSPORT_MESSAGE: &str = "connection reset";
 const RAISED_MESSAGE: &str = "boom";
 const CONFIG_MESSAGE: &str = "AWS_REGION must be set";
+const INVALID_TYPE_ERR: &str = "invalid type";
 const DUPLICATE_ERR: &str =
     r#"provider "fake" from plugin "other_plugin" is already registered by plugin "fake_plugin""#;
 const UNKNOWN_FIELD_ERR: &str = "unknown field `colour`";
@@ -45,7 +46,6 @@ const LOGIN_REQUIRED_ERR: &str = "login is required";
 const UNKNOWN_METHOD_ERR: &str = "names unknown auth method";
 const BAD_ALIAS_ERR: &str = "must be a valid provider id";
 const DUPLICATE_METHOD_ERR: &str = "is listed twice";
-const CONFIG_KEY_ERR: &str = "config key \"discover_models\"";
 const TOP_LEVEL_ERR: &str = "may only be called at the top level during plugin load";
 const CALL_LOG: &str =
     "c-cancelled:cancelled,c-closed:closed,c-compacted:compacted,c-rewound:rewound,rotate";
@@ -192,7 +192,7 @@ fn text(message: &Message) -> &str {
 #[test_case(r#"auth = { { id = "k", label = "K", login = print }, { id = "k", label = "K", login = print } },"# , DUPLICATE_METHOD_ERR ; "duplicate method")]
 #[test_case(r#"auth = { { id = "k", label = "K", login = print } }, aliases = { { id = "a", label = "A", method = "x" } },"# , UNKNOWN_METHOD_ERR ; "alias naming unknown method")]
 #[test_case(r#"auth = { { id = "k", label = "K", login = print } }, aliases = { { id = "a/b", label = "A", method = "k" } },"# , BAD_ALIAS_ERR ; "alias with bad id")]
-#[test_case(r#"config = { { key = "discover_models", prompt = "Discover" } },"# , CONFIG_KEY_ERR ; "non string config key")]
+#[test_case(r#"docs = { env = "KEY" },"# , INVALID_TYPE_ERR ; "docs env not a list")]
 #[test_case(r#"auth_status = 1,"# , EXPECTED_FUNCTION_ERR ; "auth_status of wrong type")]
 fn invalid_spec_fields_are_rejected(extra: &str, expected: &str) {
     let error = host()
@@ -202,7 +202,7 @@ fn invalid_spec_fields_are_rejected(extra: &str, expected: &str) {
 }
 
 #[test_case(r#"maki.api.register_provider({ id = "x", display_name = "X" })"#, PREPARE_REQUIRED_ERR ; "missing prepare")]
-#[test_case(r#"maki.api.register_provider({ id = 1, display_name = "X", prepare = print })"#, "invalid type" ; "id of wrong type")]
+#[test_case(r#"maki.api.register_provider({ id = 1, display_name = "X", prepare = print })"#, INVALID_TYPE_ERR ; "id of wrong type")]
 #[test_case(r#"maki.api.register_provider({ id = "x/y", display_name = "X", prepare = print })"#, BAD_ID_ERR ; "id with slash")]
 #[test_case(r#"maki.api.register_provider({ id = "..", display_name = "X", prepare = print })"#, BAD_ID_ERR ; "id with leading dot")]
 #[test_case(r#"maki.api.register_provider({ id = "x", display_name = "X", prepare = print, models = { { id = "m", colour = 1 } } })"#, UNKNOWN_FIELD_ERR ; "model descriptor field")]
@@ -473,10 +473,7 @@ fn prepare_and_discover_read_the_provider_config_at_call_time() {
     let mut config = ProvidersConfig::default();
     config.upsert(
         PROVIDER.into(),
-        ProviderDef {
-            base_url: Some(CONFIGURED_URL.into()),
-            ..ProviderDef::default()
-        },
+        ProviderDef::default().with_answers(&[("base_url".into(), CONFIGURED_URL.into())]),
     );
     config.save().unwrap();
 

@@ -35,6 +35,33 @@ const FORBIDDEN_RUST_USAGE_UI_IDENTIFIERS: &[&str] = &[
     "usage_readout",
     "usage_slot",
 ];
+/// Built-in provider ids, which Rust must not name: every provider is
+/// registered from Lua by `plugins/providers`.
+const PROVIDER_IDS: &[&str] = &[
+    "anthropic",
+    "aperture",
+    "bedrock",
+    "copilot",
+    "deepseek",
+    "google",
+    "llama-cpp",
+    "mistral",
+    "ollama",
+    "openai",
+    "opencode",
+    "openrouter",
+    "regolo",
+    "requesty",
+    "synthetic",
+    "tensorx",
+    "vertex",
+    "zai",
+];
+const VENDOR_MODEL_PREFIXES: &[&str] = &["claude-", "gpt-", "gemini-"];
+const VENDOR_ENV_PREFIXES: &[&str] = &["AWS_", "CLAUDE_", "GEMINI_"];
+const PROVIDER_MODULES: &str = "plugins/providers/providers";
+const SHARED_HOSTS: &[&str] = &["github.com", "localhost", "makima.ln4.net", "maki.sh"];
+const URL_SCHEMES: &[&str] = &["https://", "http://"];
 const FORBIDDEN_ACP_COMMANDS: &[&str] = &[
     "/compact",
     "/new",
@@ -114,6 +141,101 @@ fn acp_is_command_agnostic_proxy() {
             );
         }
     }
+}
+
+/// Every host a bundled provider module names, less the shared ones.
+fn provider_hosts() -> Vec<String> {
+    let mut hosts = Vec::new();
+    for entry in fs::read_dir(PROVIDER_MODULES).unwrap() {
+        let module = fs::read_to_string(entry.unwrap().path()).unwrap();
+        for rest in URL_SCHEMES
+            .iter()
+            .flat_map(|scheme| module.split(scheme).skip(1))
+        {
+            let host: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+                .collect();
+            if host.contains('.')
+                && !host.ends_with('.')
+                && !SHARED_HOSTS.iter().any(|shared| host.ends_with(shared))
+            {
+                hosts.push(host);
+            }
+        }
+    }
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+/// The `src` directory of the root package and of every workspace member.
+fn workspace_source_roots() -> Vec<String> {
+    let mut roots = vec!["src".to_owned()];
+    for entry in fs::read_dir(".").unwrap() {
+        let path = entry.unwrap().path();
+        if path.join("Cargo.toml").is_file() && path.join("src").is_dir() {
+            roots.push(path.join("src").to_string_lossy().into_owned());
+        }
+    }
+    roots
+}
+
+fn provider_knowledge(value: &str, hosts: &[String]) -> Option<String> {
+    let env_prefixes = PROVIDER_IDS
+        .iter()
+        .map(|id| format!("{}_", id.to_uppercase().replace('-', "_")))
+        .chain(VENDOR_ENV_PREFIXES.iter().map(|prefix| prefix.to_string()));
+    if let Some(id) = PROVIDER_IDS
+        .iter()
+        .find(|id| value == **id || value.starts_with(&format!("{id}/")))
+    {
+        Some(format!("provider id `{id}`"))
+    } else if let Some(prefix) = VENDOR_MODEL_PREFIXES
+        .iter()
+        .find(|p| value.starts_with(**p))
+    {
+        Some(format!("model prefix `{prefix}`"))
+    } else if let Some(prefix) = env_prefixes
+        .into_iter()
+        .find(|p| value.contains(p.as_str()))
+    {
+        Some(format!("env var prefix `{prefix}`"))
+    } else {
+        hosts
+            .iter()
+            .find(|host| value.contains(host.as_str()))
+            .map(|host| format!("endpoint host `{host}`"))
+    }
+}
+
+#[test]
+fn rust_source_names_no_provider() {
+    let hosts = provider_hosts();
+    assert!(!hosts.is_empty(), "no hosts found in {PROVIDER_MODULES}");
+    let roots = workspace_source_roots();
+    let roots: Vec<&str> = roots.iter().map(String::as_str).collect();
+    let mut found = Vec::new();
+    for source in production_sources(&roots).expect(SOURCE_SCAN_ERROR) {
+        // A file named for tests holds a module its parent gates behind
+        // `cfg(test)`.
+        if source.path.to_string_lossy().contains("test") {
+            continue;
+        }
+        for value in &source.strings {
+            if let Some(knowledge) = provider_knowledge(value, &hosts) {
+                found.push(format!(
+                    "{}: {knowledge} in {value:?}",
+                    source.path.display()
+                ));
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "provider knowledge in Rust:\n{}",
+        found.join("\n")
+    );
 }
 
 #[test]
@@ -223,11 +345,12 @@ fn collect(node: Node<'_>, text: &[u8], in_test: bool, source: &mut Source) {
                 source.calls.push(name);
             }
         }
-        "string_literal" => {
-            if let Ok(literal) = node.utf8_text(text)
-                && let Some(value) = literal.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
-            {
-                source.strings.push(value.to_owned());
+        "string_literal" | "raw_string_literal" => {
+            if let Ok(literal) = node.utf8_text(text) {
+                let value = literal.trim_start_matches('r').trim_matches('#');
+                if let Some(value) = value.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+                    source.strings.push(value.to_owned());
+                }
             }
         }
         _ => {}
@@ -239,7 +362,7 @@ fn collect(node: Node<'_>, text: &[u8], in_test: bool, source: &mut Source) {
 }
 
 fn is_test_item(node: Node<'_>, text: &[u8]) -> bool {
-    if !matches!(node.kind(), "mod_item" | "function_item") {
+    if !node.kind().ends_with("_item") || node.kind() == "attribute_item" {
         return false;
     }
     let mut sibling = node.prev_named_sibling();

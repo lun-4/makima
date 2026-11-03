@@ -7,8 +7,8 @@ use maki_config::SessionDefaults;
 use maki_providers::model::Model;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    Effort, Invocation, Message, ModelInfo, ProviderEvent, RequestOptions, StopReason,
-    StreamResponse, TokenUsage,
+    Effort, Invocation, Message, ProviderEvent, RequestOptions, StopReason, StreamResponse,
+    TokenUsage,
 };
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::{Effort as StoredEffort, StoredThinking};
@@ -592,10 +592,6 @@ impl Provider for RecordingProvider {
                 stop_reason: Some(StopReason::EndTurn),
             })
         })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
     }
 }
 

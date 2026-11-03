@@ -130,6 +130,7 @@ fn refresh_keeps_catalog_and_recents_through_slow_provider_failure() {
             release: release_rx,
         }),
         auth: AuthSpec::default(),
+        docs: None,
     }]));
 
     with_event_loop_providers(providers, |event_loop| {

@@ -314,6 +314,7 @@ mod tests {
     use crate::components::key;
     use crate::components::keybindings::key as kb;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use maki_providers::test_util::offline_ids;
     use test_case::test_case;
 
     const SAME_SIZED_LIST: &str = "a republished list of the same length is still a new list";
@@ -328,7 +329,7 @@ mod tests {
         models.store(Some(Arc::new(vec![
             "anthropic/claude-sonnet-4-20250514".into(),
         ])));
-        let mut p = ModelPicker::new(Arc::clone(&models), Arc::default());
+        let mut p = ModelPicker::new(Arc::clone(&models), test_providers());
         p.open("");
         assert_eq!(p.refresh(), Dirty::NO);
 
@@ -339,6 +340,13 @@ mod tests {
             Some(SWAPPED_SPEC),
             "{SAME_SIZED_LIST}"
         );
+    }
+
+    const ANTHROPIC: &str = "anthropic";
+    const OLLAMA: &str = "ollama";
+
+    fn test_providers() -> Arc<ProviderRegistry> {
+        Arc::new(offline_ids(&[ANTHROPIC, OLLAMA]))
     }
 
     fn test_models() -> Arc<ArcSwapOption<Vec<String>>> {
@@ -354,7 +362,7 @@ mod tests {
     #[test_case(key(KeyCode::Esc)          ; "esc_closes")]
     #[test_case(kb::QUIT.to_key_event()    ; "ctrl_c_closes")]
     fn close_keys(cancel_key: KeyEvent) {
-        let mut p = ModelPicker::new(test_models(), Arc::default());
+        let mut p = ModelPicker::new(test_models(), test_providers());
         p.open("");
         let action = p.handle_key(cancel_key);
         assert!(matches!(action, ModelPickerAction::Close));
@@ -367,7 +375,7 @@ mod tests {
         models.store(Some(Arc::new(vec![
             "anthropic/claude-sonnet-4-20250514".into(),
         ])));
-        let mut p = ModelPicker::new(models.clone(), Arc::default());
+        let mut p = ModelPicker::new(models.clone(), test_providers());
         p.open("");
 
         p.handle_key(key(KeyCode::Char('o')));
@@ -388,7 +396,7 @@ mod tests {
 
     #[test]
     fn open_preselects_current_model() {
-        let mut p = ModelPicker::new(test_models(), Arc::default());
+        let mut p = ModelPicker::new(test_models(), test_providers());
         p.open("anthropic/claude-opus-4-6-20260101");
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(
@@ -398,23 +406,17 @@ mod tests {
 
     #[test]
     fn parse_model_entry_valid() {
-        let entry = parse_model_entry(
-            "anthropic/claude-sonnet-4-20250514",
-            &ProviderRegistry::default(),
-        )
-        .unwrap();
+        let entry =
+            parse_model_entry("anthropic/claude-sonnet-4-20250514", &test_providers()).unwrap();
         assert_eq!(entry.id, "claude-sonnet-4-20250514");
-        assert_eq!(entry.provider_display, "Anthropic");
+        assert_eq!(entry.provider_display, ANTHROPIC);
         assert!(!entry.tier.is_empty());
     }
 
     #[test]
     fn parse_model_entry_paid_model_not_marked_free() {
-        let entry = parse_model_entry(
-            "anthropic/claude-sonnet-4-20250514",
-            &ProviderRegistry::default(),
-        )
-        .unwrap();
+        let entry =
+            parse_model_entry("anthropic/claude-sonnet-4-20250514", &test_providers()).unwrap();
         assert!(
             !entry.tier.starts_with(FREE_PREFIX),
             "paid anthropic model must not be marked free"
@@ -432,7 +434,7 @@ mod tests {
     #[test_case(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::SHIFT), ModelTier::Strong     ; "kitty_shift_1_strong")]
     #[test_case(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::SHIFT), ModelTier::Compaction ; "kitty_shift_4_compaction")]
     fn tier_shortcut_assigns_and_keeps_picker_open(k: KeyEvent, want: ModelTier) {
-        let mut p = ModelPicker::new(test_models(), Arc::default());
+        let mut p = ModelPicker::new(test_models(), test_providers());
         p.open("anthropic/claude-sonnet-4-20250514");
         let action = p.handle_key(k);
         assert!(
@@ -446,7 +448,7 @@ mod tests {
     #[test]
     fn refresh_preserves_selection_for_current_model() {
         let models = Arc::new(ArcSwapOption::empty());
-        let mut p = ModelPicker::new(models.clone(), Arc::default());
+        let mut p = ModelPicker::new(models.clone(), test_providers());
         p.open("anthropic/claude-opus-4-6-20260101");
 
         models.store(Some(Arc::new(vec![
@@ -466,7 +468,7 @@ mod tests {
     #[test]
     fn recents_include_current_model_preselected() {
         let models = test_models();
-        let mut p = ModelPicker::new(models, Arc::default());
+        let mut p = ModelPicker::new(models, test_providers());
         p.set_recents(vec![
             "ollama/glm-5".into(),
             "anthropic/claude-sonnet-4-20250514".into(),
@@ -495,7 +497,7 @@ mod tests {
     #[test]
     fn reopen_preselects_current_model_in_provider_section() {
         let models = test_models();
-        let mut p = ModelPicker::new(models, Arc::default());
+        let mut p = ModelPicker::new(models, test_providers());
         p.set_recents(vec![
             "ollama/glm-5".into(),
             "anthropic/claude-sonnet-4-20250514".into(),
@@ -514,7 +516,7 @@ mod tests {
         assert_eq!(entry.spec, "ollama/glm-5");
         assert_eq!(
             entry.section(),
-            Some("Ollama"),
+            Some(OLLAMA),
             "selection should land on the provider entry, not the Recent copy",
         );
     }
@@ -522,7 +524,7 @@ mod tests {
     #[test]
     fn refresh_keeps_selection_on_provider_entry() {
         let models = test_models();
-        let mut p = ModelPicker::new(models, Arc::default());
+        let mut p = ModelPicker::new(models, test_providers());
         p.set_recents(vec![
             "ollama/glm-5".into(),
             "anthropic/claude-sonnet-4-20250514".into(),
@@ -537,7 +539,7 @@ mod tests {
         assert_eq!(entry.spec, "ollama/glm-5");
         assert_eq!(
             entry.section(),
-            Some("Ollama"),
+            Some(OLLAMA),
             "selection should stay on the provider entry, not jump to Recent",
         );
     }
@@ -545,7 +547,7 @@ mod tests {
     #[test]
     fn refresh_after_collapse_anchors_to_provider_entry() {
         let models = test_models();
-        let mut p = ModelPicker::new(models.clone(), Arc::default());
+        let mut p = ModelPicker::new(models.clone(), test_providers());
         p.set_recents(vec![
             "ollama/glm-5".into(),
             "anthropic/claude-sonnet-4-20250514".into(),
@@ -569,7 +571,7 @@ mod tests {
         assert_eq!(entry.spec, "anthropic/claude-sonnet-4-20250514");
         assert_eq!(
             entry.section(),
-            Some("Anthropic"),
+            Some(ANTHROPIC),
             "cursor should migrate to the provider entry once it arrives",
         );
     }
@@ -577,7 +579,7 @@ mod tests {
     #[test]
     fn refresh_preserves_navigation_to_recent_entry() {
         let models = test_models();
-        let mut p = ModelPicker::new(models.clone(), Arc::default());
+        let mut p = ModelPicker::new(models.clone(), test_providers());
         p.set_recents(vec![
             "ollama/glm-5".into(),
             "anthropic/claude-sonnet-4-20250514".into(),
@@ -606,7 +608,7 @@ mod tests {
     #[test]
     fn refresh_preserves_selection_with_active_search() {
         let models = test_models();
-        let mut p = ModelPicker::new(models.clone(), Arc::default());
+        let mut p = ModelPicker::new(models.clone(), test_providers());
         p.set_recents(vec![
             "ollama/glm-5".into(),
             "anthropic/claude-sonnet-4-20250514".into(),

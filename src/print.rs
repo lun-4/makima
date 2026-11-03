@@ -848,6 +848,19 @@ mod tests {
     const DISCOVERED_WINDOW: u32 = 777_000;
     const MODELS_COMMAND: &str = "/print_models";
 
+    /// The provider of [`PRINT_MODEL`], which supports fast mode.
+    fn print_providers() -> Arc<ProviderRegistry> {
+        let (provider, id) = Model::parse_spec(PRINT_MODEL).unwrap();
+        Arc::new(maki_providers::test_util::offline_registry(vec![(
+            provider,
+            vec![maki_providers::ModelInfo {
+                supports_fast: Some(true),
+                supports_thinking: Some(true),
+                ..maki_providers::ModelInfo::id_only(id.into())
+            }],
+        )]))
+    }
+
     #[test_case("completed"; "completed")]
     #[test_case("failed"; "failed")]
     #[test_case("cancelled"; "cancelled")]
@@ -1073,7 +1086,7 @@ mod tests {
             append_system_prompt: None,
             defaults: Default::default(),
             model_policy: Arc::default(),
-            providers: Arc::default(),
+            providers: print_providers(),
             modes: EventHandle::disconnected_for_test().mode_registry(),
             question_mode: QuestionMode::Headless,
             plugin_rules: Arc::default(),
@@ -1243,15 +1256,6 @@ mod tests {
                 })
             })
         }
-
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, maki_agent::AgentError>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
-        }
     }
 
     struct SettlementTool {
@@ -1329,10 +1333,6 @@ mod tests {
                     stop_reason: Some(StopReason::ToolUse),
                 })
             })
-        }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-            Box::pin(async { Ok(Vec::new()) })
         }
     }
 

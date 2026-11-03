@@ -20,6 +20,25 @@ M.DEFAULT_PREFIX = "/v1"
 M.DEFAULTS = { context_window = 128000, max_output_tokens = 16384, supports_thinking = false }
 
 local DISPLAY_NAME = "Aperture"
+local NOTES = [[
+Aperture discovers models from your Tailscale Aperture gateway at `APERTURE_HOST` (like `https://your-host.tailnet.ts.net`), or at the `base_url` saved by `makima auth login aperture`. Tailscale identifies you, so no key is needed. Each model is `aperture/<upstream>/<model>`, and a model whose upstream is a built-in provider streams through that provider's own request code.
+
+Overrides keyed by upstream id live under `[aperture.overrides]` in `providers.toml`:
+
+```toml
+[aperture.overrides.llmserver]
+base = "llama-cpp"
+context_window = 131072
+max_output_tokens = 16384
+
+[aperture.overrides.llmserver.models."qwen-3.6"]
+context_window = 262144
+supports_vision = true
+```
+
+Upstream fields apply to every model from that upstream; entries under `models` win field by field. Fields: `context_window`, `max_output_tokens`, `supports_thinking`, `supports_vision`, `base` (routes an upstream through a built-in provider, like `llama-cpp`, `google` or `anthropic`) and `path_prefix`. Quote model ids that contain dots, since TOML reads a bare dotted key as nested tables.
+
+Makima sends `/v1` (or `/v1beta` for Gemini routes, nothing for Anthropic and Z.AI) and Aperture appends it to the upstream's base URL. If an upstream base URL already carries its own path, set `path_prefix = ""` for it.]]
 local MODELS_PATH = "/v1/models"
 local GEMINI_PREFIX = "/v1beta"
 local BASE_URL_KEY = "base_url"
@@ -243,6 +262,7 @@ function M.provider()
     display_name = DISPLAY_NAME,
     config = { { key = BASE_URL_KEY, prompt = HOST_PROMPT } },
     auth = compat.api_key_auth({ display_name = DISPLAY_NAME, key_optional = true }),
+    docs = { env = { M.HOST_ENV }, notes = NOTES },
   }
 
   function spec.auth_status(_, config)

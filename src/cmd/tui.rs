@@ -14,7 +14,7 @@ use maki_config::project::{self, ProjectDecision, TrustAnswer, policy_grant};
 use maki_config::{Config, ModelPolicy, ProjectConfig, load_env_files, load_permissions};
 use maki_lua::PluginHost;
 use maki_lua::ui_sink::{HeadlessUi, HostUi};
-use maki_providers::model::Model;
+use maki_providers::model::{Model, ModelTier};
 use maki_providers::{ProviderRegistry, Timeouts};
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
@@ -25,7 +25,6 @@ use maki_ui::{AppSession, RunOutcome};
 use crate::cli::{Cli, normalize_tool_name};
 use crate::setup;
 
-const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
 const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous model";
 const PIPED_INPUT_SEPARATOR: &str = "\n\n";
@@ -201,10 +200,11 @@ fn build_stack(
             warnings.push(format!("{MODEL_FALLBACK_WARNING}: {e:#}"));
             (last_model, false)
         }
-        (Err(_), None) if !cli.print => {
+        (Err(e), None) if !cli.print => {
             let placeholder = providers
-                .model(FALLBACK_MODEL_SPEC)
-                .expect("fallback model");
+                .spec_for_tier_any(ModelTier::Medium)
+                .and_then(|spec| providers.model(&spec).ok())
+                .ok_or(e)?;
             (placeholder, true)
         }
         (Err(e), None) => return Err(e),
@@ -647,7 +647,7 @@ mod tests {
         let session = AppSession::new("anthropic/claude-opus-4-6", "/tmp");
 
         let resolved = restored_session_model(
-            &ProviderRegistry::default(),
+            &maki_providers::test_util::offline_ids(&["anthropic", "openai"]),
             &startup,
             &session,
             explicit_model,

@@ -20,8 +20,8 @@ use maki_lua::agent_errors::{INVOCATION_EXPIRED, TURN_WAIT_TIMEOUT};
 use maki_lua::test_support::InMemoryFs;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    AgentError, ContentBlock, Invocation, Message, Model, ModelInfo, ObservationSource,
-    ProviderEvent, RequestOptions, Role, StreamResponse,
+    AgentError, ContentBlock, Invocation, Message, Model, ObservationSource, ProviderEvent,
+    RequestOptions, Role, StreamResponse,
 };
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
@@ -800,10 +800,6 @@ impl Provider for NestedRecordingProvider {
             }
         })
     }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
 }
 
 impl Provider for RecordingProvider {
@@ -822,10 +818,6 @@ impl Provider for RecordingProvider {
             self.requests.send((model.spec(), opts)).unwrap();
             Ok(common::canned_reply(SILENT_REPLY))
         })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
     }
 }
 
@@ -1032,10 +1024,6 @@ impl Provider for PendingProvider {
             unreachable!()
         })
     }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
 }
 
 fn input() -> AgentInput {
@@ -1203,10 +1191,6 @@ impl Provider for AutoDeliveryProvider {
                 }),
             }
         })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
     }
 }
 
@@ -1506,10 +1490,6 @@ impl Provider for ScriptedTaskProvider {
                 }),
             }
         })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
     }
 }
 

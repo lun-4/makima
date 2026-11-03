@@ -464,7 +464,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         Fast,
         "/fast",
         &[],
-        "Toggle fast mode (Anthropic Opus or Codex subscription models)",
+        "Toggle fast mode on models that offer it",
         typed & [],
         NO_ARGUMENT_COMPLETIONS,
         None,

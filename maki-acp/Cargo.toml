@@ -20,6 +20,7 @@ tracing = { workspace = true }
 color-eyre = { workspace = true }
 
 [dev-dependencies]
+maki-providers = { workspace = true, features = ["test-util"] }
 maki-agent = { workspace = true, features = ["test-util"] }
 maki-storage = { workspace = true, features = ["test-util"] }
 maki-lua = { workspace = true, features = ["test-support"] }

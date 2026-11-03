@@ -1957,12 +1957,6 @@ impl Provider for ConfigTestProvider {
     ) -> BoxFuture<'a, Result<StreamResponse, maki_providers::AgentError>> {
         Box::pin(async { unreachable!() })
     }
-
-    fn list_models(
-        &self,
-    ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
 }
 
 fn config(model: &str, fast: bool) -> crate::actor::EffectiveAgentConfig {

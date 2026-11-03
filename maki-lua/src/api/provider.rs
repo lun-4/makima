@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use maki_config::providers::{ProviderDef, ProvidersConfig};
 use maki_lua_macro::{lua_fn, lua_table};
-use maki_providers::ModelInfo;
 use maki_providers::login::{AuthMethod, AuthSpec, ConfigField, LoginAlias};
+use maki_providers::{ModelInfo, ProviderDocs};
 use mlua::{DeserializeOptions, Function, Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 use serde::Deserialize;
 use serde::de::{Deserializer, Error, Visitor};
@@ -31,6 +31,7 @@ pub(crate) struct ProviderSpec {
     pub(crate) logins: Vec<Function>,
     pub(crate) auth_status: Option<Function>,
     pub(crate) logout: Option<Function>,
+    pub(crate) docs: Option<ProviderDocs>,
     /// The registering plugin's `maki.net.send`, carrying its permissions.
     pub(crate) send: Function,
 }
@@ -111,6 +112,8 @@ struct SpecFields {
     config: Vec<ConfigField>,
     #[serde(default)]
     section: Option<String>,
+    #[serde(default)]
+    docs: Option<ProviderDocs>,
     #[serde(default, rename = "auth_status")]
     _auth_status: Callback,
     #[serde(default, rename = "logout")]
@@ -126,7 +129,7 @@ fn valid_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || ID_PUNCTUATION.contains(c))
 }
 
-/// Checks what serde cannot: references between methods, aliases and config.
+/// Checks what serde cannot: references between methods and aliases.
 fn validate_auth(id: &str, auth: &AuthSpec) -> Result<(), String> {
     let methods: Vec<&str> = auth.methods.iter().map(|method| &*method.id).collect();
     for (i, method) in methods.iter().enumerate() {
@@ -144,11 +147,6 @@ fn validate_auth(id: &str, auth: &AuthSpec) -> Result<(), String> {
                 alias.id, alias.method
             ));
         }
-    }
-    for field in &auth.config {
-        ProviderDef::default()
-            .with_answers(&[(field.key.clone(), String::new())])
-            .map_err(|error| format!("config key {:?}: {error}", field.key))?;
     }
     Ok(())
 }
@@ -182,8 +180,8 @@ fn spec_error(message: impl fmt::Display) -> mlua::Error {
 ///   the user asked to bypass caches (`maki models --refresh`).
 ///   `config` (table) Optional. `providers.toml` fields asked before login:
 ///   `{ key, prompt, default?, secret?, optional?, choices? }`, where
-///   `choices` is a list of `{ id, label, detail? }`. Keys are the text
-///   fields of a provider section, such as `base_url` or `plan`.
+///   `choices` is a list of `{ id, label, detail? }`. Each answer is saved
+///   as a text field of the provider's section, such as `base_url`.
 ///   `auth` (table) Login methods: `{ id, label, login }`.
 ///   `login(ctx, ui, config)` gets a `maki.provider.LoginUi` and the
 ///   provider's section with this login's answers applied, not yet saved.
@@ -199,6 +197,10 @@ fn spec_error(message: impl fmt::Display) -> mlua::Error {
 ///   provider counts as logged in while its credentials file exists.
 ///   `logout` (function) Optional. `logout(ctx)`. Without it, logout
 ///   deletes the credentials file.
+///   `docs` (table) Optional. What the providers reference page says
+///   beyond models, login methods and config fields: `env` (the
+///   environment variables it reads), `endpoint` (its default endpoint) and
+///   `notes` (Markdown). Providers without it are left off that page.
 ///
 /// Config is saved and the default model chosen only after `login`
 /// succeeds and `auth_status` no longer reports `missing`.
@@ -211,11 +213,10 @@ fn spec_error(message: impl fmt::Display) -> mlua::Error {
 /// `refresh_auth(ctx)`, `reload_auth(ctx)`, `rotate_key(ctx)`,
 /// `end_conversation(ctx, conversation_id, reason)` and `key_count` (a
 /// number, or a function read once at prepare). `request` has `model`
-/// (`id`, `output_tokens`, `max_output_tokens`, `context_window`), `system`, `messages`, `tools`, `thinking`, `fast`,
-/// `session_id` and `invocation` (`conversation_id`, `operation_id`,
-/// `attempt`, `purpose`, `agent_id`). `max_output_tokens` is what the model
-/// declares; `output_tokens` is that cap trimmed to this request's turn
-/// budget. `reason` is `cancelled`,
+/// (`id`, `max_output_tokens`, `context_window`), `system`, `messages`,
+/// `tools`, `thinking`, `fast`, `session_id` and `invocation`
+/// (`conversation_id`, `operation_id`, `attempt`, `purpose`, `agent_id`).
+/// `max_output_tokens` is what the model declares. `reason` is `cancelled`,
 /// `closed`, `compacted` or `rewound`; the host never uses an ended
 /// conversation id again. `emit(event)` takes `{ type = "text_delta", text }`
 /// and the other provider events, and returns false once the call is over.
@@ -322,6 +323,7 @@ fn register_provider(
         logins,
         auth_status: spec.get("auth_status")?,
         logout: spec.get("logout")?,
+        docs: fields.docs,
         send,
     });
     Ok(())

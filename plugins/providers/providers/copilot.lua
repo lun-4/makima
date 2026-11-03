@@ -520,6 +520,11 @@ function M.provider()
   return {
     id = M.def.id,
     display_name = M.def.display_name,
+    docs = {
+      env = TOKEN_ENVS,
+      endpoint = M.DEFAULT_ENDPOINT,
+      notes = "`makima auth login copilot` imports a token from the gh CLI, the Copilot client or the system keyring. Each model streams through the API its endpoint names: Messages, Responses or Chat Completions.",
+    },
     models = compat.descriptors(M.def),
     auth = { { id = METHOD.id, label = METHOD.label, login = login } },
     auth_status = auth_status,

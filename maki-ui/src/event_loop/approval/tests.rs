@@ -17,8 +17,8 @@ use maki_domain::ThinkingConfig as DomainThinkingConfig;
 use maki_lua::PluginHost;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    AgentError, ContentBlock, Invocation, Message, Model, ModelInfo, ProviderEvent, RequestOptions,
-    Role, StopReason, StreamResponse, TokenUsage,
+    AgentError, ContentBlock, Invocation, Message, Model, ProviderEvent, RequestOptions, Role,
+    StopReason, StreamResponse, TokenUsage,
 };
 use maki_storage::checkpoint::{CheckpointRequest, CheckpointVersion, CheckpointWriter};
 use maki_storage::id::{MakiId, SessionRef};
@@ -153,10 +153,6 @@ impl Provider for RecordingProvider {
             })
         })
     }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
 }
 
 struct ChildProvider {
@@ -212,10 +208,6 @@ impl Provider for ChildProvider {
                 }),
             })
         })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
     }
 }
 

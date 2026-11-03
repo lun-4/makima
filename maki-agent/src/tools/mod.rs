@@ -46,7 +46,7 @@ use crate::{
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_providers::RequestOptions;
 use maki_providers::provider::Provider;
-use maki_providers::{Invocation, Model, ProviderRegistry};
+use maki_providers::{Invocation, Model, ModelInfo, ProviderRegistry};
 use maki_storage::id::SessionRef;
 
 pub struct DescriptionContext<'a> {
@@ -232,6 +232,9 @@ pub const WRITE_TOOL_NAME: &str = "write";
 pub const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
 pub(crate) const DEADLINE_EXCEEDED: &str = "timeout exceeded";
 pub const TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(1);
+/// Provider and model id of the placeholder model a context without a model
+/// carries.
+const NO_MODEL: &str = "none";
 
 #[derive(Clone, Copy, Debug, Default)]
 pub enum Deadline {
@@ -838,12 +841,6 @@ impl Provider for NullProvider {
     ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
         Box::pin(async { unimplemented!() })
     }
-
-    fn list_models(
-        &self,
-    ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, crate::AgentError>> {
-        Box::pin(async { unimplemented!() })
-    }
 }
 
 pub fn interpreter_ctx(
@@ -856,8 +853,12 @@ pub fn interpreter_ctx(
     cwd: PathBuf,
 ) -> ToolContext {
     static PROVIDER: LazyLock<Arc<dyn Provider>> = LazyLock::new(|| Arc::new(NullProvider));
-    static MODEL: LazyLock<Arc<Model>> =
-        LazyLock::new(|| Arc::new(Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap()));
+    static MODEL: LazyLock<Arc<Model>> = LazyLock::new(|| {
+        Arc::new(Model::from_info(
+            NO_MODEL,
+            &ModelInfo::id_only(NO_MODEL.into()),
+        ))
+    });
     let modes = Arc::new(crate::ModeRegistry::builtin());
     ToolContext {
         execution_agent_id: None,

@@ -195,12 +195,6 @@ mod tests {
             }
         }
 
-        fn list_models(
-            &self,
-        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, crate::AgentError>> {
-            Box::pin(async { unimplemented!() })
-        }
-
         fn end_conversation(
             &self,
             conversation_id: &str,

@@ -32,6 +32,25 @@ local SONNET = pricing(3.00, 15.00, 3.75, 0.30)
 local OPUS = pricing(5.00, 25.00, 6.25, 0.50)
 local FAST_OPUS = pricing(5.00, 25.00, 6.25, 0.50, { input = 10.00, output = 50.00 })
 
+local NOTES = [[
+Add `-1m` to any Claude model, like `claude-sonnet-4-6-1m`, to use the 1M token context window.
+
+#### Amazon Bedrock
+
+If you already use Claude through AWS Bedrock, set `CLAUDE_CODE_USE_BEDROCK=1` and every Anthropic request goes through Bedrock instead. The same models, the same features, just a different door.
+
+You need `AWS_REGION` and one of these for auth:
+
+| Method | Env vars |
+|--------|----------|
+| IAM credentials | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (and optionally `AWS_SESSION_TOKEN`) |
+| Credentials file | `AWS_PROFILE` (defaults to `default`), reads `~/.aws/credentials` |
+| Bearer token | `AWS_BEARER_TOKEN_BEDROCK` |
+| Container credentials | `AWS_CONTAINER_CREDENTIALS_FULL_URI` |
+| Gateway proxy | `CLAUDE_CODE_SKIP_BEDROCK_AUTH=1` + `ANTHROPIC_BEDROCK_BASE_URL` (skips signing, for a proxy that handles auth) |
+
+`ANTHROPIC_MODEL` overrides the model and `ANTHROPIC_BEDROCK_BASE_URL` the endpoint. These names match Claude Code, so a Bedrock setup from there works here as is.]]
+
 -- The first row of a tier is its default.
 M.def = {
   id = "anthropic",
@@ -40,6 +59,7 @@ M.def = {
   base_url = "https://api.anthropic.com",
   login_url = "https://console.anthropic.com/settings/keys",
   model = "claude-sonnet-4-6",
+  notes = NOTES,
   defaults = {
     context_window = 200000,
     max_output_tokens = 128000,

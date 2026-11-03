@@ -21,8 +21,8 @@ use maki_lua::{
     test_support::run_command,
 };
 use maki_providers::{
-    AgentError, ContentBlock, Invocation, Message, Model, ModelInfo, ProviderEvent, RequestOptions,
-    Role, StreamResponse, TokenUsage,
+    AgentError, ContentBlock, Invocation, Message, Model, ProviderEvent, RequestOptions, Role,
+    StreamResponse, TokenUsage,
     provider::{BoxFuture, Provider},
 };
 use maki_storage::id::{MakiId, SessionRef};
@@ -234,10 +234,6 @@ impl Provider for GatedProvider {
                 .unwrap();
             common::bounded(response.recv_async()).await.unwrap()
         })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
     }
 }
 

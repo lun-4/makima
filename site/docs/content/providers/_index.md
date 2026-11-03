@@ -7,7 +7,7 @@ group = "Reference"
 
 # Providers
 
-Makima talks to LLM providers over their HTTP APIs. Models are split into three tiers: **weak** (cheap and fast), **medium** (balanced), and **strong** (highest capability, highest cost). There is also a **compaction** tier for choosing a dedicated model to summarize context when the conversation grows long.
+Makima talks to LLM providers over their HTTP APIs. Every provider is registered by a Lua plugin; the built-in ones come from the bundled `providers` plugin. Models are split into three tiers: **weak** (cheap and fast), **medium** (balanced), and **strong** (highest capability, highest cost). There is also a **compaction** tier for choosing a dedicated model to summarize context when the conversation grows long.
 
 Open the model picker with `/model` and press `!`, `@`, `#`, or `$` on any row to assign it to strong, medium, weak, or compaction. Press the same key again to remove the assignment. Your overrides are saved to `~/.local/state/makima/model-tiers` and apply across sessions.
 
@@ -15,134 +15,84 @@ Open the model picker with `/model` and press `!`, `@`, `#`, or `$` on any row t
 
 Makima re-reads auth from storage and environment variables each time a new agent spawns (`/new`, retry, session load). If you run `makima auth login` in another terminal or change an env var, the next session picks it up without a restart.
 
-You can set multiple API keys in one env var (`ANTHROPIC_API_KEY=sk-1,sk-2,sk-3`) and they rotate automatically on rate-limit or auth errors.
+An API key variable can hold several keys separated by commas (`sk-1,sk-2,sk-3`). They rotate on rate-limit and auth errors.
 
-## Base URL Overrides
+## Base URLs and providers.toml
 
-Every provider honors a `<SLUG>_BASE_URL` env var (`anthropic` -> `ANTHROPIC_BASE_URL`, `llama-cpp` -> `LLAMA_CPP_BASE_URL`). Set it to the origin of a proxy or a compatible endpoint and Makima appends the API paths itself:
+`providers.toml` lives in the config directory (`~/.config/makima/providers.toml` on Linux and macOS, `%APPDATA%\makima\providers.toml` on Windows). Each section is named after a provider id and holds that provider's settings. `makima auth login` writes the answers it asks for there, and `makima auth logout` removes the section.
+
+Most hosted providers read these fields:
+
+| Field | Notes |
+|-------|-------|
+| `base_url` | Origin of a proxy or compatible endpoint; Makima appends the API paths |
+| `api_key_env` | Env var that holds the key, instead of the one listed below |
+| `api_key` | Inline key (prefer the env var or `makima auth login`) |
+| `headers` | Extra headers sent with every request; values expand `${VAR}` from the environment, and a same-name header replaces the built-in auth header |
+
+A provider that lists a `<ID>_BASE_URL` variable below honors it over `base_url`, so a proxy can be set for one run:
 
 ```sh
-ANTHROPIC_BASE_URL=https://my-proxy.internal makima
+<ID>_BASE_URL=https://my-proxy.internal makima
 ```
 
-It wins over `providers.toml` and built-in defaults. `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` are the same names the official SDKs use, so an existing proxy setup carries over as is. One exception: `OPENAI_BASE_URL` only redirects the platform API, never the ChatGPT Coding Plan backend.
+Local servers list a host variable instead, and the `base_url` saved by `makima auth login` wins over it. Provider-specific fields are described in each provider's section.
 
-You can also set `base_url` for a built-in provider in `~/.config/makima/providers.toml`. It overrides the built-in default and loses to the env var above:
+## Built-in Providers
 
-```toml
-[openai]
-base_url = "http://xxxx:1234/v1"
-```
+### Anthropic
 
-The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discover_models` and `models` are ignored with a warning. Use a custom slug if you need those.
+- **Id**: `anthropic`
+- **Env vars**: `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`
+- **API**: `https://api.anthropic.com`
+- **Login**: `makima auth login anthropic` (API key)
 
-## Model Identifiers
+| Tier | Model | Pricing (in/out per 1M tokens) | Limits |
+|------|-------|-------------------------------|--------|
+| weak | **claude-haiku-4-5** (default) | $1.00 / $5.00 | 200K ctx / 64K out |
+| medium | **claude-sonnet-5** (default) | $2.00 / $10.00 | 200K ctx / 128K out |
+| medium | claude-sonnet-4-6 | $3.00 / $15.00 | 200K ctx / 64K out |
+| medium | claude-sonnet-4-5 | $3.00 / $15.00 | 200K ctx / 64K out |
+| medium | claude-sonnet-4 | $3.00 / $15.00 | 200K ctx / 64K out |
+| strong | **claude-opus-5** (default) | $5.00 / $25.00 | 200K ctx / 128K out |
+| strong | claude-opus-4-8 | $5.00 / $25.00 | 200K ctx / 128K out |
+| strong | claude-opus-4-7 | $5.00 / $25.00 | 200K ctx / 128K out |
+| strong | claude-opus-4-6 | $5.00 / $25.00 | 200K ctx / 128K out |
+| strong | claude-opus-4-5 | $5.00 / $25.00 | 200K ctx / 64K out |
+| strong | claude-fable-5 | $10.00 / $50.00 | 200K ctx / 128K out |
+| strong | claude-opus-4-0 | $15.00 / $75.00 | 200K ctx / 32K out |
+| strong | claude-opus-4-1 | $15.00 / $75.00 | 200K ctx / 32K out |
 
-Models are referenced as `provider/model_id`:
+Add `-1m` to any Claude model, like `claude-sonnet-4-6-1m`, to use the 1M token context window.
 
-```
-anthropic/claude-sonnet-4-6
-openai/gpt-4.1
-zai/glm-4.7
-```
+#### Amazon Bedrock
 
-If the model name is unique across providers, the prefix can be omitted.
+If you already use Claude through AWS Bedrock, set `CLAUDE_CODE_USE_BEDROCK=1` and every Anthropic request goes through Bedrock instead. The same models, the same features, just a different door.
 
-### Models newer than your Maki version
+You need `AWS_REGION` and one of these for auth:
 
-The tables above list the models Maki curates. Any other id a provider accepts works too: type it into `/model` or pass it to `--model`. The picker also lists what the provider's own model endpoint reports, so same-day releases are selectable there.
+| Method | Env vars |
+|--------|----------|
+| IAM credentials | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (and optionally `AWS_SESSION_TOKEN`) |
+| Credentials file | `AWS_PROFILE` (defaults to `default`), reads `~/.aws/credentials` |
+| Bearer token | `AWS_BEARER_TOKEN_BEDROCK` |
+| Container credentials | `AWS_CONTAINER_CREDENTIALS_FULL_URI` |
+| Gateway proxy | `CLAUDE_CODE_SKIP_BEDROCK_AUTH=1` + `ANTHROPIC_BEDROCK_BASE_URL` (skips signing, for a proxy that handles auth) |
 
-For an id no table covers, rates, context window, vision and thinking support come from [models.dev](https://models.dev/), refreshed daily (`maki models --refresh` forces it). Maki reads each field on its own, so a row that lists a price but no context window still leaves the window to the sources below.
+`ANTHROPIC_MODEL` overrides the model and `ANTHROPIC_BEDROCK_BASE_URL` the endpoint. These names match Claude Code, so a Bedrock setup from there works here as is.
 
-Sources rank by how sure they are to describe the exact model you asked for:
+### Aperture
 
-1. What the provider's own model endpoint reported this session.
-2. A curated row for that id, including its dated snapshots. `claude-sonnet-4-5-20250929` reads the `claude-sonnet-4-5` row.
-3. models.dev.
-4. A curated row for a close relative, reached by shared prefix. `glm-5.4` falls back to `glm-5` here, and takes its family and tier from it either way.
-5. The provider's defaults, with no cost estimate.
+- **Id**: `aperture`
+- **Env vars**: `APERTURE_HOST`
+- **Login**: `makima auth login aperture` (API key)
+- **`base_url`** in `providers.toml`: Aperture host URL
 
-A curated row is checked against the provider's own pricing page, so it wins for the id it names. For a relative it loses to models.dev, because a rate nobody checked against the id you typed is only a guess.
+No curated models. The provider's model endpoint lists them once it is configured.
 
-New models start at the **medium** tier until you assign one in the picker.
+Aperture discovers models from your Tailscale Aperture gateway at `APERTURE_HOST` (like `https://your-host.tailnet.ts.net`), or at the `base_url` saved by `makima auth login aperture`. Tailscale identifies you, so no key is needed. Each model is `aperture/<upstream>/<model>`, and a model whose upstream is a built-in provider streams through that provider's own request code.
 
-## providers.toml
-
-`providers.toml` lives in the config directory (`~/.config/makima/providers.toml` on Linux/macOS, `%APPDATA%\makima\providers.toml` on Windows). It is the file for provider overrides and custom HTTP providers. Two jobs:
-
-1. Tweak a built-in (pick a plan, change its base URL, set `enable_free_models` for Opencode).
-2. Declare a custom provider that speaks OpenAI, Anthropic, or Google wire format.
-
-```toml
-# Point a built-in at a proxy. Env vars still win over this file.
-[anthropic]
-base_url = "https://my-proxy.internal"
-
-# Full custom provider. Slug becomes the `provider/` prefix in model specs.
-[my-proxy]
-display_name = "My Proxy"
-protocol = "openai"            # openai | openai-responses | anthropic | google
-base_url = "https://llm.example.com/v1"
-api_key_env = "MY_PROXY_API_KEY"
-default_model = "my-proxy/fast-v1"
-discover_models = true         # also list models via the provider's /models endpoint
-
-[[my-proxy.models]]
-id = "fast-v1"
-tier = "weak"
-context_window = 128000
-max_output_tokens = 16384
-pricing_input = 0.5
-pricing_output = 1.5
-
-[[my-proxy.models]]
-id = "smart-v1"
-tier = "strong"
-context_window = 200000
-max_output_tokens = 32000
-supports_thinking = true
-supports_vision = false
-```
-
-### Provider fields
-
-| Field | Type | Notes |
-|-------|------|-------|
-| `display_name` | string | Shown in pickers and auth status |
-| `protocol` | string | `openai`, `openai-responses`, `anthropic`, or `google`. Required for custom slugs |
-| `base_url` | string | Origin of the API. Makima appends the protocol paths |
-| `plan` | string | Built-in plan key (see Plans below). Sets base URL and default model |
-| `api_key_env` | string | Env var that holds the key. Defaults to `<SLUG>_API_KEY` |
-| `api_key` | string | Inline key (prefer the env var or `makima auth login`) |
-| `default_model` | string | Used after login when no model is saved yet |
-| `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
-| `enable_free_models` | bool | Opencode only. Show free catalog models (default false) |
-| `models` | array | Declared models for custom providers (see below) |
-| `overrides` | table | Aperture only. Per-upstream model overrides (see below) |
-
-### Model fields
-
-| Field | Type | Default | Notes |
-|-------|------|---------|-------|
-| `id` | string | required | Model id. Spec becomes `{slug}/{id}` |
-| `tier` | string | `medium` | `weak`, `medium`, `strong`, or `compaction` |
-| `context_window` | u32 | protocol default | Tokens of context |
-| `max_output_tokens` | u32 | protocol default | Max completion tokens |
-| `supports_tool_examples` | bool | protocol default | |
-| `supports_thinking` | bool | protocol default | |
-| `requires_thinking` | bool | false | For APIs that reject requests with thinking disabled. Implies `supports_thinking` and raises thinking to minimal effort when off (including compaction) |
-| `supports_vision` | bool | protocol default | When false, image input and `view_image` are off |
-| `pricing_input` / `pricing_output` | f64 | 0 | USD per 1M tokens |
-| `pricing_cache_write` / `pricing_cache_read` | f64 | 0 | USD per 1M tokens |
-| `pricing_fast_input` / `pricing_fast_output` | f64 | unset | Fast-mode pricing when the provider supports it |
-
-Custom slugs must not reuse a built-in provider name. A bad TOML parse exits with code 2 at startup so a typo cannot silently empty the registry.
-
-You can also create a custom provider interactively with `makima auth login` and choosing the custom option. That writes a starter entry to this file.
-
-### Aperture overrides
-
-Aperture proxies upstream providers, exposing each model as `aperture/<upstream>/<model>`. Overrides keyed by upstream provider id live under `[aperture.overrides]`:
+Overrides keyed by upstream id live under `[aperture.overrides]` in `providers.toml`:
 
 ```toml
 [aperture.overrides.llmserver]
@@ -155,73 +105,382 @@ context_window = 262144
 supports_vision = true
 ```
 
-Provider-level fields apply to every model from that upstream; per-model entries under `models` win field by field. Fields: `context_window`, `max_output_tokens`, `supports_thinking`, `supports_vision`, `base` (remaps an opaque vendor to a native provider; e.g. `llama-cpp`, `google`, `anthropic`), and `path_prefix`. Model ids containing dots must be quoted (`"qwen3.6"`) since TOML treats a bare dotted key as a nested table.
+Upstream fields apply to every model from that upstream; entries under `models` win field by field. Fields: `context_window`, `max_output_tokens`, `supports_thinking`, `supports_vision`, `base` (routes an upstream through a built-in provider, like `llama-cpp`, `google` or `anthropic`) and `path_prefix`. Quote model ids that contain dots, since TOML reads a bare dotted key as nested tables.
 
-Makima sends `/v1` (or `/v1beta` for Gemini routes, nothing for Anthropic and Z.AI), and Aperture appends that path to the upstream's base url. If an upstream base url already carries its own path, set `path_prefix = ""` for it to avoid a doubled path. Z.AI defaults to no prefix since its API path has no `/v1` segment; point the upstream base url at the full API root (e.g. `https://api.z.ai/api/paas/v4`).
+Makima sends `/v1` (or `/v1beta` for Gemini routes, nothing for Anthropic and Z.AI) and Aperture appends it to the upstream's base URL. If an upstream base URL already carries its own path, set `path_prefix = ""` for it.
 
-### Plans
+### Copilot
 
-No built-in currently ships more than one plan.
+- **Id**: `copilot`
+- **Env vars**: `GH_COPILOT_TOKEN`, `COPILOT_GITHUB_TOKEN`
+- **API**: `https://api.githubcopilot.com`
+- **Login**: `makima auth login copilot` (Import GitHub token)
 
-## Dynamic Providers
+| Tier | Model | Pricing (in/out per 1M tokens) | Limits |
+|------|-------|-------------------------------|--------|
+| weak | **gpt-5.6-luna** (default) | $0.20 / $1.20 | 200K ctx / 100K out |
+| weak | gpt-5-mini | $0.25 / $2.00 | 200K ctx / 100K out |
+| weak | gpt-5.4-mini | $0.75 / $4.50 | 200K ctx / 100K out |
+| weak | gpt-5.4-nano | $0.20 / $1.25 | 200K ctx / 100K out |
+| weak | claude-haiku-4.5 | $1.00 / $5.00 | 200K ctx / 64K out |
+| weak | gemini-3.5-flash | $1.50 / $9.00 | 200K ctx / 65K out |
+| weak | mai-code-1-flash-picker | $0.75 / $4.50 | 200K ctx / 100K out |
+| medium | **gpt-5.6-terra** (default) | $2.00 / $12.00 | 200K ctx / 100K out |
+| medium | gemini-3.6-flash | $0.75 / $3.75 | 200K ctx / 65K out |
+| medium | gemini-3.7-flash | $0.75 / $3.75 | 200K ctx / 65K out |
+| medium | claude-sonnet-4.5 | $3.00 / $15.00 | 200K ctx / 64K out |
+| medium | claude-sonnet-5 | $2.00 / $10.00 | 200K ctx / 100K out |
+| medium | kimi-k2.7-code | $0.95 / $4.00 | 200K ctx / 100K out |
+| medium | gemini-3.1-pro-preview | $2.00 / $12.00 | 200K ctx / 65K out |
+| medium | grok-4.5 | $2.00 / $6.00 | 200K ctx / 100K out |
+| medium | grok-4.6 | $2.00 / $6.00 | 200K ctx / 100K out |
+| medium | claude-sonnet-4.6 | $3.00 / $15.00 | 200K ctx / 64K out |
+| strong | **claude-opus-5** (default) | $5.00 / $25.00 | 200K ctx / 64K out |
+| strong | gpt-5.5 | $5.00 / $30.00 | 200K ctx / 100K out |
+| strong | kimi-k3 | $3.00 / $15.00 | 200K ctx / 100K out |
+| strong | gpt-5.4 | $2.50 / $15.00 | 200K ctx / 100K out |
+| strong | gpt-5.6-sol | $5.00 / $30.00 | 200K ctx / 100K out |
+| strong | gpt-5.3-codex | $1.75 / $14.00 | 200K ctx / 100K out |
+| strong | claude-opus-4.8-fast | $10.00 / $50.00 | 200K ctx / 100K out |
+| strong | claude-opus-4.8 | $5.00 / $25.00 | 200K ctx / 64K out |
+| strong | claude-opus-4.7 | $5.00 / $25.00 | 200K ctx / 64K out |
+| strong | claude-opus-4.6 | $5.00 / $25.00 | 200K ctx / 64K out |
+| strong | claude-opus-4.5 | $5.00 / $25.00 | 200K ctx / 64K out |
+| strong | claude-fable-5 | $10.00 / $50.00 | 200K ctx / 100K out |
 
-To add a custom provider or proxy, drop an executable script into the config `providers/` directory (`~/.config/makima/providers/` on Linux/macOS, `%APPDATA%\makima\providers\` on Windows). The script must handle these subcommands:
+`makima auth login copilot` imports a token from the gh CLI, the Copilot client or the system keyring. Each model streams through the API its endpoint names: Messages, Responses or Chat Completions.
 
-| Subcommand | Timeout | What it does |
-|------------|---------|--------|
-| `info` | 5s | Return JSON with `display_name`, `base` provider, `has_auth` |
-| `models` | 5s | Return JSON array of model entries (optional) |
-| `resolve` | 30s | Return auth JSON (`base_url`, `headers`) |
-| `login` | interactive | OAuth or credential flow |
-| `logout` | interactive | Clear credentials |
-| `refresh` | 30s | Refresh auth tokens |
+### Custom provider...
 
-`resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
+- **Id**: `custom`
+- **Login**: `makima auth login custom` (Create)
 
-The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `ollama`, `llama-cpp`.
+Run `makima auth login custom` to add a provider of your own, or write its section in `providers.toml` (`~/.config/makima/providers.toml` on Linux and macOS, `%APPDATA%\makima\providers.toml` on Windows). A section with a `protocol` is a provider named after the section, used as the `provider/` part of its model specs:
 
-If your provider serves models not in the base catalog, add a `models` subcommand returning:
+```toml
+[my-proxy]
+display_name = "My Proxy"
+protocol = "openai"            # openai | openai-responses | anthropic | google
+base_url = "https://llm.example.com/v1"
+api_key_env = "MY_PROXY_API_KEY"
+discover_models = true         # also list the server's models
+
+[[my-proxy.models]]
+id = "fast-v1"
+tier = "weak"
+context_window = 128000
+max_output_tokens = 16384
+pricing_input = 0.5
+pricing_output = 1.5
+```
+
+| Field | Notes |
+|-------|-------|
+| `display_name` | Shown in pickers and auth status |
+| `protocol` | `openai`, `openai-responses`, `anthropic` or `google` |
+| `base_url` | Origin of the API. `<ID>_BASE_URL` wins over it |
+| `api_key_env` | Env var that holds the key, by default `<ID>_API_KEY` |
+| `api_key` | Inline key (prefer the env var or `makima auth login <id>`) |
+| `headers` | Extra headers sent with every request; values expand `${VAR}` |
+| `discover_models` | Also list the server's models (default false) |
+| `models` | Declared models, which win over discovered metadata field by field |
+
+Model fields: `id` (required), `tier` (`weak`, `medium`, `strong` or `compaction`, default `medium`), `context_window`, `max_output_tokens`, `supports_tool_examples`, `supports_thinking`, `requires_thinking` (for APIs that refuse thinking off; raises it to minimal effort, compaction included), `supports_vision` (false turns off image input and `view_image`), and `pricing_input`, `pricing_output`, `pricing_cache_write`, `pricing_cache_read`, `pricing_fast_input`, `pricing_fast_output` in USD per 1M tokens.
+
+A section never takes over a built-in provider's id. A section that fails to register is logged and left out, and a file that does not parse stops Makima at startup with exit code 2.
+
+#### Executable providers
+
+An executable file in the config `providers/` directory (`~/.config/makima/providers/` on Linux and macOS, `%APPDATA%\makima\providers\` on Windows) is a provider named after the file. Makima runs it with one subcommand and reads JSON from its output:
+
+| Subcommand | Timeout | What it returns |
+|------------|---------|-----------------|
+| `info` | 5s | `display_name`, `base`, `has_auth` and an optional `system_prefix` |
+| `models` | 5s | An optional list of models |
+| `resolve` | 30s | Auth for each new agent: `headers` and an optional `base_url` |
+| `refresh` | 30s | The same, after the server rejects the credentials |
+| `reload` | 30s | The same, after a login elsewhere |
+| `login`, `logout` | interactive | Only with `has_auth`; runs on the terminal |
+
+`resolve` runs each time an agent starts, so read tokens from disk instead of caching them, and a login in another process is picked up. `info` and `models` change only with the script, so their output is cached by the file's size and modification time.
+
+`base` names the provider whose protocol the script speaks and whose curated models it inherits: one of `anthropic`, `aperture`, `copilot`, `deepseek`, `google`, `llama-cpp`, `mistral`, `ollama`, `openai`, `opencode`, `openrouter`, `regolo`, `requesty`, `synthetic`, `tensorx`, `zai`. A `models` list replaces them:
 
 ```json
 [{"id": "my-model-v2", "tier": "strong", "context_window": 200000, "max_output_tokens": 16384}]
 ```
 
-Only `id` is required. Optional fields: `tier` (default `medium`), `context_window` (128K), `max_output_tokens` (16K), `pricing` (`{input, output, cache_write, cache_read}`, all per 1M tokens), `supports_tool_examples` (defaults to the base provider's setting), `supports_thinking` (defaults to the base provider's setting), `requires_thinking` (default false; for APIs that reject requests with thinking off, raises it to minimal effort and implies `supports_thinking`), `supports_vision` (defaults to the base provider's setting; when false, image input and the `view_image` tool are disabled). The first model listed per tier is used for sub-agents. Without this subcommand, the base provider's models are used.
+Only `id` is required. Optional fields: `tier` (default `medium`), `context_window` (default 128K), `max_output_tokens` (default 16K), `pricing` (`{input, output, cache_write, cache_read}` per 1M tokens), and `supports_tool_examples`, `supports_thinking`, `requires_thinking` and `supports_vision`, which default to the base's. A `llama-cpp` based model can also declare `thinking_fields`: the JSON merged into the request body for `off`, `adaptive` and each effort level it accepts.
 
-A `llama-cpp` model can replace Makima's token-budget mapping with its native thinking fields. Each thinking mode maps to a JSON fragment merged into the request body:
+Script models are `<file name>/<model id>`. The name starts with a letter or digit, continues with letters, digits, `_` and `-`, and cannot take an id that is already registered.
 
-```json
-[{
-  "id": "reasoning-model",
-  "supports_thinking": true,
-  "thinking_fields": {
-    "off": {"reasoning_effort": "none"},
-    "adaptive": {"reasoning_effort": "medium"},
-    "low": {"reasoning_effort": "low"},
-    "medium": {"reasoning_effort": "medium"},
-    "xhigh": {"reasoning_effort": "xhigh"}
-  }
-}]
+### DeepSeek
+
+- **Id**: `deepseek`
+- **Env vars**: `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`
+- **API**: `https://api.deepseek.com`
+- **Login**: `makima auth login deepseek` (API key)
+- **Peak pricing**: the prices below are off-peak; each turn is billed as it happens, at 2x during 01:00-04:00, 06:00-10:00 UTC, Mon-Fri
+
+| Tier | Model | Pricing (in/out per 1M tokens) | Limits |
+|------|-------|-------------------------------|--------|
+| medium | **deepseek-v4-flash** (default) | $0.22 / $0.66 | 1000K ctx / 384K out |
+| strong | **deepseek-v4-pro** (default) | $0.66 / $1.98 | 1000K ctx / 384K out |
+
+### Google
+
+- **Id**: `google`
+- **Env vars**: `GEMINI_API_KEY`, `GOOGLE_BASE_URL`
+- **API**: `https://generativelanguage.googleapis.com/v1beta`
+- **Login**: `makima auth login google` (API key)
+
+| Tier | Model | Pricing (in/out per 1M tokens) | Limits |
+|------|-------|-------------------------------|--------|
+| weak | **gemini-2.0-flash-lite** (default) | $0.07 / $0.30 | 1048K ctx / 65K out |
+| medium | **gemini-2.5-flash** (default) | $0.15 / $0.60 | 1048K ctx / 65K out |
+| strong | **gemini-2.5-pro** (default) | $1.25 / $5.00 | 1048K ctx / 65K out |
+
+### LlamaCpp
+
+- **Id**: `llama-cpp`
+- **Env vars**: `LLAMA_CPP_HOST`, `LLAMA_CPP_API_KEY`
+- **API**: `http://localhost:8080/v1`
+- **Login**: `makima auth login llama-cpp` (API key)
+- **`base_url`** in `providers.toml`: LlamaCpp host URL
+
+No curated models. The provider's model endpoint lists them once it is configured.
+
+Talks to the server at the `base_url` saved by `makima auth login llama-cpp`, else at `LLAMA_CPP_HOST`. Models come from the server: a router lists many, a single-model server one. The key is optional.
+
+### Mistral
+
+- **Id**: `mistral`
+- **Env vars**: `MISTRAL_API_KEY`, `MISTRAL_BASE_URL`
+- **API**: `https://api.mistral.ai/v1`
+- **Login**: `makima auth login mistral` (API key)
+- **`plan`** in `providers.toml`: Plan: `standard`, `coding`
+
+| Tier | Model | Pricing (in/out per 1M tokens) | Limits |
+|------|-------|-------------------------------|--------|
+| weak | **ministral-14b-latest** (default) | $0.20 / $0.20 | 262K ctx |
+| weak | ministral-14b-2512 | $0.20 / $0.20 | 262K ctx |
+| medium | **mistral-small-latest** (default) | $0.15 / $0.60 | 262K ctx |
+| medium | mistral-small-2603 | $0.15 / $0.60 | 262K ctx |
+| strong | **mistral-medium-latest** (default) | $1.50 / $7.50 | 262K ctx |
+| strong | glm-5-2 | $1.40 / $4.40 | 1000K ctx |
+| strong | mistral-medium-3.5 | $1.50 / $7.50 | 262K ctx |
+| strong | mistral-medium-3-5 | $1.50 / $7.50 | 262K ctx |
+| strong | mistral-medium-2604 | $1.50 / $7.50 | 262K ctx |
+| strong | zai-glm-5-2 | $1.40 / $4.40 | 1000K ctx |
+
+### Ollama
+
+- **Id**: `ollama`
+- **Env vars**: `OLLAMA_HOST`, `OLLAMA_API_KEY`
+- **API**: `http://localhost:11434/v1`
+- **Login**: `makima auth login ollama` (API key)
+- **`base_url`** in `providers.toml`: Ollama host URL
+
+No curated models. The provider's model endpoint lists them once it is configured.
+
+Talks to the server at the `base_url` saved by `makima auth login ollama`, else at `OLLAMA_HOST`, or to Ollama Cloud when only `OLLAMA_API_KEY` is set. Models come from the server, with the context window and vision support it reports for each.
+
+### OpenAI
+
+- **Id**: `openai`
+- **Env vars**: `OPENAI_API_KEY`, `OPENAI_BASE_URL`
+- **API**: `https://api.openai.com/v1`
+- **Login**: `makima auth login openai` (API key, ChatGPT login)
+- **Login alias**: `makima auth login openai-codex`, OpenAI Codex (ChatGPT login)
+
+| Tier | Model | Pricing (in/out per 1M tokens) | Limits |
+|------|-------|-------------------------------|--------|
+| weak | **gpt-5.6-luna** (default) | $1.00 / $6.00 | 372K ctx / 128K out |
+| weak | gpt-6-luna | $0.10 / $0.50 | 272K ctx / 128K out |
+| weak | gpt-5.4-nano | $0.20 / $1.25 | 400K ctx / 128K out |
+| weak | gpt-5.4-mini | $0.75 / $4.50 | 400K ctx / 128K out |
+| weak | gpt-4.1-nano | $0.10 / $0.40 | 1047K ctx / 32K out |
+| medium | **gpt-5.6-terra** (default) | $2.50 / $15.00 | 372K ctx / 128K out |
+| medium | gpt-6.1-sol | $2.00 / $10.00 | 500K ctx / 128K out |
+| medium | gpt-6.1-terra | $1.00 / $5.00 | 500K ctx / 128K out |
+| medium | gpt-6-sol | $2.00 / $10.00 | 272K ctx / 128K out |
+| medium | gpt-4.1-mini | $0.40 / $1.60 | 1047K ctx / 32K out |
+| medium | gpt-4.1 | $2.00 / $8.00 | 1047K ctx / 32K out |
+| medium | o4-mini | $1.10 / $4.40 | 200K ctx / 100K out |
+| medium | gpt-5.1-codex-mini | $0.25 / $2.00 | 400K ctx / 128K out |
+| strong | **gpt-5.6-sol** (default) | $5.00 / $30.00 | 372K ctx / 128K out |
+| strong | gpt-6-astra | $10.00 / $50.00 | 272K ctx / 128K out |
+| strong | gpt-5.5 | $5.00 / $30.00 | 1050K ctx / 128K out |
+| strong | gpt-5.4 | $2.50 / $15.00 | 1050K ctx / 128K out |
+| strong | o3 | $2.00 / $8.00 | 200K ctx / 100K out |
+| strong | gpt-5.3-codex | $1.75 / $14.00 | 400K ctx / 128K out |
+| strong | gpt-5.2-codex | $1.75 / $14.00 | 400K ctx / 128K out |
+| strong | gpt-5.1-codex-max | $1.25 / $10.00 | 400K ctx / 128K out |
+| strong | gpt-5.1-codex | $1.25 / $10.00 | 400K ctx / 128K out |
+
+#### Auth
+
+You can use OpenAI two ways.
+
+**API key**: set `OPENAI_API_KEY`, or pick the API key method in `/login` and paste a key from [platform.openai.com/api-keys](https://platform.openai.com/api-keys).
+
+**ChatGPT subscription**: use Codex through your ChatGPT login. Run `makima auth login openai-codex`, or pick the ChatGPT login method in `/login`. Makima walks you through the device flow at [auth.openai.com/codex](https://auth.openai.com/codex) and saves the tokens, which win over the API key. `OPENAI_BASE_URL` only redirects the API key path, never the ChatGPT backend.
+
+With a ChatGPT login the model list comes from the Codex backend's own `/models`, so a model your plan gains shows up without a Makima update, with the context window and reasoning levels the backend declares. The table above is the offline fallback. The backend hides models newer than the Codex CLI version Makima reports, so a brand new release can lag until that version is bumped.
+
+### Opencode Zen
+
+- **Id**: `opencode`
+- **Env vars**: `OPENCODE_API_KEY`
+- **Login**: `makima auth login opencode` (API key)
+
+No curated models. The provider's model endpoint lists them once it is configured.
+
+Models come from the provider's models.dev catalog entry. Free models stay hidden until you turn them on in `~/.config/makima/providers.toml`; they then work without a key through the public key:
+
+```toml
+[opencode]
+enable_free_models = true
 ```
 
-`off` is used when thinking is off, `adaptive` when thinking is on without a chosen level. Any other key is an effort level, one of `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. The levels you declare are the ones the model accepts: whatever you ask for snaps into them, downwards first, so a level the model never advertised is never sent. Every part is optional.
+Zen and Go both read it from `[opencode]`.
 
-Fragments are merged into the body, so nesting works too. A template toggle is just a fragment:
+Zen also takes `<catalog provider>/<model>` ids and sends them to that provider.
 
-```json
-"thinking_fields": {
-  "off": {"chat_template_kwargs": {"enable_thinking": false}},
-  "adaptive": {"chat_template_kwargs": {"enable_thinking": true}}
-}
+### Opencode Go
+
+- **Id**: `opencode-go`
+- **Env vars**: `OPENCODE_API_KEY`
+- **Login**: `makima auth login opencode-go` (API key)
+
+No curated models. The provider's model endpoint lists them once it is configured.
+
+Models come from the provider's models.dev catalog entry. Free models stay hidden until you turn them on in `~/.config/makima/providers.toml`; they then work without a key through the public key:
+
+```toml
+[opencode]
+enable_free_models = true
 ```
 
-Named modes send only these fields, no token budget. An explicit `/thinking <budget>` snaps into the levels you declared; a model that declares none gets the `adaptive` fragment plus `thinking_budget_tokens`. Any mode you left undeclared falls back to the usual `thinking_budget_tokens` mapping, so no request ever ends up saying nothing. Models without `thinking_fields` keep the existing llama.cpp behavior.
+Zen and Go both read it from `[opencode]`.
 
-Dynamic provider models are namespaced as `{slug}/{model_id}` (e.g. `myproxy/claude-sonnet-4-6`).
+### OpenRouter
 
-### Script Name Rules
+- **Id**: `openrouter`
+- **Env vars**: `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`
+- **API**: `https://openrouter.ai/api/v1`
+- **Login**: `makima auth login openrouter` (API key)
 
-- Must start with a letter or digit
-- Only letters, digits, underscores, and hyphens after that
-- Can't reuse a built-in provider's slug
-- Must be executable
+No curated models. The provider's model endpoint lists them once it is configured.
+
+OpenRouter serves models from many providers behind one key. Browse them at [openrouter.ai/models](https://openrouter.ai/models) and use any id directly, like `openrouter/anthropic/claude-sonnet-4`.
+
+### Regolo
+
+- **Id**: `regolo`
+- **Env vars**: `REGOLO_API_KEY`, `REGOLO_BASE_URL`
+- **API**: `https://api.regolo.ai/v1`
+- **Login**: `makima auth login regolo` (API key)
+
+| Tier | Model | Pricing (in/out per 1M tokens) | Limits |
+|------|-------|-------------------------------|--------|
+| weak | **qwen3.5-9b** (default) | $0.07 / $0.35 | 80K ctx / 80K out |
+| medium | **qwen3-coder-next** (default) | $0.50 / $2.00 | 120K ctx / 120K out |
+| strong | **qwen3.5-122b** (default) | $1.00 / $4.20 | 120K ctx / 120K out |
+
+### Requesty
+
+- **Id**: `requesty`
+- **Env vars**: `REQUESTY_API_KEY`, `REQUESTY_BASE_URL`
+- **API**: `https://router.requesty.ai/v1`
+- **Login**: `makima auth login requesty` (API key)
+
+No curated models. The provider's model endpoint lists them once it is configured.
+
+Requesty routes across many models with one key, including managed routing policies (`requesty/claude-sonnet-4-5`) and the full `<vendor>/<model>` catalog (`requesty/openai/gpt-4o-mini`). Get a key at [app.requesty.ai/api-keys](https://app.requesty.ai/api-keys). Set `REQUESTY_BASE_URL=https://router.eu.requesty.ai/v1` to keep all traffic in the EU.
+
+### Synthetic
+
+- **Id**: `synthetic`
+- **Env vars**: `SYNTHETIC_API_KEY`, `SYNTHETIC_BASE_URL`
+- **API**: `https://api.synthetic.new/openai/v1`
+- **Login**: `makima auth login synthetic` (API key)
+
+| Tier | Model | Pricing (in/out per 1M tokens) | Limits |
+|------|-------|-------------------------------|--------|
+| weak | **hf:zai-org/GLM-4.7-Flash** (default) | $0.10 / $0.50 | 200K ctx / 131K out |
+| medium | **hf:deepseek-ai/DeepSeek-V3.2** (default) | $0.56 / $1.68 | 200K ctx / 131K out |
+| strong | **hf:moonshotai/Kimi-K2.5** (default) | $0.45 / $3.40 | 200K ctx / 131K out |
+
+### TensorX
+
+- **Id**: `tensorx`
+- **Env vars**: `TENSORX_API_KEY`, `TENSORX_BASE_URL`
+- **API**: `https://api.tensorx.ai/v1`
+- **Login**: `makima auth login tensorx` (API key)
+
+No curated models. The provider's model endpoint lists them once it is configured.
+
+### Google Vertex AI
+
+- **Id**: `vertex`
+- **Env vars**: `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`, `GOOGLE_APPLICATION_CREDENTIALS`
+- **API**: `https://aiplatform.googleapis.com`
+- **Login**: `makima auth login vertex` (Application Default Credentials)
+
+| Tier | Model | Pricing (in/out per 1M tokens) | Limits |
+|------|-------|-------------------------------|--------|
+| weak | **gemini-2.5-flash-lite** (default) | $0.10 / $0.40 | 1048K ctx / 65K out |
+| weak | gemini-3.1-flash-lite | $0.25 / $1.50 | 1048K ctx / 65K out |
+| weak | gemini-3.5-flash-lite | $0.30 / $2.50 | 1048K ctx / 65K out |
+| medium | **gemini-2.5-flash** (default) | $0.30 / $2.50 | 1048K ctx / 65K out |
+| medium | gemini-3-flash-preview | $0.50 / $3.00 | 1048K ctx / 65K out |
+| medium | gemini-3.1-pro-preview | $2.00 / $12.00 | 1048K ctx / 65K out |
+| medium | gemini-3.5-flash | $1.50 / $9.00 | 1048K ctx / 65K out |
+| medium | gemini-3.6-flash | $0.75 / $3.75 | 1048K ctx / 65K out |
+| medium | gemini-3.8-flash | $0.75 / $3.75 | 500K ctx / 65K out |
+| medium | gemini-3.7-flash | $0.75 / $3.75 | 1048K ctx / 65K out |
+| strong | **gemini-2.5-pro** (default) | $1.25 / $10.00 | 1048K ctx / 65K out |
+
+Authenticates with Application Default Credentials: an `authorized_user` file from `gcloud auth application-default login`, or the metadata server of the machine Makima runs on. Service account files are rejected. The project comes from `GOOGLE_CLOUD_PROJECT` or `project` in `providers.toml`, the location from `GOOGLE_CLOUD_LOCATION` or `location` (default `global`).
+
+### Z.AI
+
+- **Id**: `zai`
+- **Env vars**: `ZHIPU_API_KEY`, `ZAI_BASE_URL`
+- **API**: `https://api.z.ai/api/paas/v4`
+- **Login**: `makima auth login zai` (API key)
+- **`plan`** in `providers.toml`: Plan: `standard`, `coding`
+
+| Tier | Model | Pricing (in/out per 1M tokens) | Limits |
+|------|-------|-------------------------------|--------|
+| weak | **glm-4.7-flash** (default) | $0.00 / $0.00 | 200K ctx / 131K out |
+| weak | glm-5.3-flash | $0.15 / $0.50 | 1000K ctx / 131K out |
+| weak | glm-4.5-flash | $0.00 / $0.00 | 131K ctx / 98K out |
+| weak | glm-4.5-air | $0.20 / $1.10 | 131K ctx / 98K out |
+| medium | **glm-4.7** (default) | $0.60 / $2.20 | 200K ctx / 131K out |
+| medium | glm-4.5 | $0.60 / $2.20 | 131K ctx / 98K out |
+| medium | glm-4.6 | $0.60 / $2.20 | 200K ctx / 131K out |
+| strong | **glm-5-code** (default) | $1.20 / $5.00 | 200K ctx / 131K out |
+| strong | glm-5.3 | $1.40 / $4.40 | 1000K ctx / 131K out |
+| strong | glm-5.2 | $1.00 / $3.20 | 1000K ctx / 131K out |
+| strong | glm-5.1 | $1.00 / $3.20 | 200K ctx / 131K out |
+| strong | glm-5 | $1.00 / $3.20 | 200K ctx / 131K out |
+
+## Model Identifiers
+
+Models are referenced as `provider/model_id`:
+
+```
+anthropic/claude-sonnet-5
+copilot/gpt-5.6-terra
+deepseek/deepseek-v4-flash
+```
+
+### Models newer than your Makima version
+
+The tables above list the models each provider curates. Any other id a provider accepts works too: type it into `/model` or pass it to `--model`. The picker also lists what the provider's own model endpoint reports, so same-day releases are selectable there.
+
+A model's rates, limits and capabilities come from its provider: what the provider's model endpoint reported this session, else its curated row. Each provider decides how a row matches an id; most match dated snapshots of a row by prefix. An id nothing describes gets a 128K context window, no cost estimate, and no thinking, vision or fast mode.
+
+New models start at the **medium** tier until you assign one in the picker.

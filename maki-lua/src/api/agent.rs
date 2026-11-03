@@ -2107,8 +2107,8 @@ mod tests {
     };
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        AgentError, ContentBlock, Invocation, Message, Model, ModelInfo, ProviderEvent,
-        RequestOptions, Role, StopReason, StreamResponse, ThinkingConfig, TokenUsage,
+        AgentError, ContentBlock, Invocation, Message, Model, ProviderEvent, RequestOptions, Role,
+        StopReason, StreamResponse, ThinkingConfig, TokenUsage,
     };
     use maki_storage::id::SessionRef;
     use serde_json::{Value, json};
@@ -2337,10 +2337,6 @@ mod tests {
                 unreachable!()
             })
         }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-            Box::pin(async { unimplemented!() })
-        }
     }
 
     pub(super) struct BackendFixture {
@@ -2401,10 +2397,6 @@ mod tests {
                 assert!(!replies.is_empty(), "no more canned replies");
                 Ok(replies.remove(0))
             })
-        }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-            Box::pin(async { unimplemented!() })
         }
     }
 
@@ -2823,10 +2815,6 @@ mod tests {
                     self.0.send(()).unwrap();
                     std::future::pending().await
                 })
-            }
-
-            fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-                Box::pin(async { Ok(Vec::new()) })
             }
         }
         let (started_tx, started_rx) = flume::bounded(1);
@@ -3352,10 +3340,6 @@ mod tests {
                     Ok(canned_reply("recovered on the same session"))
                 }
             })
-        }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-            Box::pin(async { unimplemented!() })
         }
     }
 

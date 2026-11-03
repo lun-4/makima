@@ -4,7 +4,6 @@
 
 use std::{io, time::Duration};
 
-use isahc::AsyncReadResponseExt;
 use isahc::error::ErrorKind as HttpErrorKind;
 
 use crate::retry::RetryKind;
@@ -16,11 +15,11 @@ const NETWORK_ERROR_MESSAGE: &str = "connection error, check your network";
 /// Request fields that cap the *output*. A 400 naming one of them is about the
 /// cap we sent, never about the prompt being too big.
 const OUTPUT_CAP_FIELDS: [&str; 3] = ["max_tokens", "max_completion_tokens", "max_output_tokens"];
-/// Markers of the OpenAI/vLLM shape, which quotes the two halves separately:
+/// Markers of servers that quote the two halves separately:
 /// `you requested 10000 tokens (6000 in the messages, 4000 in the completion)`.
 const MESSAGES_HALF: &str = " in the messages";
 const COMPLETION_HALF: &str = " in the completion";
-const OPENAI_LIMIT: &str = "maximum context length is ";
+const CONTEXT_LIMIT: &str = "maximum context length is ";
 
 /// Why a provider refused a request for size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,7 +63,7 @@ fn number_after(text: &str, marker: &str) -> Option<u32> {
     leading_number(text.split_once(marker)?.1)
 }
 
-/// Anthropic reports the condition as arithmetic:
+/// Some servers report the condition as arithmetic:
 /// ``input length and `max_tokens` exceed context limit: 199773 + 8192 > 200000``.
 /// All three numbers have to parse, or any prose with a `+` and a `>` would
 /// match.
@@ -84,7 +83,7 @@ fn budget_overflow(m: &str) -> Option<Overflow> {
         // and no budget is small enough to fix that.
         (number_before(m, COMPLETION_HALF)? > 0).then(|| Overflow::Budget {
             prompt: number_before(m, MESSAGES_HALF),
-            limit: number_after(m, OPENAI_LIMIT),
+            limit: number_after(m, CONTEXT_LIMIT),
         })
     })
 }
@@ -169,19 +168,10 @@ impl AgentError {
     /// numbers. The two causes have opposite remedies: one is fixed by asking
     /// for less output, the other only by dropping context.
     ///
-    /// Provider error formats:
-    /// - Anthropic:  413 "prompt is too long"  <https://docs.anthropic.com/en/docs/errors>
-    /// - Anthropic:  400 "input length and `max_tokens` exceed context limit: A + B > C"
-    /// - OpenAI:     400 "maximum context length is X tokens"  <https://platform.openai.com/docs/guides/error-codes>
-    /// - vLLM:       400 "... you requested N tokens (A in the messages, B in the completion)"
-    /// - Gemini:     400 "input token count exceeds" / "too many tokens"  <https://ai.google.dev/gemini-api/docs/troubleshooting>
-    /// - Ollama:     400 "context length exceeded"  <https://docs.ollama.com/api/errors>
-    /// - llama.cpp:  400 "exceeds the available context size"  <https://github.com/ggml-org/llama.cpp/blob/master/tools/server/server-context.cpp>
-    /// - Bedrock:    400 ValidationException "Input is too long for requested model"  <https://repost.aws/knowledge-center/bedrock-validation-exception-errors>
-    /// - DeepSeek:   400 "maximum context length is X tokens"  <https://api-docs.deepseek.com/quick_start/pricing>
-    /// - Mistral:    400 "too large for model with X maximum context length"  <https://docs.mistral.ai/resources/known-limitations>
-    /// - OpenRouter: 400 "endpoint's maximum context length is X tokens"  <https://openrouter.ai/docs/api/reference/errors-and-debugging.mdx>
-    /// - Synthetic:  400 pass-through from upstream models (OpenAI-compatible)  <https://synthetic.new>
+    /// Matches the shapes servers use for these refusals: a 413, arithmetic
+    /// like `A + B > C`, the two halves quoted separately, or a message
+    /// naming the context, tokens, prompt or input together with exceeding
+    /// a limit. Provider plugins report the server's status and body as is.
     pub fn overflow(&self) -> Option<Overflow> {
         let Self::Api {
             status, message, ..
@@ -206,8 +196,7 @@ impl AgentError {
         // `Invalid 'max_tokens': integer above maximum value` reads as "token"
         // plus "maximum" and would sail through the sniff below. The caller
         // answers a prompt overflow by summarizing the session away, and no
-        // amount of that fixes a cap we guessed too high. Our own 100k default
-        // for unknown OpenAI-kind models is how you hit this.
+        // amount of that fixes a cap we guessed too high.
         if OUTPUT_CAP_FIELDS.iter().any(|field| m.contains(field)) {
             return None;
         }
@@ -259,28 +248,8 @@ impl AgentError {
         }
     }
 
-    pub async fn from_response(mut response: isahc::Response<isahc::AsyncBody>) -> Self {
-        let status = response.status().as_u16();
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(parse_retry_after);
-        let message = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "unable to read error body".into());
-        Self::Api {
-            status,
-            message,
-            retry_after,
-        }
-    }
-
-    /// How long the server asked us to wait, when it bothered to say. Always a
-    /// positive duration: only [`Self::from_response`] ever reads headers, and
-    /// an error built any other way answers `None` and the caller falls back on
-    /// its own backoff.
+    /// How long the server asked us to wait, when it bothered to say. `None`
+    /// leaves the caller to its own backoff.
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::Api { retry_after, .. } => *retry_after,
@@ -325,19 +294,6 @@ fn is_connect_failure(e: &isahc::Error) -> bool {
         e.kind(),
         HttpErrorKind::ConnectionFailed | HttpErrorKind::NameResolution
     )
-}
-
-/// Only the delta-seconds form ("30", "60"). The HTTP-date form is legal but
-/// providers do not send it, and guessing a backoff beats parsing dates.
-///
-/// `0` is not a hint. Anthropic's own usage endpoint answers a persistent 429
-/// with `Retry-After: 0`, and sleeping for zero seconds before asking the same
-/// rate limiter again is a tight loop, not a backoff.
-fn parse_retry_after(value: &str) -> Option<Duration> {
-    match value.trim().parse::<u64>() {
-        Ok(secs) if secs > 0 => Some(Duration::from_secs(secs)),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -416,17 +372,6 @@ mod tests {
     #[test_case(HttpErrorKind::TlsEngine, NETWORK_ERROR_MESSAGE         ; "other_transport_blames_the_network")]
     fn user_message_transport(kind: HttpErrorKind, expected: &str) {
         assert_eq!(AgentError::Http(kind.into()).user_message(), expected);
-    }
-
-    #[test_case("30", Some(Duration::from_secs(30)) ; "delta_seconds")]
-    #[test_case(" 5 ", Some(Duration::from_secs(5))  ; "whitespace")]
-    #[test_case("Wed, 21 Oct 2015 07:28:00 GMT", None ; "http_date")]
-    #[test_case("", None                             ; "empty")]
-    #[test_case("-3", None                           ; "negative")]
-    // A zero would be slept on and come straight back with the same 429.
-    #[test_case("0", None                            ; "zero")]
-    fn retry_after_header_is_read_as_seconds(value: &str, expected: Option<Duration>) {
-        assert_eq!(parse_retry_after(value), expected);
     }
 
     #[test_case(401, true  ; "unauthorized")]
