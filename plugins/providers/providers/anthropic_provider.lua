@@ -37,7 +37,7 @@ Add `-1m` to any Claude model, like `claude-sonnet-4-6-1m`, to use the 1M token 
 
 #### Amazon Bedrock
 
-If you already use Claude through AWS Bedrock, set `CLAUDE_CODE_USE_BEDROCK=1` and every Anthropic request goes through Bedrock instead. The same models, the same features, just a different door.
+If you already use Claude through AWS Bedrock, set `CLAUDE_CODE_USE_BEDROCK=1` and every Anthropic request goes through Bedrock instead, with the same models and features.
 
 You need `AWS_REGION` and one of these for auth:
 

@@ -42,6 +42,10 @@ Bundled and user plugins are equal. A plugin that calls `register_provider` owns
 
 A single built-in provider cannot be disabled. A provider without credentials or configuration is unused, so a switch adds configuration surface without a current need. The first attempt shipped a `plugins.<provider>.enabled` switch that the loader silently ignored; no such option exists here.
 
+`init.lua` registers in a fixed order: the built-in providers, then `providers.toml` sections with a `protocol`, then executable scripts, then the models.dev catalog providers. A later source never takes an id an earlier one holds, and a user-defined provider that fails to register is logged and left out. The plugin reads `providers.toml` through `maki.api.provider_config(id?)`, and custom provider creation saves through `maki.api.save_provider_config(id, section)`; both were added for this plugin and are general APIs.
+
+The models.dev catalog is cached as an index of providers plus one file per provider. Startup reads only the index and never the network, so a provider new to the catalog registers from the next start. Discovery refreshes the cache once it is a day old or when the user asks, and `opencode.lua` shares the same cache.
+
 `plugins/providers/types.lua` holds Luau type annotations for the provider table, model descriptors and instances, as documentation for plugin authors. Nothing tests it against the Rust types. Generating it from the Rust types is tracked in #47.
 
 ### Registration
@@ -57,8 +61,13 @@ maki.api.register_provider({
     discover = fn,           -- optional; async model discovery
     prepare = fn,            -- returns a provider instance for one model
     config = { ... },        -- optional; providers.toml fields and prompts
+    aliases = { ... },       -- optional; { id, label, method } login shortcuts
+    section = "...",         -- optional; heading in the login picker
+    docs = { ... },          -- optional; env, endpoint, notes for docgen
 })
 ```
+
+`aliases` replaces the frontend alias lists (`openai-codex` is an alias of `openai` with the ChatGPT method preset). `section` groups the catalog providers in the login picker. `docs` is described under Docgen.
 
 Rust decodes the table once into a `ProviderSpec` struct with `mlua`'s serde support. Callback fields are kept as `Function` handles. That one decode is the only validation. Docgen renders from the same struct, so docs and runtime cannot disagree. `maki.model.validate` is not added unless a plugin needs it.
 
@@ -66,9 +75,13 @@ A model descriptor carries id, context window, max output tokens, thinking capab
 
 A provider instance returned by `prepare` has `stream(ctx, request, emit)` and optionally `fetch_usage`, `refresh_auth`, `reload_auth`, `rotate_key` and `key_count`. State lives in Lua closures.
 
+Every callback receives `ctx = { id, send, credentials }`, where `send` is the registering plugin's `maki.net.send`. A callback that fails returns nil plus an error. A table with `kind = "config"` is a configuration error (missing key, setting or login) and is never retried; the shared helper builds it with `http.config_error`. A table with `status` is an API error, and anything else is a retryable transport error. The config kind was added during the port, because configuration problems were otherwise retried with backoff, unlike in the native providers.
+
 ### Registry and the Provider trait
 
 `ProviderRegistry` maps provider ids to their spec and current model list. It is built after the plugin host loads, and an `Arc` of it is passed explicitly to every place that resolves models, including the callers of `Model::from_spec` today. There is no process-wide registry. Model resolution reads the registry and never calls Lua. Discovery results replace a provider's model list in one write.
+
+With no saved model and no `default_model`, the frontend picks the strong default, else the medium one, of the first provider in `auth_status` order that reports credentials. That order is registration order with sectioned providers last, which replaces the native `PROVIDER_PRIORITY` list.
 
 The existing `Provider` trait stays as the boundary that `maki-agent` and the frontends use. `LuaProvider` in `maki-lua` implements it by sending requests to the Lua runtime thread. Two trait changes are needed: `keys()` returns a borrowed key pool that Lua cannot provide, so it becomes `key_count()` and an async `rotate_key()`; and `adjust_model` is removed because `prepare` returns the adjusted model.
 
@@ -106,6 +119,8 @@ The message history is converted from Rust types to Lua tables once per request 
 - The User-Agent is `maki/<version>`, and the `Expect: 100-continue` fix from `7f75a8bd` applies.
 - Redirects are not followed. A 3xx response is returned to the caller.
 
+`send` also takes a `unix_socket` path. A local service can then listen on a socket protected by file permissions, which a loopback TCP port cannot offer.
+
 Stock `isahc` is used. It completes a response at the first body byte or at transfer end, not at the end of the headers. Streaming providers see no difference, because SSE and error responses send body bytes immediately. The transport stays behind the `send` API. Replacing smol and isahc with tokio and reqwest is tracked in #186.
 
 Hash and HMAC primitives (`maki.crypto.sha256`, `maki.crypto.hmac_sha256`) operate on binary strings, for SigV4 in Lua.
@@ -124,7 +139,9 @@ One Rust function, `drive_login`, runs the whole login flow for both `maki auth 
 - `device_code(url, code)`
 - `open_browser(url)`, which also shows the URL in case the browser does not open
 
-The CLI implements it on the terminal and the TUI implements it in the login picker. One `auth_status` function serves `maki auth status` and the TUI, with one error policy: a provider whose status check fails is reported as failed and the listing continues. `maki.host.open(url)` is a general Lua API, and login uses it.
+In the code `InteractionService` is a single `interact(InteractionRequest)` method over these cases, and `input` also takes a default to edit. One case was added: `run(argv)` hands the terminal to a program until it exits, for executable providers whose login is an interactive script. Only `maki auth login` can hand over its terminal; the TUI fails it with a message pointing there.
+
+The CLI implements it on the terminal and the TUI implements it in the login picker. One `auth_status` function serves `maki auth status` and the TUI, with one error policy: a provider whose status check fails is reported as failed and the listing continues. `maki.host.open(url)` is a general Lua API, and login uses it. `maki.host.keyring_get(service, account)` was added for the Copilot token import, which reads the token the GitHub CLI keeps in the system keyring.
 
 Provider-specific aliases such as `openai-codex` and protocol lists move to the Lua spec, so the frontends contain no provider names.
 
@@ -135,6 +152,8 @@ Rust keeps the provider-neutral `ThinkingConfig`. Each model descriptor declares
 ### Docgen
 
 Docgen starts the real plugin host with no user configuration, credentials or network, reads the registry, and renders from `ProviderSpec`. There is no second Lua loader.
+
+What the page says beyond models, login methods and config fields comes from the spec's optional `docs` table: `env` (the variables the provider reads), `endpoint` and `notes` (Markdown). A provider without `docs` is left off the page, which keeps the dozens of catalog providers out of it; one static section describes them instead.
 
 ### Tests
 

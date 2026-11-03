@@ -23,9 +23,9 @@ Makima re-reads auth from storage and environment variables each time a new agen
 
 An API key variable can hold several keys separated by commas (`sk-1,sk-2,sk-3`). They rotate on rate-limit and auth errors."#;
 
-const SETTINGS: &str = r#"## Base URLs and providers.toml
+const SETTINGS: &str = r#"## providers.toml
 
-`providers.toml` lives in the config directory (`~/.config/makima/providers.toml` on Linux and macOS, `%APPDATA%\makima\providers.toml` on Windows). Each section is named after a provider id and holds that provider's settings. `makima auth login` writes the answers it asks for there, and `makima auth logout` removes the section.
+`providers.toml` lives in the config directory (`~/.config/makima/providers.toml` on Linux and macOS, `%APPDATA%\makima\providers.toml` on Windows). Each section is named after a provider id and holds that provider's settings. `makima auth login` and `/login` write the answers they ask for there once the login works, and `makima auth logout` removes the section.
 
 Most hosted providers read these fields:
 
@@ -56,9 +56,9 @@ A model's rates, limits and capabilities come from its provider: what the provid
 
 New models start at the **medium** tier until you assign one in the picker."#;
 
-const NO_CATALOG: &str =
-    "No curated models. The provider's model endpoint lists them once it is configured.";
+const NO_CATALOG: &str = "No curated models. The provider lists them once it is configured.";
 const EXAMPLE_COUNT: usize = 3;
+const ELLIPSIS: &str = "...";
 const THOUSAND: u32 = 1_000;
 const AGENT_TIERS: [ModelTier; 3] = [ModelTier::Weak, ModelTier::Medium, ModelTier::Strong];
 
@@ -188,7 +188,9 @@ fn write_section(
     listing: &ProviderListing<'_>,
     docs: &ProviderDocs,
 ) {
-    let _ = writeln!(out, "### {}\n", listing.display_name);
+    // Picker labels such as "Custom provider..." end in an ellipsis.
+    let heading = listing.display_name.trim_end_matches(ELLIPSIS);
+    let _ = writeln!(out, "### {heading}\n");
     let _ = writeln!(out, "- **Id**: `{}`", listing.id);
     if !docs.env.is_empty() {
         let _ = writeln!(

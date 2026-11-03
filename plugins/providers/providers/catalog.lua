@@ -20,6 +20,17 @@ M.CACHE_DIR = "models-dev"
 M.INDEX_FILE = "index.json"
 M.TTL_SECS = 86400
 M.SECTION = "Providers from Models.dev"
+-- The providers reference page section on catalog providers.
+M.NOTES = string.format(
+  [[
+#### Providers from models.dev
+
+Every provider in the [models.dev](https://models.dev) catalog that speaks Chat Completions or Anthropic Messages at a published base URL becomes a provider of its own, under its models.dev id. A built-in provider, a `providers.toml` section or a script with the same id wins. The login picker lists them under "%s". Each takes its key from the environment variables models.dev names for it, or from `makima auth login <id>`, and shows its models once it has one.
+
+The catalog is cached in the cache directory (`%s/`) and fetched again once it is a day old, or by `makima models --refresh`. Startup reads only the cache and never waits on the network, so a provider new to the catalog appears from the next start.]],
+  M.SECTION,
+  M.CACHE_DIR
+)
 M.MESSAGES = "messages"
 M.CHAT = "chat"
 

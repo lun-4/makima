@@ -48,7 +48,7 @@ register(opencode.provider(cache, opencode.GO))
 local bases = table.clone(routes.ROUTES)
 bases.aperture = aperture.delegated()
 bases.opencode = opencode.delegated(cache)
-register(custom.creator(executable.notes(bases)))
+register(custom.creator(executable.notes(bases) .. "\n\n" .. catalog.NOTES))
 
 -- Sections with a protocol, then scripts, each win over a models.dev
 -- provider of the same id but never over a built-in one. A built-in

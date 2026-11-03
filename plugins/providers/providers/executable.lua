@@ -75,7 +75,8 @@ An executable file in the config `providers/` directory (`~/.config/makima/provi
 | `resolve` | %ds | Auth for each new agent: `headers` and an optional `base_url` |
 | `refresh` | %ds | The same, after the server rejects the credentials |
 | `reload` | %ds | The same, after a login elsewhere |
-| `login`, `logout` | interactive | Only with `has_auth`; runs on the terminal |
+| `login` | none | Only with `has_auth`. Runs on your terminal, so use `makima auth login <name>`; `/login` in the TUI cannot |
+| `logout` | %ds | Only with `has_auth`. Runs on `makima auth logout <name>` |
 
 `resolve` runs each time an agent starts, so read tokens from disk instead of caching them, and a login in another process is picked up. `info` and `models` change only with the script, so their output is cached by the file's size and modification time.
 
@@ -90,6 +91,7 @@ Only `id` is required. Optional fields: `tier` (default `medium`), `context_wind
 Script models are `<file name>/<model id>`. The name starts with a letter or digit, continues with letters, digits, `_` and `-`, and cannot take an id that is already registered.]],
     M.INFO_TIMEOUT_MS // 1000,
     M.INFO_TIMEOUT_MS // 1000,
+    M.SCRIPT_TIMEOUT_MS // 1000,
     M.SCRIPT_TIMEOUT_MS // 1000,
     M.SCRIPT_TIMEOUT_MS // 1000,
     M.SCRIPT_TIMEOUT_MS // 1000,

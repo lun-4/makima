@@ -188,7 +188,7 @@ Ring the terminal bell (`\x07`) on these events. All values are `bool`, defaulti
 |-------|------|---------|-------------|
 | `allowed_private_hosts` | string[] | `[]` | Hosts allowed to resolve to a private or loopback address, as `host`, `host:port`, or a CIDR range. Plain `http://` is kept for them instead of being upgraded to `https://` |
 
-`maki.net` refuses private, loopback and metadata addresses, because the model picks the URLs. List a host here to let it through:
+`maki.net.request` refuses private, loopback and metadata addresses, because the model picks the URLs. List a host here to let it through. Providers use `maki.net.send`, which has no such guard, so a local model server needs no entry:
 
 ```lua
 maki.setup({
@@ -344,7 +344,7 @@ Makima follows platform directory conventions. On Linux and macOS that is XDG. O
 | Logs | `~/.local/logs/makima/` | `%APPDATA%\makima\` |
 | Cache | `~/.cache/makima/` | `%LOCALAPPDATA%\makima\` |
 
-Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\makima` on Windows; that is separate from these runtime dirs.
+Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, `providers/` (executable providers), and `commands/`. State holds sessions, provider credentials (`auth/<provider>.json`, readable only by you), memories, plans, and model-tier overrides. Cache holds the provider catalog (`models-dev/`). The install script puts the binary under `%LOCALAPPDATA%\makima` on Windows; that is separate from these runtime dirs.
 
 ## Personal Instructions
 

@@ -17,9 +17,9 @@ Makima re-reads auth from storage and environment variables each time a new agen
 
 An API key variable can hold several keys separated by commas (`sk-1,sk-2,sk-3`). They rotate on rate-limit and auth errors.
 
-## Base URLs and providers.toml
+## providers.toml
 
-`providers.toml` lives in the config directory (`~/.config/makima/providers.toml` on Linux and macOS, `%APPDATA%\makima\providers.toml` on Windows). Each section is named after a provider id and holds that provider's settings. `makima auth login` writes the answers it asks for there, and `makima auth logout` removes the section.
+`providers.toml` lives in the config directory (`~/.config/makima/providers.toml` on Linux and macOS, `%APPDATA%\makima\providers.toml` on Windows). Each section is named after a provider id and holds that provider's settings. `makima auth login` and `/login` write the answers they ask for there once the login works, and `makima auth logout` removes the section.
 
 Most hosted providers read these fields:
 
@@ -67,7 +67,7 @@ Add `-1m` to any Claude model, like `claude-sonnet-4-6-1m`, to use the 1M token 
 
 #### Amazon Bedrock
 
-If you already use Claude through AWS Bedrock, set `CLAUDE_CODE_USE_BEDROCK=1` and every Anthropic request goes through Bedrock instead. The same models, the same features, just a different door.
+If you already use Claude through AWS Bedrock, set `CLAUDE_CODE_USE_BEDROCK=1` and every Anthropic request goes through Bedrock instead, with the same models and features.
 
 You need `AWS_REGION` and one of these for auth:
 
@@ -88,7 +88,7 @@ You need `AWS_REGION` and one of these for auth:
 - **Login**: `makima auth login aperture` (API key)
 - **`base_url`** in `providers.toml`: Aperture host URL
 
-No curated models. The provider's model endpoint lists them once it is configured.
+No curated models. The provider lists them once it is configured.
 
 Aperture discovers models from your Tailscale Aperture gateway at `APERTURE_HOST` (like `https://your-host.tailnet.ts.net`), or at the `base_url` saved by `makima auth login aperture`. Tailscale identifies you, so no key is needed. Each model is `aperture/<upstream>/<model>`, and a model whose upstream is a built-in provider streams through that provider's own request code.
 
@@ -150,7 +150,7 @@ Makima sends `/v1` (or `/v1beta` for Gemini routes, nothing for Anthropic and Z.
 
 `makima auth login copilot` imports a token from the gh CLI, the Copilot client or the system keyring. Each model streams through the API its endpoint names: Messages, Responses or Chat Completions.
 
-### Custom provider...
+### Custom provider
 
 - **Id**: `custom`
 - **Login**: `makima auth login custom` (Create)
@@ -200,7 +200,8 @@ An executable file in the config `providers/` directory (`~/.config/makima/provi
 | `resolve` | 30s | Auth for each new agent: `headers` and an optional `base_url` |
 | `refresh` | 30s | The same, after the server rejects the credentials |
 | `reload` | 30s | The same, after a login elsewhere |
-| `login`, `logout` | interactive | Only with `has_auth`; runs on the terminal |
+| `login` | none | Only with `has_auth`. Runs on your terminal, so use `makima auth login <name>`; `/login` in the TUI cannot |
+| `logout` | 30s | Only with `has_auth`. Runs on `makima auth logout <name>` |
 
 `resolve` runs each time an agent starts, so read tokens from disk instead of caching them, and a login in another process is picked up. `info` and `models` change only with the script, so their output is cached by the file's size and modification time.
 
@@ -213,6 +214,12 @@ An executable file in the config `providers/` directory (`~/.config/makima/provi
 Only `id` is required. Optional fields: `tier` (default `medium`), `context_window` (default 128K), `max_output_tokens` (default 16K), `pricing` (`{input, output, cache_write, cache_read}` per 1M tokens), and `supports_tool_examples`, `supports_thinking`, `requires_thinking` and `supports_vision`, which default to the base's. A `llama-cpp` based model can also declare `thinking_fields`: the JSON merged into the request body for `off`, `adaptive` and each effort level it accepts.
 
 Script models are `<file name>/<model id>`. The name starts with a letter or digit, continues with letters, digits, `_` and `-`, and cannot take an id that is already registered.
+
+#### Providers from models.dev
+
+Every provider in the [models.dev](https://models.dev) catalog that speaks Chat Completions or Anthropic Messages at a published base URL becomes a provider of its own, under its models.dev id. A built-in provider, a `providers.toml` section or a script with the same id wins. The login picker lists them under "Providers from Models.dev". Each takes its key from the environment variables models.dev names for it, or from `makima auth login <id>`, and shows its models once it has one.
+
+The catalog is cached in the cache directory (`models-dev/`) and fetched again once it is a day old, or by `makima models --refresh`. Startup reads only the cache and never waits on the network, so a provider new to the catalog appears from the next start.
 
 ### DeepSeek
 
@@ -248,7 +255,7 @@ Script models are `<file name>/<model id>`. The name starts with a letter or dig
 - **Login**: `makima auth login llama-cpp` (API key)
 - **`base_url`** in `providers.toml`: LlamaCpp host URL
 
-No curated models. The provider's model endpoint lists them once it is configured.
+No curated models. The provider lists them once it is configured.
 
 Talks to the server at the `base_url` saved by `makima auth login llama-cpp`, else at `LLAMA_CPP_HOST`. Models come from the server: a router lists many, a single-model server one. The key is optional.
 
@@ -281,7 +288,7 @@ Talks to the server at the `base_url` saved by `makima auth login llama-cpp`, el
 - **Login**: `makima auth login ollama` (API key)
 - **`base_url`** in `providers.toml`: Ollama host URL
 
-No curated models. The provider's model endpoint lists them once it is configured.
+No curated models. The provider lists them once it is configured.
 
 Talks to the server at the `base_url` saved by `makima auth login ollama`, else at `OLLAMA_HOST`, or to Ollama Cloud when only `OLLAMA_API_KEY` is set. Models come from the server, with the context window and vision support it reports for each.
 
@@ -334,7 +341,7 @@ With a ChatGPT login the model list comes from the Codex backend's own `/models`
 - **Env vars**: `OPENCODE_API_KEY`
 - **Login**: `makima auth login opencode` (API key)
 
-No curated models. The provider's model endpoint lists them once it is configured.
+No curated models. The provider lists them once it is configured.
 
 Models come from the provider's models.dev catalog entry. Free models stay hidden until you turn them on in `~/.config/makima/providers.toml`; they then work without a key through the public key:
 
@@ -353,7 +360,7 @@ Zen also takes `<catalog provider>/<model>` ids and sends them to that provider.
 - **Env vars**: `OPENCODE_API_KEY`
 - **Login**: `makima auth login opencode-go` (API key)
 
-No curated models. The provider's model endpoint lists them once it is configured.
+No curated models. The provider lists them once it is configured.
 
 Models come from the provider's models.dev catalog entry. Free models stay hidden until you turn them on in `~/.config/makima/providers.toml`; they then work without a key through the public key:
 
@@ -371,7 +378,7 @@ Zen and Go both read it from `[opencode]`.
 - **API**: `https://openrouter.ai/api/v1`
 - **Login**: `makima auth login openrouter` (API key)
 
-No curated models. The provider's model endpoint lists them once it is configured.
+No curated models. The provider lists them once it is configured.
 
 OpenRouter serves models from many providers behind one key. Browse them at [openrouter.ai/models](https://openrouter.ai/models) and use any id directly, like `openrouter/anthropic/claude-sonnet-4`.
 
@@ -395,7 +402,7 @@ OpenRouter serves models from many providers behind one key. Browse them at [ope
 - **API**: `https://router.requesty.ai/v1`
 - **Login**: `makima auth login requesty` (API key)
 
-No curated models. The provider's model endpoint lists them once it is configured.
+No curated models. The provider lists them once it is configured.
 
 Requesty routes across many models with one key, including managed routing policies (`requesty/claude-sonnet-4-5`) and the full `<vendor>/<model>` catalog (`requesty/openai/gpt-4o-mini`). Get a key at [app.requesty.ai/api-keys](https://app.requesty.ai/api-keys). Set `REQUESTY_BASE_URL=https://router.eu.requesty.ai/v1` to keep all traffic in the EU.
 
@@ -419,7 +426,7 @@ Requesty routes across many models with one key, including managed routing polic
 - **API**: `https://api.tensorx.ai/v1`
 - **Login**: `makima auth login tensorx` (API key)
 
-No curated models. The provider's model endpoint lists them once it is configured.
+No curated models. The provider lists them once it is configured.
 
 ### Google Vertex AI
 
