@@ -131,7 +131,9 @@ impl Fixture {
         )
         .unwrap();
         host.load_source(PLUGIN, &source(server)).unwrap();
-        let providers = host.provider_registry().unwrap();
+        let providers = host
+            .provider_registry(maki_providers::Timeouts::default())
+            .unwrap();
         let prepared =
             smol::block_on(bounded(providers.prepare(providers.model(SPEC).unwrap()))).unwrap();
         Self {

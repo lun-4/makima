@@ -126,7 +126,9 @@ impl Fixture {
         .unwrap();
         host.load_source(plugin, source).unwrap();
         Self {
-            registry: host.provider_registry().unwrap(),
+            registry: host
+                .provider_registry(maki_providers::Timeouts::default())
+                .unwrap(),
             _host: host,
             storage: StateDir::from_path(state.path().to_path_buf()),
             _state: state,

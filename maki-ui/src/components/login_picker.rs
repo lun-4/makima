@@ -469,7 +469,9 @@ mod tests {
             )
             .unwrap();
             host.load_source("fake_plugin", SOURCE).unwrap();
-            let registry = host.provider_registry().unwrap();
+            let registry = host
+                .provider_registry(maki_providers::Timeouts::default())
+                .unwrap();
             let storage = StateDir::from_path(state.path().to_path_buf());
             Self {
                 picker: LoginPicker {

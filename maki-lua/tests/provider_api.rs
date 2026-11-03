@@ -12,7 +12,7 @@ use maki_lua::PluginHost;
 use maki_providers::{
     AgentError, ContentBlock, ConversationEnd, Invocation, InvocationPurpose, Message,
     PreparedProvider, ProviderEvent, ProviderRegistry, RequestOptions, RetryKind, Role, StopReason,
-    UsageLimit, UsageWindow,
+    Timeouts, UsageLimit, UsageWindow,
 };
 use serde_json::json;
 use test_case::test_case;
@@ -137,14 +137,18 @@ async fn bounded<T>(fut: impl Future<Output = T>) -> T {
 }
 
 fn registry(host: &PluginHost) -> Arc<ProviderRegistry> {
-    host.provider_registry().unwrap()
+    host.provider_registry(Timeouts::default()).unwrap()
 }
 
 fn prepare_fake(instance: &str) -> (PluginHost, PreparedProvider) {
+    prepare_fake_with(instance, Timeouts::default())
+}
+
+fn prepare_fake_with(instance: &str, timeouts: Timeouts) -> (PluginHost, PreparedProvider) {
     let host = host();
     host.load_source(PLUGIN, &spec_source(PROVIDER, "", instance))
         .unwrap();
-    let providers = registry(&host);
+    let providers = host.provider_registry(timeouts).unwrap();
     let model = providers.model(SPEC).unwrap();
     let prepared = smol::block_on(bounded(providers.prepare(model))).unwrap();
     (host, prepared)
@@ -383,9 +387,9 @@ fn refused_connection_is_a_connect_failure() {
     assert_eq!(error.retry_kind(), Some(RetryKind::Connect), "{error:?}");
 }
 
-/// A body that stops arriving draws from the bounded timeout budget.
-#[test]
-fn stalled_body_is_a_timeout() {
+/// Streams a body that stops after one byte, with {request_fields} added to
+/// the `ctx.send` request, and returns the provider's error.
+fn stall_body(request_fields: &str, timeouts: Timeouts) -> AgentError {
     let listener = TcpListener::bind(LOOPBACK).unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     let (release_tx, release_rx) = flume::bounded::<()>(1);
@@ -396,7 +400,7 @@ fn stalled_body_is_a_timeout() {
     });
     let instance = format!(
         r#"return {{ stream = function(ctx)
-            local res = assert(ctx.send({{ url = "{url}", idle_timeout = {SHORT_IDLE_SECS} }}))
+            local res = assert(ctx.send({{ url = "{url}", {request_fields} }}))
             local chunk, err = res:read()
             while chunk do
                 chunk, err = res:read()
@@ -404,11 +408,33 @@ fn stalled_body_is_a_timeout() {
             return nil, err
         end }}"#
     );
-    let (_host, prepared) = prepare_fake(&instance);
+    let (_host, prepared) = prepare_fake_with(&instance, timeouts);
     let (events_tx, _events_rx) = flume::unbounded();
     let error = stream(&prepared, &events_tx).err().unwrap();
     release_tx.send(()).unwrap();
     server.join().unwrap();
+    error
+}
+
+/// A body that stops arriving draws from the bounded timeout budget.
+#[test]
+fn stalled_body_is_a_timeout() {
+    let error = stall_body(
+        &format!("idle_timeout = {SHORT_IDLE_SECS}"),
+        Timeouts::default(),
+    );
+    assert_eq!(error.retry_kind(), Some(RetryKind::Timeout), "{error:?}");
+}
+
+/// The configured stream timeout is the default for provider requests; with
+/// the 300 s send default this would run into `BOUND` instead.
+#[test]
+fn configured_stream_timeout_reaches_send() {
+    let timeouts = Timeouts {
+        stream: Duration::from_secs_f64(SHORT_IDLE_SECS),
+        ..Timeouts::default()
+    };
+    let error = stall_body("", timeouts);
     assert_eq!(error.retry_kind(), Some(RetryKind::Timeout), "{error:?}");
 }
 

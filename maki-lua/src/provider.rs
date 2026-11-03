@@ -17,7 +17,7 @@ use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
     AgentError, ConversationEnd, Invocation, Message, Model, ModelInfo, PreparedProvider,
     ProviderBackend, ProviderEvent, ProviderRegistry, ProviderUsage, RegisteredProvider,
-    RequestOptions, StopReason, StreamResponse, TokenUsage,
+    RequestOptions, StopReason, StreamResponse, Timeouts, TokenUsage,
 };
 use maki_storage::id::SessionRef;
 use mlua::{
@@ -39,19 +39,35 @@ const NO_STREAM: &str = "provider instance has no stream function";
 const DEFAULT_KEY_COUNT: usize = 1;
 const LOGIN_INCOMPLETE: &str = "login did not complete";
 const CONFIG_KIND: &str = "config";
+const SEND_WITH_DEFAULTS: &str = r#"
+    local send, defaults = ...
+    return function(request)
+        local filled = table.clone(request)
+        for field, value in defaults do
+            if filled[field] == nil then
+                filled[field] = value
+            end
+        end
+        return send(filled)
+    end
+"#;
 
 pub(crate) type ProviderJob = Box<dyn FnOnce(Lua) -> LocalBoxFuture<'static, ()> + Send>;
 /// The outer error is raised Lua; the inner one is what the provider returned.
 type JobResult<T> = mlua::Result<Result<T, AgentError>>;
 
-pub(crate) fn build_registry(lua: &Lua, requests: &Sender<Request>) -> ProviderRegistry {
+pub(crate) fn build_registry(
+    lua: &Lua,
+    requests: &Sender<Request>,
+    timeouts: Timeouts,
+) -> ProviderRegistry {
     let providers = lua
         .app_data_ref::<ProviderStore>()
         .map(|store| {
             store
                 .specs()
                 .iter()
-                .filter_map(|spec| match registered(lua, requests, spec) {
+                .filter_map(|spec| match registered(lua, requests, spec, timeouts) {
                     Ok(provider) => Some(provider),
                     Err(error) => {
                         warn!(provider = %spec.id, plugin = %spec.plugin, %error, "provider left out of registry");
@@ -68,6 +84,7 @@ fn registered(
     lua: &Lua,
     requests: &Sender<Request>,
     spec: &ProviderSpec,
+    timeouts: Timeouts,
 ) -> mlua::Result<RegisteredProvider> {
     let callbacks = Callbacks {
         id: Arc::clone(&spec.id),
@@ -84,7 +101,7 @@ fn registered(
             .collect::<mlua::Result<_>>()?,
         auth_status: optional_key(lua, &spec.auth_status)?,
         logout: optional_key(lua, &spec.logout)?,
-        send: lua.create_registry_value(spec.send.clone())?,
+        send: lua.create_registry_value(send_with_defaults(lua, &spec.send, timeouts)?)?,
     };
     Ok(RegisteredProvider {
         id: Arc::clone(&spec.id),
@@ -97,6 +114,18 @@ fn registered(
             callbacks: Arc::new(callbacks),
         }),
     })
+}
+
+/// {send} with the `[provider]` timeouts filled in where a request leaves
+/// them out.
+fn send_with_defaults(lua: &Lua, send: &Function, timeouts: Timeouts) -> mlua::Result<Function> {
+    let defaults = lua.create_table()?;
+    defaults.set("connect_timeout", timeouts.connect.as_secs_f64())?;
+    defaults.set("low_speed_timeout", timeouts.low_speed.as_secs_f64())?;
+    defaults.set("idle_timeout", timeouts.stream.as_secs_f64())?;
+    lua.load(SEND_WITH_DEFAULTS)
+        .set_name("=provider send")
+        .call((send.clone(), defaults))
 }
 
 fn optional_key(lua: &Lua, function: &Option<Function>) -> mlua::Result<Option<RegistryKey>> {

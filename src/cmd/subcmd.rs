@@ -17,7 +17,7 @@ use maki_providers::login::{
     LoginRequest, ProviderStatus, drive_login,
 };
 use maki_providers::provider::BoxFuture;
-use maki_providers::{AgentError, ProviderRegistry};
+use maki_providers::{AgentError, ProviderRegistry, Timeouts};
 use maki_storage::StateDir;
 use maki_ui::AppSession;
 
@@ -229,7 +229,7 @@ pub fn provider_host(
     host.load_builtins(&config.plugins)
         .context("load builtin plugins")?;
     let providers = host
-        .provider_registry()
+        .provider_registry(Timeouts::from(&config.provider))
         .context("build provider registry")?;
     Ok((host, providers, config))
 }
@@ -537,7 +537,7 @@ mod tests {
         )
         .unwrap();
         host.load_source("fake_plugin", SOURCE).unwrap();
-        let registry = host.provider_registry().unwrap();
+        let registry = host.provider_registry(Timeouts::default()).unwrap();
         let credentials = ProviderCredentials {
             api_key: KEY.into(),
             host: None,

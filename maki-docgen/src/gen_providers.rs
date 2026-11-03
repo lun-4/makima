@@ -67,7 +67,7 @@ const AGENT_TIERS: [ModelTier; 3] = [ModelTier::Weak, ModelTier::Medium, ModelTi
 pub(crate) fn builtin_registry() -> Arc<ProviderRegistry> {
     let host =
         PluginHost::with_all_builtins(Arc::new(ToolRegistry::new())).expect("loading builtins");
-    host.provider_registry()
+    host.provider_registry(maki_providers::Timeouts::default())
         .expect("building provider registry")
 }
 

@@ -26,7 +26,7 @@ use maki_agent::tools::{
 use maki_agent::{
     BufferSnapshot, CurrentManagedTurn, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle,
 };
-use maki_providers::ProviderRegistry;
+use maki_providers::{ProviderRegistry, Timeouts};
 use maki_storage::checkpoint::CheckpointPublication;
 use mlua::{
     Chunk, ChunkMode, Compiler, Function, Lua, MultiValue, RegistryKey, Table, Value as LuaValue,
@@ -307,6 +307,7 @@ pub enum Request {
         reply: flume::Sender<PluginOptionSpecs>,
     },
     BuildProviderRegistry {
+        timeouts: Timeouts,
         reply: flume::Sender<Arc<ProviderRegistry>>,
     },
     /// One call into a Lua provider, ended by `cancel`.
@@ -5380,9 +5381,10 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                         Request::CollectPluginOptions { reply } => {
                             let _ = reply.send(collect_plugin_options(&rt.lua));
                         }
-                        Request::BuildProviderRegistry { reply } => {
-                            let registry =
-                                Arc::new(crate::provider::build_registry(&rt.lua, &rt.tx));
+                        Request::BuildProviderRegistry { timeouts, reply } => {
+                            let registry = Arc::new(crate::provider::build_registry(
+                                &rt.lua, &rt.tx, timeouts,
+                            ));
                             rt.lua.set_app_data(Arc::clone(&registry));
                             let _ = reply.send(registry);
                         }

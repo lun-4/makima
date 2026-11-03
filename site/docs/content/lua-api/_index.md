@@ -1234,7 +1234,8 @@ already owns fails and names both plugins.
 Config is saved and the default model chosen only after `login`
 succeeds and `auth_status` no longer reports `missing`.
 
-`ctx` is `{ id, send, credentials }`, where `send` is `maki.net.send` and
+`ctx` is `{ id, send, credentials }`, where `send` is `maki.net.send`
+with the `[provider]` connect, low-speed and stream timeouts as defaults, and
 `credentials` is the provider's `maki.provider.Credentials`. Only the
 registering plugin's callbacks receive `ctx`, so a provider id's
 credentials belong to the plugin that registered it. An instance has
