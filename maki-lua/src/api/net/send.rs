@@ -12,6 +12,7 @@ use futures_lite::io::AsyncReadExt;
 #[cfg(unix)]
 use isahc::config::Dialer;
 use isahc::config::{Configurable, RedirectPolicy};
+use isahc::error::ErrorKind;
 use isahc::{AsyncBody, HttpClient, Request};
 use maki_lua_macro::{lua_class, lua_fn};
 use mlua::{
@@ -35,7 +36,13 @@ const USER_AGENT_HEADER: &str = "user-agent";
 const USER_AGENT: &str = concat!("maki/", env!("CARGO_PKG_VERSION"));
 const HEADER_VALUE_SEPARATOR: &str = ", ";
 const CLOSED_ERR: &str = "response is closed";
-const IDLE_TIMEOUT_ERR: &str = "idle timeout waiting for response body";
+/// Starts the error for a connection that was never established: refused, or
+/// a host name that does not resolve. The provider host reads it back to pick
+/// the retry budget.
+pub(crate) const CONNECT_FAILED_ERR: &str = "could not connect";
+/// The error for a read that got no byte within `idle_timeout`. The provider
+/// host reads it back to pick the retry budget.
+pub(crate) const IDLE_TIMEOUT_ERR: &str = "idle timeout waiting for response body";
 #[cfg(not(unix))]
 const UNIX_SOCKET_UNSUPPORTED_ERR: &str = "unix_socket is not supported on this platform";
 
@@ -207,7 +214,12 @@ async fn open(params: SendParams) -> Result<LuaResponse, String> {
     let response = client
         .send_async(request)
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(|e| match e.kind() {
+            ErrorKind::ConnectionFailed | ErrorKind::NameResolution => {
+                format!("{CONNECT_FAILED_ERR}: {e}")
+            }
+            _ => format!("request failed: {e}"),
+        })?;
 
     let header_map = response.headers();
     let headers = header_map
@@ -241,6 +253,11 @@ async fn open(params: SendParams) -> Result<LuaResponse, String> {
 /// The response arrives with the first body byte or when the transfer ends,
 /// not at the end of the headers. A server that sends headers and then stalls
 /// blocks `send` until its first byte or until `low_speed_timeout` fires.
+///
+/// A connection that is refused or a host name that does not resolve fails
+/// with an error starting `could not connect`. A `read()` that times out
+/// fails with an error containing `idle timeout`. Provider callbacks that
+/// return these errors as they are get bounded retries.
 ///
 /// {request} fields:
 ///   `url` (string) Required, `http://` or `https://`.
@@ -622,6 +639,15 @@ mod tests {
         }));
         release_tx.send(()).unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn refused_connection_is_a_connect_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        drop(listener);
+        let err = smol::block_on(bounded(open(params(&url)))).err().unwrap();
+        assert!(err.starts_with(CONNECT_FAILED_ERR), "{err}");
     }
 
     #[test]

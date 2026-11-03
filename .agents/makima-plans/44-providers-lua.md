@@ -75,7 +75,7 @@ A model descriptor carries id, context window, max output tokens, thinking capab
 
 A provider instance returned by `prepare` has `stream(ctx, request, emit)` and optionally `fetch_usage`, `refresh_auth`, `reload_auth`, `rotate_key` and `key_count`. State lives in Lua closures.
 
-Every callback receives `ctx = { id, send, credentials }`, where `send` is the registering plugin's `maki.net.send`. A callback that fails returns nil plus an error. A table with `kind = "config"` is a configuration error (missing key, setting or login) and is never retried; the shared helper builds it with `http.config_error`. A table with `status` is an API error, and anything else is a retryable transport error. The config kind was added during the port, because configuration problems were otherwise retried with backoff, unlike in the native providers.
+Every callback receives `ctx = { id, send, credentials }`, where `send` is the registering plugin's `maki.net.send`. A callback that fails returns nil plus an error. A table with `kind = "config"` is a configuration error (missing key, setting or login) and is never retried; the shared helper builds it with `http.config_error`. A table with `status` is an API error, and anything else is a retryable transport error. A transport error that carries the `maki.net.send` text for a refused connection or a read timeout draws from the bounded connect or timeout retry budget, as the native isahc errors did. The config kind was added during the port, because configuration problems were otherwise retried with backoff, unlike in the native providers.
 
 ### Registry and the Provider trait
 

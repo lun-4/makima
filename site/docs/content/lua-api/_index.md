@@ -4336,6 +4336,11 @@ The response arrives with the first body byte or when the transfer ends,
 not at the end of the headers. A server that sends headers and then stalls
 blocks `send` until its first byte or until `low_speed_timeout` fires.
 
+A connection that is refused or a host name that does not resolve fails
+with an error starting `could not connect`. A `read()` that times out
+fails with an error containing `idle timeout`. Provider callbacks that
+return these errors as they are get bounded retries.
+
 {request} fields:
   `url` (string) Required, `http://` or `https://`.
   `method` (string) HTTP verb (default `"GET"`).

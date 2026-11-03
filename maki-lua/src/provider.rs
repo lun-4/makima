@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::warn;
 
+use crate::api::net::send::{CONNECT_FAILED_ERR, IDLE_TIMEOUT_ERR};
 use crate::api::provider::{ProviderSpec, ProviderStore};
 use crate::credentials::Credentials;
 use crate::login_ui::LoginUi;
@@ -149,9 +150,7 @@ fn returned(values: MultiValue) -> Result<MultiValue, AgentError> {
 fn returned_error(error: &LuaValue) -> AgentError {
     let fields = match error {
         LuaValue::Table(fields) => fields,
-        LuaValue::String(message) => {
-            return AgentError::Io(io::Error::other(message.to_string_lossy()));
-        }
+        LuaValue::String(message) => return transport_error(message.to_string_lossy()),
         other => return AgentError::Io(io::Error::other(other.type_name())),
     };
     let message = fields
@@ -173,7 +172,20 @@ fn returned_error(error: &LuaValue) -> AgentError {
                 .flatten()
                 .and_then(|secs| Duration::try_from_secs_f64(secs).ok()),
         },
-        None => AgentError::Io(io::Error::other(message)),
+        None => transport_error(message),
+    }
+}
+
+/// A failure with no status, classified by the `maki.net.send` error it
+/// carries, so a refused connection and a stalled stream draw from their
+/// bounded retry budgets. Wrapping the error in more text keeps its class.
+fn transport_error(message: String) -> AgentError {
+    if message.contains(CONNECT_FAILED_ERR) {
+        AgentError::Io(io::Error::new(io::ErrorKind::ConnectionRefused, message))
+    } else if message.contains(IDLE_TIMEOUT_ERR) {
+        AgentError::Timeout { message }
+    } else {
+        AgentError::Io(io::Error::other(message))
     }
 }
 

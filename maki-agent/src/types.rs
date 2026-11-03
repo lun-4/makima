@@ -618,9 +618,7 @@ impl TurnFailure {
             AgentError::Api { .. } => TurnFailureKind::Provider,
             AgentError::Timeout { .. } => TurnFailureKind::Timeout,
             AgentError::Tool { .. } => TurnFailureKind::Tool,
-            AgentError::Io(_) | AgentError::Http(_) | AgentError::HttpRequest(_) => {
-                TurnFailureKind::Transport
-            }
+            AgentError::Io(_) => TurnFailureKind::Transport,
             AgentError::Json(_) | AgentError::Config { .. } => TurnFailureKind::InvalidResponse,
             AgentError::Channel => TurnFailureKind::Internal,
             AgentError::EmptySummary => TurnFailureKind::Compaction,
@@ -1749,7 +1747,7 @@ mod tests {
 
     #[test_case(AgentError::api(500, "down"), TurnFailureKind::Provider ; "provider")]
     #[test_case(AgentError::api(401, "bad key"), TurnFailureKind::Authentication ; "authentication")]
-    #[test_case(AgentError::Timeout { secs: 10 }, TurnFailureKind::Timeout ; "timeout")]
+    #[test_case(AgentError::Timeout { message: String::new() }, TurnFailureKind::Timeout ; "timeout")]
     #[test_case(AgentError::Tool { tool: "read".into(), message: "bad".into() }, TurnFailureKind::Tool ; "tool")]
     #[test_case(AgentError::Io(std::io::Error::other("disk")), TurnFailureKind::Transport ; "io")]
     #[test_case(AgentError::Json(serde_json::from_str::<serde_json::Value>("{").unwrap_err()), TurnFailureKind::InvalidResponse ; "json")]

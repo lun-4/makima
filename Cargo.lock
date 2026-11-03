@@ -3030,7 +3030,6 @@ dependencies = [
  "flume 0.11.1",
  "futures",
  "image",
- "isahc",
  "jiff",
  "maki-config",
  "maki-domain",

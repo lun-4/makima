@@ -1,5 +1,8 @@
 use std::future::Future;
+use std::io::Write;
+use std::net::TcpListener;
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use futures_lite::future;
@@ -8,7 +11,7 @@ use maki_config::providers::{ProviderDef, ProvidersConfig};
 use maki_lua::PluginHost;
 use maki_providers::{
     AgentError, ContentBlock, ConversationEnd, Invocation, InvocationPurpose, Message,
-    PreparedProvider, ProviderEvent, ProviderRegistry, RequestOptions, Role, StopReason,
+    PreparedProvider, ProviderEvent, ProviderRegistry, RequestOptions, RetryKind, Role, StopReason,
     UsageLimit, UsageWindow,
 };
 use serde_json::json;
@@ -33,6 +36,10 @@ const API_MESSAGE: &str = "slow down";
 const API_STATUS: u16 = 429;
 const RETRY_AFTER_SECS: f64 = 1.5;
 const TRANSPORT_MESSAGE: &str = "connection reset";
+const LOOPBACK: &str = "127.0.0.1:0";
+const SHORT_IDLE_SECS: f64 = 0.2;
+/// Headers and one body byte, so `send` returns and the next read stalls.
+const STALLED_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nx";
 const RAISED_MESSAGE: &str = "boom";
 const CONFIG_MESSAGE: &str = "AWS_REGION must be set";
 const INVALID_TYPE_ERR: &str = "invalid type";
@@ -355,6 +362,54 @@ fn stream_errors_map_to_agent_errors(body: &str, expected: fn(&AgentError) -> bo
     let (events_tx, _events_rx) = flume::unbounded();
     let error = stream(&prepared, &events_tx).err().unwrap();
     assert!(expected(&error), "{error:?}");
+}
+
+/// A refused connection draws from the bounded connect budget, even after the
+/// provider wraps the error in its own words.
+#[test]
+fn refused_connection_is_a_connect_failure() {
+    let listener = TcpListener::bind(LOOPBACK).unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    drop(listener);
+    let instance = format!(
+        r#"return {{ stream = function(ctx)
+            local _, err = ctx.send({{ url = "{url}" }})
+            return nil, {{ message = "token request: " .. err }}
+        end }}"#
+    );
+    let (_host, prepared) = prepare_fake(&instance);
+    let (events_tx, _events_rx) = flume::unbounded();
+    let error = stream(&prepared, &events_tx).err().unwrap();
+    assert_eq!(error.retry_kind(), Some(RetryKind::Connect), "{error:?}");
+}
+
+/// A body that stops arriving draws from the bounded timeout budget.
+#[test]
+fn stalled_body_is_a_timeout() {
+    let listener = TcpListener::bind(LOOPBACK).unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let (release_tx, release_rx) = flume::bounded::<()>(1);
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(STALLED_HEAD).unwrap();
+        let _ = release_rx.recv_timeout(BOUND);
+    });
+    let instance = format!(
+        r#"return {{ stream = function(ctx)
+            local res = assert(ctx.send({{ url = "{url}", idle_timeout = {SHORT_IDLE_SECS} }}))
+            local chunk, err = res:read()
+            while chunk do
+                chunk, err = res:read()
+            end
+            return nil, err
+        end }}"#
+    );
+    let (_host, prepared) = prepare_fake(&instance);
+    let (events_tx, _events_rx) = flume::unbounded();
+    let error = stream(&prepared, &events_tx).err().unwrap();
+    release_tx.send(()).unwrap();
+    server.join().unwrap();
+    assert_eq!(error.retry_kind(), Some(RetryKind::Timeout), "{error:?}");
 }
 
 fn wait_until(what: &str, mut done: impl FnMut() -> bool) {

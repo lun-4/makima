@@ -1,16 +1,13 @@
 //! Provider error types with retry semantics.
-//! Retryable: 429, 5xx, IO, HTTP transport. Non-retryable: other 4xx, JSON parse, config,
+//! Retryable: 429, 5xx, IO, stream timeouts. Non-retryable: other 4xx, JSON parse, config,
 //! channel closed, user cancel. `user_message()` returns human-readable text for each variant.
 
 use std::{io, time::Duration};
-
-use isahc::error::ErrorKind as HttpErrorKind;
 
 use crate::retry::RetryKind;
 
 const CONNECT_FAILED_MESSAGE: &str =
     "could not connect, check the server is running and the base URL is correct";
-const NETWORK_ERROR_MESSAGE: &str = "connection error, check your network";
 
 /// Request fields that cap the *output*. A 400 naming one of them is about the
 /// cap we sent, never about the prompt being too big.
@@ -103,18 +100,14 @@ pub enum AgentError {
     Tool { tool: String, message: String },
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[error("http: {0}")]
-    Http(#[from] isahc::Error),
-    #[error("http request: {0}")]
-    HttpRequest(#[from] isahc::http::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
     #[error("channel send failed")]
     Channel,
     #[error("cancelled")]
     Cancelled,
-    #[error("stream timed out after {secs}s of inactivity")]
-    Timeout { secs: u64 },
+    #[error("stream timed out: {message}")]
+    Timeout { message: String },
     #[error("compaction returned no summary")]
     EmptySummary,
 }
@@ -140,9 +133,8 @@ impl AgentError {
         match self {
             Self::Api { status: 429, .. } => Some(RetryKind::RateLimit),
             Self::Api { status, .. } if *status >= 500 => Some(RetryKind::Transient),
-            Self::Http(e) if is_connect_failure(e) => Some(RetryKind::Connect),
             Self::Io(e) if e.kind() == io::ErrorKind::ConnectionRefused => Some(RetryKind::Connect),
-            Self::Io(_) | Self::Http(_) => Some(RetryKind::Transient),
+            Self::Io(_) => Some(RetryKind::Transient),
             Self::Timeout { .. } => Some(RetryKind::Timeout),
             Self::Api { .. }
             | Self::Config { .. }
@@ -150,8 +142,7 @@ impl AgentError {
             | Self::Channel
             | Self::Json(_)
             | Self::Cancelled
-            | Self::EmptySummary
-            | Self::HttpRequest(_) => None,
+            | Self::EmptySummary => None,
         }
     }
 
@@ -237,10 +228,7 @@ impl AgentError {
                 CONNECT_FAILED_MESSAGE.into()
             }
             Self::Io(e) => format!("I/O error: {e}"),
-            Self::Http(e) if is_connect_failure(e) => CONNECT_FAILED_MESSAGE.into(),
-            Self::Http(_) => NETWORK_ERROR_MESSAGE.into(),
             Self::Timeout { .. } => "stream timed out, retrying".into(),
-            Self::HttpRequest(e) => format!("request error: {e}"),
             Self::Json(_) => "received an invalid response from the API".into(),
             Self::Channel => "internal error, try again".into(),
             Self::Cancelled => "cancelled".into(),
@@ -262,7 +250,7 @@ impl AgentError {
             Self::Api { status: 429, .. } => "Rate limited".into(),
             Self::Api { status: 529, .. } => "Provider is overloaded".into(),
             Self::Api { status, .. } if *status >= 500 => format!("Server error ({status})"),
-            Self::Io(_) | Self::Http(_) => "Connection error".into(),
+            Self::Io(_) => "Connection error".into(),
             Self::Timeout { .. } => "Stream timed out".into(),
             _ => self.to_string(),
         }
@@ -285,17 +273,6 @@ impl From<maki_storage::StorageError> for AgentError {
     }
 }
 
-/// Nothing answered at the other end, either because no socket is listening or
-/// because the host name does not resolve. isahc folds a refused connection and
-/// a dead provider edge into the same `ConnectionFailed`, and telling them
-/// apart is not possible from here.
-fn is_connect_failure(e: &isahc::Error) -> bool {
-    matches!(
-        e.kind(),
-        HttpErrorKind::ConnectionFailed | HttpErrorKind::NameResolution
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use maki_config::DEFAULT_MAX_RETRIES;
@@ -310,6 +287,12 @@ mod tests {
 
     fn api(status: u16) -> AgentError {
         AgentError::api(status, "")
+    }
+
+    fn timeout() -> AgentError {
+        AgentError::Timeout {
+            message: String::new(),
+        }
     }
 
     fn api_msg(status: u16, message: &str) -> AgentError {
@@ -334,10 +317,7 @@ mod tests {
 
     #[test]
     fn a_timeout_is_its_own_kind() {
-        assert_eq!(
-            AgentError::Timeout { secs: 30 }.retry_kind(),
-            Some(RetryKind::Timeout)
-        );
+        assert_eq!(timeout().retry_kind(), Some(RetryKind::Timeout));
     }
 
     /// Retries this error is granted before the loop has to give up, stopping
@@ -350,28 +330,16 @@ mod tests {
             .count() as u32
     }
 
-    /// A dead provider edge and a local server nobody started both land in
-    /// `ConnectionFailed`, so the run has to give up on it, while a failure on
-    /// a connection that was made is the network being the network and is
-    /// waited out.
-    #[test_case(HttpErrorKind::ConnectionFailed, DEFAULT_MAX_RETRIES ; "a_refused_connection_gives_up")]
-    #[test_case(HttpErrorKind::NameResolution, DEFAULT_MAX_RETRIES   ; "an_unresolvable_host_gives_up")]
-    #[test_case(HttpErrorKind::Io, ROUNDS                            ; "a_read_error_keeps_retrying")]
-    #[test_case(HttpErrorKind::TlsEngine, ROUNDS                     ; "a_tls_failure_keeps_retrying")]
-    fn a_transport_failure_is_waited_out_only_once_connected(kind: HttpErrorKind, expected: u32) {
-        assert_eq!(retries_granted(&AgentError::Http(kind.into())), expected);
-    }
-
     #[test_case(io::ErrorKind::ConnectionRefused, DEFAULT_MAX_RETRIES ; "a_refused_socket_gives_up")]
     #[test_case(io::ErrorKind::UnexpectedEof, ROUNDS                  ; "a_truncated_read_keeps_retrying")]
     fn an_io_failure_gives_up_when_nothing_is_listening(kind: io::ErrorKind, expected: u32) {
         assert_eq!(retries_granted(&AgentError::Io(kind.into())), expected);
     }
 
-    #[test_case(HttpErrorKind::ConnectionFailed, CONNECT_FAILED_MESSAGE ; "connect_failure_names_the_server")]
-    #[test_case(HttpErrorKind::TlsEngine, NETWORK_ERROR_MESSAGE         ; "other_transport_blames_the_network")]
-    fn user_message_transport(kind: HttpErrorKind, expected: &str) {
-        assert_eq!(AgentError::Http(kind.into()).user_message(), expected);
+    #[test]
+    fn a_refused_connection_names_the_server() {
+        let error = AgentError::Io(io::ErrorKind::ConnectionRefused.into());
+        assert_eq!(error.user_message(), CONNECT_FAILED_MESSAGE);
     }
 
     #[test_case(401, true  ; "unauthorized")]
@@ -399,7 +367,7 @@ mod tests {
 
     #[test]
     fn timeout_is_retryable() {
-        assert!(AgentError::Timeout { secs: 30 }.is_retryable());
+        assert!(timeout().is_retryable());
     }
 
     // llama.cpp: https://github.com/ggml-org/llama.cpp/blob/master/tools/server/server-context.cpp
