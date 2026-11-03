@@ -7645,6 +7645,23 @@ function M.eq(actual, expected, msg)
 function M.has(s, substr, msg)
 function M.mktmpdir(prefix)
 function M.rmtree(dir)
+
+-- A scripted `maki.net.send` response that yields {chunks} in order. A
+-- `read_error` is returned once the chunks run out instead of the end.
+function M.response(chunks, opts)
+
+-- A provider `ctx` whose `send` records each request and returns the next of
+-- {responses}, and whose credentials live in memory.
+function M.provider_ctx(responses, saved)
+
+-- An `emit` for provider streams, plus the list it records into.
+function M.recorder()
+
+-- Runs {fn} with `maki.uv.os_getenv` reading from {env} instead.
+function M.with_env(env, fn)
+
+-- Compares JSON-like values structurally.
+function M.same(actual, expected, path)
 function M.report()
 ```
 

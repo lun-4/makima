@@ -115,6 +115,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "options",
     "perf",
     "plan_submit_tool",
+    "providers",
     "question",
     "read",
     "sessions",
