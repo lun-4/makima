@@ -26,6 +26,7 @@ use maki_storage::StateDir;
 use maki_storage::auth::load_provider_credentials;
 use maki_storage::id::SessionRef;
 
+use crate::manifest::ManifestRegistry;
 use crate::model::{Model, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, NativeProvider, Provider};
 use crate::providers::anthropic::shared;
@@ -296,7 +297,9 @@ impl CatalogData {
 
         for (provider_id, provider) in index {
             let slug = builtin_slug(&provider_id);
-            let builtin = builtin_provider(slug).is_some() || slug != provider_id;
+            let builtin = builtin_provider(slug).is_some()
+                || ManifestRegistry::get(slug).is_some()
+                || slug != provider_id;
             if builtin && !OPENCODE_FAMILY_SLUGS.contains(&slug) {
                 let models = parse_models(&provider.models);
                 debug!(

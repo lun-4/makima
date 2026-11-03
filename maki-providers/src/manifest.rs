@@ -126,7 +126,6 @@ const APERTURE: ProviderManifest = ProviderManifest {
 };
 
 const BUILTINS: &[ProviderManifest] = &[
-    ANTHROPIC,
     OPENAI,
     GOOGLE,
     VERTEX,
@@ -138,11 +137,18 @@ const BUILTINS: &[ProviderManifest] = &[
     APERTURE,
 ];
 
+/// Protocols the native gateways still route to after their provider moved
+/// to Lua. They resolve by slug but are not native providers themselves.
+const PROTOCOL_BASES: &[ProviderManifest] = &[ANTHROPIC];
+
 pub struct ManifestRegistry;
 
 impl ManifestRegistry {
     pub fn get(slug: &str) -> Option<&'static ProviderManifest> {
-        BUILTINS.iter().find(|m| m.slug == slug)
+        BUILTINS
+            .iter()
+            .chain(PROTOCOL_BASES)
+            .find(|m| m.slug == slug)
     }
 
     /// Like `get`, but resolves dynamic and custom (providers.toml) slugs to

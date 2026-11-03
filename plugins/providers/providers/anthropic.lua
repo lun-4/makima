@@ -7,13 +7,14 @@ local thinking = require("providers.thinking")
 
 local M = {}
 
+M.LONG_CONTEXT_BETA = "context-1m-2025-08-07"
+
 local FALLBACK_MAX_TOKENS = 32000
 local EMPTY_TEXT = "(empty)"
 local EPHEMERAL = { type = "ephemeral" }
 local CACHED_TAIL_MESSAGES = 2
 local LONG_CONTEXT_SUFFIX = "%-1m$"
 local FAST_BETA = "fast-mode-2026-02-01"
-local LONG_CONTEXT_BETA = "context-1m-2025-08-07"
 local UNPARSED_ERROR_STATUS = 400
 local OPUS = "opus"
 local ADAPTIVE_SINCE = { 5, 0 }
@@ -140,11 +141,18 @@ function M.build_body(request, system_prefix)
   return body
 end
 
--- The Anthropic API body. A `-1m` model id selects the long context window
--- through the beta header and is sent without the suffix.
+-- A `-1m` model id asks for the long context window: the API takes the id
+-- without the suffix plus `LONG_CONTEXT_BETA`. Returns the bare id and whether
+-- the suffix was there.
+function M.strip_long_context(model_id)
+  local bare, count = model_id:gsub(LONG_CONTEXT_SUFFIX, "")
+  return bare, count > 0
+end
+
+-- The Anthropic API body.
 function M.build_request(request, system_prefix)
   local body = M.build_body(request, system_prefix)
-  body.model = request.model.id:gsub(LONG_CONTEXT_SUFFIX, "")
+  body.model = M.strip_long_context(request.model.id)
   body.stream = true
   if request.fast then
     body.speed = "fast"
@@ -157,8 +165,8 @@ function M.beta_header(request)
   if request.fast then
     betas[#betas + 1] = FAST_BETA
   end
-  if request.model.id:match(LONG_CONTEXT_SUFFIX) then
-    betas[#betas + 1] = LONG_CONTEXT_BETA
+  if select(2, M.strip_long_context(request.model.id)) then
+    betas[#betas + 1] = M.LONG_CONTEXT_BETA
   end
   return #betas > 0 and table.concat(betas, ",") or nil
 end

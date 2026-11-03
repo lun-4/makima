@@ -38,46 +38,6 @@ The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discov
 
 ## Built-in Providers
 
-### Anthropic
-
-- **Env var**: `ANTHROPIC_API_KEY`
-- **API**: `https://api.anthropic.com/v1/messages`
-- **Features**: Prompt caching, thinking mode (adaptive/budgeted), advanced tool use
-
-| Tier | Models | Pricing (in/out per 1M tokens) | Context |
-|------|--------|-------------------------------|---------|
-| Weak | **claude-haiku-4-5** (default) | $1.00 / $5.00 | 200K ctx / 64K out |
-| Medium | claude-sonnet-4-5 | $3.00 / $15.00 | 200K ctx / 64K out |
-| Medium | claude-sonnet-4-6 | $3.00 / $15.00 | 200K ctx / 64K out |
-| Medium | **claude-sonnet-5** (default) | $2.00 / $10.00 | 200K ctx / 128K out |
-| Medium | claude-sonnet-4 | $3.00 / $15.00 | 200K ctx / 64K out |
-| Strong | claude-opus-4-5 | $5.00 / $25.00 | 200K ctx / 64K out |
-| Strong | claude-opus-4-6 | $5.00 / $25.00 | 200K ctx / 128K out |
-| Strong | claude-opus-4-7 | $5.00 / $25.00 | 200K ctx / 128K out |
-| Strong | claude-opus-4-8 | $5.00 / $25.00 | 200K ctx / 128K out |
-| Strong | **claude-opus-5** (default) | $5.00 / $25.00 | 200K ctx / 128K out |
-| Strong | claude-fable-5 | $10.00 / $50.00 | 200K ctx / 128K out |
-| Strong | claude-opus-4-0, claude-opus-4-1 | $15.00 / $75.00 | 200K ctx / 32K out |
-
-Defaults: claude-haiku-4-5 (weak), claude-sonnet-5 (medium), claude-opus-5 (strong)
-
-Add `-1m` to any Claude model, like `claude-sonnet-4-6-1m`, to use the 1M token context window.
-
-#### Amazon Bedrock
-
-If you already use Claude through AWS Bedrock, you can point Makima at it instead of the direct Anthropic API. Set `CLAUDE_CODE_USE_BEDROCK=1` and Makima will route all Anthropic requests through Bedrock. The same models, the same features, just a different door.
-
-You will need `AWS_REGION` and one of the following for auth:
-
-| Method | Env vars |
-|--------|----------|
-| IAM credentials | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (and optionally `AWS_SESSION_TOKEN`) |
-| Credentials file | `AWS_PROFILE` (defaults to `default`), reads `~/.aws/credentials` |
-| Bearer token | `AWS_BEARER_TOKEN_BEDROCK` |
-| Gateway proxy | `CLAUDE_CODE_SKIP_BEDROCK_AUTH=1` + `ANTHROPIC_BEDROCK_BASE_URL` (skips signing, useful behind a proxy that handles auth) |
-
-You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROPIC_BEDROCK_BASE_URL`. These env var names match Claude Code, so if you were already using Bedrock there, the same setup works here.
-
 ### OpenAI
 
 - **Env var**: `OPENAI_API_KEY` (also supports OAuth device flow)

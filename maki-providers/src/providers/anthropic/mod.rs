@@ -1,7 +1,10 @@
+//! The Anthropic Messages client the native gateways (Aperture, dynamic and
+//! custom providers, Copilot, the catalog) still route through. The
+//! `anthropic` provider itself is registered by `plugins/providers`.
+//!
 //! Anthropic allows 4 cache breakpoints per request. We place them on: the last tool
 //! definition, the system prompt, and the last block of the 2 most recent messages.
 
-pub(crate) mod bedrock;
 pub(crate) mod shared;
 
 use std::sync::{Arc, Mutex};
@@ -22,10 +25,6 @@ use crate::{
     UsageLimit, UsageWindow,
 };
 
-use super::{KeyHeader, KeyPool, KeyRotation};
-
-const API_KEY_HEADER: &str = "x-api-key";
-
 const API_VERSION: &str = "2023-06-01";
 const API_ORIGIN: &str = "https://api.anthropic.com";
 const MESSAGES_PATH: &str = "/v1/messages";
@@ -34,20 +33,6 @@ const USAGE_PATH: &str = "/api/oauth/usage";
 const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
 const OAUTH_BETA: &str = "oauth-2025-04-20";
 const MONEY_EXPONENT: u32 = 2;
-
-const ENV_VAR: &str = "ANTHROPIC_API_KEY";
-
-inventory::submit!(maki_config::providers::BuiltInProvider {
-    slug: "anthropic",
-    display_name: "Anthropic",
-    protocol: maki_config::providers::Protocol::Anthropic,
-    default_base_url: API_ORIGIN,
-    default_api_key_env: ENV_VAR,
-    default_model: "anthropic/claude-sonnet-4-6",
-    plans: None,
-    login_url: Some("https://console.anthropic.com/settings/keys"),
-    needs_url: false,
-});
 
 pub(crate) use shared::models;
 
@@ -229,68 +214,26 @@ fn origin(base_url: &str) -> &str {
     trimmed.strip_suffix(MESSAGES_PATH).unwrap_or(trimmed)
 }
 
-/// True when `base_url` targets the real Anthropic API, directly or via the
-/// construction-time base-URL override (so quota stays visible behind a proxy).
-fn first_party(base_url: &str, configured_override: Option<&str>) -> bool {
-    let target = origin(base_url);
-    target.contains("api.anthropic.com")
-        || configured_override.is_some_and(|configured| origin(configured) == target)
-}
-
 /// Subscription quota only exists for OAuth tokens against the real Anthropic
 /// API; API keys and anthropic-protocol third-party endpoints have none.
-fn usage_eligible(auth: &super::ResolvedAuth, configured_override: Option<&str>) -> bool {
+fn usage_eligible(auth: &super::ResolvedAuth) -> bool {
     auth.headers
         .iter()
         .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
         && auth
             .base_url
             .as_deref()
-            .is_none_or(|url| first_party(url, configured_override))
-}
-
-fn resolve_anthropic_base_url() -> Option<String> {
-    let config = maki_config::providers::ProvidersConfig::load();
-    maki_config::providers::resolve_base_url("anthropic", config.get("anthropic"))
-}
-
-fn resolve_auth_from_key(
-    key: &str,
-    base_url: Option<String>,
-) -> Result<super::ResolvedAuth, AgentError> {
-    Ok(
-        super::ResolvedAuth::new("anthropic", vec![(API_KEY_HEADER.into(), key.to_string())])?
-            .with_base_url(base_url),
-    )
+            .is_none_or(|url| origin(url).contains("api.anthropic.com"))
 }
 
 pub struct Anthropic {
     client: HttpClient,
     auth: Arc<Mutex<super::ResolvedAuth>>,
-    key_pool: Option<KeyPool>,
     system_prefix: Option<String>,
     stream_timeout: Duration,
-    /// Env / `providers.toml` / inventory default, resolved once at construction.
-    /// Reused by key rotation / reload so they do not re-parse providers.toml.
-    resolved_base_url: Option<String>,
 }
 
 impl Anthropic {
-    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::resolve("anthropic", ENV_VAR)?;
-        let resolved_base_url = resolve_anthropic_base_url();
-        let resolved = resolve_auth_from_key(pool.current(), resolved_base_url.clone())?;
-        debug!(keys = pool.len(), "using API key authentication");
-        Ok(Self {
-            client: super::http_client(timeouts),
-            auth: Arc::new(Mutex::new(resolved)),
-            key_pool: Some(pool),
-            system_prefix: None,
-            stream_timeout: timeouts.stream,
-            resolved_base_url,
-        })
-    }
-
     pub(crate) fn with_auth(
         auth: Arc<Mutex<super::ResolvedAuth>>,
         timeouts: super::Timeouts,
@@ -298,13 +241,8 @@ impl Anthropic {
         Self {
             client: super::http_client(timeouts),
             auth,
-            key_pool: None,
             system_prefix: None,
             stream_timeout: timeouts.stream,
-            // Custom / dynamic callers own their base URL; treating it as the
-            // anthropic override would make every third-party endpoint look
-            // first party and poll `/api/oauth/usage` against it.
-            resolved_base_url: None,
         }
     }
 
@@ -454,22 +392,9 @@ impl Provider for Anthropic {
         Box::pin(self.do_list_models())
     }
 
-    fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
-        Box::pin(async {
-            let pool = KeyPool::resolve("anthropic", ENV_VAR)?;
-            *self.auth.lock().unwrap() =
-                resolve_auth_from_key(pool.current(), self.resolved_base_url.clone())?;
-            debug!("reloaded Anthropic auth from env");
-            Ok(())
-        })
-    }
-
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
         Box::pin(async move {
-            if !usage_eligible(
-                &self.auth.lock().unwrap(),
-                self.resolved_base_url.as_deref(),
-            ) {
+            if !usage_eligible(&self.auth.lock().unwrap()) {
                 return Ok(None);
             }
             let request = self
@@ -486,15 +411,7 @@ impl Provider for Anthropic {
     }
 }
 
-impl NativeProvider for Anthropic {
-    fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Raw(API_KEY_HEADER),
-        ))
-    }
-}
+impl NativeProvider for Anthropic {}
 
 #[derive(Deserialize)]
 struct ApiModelInfo {
@@ -554,7 +471,6 @@ mod tests {
     use test_case::test_case;
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
-    const THIRD_PARTY_BASE_URL: &str = "https://proxy.example.com/v1/messages";
 
     const USAGE_BODY: &str = r#"{
         "five_hour": {"utilization": 14.0, "resets_at": "2026-02-06T22:00:00+00:00"},
@@ -660,37 +576,7 @@ mod tests {
             base_url.map(String::from),
             vec![(header.into(), "token".into())],
         );
-        assert_eq!(usage_eligible(&auth, None), expected);
-    }
-
-    #[test]
-    fn with_auth_keeps_third_party_endpoint_ineligible() {
-        let auth = crate::providers::ResolvedAuth::for_test(
-            Some(THIRD_PARTY_BASE_URL.into()),
-            vec![("authorization".into(), "Bearer token".into())],
-        );
-        let provider = Anthropic::with_auth(
-            Arc::new(Mutex::new(auth)),
-            crate::providers::Timeouts::default(),
-        );
-        assert!(provider.resolved_base_url.is_none());
-        assert!(!usage_eligible(
-            &provider.auth.lock().unwrap(),
-            provider.resolved_base_url.as_deref()
-        ));
-    }
-
-    #[test]
-    fn usage_eligible_when_url_matches_configured_override() {
-        let auth = crate::providers::ResolvedAuth::for_test(
-            Some(THIRD_PARTY_BASE_URL.into()),
-            vec![("Authorization".into(), "token".into())],
-        );
-        assert!(usage_eligible(&auth, Some(THIRD_PARTY_BASE_URL)));
-        assert!(!usage_eligible(
-            &auth,
-            Some("https://other-proxy.example.com")
-        ));
+        assert_eq!(usage_eligible(&auth), expected);
     }
 
     #[test_case("https://api.anthropic.com/v1/messages", "https://api.anthropic.com" ; "strips_messages_path")]

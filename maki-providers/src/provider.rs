@@ -14,8 +14,6 @@ use maki_storage::id::SessionRef;
 use crate::model::{Model, ModelFamily, ModelInfo};
 use crate::providers::KeyRotation;
 use crate::providers::Timeouts;
-use crate::providers::anthropic::Anthropic;
-use crate::providers::anthropic::bedrock;
 use crate::providers::aperture::Aperture;
 use crate::providers::catalog::{
     OPENCODE_FAMILY_SLUGS, available_if_warm, catalog_providers, catalog_providers_if_available,
@@ -35,6 +33,8 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, EnumString, EnumIter)]
 #[strum(serialize_all = "kebab-case")]
 pub enum ProviderKind {
+    /// Only the protocol base that Aperture routes and dynamic and custom
+    /// providers name. The `anthropic` provider is registered from Lua.
     Anthropic,
     #[strum(serialize = "openai")]
     OpenAi,
@@ -164,13 +164,9 @@ impl ProviderKind {
 
     pub(crate) fn create(self, timeouts: Timeouts) -> Result<Box<dyn NativeProvider>, AgentError> {
         match self {
-            Self::Anthropic => {
-                if bedrock::is_enabled() {
-                    Ok(Box::new(bedrock::Bedrock::new(timeouts)?))
-                } else {
-                    Ok(Box::new(Anthropic::new(timeouts)?))
-                }
-            }
+            Self::Anthropic => Err(AgentError::Config {
+                message: format!("provider '{self}' is registered by the providers plugin"),
+            }),
             Self::OpenAi => Ok(Box::new(OpenAi::new(timeouts)?)),
             Self::Google => Ok(Box::new(Google::new(timeouts)?)),
             Self::Vertex => Ok(Box::new(Vertex::new(timeouts)?)),

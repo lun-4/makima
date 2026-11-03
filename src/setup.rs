@@ -125,7 +125,7 @@ fn auto_detect_model(
 /// subscriber to reach.
 pub fn warn_ignored_provider_fields() {
     for (slug, def) in &maki_config::providers::ProvidersConfig::load().providers {
-        if ManifestRegistry::get(slug).is_none() {
+        if !ManifestRegistry::builtins().iter().any(|m| m.slug == slug) {
             continue;
         }
         let ignored = maki_config::providers::ignored_builtin_fields(slug, def);

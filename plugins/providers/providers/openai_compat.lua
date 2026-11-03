@@ -111,7 +111,7 @@ function M.descriptors(def)
 end
 
 -- Discovered rows merged over the curated ones, which keep their place.
-local function merge(def, rows)
+function M.merge(def, rows)
   local by_id, seen, out = {}, {}, {}
   for _, row in ipairs(rows) do
     by_id[row.id] = by_id[row.id] or row
@@ -332,7 +332,7 @@ function M.provider(def)
     if not rows then
       return nil, err
     end
-    return merge(def, rows)
+    return M.merge(def, rows)
   end
 
   function spec.prepare(ctx, info, config)

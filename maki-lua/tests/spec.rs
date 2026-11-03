@@ -13,6 +13,8 @@ use test_case::test_case;
 #[test_case("mode_plan_override", include_str!("../../plugins/mode_plan_override/init.lua") ; "mode_plan_override_loads")]
 #[test_case("options", include_str!("../../plugins/options/tests/spec.lua") ; "options_plugin_spec")]
 #[test_case("providers_anthropic", include_str!("../../plugins/providers/tests/anthropic.lua") ; "providers_anthropic_spec")]
+#[test_case("providers_anthropic_provider", include_str!("../../plugins/providers/tests/anthropic_provider.lua") ; "providers_anthropic_provider_spec")]
+#[test_case("providers_bedrock", include_str!("../../plugins/providers/tests/bedrock.lua") ; "providers_bedrock_spec")]
 #[test_case("providers_bedrock_eventstream", include_str!("../../plugins/providers/tests/bedrock_eventstream.lua") ; "providers_bedrock_eventstream_spec")]
 #[test_case("providers_chat_completions", include_str!("../../plugins/providers/tests/chat_completions.lua") ; "providers_chat_completions_spec")]
 #[test_case("providers_clock", include_str!("../../plugins/providers/tests/clock.lua") ; "providers_clock_spec")]

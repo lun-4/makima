@@ -13,8 +13,6 @@ use crate::{
     StreamResponse, ThinkingConfig, TokenUsage,
 };
 
-pub(super) const BETA_TOOL_EXAMPLES_BEDROCK: &str = "tool-examples-2025-10-29";
-
 /// The messages API refuses requests without max_tokens. Anthropic-kind
 /// models always get a window from the fallback table, so this only fires if
 /// an unknown-window model is ever routed here; 32k is safe for every Claude.

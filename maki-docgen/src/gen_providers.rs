@@ -39,23 +39,6 @@ base_url = "http://xxxx:1234/v1"
 
 The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discover_models` and `models` are ignored with a warning. Use a custom slug if you need those."#;
 
-const LONG_CONTEXT_NOTE: &str = r#"Add `-1m` to any Claude model, like `claude-sonnet-4-6-1m`, to use the 1M token context window."#;
-
-const BEDROCK_NOTE: &str = r#"#### Amazon Bedrock
-
-If you already use Claude through AWS Bedrock, you can point Makima at it instead of the direct Anthropic API. Set `CLAUDE_CODE_USE_BEDROCK=1` and Makima will route all Anthropic requests through Bedrock. The same models, the same features, just a different door.
-
-You will need `AWS_REGION` and one of the following for auth:
-
-| Method | Env vars |
-|--------|----------|
-| IAM credentials | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (and optionally `AWS_SESSION_TOKEN`) |
-| Credentials file | `AWS_PROFILE` (defaults to `default`), reads `~/.aws/credentials` |
-| Bearer token | `AWS_BEARER_TOKEN_BEDROCK` |
-| Gateway proxy | `CLAUDE_CODE_SKIP_BEDROCK_AUTH=1` + `ANTHROPIC_BEDROCK_BASE_URL` (skips signing, useful behind a proxy that handles auth) |
-
-You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROPIC_BEDROCK_BASE_URL`. These env var names match Claude Code, so if you were already using Bedrock there, the same setup works here."#;
-
 const OPENCODE_FREE_MODELS_NOTE: &str = r#"By default Makima hides free models from the Opencode catalog. To list free models (they use a public fallback, no API key needed), add this to `~/.config/makima/providers.toml`:
 
 ```toml
@@ -394,6 +377,8 @@ fn build_sections() -> Vec<ProviderSection> {
 
     for kind in ProviderKind::iter() {
         match kind {
+            // Registered from Lua; the variant is only a protocol base.
+            ProviderKind::Anthropic => {}
             ProviderKind::OpenAi => {
                 sections.push(ProviderSection {
                     kind,
@@ -524,11 +509,6 @@ fn write_section(out: &mut String, section: &ProviderSection) {
         let _ = writeln!(out, "{}", no_catalog_note(section.kind));
     } else {
         write_model_table(out, section.entries);
-    }
-
-    if section.name == "Anthropic" {
-        let _ = writeln!(out, "\n{LONG_CONTEXT_NOTE}");
-        let _ = writeln!(out, "\n{BEDROCK_NOTE}");
     }
 
     if section.kind == ProviderKind::Opencode {
