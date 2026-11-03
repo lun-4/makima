@@ -4789,7 +4789,7 @@ token that the server already issued is always written.
 
 - `{fn}` (`function`) `fn(current)` returning the table to store.
 
-**Returns:** (`table?`, `string?`) The stored table after the refresh, or nil plus an error.
+**Returns:** (`table?`, `any?`) The stored table after the refresh, or nil plus the error {fn} returned, unchanged.
 
 **Example:**
 

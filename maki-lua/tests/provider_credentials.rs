@@ -38,6 +38,8 @@ const FRESH: &str = "fresh-access";
 const REFRESHED: &str = "refreshed-by-fn";
 const ROTATED: &str = "rotated-access";
 const REFRESH_ERR: &str = "boom";
+const REFRESH_STATUS: u16 = 401;
+const RETRY_AFTER_SECS: u32 = 7;
 
 #[derive(Clone, Copy)]
 enum Shape {
@@ -108,6 +110,12 @@ const SCRIPTS: &str = r#"
             end
             return attempt() .. "," .. attempt() .. "," .. calls
         end,
+        fail_table = function(ctx)
+            local _, err = ctx.credentials:refresh(function()
+                return nil, { status = REFRESH_STATUS, message = REFRESH_ERR, retry_after = RETRY_AFTER }
+            end)
+            return table.concat({ err.status, err.message, err.retry_after }, ",")
+        end,
     }
 "#;
 
@@ -157,6 +165,7 @@ fn source(server: &str) -> String {
         r#"
         local API_KEY, HOST, ACCESS, REFRESH = "{API_KEY}", "{HOST}", "{ACCESS}", "{REFRESH}"
         local EXPIRES, FRESH, REFRESHED, REFRESH_ERR = {EXPIRES}, "{FRESH}", "{REFRESHED}", "{REFRESH_ERR}"
+        local REFRESH_STATUS, RETRY_AFTER = {REFRESH_STATUS}, {RETRY_AFTER_SECS}
         local SERVER = "{server}"
         "#
     );
@@ -367,5 +376,14 @@ fn refresh_error_is_returned_and_flight_cleared() {
     assert_eq!(
         fixture.run("fail"),
         format!("{REFRESH_ERR},{REFRESH_ERR},2")
+    );
+}
+
+#[test]
+fn refresh_error_table_reaches_the_caller_intact() {
+    let fixture = Fixture::new("");
+    assert_eq!(
+        fixture.run("fail_table"),
+        format!("{REFRESH_STATUS},{REFRESH_ERR},{RETRY_AFTER_SECS}")
     );
 }

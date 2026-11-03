@@ -23,7 +23,7 @@ use smol::{Timer, unblock};
 use tracing::warn;
 
 use crate::api::env::host_state_dir;
-use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
+use crate::api::util::pair::{Pair, pair, try_pair};
 use crate::provider::{HOST_STOPPED, ProviderJob, serialize_options};
 use crate::runtime::{Request, RequestTx, strip_traceback};
 
@@ -32,7 +32,9 @@ use crate::runtime::{Request, RequestTx, strip_traceback};
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(120);
 const REFRESH_TIMEOUT_ERR: &str = "credential refresh timed out";
 
-type RefreshResult = Result<Option<Value>, String>;
+/// The error is what the refresh function returned, a string or a table such
+/// as `{ status, message, retry_after }`, handed back to every caller as is.
+type RefreshResult = Result<Option<Value>, Value>;
 type Flight = Shared<oneshot::Receiver<RefreshResult>>;
 
 /// In-flight refreshes by provider id. Only the Lua thread touches it.
@@ -101,7 +103,7 @@ async fn delete(lua: Lua, this: UserDataRef<Credentials>) -> LuaResult<Pair<bool
 /// token that the server already issued is always written.
 ///
 /// @param fn function `fn(current)` returning the table to store.
-/// @return (table?, string?) The stored table after the refresh, or nil plus an error.
+/// @return (table?, any?) The stored table after the refresh, or nil plus the error {fn} returned, unchanged.
 /// @example
 /// local tokens, err = ctx.credentials:refresh(function(current)
 ///   if current and current.expires > maki.time.now().secs * 1000 + 60000 then return nil end
@@ -112,20 +114,25 @@ async fn refresh(
     lua: Lua,
     this: UserDataRef<Credentials>,
     r#fn: Function,
-) -> LuaResult<Pair<LuaValue>> {
+) -> LuaResult<(LuaValue, LuaValue)> {
     let id = Arc::clone(&this.id);
     drop(this);
     let existing = lua
         .app_data_ref::<RefreshFlights>()
         .and_then(|flights| flights.0.get(&id).cloned());
     let flight = match existing {
-        Some(flight) => flight,
-        None => try_pair!(start_refresh(&lua, id, r#fn)),
+        Some(flight) => Ok(flight),
+        None => start_refresh(&lua, id, r#fn),
     };
-    match flight.await.unwrap_or_else(|_| Err(HOST_STOPPED.into())) {
-        Ok(Some(value)) => Ok((Some(lua.to_value_with(&value, serialize_options())?), None)),
-        Ok(None) => Ok((None, None)),
-        Err(error) => Ok(err_pair(error)),
+    let result = match flight {
+        Ok(flight) => flight.await.unwrap_or_else(|_| Err(HOST_STOPPED.into())),
+        Err(error) => Err(error.into()),
+    };
+    let to_lua = |value: &Value| lua.to_value_with(value, serialize_options());
+    match result {
+        Ok(Some(value)) => Ok((to_lua(&value)?, LuaValue::Nil)),
+        Ok(None) => Ok((LuaValue::Nil, LuaValue::Nil)),
+        Err(error) => Ok((LuaValue::Nil, to_lua(&error)?)),
     }
 }
 
@@ -143,7 +150,7 @@ fn start_refresh(lua: &Lua, id: Arc<str>, refresh: Function) -> Result<Flight, S
         Box::pin(async move {
             let timeout = async {
                 Timer::after(REFRESH_TIMEOUT).await;
-                Err(REFRESH_TIMEOUT_ERR.to_owned())
+                Err(REFRESH_TIMEOUT_ERR.into())
             };
             let result = future::or(run_refresh(&lua, &job_id, refresh), timeout).await;
             if let Some(mut flights) = lua.app_data_mut::<RefreshFlights>() {
@@ -184,9 +191,9 @@ async fn run_refresh(lua: &Lua, id: &Arc<str>, refresh: Function) -> RefreshResu
         .map_err(|error| strip_traceback(&error))?;
     let refreshed: Value = match (values.front(), values.get(1)) {
         (None | Some(LuaValue::Nil), Some(error)) if !error.is_nil() => {
-            return Err(error
-                .to_string()
-                .unwrap_or_else(|_| error.type_name().to_owned()));
+            return Err(lua
+                .from_value(error.clone())
+                .unwrap_or_else(|_| error.type_name().into()));
         }
         (None | Some(LuaValue::Nil), _) => return Ok(current),
         (Some(value), _) => lua
