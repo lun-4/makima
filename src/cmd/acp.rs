@@ -74,7 +74,7 @@ pub fn run(
 
     let timeouts = maki_providers::Timeouts::from(&config.provider);
     let providers = plugin_host
-        .provider_registry(timeouts)
+        .provider_registry()
         .context("build provider registry")?;
 
     let model = setup::resolve_model(&providers, model_arg.as_deref(), &config.provider, &storage)?;

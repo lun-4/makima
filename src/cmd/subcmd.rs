@@ -1,6 +1,6 @@
-use std::env;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 
 use color_eyre::Result;
@@ -9,27 +9,17 @@ use color_eyre::eyre::{Context, bail};
 use maki_agent::mcp::{config as mcp_config, oauth as mcp_oauth};
 use maki_agent::tools::ToolRegistry;
 use maki_config::project::{self, ProjectConfig, TrustMode};
-use maki_config::providers::{
-    ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
-    resolve_base_url, resolve_default_model, resolve_display_name, resolve_login_url, slugify,
-};
 use maki_config::{Config, load_env_files, load_permissions};
 use maki_lua::PluginHost;
 use maki_lua::ui_sink::{HeadlessUi, HostUi};
-use maki_providers::dynamic;
 use maki_providers::login::{
     self, AuthState, AuthStatus, InteractionRequest, InteractionService, LoginOutcome,
     LoginRequest, ProviderStatus, drive_login,
 };
 use maki_providers::provider::BoxFuture;
-use maki_providers::{AgentError, ProviderRegistry, Timeouts};
+use maki_providers::{AgentError, ProviderRegistry};
 use maki_storage::StateDir;
-use maki_storage::auth::ProviderCredentials;
-use maki_storage::auth::{
-    delete_provider_credentials, load_provider_credentials, save_provider_credentials,
-};
-use maki_storage::model::persist_model;
-use maki_ui::{AppSession, CUSTOM_SLUG, native_login_choices};
+use maki_ui::AppSession;
 
 const SESSIONS_JSON_ONLY_ERR: &str =
     "the sessions command only supports --json; use `makima sessions --json`";
@@ -38,6 +28,7 @@ const ENV_MARK: &str = "\x1b[33m~\x1b[0m";
 const CONFIGURED_MARK: &str = "\x1b[34m●\x1b[0m";
 const MISSING_MARK: &str = "\x1b[31m✗\x1b[0m";
 const FAILED_MARK: &str = "\x1b[31m!\x1b[0m";
+const EMPTY_COMMAND_ERR: &str = "no program to run";
 
 /// Subcommands have no UI, so their hosts print notifications to stderr.
 fn headless() -> HostUi {
@@ -49,36 +40,19 @@ pub fn auth_login(
     storage: &StateDir,
     registry: &ProviderRegistry,
 ) -> Result<()> {
-    let native = match provider {
-        Some(_) => Vec::new(),
-        None => native_login_choices(storage, registry),
-    };
     let request = LoginRequest {
         provider: provider.map(str::to_owned),
-        native,
     };
     let ui = Arc::new(TerminalInteraction);
-    match smol::block_on(drive_login(registry, ui, storage, request))? {
-        LoginOutcome::LoggedIn {
-            display_name,
-            model,
-            ..
-        } => {
-            println!();
-            println!("  {SAVED_MARK} Authenticated: {display_name}");
-            if let Some(model) = model {
-                println!("  Default model: {model}");
-            }
-        }
-        LoginOutcome::Native(name) => login_native(&slugify(&name), storage)?,
-    }
-    Ok(())
-}
-
-fn login_native(slug: &str, storage: &StateDir) -> Result<()> {
-    match slug {
-        CUSTOM_SLUG => login_custom(storage)?,
-        slug => login_provider(slug, storage)?,
+    let LoginOutcome {
+        display_name,
+        model,
+        ..
+    } = smol::block_on(drive_login(registry, ui, storage, request))?;
+    println!();
+    println!("  {SAVED_MARK} Authenticated: {display_name}");
+    if let Some(model) = model {
+        println!("  Default model: {model}");
     }
     Ok(())
 }
@@ -158,6 +132,29 @@ fn terminal_interact(
             writeln!(out, "  Opening {url} in your browser")?;
             Ok(String::new())
         }
+        InteractionRequest::Terminal(argv) => {
+            run_on_terminal(&argv)?;
+            Ok(String::new())
+        }
+    }
+}
+
+/// Hands the terminal to {argv} until it exits.
+fn run_on_terminal(argv: &[String]) -> Result<(), AgentError> {
+    let (program, args) = argv.split_first().ok_or_else(|| AgentError::Config {
+        message: EMPTY_COMMAND_ERR.into(),
+    })?;
+    let status = Command::new(program)
+        .args(args)
+        .status()
+        .map_err(|error| AgentError::Config {
+            message: format!("failed to run {program}: {error}"),
+        })?;
+    match status.success() {
+        true => Ok(()),
+        false => Err(AgentError::Config {
+            message: format!("{program} exited with {status}"),
+        }),
     }
 }
 
@@ -169,274 +166,15 @@ fn read_answer(input: &mut impl BufRead) -> Result<String, AgentError> {
     Ok(line.trim().to_owned())
 }
 
-fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
-    let builtin = builtin_provider(slug);
-    let is_custom = ProvidersConfig::load().get(slug).is_some();
-    if builtin.is_none() && dynamic::display_name(slug).is_none() && !is_custom {
-        bail!("unknown provider '{slug}'");
-    }
-
-    if builtin.is_none() && dynamic::auth_providers().iter().any(|(s, _)| *s == slug) {
-        dynamic::login(slug)?;
-        return Ok(());
-    }
-
-    let mut config = ProvidersConfig::load();
-    let def = config.get(slug).cloned();
-
-    let plan = select_plan(slug, builtin, def.as_ref())?;
-
-    let needs_url = builtin.is_some_and(|b| b.needs_url);
-    let host_url = if needs_url {
-        Some(prompt_host_url(
-            slug,
-            &resolve_display_name(slug, def.as_ref()),
-            def.as_ref(),
-        )?)
-    } else {
-        None
-    };
-
-    let api_key_optional = needs_url;
-    let login_url = resolve_login_url(slug, plan.as_deref());
-    let api_key = prompt_api_key(
-        login_url.as_deref(),
-        &resolve_display_name(slug, def.as_ref()),
-        api_key_optional,
-    )?;
-
-    let mut provider_def = def.unwrap_or_default();
-    if let Some(plan_name) = &plan {
-        provider_def.plan = Some(plan_name.clone());
-    }
-    if let Some(url) = &host_url {
-        provider_def.base_url = Some(url.clone());
-    }
-
-    let has_key = !api_key.is_empty();
-    if has_key {
-        let creds = ProviderCredentials {
-            api_key,
-            host: None,
-        };
-        save_provider_credentials(storage, slug, &creds).context("save credentials")?;
-    }
-
-    if plan.is_some() || needs_url || host_url.is_some() || builtin.is_none() {
-        config.upsert(slug.to_string(), provider_def);
-        config.save().context("save providers.toml")?;
-    }
-
-    let default_model = if needs_url {
-        None
-    } else {
-        resolve_default_model(slug, config.get(slug))
-    };
-    if let Some(model) = &default_model {
-        persist_model(storage, model);
-    }
-
-    println!();
-    let display = resolve_display_name(slug, config.get(slug));
-    println!("  \x1b[32m✓\x1b[0m Configured: {}", display);
-    if let Some(url) = resolve_base_url(slug, config.get(slug)) {
-        println!("  Endpoint: {}", url);
-    }
-    if let Some(model) = &default_model {
-        println!("  Default model: {}", model);
-    }
-    if has_key {
-        println!("  Credentials: ~/.local/state/makima/auth/{}.json", slug);
-    } else {
-        let env_var = resolve_api_key_env(slug, config.get(slug));
-        println!(
-            "  Set API key via: {} or run: makima auth login {}",
-            env_var, slug
-        );
-    }
-
-    Ok(())
-}
-
-fn login_custom(storage: &StateDir) -> Result<()> {
-    print!("  Provider name: ");
-    io::stdout().flush()?;
-    let mut name = String::new();
-    io::stdin().read_line(&mut name)?;
-    let slug = slugify(&name);
-    if slug.is_empty() {
-        bail!("provider name cannot be empty");
-    }
-
-    println!("  Protocol:");
-    println!("    1. openai   (OpenAI-compatible chat completions)");
-    println!("    2. anthropic (Anthropic messages API)");
-    println!("    3. google   (Google Gemini API)");
-    print!("  Select [1-3]: ");
-    io::stdout().flush()?;
-    let mut proto_input = String::new();
-    io::stdin().read_line(&mut proto_input)?;
-    let protocol = match proto_input.trim() {
-        "1" | "openai" => "openai",
-        "2" | "anthropic" => "anthropic",
-        "3" | "google" => "google",
-        _ => bail!("invalid protocol selection"),
-    };
-
-    print!("  Base URL: ");
-    io::stdout().flush()?;
-    let mut url_input = String::new();
-    io::stdin().read_line(&mut url_input)?;
-    let base_url = url_input.trim().to_string();
-    if base_url.is_empty() {
-        bail!("base URL cannot be empty");
-    }
-
-    let display_name = format!("Custom ({slug})");
-    let api_key_env = format!("{}_API_KEY", slug.to_uppercase().replace('-', "_"));
-
-    print!("  API key (or Enter to skip): ");
-    io::stdout().flush()?;
-    let mut key_input = String::new();
-    io::stdin().read_line(&mut key_input)?;
-    let api_key = key_input.trim().to_string();
-
-    let mut config = ProvidersConfig::load();
-    let provider_def = ProviderDef {
-        display_name: Some(display_name),
-        protocol: Some(
-            protocol
-                .parse()
-                .map_err(|e: String| color_eyre::eyre::eyre!("{e}"))?,
-        ),
-        base_url: Some(base_url.clone()),
-        api_key_env: Some(api_key_env.clone()),
-        discover_models: true,
-        ..Default::default()
-    };
-
-    let has_key = !api_key.is_empty();
-    if has_key {
-        let creds = ProviderCredentials {
-            api_key,
-            host: None,
-        };
-        save_provider_credentials(storage, &slug, &creds).context("save credentials")?;
-    }
-
-    config.upsert(slug.clone(), provider_def);
-    config.save().context("save providers.toml")?;
-
-    println!();
-    println!("  \x1b[32m✓\x1b[0m Configured: {}", slug);
-    println!("  Endpoint: {}", base_url);
-    if has_key {
-        println!("  Credentials: ~/.local/state/makima/auth/{}.json", slug);
-    } else {
-        println!(
-            "  Set API key via: {} or run: makima auth login {}",
-            api_key_env, slug
-        );
-    }
-    println!("  Use with: makima -m {}/<model>", slug);
-
-    Ok(())
-}
-
-fn select_plan(
-    slug: &str,
-    builtin: Option<&'static maki_config::providers::BuiltInProvider>,
-    def: Option<&ProviderDef>,
-) -> Result<Option<String>> {
-    let plans = builtin.and_then(|b| b.plans);
-    if plans.is_none_or(|p| p.len() <= 1) {
-        if let Some(d) = def {
-            return Ok(d.plan.clone());
-        }
-        return Ok(None);
-    }
-    let plans = plans.unwrap();
-
-    if let Some(d) = def
-        && d.plan.is_some()
-    {
-        return Ok(d.plan.clone());
-    }
-
-    println!();
-    println!("  {} plan:", resolve_display_name(slug, def));
-    for (i, (_key, plan)) in plans.iter().enumerate() {
-        println!("    {}. {} ({})", i + 1, plan.display_name, plan.base_url);
-    }
-    println!();
-    print!("  Select [1-{}]: ", plans.len());
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let choice: usize = input.trim().parse().context("enter a number")?;
-    if choice == 0 || choice > plans.len() {
-        bail!("invalid plan selection");
-    }
-    Ok(Some(plans[choice - 1].0.to_string()))
-}
-
-fn prompt_host_url(slug: &str, display_name: &str, def: Option<&ProviderDef>) -> Result<String> {
-    let default = resolve_base_url(slug, def).unwrap_or_default();
-    print!("  {} host URL [{}]: ", display_name, default);
-    io::stdout().flush()?;
-
-    let mut url = String::new();
-    io::stdin().read_line(&mut url)?;
-    let url = url.trim().to_string();
-
-    Ok(if url.is_empty() { default } else { url })
-}
-
-fn prompt_api_key(url: Option<&str>, display_name: &str, optional: bool) -> Result<String> {
-    if let Some(url) = url {
-        if let Err(e) = open::that(url) {
-            tracing::warn!(error = %e, "failed to open browser");
-        }
-        println!("  Opened {} in your browser.", url);
-    }
-    if optional {
-        print!("  {} API key (or Enter to skip): ", display_name);
-    } else {
-        print!("  {} API key: ", display_name);
-    }
-    io::stdout().flush()?;
-
-    let mut api_key = String::new();
-    io::stdin().read_line(&mut api_key)?;
-    let api_key = api_key.trim().to_string();
-
-    Ok(api_key)
-}
-
 pub fn auth_logout(provider: &str, storage: &StateDir, registry: &ProviderRegistry) -> Result<()> {
-    if let Some(name) = smol::block_on(login::logout(registry, storage, provider))? {
-        println!("Logged out of {name}.");
-        return Ok(());
-    }
-    let slug = slugify(provider);
-    let mut config = ProvidersConfig::load();
-    let deleted = delete_provider_credentials(storage, &slug).context("delete credentials")?;
-    if deleted {
-        println!("Removed credentials for '{}'.", slug);
-    }
-    if config.remove(&slug) {
-        config.save().context("save providers.toml")?;
-    }
-    if !deleted && builtin_provider(&slug).is_none() {
-        dynamic::logout(&slug)?;
+    match smol::block_on(login::logout(registry, storage, provider))? {
+        Some(name) => println!("Logged out of {name}."),
+        None => bail!("unknown provider '{provider}'"),
     }
     Ok(())
 }
 
 pub fn auth_status(storage: &StateDir, registry: &ProviderRegistry) -> Result<()> {
-    let config = ProvidersConfig::load();
-    let builtins = all_builtins();
-
     println!();
     let mut section = None;
     for provider in smol::block_on(login::auth_status(registry, storage)) {
@@ -447,71 +185,6 @@ pub fn auth_status(storage: &StateDir, registry: &ProviderRegistry) -> Result<()
             section = provider.section.clone();
         }
         println!("{}", status_line(&provider));
-    }
-    for b in builtins.iter().filter(|b| !registry.contains(b.slug)) {
-        let def = config.get(b.slug);
-        let display = resolve_display_name(b.slug, def);
-
-        if let Some(creds) = load_provider_credentials(storage, b.slug) {
-            let plan_info = def
-                .and_then(|d| d.plan.as_deref())
-                .map(|p| format!(" ({})", p))
-                .unwrap_or_default();
-            let masked = if creds.api_key.len() > 8 {
-                format!(
-                    "{}...{}",
-                    &creds.api_key[..4],
-                    &creds.api_key[creds.api_key.len() - 4..]
-                )
-            } else {
-                "****".to_string()
-            };
-            println!(
-                "  \x1b[32m✓\x1b[0m {:<14} {} (key: {}){}",
-                b.slug, display, masked, plan_info
-            );
-        } else if env::var(b.default_api_key_env).is_ok() {
-            println!(
-                "  \x1b[33m~\x1b[0m {:<14} {} (via {})",
-                b.slug, display, b.default_api_key_env
-            );
-        } else if def.is_some_and(|d| d.base_url.is_some()) {
-            println!("  \x1b[34m●\x1b[0m {:<14} {} (configured)", b.slug, display);
-        } else {
-            println!(
-                "  \x1b[31m✗\x1b[0m {:<14} {} (run: makima auth login {})",
-                b.slug, display, b.slug
-            );
-        }
-    }
-
-    for (slug, def) in &config.providers {
-        if builtin_provider(slug).is_some() || registry.contains(slug) {
-            continue;
-        }
-        let display = def.display_name.as_deref().unwrap_or(slug);
-        if let Some(creds) = load_provider_credentials(storage, slug) {
-            println!(
-                "  \x1b[32m✓\x1b[0m {:<14} {} (key: {})",
-                slug,
-                display,
-                creds.masked_api_key()
-            );
-        } else {
-            let default_env = format!("{}_API_KEY", slug.to_uppercase().replace('-', "_"));
-            let env_var = def.api_key_env.as_deref().unwrap_or(&default_env);
-            if env::var(env_var).is_ok() {
-                println!(
-                    "  \x1b[33m~\x1b[0m {:<14} {} (via {})",
-                    slug, display, env_var
-                );
-            } else {
-                println!(
-                    "  \x1b[31m✗\x1b[0m {:<14} {} (run: makima auth login {})",
-                    slug, display, slug
-                );
-            }
-        }
     }
     Ok(())
 }
@@ -555,7 +228,7 @@ pub fn provider_host(
     host.load_builtins(&config.plugins)
         .context("load builtin plugins")?;
     let providers = host
-        .provider_registry(Timeouts::from(&config.provider))
+        .provider_registry()
         .context("build provider registry")?;
     Ok((host, providers, config))
 }
@@ -784,6 +457,9 @@ mod tests {
     use super::*;
     use maki_lua::test_support::InMemoryFs;
     use maki_providers::login::ChoiceOption;
+    use maki_storage::auth::{
+        ProviderCredentials, load_provider_credentials, save_provider_credentials,
+    };
     use maki_storage::sessions::SessionSummary;
     use std::collections::BTreeSet;
     use std::io::Cursor;
@@ -860,7 +536,7 @@ mod tests {
         )
         .unwrap();
         host.load_source("fake_plugin", SOURCE).unwrap();
-        let registry = host.provider_registry(Timeouts::default()).unwrap();
+        let registry = host.provider_registry().unwrap();
         let credentials = ProviderCredentials {
             api_key: KEY.into(),
             host: None,

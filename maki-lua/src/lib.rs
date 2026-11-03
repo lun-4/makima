@@ -61,32 +61,80 @@ pub mod test_support {
         CommandContent, CommandError, CommandFuture, CommandHost, CommandOutcome, CommandRegistry,
         HostRequest, HostResponse, TargetCapabilities,
     };
-    use maki_config::providers::{Protocol, ProviderDef, ProvidersConfig};
-    use std::sync::Arc;
+    use maki_providers::login::{AuthSpec, AuthStatus, InteractionService};
+    use maki_providers::provider::{BoxFuture, unconfigured};
+    use maki_providers::{
+        AgentError, Model, ModelInfo, PreparedProvider, ProviderBackend, ProviderRegistry,
+        RegisteredProvider,
+    };
+    use serde_json::Value;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     pub use crate::api::util::dispatch::MAX_HOOK_DEPTH;
 
     pub const COMMAND_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
-    const UNREACHABLE_HOST: &str = "http://127.0.0.1:1";
-    const CUSTOM_PROVIDER_KEY: &str = "test-key";
+    type SharedModels = Arc<Mutex<Vec<ModelInfo>>>;
 
-    /// Saves a native custom provider {slug} into `providers.toml` of the
-    /// initialised config directory, for tests that need a native provider
-    /// to resolve and prepare any model without the network.
-    pub fn save_custom_provider(slug: &str) {
-        let mut providers = ProvidersConfig::try_load().unwrap();
-        providers.upsert(
-            slug.into(),
-            ProviderDef {
-                protocol: Some(Protocol::Openai),
-                base_url: Some(UNREACHABLE_HOST.into()),
-                api_key: Some(CUSTOM_PROVIDER_KEY.into()),
-                ..ProviderDef::default()
-            },
-        );
-        providers.save().unwrap();
+    struct OfflineBackend(SharedModels);
+
+    impl ProviderBackend for OfflineBackend {
+        fn prepare(
+            &self,
+            model: Model,
+            _info: ModelInfo,
+        ) -> BoxFuture<'static, Result<PreparedProvider, AgentError>> {
+            Box::pin(async move {
+                Ok(PreparedProvider {
+                    model,
+                    provider: unconfigured(),
+                })
+            })
+        }
+
+        fn discover(
+            &self,
+            _refresh: bool,
+        ) -> Option<BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>> {
+            let models = self.0.lock().unwrap().clone();
+            Some(Box::pin(async move { Ok(models) }))
+        }
+
+        fn login(
+            &self,
+            _method: String,
+            _config: Value,
+            _ui: Arc<dyn InteractionService>,
+        ) -> BoxFuture<'static, Result<Option<String>, AgentError>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn auth_status(
+            &self,
+            _config: Value,
+        ) -> Option<BoxFuture<'static, Result<AuthStatus, AgentError>>> {
+            None
+        }
+
+        fn logout(&self) -> Option<BoxFuture<'static, Result<(), AgentError>>> {
+            None
+        }
+    }
+
+    /// A registry with the one provider {id}, for tests that need a provider
+    /// without the network. Every model id resolves, with the metadata
+    /// {models} holds; `prepare` hands out a provider that fails each
+    /// request; and discovery reports what {models} holds by then.
+    pub fn offline_registry(id: &str, models: SharedModels) -> Arc<ProviderRegistry> {
+        let listed = models.lock().unwrap().clone();
+        Arc::new(ProviderRegistry::new(vec![RegisteredProvider {
+            id: id.into(),
+            display_name: id.into(),
+            models: listed,
+            backend: Arc::new(OfflineBackend(models)),
+            auth: AuthSpec::default(),
+        }]))
     }
 
     struct DetachedCommandHost;

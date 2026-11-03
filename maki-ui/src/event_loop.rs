@@ -3929,20 +3929,6 @@ impl<'t> EventLoop<'t> {
             .map_or(&self.ctx.model_slot, |rt| &rt.model_slot)
     }
 
-    fn change_model(&mut self, idx: usize, spec: &str) {
-        self.note_if_deferred(idx, "model");
-        let target = self.selected_target(idx);
-        self.dispatch_model_selection(
-            idx,
-            target,
-            maki_commands::ModelSelection {
-                spec: Some(Arc::from(spec)),
-                ..Default::default()
-            },
-            None,
-        );
-    }
-
     /// Runs a command for a keymap or event callback against the agent that
     /// callback was pinned to, in the session that owns it.
     /// Pins the keymap callback to the agent selected when the key was
@@ -4459,8 +4445,6 @@ impl<'t> EventLoop<'t> {
         let model = self.sessions[idx].model_slot.load().model.clone();
         if model.provider.to_string() == slug {
             self.reprepare_root_model(idx, model.spec());
-        } else if let Some(builtin) = maki_config::providers::builtin_provider(&slug) {
-            self.change_model(idx, builtin.default_model);
         }
     }
 
@@ -5641,15 +5625,16 @@ mod tests {
         discovered: &str,
         refreshed: bool,
     ) {
-        let _providers = configure_discovery_provider();
+        let (models, providers) = discovery_providers();
         let spec = |id: &str| format!("{DISCOVERY_PROVIDER}/{id}");
-        with_event_loop_runtime(
+        with_event_loop_runtime_providers(
+            &providers,
             |harness| {
-                let startup = Model::from_spec(&spec(STARTUP_MODEL_ID)).unwrap();
+                let startup = providers.model(&spec(STARTUP_MODEL_ID)).unwrap();
                 harness.ctx.as_mut().unwrap().model_slot =
                     ProviderSlot::new(startup, Arc::new(StubProvider)).0;
                 let resumed = (session_model != STARTUP_MODEL_ID).then(|| PreparedProvider {
-                    model: Model::from_spec(&spec(session_model)).unwrap(),
+                    model: providers.model(&spec(session_model)).unwrap(),
                     provider: Arc::new(StubProvider),
                 });
                 harness
@@ -5663,13 +5648,7 @@ mod tests {
                 assert_eq!(before.model.spec(), spec(session_model));
                 assert_ne!(before.model.context_window, DISCOVERED_WINDOW);
                 let identity = runtime.model_slot.load().provider.identity();
-                maki_providers::model_registry::set_known_models(
-                    DISCOVERY_PROVIDER,
-                    vec![maki_providers::ModelInfo {
-                        context_window: Some(DISCOVERED_WINDOW),
-                        ..maki_providers::ModelInfo::id_only(discovered.into())
-                    }],
-                );
+                discover_window(&models, &providers, discovered);
 
                 event_loop.sync_orchestration();
                 smol::block_on(
@@ -5704,11 +5683,12 @@ mod tests {
     #[test_case(true ; "idle_guard")]
     #[test_case(false ; "session_lease")]
     fn busy_discovery_refresh_applies_once_released(idle_guard: bool) {
-        let _providers = configure_discovery_provider();
+        let (models, providers) = discovery_providers();
         let spec = format!("{DISCOVERY_PROVIDER}/{BUSY_MODEL_ID}");
-        with_event_loop_runtime(
+        with_event_loop_runtime_providers(
+            &providers,
             |harness| {
-                let startup = Model::from_spec(&spec).unwrap();
+                let startup = providers.model(&spec).unwrap();
                 harness.ctx.as_mut().unwrap().model_slot =
                     ProviderSlot::new(startup, Arc::new(StubProvider)).0;
                 harness
@@ -5718,13 +5698,7 @@ mod tests {
             },
             |event_loop| {
                 event_loop.sync_orchestration();
-                maki_providers::model_registry::set_known_models(
-                    DISCOVERY_PROVIDER,
-                    vec![maki_providers::ModelInfo {
-                        context_window: Some(DISCOVERED_WINDOW),
-                        ..maki_providers::ModelInfo::id_only(BUSY_MODEL_ID.into())
-                    }],
-                );
+                discover_window(&models, &providers, BUSY_MODEL_ID);
                 let runtime = &event_loop.sessions[0];
                 let (manager, root) = runtime.handles.manager_and_root();
                 let guard =
@@ -5932,11 +5906,37 @@ mod tests {
     }
     const TEST_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
-    pub(super) fn configure_discovery_provider() -> tempfile::TempDir {
-        let root = tempfile::tempdir().unwrap();
-        maki_storage::paths::init_at(root.path().to_path_buf()).unwrap();
-        maki_lua::test_support::save_custom_provider(DISCOVERY_PROVIDER);
-        root
+    pub(super) type DiscoveredModels = Arc<std::sync::Mutex<Vec<maki_providers::ModelInfo>>>;
+
+    /// A registry with the discovery provider, and the models its discovery
+    /// reports.
+    pub(super) fn discovery_providers() -> (DiscoveredModels, Arc<ProviderRegistry>) {
+        let models = DiscoveredModels::default();
+        let providers =
+            maki_lua::test_support::offline_registry(DISCOVERY_PROVIDER, Arc::clone(&models));
+        (models, providers)
+    }
+
+    /// Discovery reports {model_id} with the discovered window.
+    fn discover_window(models: &DiscoveredModels, providers: &ProviderRegistry, model_id: &str) {
+        *models.lock().unwrap() = vec![maki_providers::ModelInfo {
+            context_window: Some(DISCOVERED_WINDOW),
+            ..maki_providers::ModelInfo::id_only(model_id.into())
+        }];
+        smol::block_on(providers.fetch_all(&ModelPolicy::default(), false, |_| {}));
+    }
+
+    fn with_event_loop_runtime_providers(
+        providers: &Arc<ProviderRegistry>,
+        runtime: impl FnOnce(&mut RuntimeHarness) -> SessionRuntime,
+        test: impl FnOnce(&mut EventLoop<'_>),
+    ) {
+        let catalog = ModelCatalog::offline(Arc::clone(providers), &ModelPolicy::default());
+        run_event_loop(
+            RuntimeHarness::with(PermissionsConfig::default(), Arc::clone(providers), catalog),
+            runtime,
+            test,
+        );
     }
 
     pub(super) fn with_event_loop(test: impl FnOnce(&mut EventLoop<'_>)) {

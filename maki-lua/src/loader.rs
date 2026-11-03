@@ -12,7 +12,7 @@ use maki_agent::tools::{ToolRegistry, ToolSource};
 use maki_agent::{AgentManagerHandle, AgentRef};
 use maki_commands::{CommandBehavior, CommandRegistry};
 use maki_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
-use maki_providers::{ProviderRegistry, Timeouts};
+use maki_providers::ProviderRegistry;
 
 use crate::api::completion::{CompletionCtx, ItemSpec};
 use crate::api::fs::{FsBackend, RealFs};
@@ -659,17 +659,11 @@ impl PluginHost {
 
     /// Builds the provider registry from what the loaded plugins registered
     /// and makes it the one `maki.model` reads.
-    pub fn provider_registry(
-        &self,
-        timeouts: Timeouts,
-    ) -> Result<Arc<ProviderRegistry>, PluginError> {
+    pub fn provider_registry(&self) -> Result<Arc<ProviderRegistry>, PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner
             .tx
-            .send(Request::BuildProviderRegistry {
-                timeouts,
-                reply: reply_tx,
-            })
+            .send(Request::BuildProviderRegistry { reply: reply_tx })
             .map_err(|_| PluginError::HostDead)?;
         reply_rx.recv().map_err(|_| PluginError::HostDead)
     }

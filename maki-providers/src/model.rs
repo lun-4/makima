@@ -19,7 +19,7 @@ use serde_json::Value;
 use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model_registry;
 use crate::pricing::PricingSchedule;
-use crate::providers::{anthropic, custom, dynamic};
+use crate::providers::anthropic;
 use crate::types::ThinkingFields;
 
 const PER_MILLION: f64 = 1_000_000.0;
@@ -580,30 +580,7 @@ impl Model {
     }
 
     pub fn from_tier_dynamic(slug: &str, tier: ModelTier) -> Result<Self, ModelError> {
-        if let Some(model) = dynamic::find_model_for_tier(slug, tier) {
-            return Ok(model);
-        }
-        // One providers.toml read, three answers: a model declared at this tier,
-        // the provider exists but declares nothing here (inherit the base
-        // protocol default under the custom slug, keeping its tier and pricing),
-        // or no such provider.
-        match custom::resolve_tier(slug, tier) {
-            custom::TierLookup::Model(model) => return Ok(model),
-            custom::TierLookup::NoModelForTier(base) => {
-                let manifest = ManifestRegistry::get(&base.to_string())
-                    .ok_or_else(|| ModelError::NoDefault(slug.to_string(), tier))?;
-                let entry = manifest
-                    .models
-                    .iter()
-                    .find(|e| e.default && e.tier == tier)
-                    .ok_or_else(|| ModelError::NoDefault(slug.to_string(), tier))?;
-                return Ok(Self::from_base(manifest, slug, entry.prefixes[0]));
-            }
-            custom::TierLookup::Unknown => {}
-        }
-        // Builtin or dynamic slug: resolve the base default under the slug
-        // (dynamic slugs route through `base_for_slug`).
-        if ManifestRegistry::get(slug).is_some() || dynamic::base_for_slug(slug).is_some() {
+        if ManifestRegistry::get(slug).is_some() {
             return Self::from_tier(slug, tier);
         }
         Err(ModelError::UnsupportedProvider(slug.to_string()))
@@ -620,25 +597,8 @@ impl Model {
     pub fn from_spec(spec: &str) -> Result<Self, ModelError> {
         let (slug, model_id) = Self::parse_spec(spec)?;
 
-        // Precedence: builtin, then dynamic script, then providers.toml custom.
-        // Discovery drops any script slug a builtin or custom entry already owns,
-        // so a script and a custom provider can never share a slug here.
         if let Some(manifest) = ManifestRegistry::get(slug) {
             return Ok(Self::from_base(manifest, slug, model_id));
-        }
-
-        if let Some(model) = dynamic::lookup_model(slug, model_id) {
-            return Ok(model);
-        }
-
-        if let Some(base) = dynamic::base_for_slug(slug)
-            && let Some(manifest) = ManifestRegistry::get(&base.to_string())
-        {
-            return Ok(Self::from_base(manifest, slug, model_id));
-        }
-
-        if let Some(model) = custom::lookup_model(slug, model_id) {
-            return Ok(model);
         }
 
         Err(ModelError::UnsupportedProvider(slug.to_string()))

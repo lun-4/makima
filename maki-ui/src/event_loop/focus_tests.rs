@@ -14,7 +14,7 @@ use maki_storage::id::SessionRef;
 use maki_storage::sessions::{Effort as StoredEffort, StoredThinking};
 use test_case::test_case;
 
-use super::tests::{select_child_chat, with_event_loop};
+use super::tests::{select_child_chat, with_event_loop, with_event_loop_providers};
 use super::{
     AppSession, CLOSED_TARGET_ERR, CommandEvent, EventLoop, PreparedProvider, SESSION_OP_TIMEOUT,
     SessionRequest, UiAction,
@@ -539,8 +539,8 @@ fn model_argument_resolves_against_the_catalog(
     argument: &str,
     expected: Result<&str, &str>,
 ) {
-    let _providers = super::tests::configure_discovery_provider();
-    with_event_loop(|event_loop| {
+    let (_, providers) = super::tests::discovery_providers();
+    with_event_loop_providers(providers, |event_loop| {
         event_loop.ctx.catalog.specs().store(Some(Arc::new(
             catalog.iter().map(|spec| spec.to_string()).collect(),
         )));

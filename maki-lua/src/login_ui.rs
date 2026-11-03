@@ -123,10 +123,23 @@ async fn open_browser(_lua: Lua, this: UserDataRef<LoginUi>, url: String) -> Lua
     Ok(notify(this, InteractionRequest::OpenBrowser(url)).await)
 }
 
+/// Run the program {argv} on the user's terminal, handing it input and
+/// output until it exits, for a login that is an interactive program. Only
+/// `maki auth login` has a terminal to hand over; the TUI fails this.
+///
+/// @param argv table The program and its arguments.
+/// @return (boolean?, string?) true once the program exited successfully, or nil plus an error.
+/// @example
+/// local ok, err = ui:run({ "/home/me/.config/makima/providers/corp", "login" })
+#[lua_fn]
+async fn run(_lua: Lua, this: UserDataRef<LoginUi>, argv: Vec<String>) -> LuaResult<Pair<bool>> {
+    Ok(notify(this, InteractionRequest::Terminal(argv)).await)
+}
+
 lua_class! {
     /// The `ui` a provider's `login(ctx, ui, config)` receives.
     ///
     /// The CLI or the TUI shows it. `input` and `choice` wait for the user. The notices `instructions`,
-    /// `device_code` and `open_browser` return at once.
-    "maki.provider.LoginUi" => LoginUi, LOGIN_UI_DOCS [input, choice, instructions, device_code, open_browser]
+    /// `device_code` and `open_browser` return at once. `run` waits for a program on the terminal.
+    "maki.provider.LoginUi" => LoginUi, LOGIN_UI_DOCS [input, choice, instructions, device_code, open_browser, run]
 }

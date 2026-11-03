@@ -1286,6 +1286,62 @@ maki.api.register_provider({
 })
 ```
 
+---
+
+### `maki.api.provider_config()` {#maki-api-provider_config}
+
+```lua
+maki.api.provider_config({id?})
+```
+
+Read `providers.toml`: the section of provider {id}, or every section by
+provider id when {id} is nil. The file is read at each call, so a section
+saved earlier in the session is seen. A section has the fields a
+provider's `config` argument has. Use it for a setting another provider's
+section holds, or to register providers the file defines.
+
+Requires the `env` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{id?}` (`string?`) Provider id.
+
+**Returns:** (`table?`) The section, nil when there is none, or every section.
+
+**Example:**
+
+```lua
+local opencode = maki.api.provider_config("opencode") or {}
+for id, section in pairs(maki.api.provider_config()) do print(id, section.protocol) end
+```
+
+---
+
+### `maki.api.save_provider_config()` {#maki-api-save_provider_config}
+
+```lua
+maki.api.save_provider_config({id}, {section})
+```
+
+Save {section} as provider {id}'s `providers.toml` section, replacing
+any section it had. Fields the file does not know are dropped. Fails
+without touching the file when it does not parse.
+
+Requires the `fs_write` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{id}` (`string`) Provider id.
+- `{section}` (`table`) Fields such as `protocol`, `base_url` and `api_key_env`.
+
+**Returns:** (`boolean?`, `string?`) true, or nil plus an error.
+
+**Example:**
+
+```lua
+maki.api.save_provider_config("my-llm", { protocol = "openai", base_url = "http://localhost:8000/v1" })
+```
+
 
 ## maki.perf {#maki-perf}
 
@@ -2821,15 +2877,15 @@ end
 maki.fn.executable({name})
 ```
 
-Check whether {name} can be found on `$PATH` or is an absolute path
-to a file. Returns 1 when found, 0 otherwise (matches Neovim's
-`vim.fn.executable`).
+Check whether {name} can be found on `$PATH` or is a path to a file,
+and on Unix whether that file may be executed. Returns 1 when found, 0
+otherwise (matches Neovim's `vim.fn.executable`).
 
 Requires the `env` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
-- `{name}` (`string`) Program name (e.g. `"git"`) or absolute path.
+- `{name}` (`string`) Program name (e.g. `"git"`) or path.
 
 **Returns:** (`integer`) `1` if found, `0` otherwise.
 
@@ -4741,7 +4797,7 @@ end)
 The `ui` a provider's `login(ctx, ui, config)` receives.
 
 The CLI or the TUI shows it. `input` and `choice` wait for the user. The notices `instructions`,
-`device_code` and `open_browser` return at once.
+`device_code` and `open_browser` return at once. `run` waits for a program on the terminal.
 
 ---
 
@@ -4857,6 +4913,30 @@ URL, in case the browser does not open. Returns at once.
 
 ```lua
 ui:open_browser("https://example.com/keys")
+```
+
+---
+
+### `LoginUi:run()` {#LoginUi-run}
+
+```lua
+LoginUi:run({argv})
+```
+
+Run the program {argv} on the user's terminal, handing it input and
+output until it exits, for a login that is an interactive program. Only
+`maki auth login` has a terminal to hand over; the TUI fails this.
+
+**Parameters:**
+
+- `{argv}` (`table`) The program and its arguments.
+
+**Returns:** (`boolean?`, `string?`) true once the program exited successfully, or nil plus an error.
+
+**Example:**
+
+```lua
+local ok, err = ui:run({ "/home/me/.config/makima/providers/corp", "login" })
 ```
 
 

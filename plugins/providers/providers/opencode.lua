@@ -32,19 +32,28 @@ local function gated_error(id)
       "provider '%s' has no API key; run `maki auth login %s` or set providers.%s.enable_free_models = true to use its free models",
       id,
       id,
-      id
+      M.ZEN.id
     )
   )
 end
 
+-- Whether free models are shown. Both members read it from Zen's section,
+-- `[opencode]`.
+function M.free_models(config, member)
+  if member ~= M.ZEN then
+    config = maki.api.provider_config(M.ZEN.id) or {}
+  end
+  return config.enable_free_models == true
+end
+
 -- Keys and whether they unlock every model: a real key does, the public key
 -- only the free ones, nil none.
-local function access(ctx, config, entry)
+local function access(ctx, config, member, entry)
   local keys = catalog.api_keys(ctx, config, entry)
   if keys then
     return keys, true
   end
-  if config.enable_free_models then
+  if M.free_models(config, member) then
     return { M.PUBLIC_KEY }, false
   end
 end
@@ -102,6 +111,28 @@ local function delegate(ctx, config, sub, entry, model_id)
   }
 end
 
+-- A route for credentials that come from elsewhere: `<catalog
+-- provider>/<model>` goes to that provider and anything else to Zen, at the
+-- client's base if it has one.
+function M.delegated(cache)
+  return {
+    def = { models = {} },
+    stream = function(client, _, ctx, request, emit)
+      local sub, model_id = request.model.id:match("^([^/]+)/(.+)$")
+      local entry = sub and cache:served(sub)
+      if not entry then
+        model_id, entry = request.model.id, cache:entry(M.ZEN.id)
+      end
+      if not entry then
+        return nil, http.config_error("provider '" .. M.ZEN.id .. "' is not in the models.dev catalog yet")
+      end
+      request.model.id = model_id
+      local api = { base = client.base or entry.api, protocol = catalog.protocol(entry), headers = client.headers }
+      return catalog.stream(api, ctx, request, emit)
+    end,
+  }
+end
+
 -- The provider for {member} (`M.ZEN` or `M.GO`), backed by {cache}.
 function M.provider(cache, member)
   local id = member.id
@@ -123,13 +154,13 @@ function M.provider(cache, member)
       return nil, err
     end
     local own = entry()
-    local keys, keyed = access(ctx, config, own or FALLBACK_ENTRY)
+    local keys, keyed = access(ctx, config, member, own or FALLBACK_ENTRY)
     if not own or not keys then
       return {}
     end
     return catalog.descriptors(cache:models(id) or {}, function(row)
       local free = catalog.is_free(row)
-      return (not free or config.enable_free_models == true) and (keyed or free)
+      return (not free or M.free_models(config, member)) and (keyed or free)
     end, describe)
   end
 
@@ -141,7 +172,7 @@ function M.provider(cache, member)
     end
     -- `<own id>/<model>` names the provider's own model.
     local own_id = sub == id and model_id or info.id
-    local keys = access(ctx, config, entry() or FALLBACK_ENTRY)
+    local keys = access(ctx, config, member, entry() or FALLBACK_ENTRY)
     if not keys then
       return {
         stream = function()

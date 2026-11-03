@@ -26,7 +26,7 @@ use maki_agent::tools::{
 use maki_agent::{
     BufferSnapshot, CurrentManagedTurn, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle,
 };
-use maki_providers::{ProviderRegistry, Timeouts};
+use maki_providers::ProviderRegistry;
 use maki_storage::checkpoint::CheckpointPublication;
 use mlua::{
     Chunk, ChunkMode, Compiler, Function, Lua, MultiValue, RegistryKey, Table, Value as LuaValue,
@@ -307,7 +307,6 @@ pub enum Request {
         reply: flume::Sender<PluginOptionSpecs>,
     },
     BuildProviderRegistry {
-        timeouts: Timeouts,
         reply: flume::Sender<Arc<ProviderRegistry>>,
     },
     /// One call into a Lua provider, ended by `cancel`.
@@ -5381,9 +5380,9 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                         Request::CollectPluginOptions { reply } => {
                             let _ = reply.send(collect_plugin_options(&rt.lua));
                         }
-                        Request::BuildProviderRegistry { timeouts, reply } => {
+                        Request::BuildProviderRegistry { reply } => {
                             let registry =
-                                Arc::new(crate::provider::build_registry(&rt.lua, &rt.tx, timeouts));
+                                Arc::new(crate::provider::build_registry(&rt.lua, &rt.tx));
                             rt.lua.set_app_data(Arc::clone(&registry));
                             let _ = reply.send(registry);
                         }
@@ -5688,17 +5687,22 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                 .map_or(Ok(()), |option| {
                                     validate_option_value(&rt.lua, option, &value)
                                 });
-                            let result = match validation {
-                                Ok(()) => coordinator
-                                    .set_option_if_version(id, value, Some(snapshot.version))
-                                    .await
-                                    .map_err(Into::into),
-                                Err(error) => Err(
-                                    maki_agent::config_change::ConfigChangeError::from(error)
-                                        .into(),
-                                ),
-                            };
-                            let _ = reply.send(result);
+                            // Detached: a model change prepares its provider,
+                            // and a Lua provider's prepare runs on this loop.
+                            ex.spawn(async move {
+                                let result = match validation {
+                                    Ok(()) => coordinator
+                                        .set_option_if_version(id, value, Some(snapshot.version))
+                                        .await
+                                        .map_err(Into::into),
+                                    Err(error) => Err(
+                                        maki_agent::config_change::ConfigChangeError::from(error)
+                                            .into(),
+                                    ),
+                                };
+                                let _ = reply.send(result);
+                            })
+                            .detach();
                         }
                     }
                 }

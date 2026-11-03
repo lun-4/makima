@@ -1,5 +1,5 @@
 use crate::model::{ModelEntry, ModelFamily, ModelTier};
-use crate::providers::{anthropic, custom, dynamic, google, openai};
+use crate::providers::{anthropic, google, openai};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ProviderManifest {
@@ -68,9 +68,8 @@ const LLAMA_CPP: ProviderManifest = ProviderManifest {
     models: &[],
 };
 
-/// Protocols the native custom and dynamic providers still route to after
-/// their provider moved to Lua. They resolve by slug but are not native
-/// providers themselves.
+/// Protocol bases left from the native providers, removed in commit 9. They
+/// resolve by slug but are not providers themselves.
 const PROTOCOL_BASES: &[ProviderManifest] = &[ANTHROPIC, OPENAI, GOOGLE, OLLAMA, LLAMA_CPP];
 
 pub struct ManifestRegistry;
@@ -80,15 +79,9 @@ impl ManifestRegistry {
         PROTOCOL_BASES.iter().find(|m| m.slug == slug)
     }
 
-    /// Like `get`, but resolves dynamic and custom (providers.toml) slugs to
-    /// their base provider's manifest so capability lookups (thinking, display
-    /// name, tier defaults) still work for stubs that declare no models. `None`
-    /// for an unknown slug, so callers pick a fallback instead of silently
-    /// inheriting a zeroed manifest.
+    /// Kept apart from `get` until the protocol bases go in commit 9.
     pub fn for_slug(slug: &str) -> Option<&'static ProviderManifest> {
         Self::get(slug)
-            .or_else(|| dynamic::base_for_slug(slug).and_then(|base| Self::get(&base.to_string())))
-            .or_else(|| custom::base_kind(slug).and_then(|base| Self::get(&base.to_string())))
     }
 
     pub fn find_default_for_tier(slug: &str, tier: ModelTier) -> Option<&'static ModelEntry> {

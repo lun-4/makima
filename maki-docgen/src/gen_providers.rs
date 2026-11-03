@@ -68,61 +68,7 @@ A curated row is checked against the provider's own pricing page, so it wins for
 New models start at the **medium** tier until you assign one in the picker."#;
 
 fn providers_toml_section() -> String {
-    let mut plan_rows = String::new();
-    let mut plan_examples = String::new();
-    let mut builtins: Vec<_> = maki_config::providers::all_builtins();
-    builtins.sort_by_key(|b| b.slug);
-    let mut wrote_example = false;
-    for b in builtins {
-        let Some(plans) = b.plans.filter(|p| p.len() > 1) else {
-            continue;
-        };
-        if !wrote_example {
-            let _ = writeln!(plan_examples, "```toml");
-            wrote_example = true;
-        } else {
-            let _ = writeln!(plan_examples);
-        }
-        // Prefer a non-default plan key in the example when one exists.
-        let example_key = plans
-            .iter()
-            .find(|(_, p)| {
-                p.base_url != b.default_base_url || p.default_model != Some(b.default_model)
-            })
-            .unwrap_or(&plans[0])
-            .0;
-        let _ = writeln!(plan_examples, "[{}]", b.slug);
-        let _ = writeln!(plan_examples, "plan = \"{example_key}\"");
-        for (key, plan) in plans {
-            let mut detail = plan.display_name.to_string();
-            if !plan.base_url.is_empty() {
-                detail = format!("{detail} at `{}`", plan.base_url);
-            }
-            if let Some(model) = plan.default_model {
-                detail = format!("{detail}, default `{model}`");
-            }
-            let _ = writeln!(plan_rows, "| {} | `{key}` | {detail} |", b.display_name);
-        }
-    }
-    if wrote_example {
-        let _ = writeln!(plan_examples, "```");
-    }
-
-    let plans_body = if plan_rows.is_empty() {
-        "No built-in currently ships more than one plan.".to_string()
-    } else {
-        format!(
-            "Some built-ins ship multiple plans (different base URLs or default models). \
-`makima auth login <provider>` asks which plan to use when more than one exists. \
-You can also set it in TOML:\n\n\
-{plan_examples}\n\
-Current plans:\n\n\
-| Provider | Plan | What it does |\n\
-|----------|------|--------------|\n\
-{plan_rows}\n\
-Env `<SLUG>_BASE_URL` still wins over both the plan and a `base_url` in this file."
-        )
-    };
+    let plans_body = "No built-in currently ships more than one plan.";
 
     format!(
         r#"## providers.toml

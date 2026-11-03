@@ -11,7 +11,7 @@ use maki_lua::PluginHost;
 use maki_lua::test_support::InMemoryFs;
 use maki_lua::ui_sink::HostUi;
 use maki_providers::{
-    ContentBlock, Invocation, InvocationPurpose, PreparedProvider, RequestOptions, Timeouts,
+    ContentBlock, Invocation, InvocationPurpose, PreparedProvider, RequestOptions,
 };
 use maki_storage::StateDir;
 use maki_storage::auth::{
@@ -131,7 +131,7 @@ impl Fixture {
         )
         .unwrap();
         host.load_source(PLUGIN, &source(server)).unwrap();
-        let providers = host.provider_registry(Timeouts::default()).unwrap();
+        let providers = host.provider_registry().unwrap();
         let prepared =
             smol::block_on(bounded(providers.prepare(providers.model(SPEC).unwrap()))).unwrap();
         Self {

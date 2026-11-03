@@ -1,14 +1,26 @@
 local aperture = require("providers.aperture")
 local catalog = require("providers.catalog")
 local compat = require("providers.openai_compat")
+local custom = require("providers.custom")
+local executable = require("providers.executable")
 local local_server = require("providers.local_server")
 local opencode = require("providers.opencode")
+local routes = require("providers.routes")
 
 local registered = {}
 
 local function register(spec)
   maki.api.register_provider(spec)
   registered[spec.id] = true
+end
+
+-- Providers the user defines: a bad one is logged and left out instead of
+-- taking every provider down with it.
+local function register_user(spec, source)
+  local ok, err = pcall(register, spec)
+  if not ok then
+    maki.log.warn(string.format("%s: provider %s left out: %s", source, spec.id, tostring(err)))
+  end
 end
 
 register(require("providers.anthropic_provider").provider())
@@ -31,6 +43,40 @@ local cache = catalog.new(catalog.cache_dir())
 cache:load()
 register(opencode.provider(cache, opencode.ZEN))
 register(opencode.provider(cache, opencode.GO))
+register(custom.creator())
+
+-- Sections with a protocol, then scripts, each win over a models.dev
+-- provider of the same id but never over a built-in one. A built-in
+-- provider's section may name a protocol of its own.
+local sections = maki.api.provider_config()
+local ids = {}
+for id, section in pairs(sections) do
+  if section.protocol then
+    ids[#ids + 1] = id
+  end
+end
+table.sort(ids)
+for _, id in ipairs(ids) do
+  if not registered[id] then
+    register_user(custom.provider(id, sections[id]), "providers.toml")
+  end
+end
+
+local config_dir, state_dir = maki.env.config_dir(), maki.env.state_dir()
+if config_dir then
+  local bases = table.clone(routes.ROUTES)
+  bases.aperture = aperture.delegated()
+  bases.opencode = opencode.delegated(cache)
+  local cache_path = state_dir and maki.fs.joinpath(state_dir, executable.CACHE_FILE)
+  for _, script in ipairs(executable.scan(maki.fs.joinpath(config_dir, executable.DIR), cache_path, bases)) do
+    if registered[script.slug] then
+      maki.log.warn(string.format("%s: provider id %s is already taken, skipping", script.path, script.slug))
+    else
+      register_user(executable.provider(script, bases[script.info.base]), script.path)
+    end
+  end
+end
+
 for _, id in ipairs(cache:servable(registered)) do
   register(catalog.provider(cache, id))
 end

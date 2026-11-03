@@ -14,7 +14,13 @@ local ROLLING_RESET_MS = 1787983276964
 local WEEKLY_RESET_MS = 1788134400964
 local MONTHLY_RESET_MS = 1789744986964
 local GATED_ERROR =
-  "provider 'opencode-go' has no API key; run `maki auth login opencode-go` or set providers.opencode-go.enable_free_models = true to use its free models"
+  "provider 'opencode-go' has no API key; run `maki auth login opencode-go` or set providers.opencode.enable_free_models = true to use its free models"
+
+-- What `[opencode]` holds, which Go reads `enable_free_models` from.
+local zen_section = {}
+maki.api.provider_config = function(id)
+  return id == opencode.ZEN.id and zen_section or nil
+end
 
 local function models()
   return {
@@ -115,6 +121,13 @@ end)
 t.case("public_fallback_lists_only_free_models", function()
   t.same(ids(discover(opencode.ZEN, {}, { enable_free_models = true })), { "free-one", "unpriced" })
   t.same(discover(opencode.GO, {}), {})
+end)
+
+t.case("opencode_go_reads_free_models_from_zen_section", function()
+  t.same(discover(opencode.GO, {}, { enable_free_models = true }), {})
+  zen_section = { enable_free_models = true }
+  t.same(ids(discover(opencode.GO, {}, {})), { "free-one", "unpriced" })
+  zen_section = {}
 end)
 
 t.case("descriptors_mark_free_models", function()

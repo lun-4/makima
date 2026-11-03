@@ -15,7 +15,7 @@ use maki_providers::login::{
     drive_login, logout,
 };
 use maki_providers::provider::BoxFuture;
-use maki_providers::{AgentError, ProviderRegistry, Timeouts};
+use maki_providers::{AgentError, ProviderRegistry};
 use maki_storage::StateDir;
 use maki_storage::auth::{
     ProviderCredentials, load_provider_credentials, save_provider_credentials,
@@ -126,7 +126,7 @@ impl Fixture {
         .unwrap();
         host.load_source(plugin, source).unwrap();
         Self {
-            registry: host.provider_registry(Timeouts::default()).unwrap(),
+            registry: host.provider_registry().unwrap(),
             _host: host,
             storage: StateDir::from_path(state.path().to_path_buf()),
             _state: state,
@@ -148,7 +148,6 @@ impl Fixture {
         let storage = self.storage.clone();
         let request = LoginRequest {
             provider: Some(provider.into()),
-            native: Vec::new(),
         };
         let login = thread::spawn(move || {
             smol::block_on(bounded(drive_login(&registry, ui, &storage, request)))
@@ -201,7 +200,7 @@ fn drive_login_through_lua_provider() {
 
     assert_eq!(
         outcome,
-        LoginOutcome::LoggedIn {
+        LoginOutcome {
             provider: PROVIDER.into(),
             display_name: DISPLAY_NAME.into(),
             model: Some(format!("{PROVIDER}/{RETURNED_MODEL}")),
@@ -301,7 +300,7 @@ fn bundled_provider_logs_in_with_its_plan() {
 
     assert_eq!(
         outcome,
-        LoginOutcome::LoggedIn {
+        LoginOutcome {
             provider: PLAN_PROVIDER.into(),
             display_name: PLAN_PROVIDER_NAME.into(),
             model: Some(PLAN_MODEL.into()),

@@ -277,6 +277,11 @@ function M.api_keys(ctx, config, entry)
   return http.api_keys(ctx, config, M.env_name(env_names(entry)))
 end
 
+-- The protocol {entry} speaks: `M.CHAT` or `M.MESSAGES`.
+function M.protocol(entry)
+  return PROTOCOLS[entry.npm]
+end
+
 -- The base URL, protocol and headers of {entry} with keys from {pool}, or nil
 -- plus a config error for an unset header variable.
 function M.client(id, entry, pool, config)
@@ -284,7 +289,7 @@ function M.client(id, entry, pool, config)
   if not configured then
     return nil, err
   end
-  local protocol = PROTOCOLS[entry.npm]
+  local protocol = M.protocol(entry)
   local client = { base = entry.api, protocol = protocol }
   -- {extra} plus the key, with configured headers replacing any of them.
   function client.headers(extra)

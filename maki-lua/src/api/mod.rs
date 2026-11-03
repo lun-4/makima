@@ -108,6 +108,7 @@ pub(crate) fn create_maki_global(
         context.pending_providers.clone(),
         Arc::clone(&plugin),
         net.get("send")?,
+        permissions,
     )?;
     maki.set("net", net)?;
     maki.set("crypto", crypto::create_crypto_table(lua)?)?;

@@ -21,7 +21,6 @@ pub use model::{
     ThinkingSupport, TokenUsage, format_tokens,
 };
 pub use pricing::{model_cost, settle_session};
-pub use providers::dynamic;
 pub use providers::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
 pub use registry::{PreparedProvider, ProviderBackend, ProviderRegistry, RegisteredProvider};
 pub use retry::{RetryKind, RetryPolicy, RetryState};

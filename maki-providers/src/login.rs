@@ -44,6 +44,10 @@ pub enum InteractionRequest {
     /// The frontend opens the URL in a browser and shows it, in case the
     /// browser does not open.
     OpenBrowser(String),
+    /// Answered once the program {argv} exited successfully after running on
+    /// the user's terminal with its input and output. A frontend that cannot
+    /// hand over its terminal fails it.
+    Terminal(Vec<String>),
 }
 
 pub trait InteractionService: Send + Sync {
@@ -144,19 +148,13 @@ pub struct ProviderStatus {
 pub struct LoginRequest {
     /// A provider id or alias; `None` asks the user.
     pub provider: Option<String>,
-    /// Native providers the frontend can still log in to; removed with them in commit 9.
-    pub native: Vec<ChoiceOption>,
 }
 
 #[derive(Debug, PartialEq)]
-pub enum LoginOutcome {
-    LoggedIn {
-        provider: Arc<str>,
-        display_name: Arc<str>,
-        model: Option<String>,
-    },
-    /// A provider the registry does not know; the frontend runs its native flow.
-    Native(String),
+pub struct LoginOutcome {
+    pub provider: Arc<str>,
+    pub display_name: Arc<str>,
+    pub model: Option<String>,
 }
 
 fn config_error(message: impl Into<String>) -> AgentError {
@@ -177,7 +175,7 @@ pub async fn drive_login(
     let name = match request.provider {
         Some(name) => name,
         None => {
-            let options = provider_options(registry, storage, request.native).await;
+            let options = provider_options(registry, storage).await;
             ui.interact(InteractionRequest::Choice {
                 prompt: PROVIDER_PROMPT.into(),
                 options,
@@ -186,7 +184,7 @@ pub async fn drive_login(
         }
     };
     let Some((id, entry, preset)) = registry.login_target(&name) else {
-        return Ok(LoginOutcome::Native(name));
+        return Err(config_error(format!("unknown provider '{name}'")));
     };
     let current = ProvidersConfig::try_load()
         .map_err(config_error)?
@@ -242,18 +240,14 @@ pub async fn drive_login(
     if let Some(spec) = &model {
         persist_model(storage, spec);
     }
-    Ok(LoginOutcome::LoggedIn {
+    Ok(LoginOutcome {
         provider: Arc::clone(id),
         display_name: Arc::clone(&entry.display_name),
         model,
     })
 }
 
-async fn provider_options(
-    registry: &ProviderRegistry,
-    storage: &StateDir,
-    native: Vec<ChoiceOption>,
-) -> Vec<ChoiceOption> {
+async fn provider_options(registry: &ProviderRegistry, storage: &StateDir) -> Vec<ChoiceOption> {
     let aliases = registry
         .entries()
         .flat_map(|(_, entry)| &entry.auth.aliases)
@@ -272,7 +266,6 @@ async fn provider_options(
             section: provider.section,
         })
         .chain(aliases)
-        .chain(native)
         .collect()
 }
 
@@ -430,7 +423,6 @@ mod tests {
 
     use super::*;
     use crate::model::{Model, ModelInfo};
-    use crate::providers::Timeouts;
     use crate::registry::{PreparedProvider, ProviderBackend, RegisteredProvider};
 
     const PROVIDER: &str = "fake-login";
@@ -449,7 +441,7 @@ mod tests {
     const OLD_KEY: &str = "sk-old";
     const STRONG_MODEL: &str = "strong-1";
     const CHOSEN_MODEL: &str = "chosen-1";
-    const NATIVE: &str = "native-provider";
+    const UNKNOWN: &str = "unknown-provider";
     const STATUS_ERR: &str = "status exploded";
     const LOGIN_ERR: &str = "login exploded";
     const SECTION: &str = "More providers";
@@ -587,10 +579,7 @@ mod tests {
         }
 
         fn registry(&self, backend: FakeAuthBackend, methods: &[&str]) -> ProviderRegistry {
-            ProviderRegistry::new(
-                vec![registered(PROVIDER, backend, methods)],
-                Timeouts::default(),
-            )
+            ProviderRegistry::new(vec![registered(PROVIDER, backend, methods)])
         }
 
         fn login(
@@ -605,7 +594,6 @@ mod tests {
                 &self.storage,
                 LoginRequest {
                     provider: provider.map(str::to_owned),
-                    native: vec![option(NATIVE)],
                 },
             ))
         }
@@ -691,7 +679,7 @@ mod tests {
     }
 
     fn logged_in(model: &str) -> LoginOutcome {
-        LoginOutcome::LoggedIn {
+        LoginOutcome {
             provider: PROVIDER.into(),
             display_name: DISPLAY_NAME.into(),
             model: Some(format!("{PROVIDER}/{model}")),
@@ -765,18 +753,18 @@ mod tests {
     }
 
     #[test]
-    fn provider_selection_lists_status_aliases_and_natives() {
+    fn provider_selection_lists_status_and_aliases() {
         let fixture = Fixture::new();
         save_credentials(&fixture.storage, PROVIDER, &json!({ "api_key": OLD_KEY })).unwrap();
         let registry = fixture.registry(
             FakeAuthBackend::new(&fixture.storage, Status::CredentialsFile),
             &[KEY_METHOD],
         );
-        let ui = ScriptedInteraction::new(&[NATIVE]);
+        let ui = ScriptedInteraction::new(&[UNKNOWN]);
 
-        let outcome = fixture.login(&registry, Arc::clone(&ui), None);
+        let error = fixture.login(&registry, Arc::clone(&ui), None).unwrap_err();
 
-        assert_eq!(outcome.unwrap(), LoginOutcome::Native(NATIVE.into()));
+        assert!(error.to_string().contains(UNKNOWN), "{error}");
         let provider = ChoiceOption {
             id: PROVIDER.into(),
             label: DISPLAY_NAME.into(),
@@ -792,7 +780,7 @@ mod tests {
             ui.asked(),
             vec![InteractionRequest::Choice {
                 prompt: PROVIDER_PROMPT.into(),
-                options: vec![provider, alias, option(NATIVE)],
+                options: vec![provider, alias],
             }]
         );
     }
@@ -803,13 +791,13 @@ mod tests {
         let backend = || FakeAuthBackend::new(&fixture.storage, Status::Missing);
         let mut sectioned = registered(FAILING, backend(), &[KEY_METHOD]);
         sectioned.auth.section = Some(SECTION.into());
-        let registry = ProviderRegistry::new(
-            vec![sectioned, registered(PROVIDER, backend(), &[KEY_METHOD])],
-            Timeouts::default(),
-        );
-        let ui = ScriptedInteraction::new(&[NATIVE]);
+        let registry = ProviderRegistry::new(vec![
+            sectioned,
+            registered(PROVIDER, backend(), &[KEY_METHOD]),
+        ]);
+        let ui = ScriptedInteraction::new(&[UNKNOWN]);
 
-        fixture.login(&registry, Arc::clone(&ui), None).unwrap();
+        let _ = fixture.login(&registry, Arc::clone(&ui), None);
 
         let InteractionRequest::Choice { options, .. } = &ui.asked()[0] else {
             panic!("expected the provider choice");
@@ -853,21 +841,18 @@ mod tests {
     fn auth_status_reports_failure_and_continues() {
         let fixture = Fixture::new();
         save_credentials(&fixture.storage, PROVIDER, &json!({ "api_key": OLD_KEY })).unwrap();
-        let registry = ProviderRegistry::new(
-            vec![
-                registered(
-                    FAILING,
-                    FakeAuthBackend::new(&fixture.storage, Status::Fails),
-                    &[],
-                ),
-                registered(
-                    PROVIDER,
-                    FakeAuthBackend::new(&fixture.storage, Status::CredentialsFile),
-                    &[],
-                ),
-            ],
-            Timeouts::default(),
-        );
+        let registry = ProviderRegistry::new(vec![
+            registered(
+                FAILING,
+                FakeAuthBackend::new(&fixture.storage, Status::Fails),
+                &[],
+            ),
+            registered(
+                PROVIDER,
+                FakeAuthBackend::new(&fixture.storage, Status::CredentialsFile),
+                &[],
+            ),
+        ]);
 
         let statuses = smol::block_on(auth_status(&registry, &fixture.storage));
 
@@ -893,7 +878,7 @@ mod tests {
         );
 
         let name = smol::block_on(logout(&registry, &fixture.storage, ALIAS)).unwrap();
-        let unknown = smol::block_on(logout(&registry, &fixture.storage, NATIVE)).unwrap();
+        let unknown = smol::block_on(logout(&registry, &fixture.storage, UNKNOWN)).unwrap();
 
         assert_eq!(name.as_deref(), Some(DISPLAY_NAME));
         assert_eq!(unknown, None);

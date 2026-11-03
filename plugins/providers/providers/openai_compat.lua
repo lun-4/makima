@@ -209,8 +209,8 @@ function M.client(ctx, def, config)
     end
     return headers
   end
-  function client.get_json(call_ctx, url)
-    local response, send_err = http.send(call_ctx, { url = url, headers = client.headers() })
+  function client.get_json(call_ctx, url, extra)
+    local response, send_err = http.send(call_ctx, { url = url, headers = client.headers(extra) })
     if not response then
       return nil, send_err
     end
@@ -219,7 +219,8 @@ function M.client(ctx, def, config)
   return client
 end
 
-local function list_models(def)
+-- The `/models` listing of {def}'s server, parsed with `def.parse_model`.
+function M.list_models(def)
   return function(ctx, client)
     local body, err = client.get_json(ctx, client.base .. M.MODELS_PATH)
     if err then
@@ -342,7 +343,7 @@ function M.provider(def)
     spec.config = { { key = PLAN_KEY, prompt = PLAN_PROMPT, choices = choices } }
   end
 
-  local list = def.list_models or list_models(def)
+  local list = def.list_models or M.list_models(def)
   function spec.discover(ctx, config)
     local client = M.client(ctx, def, config)
     if not client then

@@ -123,8 +123,8 @@ local function client(ctx, config)
 end
 
 -- Every listed model, plus a `-1m` row for those whose input window reaches
--- the long context.
-local function list_models(ctx, api)
+-- the long context. {api} has `base` and `get_json(ctx, url, extra)`.
+function M.list_models(ctx, api)
   local rows, after = {}, nil
   repeat
     local url = api.base .. MODELS_PATH .. (after and "&after_id=" .. after or "")
@@ -235,9 +235,23 @@ local function authorized(headers)
   return false
 end
 
+-- Subscription quota for {api}. It exists only for OAuth tokens, which
+-- arrive as an `Authorization` header; API keys have none.
+function M.fetch_usage(ctx, api)
+  if not authorized(api.headers()) then
+    return nil
+  end
+  local body, err = api.get_json(ctx, api.base .. USAGE_PATH, { ["anthropic-beta"] = OAUTH_BETA })
+  if err then
+    return nil, err
+  end
+  return M.parse_usage(body)
+end
+
 -- Streams {request} to the Messages API at {api} (`base` origin and
--- `headers(extra)`) for descriptor {model}.
-function M.stream(api, model, ctx, request, emit)
+-- `headers(extra)`) for descriptor {model}. {system_prefix} goes before the
+-- system prompt as its own block.
+function M.stream(api, model, ctx, request, emit, system_prefix)
   -- A stale fast flag must never bill an ineligible model at the fast rate.
   request.fast = request.fast and model.supports_fast == true
   local response, err = http.send(ctx, {
@@ -248,7 +262,7 @@ function M.stream(api, model, ctx, request, emit)
       ["anthropic-beta"] = codec.beta_header(request),
       ["anthropic-version"] = M.API_VERSION,
     }),
-    body = assert(maki.json.encode(codec.build_request(request))),
+    body = assert(maki.json.encode(codec.build_request(request, system_prefix))),
   })
   if not response then
     return nil, err
@@ -278,17 +292,8 @@ local function api_instance(ctx, model, config)
     stream = function(call_ctx, request, emit)
       return M.stream(api, model, call_ctx, request, emit)
     end,
-    -- Subscription quota exists only for OAuth tokens, which arrive as a
-    -- configured `Authorization` header; API keys have none.
     fetch_usage = function(call_ctx)
-      if not authorized(api.headers()) then
-        return nil
-      end
-      local body, usage_err = api.get_json(call_ctx, api.base .. USAGE_PATH, { ["anthropic-beta"] = OAUTH_BETA })
-      if usage_err then
-        return nil, usage_err
-      end
-      return M.parse_usage(body)
+      return M.fetch_usage(call_ctx, api)
     end,
   }
 end
@@ -309,7 +314,7 @@ function M.provider()
     if not api then
       return compat.descriptors(M.def)
     end
-    local rows, err = list_models(ctx, api)
+    local rows, err = M.list_models(ctx, api)
     if not rows then
       return nil, err
     end

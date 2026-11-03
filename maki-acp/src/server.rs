@@ -2445,7 +2445,7 @@ mod tests {
     use maki_agent::{AgentMode, TurnTicket};
     use maki_commands::TargetCapabilities;
     use maki_lua::orchestration::{OrchestrationServices, TurnCompletion};
-    use maki_providers::{ContentBlock as MsgBlock, Invocation, Role, TokenUsage};
+    use maki_providers::{ContentBlock as MsgBlock, Invocation, ModelInfo, Role, TokenUsage};
     use maki_storage::StateDir;
     use maki_storage::checkpoint::{ClaimingWriter, accept_all};
     use maki_storage::sessions::StoredMode;
@@ -3125,7 +3125,7 @@ mod tests {
             system_prompt_override: Some(String::new()),
             append_system_prompt: None,
             model_policy: Arc::default(),
-            providers: Arc::default(),
+            providers: test_providers(Arc::default()),
             plugin_rules: Arc::default(),
             lua_event_handle: maki_lua::EventHandle::disconnected_for_test(),
             command_registry: test_registry(&[]),
@@ -4035,8 +4035,15 @@ mod tests {
     fn configure_test_provider() -> TempDir {
         let root = TempDir::new().unwrap();
         maki_storage::paths::init_at(root.path().to_path_buf()).unwrap();
-        maki_lua::test_support::save_custom_provider(DISCOVERY_PROVIDER);
         root
+    }
+
+    fn test_providers(models: Arc<Mutex<Vec<ModelInfo>>>) -> Arc<ProviderRegistry> {
+        maki_lua::test_support::offline_registry(DISCOVERY_PROVIDER, models)
+    }
+
+    fn test_model(spec: &str) -> Model {
+        test_providers(Arc::default()).model(spec).unwrap()
     }
 
     #[test]
@@ -4046,10 +4053,7 @@ mod tests {
             let cwd = TempDir::new().unwrap();
             let host = maki_lua::PluginHost::new(Arc::new(maki_agent::tools::ToolRegistry::new()))
                 .unwrap();
-            let mut params = test_params(
-                Model::from_spec(SPAWN_TEST_SPEC).unwrap(),
-                cwd.path().to_path_buf(),
-            );
+            let mut params = test_params(test_model(SPAWN_TEST_SPEC), cwd.path().to_path_buf());
             params.lua_event_handle = host.event_handle();
             let (out_tx, _out_rx) = flume::unbounded();
             let mut srv = Server {
@@ -4094,10 +4098,7 @@ mod tests {
             let project = cwd.path().join(maki_config::PROJECT_DIR);
             std::fs::create_dir_all(&project).unwrap();
             std::fs::write(project.join("permissions.toml"), "[bash]\ndeyn = [\"x\"]\n").unwrap();
-            let params = test_params(
-                Model::from_spec(SPAWN_TEST_SPEC).unwrap(),
-                cwd.path().to_path_buf(),
-            );
+            let params = test_params(test_model(SPAWN_TEST_SPEC), cwd.path().to_path_buf());
             let error = new_session(
                 &mut srv,
                 &serde_json::json!({ "params": { "cwd": cwd.path(), "mcpServers": [] } }),
@@ -4120,10 +4121,7 @@ mod tests {
         let _providers = configure_test_provider();
         smol::block_on(async {
             let cwd = TempDir::new().unwrap();
-            let params = test_params(
-                Model::from_spec(SPAWN_TEST_SPEC).unwrap(),
-                cwd.path().to_path_buf(),
-            );
+            let params = test_params(test_model(SPAWN_TEST_SPEC), cwd.path().to_path_buf());
             let (out_tx, _out_rx) = flume::unbounded();
             let mut srv = Server {
                 out_tx,
@@ -4199,7 +4197,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(config_error.code, AcpError::resource_not_found(None).code);
 
-        let params = test_params(Model::from_spec(SPAWN_TEST_SPEC).unwrap(), PathBuf::new());
+        let params = test_params(test_model(SPAWN_TEST_SPEC), PathBuf::new());
         let mode_error = smol::block_on(handle_set_mode(
             &mut srv,
             &serde_json::json!({
@@ -5996,7 +5994,7 @@ mod tests {
             let _providers = configure_test_provider();
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
             let session_id = srv.session.as_ref().unwrap().handle.session_id.clone();
-            let model = Model::from_spec(SPAWN_TEST_SPEC).unwrap();
+            let model = test_model(SPAWN_TEST_SPEC);
             let (handle, _root_target) = spawn_session(
                 &AcpParams {
                     model: model.clone(),
@@ -6011,7 +6009,7 @@ mod tests {
                     system_prompt_override: Some(String::new()),
                     append_system_prompt: None,
                     model_policy: Arc::default(),
-                    providers: Arc::default(),
+                    providers: test_providers(Arc::default()),
                     plugin_rules: Arc::default(),
                     lua_event_handle: maki_lua::EventHandle::disconnected_for_test(),
                     command_registry: test_registry(&[]),
@@ -6374,7 +6372,7 @@ mod tests {
             let temp = TempDir::new().unwrap();
             let cwd = temp.path().to_path_buf();
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
-            let model = Model::from_spec(SPAWN_TEST_SPEC).unwrap();
+            let model = test_model(SPAWN_TEST_SPEC);
             let params = test_params(model, cwd.clone());
             let request = serde_json::json!({
                 "params": { "cwd": cwd, "mcpServers": [] }
@@ -6457,10 +6455,16 @@ mod tests {
             let temp = TempDir::new().unwrap();
             let cwd = temp.path().to_path_buf();
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
-            let model =
-                Model::from_spec(&format!("{DISCOVERY_PROVIDER}/{DISCOVERY_MODEL_ID}")).unwrap();
+            let models = Arc::default();
+            let providers = test_providers(Arc::clone(&models));
+            let model = providers
+                .model(&format!("{DISCOVERY_PROVIDER}/{DISCOVERY_MODEL_ID}"))
+                .unwrap();
             assert_ne!(model.context_window, DISCOVERED_WINDOW);
-            let params = test_params(model, cwd.clone());
+            let mut params = test_params(model, cwd.clone());
+            params.providers = Arc::clone(&providers);
+            srv.catalog =
+                ModelCatalog::offline(Arc::clone(&providers), &maki_config::ModelPolicy::default());
             handle_request(
                 &mut srv,
                 "session/new",
@@ -6479,13 +6483,13 @@ mod tests {
             let read = session.coordinator.as_ref().unwrap().read();
             let actor = root.actor().unwrap();
             let commits = actor.subscribe_config_commits();
-            maki_providers::model_registry::set_known_models(
-                DISCOVERY_PROVIDER,
-                vec![maki_providers::ModelInfo {
-                    context_window: Some(DISCOVERED_WINDOW),
-                    ..maki_providers::ModelInfo::id_only(DISCOVERY_MODEL_ID.into())
-                }],
-            );
+            *models.lock().unwrap() = vec![ModelInfo {
+                context_window: Some(DISCOVERED_WINDOW),
+                ..ModelInfo::id_only(DISCOVERY_MODEL_ID.into())
+            }];
+            providers
+                .fetch_all(&maki_config::ModelPolicy::default(), false, |_| {})
+                .await;
 
             srv.catalog
                 .apply(
@@ -6589,7 +6593,7 @@ mod tests {
                 &serde_json::json!({ "params": { "sessionId": old_id } }),
             );
 
-            let params = test_params(Model::from_spec(SPAWN_TEST_SPEC).unwrap(), cwd.clone());
+            let params = test_params(test_model(SPAWN_TEST_SPEC), cwd.clone());
             new_session(
                 &mut srv,
                 &serde_json::json!({
@@ -7154,16 +7158,12 @@ mod tests {
         smol::block_on(async {
             let tmp = TempDir::new().unwrap();
             maki_storage::paths::init_at(tmp.path().to_path_buf()).unwrap();
-            maki_lua::test_support::save_custom_provider(DISCOVERY_PROVIDER);
             let plan = tmp.path().join(SAVED_PLAN_FILE);
             std::fs::write(&plan, "").unwrap();
-            maki_providers::model_registry::set_known_models(
-                DISCOVERY_PROVIDER,
-                vec![maki_providers::ModelInfo {
-                    supports_thinking: Some(true),
-                    ..maki_providers::ModelInfo::id_only(THINKING_MODEL_ID.into())
-                }],
-            );
+            let providers = test_providers(Arc::new(Mutex::new(vec![ModelInfo {
+                supports_thinking: Some(true),
+                ..ModelInfo::id_only(THINKING_MODEL_ID.into())
+            }])));
             let spec = format!("{DISCOVERY_PROVIDER}/{THINKING_MODEL_ID}");
             let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
                 Session::new(&spec, &tmp.path().to_string_lossy());
@@ -7173,9 +7173,10 @@ mod tests {
             session.meta.thinking = Some(StoredThinking::Off);
             let storage = StateDir::from_path(tmp.path().to_path_buf());
             session.save(&storage).unwrap();
-            let model = Model::from_spec(&spec).unwrap();
+            let model = providers.model(&spec).unwrap();
             assert!(model.supports_thinking());
             let mut params = test_params(model, tmp.path().to_path_buf());
+            params.providers = providers;
             params.defaults.thinking = Some(StoredThinking::Effort {
                 level: Effort::High,
             });

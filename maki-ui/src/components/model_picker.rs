@@ -6,9 +6,7 @@ use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 
-use maki_providers::dynamic;
 use maki_providers::model_registry;
-use maki_providers::provider::ProviderKind;
 use maki_providers::{ModelTier, ProviderRegistry};
 
 use crate::components::Overlay;
@@ -278,19 +276,7 @@ impl Overlay for ModelPicker {
 fn parse_model_entry(spec: &str, providers: &ProviderRegistry) -> Option<ModelEntry> {
     let (provider_str, model_id) = spec.split_once('/')?;
 
-    let provider_display = if let Ok(kind) = provider_str.parse::<ProviderKind>() {
-        kind.display_name().to_string()
-    } else if let Some(name) = dynamic::display_name(provider_str) {
-        name.to_string()
-    } else if let Some(builtin) = maki_config::providers::builtin_provider(provider_str) {
-        builtin.display_name.to_string()
-    } else {
-        let config = maki_config::providers::ProvidersConfig::load();
-        match config.get(provider_str) {
-            Some(entry) => maki_config::providers::resolve_display_name(provider_str, Some(entry)),
-            None => providers.display_name(provider_str)?.to_string(),
-        }
-    };
+    let provider_display = providers.display_name(provider_str)?.to_string();
 
     let override_tiers = model_registry::override_tiers(spec);
     let (tier, free) = match providers.model(spec) {

@@ -8,11 +8,9 @@
 -- overrides limits and capabilities, with `models."<id>"` winning field by
 -- field.
 
-local anthropic = require("providers.anthropic_provider")
 local compat = require("providers.openai_compat")
-local google = require("providers.google")
 local http = require("providers.http")
-local local_server = require("providers.local_server")
+local routes = require("providers.routes")
 
 local M = {}
 
@@ -31,53 +29,27 @@ local OVERRIDABLE = { "context_window", "max_output_tokens", "supports_thinking"
 -- The gateway serves a plain chat completions route for upstreams without one.
 local GENERIC = { id = M.ID, include_stream_usage = true }
 
-local function compat_route(name, prefix)
-  local def = require("providers." .. name).def
-  return {
-    def = def,
-    prefix = prefix,
-    stream = function(client, model, ctx, request, emit)
-      return compat.stream(def, client, model, ctx, request, emit)
-    end,
-  }
-end
-
-local function local_route(name)
-  local def = require("providers." .. name).def
-  return {
-    def = def,
-    stream = function(client, _, ctx, request, emit)
-      return local_server.stream(def, client, {}, ctx, request, emit)
-    end,
-  }
+-- The shared route to provider {id}, with the gateway's path {prefix}.
+local function gateway(id, prefix, bare_id)
+  local route = table.clone(routes.ROUTES[id])
+  route.prefix, route.bare_id = prefix, bare_id
+  return route
 end
 
 -- Upstreams by provider id. Anthropic rebuilds `/v1/messages` from the bare
 -- origin and Z.AI has no `/v1` segment, so neither gets a prefix; Gemini puts
 -- the model in the path, where an encoded slash would not survive, so it
--- takes the bare id. OpenAI and Copilot stay on the generic route: their
--- own code would leave the gateway.
+-- takes the bare id. OpenAI and Copilot stay on the generic route.
 M.ROUTES = {
-  anthropic = { def = anthropic.def, prefix = "", stream = anthropic.stream },
-  google = {
-    def = google.def,
-    prefix = GEMINI_PREFIX,
-    bare_id = true,
-    stream = function(client, _, ctx, request, emit)
-      return google.stream(client, ctx, request, emit)
-    end,
-  },
-  ollama = local_route("ollama"),
-  ["llama-cpp"] = local_route("llama_cpp"),
-  zai = compat_route("zai", ""),
-  mistral = compat_route("mistral"),
-  deepseek = compat_route("deepseek"),
-  openrouter = compat_route("openrouter"),
-  requesty = compat_route("requesty"),
-  synthetic = compat_route("synthetic"),
-  regolo = compat_route("regolo"),
-  tensorx = compat_route("tensorx"),
+  anthropic = gateway("anthropic", ""),
+  google = gateway("google", GEMINI_PREFIX, true),
+  ollama = gateway("ollama"),
+  ["llama-cpp"] = gateway("llama-cpp"),
+  zai = gateway("zai", ""),
 }
+for _, id in ipairs({ "mistral", "deepseek", "openrouter", "requesty", "synthetic", "regolo", "tensorx" }) do
+  M.ROUTES[id] = gateway(id)
+end
 
 local function trim(text)
   return type(text) == "string" and text:match("^%s*(.-)%s*$") or ""
@@ -220,6 +192,51 @@ function M.parse_model(row, config)
   }
 end
 
+-- The models the gateway at {api} lists.
+function M.discover(ctx, api, config)
+  local response, err = http.send(ctx, { url = api.base .. MODELS_PATH, headers = api.headers() })
+  if not response then
+    return nil, err
+  end
+  local body, read_err = http.read_json(response)
+  if read_err then
+    return nil, read_err
+  end
+  local models = {}
+  for _, row in ipairs(type(body) == "table" and type(body.data) == "table" and body.data or {}) do
+    models[#models + 1] = M.parse_model(row, config)
+  end
+  return models
+end
+
+-- An instance for {info}, reaching the gateway through {api_for}`(prefix)`,
+-- which returns `{ base, headers }` or nil plus an error. Returns the
+-- instance and its descriptor.
+function M.instance(info, config, api_for)
+  local model, route, model_id, overrides = M.describe(info, config)
+  if overrides.base and not M.ROUTES[overrides.base] then
+    maki.log.warn(string.format("aperture: base %q is not a provider it routes to, ignoring", overrides.base))
+  end
+  local api, err = api_for(M.prefix(route, overrides))
+  if not api then
+    return nil, err
+  end
+  local routed = table.clone(model)
+  routed.id = model_id
+  return {
+    stream = function(call_ctx, request, emit)
+      if not route then
+        return compat.stream(GENERIC, api, model, call_ctx, request, emit)
+      end
+      if route.bare_id then
+        request.model.id = model_id
+      end
+      return route.stream(api, routed, call_ctx, request, emit)
+    end,
+  },
+    model
+end
+
 function M.provider()
   local spec = {
     id = M.ID,
@@ -240,47 +257,39 @@ function M.provider()
     if not api then
       return {}
     end
-    local response, err = http.send(ctx, { url = api.base .. MODELS_PATH, headers = api.headers() })
-    if not response then
-      return nil, err
-    end
-    local body, read_err = http.read_json(response)
-    if read_err then
-      return nil, read_err
-    end
-    local models = {}
-    for _, row in ipairs(type(body) == "table" and type(body.data) == "table" and body.data or {}) do
-      models[#models + 1] = M.parse_model(row, config)
-    end
-    return models
+    return M.discover(ctx, api, config)
   end
 
   function spec.prepare(_, info, config)
-    local model, route, model_id, overrides = M.describe(info, config)
-    if overrides.base and not M.ROUTES[overrides.base] then
-      maki.log.warn(string.format("aperture: base %q is not a provider it routes to, ignoring", overrides.base))
-    end
-    local api, err = client(config, M.prefix(route, overrides))
-    if not api then
-      return nil, err
-    end
-    local routed = table.clone(model)
-    routed.id = model_id
-    return {
-      stream = function(call_ctx, request, emit)
-        if not route then
-          return compat.stream(GENERIC, api, model, call_ctx, request, emit)
-        end
-        if route.bare_id then
-          request.model.id = model_id
-        end
-        return route.stream(api, routed, call_ctx, request, emit)
-      end,
-    },
-      model
+    return M.instance(info, config, function(prefix)
+      return client(config, prefix)
+    end)
   end
 
   return spec
+end
+
+-- A route for a gateway at the client's base, with its headers and the
+-- overrides in `client.config`.
+function M.delegated()
+  local function api_for(client)
+    return function(prefix)
+      return { base = client.base:gsub("/+$", "") .. prefix, headers = client.headers }
+    end
+  end
+  return {
+    def = { models = {} },
+    stream = function(client, model, ctx, request, emit)
+      local instance, err = M.instance(model, client.config, api_for(client))
+      if not instance then
+        return nil, err
+      end
+      return instance.stream(ctx, request, emit)
+    end,
+    list_models = function(ctx, client)
+      return M.discover(ctx, api_for(client)(""), client.config)
+    end,
+  }
 end
 
 return M

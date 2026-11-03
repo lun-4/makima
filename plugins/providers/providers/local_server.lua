@@ -77,8 +77,9 @@ function M.client(ctx, def, config)
 end
 
 -- Streams {request} through {client} (`base` and `headers(extra)`), with
--- the Responses API when {config} asks for it.
-function M.stream(def, client, config, ctx, request, emit)
+-- the Responses API when {config} asks for it. {fields} are the model's
+-- local thinking fields, if it declares any.
+function M.stream(def, client, config, ctx, request, emit, fields)
   local max = thinking.max_budget(request.model)
   if config.protocol == RESPONSES_PROTOCOL then
     local body =
@@ -88,7 +89,7 @@ function M.stream(def, client, config, ctx, request, emit)
   end
   local body = chat.build_request(request, { max_tokens_field = MAX_TOKENS_FIELD, include_stream_usage = true })
   if def.local_thinking then
-    thinking.apply_local(body, request.thinking, nil, max)
+    thinking.apply_local(body, request.thinking, fields, max)
   end
   return http.post_stream(ctx, client.base .. CHAT_PATH, client.headers(), body, chat.stream, emit)
 end

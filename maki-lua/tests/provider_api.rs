@@ -8,7 +8,7 @@ use maki_config::providers::{ProviderDef, ProvidersConfig};
 use maki_lua::PluginHost;
 use maki_providers::{
     AgentError, ContentBlock, ConversationEnd, Invocation, InvocationPurpose, Message,
-    PreparedProvider, ProviderEvent, ProviderRegistry, RequestOptions, Role, StopReason, Timeouts,
+    PreparedProvider, ProviderEvent, ProviderRegistry, RequestOptions, Role, StopReason,
     UsageLimit, UsageWindow,
 };
 use serde_json::json;
@@ -130,7 +130,7 @@ async fn bounded<T>(fut: impl Future<Output = T>) -> T {
 }
 
 fn registry(host: &PluginHost) -> Arc<ProviderRegistry> {
-    host.provider_registry(Timeouts::default()).unwrap()
+    host.provider_registry().unwrap()
 }
 
 fn prepare_fake(instance: &str) -> (PluginHost, PreparedProvider) {

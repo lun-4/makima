@@ -17,7 +17,7 @@ use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
     AgentError, ConversationEnd, Invocation, Message, Model, ModelInfo, PreparedProvider,
     ProviderBackend, ProviderEvent, ProviderRegistry, ProviderUsage, RegisteredProvider,
-    RequestOptions, StopReason, StreamResponse, Timeouts, TokenUsage,
+    RequestOptions, StopReason, StreamResponse, TokenUsage,
 };
 use maki_storage::id::SessionRef;
 use mlua::{
@@ -43,11 +43,7 @@ pub(crate) type ProviderJob = Box<dyn FnOnce(Lua) -> LocalBoxFuture<'static, ()>
 /// The outer error is raised Lua; the inner one is what the provider returned.
 type JobResult<T> = mlua::Result<Result<T, AgentError>>;
 
-pub(crate) fn build_registry(
-    lua: &Lua,
-    requests: &Sender<Request>,
-    timeouts: Timeouts,
-) -> ProviderRegistry {
+pub(crate) fn build_registry(lua: &Lua, requests: &Sender<Request>) -> ProviderRegistry {
     let providers = lua
         .app_data_ref::<ProviderStore>()
         .map(|store| {
@@ -64,7 +60,7 @@ pub(crate) fn build_registry(
                 .collect()
         })
         .unwrap_or_default();
-    ProviderRegistry::new(providers, timeouts)
+    ProviderRegistry::new(providers)
 }
 
 fn registered(

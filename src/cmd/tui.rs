@@ -191,7 +191,7 @@ fn build_stack(
     let commands = discover_commands(cli.no_commands, cwd, &trust.project_config);
 
     let providers = plugin_host
-        .provider_registry(Timeouts::from(&config.provider))
+        .provider_registry()
         .context("build provider registry")?;
     let model_result =
         setup::resolve_model(&providers, cli.model.as_deref(), &config.provider, storage);

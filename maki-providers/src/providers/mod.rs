@@ -1,39 +1,18 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use futures_lite::StreamExt;
-use futures_lite::io::AsyncBufRead;
-use isahc::config::Configurable;
 use isahc::http::request::Builder;
-use serde::Deserialize;
-use serde_json::Value;
 use tracing::debug;
 
 use crate::AgentError;
 
 pub(crate) mod anthropic;
-pub mod custom;
-pub mod dynamic;
 pub(crate) mod google;
-pub(crate) mod local;
 pub(crate) mod openai;
-pub(crate) mod openai_compat;
 
-const LOW_SPEED_BYTES_PER_SEC: u32 = 1;
-const UNMAPPED_SSE_ERROR_STATUS: u16 = 400;
-const EMPTY_SSE_ERROR_MESSAGE: &str = "provider sent an error frame with no detail";
 const AUTHORIZATION_HEADER: &str = "authorization";
-
-pub(crate) fn user_agent() -> &'static str {
-    concat!(
-        "maki/v",
-        env!("CARGO_PKG_VERSION"),
-        "-g",
-        env!("GIT_SHORT_HASH")
-    )
-}
 
 fn bearer_value(api_key: &str) -> String {
     format!("Bearer {api_key}")
@@ -172,147 +151,6 @@ impl ResolvedAuth {
             config_headers: Vec::new(),
         }
     }
-}
-
-pub(crate) fn with_prefix<'a>(
-    prefix: &Option<String>,
-    system: &'a str,
-    buf: &'a mut String,
-) -> &'a str {
-    match prefix {
-        Some(p) => {
-            *buf = format!("{p}\n\n{system}");
-            buf
-        }
-        None => system,
-    }
-}
-
-pub(crate) fn urlenc(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 2);
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => {
-                out.push('%');
-                out.push_str(&format!("{b:02X}"));
-            }
-        }
-    }
-    out
-}
-
-#[derive(Deserialize)]
-pub(crate) struct SseErrorPayload {
-    pub error: SseErrorDetail,
-}
-
-/// Every field is optional because rejecting any one shape throws away the whole error, and a
-/// half-filled error frame still tells us an outage happened. `code` in particular arrives as a
-/// string, a number or `null` depending on the provider.
-#[derive(Deserialize)]
-pub(crate) struct SseErrorDetail {
-    #[serde(default)]
-    pub r#type: String,
-    #[serde(default)]
-    pub code: Value,
-    #[serde(default)]
-    pub message: String,
-    #[serde(default)]
-    pub metadata: Option<SseErrorMetadata>,
-}
-
-/// OpenRouter puts its machine-readable tag here rather than in `type`.
-#[derive(Deserialize)]
-pub(crate) struct SseErrorMetadata {
-    #[serde(default)]
-    pub error_type: String,
-}
-
-/// A streamed error rides inside a plain 200 response, so this tag is the only clue we get about
-/// what went wrong and whether waiting will help.
-pub(crate) fn sse_error_status(tag: &str) -> Option<u16> {
-    Some(match tag {
-        "overloaded_error" | "server_is_overloaded" => 529,
-        "service_unavailable_error" | "provider_overloaded" => 503,
-        "provider_unavailable" => 502,
-        "api_error" | "server_error" => 500,
-        "rate_limit_error" | "rate_limit_exceeded" | "tokens" => 429,
-        "request_too_large" => 413,
-        "not_found_error" => 404,
-        "permission_error" => 403,
-        "billing_error" | "insufficient_quota" => 402,
-        "authentication_error" | "invalid_api_key" => 401,
-        _ => return None,
-    })
-}
-
-/// A numeric `code` is a literal HTTP status, which some routers (OpenRouter) send instead of a
-/// tag. Reading it as a tag would discard the only signal about whether a retry can help.
-fn code_status(code: &Value) -> Option<u16> {
-    let status = match code {
-        Value::Number(n) => u16::try_from(n.as_u64()?).ok()?,
-        Value::String(s) => s.parse().ok()?,
-        _ => return None,
-    };
-    (100..600).contains(&status).then_some(status)
-}
-
-impl SseErrorPayload {
-    pub fn into_agent_error(self) -> AgentError {
-        let status = sse_error_status(self.error.code.as_str().unwrap_or_default())
-            .or_else(|| code_status(&self.error.code))
-            .or_else(|| sse_error_status(&self.error.r#type))
-            .or_else(|| {
-                self.error
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| sse_error_status(&m.error_type))
-            })
-            .unwrap_or(UNMAPPED_SSE_ERROR_STATUS);
-        let message = if self.error.message.trim().is_empty() {
-            EMPTY_SSE_ERROR_MESSAGE.to_string()
-        } else {
-            self.error.message
-        };
-        AgentError::api(status, message)
-    }
-}
-
-pub(crate) async fn next_sse_line<R: AsyncBufRead + Unpin>(
-    lines: &mut futures_lite::io::Lines<R>,
-    deadline: &mut Instant,
-    stream_timeout: Duration,
-) -> Result<Option<String>, AgentError> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let result = futures_lite::future::or(
-        async { lines.next().await.transpose().map_err(AgentError::from) },
-        async {
-            smol::Timer::after(remaining).await;
-            Err(AgentError::Timeout {
-                secs: stream_timeout.as_secs(),
-            })
-        },
-    )
-    .await;
-    if let Ok(Some(_)) = &result {
-        *deadline = Instant::now() + stream_timeout;
-    }
-    result
-}
-
-pub(crate) fn http_client(timeouts: Timeouts) -> isahc::HttpClient {
-    isahc::HttpClient::builder()
-        .connect_timeout(timeouts.connect)
-        .low_speed_timeout(LOW_SPEED_BYTES_PER_SEC, timeouts.low_speed)
-        // libcurl sends `Expect: 100-continue` by default for HTTP/1.1 POST bodies
-        // over 1 KB. Edge proxies (notably Google's for Gemini/Vertex) reject this
-        // preflight check on large payloads with 417 Expectation Failed.
-        .expect_continue(false)
-        .build()
-        .expect("failed to build HTTP client")
 }
 
 #[derive(Clone, Debug)]
@@ -508,107 +346,6 @@ impl<'a> KeyRotation<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_lite::io::AsyncBufReadExt;
-    use test_case::test_case;
-
-    const ERROR_MESSAGE: &str = "Our servers are currently overloaded. Please try again later.";
-    const PARSE_FAILED: &str = "SSE error payload should deserialize";
-    const UNAVAILABLE_STATUS: u16 = 502;
-    const UNAVAILABLE_TAG: &str = "provider_unavailable";
-
-    // Codex only admits the overload in `code`, and anything we cannot place has to stay a plain
-    // 400 so a user mistake is not retried forever: https://github.com/tontinton/maki/issues/777
-    #[test_case(r#""type":"service_unavailable_error","code":"server_is_overloaded""#, 529, true  ; "code_beats_type")]
-    #[test_case(r#""type":"service_unavailable_error""#,                               503, true  ; "absent_code")]
-    #[test_case(r#""type":"service_unavailable_error","code":null"#,                   503, true  ; "null_code")]
-    #[test_case(r#""type":"rate_limit_error","code":429"#,                             429, true  ; "numeric_code")]
-    #[test_case(r#""code":429"#,                                                       429, true  ; "numeric_code_alone")]
-    #[test_case(r#""code":502,"metadata":{"error_type":"provider_unavailable"}"#,      502, true  ; "openrouter_provider_unavailable")]
-    #[test_case(r#""code":null,"metadata":{"error_type":"provider_unavailable"}"#,     502, true  ; "metadata_provider_unavailable")]
-    #[test_case(r#""code":null,"metadata":{"error_type":"provider_overloaded"}"#,      503, true  ; "metadata_provider_overloaded")]
-    #[test_case(r#""code":null,"metadata":{"error_type":"rate_limit_exceeded"}"#,      429, true  ; "metadata_rate_limit")]
-    #[test_case(r#""code":401"#,                                                       401, false ; "numeric_auth_status")]
-    #[test_case(r#""type":"invalid_request_error","code":"invalid_value""#,            400, false ; "unknown_tags")]
-    fn sse_error_payload_status(tags: &str, status: u16, retryable: bool) {
-        let payload: SseErrorPayload = serde_json::from_str(&format!(
-            r#"{{"error":{{{tags},"message":"{ERROR_MESSAGE}"}}}}"#
-        ))
-        .expect(PARSE_FAILED);
-        let err = payload.into_agent_error();
-
-        assert_eq!(
-            err.to_string(),
-            format!("API error ({status}): {ERROR_MESSAGE}")
-        );
-        assert_eq!(err.is_retryable(), retryable);
-    }
-
-    // A frame that only says "the upstream is down" must survive parsing, or the turn ends with an
-    // empty assistant message and no retry.
-    #[test_case(Some(ERROR_MESSAGE), ERROR_MESSAGE           ; "message_present")]
-    #[test_case(None,                EMPTY_SSE_ERROR_MESSAGE ; "message_key_absent")]
-    #[test_case(Some(""),            EMPTY_SSE_ERROR_MESSAGE ; "message_empty")]
-    #[test_case(Some("   "),         EMPTY_SSE_ERROR_MESSAGE ; "message_blank")]
-    fn sse_error_payload_without_message_still_classifies(message: Option<&str>, expected: &str) {
-        let mut error = serde_json::json!({
-            "code": UNAVAILABLE_STATUS,
-            "metadata": { "error_type": UNAVAILABLE_TAG },
-        });
-        if let Some(message) = message {
-            error["message"] = message.into();
-        }
-        let payload: SseErrorPayload =
-            serde_json::from_value(serde_json::json!({ "error": error })).expect(PARSE_FAILED);
-        let err = payload.into_agent_error();
-
-        assert_eq!(
-            err.to_string(),
-            format!("API error ({UNAVAILABLE_STATUS}): {expected}")
-        );
-        assert!(err.is_retryable());
-    }
-    #[test_case("a b", "a%20b" ; "space")]
-    #[test_case("a:b", "a%3Ab" ; "colon")]
-    #[test_case("abc", "abc"   ; "passthrough")]
-    fn urlenc_encodes(input: &str, expected: &str) {
-        assert_eq!(urlenc(input), expected);
-    }
-
-    struct NeverReader;
-
-    impl futures_lite::io::AsyncRead for NeverReader {
-        fn poll_read(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-            _buf: &mut [u8],
-        ) -> std::task::Poll<std::io::Result<usize>> {
-            std::task::Poll::Pending
-        }
-    }
-
-    impl futures_lite::io::AsyncBufRead for NeverReader {
-        fn poll_fill_buf(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<&[u8]>> {
-            std::task::Poll::Pending
-        }
-
-        fn consume(self: std::pin::Pin<&mut Self>, _amt: usize) {}
-    }
-
-    #[test]
-    fn next_sse_line_expired_deadline_returns_timeout() {
-        smol::block_on(async {
-            let mut lines = NeverReader.lines();
-            let mut past = Instant::now() - Duration::from_secs(1);
-            let stream_timeout = Duration::from_secs(300);
-            let err = next_sse_line(&mut lines, &mut past, stream_timeout)
-                .await
-                .unwrap_err();
-            assert!(matches!(err, AgentError::Timeout { .. }));
-        })
-    }
 
     #[test]
     fn key_pool_single_key_current() {
@@ -670,40 +407,6 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{result:?}");
         assert!(msg.contains(&env_var) || msg.contains(&slug));
-    }
-
-    #[test]
-    fn http_client_omits_expect_continue_on_large_payload() {
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let client = http_client(Timeouts::default());
-        let body = vec![b'x'; 2048];
-        let req = isahc::Request::post(format!("http://{addr}"))
-            .body(body)
-            .unwrap();
-
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 1024];
-            let n = stream.read(&mut buf).unwrap();
-            let received = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
-            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
-            received
-        });
-
-        smol::block_on(async {
-            let _ = client.send_async(req).await;
-        });
-
-        let received = handle.join().unwrap();
-        assert!(
-            !received.contains("100-continue"),
-            "large payload should omit Expect: 100-continue, got:\n{received}"
-        );
     }
 
     const TEST_SLUG: &str = "gateway";

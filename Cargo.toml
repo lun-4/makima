@@ -206,7 +206,6 @@ shell-words = "1"
 agent-client-protocol-schema = { version = "0.13", features = ["unstable_boolean_config", "unstable_elicitation"] }
 
 wait-timeout = "0.2"
-inventory = "0.3"
 
 [profile.bench]
 debug = true

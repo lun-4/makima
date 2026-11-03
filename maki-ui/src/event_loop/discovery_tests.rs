@@ -6,7 +6,7 @@ use maki_providers::login::{AuthSpec, AuthStatus, InteractionService};
 use maki_providers::provider::{self, BoxFuture};
 use maki_providers::{
     AgentError, Model, ModelInfo, PreparedProvider, ProviderBackend, ProviderRegistry,
-    RegisteredProvider, Timeouts,
+    RegisteredProvider,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use serde_json::Value;
@@ -121,19 +121,16 @@ fn assert_picker_usable(event_loop: &mut EventLoop<'_>) {
 fn refresh_keeps_catalog_and_recents_through_slow_provider_failure() {
     let (entered_tx, entered_rx) = flume::bounded(1);
     let (release_tx, release_rx) = flume::bounded(1);
-    let providers = Arc::new(ProviderRegistry::new(
-        vec![RegisteredProvider {
-            id: PROVIDER.into(),
-            display_name: DISPLAY_NAME.into(),
-            models: Vec::new(),
-            backend: Arc::new(SlowFailingBackend {
-                entered: entered_tx,
-                release: release_rx,
-            }),
-            auth: AuthSpec::default(),
-        }],
-        Timeouts::default(),
-    ));
+    let providers = Arc::new(ProviderRegistry::new(vec![RegisteredProvider {
+        id: PROVIDER.into(),
+        display_name: DISPLAY_NAME.into(),
+        models: Vec::new(),
+        backend: Arc::new(SlowFailingBackend {
+            entered: entered_tx,
+            release: release_rx,
+        }),
+        auth: AuthSpec::default(),
+    }]));
 
     with_event_loop_providers(providers, |event_loop| {
         let policy = Arc::new(ModelPolicy::new(&[RECENT.into(), CATALOG.into()], &[]).unwrap());

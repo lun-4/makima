@@ -815,7 +815,7 @@ mod tests {
     };
     use maki_providers::{
         ContentBlock, Invocation, Message, ModelInfo, ProviderEvent, RequestOptions, Role,
-        StopReason, StreamResponse, TokenUsage, model_registry,
+        StopReason, StreamResponse, TokenUsage,
         provider::{BoxFuture, ModelBatch, Provider},
     };
     use maki_storage::sessions::{SESSIONS_DIR, offload_dir};
@@ -1397,7 +1397,9 @@ mod tests {
     fn print_root_starts_on_its_discovered_provider() {
         let state = tempfile::tempdir().unwrap();
         maki_storage::paths::init_at(state.path().to_path_buf()).unwrap();
-        maki_lua::test_support::save_custom_provider(DISCOVERY_PROVIDER);
+        let models = Arc::<std::sync::Mutex<Vec<ModelInfo>>>::default();
+        let providers =
+            maki_lua::test_support::offline_registry(DISCOVERY_PROVIDER, Arc::clone(&models));
         let spec = format!("{DISCOVERY_PROVIDER}/{DISCOVERY_MODEL_ID}");
         let registry = CommandRegistry::new();
         let (ui, notices) = maki_lua::test_support::RecordingUi::new();
@@ -1431,7 +1433,8 @@ mod tests {
         .unwrap();
         let lua_handle = host.event_handle();
         let mut params = print_params(&std::env::temp_dir(), None);
-        params.model = Model::from_spec(&spec).unwrap();
+        params.model = providers.model(&spec).unwrap();
+        params.providers = Arc::clone(&providers);
         assert_ne!(params.model.context_window, DISCOVERED_WINDOW);
         let (requests, _) = flume::unbounded();
         let session = start_print_session(
@@ -1446,13 +1449,13 @@ mod tests {
             |catalog, active| {
                 catalog.discover_from(
                     async move |mut on_ready| {
-                        model_registry::set_known_models(
-                            DISCOVERY_PROVIDER,
-                            vec![ModelInfo {
-                                context_window: Some(DISCOVERED_WINDOW),
-                                ..ModelInfo::id_only(DISCOVERY_MODEL_ID.into())
-                            }],
-                        );
+                        *models.lock().unwrap() = vec![ModelInfo {
+                            context_window: Some(DISCOVERED_WINDOW),
+                            ..ModelInfo::id_only(DISCOVERY_MODEL_ID.into())
+                        }];
+                        providers
+                            .fetch_all(&ModelPolicy::default(), false, |_| {})
+                            .await;
                         on_ready(ModelBatch {
                             provider: Some(DISCOVERY_PROVIDER.into()),
                             models: vec![spec],

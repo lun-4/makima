@@ -488,6 +488,26 @@ local function stream(state, model, ctx, request, emit)
   return http.post_stream(ctx, auth.endpoint .. CHAT_PATH, headers(state, auth, true), body, chat.stream, emit)
 end
 
+-- State for {client} (`base` and `headers()`), whose headers carry
+-- credentials that come from elsewhere and whose base is the endpoint. The
+-- model listing stays with the client.
+local function delegated(client)
+  client.copilot = client.copilot or {}
+  local state = client.copilot
+  state.configured = client.headers()
+  state.auth = { token = "", endpoint = client.base }
+  return state
+end
+
+function M.route_stream(client, model, ctx, request, emit)
+  return stream(delegated(client), model, ctx, request, emit)
+end
+
+function M.route_list(ctx, client)
+  local state = delegated(client)
+  return list(ctx, state, state.auth)
+end
+
 local function new_state(config)
   local configured, err = http.headers(M.def.id, {}, config.headers)
   if not configured then

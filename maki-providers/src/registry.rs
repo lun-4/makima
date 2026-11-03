@@ -5,7 +5,7 @@
 //! not know falls back to the native tables until those are removed.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 use maki_config::ModelPolicy;
 use serde_json::Value;
@@ -16,8 +16,7 @@ use crate::login::{AuthSpec, AuthStatus, InteractionService};
 use crate::manifest::ManifestRegistry;
 use crate::model::{Model, ModelError, ModelInfo, ModelTier};
 use crate::model_registry;
-use crate::provider::{self, BoxFuture, ModelBatch, Provider};
-use crate::providers::Timeouts;
+use crate::provider::{BoxFuture, ModelBatch, Provider};
 
 pub trait ProviderBackend: Send + Sync {
     /// Builds the provider for one model. The returned model may differ from
@@ -108,11 +107,10 @@ impl Entry {
 #[derive(Default)]
 pub struct ProviderRegistry {
     entries: BTreeMap<Arc<str>, Entry>,
-    timeouts: Timeouts,
 }
 
 impl ProviderRegistry {
-    pub fn new(providers: Vec<RegisteredProvider>, timeouts: Timeouts) -> Self {
+    pub fn new(providers: Vec<RegisteredProvider>) -> Self {
         let entries = providers
             .into_iter()
             .map(|provider| {
@@ -125,7 +123,7 @@ impl ProviderRegistry {
                 (provider.id, entry)
             })
             .collect();
-        Self { entries, timeouts }
+        Self { entries }
     }
 
     pub fn contains(&self, id: &str) -> bool {
@@ -146,10 +144,6 @@ impl ProviderRegistry {
             let alias = entry.auth.aliases.iter().find(|alias| alias.id == name)?;
             Some((id, entry, Some(alias.method.as_str())))
         })
-    }
-
-    fn registered(&self, spec: &str) -> bool {
-        Model::parse_spec(spec).is_ok_and(|(provider, _)| self.entries.contains_key(provider))
     }
 
     pub fn model(&self, spec: &str) -> Result<Model, ModelError> {
@@ -208,7 +202,7 @@ impl ProviderRegistry {
     }
 
     pub fn available(&self, provider: &str) -> bool {
-        self.entries.contains_key(provider) || provider::provider_available(provider)
+        self.entries.contains_key(provider)
     }
 
     pub fn display_name(&self, provider: &str) -> Option<Arc<str>> {
@@ -220,57 +214,32 @@ impl ProviderRegistry {
         }
     }
 
-    pub async fn prepare(&self, mut model: Model) -> Result<PreparedProvider, AgentError> {
-        if let Some(entry) = self.entries.get(&*model.provider) {
-            let info = entry.info(&model.id);
-            return entry.backend.prepare(model, info).await;
-        }
-        let provider = provider::from_model_async(&mut model, self.timeouts).await?;
-        Ok(PreparedProvider {
-            model,
-            provider: Arc::from(provider),
-        })
+    pub async fn prepare(&self, model: Model) -> Result<PreparedProvider, AgentError> {
+        let Some(entry) = self.entries.get(&*model.provider) else {
+            return Err(AgentError::Config {
+                message: format!("unknown provider '{}'", model.provider),
+            });
+        };
+        let info = entry.info(&model.id);
+        entry.backend.prepare(model, info).await
     }
 
     /// Specs known without any network call.
     pub fn offline_specs(&self, policy: &ModelPolicy) -> Vec<String> {
-        let mut specs = provider::available_model_specs(policy);
-        specs.retain(|spec| !self.registered(spec));
-        for (provider, entry) in &self.entries {
-            specs.extend(
-                entry
-                    .specs(provider)
-                    .into_iter()
-                    .filter(|spec| policy.allows(spec)),
-            );
-        }
-        specs
+        self.entries
+            .iter()
+            .flat_map(|(provider, entry)| entry.specs(provider))
+            .filter(|spec| policy.allows(spec))
+            .collect()
     }
 
-    /// Native discovery plus every registered provider's own, each batch
-    /// delivered as it arrives. {refresh} asks providers to bypass caches.
+    /// Every provider's discovery, each batch delivered as it arrives.
+    /// {refresh} asks providers to bypass caches.
     pub async fn fetch_all(
         &self,
         policy: &ModelPolicy,
         refresh: bool,
-        on_ready: impl FnMut(ModelBatch) + Send,
-    ) {
-        let on_ready = Mutex::new(on_ready);
-        let native = provider::fetch_all_models(policy, |mut batch| {
-            batch.models.retain(|spec| !self.registered(spec));
-            (on_ready.lock().unwrap())(batch);
-        });
-        let registered = self.discover_registered(policy, refresh, |batch| {
-            (on_ready.lock().unwrap())(batch);
-        });
-        futures_lite::future::zip(native, registered).await;
-    }
-
-    async fn discover_registered(
-        &self,
-        policy: &ModelPolicy,
-        refresh: bool,
-        mut on_ready: impl FnMut(ModelBatch),
+        mut on_ready: impl FnMut(ModelBatch) + Send,
     ) {
         let (tx, rx) = flume::unbounded();
         for (provider, entry) in &self.entries {
@@ -352,7 +321,7 @@ mod tests {
             Box::pin(async move {
                 Ok(PreparedProvider {
                     model,
-                    provider: provider::unconfigured(),
+                    provider: crate::provider::unconfigured(),
                 })
             })
         }
@@ -404,20 +373,17 @@ mod tests {
             discovered,
             prepared: AtomicBool::new(false),
         });
-        let registry = ProviderRegistry::new(
-            vec![RegisteredProvider {
-                id: id.into(),
-                display_name: id.into(),
-                models: vec![
-                    info(STRONG_FIRST, Some(ModelTier::Strong)),
-                    info(STRONG_SECOND, Some(ModelTier::Strong)),
-                    info(WEAK, Some(ModelTier::Weak)),
-                ],
-                backend: Arc::clone(&backend) as Arc<dyn ProviderBackend>,
-                auth: AuthSpec::default(),
-            }],
-            Timeouts::default(),
-        );
+        let registry = ProviderRegistry::new(vec![RegisteredProvider {
+            id: id.into(),
+            display_name: id.into(),
+            models: vec![
+                info(STRONG_FIRST, Some(ModelTier::Strong)),
+                info(STRONG_SECOND, Some(ModelTier::Strong)),
+                info(WEAK, Some(ModelTier::Weak)),
+            ],
+            backend: Arc::clone(&backend) as Arc<dyn ProviderBackend>,
+            auth: AuthSpec::default(),
+        }]);
         (registry, backend)
     }
 
@@ -504,11 +470,9 @@ mod tests {
     fn discovery_replaces_model_list() {
         let (registry, _) = registry_with(FAKE, Some(Ok(vec![info(DISCOVERED, None)])));
         let mut batches = Vec::new();
-        smol::block_on(
-            registry.discover_registered(&ModelPolicy::default(), false, |batch| {
-                batches.push(batch.models);
-            }),
-        );
+        smol::block_on(registry.fetch_all(&ModelPolicy::default(), false, |batch| {
+            batches.push(batch.models);
+        }));
         let discovered = format!("{FAKE}/{DISCOVERED}");
         assert_eq!(batches, vec![vec![discovered.clone()]]);
         assert_eq!(registry.spec_for_tier(FAKE, ModelTier::Strong), None);
@@ -522,11 +486,9 @@ mod tests {
     fn failed_discovery_keeps_curated_list() {
         let (registry, _) = registry_with(FAKE, Some(Err(DISCOVERY_FAILURE.into())));
         let mut warnings = Vec::new();
-        smol::block_on(
-            registry.discover_registered(&ModelPolicy::default(), false, |batch| {
-                warnings.extend(batch.warnings);
-            }),
-        );
+        smol::block_on(registry.fetch_all(&ModelPolicy::default(), false, |batch| {
+            warnings.extend(batch.warnings);
+        }));
         assert!(warnings[0].contains(DISCOVERY_FAILURE));
         assert!(registry.spec_for_tier(FAKE, ModelTier::Strong).is_some());
     }

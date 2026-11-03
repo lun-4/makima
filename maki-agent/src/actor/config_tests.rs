@@ -4,7 +4,7 @@ use maki_providers::login::{AuthSpec, AuthStatus, InteractionService};
 use maki_providers::provider::{self, BoxFuture};
 use maki_providers::{
     AgentError, Model, ModelInfo, PreparedProvider, ProviderBackend, ProviderRegistry,
-    RegisteredProvider, Timeouts,
+    RegisteredProvider,
 };
 use maki_storage::checkpoint::CheckpointPublication;
 use serde_json::Value;
@@ -1617,19 +1617,16 @@ impl ProviderBackend for EchoBackend {
 /// A registry whose provider lists only {DISCOVERED_MODEL_ID}, with a
 /// window no model built from a bare id has.
 fn discovery_registry() -> ProviderRegistry {
-    ProviderRegistry::new(
-        vec![RegisteredProvider {
-            id: DISCOVERY_PROVIDER.into(),
-            display_name: DISCOVERY_PROVIDER.into(),
-            models: vec![ModelInfo {
-                context_window: Some(DISCOVERED_WINDOW),
-                ..ModelInfo::id_only(DISCOVERED_MODEL_ID.into())
-            }],
-            backend: Arc::new(EchoBackend),
-            auth: AuthSpec::default(),
+    ProviderRegistry::new(vec![RegisteredProvider {
+        id: DISCOVERY_PROVIDER.into(),
+        display_name: DISCOVERY_PROVIDER.into(),
+        models: vec![ModelInfo {
+            context_window: Some(DISCOVERED_WINDOW),
+            ..ModelInfo::id_only(DISCOVERED_MODEL_ID.into())
         }],
-        Timeouts::default(),
-    )
+        backend: Arc::new(EchoBackend),
+        auth: AuthSpec::default(),
+    }])
 }
 
 fn cold_model(model_id: &str) -> Model {

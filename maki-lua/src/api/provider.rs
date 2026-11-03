@@ -1,7 +1,7 @@
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use maki_config::providers::ProviderDef;
+use maki_config::providers::{ProviderDef, ProvidersConfig};
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::ModelInfo;
 use maki_providers::login::{AuthMethod, AuthSpec, ConfigField, LoginAlias};
@@ -9,6 +9,9 @@ use mlua::{DeserializeOptions, Function, Lua, LuaSerdeExt, Result as LuaResult, 
 use serde::Deserialize;
 use serde::de::{Deserializer, Error, Visitor};
 
+use crate::api::util::pair::{Pair, try_pair};
+use crate::plugin_permissions::PluginPermissions;
+use crate::provider::serialize_options;
 use crate::runtime::require_plugin_load;
 
 const ID_PUNCTUATION: &str = "-_.";
@@ -324,10 +327,55 @@ fn register_provider(
     Ok(())
 }
 
+/// Read `providers.toml`: the section of provider {id}, or every section by
+/// provider id when {id} is nil. The file is read at each call, so a section
+/// saved earlier in the session is seen. A section has the fields a
+/// provider's `config` argument has. Use it for a setting another provider's
+/// section holds, or to register providers the file defines.
+///
+/// @param id string? Provider id.
+/// @return (table?) The section, nil when there is none, or every section.
+/// @example
+/// local opencode = maki.api.provider_config("opencode") or {}
+/// for id, section in pairs(maki.api.provider_config()) do print(id, section.protocol) end
+#[lua_fn(guard = Env)]
+fn provider_config(lua: &Lua, id: Option<String>) -> LuaResult<Value> {
+    let config = ProvidersConfig::load_or_default();
+    match id {
+        Some(id) => config.get(&id).map_or(Ok(Value::Nil), |def| {
+            lua.to_value_with(def, serialize_options())
+        }),
+        None => lua.to_value_with(&config.providers, serialize_options()),
+    }
+}
+
+/// Save {section} as provider {id}'s `providers.toml` section, replacing
+/// any section it had. Fields the file does not know are dropped. Fails
+/// without touching the file when it does not parse.
+///
+/// @param id string Provider id.
+/// @param section table Fields such as `protocol`, `base_url` and `api_key_env`.
+/// @return (boolean?, string?) true, or nil plus an error.
+/// @example
+/// maki.api.save_provider_config("my-llm", { protocol = "openai", base_url = "http://localhost:8000/v1" })
+#[lua_fn(guard = FsWrite)]
+fn save_provider_config(lua: &Lua, id: String, section: Value) -> LuaResult<Pair<bool>> {
+    let def: ProviderDef = try_pair!(lua.from_value(section));
+    let mut config = try_pair!(ProvidersConfig::try_load());
+    config.upsert(id, def);
+    try_pair!(config.save());
+    Ok((Some(true), None))
+}
+
 lua_table! {
     extend "maki.api" => pub(crate) fn add_provider_fn(
         pending: PendingProviders,
         plugin: Arc<str>,
-        send: Function
-    ), DOCS [register_provider(pending, plugin, send)]
+        send: Function,
+        perms: &PluginPermissions
+    ), DOCS [
+        register_provider(pending, plugin, send),
+        provider_config(perms),
+        save_provider_config(perms),
+    ]
 }
