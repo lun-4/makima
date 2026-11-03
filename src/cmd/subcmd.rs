@@ -557,10 +557,13 @@ pub fn models(
     let trust = project::resolve_noninteractive(cwd, trust_mode);
     load_env_files(&trust.project_config);
 
-    let host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit, headless())
-        .context("initialize lua plugin host")?;
+    let mut host =
+        PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit, headless())
+            .context("initialize lua plugin host")?;
     let mut warnings: Vec<String> = trust.warning.clone().into_iter().collect();
     let config = load_effective_config(&host, no_plugins, &trust.project_config, &mut warnings)?;
+    host.load_builtins(&config.plugins)
+        .context("load builtin plugins")?;
 
     let mut refresh_failure = None;
     if refresh {

@@ -4,7 +4,7 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use futures_lite::future;
@@ -23,6 +23,7 @@ use smol::Timer;
 use crate::api::base64::bytes_arg;
 use crate::api::net::parse_http_url;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::runtime::register_defer_close;
 
 const CHUNK_SIZE: usize = 64 * 1024;
 const DEFAULT_METHOD: &str = "GET";
@@ -103,14 +104,25 @@ fn timeout_field(request: &Table, field: &str, default_secs: f64) -> LuaResult<D
 
 enum BodyState {
     Open(AsyncBody),
+    /// Taken out by a read in flight. A read dropped mid-flight leaves it here,
+    /// which reads as closed.
+    Reading,
     Finished,
     Closed,
+}
+
+type SharedBody = Arc<Mutex<BodyState>>;
+
+fn lock_body(body: &SharedBody) -> MutexGuard<'_, BodyState> {
+    body.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 pub(crate) struct LuaResponse {
     status: u16,
     headers: Vec<(String, String)>,
-    body: BodyState,
+    /// Shared with the opening task's close hook, so the transfer ends with
+    /// that task even while Lua still holds the handle.
+    body: SharedBody,
     idle_timeout: Duration,
     buf: Box<[u8]>,
 }
@@ -119,24 +131,41 @@ impl LuaResponse {
     /// `Ok(None)` at end of stream. A failed read closes the body, because the
     /// stream is left at an unknown position.
     async fn next_chunk(&mut self) -> Result<Option<&[u8]>, String> {
-        let body = match &mut self.body {
-            BodyState::Open(body) => body,
-            BodyState::Finished => return Ok(None),
-            BodyState::Closed => return Err(CLOSED_ERR.to_string()),
+        let mut body = {
+            let mut state = lock_body(&self.body);
+            match std::mem::replace(&mut *state, BodyState::Reading) {
+                BodyState::Open(body) => body,
+                BodyState::Finished => {
+                    *state = BodyState::Finished;
+                    return Ok(None);
+                }
+                other => {
+                    *state = other;
+                    return Err(CLOSED_ERR.to_string());
+                }
+            }
         };
         let idle_timeout = self.idle_timeout;
         let idle = async move {
             Timer::after(idle_timeout).await;
             Err(io::Error::new(io::ErrorKind::TimedOut, IDLE_TIMEOUT_ERR))
         };
-        match future::or(body.read(&mut self.buf), idle).await {
+        let read = future::or(body.read(&mut self.buf), idle).await;
+        let mut state = lock_body(&self.body);
+        if !matches!(*state, BodyState::Reading) {
+            return Err(CLOSED_ERR.to_string());
+        }
+        match read {
             Ok(0) => {
-                self.body = BodyState::Finished;
+                *state = BodyState::Finished;
                 Ok(None)
             }
-            Ok(n) => Ok(Some(&self.buf[..n])),
+            Ok(n) => {
+                *state = BodyState::Open(body);
+                Ok(Some(&self.buf[..n]))
+            }
             Err(e) => {
-                self.body = BodyState::Closed;
+                *state = BodyState::Closed;
                 Err(format!("read failed: {e}"))
             }
         }
@@ -196,7 +225,7 @@ async fn open(params: SendParams) -> Result<LuaResponse, String> {
     Ok(LuaResponse {
         status: response.status().as_u16(),
         headers,
-        body: BodyState::Open(response.into_body()),
+        body: Arc::new(Mutex::new(BodyState::Open(response.into_body()))),
         idle_timeout: params.idle_timeout,
         buf: vec![0; CHUNK_SIZE].into_boxed_slice(),
     })
@@ -244,9 +273,16 @@ async fn open(params: SendParams) -> Result<LuaResponse, String> {
 /// end
 /// res:close()
 #[lua_fn(guard = Net)]
-async fn send(_lua: Lua, request: Table) -> LuaResult<Pair<LuaResponse>> {
+async fn send(lua: Lua, request: Table) -> LuaResult<Pair<LuaResponse>> {
     let params = SendParams::from_table(&request)?;
-    Ok((Some(try_pair!(open(params).await)), None))
+    let response = try_pair!(open(params).await);
+    let body = Arc::clone(&response.body);
+    // Outside a task scope nothing ends the handle but `close` and GC.
+    let _ = register_defer_close(
+        &lua,
+        Box::new(move || *lock_body(&body) = BodyState::Closed),
+    );
+    Ok((Some(response), None))
 }
 
 /// Read the next chunk of the body, up to 64 KiB. Returns nil at the end of
@@ -273,7 +309,7 @@ async fn read(lua: Lua, mut this: UserDataRefMut<LuaResponse>) -> LuaResult<Pair
 /// res:close()
 #[lua_fn]
 fn close(_lua: &Lua, this: &mut LuaResponse) -> LuaResult<()> {
-    this.body = BodyState::Closed;
+    *lock_body(&this.body) = BodyState::Closed;
     Ok(())
 }
 
@@ -293,8 +329,9 @@ lua_class! {
     ///
     /// `status` is the integer status code. `headers` is a table keyed by
     /// lowercase header name, with repeated headers joined by `", "`. Read
-    /// the body with `:read()`. Closing or dropping the handle closes the
-    /// connection once the next byte arrives from the server.
+    /// the body with `:read()`. Closing or dropping the handle, or the end of
+    /// the task that sent the request, closes the connection once the next
+    /// byte arrives from the server.
     "maki.net.Response" => LuaResponse, RESPONSE_DOCS [read, close] fields response_fields
 }
 
@@ -311,6 +348,7 @@ mod tests {
     use super::*;
     use crate::api::net::{NON_HTTP_URL_ERR, create_net_table};
     use crate::plugin_permissions::PluginPermissions;
+    use crate::runtime::TaskScope;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
     const SHORT_IDLE_SECS: f64 = 0.2;
@@ -630,6 +668,34 @@ mod tests {
         assert_eq!(&*body.as_bytes(), BINARY_BODY);
         assert!(nil_after_close);
         assert_eq!(closed_err, CLOSED_ERR);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn ending_the_sending_task_closes_the_response() {
+        let (release_tx, release_rx) = steps();
+        let (url, server) = serve(move |mut stream, _, _| {
+            stream.write_all(CHUNKED_HEAD).unwrap();
+            stream.write_all(&chunk(CHUNKS[0])).unwrap();
+            recv(&release_rx);
+        });
+        let lua = Lua::new();
+        let net = create_net_table(&lua, &PluginPermissions::trusted()).unwrap();
+        lua.globals().set("net", net).unwrap();
+        lua.globals().set("url", url).unwrap();
+        let script = lua.load("return net.send({ url = url })");
+        let response: LuaValue = smol::block_on(bounded(async {
+            let scope = TaskScope::detached(&lua);
+            let response = scope.scope_future(script.eval_async()).await.unwrap();
+            drop(scope);
+            response
+        }));
+        lua.globals().set("res", response).unwrap();
+        let (chunk, err): (Option<LuaString>, String) =
+            smol::block_on(bounded(lua.load("return res:read()").eval_async())).unwrap();
+        assert!(chunk.is_none());
+        assert_eq!(err, CLOSED_ERR);
+        release_tx.send(()).unwrap();
         server.join().unwrap();
     }
 

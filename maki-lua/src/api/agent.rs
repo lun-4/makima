@@ -27,7 +27,7 @@ use maki_agent::actor::{
 };
 use maki_agent::agent::{PromptSlotSource, TurnSetup, build_mode_system_prompt, tool_dispatch};
 use maki_agent::cancel::CancelMap;
-use maki_agent::config_change::{ConfigChangeError, invalid_model_spec, prepare_model};
+use maki_agent::config_change::{ConfigChangeError, prepare_model, unresolved_model};
 use maki_agent::headless::default_model_preparer;
 use maki_agent::session_coordinator::ModelPreparer;
 use maki_agent::template::env_vars_for;
@@ -111,7 +111,7 @@ async fn build_session_provider(
         Some(prepare) => Arc::new(move |spec| {
             let prepared = providers
                 .model(&spec)
-                .map_err(|_| invalid_model_spec(&spec))
+                .map_err(unresolved_model)
                 .and_then(|model| {
                     prepare(model)
                         .map(|(model, provider)| PreparedModel { model, provider })

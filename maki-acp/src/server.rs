@@ -1740,6 +1740,7 @@ fn config_error(error: ConfigChangeError) -> AcpError {
                 option,
                 SessionOptionError::UnknownId(_)
                     | SessionOptionError::InvalidValue { .. }
+                    | SessionOptionError::UnresolvedModel(_)
                     | SessionOptionError::FastUnsupported
                     | SessionOptionError::PolicyRejected(_)
                     | SessionOptionError::CallbackFailed(_)
@@ -3343,7 +3344,7 @@ mod tests {
                 Arc::new(move |spec| {
                     let provider = Arc::clone(&provider);
                     let model = Model::from_spec(&spec)
-                        .map_err(|_| maki_agent::config_change::invalid_model_spec(&spec));
+                        .map_err(maki_agent::config_change::unresolved_model);
                     Box::pin(async move {
                         Ok(maki_agent::actor::PreparedModel {
                             model: model?,
@@ -6866,11 +6867,11 @@ mod tests {
 
         assert_eq!(
             first.message,
-            "command failed: invalid value \"definitely-invalid-provider/test\" for session option model"
+            "command failed: unsupported provider 'definitely-invalid-provider'"
         );
         assert_eq!(
             second.message,
-            "command failed: invalid value \"codex/gpt-5.6-sol\" for session option model"
+            "command failed: unsupported provider 'codex'"
         );
         turns.assert_untouched();
     }

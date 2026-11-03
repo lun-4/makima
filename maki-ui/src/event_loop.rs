@@ -4902,8 +4902,8 @@ mod tests {
         Arc::new(move |spec| {
             let prepare = Arc::clone(&prepare);
             Box::pin(async move {
-                let model = Model::from_spec(&spec)
-                    .map_err(|_| maki_agent::config_change::invalid_model_spec(&spec))?;
+                let model =
+                    Model::from_spec(&spec).map_err(maki_agent::config_change::unresolved_model)?;
                 smol::unblock(move || prepare(model))
                     .await
                     .map_err(ConfigChangeError::ModelPreparation)

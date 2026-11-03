@@ -25,7 +25,7 @@ use crate::agent::isolated_turn::IsolatedTurnEvent;
 use crate::agent::streaming::end_conversation_detached;
 use crate::agent::{self, History, PromptSlotSource, TurnSetup};
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
-use crate::config_change::{ConfigChangeError, invalid_model_spec};
+use crate::config_change::{ConfigChangeError, unresolved_model};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
 use crate::session_coordinator::{ModelPreparer, SessionCoordinatorHandle};
@@ -434,9 +434,7 @@ pub fn default_model_preparer(providers: Arc<ProviderRegistry>) -> ModelPreparer
     Arc::new(move |spec| {
         let providers = Arc::clone(&providers);
         Box::pin(async move {
-            let model = providers
-                .model(&spec)
-                .map_err(|_| invalid_model_spec(&spec))?;
+            let model = providers.model(&spec).map_err(unresolved_model)?;
             providers
                 .prepare(model)
                 .await

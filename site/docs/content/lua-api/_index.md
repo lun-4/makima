@@ -1174,6 +1174,74 @@ for _, option in ipairs(maki.api.get_session_options()) do
 end
 ```
 
+---
+
+### `maki.api.register_provider()` {#maki-api-register_provider}
+
+```lua
+maki.api.register_provider({spec})
+```
+
+Registers a model provider. Call it at the top level during plugin load.
+A provider id belongs to one plugin; registering an id another plugin
+already owns fails and names both plugins.
+
+{spec} fields:
+  `id` (string) Required. The provider part of `provider/model` specs.
+  `display_name` (string) Required.
+  `models` (table) Model descriptors: `id` plus optional
+  `context_window`, `max_output_tokens`, `pricing`, `supports_thinking`,
+  `requires_thinking`, `supports_vision`, `supports_fast`,
+  `supports_tool_examples`, `tier` and `provider_data`. The first
+  descriptor with a tier is that tier's default.
+  `prepare` (function) Required. `prepare(ctx, model)` returns an instance
+  for one model descriptor, optionally followed by an adjusted descriptor
+  with the same id, or nil plus an error.
+  `discover` (function) Optional. `discover(ctx)` returns the descriptors
+  the provider offers now.
+
+`ctx` is `{ id, send }`, where `send` is `maki.net.send`. An instance has
+`stream(ctx, request, emit)` and optionally `fetch_usage(ctx)`,
+`refresh_auth(ctx)`, `reload_auth(ctx)`, `rotate_key(ctx)`,
+`end_conversation(ctx, conversation_id, reason)` and `key_count` (a
+number, or a function read once at prepare). `request` has `model`
+(`id`, `output_tokens`, `thinking_ceiling`, `context_window`), `system`,
+`messages`, `tools`, `thinking`, `fast`, `session_id` and `invocation`
+(`conversation_id`, `operation_id`, `attempt`, `purpose`, `agent_id`).
+`reason` is `cancelled`, `closed`, `compacted` or `rewound`; the host
+never uses an ended conversation id again. `emit(event)` takes
+`{ type = "text_delta", text }` and the other provider events, and
+returns false once the call is over. `stream` returns
+`{ message, usage, stop_reason }`. A failure returns nil plus an error:
+a table with `status`, `message` and optional `retry_after` seconds is
+an API error, anything else a retryable transport error. A raised error
+is not retried.
+
+**Parameters:**
+
+- `{spec}` (`table`) Provider definition (see above).
+
+**Example:**
+
+```lua
+maki.api.register_provider({
+  id = "echo",
+  display_name = "Echo",
+  models = { { id = "echo-1", tier = "strong" } },
+  prepare = function(ctx, model)
+    return {
+      stream = function(ctx, request, emit)
+        emit({ type = "text_delta", text = "hi" })
+        return {
+          message = { role = "assistant", content = { { type = "text", text = "hi" } } },
+          stop_reason = "end_turn",
+        }
+      end,
+    }
+  end,
+})
+```
+
 
 ## maki.perf {#maki-perf}
 
@@ -4165,8 +4233,9 @@ A streaming HTTP response from `maki.net.send`.
 
 `status` is the integer status code. `headers` is a table keyed by
 lowercase header name, with repeated headers joined by `", "`. Read
-the body with `:read()`. Closing or dropping the handle closes the
-connection once the next byte arrives from the server.
+the body with `:read()`. Closing or dropping the handle, or the end of
+the task that sent the request, closes the connection once the next
+byte arrives from the server.
 
 ---
 

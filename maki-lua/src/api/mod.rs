@@ -19,6 +19,7 @@ pub(crate) mod model;
 pub(crate) mod net;
 pub(crate) mod options;
 pub(crate) mod perf;
+pub(crate) mod provider;
 pub(crate) mod session;
 pub(crate) mod session_option;
 pub(crate) mod slot;
@@ -42,6 +43,7 @@ use mlua::{Lua, Result as LuaResult, Table, Value};
 
 use crate::api::keymap::PendingKeymapStore;
 use crate::api::options::PluginOpts;
+use crate::api::provider::PendingProviders;
 use crate::api::session_option::PendingSessionOptions;
 use crate::api::store::PendingStore;
 use crate::api::tool::{PendingRules, PendingTools};
@@ -64,6 +66,7 @@ pub(crate) struct PluginLoadContext {
     pub(crate) pending_slots: crate::api::slot::PendingSlotStore,
     pub(crate) pending_prompts: crate::runtime::PendingPromptHintCallbacks,
     pub(crate) pending_hint: crate::api::ui::PendingHintStore,
+    pub(crate) pending_providers: PendingProviders,
 }
 
 pub(crate) fn create_maki_global(
@@ -88,7 +91,7 @@ pub(crate) fn create_maki_global(
     lua.set_app_data(context.pending_slots.clone());
     slot::add_slot_methods(&api, lua, Arc::clone(&plugin))?;
     api.set("mode", mode::create_mode_table(lua)?)?;
-    maki.set("api", api)?;
+    maki.set("api", &api)?;
     maki.set("env", env::create_env_table(lua, permissions)?)?;
     maki.set("fs", fs::create_fs_table(lua, permissions)?)?;
     maki.set("log", log::create_log_table(lua, Arc::clone(&plugin))?)?;
@@ -98,7 +101,15 @@ pub(crate) fn create_maki_global(
     maki.set("image", image::create_image_table(lua)?)?;
     maki.set("json", json::create_json_table(lua)?)?;
     maki.set("yaml", yaml::create_yaml_table(lua)?)?;
-    maki.set("net", net::create_net_table(lua, permissions)?)?;
+    let net = net::create_net_table(lua, permissions)?;
+    provider::add_provider_fn(
+        &api,
+        lua,
+        context.pending_providers.clone(),
+        Arc::clone(&plugin),
+        net.get("send")?,
+    )?;
+    maki.set("net", net)?;
     maki.set("crypto", crypto::create_crypto_table(lua)?)?;
     maki.set("host", host::create_host_table(lua, permissions)?)?;
     maki.set("text", text::create_text_table(lua)?)?;

@@ -11,6 +11,7 @@ mod loader;
 pub mod orchestration;
 pub use runtime::current_managed_turn;
 pub(crate) mod plugin_permissions;
+mod provider;
 mod runtime;
 pub mod session_snapshot;
 mod splash;

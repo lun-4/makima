@@ -456,7 +456,8 @@ impl TitleSource for Message {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProviderEvent {
     TextDelta {
         text: String,
@@ -508,7 +509,7 @@ pub enum ConversationEnd {
     Rewound,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Display, IntoStaticStr)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Display, IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
@@ -865,7 +866,7 @@ impl ThinkingConfigExt for ThinkingConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct RequestOptions {
     pub thinking: ThinkingConfig,
     /// Raw user preference, reconciled by [`RequestOptions::clamped`] before use.
