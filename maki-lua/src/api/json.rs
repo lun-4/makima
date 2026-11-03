@@ -201,6 +201,23 @@ mod tests {
         assert_eq!(result, "test:3");
     }
 
+    // A file mtime in seconds; the default float parser misreads it by one
+    // ulp, so a cache keyed on it would never hit.
+    #[test]
+    fn float_roundtrips_exactly() {
+        let lua = lua_with_json();
+        let exact: bool = lua
+            .load(
+                r#"
+                local mtime = 1762000000.0246913
+                return json.decode(json.encode({ mtime = mtime })).mtime == mtime
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert!(exact);
+    }
+
     #[test]
     fn decode_array() {
         let lua = lua_with_json();
