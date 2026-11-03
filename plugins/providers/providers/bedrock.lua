@@ -169,12 +169,6 @@ function M.auth_status(ctx)
   return { state = "env", detail = STATUS_DETAIL .. " (" .. credentials.method .. ")" }
 end
 
-local function urlencode(text)
-  return (text:gsub("[^%w%-_%.~]", function(byte)
-    return string.format("%%%02X", string.byte(byte))
-  end))
-end
-
 local function has_examples(tools)
   for _, tool in ipairs(tools or {}) do
     if tool.input_examples ~= nil then
@@ -202,7 +196,7 @@ function M.build_request(request, region)
     body.anthropic_beta = betas
   end
   local base = env("ANTHROPIC_BEDROCK_BASE_URL") or string.format("https://bedrock-runtime.%s.amazonaws.com", region)
-  return base .. "/model/" .. urlencode(model_id) .. "/invoke-with-response-stream", body
+  return base .. "/model/" .. http.urlencode(model_id) .. "/invoke-with-response-stream", body
 end
 
 -- `YYYYMMDDTHHMMSSZ` for {secs}.

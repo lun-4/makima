@@ -1,7 +1,5 @@
 use crate::model::{ModelEntry, ModelFamily, ModelTier};
-use crate::providers::{
-    anthropic, aperture, custom, dynamic, google, llama_cpp, ollama, openai, vertex,
-};
+use crate::providers::{anthropic, aperture, custom, dynamic, google, llama_cpp, ollama, openai};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ProviderManifest {
@@ -46,17 +44,6 @@ const GOOGLE: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(65_536),
     fallback_context_window: 1_000_000,
     models: google::models(),
-};
-
-const VERTEX: ProviderManifest = ProviderManifest {
-    slug: "vertex",
-    display_name: "Google Vertex AI",
-    family: ModelFamily::Gemini,
-    supports_thinking: true,
-    accepts_arbitrary_models: true,
-    fallback_max_output: Some(65_536),
-    fallback_context_window: 1_000_000,
-    models: vertex::models(),
 };
 
 const OLLAMA: ProviderManifest = ProviderManifest {
@@ -114,19 +101,11 @@ const APERTURE: ProviderManifest = ProviderManifest {
     models: aperture::models(),
 };
 
-const BUILTINS: &[ProviderManifest] = &[
-    GOOGLE,
-    VERTEX,
-    OLLAMA,
-    LLAMA_CPP,
-    OPENCODE,
-    OPENCODE_GO,
-    APERTURE,
-];
+const BUILTINS: &[ProviderManifest] = &[OLLAMA, LLAMA_CPP, OPENCODE, OPENCODE_GO, APERTURE];
 
 /// Protocols the native gateways still route to after their provider moved
 /// to Lua. They resolve by slug but are not native providers themselves.
-const PROTOCOL_BASES: &[ProviderManifest] = &[ANTHROPIC, OPENAI];
+const PROTOCOL_BASES: &[ProviderManifest] = &[ANTHROPIC, OPENAI, GOOGLE];
 
 pub struct ManifestRegistry;
 

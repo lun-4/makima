@@ -1,3 +1,7 @@
+//! The Gemini generateContent client the native gateways (Aperture, dynamic
+//! and custom providers, the catalog) still route through. The `google` and
+//! `vertex` providers themselves are registered by `plugins/providers`.
+
 use crate::types::ThinkingConfigExt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -17,12 +21,11 @@ use crate::{
     StreamResponse, ThinkingConfig, TokenUsage,
 };
 
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, http_client, next_sse_line};
+use super::{ResolvedAuth, http_client, next_sse_line};
 
 const API_KEY_HEADER: &str = "x-goog-api-key";
 
 const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
-const ENV_VAR: &str = "GEMINI_API_KEY";
 const FLASH_MAX_THINKING: u32 = 24_576;
 const PRO_MAX_THINKING: u32 = 32_768;
 
@@ -36,18 +39,6 @@ fn max_thinking(model: &Model) -> u32 {
     };
     model.max_thinking_budget().map_or(cap, |m| m.min(cap))
 }
-
-inventory::submit!(maki_config::providers::BuiltInProvider {
-    slug: "google",
-    display_name: "Google",
-    protocol: maki_config::providers::Protocol::Google,
-    default_base_url: BASE_URL,
-    default_api_key_env: ENV_VAR,
-    default_model: "google/gemini-2.5-pro",
-    plans: None,
-    login_url: Some("https://aistudio.google.com/apikey"),
-    needs_url: false,
-});
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
     &[
@@ -102,53 +93,21 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
     ]
 }
 
-fn resolve_google_base_url() -> Option<String> {
-    let config = maki_config::providers::ProvidersConfig::load();
-    maki_config::providers::resolve_base_url("google", config.get("google"))
-}
-
-fn resolve_auth_from_key(key: &str, base_url: Option<String>) -> Result<ResolvedAuth, AgentError> {
-    Ok(
-        ResolvedAuth::new("google", vec![(API_KEY_HEADER.into(), key.to_string())])?
-            .with_base_url(base_url),
-    )
-}
-
 pub struct Google {
     client: HttpClient,
     auth: Arc<Mutex<ResolvedAuth>>,
-    key_pool: Option<KeyPool>,
     stream_timeout: Duration,
-    /// Env / `providers.toml` / inventory default, resolved once at construction.
-    /// Reused by key rotation / reload so they do not re-parse providers.toml.
-    resolved_base_url: Option<String>,
 }
 
 impl Google {
-    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::resolve("google", ENV_VAR)?;
-        let resolved_base_url = resolve_google_base_url();
-        let resolved = resolve_auth_from_key(pool.current(), resolved_base_url.clone())?;
-        Ok(Self {
-            client: http_client(timeouts),
-            auth: Arc::new(Mutex::new(resolved)),
-            key_pool: Some(pool),
-            stream_timeout: timeouts.stream,
-            resolved_base_url,
-        })
-    }
-
     pub(crate) fn with_auth(
         auth: Arc<Mutex<super::ResolvedAuth>>,
         timeouts: super::Timeouts,
     ) -> Self {
-        let resolved_base_url = auth.lock().unwrap().base_url.clone();
         Self {
             client: http_client(timeouts),
             auth,
-            key_pool: None,
             stream_timeout: timeouts.stream,
-            resolved_base_url,
         }
     }
 
@@ -166,7 +125,7 @@ impl Google {
         let auth = self.auth.lock().unwrap();
         auth.headers
             .iter()
-            .find(|(k, _)| k == "x-goog-api-key")
+            .find(|(k, _)| k == API_KEY_HEADER)
             .map(|(_, v)| v.clone())
             .unwrap_or_default()
     }
@@ -276,26 +235,9 @@ impl Provider for Google {
             Ok(infos)
         })
     }
-
-    fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
-        Box::pin(async {
-            let pool = KeyPool::resolve("google", ENV_VAR)?;
-            *self.auth.lock().unwrap() =
-                resolve_auth_from_key(pool.current(), self.resolved_base_url.clone())?;
-            Ok(())
-        })
-    }
 }
 
-impl NativeProvider for Google {
-    fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Raw(API_KEY_HEADER),
-        ))
-    }
-}
+impl NativeProvider for Google {}
 
 pub(crate) fn build_body(
     model: &Model,

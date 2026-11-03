@@ -19,10 +19,8 @@ use crate::providers::catalog::{
     OPENCODE_FAMILY_SLUGS, available_if_warm, catalog_providers, catalog_providers_if_available,
 };
 use crate::providers::dynamic;
-use crate::providers::google::Google;
 use crate::providers::local::{LLAMACPP, LocalEndpoint, OLLAMA};
 use crate::providers::opencode::Opencode;
-use crate::providers::vertex::Vertex;
 use crate::{
     AgentError, ConversationEnd, Invocation, Message, ProviderEvent, ProviderUsage, RequestOptions,
     StreamResponse,
@@ -38,8 +36,9 @@ pub enum ProviderKind {
     /// `openai` provider is registered from Lua.
     #[strum(serialize = "openai")]
     OpenAi,
+    /// Only the protocol base that Aperture routes and dynamic and custom
+    /// providers name. The `google` provider is registered from Lua.
     Google,
-    Vertex,
     Ollama,
     LlamaCpp,
     #[strum(serialize = "opencode")]
@@ -53,7 +52,6 @@ impl ProviderKind {
             Self::Anthropic => "Anthropic",
             Self::OpenAi => "OpenAI",
             Self::Google => "Google",
-            Self::Vertex => "Google Vertex AI",
             Self::Ollama => "Ollama",
             Self::LlamaCpp => "LlamaCpp",
             Self::Opencode => "Opencode Zen",
@@ -66,7 +64,6 @@ impl ProviderKind {
             Self::Anthropic => "ANTHROPIC_API_KEY",
             Self::OpenAi => "OPENAI_API_KEY",
             Self::Google => "GEMINI_API_KEY",
-            Self::Vertex => "",
             Self::Ollama => "OLLAMA_API_KEY",
             Self::LlamaCpp => "LLAMA_CPP_API_KEY",
             Self::Opencode => "OPENCODE_API_KEY",
@@ -79,7 +76,6 @@ impl ProviderKind {
             Self::Anthropic => "https://api.anthropic.com/v1/messages",
             Self::OpenAi => "https://api.openai.com/v1",
             Self::Google => "https://generativelanguage.googleapis.com/v1beta",
-            Self::Vertex => "https://aiplatform.googleapis.com/v1",
             Self::Ollama => "http://localhost:11434/v1",
             Self::LlamaCpp => "http://localhost:8080/v1",
             Self::Opencode => "https://opencode.ai/zen/v1",
@@ -93,9 +89,6 @@ impl ProviderKind {
                 Some("Prompt caching, thinking mode (adaptive/budgeted), advanced tool use")
             }
             Self::Google => Some("Native Gemini API with thinking support"),
-            Self::Vertex => {
-                Some("Native Vertex AI Gemini API using Application Default Credentials")
-            }
             Self::Ollama => {
                 Some("Local or remote inference via OLLAMA_HOST, cloud fallback via OLLAMA_API_KEY")
             }
@@ -116,7 +109,7 @@ impl ProviderKind {
         match self {
             Self::Anthropic => ModelFamily::Claude,
             Self::OpenAi => ModelFamily::Gpt,
-            Self::Google | Self::Vertex => ModelFamily::Gemini,
+            Self::Google => ModelFamily::Gemini,
             Self::Ollama => ModelFamily::Generic,
             Self::LlamaCpp => ModelFamily::Generic,
             Self::Opencode => ModelFamily::Generic,
@@ -132,7 +125,7 @@ impl ProviderKind {
         match self {
             Self::Anthropic => Some(128_000),
             Self::OpenAi => Some(100_000),
-            Self::Google | Self::Vertex => Some(65_536),
+            Self::Google => Some(65_536),
             Self::Ollama => Some(16_384),
             Self::LlamaCpp => None,
             Self::Opencode => Some(128_000),
@@ -144,7 +137,7 @@ impl ProviderKind {
         match self {
             Self::Anthropic => 200_000,
             Self::OpenAi => 200_000,
-            Self::Google | Self::Vertex => 1_000_000,
+            Self::Google => 1_000_000,
             Self::Ollama => 128_000,
             Self::LlamaCpp => 128_000,
             Self::Opencode => 256_000,
@@ -154,11 +147,9 @@ impl ProviderKind {
 
     pub(crate) fn create(self, timeouts: Timeouts) -> Result<Box<dyn NativeProvider>, AgentError> {
         match self {
-            Self::Anthropic | Self::OpenAi => Err(AgentError::Config {
+            Self::Anthropic | Self::OpenAi | Self::Google => Err(AgentError::Config {
                 message: format!("provider '{self}' is registered by the providers plugin"),
             }),
-            Self::Google => Ok(Box::new(Google::new(timeouts)?)),
-            Self::Vertex => Ok(Box::new(Vertex::new(timeouts)?)),
             Self::Ollama => Ok(Box::new(LocalEndpoint::new(&OLLAMA, timeouts)?)),
             Self::LlamaCpp => Ok(Box::new(LocalEndpoint::new(&LLAMACPP, timeouts)?)),
             Self::Opencode => Ok(Box::new(Opencode::new(timeouts)?)),
@@ -609,17 +600,20 @@ mod tests {
 
     #[test]
     fn available_specs_apply_model_policy() {
+        const PROVIDER: &str = "policy-test";
         let tmp = tempfile::tempdir().unwrap();
         maki_storage::paths::init_at(tmp.path().to_path_buf()).unwrap();
-        unsafe { std::env::set_var("GEMINI_API_KEY", "test-model-policy") };
-        let policy = policy(&["google/*"], &["*/gemini-2.5-flash"]);
+        let config: maki_config::providers::ProvidersConfig = toml::from_str(&format!(
+            "[{PROVIDER}]\nprotocol = \"openai\"\nbase_url = \"http://127.0.0.1:1/v1\"\napi_key = \"k\"\n\
+             models = [{{ id = \"kept\" }}, {{ id = \"denied\" }}]\n"
+        ))
+        .unwrap();
+        config.save().unwrap();
+        let policy = policy(&[&format!("{PROVIDER}/*")], &["*/denied"]);
 
         let specs = available_model_specs(&policy);
-        unsafe { std::env::remove_var("GEMINI_API_KEY") };
 
-        assert!(!specs.is_empty());
-        assert!(specs.iter().all(|spec| spec.starts_with("google/")));
-        assert!(!specs.iter().any(|spec| spec == "google/gemini-2.5-flash"));
+        assert_eq!(specs, [format!("{PROVIDER}/kept")]);
     }
 
     #[test]

@@ -10,6 +10,8 @@
 --   `models`: curated descriptors, each with optional `aliases`: ids that
 --   share the row. Unknown ids take the row with the longest matching prefix.
 --   `defaults`: descriptor fields every model starts from.
+--   `key_headers(key)`: the headers that carry a key, instead of a bearer
+--   `Authorization`.
 --   `max_tokens_field` (default `max_tokens`), `include_stream_usage`.
 --   `adjust(descriptor)`: returns the descriptor with model quirks applied.
 --   `encode(body, request, model)`: edits the request body; may return
@@ -188,12 +190,18 @@ function M.client(ctx, def, config)
   if not configured then
     return nil, header_err
   end
-  local pool = http.key_pool(keys)
-  local client = { base = M.base_url(def, config), pool = pool }
+  local client = { base = M.base_url(def, config), pool = http.key_pool(keys) }
   -- {extra} plus the key, with configured headers replacing any of them.
   function client.headers(extra)
     local headers = table.clone(extra or {})
-    headers.Authorization = "Bearer " .. pool.current()
+    local key = client.pool.current()
+    if def.key_headers then
+      for name, value in pairs(def.key_headers(key)) do
+        headers[name] = value
+      end
+    else
+      headers.Authorization = "Bearer " .. key
+    end
     for name, value in pairs(configured) do
       http.set_header(headers, name, value)
     end

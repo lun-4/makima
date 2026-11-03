@@ -208,17 +208,6 @@ local function expired(tokens)
   return type(tokens.expires) ~= "number" or now_ms() + REFRESH_MARGIN_MS >= tokens.expires
 end
 
-local function form(fields)
-  local parts = {}
-  for _, field in ipairs(fields) do
-    local value = field[2]:gsub("[^%w%-._~]", function(char)
-      return string.format("%%%02X", char:byte())
-    end)
-    parts[#parts + 1] = field[1] .. "=" .. value
-  end
-  return table.concat(parts, "&")
-end
-
 local function post(ctx, url, content_type, body)
   local response, err =
     http.send(ctx, { url = url, method = "POST", headers = { ["Content-Type"] = content_type }, body = body })
@@ -229,7 +218,7 @@ local function post(ctx, url, content_type, body)
 end
 
 local function token_grant(ctx, fields)
-  local value, err = post(ctx, M.TOKEN_URL, FORM_TYPE, form(fields))
+  local value, err = post(ctx, M.TOKEN_URL, FORM_TYPE, http.form(fields))
   if err then
     return nil, err
   end

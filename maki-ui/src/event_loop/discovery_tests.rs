@@ -16,9 +16,9 @@ use std::{
 };
 
 const TIMEOUT: Duration = Duration::from_secs(5);
-const RECENT: &str = "google/discovery-recent";
-const CATALOG: &str = "google/discovery-catalog";
-const API_KEY_ENV: &str = "GEMINI_API_KEY";
+const RECENT: &str = "llama-cpp/discovery-recent";
+const CATALOG: &str = "llama-cpp/discovery-catalog";
+const API_KEY_ENV: &str = "LLAMA_CPP_API_KEY";
 const FAILURE_RESPONSE: &[u8] =
     b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
@@ -46,7 +46,7 @@ fn assert_picker_usable(event_loop: &mut EventLoop<'_>) {
     picker.open(RECENT);
     let text = picker_text(event_loop);
     assert!(text.contains("Recent"), "{text}");
-    assert!(text.contains("Google"), "{text}");
+    assert!(text.contains("LlamaCpp"), "{text}");
     assert!(text.contains("discovery-recent"), "{text}");
     assert!(text.contains("discovery-catalog"), "{text}");
     for spec in [RECENT, CATALOG] {
@@ -69,7 +69,7 @@ fn refresh_keeps_catalog_and_recents_through_slow_provider_failure() {
     unsafe { std::env::set_var(API_KEY_ENV, "discovery-test-key") };
     let mut providers = ProvidersConfig::default();
     providers.upsert(
-        "google".into(),
+        "llama-cpp".into(),
         ProviderDef {
             base_url: Some(format!(
                 "http://{}",
@@ -89,7 +89,7 @@ fn refresh_keeps_catalog_and_recents_through_slow_provider_failure() {
             assert_eq!(stream.read(&mut byte).await.unwrap(), 1);
             request.push(byte[0]);
         }
-        assert!(request.starts_with(b"GET /models?"));
+        assert!(request.starts_with(b"GET /props?"));
         entered_tx.send_async(()).await.unwrap();
         if release_rx.recv_async().await.is_ok() {
             stream.write_all(FAILURE_RESPONSE).await.unwrap();
@@ -163,7 +163,7 @@ fn refresh_keeps_catalog_and_recents_through_slow_provider_failure() {
                 .warn_rx
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                 .unwrap();
-            if warning.starts_with("Google:") {
+            if warning.starts_with("LlamaCpp:") {
                 assert!(warning.contains("503"), "{warning}");
                 assert!(warning.contains("using static fallback"), "{warning}");
                 break;

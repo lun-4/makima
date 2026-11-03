@@ -114,6 +114,23 @@ function M.headers(id, base, configured)
   return result
 end
 
+-- Percent-encodes everything but RFC 3986 unreserved characters.
+function M.urlencode(text)
+  return (text:gsub("[^%w%-._~]", function(char)
+    return string.format("%%%02X", char:byte())
+  end))
+end
+
+-- An `application/x-www-form-urlencoded` body from ordered `{ name, value }`
+-- pairs.
+function M.form(fields)
+  local parts = {}
+  for _, field in ipairs(fields) do
+    parts[#parts + 1] = field[1] .. "=" .. M.urlencode(field[2])
+  end
+  return table.concat(parts, "&")
+end
+
 -- Seconds from a `Retry-After` header in delay-seconds form, if positive.
 function M.retry_after(response)
   local value = response.headers[RETRY_AFTER_HEADER]

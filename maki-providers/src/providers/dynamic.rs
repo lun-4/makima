@@ -555,11 +555,6 @@ pub(crate) fn create(
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
         ProviderKind::Google => Box::new(Google::with_auth(auth.clone(), timeouts)),
-        ProviderKind::Vertex => {
-            return Err(AgentError::Config {
-                message: "Vertex cannot be used as a dynamic provider base".into(),
-            });
-        }
         ProviderKind::Ollama => Box::new(
             LocalEndpoint::with_auth(&OLLAMA, auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),

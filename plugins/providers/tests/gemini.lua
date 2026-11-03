@@ -145,4 +145,78 @@ t.case("stream_merges_parts_and_ends_thinking", function()
   })
 end)
 
+t.case("tool_results_are_always_objects_and_unknown_names_fall_back", function()
+  local function response(content)
+    local contents = gemini.convert_messages({
+      { role = "user", content = { { type = "tool_result", tool_use_id = "missing", content = content } } },
+    })
+    return contents[1].parts[1].functionResponse
+  end
+  t.same(response("not json"), { name = "unknown", response = { result = "not json" } })
+  t.same(response('"a json string"').response, { result = "a json string" })
+  t.same(response("42").response, { result = 42 })
+  t.same(response("[1]").response, { result = { 1 } })
+  t.same(response('{"out":"ok"}').response, { out = "ok" })
+end)
+
+t.case("pasted_images_stay_in_their_turn", function()
+  local contents = gemini.convert_messages({
+    {
+      role = "user",
+      content = {
+        { type = "text", text = "what is this?" },
+        { type = "image", source = { media_type = "image/webp", data = "abc" } },
+      },
+    },
+  })
+  t.same(contents, {
+    {
+      role = "user",
+      parts = { { text = "what is this?" }, { inlineData = { mimeType = "image/webp", data = "abc" } } },
+    },
+  })
+end)
+
+t.case("additional_properties_are_stripped_at_every_depth", function()
+  local tools = gemini.convert_tools({
+    {
+      name = "t",
+      input_schema = {
+        type = "object",
+        additionalProperties = false,
+        properties = {
+          inner = { type = "object", additionalProperties = false, properties = { x = { type = "number" } } },
+          list = { type = "array", items = { type = "string", additionalProperties = false } },
+        },
+      },
+    },
+  })
+  t.same(tools[1], {
+    name = "t",
+    description = "",
+    parameters = {
+      type = "object",
+      properties = {
+        inner = { type = "object", properties = { x = { type = "number" } } },
+        list = { type = "array", items = { type = "string" } },
+      },
+    },
+  })
+end)
+
+t.case("stream_call_ids_signatures_and_max_tokens", function()
+  local call = { functionCall = { name = "bash", args = { cmd = "ls" }, thoughtSignature = "nested" } }
+  local result = assert(
+    gemini.stream(
+      sse({ parts(call, { functionCall = { name = "bash" } }), { candidates = { { finishReason = "MAX_TOKENS" } } } }),
+      t.recorder()
+    )
+  )
+  local first, second = result.message.content[1], result.message.content[2]
+  t.eq(first.thought_signature, "nested")
+  t.same(second.input, {})
+  assert(first.id ~= second.id, "parallel same-name calls need distinct ids")
+  t.eq(result.stop_reason, "max_tokens")
+end)
+
 t.report()

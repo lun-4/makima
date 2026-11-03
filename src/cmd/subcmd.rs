@@ -10,9 +10,8 @@ use maki_agent::mcp::{config as mcp_config, oauth as mcp_oauth};
 use maki_agent::tools::ToolRegistry;
 use maki_config::project::{self, ProjectConfig, TrustMode};
 use maki_config::providers::{
-    ProviderDef, ProvidersConfig, VERTEX_LOGIN_INSTRUCTIONS, all_builtins, builtin_provider,
-    resolve_api_key_env, resolve_base_url, resolve_default_model, resolve_display_name,
-    resolve_login_url, slugify,
+    ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
+    resolve_base_url, resolve_default_model, resolve_display_name, resolve_login_url, slugify,
 };
 use maki_config::{Config, load_env_files, load_permissions};
 use maki_lua::PluginHost;
@@ -78,7 +77,6 @@ pub fn auth_login(
 
 fn login_native(slug: &str, storage: &StateDir) -> Result<()> {
     match slug {
-        "vertex" => println!("{VERTEX_LOGIN_INSTRUCTIONS}"),
         CUSTOM_SLUG => login_custom(storage)?,
         slug => {
             if builtin_provider(slug).is_none()

@@ -38,41 +38,6 @@ The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discov
 
 ## Built-in Providers
 
-### Google
-
-- **Env var**: `GEMINI_API_KEY`
-- **API**: `https://generativelanguage.googleapis.com/v1beta`
-- **Features**: Native Gemini API with thinking support
-
-| Tier | Models | Pricing (in/out per 1M tokens) | Context |
-|------|--------|-------------------------------|---------|
-| Weak | **gemini-2.0-flash-lite** (default) | $0.07 / $0.30 | 1048K ctx / 65K out |
-| Medium | **gemini-2.5-flash** (default) | $0.15 / $0.60 | 1048K ctx / 65K out |
-| Strong | **gemini-2.5-pro** (default) | $1.25 / $5.00 | 1048K ctx / 65K out |
-
-Defaults: gemini-2.5-pro (strong), gemini-2.5-flash (medium), gemini-2.0-flash-lite (weak)
-
-### Google Vertex AI
-
-- **Env var**: `GOOGLE_CLOUD_PROJECT` plus Application Default Credentials (`GOOGLE_APPLICATION_CREDENTIALS` or `gcloud auth application-default login`); optional `GOOGLE_CLOUD_LOCATION`
-- **API**: `https://aiplatform.googleapis.com/v1`
-- **Features**: Native Vertex AI Gemini API using Application Default Credentials
-
-| Tier | Models | Pricing (in/out per 1M tokens) | Context |
-|------|--------|-------------------------------|---------|
-| Weak | **gemini-2.5-flash-lite** (default) | $0.10 / $0.40 | 1048K ctx / 65K out |
-| Weak | gemini-3.1-flash-lite | $0.25 / $1.50 | 1048K ctx / 65K out |
-| Weak | gemini-3.5-flash-lite | $0.30 / $2.50 | 1048K ctx / 65K out |
-| Medium | **gemini-2.5-flash** (default) | $0.30 / $2.50 | 1048K ctx / 65K out |
-| Medium | gemini-3-flash-preview | $0.50 / $3.00 | 1048K ctx / 65K out |
-| Medium | gemini-3.1-pro-preview | $2.00 / $12.00 | 1048K ctx / 65K out |
-| Medium | gemini-3.5-flash | $1.50 / $9.00 | 1048K ctx / 65K out |
-| Medium | gemini-3.6-flash, gemini-3.7-flash | $0.75 / $3.75 | 1048K ctx / 65K out |
-| Medium | gemini-3.8-flash | $0.75 / $3.75 | 500K ctx / 65K out |
-| Strong | **gemini-2.5-pro** (default) | $1.25 / $10.00 | 1048K ctx / 65K out |
-
-Defaults: gemini-2.5-pro (strong), gemini-2.5-flash (medium), gemini-2.5-flash-lite (weak)
-
 ### Ollama
 
 - **Env var**: `OLLAMA_HOST` for local/remote (e.g. `http://localhost:11434`), `OLLAMA_API_KEY` for auth

@@ -25,7 +25,6 @@ pub(crate) mod ollama;
 pub(crate) mod openai;
 pub(crate) mod openai_compat;
 pub mod opencode;
-pub(crate) mod vertex;
 
 const LOW_SPEED_BYTES_PER_SEC: u32 = 1;
 const UNMAPPED_SSE_ERROR_STATUS: u16 = 400;
