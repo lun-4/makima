@@ -2622,7 +2622,6 @@ mod tests {
             )),
             Err(maki_agent::ActorError::InstructionOverflow.to_string())
         );
-        session.release.send(()).unwrap();
         let results = session.end_input();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["is_error"], false);
