@@ -41,6 +41,8 @@ pub enum InteractionRequest {
         url: String,
         code: String,
     },
+    /// The frontend opens the URL in a browser and shows it, in case the
+    /// browser does not open.
     OpenBrowser(String),
 }
 

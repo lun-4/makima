@@ -333,7 +333,7 @@ mod tests {
     use test_case::test_case;
 
     const SAME_SIZED_LIST: &str = "a republished list of the same length is still a new list";
-    const SWAPPED_SPEC: &str = "zai/glm-5";
+    const SWAPPED_SPEC: &str = "ollama/glm-5";
 
     /// A provider that republishes the same number of specs has still changed
     /// the list. Comparing lengths calls that no change, and the picker goes on
@@ -362,7 +362,7 @@ mod tests {
         models.store(Some(Arc::new(vec![
             "anthropic/claude-sonnet-4-20250514".into(),
             "anthropic/claude-opus-4-6-20260101".into(),
-            "zai/glm-5".into(),
+            "ollama/glm-5".into(),
         ])));
         models
     }
@@ -468,7 +468,7 @@ mod tests {
         models.store(Some(Arc::new(vec![
             "anthropic/claude-sonnet-4-20250514".into(),
             "anthropic/claude-opus-4-6-20260101".into(),
-            "zai/glm-5".into(),
+            "ollama/glm-5".into(),
         ])));
         let _ = p.refresh();
 
@@ -484,7 +484,7 @@ mod tests {
         let models = test_models();
         let mut p = ModelPicker::new(models, Arc::default());
         p.set_recents(vec![
-            "zai/glm-5".into(),
+            "ollama/glm-5".into(),
             "anthropic/claude-sonnet-4-20250514".into(),
         ]);
         p.open("anthropic/claude-opus-4-6-20260101");
@@ -492,18 +492,18 @@ mod tests {
         p.picker.select(0);
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(
-            matches!(action, ModelPickerAction::Select(ref s) if s == "zai/glm-5"),
+            matches!(action, ModelPickerAction::Select(ref s) if s == "ollama/glm-5"),
             "first entry should be the most recent model",
         );
 
         p.set_recents(vec![
-            "zai/glm-5".into(),
+            "ollama/glm-5".into(),
             "anthropic/claude-sonnet-4-20250514".into(),
         ]);
-        p.open("zai/glm-5");
+        p.open("ollama/glm-5");
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(
-            matches!(action, ModelPickerAction::Select(ref s) if s == "zai/glm-5"),
+            matches!(action, ModelPickerAction::Select(ref s) if s == "ollama/glm-5"),
             "current model should be preselected in its provider section",
         );
     }
@@ -513,24 +513,24 @@ mod tests {
         let models = test_models();
         let mut p = ModelPicker::new(models, Arc::default());
         p.set_recents(vec![
-            "zai/glm-5".into(),
+            "ollama/glm-5".into(),
             "anthropic/claude-sonnet-4-20250514".into(),
         ]);
         p.open("anthropic/claude-sonnet-4-20250514");
         p.handle_key(key(KeyCode::Down));
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(
-            matches!(action, ModelPickerAction::Select(ref s) if s == "zai/glm-5"),
+            matches!(action, ModelPickerAction::Select(ref s) if s == "ollama/glm-5"),
             "selecting the provider entry should return its spec",
         );
 
-        p.open("zai/glm-5");
+        p.open("ollama/glm-5");
 
         let entry = p.picker.selected_item().expect("selection on reopen");
-        assert_eq!(entry.spec, "zai/glm-5");
+        assert_eq!(entry.spec, "ollama/glm-5");
         assert_eq!(
             entry.section(),
-            Some("Z.AI"),
+            Some("Ollama"),
             "selection should land on the provider entry, not the Recent copy",
         );
     }
@@ -540,7 +540,7 @@ mod tests {
         let models = test_models();
         let mut p = ModelPicker::new(models, Arc::default());
         p.set_recents(vec![
-            "zai/glm-5".into(),
+            "ollama/glm-5".into(),
             "anthropic/claude-sonnet-4-20250514".into(),
         ]);
         p.open("anthropic/claude-sonnet-4-20250514");
@@ -550,10 +550,10 @@ mod tests {
         let _ = p.refresh();
 
         let entry = p.picker.selected_item().expect("selection after refresh");
-        assert_eq!(entry.spec, "zai/glm-5");
+        assert_eq!(entry.spec, "ollama/glm-5");
         assert_eq!(
             entry.section(),
-            Some("Z.AI"),
+            Some("Ollama"),
             "selection should stay on the provider entry, not jump to Recent",
         );
     }
@@ -563,7 +563,7 @@ mod tests {
         let models = test_models();
         let mut p = ModelPicker::new(models.clone(), Arc::default());
         p.set_recents(vec![
-            "zai/glm-5".into(),
+            "ollama/glm-5".into(),
             "anthropic/claude-sonnet-4-20250514".into(),
         ]);
         p.open("anthropic/claude-sonnet-4-20250514");
@@ -577,7 +577,7 @@ mod tests {
         models.store(Some(Arc::new(vec![
             "anthropic/claude-sonnet-4-20250514".into(),
             "anthropic/claude-opus-4-6-20260101".into(),
-            "zai/glm-5".into(),
+            "ollama/glm-5".into(),
         ])));
         let _ = p.refresh();
 
@@ -595,7 +595,7 @@ mod tests {
         let models = test_models();
         let mut p = ModelPicker::new(models.clone(), Arc::default());
         p.set_recents(vec![
-            "zai/glm-5".into(),
+            "ollama/glm-5".into(),
             "anthropic/claude-sonnet-4-20250514".into(),
         ]);
         p.open("anthropic/claude-sonnet-4-20250514");
@@ -606,12 +606,12 @@ mod tests {
         models.store(Some(Arc::new(vec![
             "anthropic/claude-sonnet-4-20250514".into(),
             "anthropic/claude-opus-4-6-20260101".into(),
-            "zai/glm-5".into(),
+            "ollama/glm-5".into(),
         ])));
         let _ = p.refresh();
 
         let entry = p.picker.selected_item().expect("selection after arrival");
-        assert_eq!(entry.spec, "zai/glm-5");
+        assert_eq!(entry.spec, "ollama/glm-5");
         assert_eq!(
             entry.section(),
             Some("Recent"),
@@ -624,7 +624,7 @@ mod tests {
         let models = test_models();
         let mut p = ModelPicker::new(models.clone(), Arc::default());
         p.set_recents(vec![
-            "zai/glm-5".into(),
+            "ollama/glm-5".into(),
             "anthropic/claude-sonnet-4-20250514".into(),
         ]);
         p.open("anthropic/claude-sonnet-4-20250514");
@@ -637,12 +637,12 @@ mod tests {
         models.store(Some(Arc::new(vec![
             "anthropic/claude-sonnet-4-20250514".into(),
             "anthropic/claude-opus-4-6-20260101".into(),
-            "zai/glm-5".into(),
+            "ollama/glm-5".into(),
         ])));
         let _ = p.refresh();
 
         let entry = p.picker.selected_item().expect("selection after refresh");
-        assert_eq!(entry.spec, "zai/glm-5");
+        assert_eq!(entry.spec, "ollama/glm-5");
         assert_eq!(entry.section(), Some("Recent"));
     }
 }

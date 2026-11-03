@@ -1,4 +1,5 @@
 use std::env;
+use std::io;
 use std::iter;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -244,6 +245,8 @@ pub struct LoginPicker {
     login: Option<LoginTask>,
     /// Notices from the provider's login, shown until the picker closes.
     notes: Vec<String>,
+    /// Opens a URL in the user's browser; tests swap in one that does not.
+    browser: fn(&str) -> io::Result<()>,
 }
 
 /// Native providers a frontend logs in to itself, skipping any the registry
@@ -330,7 +333,17 @@ fn native_choice(id: &str, label: &str, section: Option<&str>, state: AuthState)
     }
 }
 
+fn open_in_browser(url: &str) -> io::Result<()> {
+    open::that_detached(url)
+}
+
 impl LoginPicker {
+    fn open_browser(&self, url: &str) {
+        if let Err(error) = (self.browser)(url) {
+            tracing::warn!(%error, url, "failed to open browser");
+        }
+    }
+
     pub fn new(providers: Arc<ProviderRegistry>, storage: StateDir) -> Self {
         Self {
             step: Step::Closed,
@@ -339,6 +352,7 @@ impl LoginPicker {
             native: Vec::new(),
             login: None,
             notes: Vec::new(),
+            browser: open_in_browser,
         }
     }
 
@@ -413,7 +427,10 @@ impl LoginPicker {
                     InteractionRequest::DeviceCode { url, code } => {
                         format!("Open {url} and enter code {code}")
                     }
-                    InteractionRequest::OpenBrowser(url) => format!("Opening {url}"),
+                    InteractionRequest::OpenBrowser(url) => {
+                        self.open_browser(&url);
+                        format!("Opening {url}")
+                    }
                 };
                 self.notes.push(note);
                 let _ = reply.send(String::new());
@@ -787,9 +804,8 @@ impl LoginPicker {
             } => {
                 if custom.is_none()
                     && let Some(url) = providers::resolve_login_url(&slug, plan.as_deref())
-                    && let Err(e) = open::that(&url)
                 {
-                    tracing::warn!(error = %e, url, "failed to open browser");
+                    self.open_browser(&url);
                 }
                 self.step = Step::EnterKey {
                     input: TextBuffer::new(String::new()),
@@ -814,13 +830,7 @@ impl LoginPicker {
                 LoginPickerAction::Consumed
             }
             StepAction::GoCodex { display_name } => {
-                if let Err(e) = open::that(openai_auth::CODEX_DEVICE_URL) {
-                    tracing::warn!(
-                        error = %e,
-                        url = openai_auth::CODEX_DEVICE_URL,
-                        "failed to open codex browser"
-                    );
-                }
+                self.open_browser(openai_auth::CODEX_DEVICE_URL);
                 let (tx, rx) = flume::unbounded();
                 let abort = Arc::new(AtomicBool::new(false));
                 let thread_abort = abort.clone();
@@ -1291,7 +1301,10 @@ mod tests {
             let registry = host.provider_registry(Timeouts::default()).unwrap();
             let storage = StateDir::from_path(state.path().to_path_buf());
             Self {
-                picker: LoginPicker::new(registry, storage.clone()),
+                picker: LoginPicker {
+                    browser: no_browser,
+                    ..LoginPicker::new(registry, storage.clone())
+                },
                 _host: host,
                 storage,
                 _state: state,
@@ -1322,8 +1335,13 @@ mod tests {
         let registry = Arc::new(ProviderRegistry::new(Vec::new(), Timeouts::default()));
         LoginPicker {
             step,
+            browser: no_browser,
             ..LoginPicker::new(registry, StateDir::from_path(env::temp_dir()))
         }
+    }
+
+    fn no_browser(_: &str) -> io::Result<()> {
+        Ok(())
     }
 
     fn ctrl(c: char) -> KeyEvent {

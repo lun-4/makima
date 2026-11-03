@@ -4,10 +4,12 @@ use std::time::{Duration, Instant};
 
 use futures_lite::future;
 use maki_agent::tools::ToolRegistry;
+use maki_config::providers::{ProviderDef, ProvidersConfig};
 use maki_lua::PluginHost;
 use maki_providers::{
     AgentError, ContentBlock, ConversationEnd, Invocation, InvocationPurpose, Message,
     PreparedProvider, ProviderEvent, ProviderRegistry, RequestOptions, Role, StopReason, Timeouts,
+    UsageLimit, UsageWindow,
 };
 use serde_json::json;
 use test_case::test_case;
@@ -47,6 +49,21 @@ const TOP_LEVEL_ERR: &str = "may only be called at the top level during plugin l
 const CALL_LOG: &str =
     "c-cancelled:cancelled,c-closed:closed,c-compacted:compacted,c-rewound:rewound,rotate";
 const KEY_COUNT: usize = 3;
+const CONFIGURED_URL: &str = "http://configured.invalid";
+const FIVE_HOURS: u64 = 5;
+const USED_PERCENT: u32 = 70;
+const CONFIG_SOURCE: &str = r#"
+    maki.api.register_provider({
+        id = "fake",
+        display_name = "Fake Provider",
+        discover = function(ctx, config)
+            return { { id = config.base_url } }
+        end,
+        prepare = function(ctx, model, config)
+            return { stream = function() end }, { id = model.id, context_window = #config.base_url }
+        end,
+    })
+"#;
 
 fn host() -> PluginHost {
     PluginHost::new(Arc::new(ToolRegistry::new())).unwrap()
@@ -422,6 +439,73 @@ fn optional_methods_dispatch_with_their_arguments() {
         .unwrap()
         .unwrap();
     assert_eq!(usage.plan.as_deref(), Some(CALL_LOG));
+}
+
+#[test]
+fn prepare_and_discover_read_the_provider_config_at_call_time() {
+    let state = tempfile::tempdir().unwrap();
+    maki_storage::paths::init_at(state.path().to_path_buf()).unwrap();
+    let host = host();
+    host.load_source(PLUGIN, CONFIG_SOURCE).unwrap();
+    let providers = registry(&host);
+    let mut config = ProvidersConfig::default();
+    config.upsert(
+        PROVIDER.into(),
+        ProviderDef {
+            base_url: Some(CONFIGURED_URL.into()),
+            ..ProviderDef::default()
+        },
+    );
+    config.save().unwrap();
+
+    let mut batches = Vec::new();
+    smol::block_on(bounded(
+        providers.fetch_all(&Default::default(), |batch| batches.extend(batch.models)),
+    ));
+    let spec = format!("{PROVIDER}/{CONFIGURED_URL}");
+    assert!(batches.contains(&spec), "{batches:?}");
+
+    let model = providers.model(&spec).unwrap();
+    let prepared = smol::block_on(bounded(providers.prepare(model))).unwrap();
+    assert_eq!(prepared.model.id, CONFIGURED_URL);
+    assert_eq!(prepared.model.context_window as usize, CONFIGURED_URL.len());
+}
+
+#[test]
+fn usage_limits_decode_from_lua_shapes() {
+    let (_host, prepared) = prepare_fake(&format!(
+        r#"return {{
+            stream = function() end,
+            fetch_usage = function()
+                return {{ limits = {{
+                    {{ kind = {{ Hours = {FIVE_HOURS} }}, percentage = {USED_PERCENT} }},
+                    {{ kind = {{ Weekly = {{}} }} }},
+                    {{ kind = "Credits", detail = "$1" }},
+                }} }}
+            end,
+        }}"#
+    ));
+    let usage = smol::block_on(bounded(prepared.provider.fetch_usage()))
+        .unwrap()
+        .unwrap();
+    let kinds: Vec<&UsageWindow> = usage.limits.iter().map(|limit| &limit.kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            &UsageWindow::Hours(FIVE_HOURS),
+            &UsageWindow::Weekly { model: None },
+            &UsageWindow::Credits,
+        ]
+    );
+    assert_eq!(
+        usage.limits[0],
+        UsageLimit {
+            kind: UsageWindow::Hours(FIVE_HOURS),
+            percentage: Some(USED_PERCENT),
+            reset_at: None,
+            detail: None,
+        }
+    );
 }
 
 #[test]

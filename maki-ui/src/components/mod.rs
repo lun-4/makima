@@ -461,6 +461,7 @@ pub(crate) fn test_model() -> maki_providers::Model {
         supports_vision_override: Some(true),
         supports_fast_override: None,
         pricing: test_pricing(),
+        pricing_schedule: None,
         max_output_tokens: Some(8192),
         turn_output_tokens: None,
         context_window: TEST_CONTEXT_WINDOW,

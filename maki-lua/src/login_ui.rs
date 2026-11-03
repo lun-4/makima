@@ -9,7 +9,7 @@ use maki_providers::AgentError;
 use maki_providers::login::{ChoiceOption, InteractionRequest, InteractionService};
 use mlua::{Lua, LuaSerdeExt, Result as LuaResult, UserDataRef, Value as LuaValue};
 
-use crate::api::host::open_url;
+use crate::api::net::parse_http_url;
 use crate::api::util::pair::{Pair, pair, try_pair};
 
 pub(crate) struct LoginUi {
@@ -110,8 +110,8 @@ async fn device_code(
     Ok(notify(this, InteractionRequest::DeviceCode { url, code }).await)
 }
 
-/// Show {url} and open it in the user's browser, like `maki.host.open`. The
-/// URL stays on screen in case the browser does not open. Returns at once.
+/// Ask the frontend to open {url} in the user's browser. It also shows the
+/// URL, in case the browser does not open. Returns at once.
 ///
 /// @param url string An `http` or `https` URL.
 /// @return (boolean?, string?) true, or nil plus an error.
@@ -119,12 +119,8 @@ async fn device_code(
 /// ui:open_browser("https://example.com/keys")
 #[lua_fn]
 async fn open_browser(_lua: Lua, this: UserDataRef<LoginUi>, url: String) -> LuaResult<Pair<bool>> {
-    let (shown, error) = notify(this, InteractionRequest::OpenBrowser(url.clone())).await;
-    if shown.is_none() {
-        return Ok((None, error));
-    }
-    try_pair!(open_url(&url).await);
-    Ok((Some(true), None))
+    try_pair!(parse_http_url(&url));
+    Ok(notify(this, InteractionRequest::OpenBrowser(url)).await)
 }
 
 lua_class! {

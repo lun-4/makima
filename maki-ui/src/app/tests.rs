@@ -43,8 +43,8 @@ const SETTLE_POLL: Duration = Duration::from_millis(1);
 const TASK_ID: &str = "task1";
 const SUB_TOOL_ID: &str = "sub_t1";
 const TOOL_OUTPUT_LINE: &str = "hello from the subagent";
-const LATE_MODEL_SPEC: &str = "zai/glm-5";
-const MODEL_SPEC_GLM4: &str = "zai/glm-4";
+const LATE_MODEL_SPEC: &str = "ollama/glm-5";
+const MODEL_SPEC_GLM4: &str = "ollama/glm-4";
 const MODEL_SPEC_GPT9: &str = "openai/gpt-9";
 const HINT_PLUGIN: &str = "statusline";
 const HINT_TEXT: &str = "2/4 staged";
@@ -6858,7 +6858,7 @@ fn plan_model_picker_stages_without_switching(row: bool) {
     // process, which rewrite the model, recents and prefs this test pins.
     let (_tmp, _dir, _writer, mut app) = tempdir_app();
     let models = install_model_slot(&mut app);
-    const MODEL: &str = "zai/glm-5";
+    const MODEL: &str = "ollama/glm-5";
     models.store(Some(Arc::new(vec![MODEL.into()])));
     set_root_mode(&mut app, Mode::Plan);
     app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
@@ -6940,7 +6940,7 @@ enum BlockingSurface {
 #[test_case(BlockingSurface::Btw ; "btw")]
 #[test_case(BlockingSurface::Float ; "float")]
 fn plan_picker_yields_to_blocking_overlay(surface: BlockingSurface) {
-    const MODEL: &str = "zai/glm-5";
+    const MODEL: &str = "ollama/glm-5";
     let (mut app, models) = app_with_model_slot();
     models.store(Some(Arc::new(vec![MODEL.into()])));
     set_root_mode(&mut app, Mode::Plan);
@@ -7022,7 +7022,7 @@ fn plan_form_yields_escape_to_blocking_modal(btw: bool) {
 fn plan_mode_exit_clears_staging_and_picker(mode: &str) {
     let mut app = plan_app();
     app.plan_form
-        .set_implementation_model("zai/glm-5".into(), &app.root_config().model.spec());
+        .set_implementation_model("ollama/glm-5".into(), &app.root_config().model.spec());
     app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
     set_root_mode(&mut app, Mode::from_id(mode));
     assert_eq!(app.plan_form.implementation_model(), None);
@@ -7053,7 +7053,7 @@ fn model_picker_without_target_initializes_from_root(plan: bool) {
 
 #[test]
 fn normal_model_picker_still_requests_model_change() {
-    const MODEL: &str = "zai/glm-5";
+    const MODEL: &str = "ollama/glm-5";
     let (mut app, models) = app_with_model_slot();
     models.store(Some(Arc::new(vec![MODEL.into()])));
     app.run_builtin(BuiltinAction::ModelPicker);
@@ -7068,7 +7068,7 @@ fn normal_model_picker_still_requests_model_change() {
 fn plan_approval_pending_blocks_edits_and_requests_cancellation() {
     let mut app = plan_app();
     app.plan_form
-        .set_implementation_model("zai/glm-5".into(), &app.root_config().model.spec());
+        .set_implementation_model("ollama/glm-5".into(), &app.root_config().model.spec());
     app.update(Msg::Key(key(KeyCode::Down)));
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(app.plan_approval_pending);
@@ -7084,7 +7084,7 @@ fn plan_approval_pending_blocks_edits_and_requests_cancellation() {
         [Action::CancelPlanApproval]
     ));
     assert!(app.plan_approval_pending);
-    assert_eq!(app.plan_form.implementation_model(), Some("zai/glm-5"));
+    assert_eq!(app.plan_form.implementation_model(), Some("ollama/glm-5"));
     assert!(app.state.plan.is_ready());
 }
 
@@ -7112,7 +7112,7 @@ fn plan_form_renders_effective_implementation_model(staged: bool) {
     let initial_height = app
         .plan_form
         .height(RENDER_AREA.width, &app.focused_model_spec());
-    const MODEL: &str = "zai/glm-5";
+    const MODEL: &str = "ollama/glm-5";
     if staged {
         app.plan_form
             .set_implementation_model(MODEL.into(), &app.focused_model_spec());
@@ -9747,10 +9747,10 @@ fn seed_models(backend: &maki_lua::TestCompletionBackend, models: &[&str]) {
 fn at_m_prefix_lists_models() {
     let (_tmp, mut app, backend) = completion_app();
     app.available_models.store(Some(Arc::new(vec![
-        "zai/glm-5".into(),
+        "ollama/glm-5".into(),
         "anthropic/claude".into(),
     ])));
-    seed_models(&backend, &["zai/glm-5", "anthropic/claude"]);
+    seed_models(&backend, &["ollama/glm-5", "anthropic/claude"]);
     for c in "@m:".chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
     }
@@ -9767,7 +9767,7 @@ fn at_m_prefix_lists_models() {
         .collect();
     assert_eq!(
         specs,
-        vec!["zai/glm-5".to_string(), "anthropic/claude".to_string()]
+        vec!["ollama/glm-5".to_string(), "anthropic/claude".to_string()]
     );
 }
 
@@ -9789,8 +9789,8 @@ fn mixed_list_includes_skills_subagents_and_models() {
     seed_skill(&backend, "review");
     seed_subagents(&backend, "build");
     app.available_models
-        .store(Some(Arc::new(vec!["zai/glm-5".into()])));
-    seed_models(&backend, &["zai/glm-5"]);
+        .store(Some(Arc::new(vec!["ollama/glm-5".into()])));
+    seed_models(&backend, &["ollama/glm-5"]);
     app.update(Msg::Key(key(KeyCode::Char('@'))));
     let deadline = Instant::now() + Duration::from_secs(5);
     let items = loop {
@@ -9848,13 +9848,13 @@ fn submit_expands_subagent_model_and_skill_in_place() {
 fn submit_standalone_model_expands_in_place_no_action() {
     let (_tmp, mut app, backend) = completion_app();
     bind_root(&mut app, parked_root());
-    seed_models(&backend, &["zai/glm-5"]);
+    seed_models(&backend, &["ollama/glm-5"]);
     // No ChangeModel: the `@model` path no longer switches the session model.
     assert!(matches!(
-        app.submit_prompt(queued_msg("@model:zai/glm-5 fix the bug")),
+        app.submit_prompt(queued_msg("@model:ollama/glm-5 fix the bug")),
         SubmitOutcome::Started(actions) if actions.is_empty()
     ));
-    assert_eq!(root_submissions(&app), ["<model:zai/glm-5> fix the bug"]);
+    assert_eq!(root_submissions(&app), ["<model:ollama/glm-5> fix the bug"]);
 }
 
 #[test]

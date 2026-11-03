@@ -205,108 +205,6 @@ This provider talks the OpenAI-compatible `/v1` API, so it also works with llama
 
 Connects to any OpenAI-compatible `/v1` endpoint. Point `LLAMA_CPP_HOST` to your server address (defaults to `http://localhost:8080`).
 
-### Mistral
-
-- **Env var**: `MISTRAL_API_KEY`
-- **API**: `https://api.mistral.ai/v1`
-
-| Tier | Models | Pricing (in/out per 1M tokens) | Context |
-|------|--------|-------------------------------|---------|
-| Weak | **ministral-14b-latest, ministral-14b-2512** (default) | $0.20 / $0.20 | 262K ctx |
-| Medium | **mistral-small-latest, mistral-small-2603** (default) | $0.15 / $0.60 | 262K ctx |
-| Strong | **mistral-medium-latest, mistral-medium-3.5, mistral-medium-3-5, mistral-medium-2604** (default) | $1.50 / $7.50 | 262K ctx |
-| Strong | glm-5-2, zai-glm-5-2 | $1.40 / $4.40 | 1000K ctx |
-
-Defaults: mistral-medium-latest (strong), mistral-small-latest (medium), ministral-14b-latest (weak)
-
-### Z.AI
-
-- **Env var**: `ZHIPU_API_KEY` (shared across both endpoints)
-- **API endpoints**:
-  - `https://api.z.ai/api/paas/v4`
-  - `https://api.z.ai/api/coding/paas/v4`
-
-| Tier | Models | Pricing (in/out per 1M tokens) | Context |
-|------|--------|-------------------------------|---------|
-| Weak | glm-5.3-flash | $0.15 / $0.50 | 1000K ctx / 131K out |
-| Weak | **glm-4.7-flash** (default) | $0.00 / $0.00 | 200K ctx / 131K out |
-| Weak | glm-4.5-flash | $0.00 / $0.00 | 131K ctx / 98K out |
-| Weak | glm-4.5-air | $0.20 / $1.10 | 131K ctx / 98K out |
-| Medium | **glm-4.7, glm-4.6** (default) | $0.60 / $2.20 | 200K ctx / 131K out |
-| Medium | glm-4.5 | $0.60 / $2.20 | 131K ctx / 98K out |
-| Strong | **glm-5-code** (default) | $1.20 / $5.00 | 200K ctx / 131K out |
-| Strong | glm-5.3 | $1.40 / $4.40 | 1000K ctx / 131K out |
-| Strong | glm-5.2 | $1.00 / $3.20 | 1000K ctx / 131K out |
-| Strong | glm-5.1, glm-5 | $1.00 / $3.20 | 200K ctx / 131K out |
-
-Defaults: glm-5-code (strong), glm-4.7-flash (weak), glm-4.7 (medium)
-
-### DeepSeek
-
-- **Env var**: `DEEPSEEK_API_KEY`
-- **API**: `https://api.deepseek.com`
-- **Features**: Thinking mode toggle (on/off), open-weight models
-- **Peak pricing**: the prices below are off-peak; each turn is billed as it happens, at 2x during 01:00-04:00, 06:00-10:00 UTC, Mon-Fri
-
-| Tier | Models | Pricing (in/out per 1M tokens) | Context |
-|------|--------|-------------------------------|---------|
-| Medium | **deepseek-v4-flash** (default) | $0.22 / $0.66 | 1000K ctx / 384K out |
-| Strong | **deepseek-v4-pro** (default) | $0.66 / $1.98 | 1000K ctx / 384K out |
-
-Defaults: deepseek-v4-flash (medium), deepseek-v4-pro (strong)
-
-### OpenRouter
-
-- **Env var**: `OPENROUTER_API_KEY`
-- **API**: `https://openrouter.ai/api/v1`
-- **Features**: 300+ models from all providers, prompt caching, provider routing
-
-OpenRouter aggregates models from many providers behind a single API key. Browse available models at [openrouter.ai/models](https://openrouter.ai/models). Use any model ID directly (e.g. `openrouter/anthropic/claude-sonnet-4`).
-
-### Requesty
-
-- **Env var**: `REQUESTY_API_KEY`
-- **API**: `https://router.requesty.ai/v1`
-- **Features**: 700+ models behind one key, curated managed routing policies, EU region via `REQUESTY_BASE_URL`
-
-Requesty routes across 700+ models with one key, including managed routing policies (e.g. `requesty/claude-sonnet-4-5`) and the full `<vendor>/<model>` catalog (e.g. `requesty/openai/gpt-4o-mini`). Get a key at [app.requesty.ai/api-keys](https://app.requesty.ai/api-keys). Set `REQUESTY_BASE_URL=https://router.eu.requesty.ai/v1` to keep all traffic in the EU.
-
-### Synthetic
-
-- **Env var**: `SYNTHETIC_API_KEY`
-- **API**: `https://api.synthetic.new/openai/v1`
-- **Features**: Reasoning effort support (low/medium/high), open-weight models
-
-| Tier | Models | Pricing (in/out per 1M tokens) | Context |
-|------|--------|-------------------------------|---------|
-| Weak | **hf:zai-org/GLM-4.7-Flash** (default) | $0.10 / $0.50 | 200K ctx / 131K out |
-| Medium | **hf:deepseek-ai/DeepSeek-V3.2** (default) | $0.56 / $1.68 | 200K ctx / 131K out |
-| Strong | **hf:moonshotai/Kimi-K2.5** (default) | $0.45 / $3.40 | 200K ctx / 131K out |
-
-Defaults: hf:moonshotai/Kimi-K2.5 (strong), hf:deepseek-ai/DeepSeek-V3.2 (medium), hf:zai-org/GLM-4.7-Flash (weak)
-
-### Regolo
-
-- **Env var**: `REGOLO_API_KEY`
-- **API**: `https://api.regolo.ai/v1`
-- **Features**: EU-hosted open-weight models with tool calling. The catalogue and prices are listed live from the API
-
-| Tier | Models | Pricing (in/out per 1M tokens) | Context |
-|------|--------|-------------------------------|---------|
-| Weak | **qwen3.5-9b** (default) | $0.07 / $0.35 | 80K ctx / 80K out |
-| Medium | **qwen3-coder-next** (default) | $0.50 / $2.00 | 120K ctx / 120K out |
-| Strong | **qwen3.5-122b** (default) | $1.00 / $4.20 | 120K ctx / 120K out |
-
-Defaults: qwen3.5-122b (strong), qwen3-coder-next (medium), qwen3.5-9b (weak)
-
-### TensorX
-
-- **Env var**: `TENSORX_API_KEY`
-- **API**: `https://api.tensorx.ai/v1`
-- **Features**: Open-weight models, zero data retention, prompt caching
-
-No hardcoded model catalog. Use any model ID supported by this provider.
-
 ### Opencode Zen
 
 - **Env var**: `OPENCODE_API_KEY`
@@ -466,26 +364,7 @@ Makima sends `/v1` (or `/v1beta` for Gemini routes, nothing for Anthropic and Z.
 
 ### Plans
 
-Some built-ins ship multiple plans (different base URLs or default models). `makima auth login <provider>` asks which plan to use when more than one exists. You can also set it in TOML:
-
-```toml
-[mistral]
-plan = "coding"
-
-[zai]
-plan = "coding"
-```
-
-Current plans:
-
-| Provider | Plan | What it does |
-|----------|------|--------------|
-| Mistral | `standard` | Standard at `https://api.mistral.ai/v1`, default `mistral/mistral-medium-latest` |
-| Mistral | `coding` | Vibe / Coding at `https://api.mistral.ai/v1`, default `mistral/mistral-vibe-cli-latest` |
-| Z.AI | `standard` | Pay-as-you-go at `https://api.z.ai/api/paas/v4`, default `zai/glm-5.1` |
-| Z.AI | `coding` | Coding plan at `https://api.z.ai/api/coding/paas/v4`, default `zai/glm-5-code` |
-
-Env `<SLUG>_BASE_URL` still wins over both the plan and a `base_url` in this file.
+No built-in currently ships more than one plan.
 
 ## Dynamic Providers
 
@@ -502,7 +381,7 @@ To add a custom provider or proxy, drop an executable script into the config `pr
 
 `resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
 
-The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `requesty`, `synthetic`, `regolo`, `tensorx`, `opencode`, `aperture`.
+The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `opencode`, `aperture`.
 
 If your provider serves models not in the base catalog, add a `models` subcommand returning:
 

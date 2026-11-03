@@ -18,6 +18,7 @@ use serde_json::Value;
 
 use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model_registry;
+use crate::pricing::PricingSchedule;
 use crate::providers::catalog::{self, CatalogMeta};
 use crate::providers::{anthropic, custom, dynamic};
 use crate::types::ThinkingFields;
@@ -68,6 +69,9 @@ pub struct ModelInfo {
     pub max_output_tokens: Option<u32>,
     #[serde(default)]
     pub pricing: Option<ModelPricing>,
+    /// Scales `pricing` by the wall clock, for providers with peak hours.
+    #[serde(default)]
+    pub pricing_schedule: Option<PricingSchedule>,
     #[serde(default)]
     pub supports_thinking: Option<bool>,
     #[serde(default)]
@@ -377,6 +381,7 @@ pub struct Model {
     pub supports_vision_override: Option<bool>,
     pub supports_fast_override: Option<FastSupport>,
     pub pricing: ModelPricing,
+    pub pricing_schedule: Option<PricingSchedule>,
     /// What the model declares it can generate, `None` when unknown (see
     /// [`ProviderKind::fallback_max_output`]). Stays the same across requests,
     /// because [`Self::max_thinking_budget`] scales effort levels off it.
@@ -433,6 +438,7 @@ impl Model {
             supports_vision_override: None,
             supports_fast_override: None,
             pricing,
+            pricing_schedule: None,
             max_output_tokens,
             turn_output_tokens: None,
             context_window,
@@ -464,6 +470,7 @@ impl Model {
                 }
             }),
             pricing: info.pricing.clone().unwrap_or_default(),
+            pricing_schedule: info.pricing_schedule.clone(),
             max_output_tokens: info.max_output_tokens,
             turn_output_tokens: None,
             context_window: info.context_window.unwrap_or(UNKNOWN_CONTEXT_WINDOW),
@@ -488,6 +495,7 @@ impl Model {
             supports_vision_override: meta.supports_vision,
             supports_fast_override: None,
             pricing: meta.pricing.unwrap_or_default(),
+            pricing_schedule: None,
             max_output_tokens: Some(max_output_tokens),
             turn_output_tokens: None,
             context_window,
@@ -611,15 +619,18 @@ impl Model {
 
     /// What the provider charges right now, so it is only ever correct for a
     /// turn that just finished: under a
-    /// [`PricingSchedule`](crate::pricing::PricingSchedule) the answer moves
+    /// [`PricingSchedule`] the answer moves
     /// with the clock. Anything historical wants [`Self::list_cost`].
     ///
     /// `None` on an unpriced model (oauth, local), so callers can hide the cost
     /// instead of showing a misleading "$0.000".
     pub fn billed_cost(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
         let cost = self.list_cost(usage, fast)?;
-        let schedule = ManifestRegistry::for_slug(&self.provider).and_then(|m| m.pricing_schedule);
-        Some(schedule.map_or(cost, |s| cost * s.multiplier_at(Timestamp::now())))
+        Some(
+            self.pricing_schedule
+                .as_ref()
+                .map_or(cost, |s| cost * s.multiplier_at(Timestamp::now())),
+        )
     }
 
     /// The quoted rates, with no wall-clock surcharge. Deterministic, which is
@@ -873,6 +884,7 @@ impl AddAssign for TokenUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use test_case::test_case;
 
     fn warm_empty_catalog() -> std::sync::MutexGuard<'static, ()> {
@@ -908,10 +920,9 @@ mod tests {
     /// Declaration index of `Compaction`, which a derived `Ord` would read as
     /// the strongest tier.
     const COMPACTION_DECLARED_LAST: u8 = 3;
-    /// The only builtin whose rates move with the wall clock.
-    const SCHEDULED_PROVIDERS: [&str; 1] = ["deepseek"];
-    const DEEPSEEK_SPEC: &str = "deepseek/deepseek-v4-pro";
-    const UNPRICED_DEEPSEEK_SPEC: &str = "deepseek/my-custom-model";
+    const SCHEDULED_PROVIDER: &str = "scheduled";
+    const SCHEDULED_MODEL: &str = "peak-priced";
+    const SCHEDULED_INPUT_RATE: f64 = 0.66;
     const MILLION: u32 = 1_000_000;
     const INPUT_ONLY: TokenUsage = TokenUsage {
         input: MILLION,
@@ -1299,11 +1310,8 @@ mod tests {
     }
 
     #[test_case("anthropic/claude-99-turbo", "anthropic", "claude-99-turbo" ; "unknown_anthropic_model_accepted")]
-    #[test_case("zai/glm-99", "zai", "glm-99" ; "unknown_zai_model_accepted")]
     #[test_case("openai/gpt-99", "openai", "gpt-99" ; "unknown_openai_model_accepted")]
-    #[test_case("synthetic/hf:nonexistent", "synthetic", "hf:nonexistent" ; "unknown_synthetic_model_accepted")]
     #[test_case("ollama/my-custom-model", "ollama", "my-custom-model" ; "unknown_ollama_model_accepted")]
-    #[test_case("deepseek/my-custom-model", "deepseek", "my-custom-model" ; "unknown_deepseek_model_accepted")]
     fn unknown_model_accepted(spec: &str, expected_slug: &str, expected_id: &str) {
         let model = Model::from_spec(spec).unwrap();
         assert_eq!(model.provider, Arc::<str>::from(expected_slug));
@@ -1337,12 +1345,8 @@ mod tests {
     #[test_case("openai/gpt-5.4",                   true  ; "gpt")]
     #[test_case("google/gemini-2.5-pro",            true  ; "gemini")]
     #[test_case("copilot/claude-opus-4.7",          true  ; "copilot_entry_beats_generic_family")]
-    #[test_case("zai/glm-5-code",                   false ; "glm_code_text_only")]
-    #[test_case("deepseek/deepseek-v4-pro",         false ; "deepseek_text_only")]
-    #[test_case("mistral/mistral-medium-latest",    true  ; "mistral_medium")]
-    #[test_case("mistral/ministral-14b-latest",     false ; "ministral_text_only")]
     #[test_case("anthropic/claude-nonexistent-99",  true  ; "unknown_model_uses_family_fallback")]
-    #[test_case("deepseek/my-custom-model",         false ; "unknown_generic_defaults_off")]
+    #[test_case("ollama/my-custom-model",           false ; "unknown_generic_defaults_off")]
     fn vision_resolved_from_entry_or_family(spec: &str, expected: bool) {
         assert_eq!(Model::from_spec(spec).unwrap().supports_vision(), expected);
     }
@@ -1412,19 +1416,19 @@ mod tests {
         use crate::model::ModelInfo;
 
         model_registry::set_known_models(
-            "synthetic",
+            "google",
             vec![
                 ModelInfo {
-                    supports_vision: Some(true),
-                    ..ModelInfo::id_only("syn:test-vision".into())
+                    supports_vision: Some(false),
+                    ..ModelInfo::id_only("gem:test-blind".into())
                 },
-                ModelInfo::id_only("syn:test-blind".into()),
+                ModelInfo::id_only("gem:test-family".into()),
             ],
         );
 
         let vision = |id| Model::from_spec(id).unwrap().supports_vision();
-        assert!(vision("synthetic/syn:test-vision"));
-        assert!(!vision("synthetic/syn:test-blind"));
+        assert!(!vision("google/gem:test-blind"));
+        assert!(vision("google/gem:test-family"));
     }
 
     #[test]
@@ -1455,28 +1459,31 @@ mod tests {
         assert_eq!(wrapped.context_window, expected_window);
     }
 
-    /// A schedule hung on the wrong manifest silently doubles every turn of a
-    /// provider that bills flat.
-    #[test]
-    fn only_deepseek_bills_by_the_clock() {
-        let scheduled: Vec<&str> = ManifestRegistry::builtins()
-            .iter()
-            .filter(|m| m.pricing_schedule.is_some())
-            .map(|m| m.slug)
-            .collect();
-        assert_eq!(scheduled, SCHEDULED_PROVIDERS);
+    /// A descriptor quoting off-peak rates with a peak-hours schedule.
+    fn scheduled_model(input_rate: Option<f64>) -> Model {
+        let pricing = input_rate.map(
+            |input| json!({"input": input, "output": 0.0, "cache_write": 0.0, "cache_read": 0.0}),
+        );
+        let info: ModelInfo = serde_json::from_value(json!({
+            "id": SCHEDULED_MODEL,
+            "pricing": pricing,
+            "pricing_schedule": {
+                "windows": [{"start": 1, "end": 4}, {"start": 6, "end": 10}],
+                "weekdays_only": true,
+                "multiplier": 2.0,
+            },
+        }))
+        .unwrap();
+        Model::from_info(SCHEDULED_PROVIDER, &info)
     }
 
-    /// Nothing else pins the wiring: a real DeepSeek model has to pick the
-    /// schedule up out of its manifest, and `list_cost` has to stay out of it.
+    /// `list_cost` stays out of the schedule, `billed_cost` applies it.
     /// `billed_cost` reads the real clock, so the expectation is sampled either
     /// side of the call in case the hour ticks over mid-test.
     #[test]
-    fn deepseek_bills_its_peak_surcharge_on_top_of_the_table() {
-        let model = Model::from_spec(DEEPSEEK_SPEC).unwrap();
-        let schedule = ManifestRegistry::for_slug(&model.provider)
-            .and_then(|m| m.pricing_schedule)
-            .expect("deepseek bills by the clock");
+    fn a_scheduled_model_bills_its_peak_surcharge_on_top_of_the_table() {
+        let model = scheduled_model(Some(SCHEDULED_INPUT_RATE));
+        let schedule = model.pricing_schedule.as_ref().unwrap();
 
         let list = model.list_cost(&INPUT_ONLY, false).unwrap();
         let table_price = f64::from(INPUT_ONLY.input) * model.pricing.input / PER_MILLION;
@@ -1500,7 +1507,7 @@ mod tests {
     /// and any multiple of nothing is still nothing.
     #[test]
     fn unpriced_models_stay_unpriced_under_a_schedule() {
-        let model = Model::from_spec(UNPRICED_DEEPSEEK_SPEC).unwrap();
+        let model = scheduled_model(None);
         assert!(model.pricing.is_zero());
         assert_eq!(model.list_cost(&INPUT_ONLY, false), None);
         assert_eq!(model.billed_cost(&INPUT_ONLY, false), None);

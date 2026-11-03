@@ -607,7 +607,7 @@ mod tests {
 
     #[test_case(None, &dialect::STANDARD, None; "no_thinking_config")]
     #[test_case(Some(ThinkingConfig::Off), &dialect::STANDARD, None; "off_omitted")]
-    #[test_case(Some(ThinkingConfig::Off), &dialect::TENSORX, Some(json!({"effort": "none"})); "off_explicit")]
+    #[test_case(Some(ThinkingConfig::Off), &EffortDialect { off: Some(dialect::OFF), ..dialect::STANDARD }, Some(json!({"effort": "none"})); "off_explicit")]
     #[test_case(Some(ThinkingConfig::Adaptive), &dialect::ANTHROPIC_ADAPTIVE, Some(json!({"summary": "auto"})); "native_adaptive")]
     #[test_case(Some(ThinkingConfig::Adaptive), &dialect::STANDARD, Some(json!({"effort": "medium", "summary": "auto"})); "adaptive_effort")]
     #[test_case(Some(ThinkingConfig::Effort(Effort::High)), &dialect::STANDARD, Some(json!({"effort": "high", "summary": "auto"})); "explicit_effort")]

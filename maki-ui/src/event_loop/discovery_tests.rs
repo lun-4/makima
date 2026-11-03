@@ -16,8 +16,9 @@ use std::{
 };
 
 const TIMEOUT: Duration = Duration::from_secs(5);
-const RECENT: &str = "mistral/discovery-recent";
-const CATALOG: &str = "mistral/discovery-catalog";
+const RECENT: &str = "openai/discovery-recent";
+const CATALOG: &str = "openai/discovery-catalog";
+const API_KEY_ENV: &str = "OPENAI_API_KEY";
 const FAILURE_RESPONSE: &[u8] =
     b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
@@ -45,7 +46,7 @@ fn assert_picker_usable(event_loop: &mut EventLoop<'_>) {
     picker.open(RECENT);
     let text = picker_text(event_loop);
     assert!(text.contains("Recent"), "{text}");
-    assert!(text.contains("Mistral"), "{text}");
+    assert!(text.contains("OpenAI"), "{text}");
     assert!(text.contains("discovery-recent"), "{text}");
     assert!(text.contains("discovery-catalog"), "{text}");
     for spec in [RECENT, CATALOG] {
@@ -64,11 +65,12 @@ fn refresh_keeps_catalog_and_recents_through_slow_provider_failure() {
     paths::init_at(root.path().to_path_buf()).unwrap();
     std::fs::write(root.path().join("models-dev-catalog.json"), "{}").unwrap();
     let listener = Async::new(TcpListener::bind(("127.0.0.1", 0)).unwrap()).unwrap();
+    // SAFETY: nextest runs each test in its own process.
+    unsafe { std::env::set_var(API_KEY_ENV, "discovery-test-key") };
     let mut providers = ProvidersConfig::default();
     providers.upsert(
-        "mistral".into(),
+        "openai".into(),
         ProviderDef {
-            api_key: Some("discovery-test-key".into()),
             base_url: Some(format!(
                 "http://{}",
                 listener.get_ref().local_addr().unwrap()
@@ -161,7 +163,7 @@ fn refresh_keeps_catalog_and_recents_through_slow_provider_failure() {
                 .warn_rx
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                 .unwrap();
-            if warning.starts_with("Mistral:") {
+            if warning.starts_with("OpenAI:") {
                 assert!(warning.contains("503"), "{warning}");
                 assert!(warning.contains("using static fallback"), "{warning}");
                 break;

@@ -106,6 +106,11 @@ struct TerminalInteraction;
 impl InteractionService for TerminalInteraction {
     fn interact(&self, request: InteractionRequest) -> BoxFuture<'_, Result<String, AgentError>> {
         Box::pin(smol::unblock(move || {
+            if let InteractionRequest::OpenBrowser(url) = &request
+                && let Err(error) = open::that_detached(url)
+            {
+                tracing::warn!(%error, url, "failed to open browser");
+            }
             terminal_interact(request, &mut io::stdin().lock(), &mut io::stdout())
         }))
     }

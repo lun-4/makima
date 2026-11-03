@@ -329,8 +329,8 @@ mod tests {
     const DISCOVERY_FAILURE: &str = "listing failed";
     const APERTURE_HOST_ENV: &str = "APERTURE_HOST";
     const APERTURE_HOST: &str = "https://example.com";
-    /// Routed through aperture, it inherits zai's thinking support.
-    const ROUTED_SPEC: &str = "aperture/zai/glm-5.2";
+    /// Routed through aperture, it inherits anthropic's thinking support.
+    const ROUTED_SPEC: &str = "aperture/anthropic/claude-sonnet-4-5";
 
     struct FakeBackend {
         discovered: Option<Result<Vec<ModelInfo>, String>>,

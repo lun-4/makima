@@ -394,22 +394,6 @@ fn build_sections() -> Vec<ProviderSection> {
 
     for kind in ProviderKind::iter() {
         match kind {
-            ProviderKind::Zai => {
-                sections.push(ProviderSection {
-                    kind: ProviderKind::Zai,
-                    name: "Z.AI",
-                    auth_line: format!(
-                        "{} (shared across both endpoints)",
-                        format_auth(ProviderKind::Zai)
-                    ),
-                    urls: vec![
-                        ProviderKind::Zai.base_url(),
-                        "https://api.z.ai/api/coding/paas/v4",
-                    ],
-                    features: ProviderKind::Zai.features(),
-                    entries: ManifestRegistry::get("zai").unwrap().models,
-                });
-            }
             ProviderKind::OpenAi => {
                 sections.push(ProviderSection {
                     kind,
@@ -513,19 +497,6 @@ fn no_catalog_note(kind: ProviderKind) -> &'static str {
             "Aperture discovers models from your gateway. Set `APERTURE_HOST` to your Tailscale Aperture \
              endpoint (e.g. `https://your-host.tailnet.ts.net`). No API key needed, Tailscale handles auth."
         }
-        ProviderKind::OpenRouter => {
-            "OpenRouter aggregates models from many providers behind a single API key. \
-             Browse available models at [openrouter.ai/models](https://openrouter.ai/models). \
-             Use any model ID directly (e.g. `openrouter/anthropic/claude-sonnet-4`)."
-        }
-        ProviderKind::Requesty => {
-            "Requesty routes across 700+ models with one key, including managed \
-             routing policies (e.g. `requesty/claude-sonnet-4-5`) and the full \
-             `<vendor>/<model>` catalog (e.g. `requesty/openai/gpt-4o-mini`). \
-             Get a key at [app.requesty.ai/api-keys](https://app.requesty.ai/api-keys). \
-             Set `REQUESTY_BASE_URL=https://router.eu.requesty.ai/v1` to keep all \
-             traffic in the EU."
-        }
         _ => "No hardcoded model catalog. Use any model ID supported by this provider.",
     }
 }
@@ -545,16 +516,6 @@ fn write_section(out: &mut String, section: &ProviderSection) {
 
     if let Some(features) = section.features {
         let _ = writeln!(out, "- **Features**: {features}");
-    }
-
-    // Rendered from the schedule, so the docs cannot drift from what we bill.
-    if let Some(schedule) = ManifestRegistry::get(&section.kind.to_string())
-        .and_then(|manifest| manifest.pricing_schedule)
-    {
-        let _ = writeln!(
-            out,
-            "- **Peak pricing**: the prices below are off-peak; each turn is billed as it happens, at {schedule}"
-        );
     }
 
     let _ = writeln!(out);

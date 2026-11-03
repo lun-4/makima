@@ -13,12 +13,21 @@ export type Pricing = {
   fast: { input: number, output: number }?,
 }
 
+-- Scales `pricing` inside whole-hour UTC windows (`start` inclusive, `end`
+-- exclusive); `multiplier` must exceed 1.
+export type PricingSchedule = {
+  windows: { { start: number, ["end"]: number } },
+  weekdays_only: boolean?,
+  multiplier: number,
+}
+
 -- Absent fields stay unknown.
 export type ModelDescriptor = {
   id: string,
   context_window: number?,
   max_output_tokens: number?,
   pricing: Pricing?,
+  pricing_schedule: PricingSchedule?,
   supports_thinking: boolean?,
   requires_thinking: boolean?,
   supports_vision: boolean?,
@@ -181,8 +190,12 @@ export type Provider = {
     detail: string?,
   })?,
   logout: ((ctx: Context) -> ())?,
-  discover: ((ctx: Context) -> ({ ModelDescriptor }?, Error?))?,
-  prepare: (ctx: Context, model: ModelDescriptor) -> (Instance?, ModelDescriptor | Error | nil),
+  discover: ((ctx: Context, config: { [string]: Json }) -> ({ ModelDescriptor }?, Error?))?,
+  prepare: (
+    ctx: Context,
+    model: ModelDescriptor,
+    config: { [string]: Json }
+  ) -> (Instance?, ModelDescriptor | Error | nil),
 }
 
 return nil

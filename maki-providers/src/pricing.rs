@@ -13,6 +13,7 @@ use jiff::Timestamp;
 use jiff::civil::Weekday;
 use jiff::tz::Offset;
 use maki_storage::sessions::StoredTokenUsage;
+use serde::{Deserialize, Serialize};
 
 use crate::model::{Model, TokenUsage};
 use crate::registry::ProviderRegistry;
@@ -20,38 +21,37 @@ use crate::registry::ProviderRegistry;
 const HOURS_PER_DAY: u8 = 24;
 /// Multiplier of a provider that bills the same rate around the clock.
 pub(crate) const FLAT_RATE: f64 = 1.0;
+const NO_WINDOWS_ERR: &str = "a schedule with no windows never applies; drop it instead";
+const NO_SURCHARGE_ERR: &str =
+    "descriptors quote the off-peak rates, so a schedule multiplier must be above 1";
+const OUTSIDE_DAY_ERR: &str = "lies outside the day";
+const EMPTY_WINDOW_ERR: &str = "covers no time at all";
+const WRAPPING_WEEKDAYS_ERR: &str =
+    "wraps past midnight, which a weekdays-only schedule cannot bill";
 
 /// Rates that move with the wall clock. DeepSeek doubles everything during its
-/// peak UTC hours, so model tables quote the off-peak rates and the provider's
-/// schedule scales the bill inside its windows. The next price change is then a
-/// constant edit instead of new code.
+/// peak UTC hours, so its model descriptors quote the off-peak rates and carry
+/// this schedule, which scales the bill inside its windows.
 ///
 /// One multiplier is enough while providers move all four rates together.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "ScheduleFields")]
 pub struct PricingSchedule {
-    windows: &'static [PricingWindow],
+    windows: Vec<PricingWindow>,
     weekdays_only: bool,
     multiplier: f64,
 }
 
 /// Half-open `[start, end)` in whole UTC hours. `start > end` wraps past
 /// midnight, so a window never needs splitting in two.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PricingWindow {
     start: u8,
     end: u8,
 }
 
 impl PricingWindow {
-    /// `hours(22, 2)` wraps past midnight. Every window is a `const`, so a typo
-    /// here is a build error rather than a mispriced turn.
-    pub const fn hours(start: u8, end: u8) -> Self {
-        assert!(start < HOURS_PER_DAY, "window starts after the day ends");
-        assert!(end <= HOURS_PER_DAY, "window ends after the day ends");
-        assert!(start != end, "window covers no time at all");
-        Self { start, end }
-    }
-
     fn contains(&self, hour: u8) -> bool {
         if self.start < self.end {
             hour >= self.start && hour < self.end
@@ -68,38 +68,45 @@ impl fmt::Display for PricingWindow {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScheduleFields {
+    windows: Vec<PricingWindow>,
+    #[serde(default)]
+    weekdays_only: bool,
+    multiplier: f64,
+}
+
+impl TryFrom<ScheduleFields> for PricingSchedule {
+    type Error = String;
+
+    fn try_from(fields: ScheduleFields) -> Result<Self, String> {
+        if fields.windows.is_empty() {
+            return Err(NO_WINDOWS_ERR.into());
+        }
+        if fields.multiplier.is_nan() || fields.multiplier <= FLAT_RATE {
+            return Err(NO_SURCHARGE_ERR.into());
+        }
+        for window in &fields.windows {
+            if window.start >= HOURS_PER_DAY || window.end > HOURS_PER_DAY {
+                return Err(format!("window {window} {OUTSIDE_DAY_ERR}"));
+            }
+            if window.start == window.end {
+                return Err(format!("window {window} {EMPTY_WINDOW_ERR}"));
+            }
+            if fields.weekdays_only && window.start > window.end {
+                return Err(format!("window {window} {WRAPPING_WEEKDAYS_ERR}"));
+            }
+        }
+        Ok(Self {
+            windows: fields.windows,
+            weekdays_only: fields.weekdays_only,
+            multiplier: fields.multiplier,
+        })
+    }
+}
+
 impl PricingSchedule {
-    pub const fn new(windows: &'static [PricingWindow], multiplier: f64) -> Self {
-        assert!(
-            !windows.is_empty(),
-            "a schedule with no windows never applies; drop it instead"
-        );
-        assert!(
-            multiplier > FLAT_RATE,
-            "model tables quote the off-peak rates, so a schedule only ever adds a surcharge"
-        );
-        Self {
-            windows,
-            weekdays_only: false,
-            multiplier,
-        }
-    }
-
-    /// Keeps the surcharge off Saturday and Sunday, the way DeepSeek words its
-    /// peak hours.
-    pub const fn weekdays_only(mut self) -> Self {
-        let mut i = 0;
-        while i < self.windows.len() {
-            assert!(
-                self.windows[i].start < self.windows[i].end,
-                "a wrapping window leaves its tail on the next day, which no run of weekdays can bill"
-            );
-            i += 1;
-        }
-        self.weekdays_only = true;
-        self
-    }
-
     /// DeepSeek publishes the days in UTC next to the hours, so the UTC weekday
     /// is the rule itself and not an approximation. Their Chinese page words it
     /// as Monday to Friday 09:00-18:00 Beijing, the same instants on the same
@@ -203,11 +210,10 @@ mod tests {
     const SECONDS_PER_DAY: i64 = HOURS_PER_DAY as i64 * SECONDS_PER_HOUR;
     const PEAK: f64 = 2.0;
     const DAYS_SINCE_EPOCH: i64 = 20_000;
-    const PEAK_WINDOWS: &[PricingWindow] =
-        &[PricingWindow::hours(1, 4), PricingWindow::hours(6, 10)];
-    const WRAPPING_WINDOW: &[PricingWindow] = &[PricingWindow::hours(22, 2)];
-    const UNTIL_MIDNIGHT_WINDOW: &[PricingWindow] = &[PricingWindow::hours(22, HOURS_PER_DAY)];
-    const WHOLE_DAY_WINDOW: &[PricingWindow] = &[PricingWindow::hours(0, HOURS_PER_DAY)];
+    const PEAK_WINDOWS: &[(u8, u8)] = &[(1, 4), (6, 10)];
+    const WRAPPING_WINDOW: &[(u8, u8)] = &[(22, 2)];
+    const UNTIL_MIDNIGHT_WINDOW: &[(u8, u8)] = &[(22, HOURS_PER_DAY)];
+    const WHOLE_DAY_WINDOW: &[(u8, u8)] = &[(0, HOURS_PER_DAY)];
     const LAST_MINUTE: i64 = 59;
     const LAST_SECOND: i64 = 59;
 
@@ -224,7 +230,18 @@ mod tests {
     /// [`ONE_MILLION`] input tokens at [`FAST_INPUT_RATE`].
     const FAST_LIST_PRICE: f64 = 12.0;
     /// A real spec, so the bare-id fallback runs against the real tables.
-    const SCHEDULED_SPEC: &str = "deepseek/deepseek-v4-pro";
+    const NATIVE_SPEC: &str = "anthropic/claude-sonnet-4-5";
+
+    fn schedule(windows: &[(u8, u8)], weekdays_only: bool) -> Result<PricingSchedule, String> {
+        PricingSchedule::try_from(ScheduleFields {
+            windows: windows
+                .iter()
+                .map(|&(start, end)| PricingWindow { start, end })
+                .collect(),
+            weekdays_only,
+            multiplier: PEAK,
+        })
+    }
 
     fn utc(day: i64, hour: i64, minute: i64, second: i64) -> Timestamp {
         Timestamp::from_second(
@@ -247,6 +264,7 @@ mod tests {
                 input: input_rate,
                 ..ModelPricing::ZERO
             },
+            pricing_schedule: None,
             max_output_tokens: None,
             turn_output_tokens: None,
             context_window: 0,
@@ -288,13 +306,13 @@ mod tests {
     #[test_case(WHOLE_DAY_WINDOW, 0, 0, 0, PEAK                      ; "whole_day_starts_at_midnight")]
     #[test_case(WHOLE_DAY_WINDOW, 23, LAST_MINUTE, LAST_SECOND, PEAK ; "whole_day_never_leaves_peak")]
     fn windows_price_by_the_utc_clock(
-        windows: &'static [PricingWindow],
+        windows: &[(u8, u8)],
         hour: i64,
         minute: i64,
         second: i64,
         expected: f64,
     ) {
-        let schedule = PricingSchedule::new(windows, PEAK);
+        let schedule = schedule(windows, false).unwrap();
         for day in [DAYS_SINCE_EPOCH, -DAYS_SINCE_EPOCH] {
             assert_eq!(
                 schedule.multiplier_at(utc(day, hour, minute, second)),
@@ -312,7 +330,7 @@ mod tests {
     #[test_case("2024-01-07T07:00:00Z", FLAT_RATE ; "sunday_inside_the_same_window")]
     #[test_case("2024-01-01T12:00:00Z", FLAT_RATE ; "monday_outside_every_window")]
     fn a_weekdays_only_schedule_leaves_the_weekend_alone(at: &str, expected: f64) {
-        let schedule = PricingSchedule::new(PEAK_WINDOWS, PEAK).weekdays_only();
+        let schedule = schedule(PEAK_WINDOWS, true).unwrap();
         let at = at.parse().expect("a valid timestamp");
         assert_eq!(schedule.multiplier_at(at), expected);
     }
@@ -320,18 +338,28 @@ mod tests {
     #[test]
     fn schedules_render_the_hours_and_days_they_bill() {
         assert_eq!(
-            PricingSchedule::new(PEAK_WINDOWS, PEAK).to_string(),
+            schedule(PEAK_WINDOWS, false).unwrap().to_string(),
             "2x during 01:00-04:00, 06:00-10:00 UTC"
         );
         assert_eq!(
-            PricingSchedule::new(PEAK_WINDOWS, PEAK)
-                .weekdays_only()
-                .to_string(),
+            schedule(PEAK_WINDOWS, true).unwrap().to_string(),
             "2x during 01:00-04:00, 06:00-10:00 UTC, Mon-Fri"
         );
         assert_eq!(
-            PricingSchedule::new(WRAPPING_WINDOW, PEAK).to_string(),
+            schedule(WRAPPING_WINDOW, false).unwrap().to_string(),
             "2x during 22:00-02:00 UTC"
+        );
+    }
+
+    #[test_case(&[], false, NO_WINDOWS_ERR ; "no_windows")]
+    #[test_case(&[(24, 2)], false, OUTSIDE_DAY_ERR ; "starts_after_the_day")]
+    #[test_case(&[(3, 3)], false, EMPTY_WINDOW_ERR ; "empty_window")]
+    #[test_case(&[(22, 2)], true, WRAPPING_WEEKDAYS_ERR ; "wrapping_weekdays")]
+    fn invalid_schedules_are_rejected(windows: &[(u8, u8)], weekdays_only: bool, error: &str) {
+        assert!(
+            schedule(windows, weekdays_only)
+                .unwrap_err()
+                .contains(error)
         );
     }
 
@@ -424,7 +452,7 @@ mod tests {
     /// `current`'s rates leaking through.
     #[test]
     fn bare_ids_resolve_against_the_current_provider() {
-        let current = Model::from_spec(SCHEDULED_SPEC).unwrap();
+        let current = Model::from_spec(NATIVE_SPEC).unwrap();
         let sibling_id = ManifestRegistry::for_slug(&current.provider)
             .expect("a builtin provider")
             .models

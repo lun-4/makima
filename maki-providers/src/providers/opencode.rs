@@ -32,7 +32,6 @@ const EMPTY_USAGE_ERROR: &str =
 
 static CATALOG_CHAT_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "opencode",
-    api_key_env: "",
     base_url: "",
     max_tokens_field: "max_tokens",
     include_stream_usage: true,

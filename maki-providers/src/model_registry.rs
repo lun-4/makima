@@ -355,20 +355,20 @@ mod tests {
     fn curated_provider_ignores_discovered_tiers() {
         let mut reg = ModelRegistry::default();
         reg.set_known_models(
-            "synthetic",
+            "anthropic",
             vec![ModelInfo {
                 tier: Some(ModelTier::Strong),
-                ..ModelInfo::id_only("syn:large:vision".into())
+                ..ModelInfo::id_only("claude-large-vision".into())
             }],
         );
 
         assert_ne!(
-            reg.tier_for("synthetic/syn:large:vision", "synthetic", None),
+            reg.tier_for("anthropic/claude-large-vision", "anthropic", None),
             ModelTier::Strong
         );
         assert_ne!(
-            reg.spec_for_tier("synthetic", ModelTier::Strong),
-            Some("synthetic/syn:large:vision".into())
+            reg.spec_for_tier("anthropic", ModelTier::Strong),
+            Some("anthropic/claude-large-vision".into())
         );
     }
 

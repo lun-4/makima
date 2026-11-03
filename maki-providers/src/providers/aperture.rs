@@ -14,17 +14,9 @@ use crate::{AgentError, Invocation, Message, ProviderEvent, RequestOptions, Stre
 use maki_storage::id::SessionRef;
 
 use super::anthropic::Anthropic;
-use super::deepseek::DeepSeek;
 use super::google::Google;
 use super::local::{LLAMACPP, LocalEndpoint, OLLAMA};
-use super::mistral::Mistral;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::openrouter::OpenRouter;
-use super::regolo::Regolo;
-use super::requesty::Requesty;
-use super::synthetic::Synthetic;
-use super::tensorx::TensorX;
-use super::zai::Zai;
 use super::{ResolvedAuth, Timeouts};
 
 const HOST_ENV: &str = "APERTURE_HOST";
@@ -35,7 +27,6 @@ const GEMINI_PATH_PREFIX: &str = "/v1beta";
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "aperture",
-    api_key_env: "",
     base_url: "",
     max_tokens_field: "max_tokens",
     include_stream_usage: true,
@@ -123,15 +114,7 @@ fn compat_kind(kind: ProviderKind) -> Option<ProviderKind> {
         ProviderKind::Anthropic
         | ProviderKind::Google
         | ProviderKind::Ollama
-        | ProviderKind::LlamaCpp
-        | ProviderKind::Mistral
-        | ProviderKind::Zai
-        | ProviderKind::DeepSeek
-        | ProviderKind::OpenRouter
-        | ProviderKind::Requesty
-        | ProviderKind::Synthetic
-        | ProviderKind::Regolo
-        | ProviderKind::TensorX => Some(kind),
+        | ProviderKind::LlamaCpp => Some(kind),
         _ => None,
     }
 }
@@ -164,28 +147,18 @@ fn kind_supports_thinking(kind: ProviderKind) -> bool {
 /// request path to the upstream's configured base url. The prefix therefore
 /// follows the API format the request uses: `/v1` for OpenAI chat (and for the
 /// generic gateway path), `/v1beta` for Gemini. Anthropic gets none because its
-/// provider rebuilds `/v1/messages` from the bare origin. Zai gets none because
-/// its API has no `/v1` segment at all (`/api/paas/v4/chat/completions`), so
-/// the upstream base url must carry the full path and any prefix would double
-/// up. `path_prefix` in the overrides replaces the default per gateway
-/// provider.
+/// provider rebuilds `/v1/messages` from the bare origin. `path_prefix` in the
+/// overrides replaces the default per gateway provider.
 /// Exhaustive on purpose: a new `ProviderKind` must state its prefix here
-/// instead of silently inheriting `/v1` (which broke Zai once already).
+/// instead of silently inheriting `/v1`.
 fn default_path_prefix(kind: Option<ProviderKind>) -> &'static str {
     match kind {
-        Some(ProviderKind::Anthropic | ProviderKind::Zai) => "",
+        Some(ProviderKind::Anthropic) => "",
         Some(ProviderKind::Google) => GEMINI_PATH_PREFIX,
         Some(ProviderKind::Vertex) => DEFAULT_PATH_PREFIX,
         Some(
             ProviderKind::Ollama
             | ProviderKind::LlamaCpp
-            | ProviderKind::Mistral
-            | ProviderKind::DeepSeek
-            | ProviderKind::OpenRouter
-            | ProviderKind::Requesty
-            | ProviderKind::Synthetic
-            | ProviderKind::Regolo
-            | ProviderKind::TensorX
             | ProviderKind::OpenAi
             | ProviderKind::Copilot
             | ProviderKind::Opencode
@@ -231,30 +204,6 @@ fn build_routed_provider(
         ProviderKind::LlamaCpp => Box::new(
             LocalEndpoint::with_auth(&LLAMACPP, auth, timeouts).with_system_prefix(system_prefix),
         ),
-        ProviderKind::Mistral => {
-            Box::new(Mistral::with_auth(auth, timeouts).with_system_prefix(system_prefix))
-        }
-        ProviderKind::Zai => {
-            Box::new(Zai::with_auth(auth, timeouts).with_system_prefix(system_prefix))
-        }
-        ProviderKind::DeepSeek => {
-            Box::new(DeepSeek::with_auth(auth, timeouts).with_system_prefix(system_prefix))
-        }
-        ProviderKind::OpenRouter => {
-            Box::new(OpenRouter::with_auth(auth, timeouts).with_system_prefix(system_prefix))
-        }
-        ProviderKind::Requesty => {
-            Box::new(Requesty::with_auth(auth, timeouts).with_system_prefix(system_prefix))
-        }
-        ProviderKind::Regolo => {
-            Box::new(Regolo::with_auth(auth, timeouts).with_system_prefix(system_prefix))
-        }
-        ProviderKind::Synthetic => {
-            Box::new(Synthetic::with_auth(auth, timeouts).with_system_prefix(system_prefix))
-        }
-        ProviderKind::TensorX => {
-            Box::new(TensorX::with_auth(auth, timeouts).with_system_prefix(system_prefix))
-        }
         ProviderKind::Anthropic => {
             Box::new(Anthropic::with_auth(auth, timeouts).with_system_prefix(system_prefix))
         }
@@ -507,8 +456,12 @@ mod tests {
     use serde_json::json;
     use test_case::test_case;
 
-    #[test_case("zai", Some(ProviderKind::Zai) ; "known_zai")]
-    #[test_case("synthetic", Some(ProviderKind::Synthetic) ; "known_synthetic")]
+    const ROUTED_VENDOR: &str = "anthropic";
+    const ROUTED_MODEL: &str = "claude-sonnet-4-5";
+    const ROUTED_SPEC: &str = "aperture/anthropic/claude-sonnet-4-5";
+    const OVERRIDDEN_CONTEXT: u32 = 123_456;
+
+    #[test_case("ollama", Some(ProviderKind::Ollama) ; "known_ollama")]
     #[test_case("openai", None ; "openai_excluded")]
     #[test_case("llama-cpp", Some(ProviderKind::LlamaCpp) ; "known_llama_cpp")]
     #[test_case("ikora-openai", None ; "unknown_vendor_no_override")]
@@ -533,7 +486,7 @@ mod tests {
 
     #[test_case("gemini", "google", Some(ProviderKind::Google) ; "remaps_vendor_the_gateway_renamed")]
     #[test_case("ikora-openai", "llama-cpp", Some(ProviderKind::LlamaCpp) ; "remaps_unknown_vendor")]
-    #[test_case("zai", "not-a-real-provider", Some(ProviderKind::Zai) ; "invalid_base_falls_back_to_provider_id")]
+    #[test_case("ollama", "not-a-real-provider", Some(ProviderKind::Ollama) ; "invalid_base_falls_back_to_provider_id")]
     fn routed_kind_with_base_override(
         provider_id: &str,
         base: &str,
@@ -559,7 +512,6 @@ mod tests {
 
     #[test_case(ProviderKind::Google, "aperture/gemini/gemini-pro-latest", "gemini-pro-latest" ; "native_google_strips_vendor_prefix")]
     #[test_case(ProviderKind::Anthropic, "aperture/anthropic/claude-test", "anthropic/claude-test" ; "anthropic_keeps_vendor_prefix")]
-    #[test_case(ProviderKind::Zai, "aperture/zai/glm-5.2", "zai/glm-5.2" ; "compat_zai_keeps_vendor_prefix")]
     #[test_case(ProviderKind::Ollama, "aperture/ollama/glm-5.2", "ollama/glm-5.2" ; "compat_ollama_keeps_vendor_prefix")]
     fn native_route_model_vendor_prefix_policy(kind: ProviderKind, spec: &str, expected_id: &str) {
         let model = Model::from_spec(spec).unwrap();
@@ -573,13 +525,13 @@ mod tests {
         let overrides = Overrides::from([(
             vendor.into(),
             ProviderOverride {
-                default: base_override("mistral"),
+                default: base_override("ollama"),
                 models: HashMap::from([("special".into(), base_override("llama-cpp"))]),
             },
         )]);
         let kind = |model| routed_kind(vendor, &merged_override(&overrides, vendor, model));
         assert_eq!(kind("special"), Some(ProviderKind::LlamaCpp));
-        assert_eq!(kind("other"), Some(ProviderKind::Mistral));
+        assert_eq!(kind("other"), Some(ProviderKind::Ollama));
     }
 
     fn test_auth() -> Arc<Mutex<ResolvedAuth>> {
@@ -590,8 +542,6 @@ mod tests {
     }
 
     #[test_case(Some(ProviderKind::Ollama), Some("https://aperture.example.com/v1") ; "ollama_appends_v1")]
-    #[test_case(Some(ProviderKind::Zai), Some("https://aperture.example.com") ; "zai_keeps_bare_host")]
-    #[test_case(Some(ProviderKind::DeepSeek), Some("https://aperture.example.com/v1") ; "deepseek_appends_v1")]
     #[test_case(None, Some("https://aperture.example.com/v1") ; "unrouted_appends_v1")]
     #[test_case(Some(ProviderKind::Google), Some("https://aperture.example.com/v1beta") ; "google_appends_v1beta")]
     #[test_case(Some(ProviderKind::Anthropic), Some("https://aperture.example.com") ; "anthropic_keeps_bare_host")]
@@ -602,7 +552,7 @@ mod tests {
     }
 
     #[test_case(Some("") , Some("https://aperture.example.com") ; "empty_prefix_keeps_bare_host")]
-    #[test_case(Some("v1"), Some("https://aperture.example.com/v1") ; "configured_prefix_beats_zai_default")]
+    #[test_case(Some("v1"), Some("https://aperture.example.com/v1") ; "configured_prefix_beats_anthropic_default")]
     #[test_case(Some("api/paas/v4"), Some("https://aperture.example.com/api/paas/v4") ; "prefix_gets_leading_slash")]
     #[test_case(Some("/v1/"), Some("https://aperture.example.com/v1") ; "prefix_trailing_slash_trimmed")]
     fn routed_auth_path_prefix_override_wins(configured: Option<&str>, expected: Option<&str>) {
@@ -610,7 +560,10 @@ mod tests {
             path_prefix: configured.map(String::from),
             ..Default::default()
         };
-        let auth = routed_auth(&test_auth(), &path_prefix(Some(ProviderKind::Zai), &merged));
+        let auth = routed_auth(
+            &test_auth(),
+            &path_prefix(Some(ProviderKind::Anthropic), &merged),
+        );
         assert_eq!(auth.lock().unwrap().base_url.as_deref(), expected);
     }
 
@@ -710,41 +663,46 @@ mod tests {
         assert!(parse_models(&json!({"data": []}), &Overrides::new()).is_empty());
     }
 
+    fn routed_entry() -> &'static ModelEntry {
+        let manifest = manifest_for_kind(ProviderKind::Anthropic).unwrap();
+        lookup_entry(manifest.models, ROUTED_MODEL).unwrap()
+    }
+
     #[test]
     fn apply_adjustments_uses_routed_provider_static_table() {
-        let mut model = Model::from_spec("aperture/zai/glm-5.2").unwrap();
+        let mut model = Model::from_spec(ROUTED_SPEC).unwrap();
         assert_eq!(
             model.context_window,
             ProviderKind::Aperture.fallback_context_window()
         );
         apply_adjustments(&mut model, &Overrides::new());
-        assert_eq!(model.context_window, 1_000_000);
-        assert_eq!(model.max_output_tokens, Some(131_072));
-        assert_eq!(model.family, ModelFamily::Glm);
+        assert_eq!(model.context_window, routed_entry().context_window);
+        assert_eq!(model.max_output_tokens, routed_entry().max_output_tokens);
+        assert_eq!(model.family, ModelFamily::Claude);
     }
 
     #[test]
     fn apply_adjustments_override_wins_over_static_table() {
         let mut overrides = Overrides::new();
         overrides.insert(
-            "zai".into(),
+            ROUTED_VENDOR.into(),
             ProviderOverride {
                 default: OverrideFields {
-                    context_window: Some(200_000),
+                    context_window: Some(OVERRIDDEN_CONTEXT),
                     ..Default::default()
                 },
                 ..Default::default()
             },
         );
-        let mut model = Model::from_spec("aperture/zai/glm-5.2").unwrap();
+        let mut model = Model::from_spec(ROUTED_SPEC).unwrap();
         apply_adjustments(&mut model, &overrides);
-        assert_eq!(model.context_window, 200_000);
-        assert_eq!(model.max_output_tokens, Some(131_072));
+        assert_eq!(model.context_window, OVERRIDDEN_CONTEXT);
+        assert_eq!(model.max_output_tokens, routed_entry().max_output_tokens);
     }
 
     #[test]
     fn apply_adjustments_vision_uses_routed_static_table() {
-        let mut model = Model::from_spec("aperture/mistral/mistral-medium-latest").unwrap();
+        let mut model = Model::from_spec(ROUTED_SPEC).unwrap();
         assert!(model.supports_vision_override.is_none());
         apply_adjustments(&mut model, &Overrides::new());
         assert_eq!(model.supports_vision_override, Some(true));
@@ -755,11 +713,11 @@ mod tests {
     fn apply_adjustments_vision_override_enables_gateway_model() {
         let mut overrides = Overrides::new();
         overrides.insert(
-            "synthetic".into(),
+            "ollama".into(),
             ProviderOverride {
                 default: OverrideFields::default(),
                 models: HashMap::from([(
-                    "hf:moonshotai/Kimi-K3".into(),
+                    "kimi-k3".into(),
                     OverrideFields {
                         supports_vision: Some(true),
                         ..Default::default()
@@ -767,7 +725,7 @@ mod tests {
                 )]),
             },
         );
-        let mut model = Model::from_spec("aperture/synthetic/hf:moonshotai/Kimi-K3").unwrap();
+        let mut model = Model::from_spec("aperture/ollama/kimi-k3").unwrap();
         apply_adjustments(&mut model, &overrides);
         assert_eq!(model.supports_vision_override, Some(true));
         assert!(model.supports_vision());
@@ -777,7 +735,7 @@ mod tests {
     fn apply_adjustments_vision_override_disables_static_vision_model() {
         let mut overrides = Overrides::new();
         overrides.insert(
-            "mistral".into(),
+            ROUTED_VENDOR.into(),
             ProviderOverride {
                 default: OverrideFields {
                     supports_vision: Some(false),
@@ -786,7 +744,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mut model = Model::from_spec("aperture/mistral/mistral-medium-latest").unwrap();
+        let mut model = Model::from_spec(ROUTED_SPEC).unwrap();
         apply_adjustments(&mut model, &overrides);
         assert_eq!(model.supports_vision_override, Some(false));
         assert!(!model.supports_vision());
@@ -804,9 +762,8 @@ mod tests {
         assert!(!model.supports_thinking());
     }
 
-    #[test_case("aperture/deepseek/deepseek-chat", ProviderKind::DeepSeek ; "routed_thinking_capable")]
+    #[test_case(ROUTED_SPEC, ProviderKind::Anthropic ; "routed_thinking_capable")]
     #[test_case("aperture/ollama/qwen3", ProviderKind::Ollama ; "routed_non_thinking")]
-    #[test_case("aperture/zai/glm-5.2", ProviderKind::Zai ; "routed_zai")]
     fn apply_adjustments_thinking_follows_routed_kind(spec: &str, kind: ProviderKind) {
         let mut model = Model::from_spec(spec).unwrap();
         assert!(model.thinking_override.is_none());
@@ -826,7 +783,7 @@ mod tests {
         )));
         let aperture =
             Aperture::with_auth_and_overrides(auth, Timeouts::default(), Overrides::new());
-        let mut model = Model::from_spec("aperture/zai/glm-5.2").unwrap();
+        let mut model = Model::from_spec(ROUTED_SPEC).unwrap();
         assert!(!model.supports_thinking());
         aperture.adjust_model(&mut model);
         assert!(model.supports_thinking());
@@ -836,11 +793,11 @@ mod tests {
     fn apply_adjustments_thinking_override_wins_over_route() {
         let mut overrides = Overrides::new();
         overrides.insert(
-            "zai".into(),
+            "ollama".into(),
             ProviderOverride {
                 default: OverrideFields::default(),
                 models: HashMap::from([(
-                    "glm-5.2".into(),
+                    "qwen3".into(),
                     OverrideFields {
                         supports_thinking: Some(true),
                         ..Default::default()
@@ -848,7 +805,7 @@ mod tests {
                 )]),
             },
         );
-        let mut model = Model::from_spec("aperture/zai/glm-5.2").unwrap();
+        let mut model = Model::from_spec("aperture/ollama/qwen3").unwrap();
         apply_adjustments(&mut model, &overrides);
         assert_eq!(
             model.thinking_override,
@@ -861,7 +818,7 @@ mod tests {
     fn apply_adjustments_thinking_override_disables_routed_capable_model() {
         let mut overrides = Overrides::new();
         overrides.insert(
-            "deepseek".into(),
+            ROUTED_VENDOR.into(),
             ProviderOverride {
                 default: OverrideFields {
                     supports_thinking: Some(false),
@@ -870,7 +827,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mut model = Model::from_spec("aperture/deepseek/deepseek-chat").unwrap();
+        let mut model = Model::from_spec(ROUTED_SPEC).unwrap();
         apply_adjustments(&mut model, &overrides);
         assert_eq!(
             model.thinking_override,
@@ -935,7 +892,7 @@ supports_vision = true
         assert_eq!(ov.max_output_tokens, Some(8_192));
         assert_eq!(ov.supports_thinking, Some(true));
         assert_eq!(ov.supports_vision, Some(true));
-        assert_eq!(path_prefix(Some(ProviderKind::Zai), &ov), "");
+        assert_eq!(path_prefix(None, &ov), "");
         let ov2 = merged_override(&overrides, "zai", "other");
         assert_eq!(ov2.context_window, Some(128_000));
     }

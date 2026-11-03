@@ -21,20 +21,12 @@ use crate::providers::catalog::{
     OPENCODE_FAMILY_SLUGS, available_if_warm, catalog_providers, catalog_providers_if_available,
 };
 use crate::providers::copilot::Copilot;
-use crate::providers::deepseek::DeepSeek;
 use crate::providers::dynamic;
 use crate::providers::google::Google;
 use crate::providers::local::{LLAMACPP, LocalEndpoint, OLLAMA};
-use crate::providers::mistral::Mistral;
 use crate::providers::openai::OpenAi;
 use crate::providers::opencode::Opencode;
-use crate::providers::openrouter::OpenRouter;
-use crate::providers::regolo::Regolo;
-use crate::providers::requesty::Requesty;
-use crate::providers::synthetic::Synthetic;
-use crate::providers::tensorx::TensorX;
 use crate::providers::vertex::Vertex;
-use crate::providers::zai::Zai;
 use crate::{
     AgentError, ConversationEnd, Invocation, Message, ProviderEvent, ProviderUsage, RequestOptions,
     StreamResponse,
@@ -51,17 +43,6 @@ pub enum ProviderKind {
     Copilot,
     Ollama,
     LlamaCpp,
-    Mistral,
-    Zai,
-    #[strum(serialize = "deepseek")]
-    DeepSeek,
-    #[strum(serialize = "openrouter")]
-    OpenRouter,
-    Requesty,
-    Synthetic,
-    Regolo,
-    #[strum(serialize = "tensorx")]
-    TensorX,
     #[strum(serialize = "opencode")]
     Opencode,
     Aperture,
@@ -77,14 +58,6 @@ impl ProviderKind {
             Self::Copilot => "Copilot",
             Self::Ollama => "Ollama",
             Self::LlamaCpp => "LlamaCpp",
-            Self::Mistral => "Mistral",
-            Self::Zai => "Z.AI",
-            Self::DeepSeek => "DeepSeek",
-            Self::OpenRouter => "OpenRouter",
-            Self::Requesty => "Requesty",
-            Self::Synthetic => "Synthetic",
-            Self::Regolo => "Regolo",
-            Self::TensorX => "TensorX",
             Self::Opencode => "Opencode Zen",
             Self::Aperture => "Aperture",
         }
@@ -99,14 +72,6 @@ impl ProviderKind {
             Self::Copilot => "GH_COPILOT_TOKEN",
             Self::Ollama => "OLLAMA_API_KEY",
             Self::LlamaCpp => "LLAMA_CPP_API_KEY",
-            Self::Mistral => "MISTRAL_API_KEY",
-            Self::Zai => "ZHIPU_API_KEY",
-            Self::DeepSeek => "DEEPSEEK_API_KEY",
-            Self::OpenRouter => "OPENROUTER_API_KEY",
-            Self::Requesty => "REQUESTY_API_KEY",
-            Self::Synthetic => "SYNTHETIC_API_KEY",
-            Self::Regolo => "REGOLO_API_KEY",
-            Self::TensorX => "TENSORX_API_KEY",
             Self::Opencode => "OPENCODE_API_KEY",
             Self::Aperture => "",
         }
@@ -123,14 +88,6 @@ impl ProviderKind {
             }
             Self::Ollama => "http://localhost:11434/v1",
             Self::LlamaCpp => "http://localhost:8080/v1",
-            Self::Mistral => "https://api.mistral.ai/v1",
-            Self::Zai => "https://api.z.ai/api/paas/v4",
-            Self::DeepSeek => "https://api.deepseek.com",
-            Self::OpenRouter => "https://openrouter.ai/api/v1",
-            Self::Requesty => "https://router.requesty.ai/v1",
-            Self::Synthetic => "https://api.synthetic.new/openai/v1",
-            Self::Regolo => "https://api.regolo.ai/v1",
-            Self::TensorX => "https://api.tensorx.ai/v1",
             Self::Opencode => "https://opencode.ai/zen/v1",
             Self::Aperture => "Aperture gateway (set APERTURE_HOST)",
         }
@@ -152,20 +109,6 @@ impl ProviderKind {
             Self::LlamaCpp => Some(
                 "Local or remote inference via LLAMA_CPP_HOST, set optional key via LLAMA_CPP_API_KEY",
             ),
-            Self::Synthetic => {
-                Some("Reasoning effort support (low/medium/high), open-weight models")
-            }
-            Self::TensorX => Some("Open-weight models, zero data retention, prompt caching"),
-            Self::DeepSeek => Some("Thinking mode toggle (on/off), open-weight models"),
-            Self::OpenRouter => {
-                Some("300+ models from all providers, prompt caching, provider routing")
-            }
-            Self::Requesty => Some(
-                "700+ models behind one key, curated managed routing policies, EU region via `REQUESTY_BASE_URL`",
-            ),
-            Self::Regolo => Some(
-                "EU-hosted open-weight models with tool calling. The catalogue and prices are listed live from the API",
-            ),
             Self::Opencode => Some(
                 "Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Zen API",
             ),
@@ -184,22 +127,13 @@ impl ProviderKind {
             Self::Copilot => ModelFamily::Generic,
             Self::Ollama => ModelFamily::Generic,
             Self::LlamaCpp => ModelFamily::Generic,
-            Self::Mistral => ModelFamily::Generic,
-            Self::Zai => ModelFamily::Glm,
-            Self::DeepSeek => ModelFamily::Generic,
-            Self::OpenRouter => ModelFamily::Generic,
-            Self::Requesty => ModelFamily::Generic,
-            Self::Synthetic => ModelFamily::Synthetic,
-            Self::Regolo => ModelFamily::Generic,
-            Self::TensorX => ModelFamily::Generic,
             Self::Opencode => ModelFamily::Generic,
             Self::Aperture => ModelFamily::Generic,
         }
     }
 
     /// `None` when we honestly don't know the output window: llama.cpp
-    /// serves whatever model the user loaded, and TensorX rejects explicit
-    /// max_tokens (see tensorx.rs). Unknown means "don't limit", never
+    /// serves whatever model the user loaded. Unknown means "don't limit", never
     /// "assume small"; a `0` sentinel here once silently capped llama.cpp
     /// thinking budgets at the floor.
     pub const fn fallback_max_output(self) -> Option<u32> {
@@ -210,14 +144,6 @@ impl ProviderKind {
             Self::Copilot => Some(100_000),
             Self::Ollama => Some(16_384),
             Self::LlamaCpp => None,
-            Self::Mistral => None,
-            Self::Zai => Some(16_000),
-            Self::DeepSeek => Some(384_000),
-            Self::OpenRouter => Some(128_000),
-            Self::Requesty => Some(128_000),
-            Self::Synthetic => Some(32_000),
-            Self::Regolo => Some(120_000),
-            Self::TensorX => None,
             Self::Opencode => Some(128_000),
             Self::Aperture => Some(16_384),
         }
@@ -231,14 +157,6 @@ impl ProviderKind {
             Self::Copilot => 200_000,
             Self::Ollama => 128_000,
             Self::LlamaCpp => 128_000,
-            Self::Mistral => 128_000,
-            Self::Zai => 128_000,
-            Self::DeepSeek => 1_000_000,
-            Self::OpenRouter => 200_000,
-            Self::Requesty => 200_000,
-            Self::Synthetic => 128_000,
-            Self::Regolo => 120_000,
-            Self::TensorX => 200_000,
             Self::Opencode => 256_000,
             Self::Aperture => 128_000,
         }
@@ -259,14 +177,6 @@ impl ProviderKind {
             Self::Copilot => Ok(Box::new(Copilot::new(timeouts)?)),
             Self::Ollama => Ok(Box::new(LocalEndpoint::new(&OLLAMA, timeouts)?)),
             Self::LlamaCpp => Ok(Box::new(LocalEndpoint::new(&LLAMACPP, timeouts)?)),
-            Self::Mistral => Ok(Box::new(Mistral::new(timeouts)?)),
-            Self::Zai => Ok(Box::new(Zai::new(timeouts)?)),
-            Self::DeepSeek => Ok(Box::new(DeepSeek::new(timeouts)?)),
-            Self::OpenRouter => Ok(Box::new(OpenRouter::new(timeouts)?)),
-            Self::Requesty => Ok(Box::new(Requesty::new(timeouts)?)),
-            Self::Synthetic => Ok(Box::new(Synthetic::new(timeouts)?)),
-            Self::Regolo => Ok(Box::new(Regolo::new(timeouts)?)),
-            Self::TensorX => Ok(Box::new(TensorX::new(timeouts)?)),
             Self::Opencode => Ok(Box::new(Opencode::new(timeouts)?)),
             Self::Aperture => Ok(Box::new(Aperture::new(timeouts)?)),
         }

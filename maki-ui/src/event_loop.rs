@@ -7445,7 +7445,7 @@ mod tests {
 
     #[test]
     fn replacement_preparation_installs_the_session_provider_on_activation() {
-        const REPLACEMENT_MODEL: &str = "synthetic/hf:test-model";
+        const REPLACEMENT_MODEL: &str = "ollama/hf:test-model";
 
         let harness = RuntimeHarness::new();
         let previous_provider = harness.ctx().model_slot.load().provider.identity();

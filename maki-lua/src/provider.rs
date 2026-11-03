@@ -11,6 +11,7 @@ use std::time::Duration;
 use flume::Sender;
 use futures::future::LocalBoxFuture;
 use maki_agent::cancel::CancelToken;
+use maki_config::providers::ProvidersConfig;
 use maki_providers::login::{AuthStatus, InteractionService};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -265,8 +266,11 @@ impl ProviderBackend for LuaBackend {
         let callbacks = Arc::clone(&self.callbacks);
         Box::pin(async move {
             let job_callbacks = Arc::clone(&callbacks);
+            let config = provider_config(&callbacks.id);
             let (instance, adjusted, key_count) = invoke(&requests, move |lua| {
-                Box::pin(async move { prepare_instance(&lua, &job_callbacks, &info).await })
+                Box::pin(
+                    async move { prepare_instance(&lua, &job_callbacks, &info, &config).await },
+                )
             })
             .await?;
             let model = match adjusted {
@@ -293,9 +297,10 @@ impl ProviderBackend for LuaBackend {
 
     fn discover(&self) -> Option<BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>> {
         self.callbacks.discover.as_ref()?;
+        let config = provider_config(&self.callbacks.id);
         Some(self.call_callback(
             |callbacks| callbacks.discover.as_ref(),
-            no_args,
+            move |lua| config_arg(lua, &config),
             |lua, models| Ok(Ok(lua.from_value(models.unwrap_or(LuaValue::Nil))?)),
         ))
     }
@@ -349,10 +354,7 @@ impl ProviderBackend for LuaBackend {
         self.callbacks.auth_status.as_ref()?;
         Some(self.call_callback(
             |callbacks| callbacks.auth_status.as_ref(),
-            move |lua| {
-                lua.to_value_with(&config, serialize_options())?
-                    .into_lua_multi(lua)
-            },
+            move |lua| config_arg(lua, &config),
             |lua, status| Ok(Ok(lua.from_value(status.unwrap_or(LuaValue::Nil))?)),
         ))
     }
@@ -367,16 +369,33 @@ impl ProviderBackend for LuaBackend {
     }
 }
 
+/// The provider's `providers.toml` section, read at call time so a login
+/// earlier in the session is seen. Serializing a parsed section cannot fail.
+fn provider_config(id: &str) -> Value {
+    let section = ProvidersConfig::load_or_default()
+        .get(id)
+        .cloned()
+        .unwrap_or_default();
+    serde_json::to_value(section).unwrap_or_default()
+}
+
+fn config_arg(lua: &Lua, config: &Value) -> mlua::Result<MultiValue> {
+    lua.to_value_with(config, serialize_options())?
+        .into_lua_multi(lua)
+}
+
 async fn prepare_instance(
     lua: &Lua,
     callbacks: &Callbacks,
     info: &ModelInfo,
+    config: &Value,
 ) -> JobResult<(RegistryKey, Option<ModelInfo>, usize)> {
     let prepare: Function = lua.registry_value(&callbacks.prepare)?;
     let values = prepare
         .call_async::<MultiValue>((
             callbacks.ctx(lua)?,
             lua.to_value_with(info, serialize_options())?,
+            lua.to_value_with(config, serialize_options())?,
         ))
         .await?;
     let mut values = match returned(values) {

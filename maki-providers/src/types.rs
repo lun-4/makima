@@ -648,42 +648,22 @@ fn merge_body(body: &mut Map<String, Value>, fragment: &Map<String, Value>) {
 
 pub mod dialect {
     use super::EffortDialect;
-    use maki_storage::sessions::Effort::{High, Low, Max, Medium, Minimal, XHigh};
+    use maki_storage::sessions::Effort::{High, Low, Medium, Minimal};
 
     /// Wire string that disables reasoning, for APIs that need an explicit
     /// opt-out.
     pub const OFF: &str = "none";
 
-    /// OpenAI platform, synthetic.
+    /// OpenAI platform.
     pub const STANDARD: EffortDialect = EffortDialect {
         supported: &[Minimal, Low, Medium, High],
         adaptive: Some(Medium),
         off: None,
     };
-    /// opencode chat-completions, openrouter (static fallback).
+    /// opencode chat-completions.
     pub const PREFER_HIGH: EffortDialect = EffortDialect {
         supported: &[Low, Medium, High],
         adaptive: Some(High),
-        off: None,
-    };
-    /// Mistral.
-    pub const HIGH_ONLY: EffortDialect = EffortDialect {
-        supported: &[High],
-        adaptive: Some(High),
-        off: None,
-    };
-    /// Z.AI. GLM reasons by default, so Off sends "none" explicitly.
-    /// Only use behind `Model::supports_thinking`.
-    pub const GLM: EffortDialect = EffortDialect {
-        supported: &[High, XHigh],
-        adaptive: Some(High),
-        off: Some(OFF),
-    };
-    /// DeepSeek accepts only "max"; Adaptive keeps the model's own default
-    /// reasoning depth by sending no effort at all.
-    pub const DEEPSEEK: EffortDialect = EffortDialect {
-        supported: &[Max],
-        adaptive: None,
         off: None,
     };
     /// `output_config.effort` on Anthropic adaptive-thinking models. The API
@@ -692,13 +672,6 @@ pub mod dialect {
         supported: &[Low, Medium, High],
         adaptive: None,
         off: None,
-    };
-    /// TensorX routes models that may reason by default, so Off sends "none"
-    /// explicitly and Adaptive asks for full depth.
-    pub const TENSORX: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High],
-        adaptive: Some(High),
-        off: Some(OFF),
     };
 }
 
@@ -1279,11 +1252,7 @@ mod tests {
         let all = [
             &dialect::STANDARD,
             &dialect::PREFER_HIGH,
-            &dialect::HIGH_ONLY,
-            &dialect::GLM,
-            &dialect::DEEPSEEK,
             &dialect::ANTHROPIC_ADAPTIVE,
-            &dialect::TENSORX,
         ];
         for d in all {
             assert!(!d.supported.is_empty());
@@ -1324,16 +1293,8 @@ mod tests {
     #[test_case(&dialect::STANDARD, ThinkingConfig::Effort(Max),     Some("high")    ; "standard_max_snaps_down")]
     #[test_case(&dialect::STANDARD, ThinkingConfig::Budget(1024),    Some("medium")  ; "standard_quarter_budget")]
     #[test_case(&dialect::PREFER_HIGH, ThinkingConfig::Adaptive,        Some("high") ; "prefer_high_adaptive")]
-    #[test_case(&dialect::HIGH_ONLY, ThinkingConfig::Adaptive,        Some("high") ; "high_only_adaptive")]
-    #[test_case(&dialect::HIGH_ONLY, ThinkingConfig::Effort(Minimal), Some("high") ; "high_only_minimal")]
-    #[test_case(&dialect::GLM, ThinkingConfig::Off,          Some("none")  ; "glm_off_explicit_none")]
-    #[test_case(&dialect::GLM, ThinkingConfig::Adaptive,     Some("high")  ; "glm_adaptive")]
-    #[test_case(&dialect::GLM, ThinkingConfig::Effort(Max),  Some("xhigh") ; "glm_max_snaps_to_xhigh")]
-    #[test_case(&dialect::DEEPSEEK, ThinkingConfig::Adaptive,        None        ; "deepseek_adaptive_uses_api_default")]
-    #[test_case(&dialect::DEEPSEEK, ThinkingConfig::Effort(Minimal), Some("max") ; "deepseek_minimal")]
     #[test_case(&dialect::ANTHROPIC_ADAPTIVE, ThinkingConfig::Adaptive,      None         ; "anthropic_adaptive_is_native")]
     #[test_case(&dialect::ANTHROPIC_ADAPTIVE, ThinkingConfig::Effort(XHigh), Some("high") ; "anthropic_xhigh_snaps_down")]
-    #[test_case(&dialect::TENSORX, ThinkingConfig::Off,             Some("none") ; "tensorx_off_explicit_none")]
     fn thinking_apply_reasoning_effort(
         dialect: &EffortDialect,
         config: ThinkingConfig,
@@ -1465,6 +1426,7 @@ mod tests {
             supports_vision_override: Some(provider.family().supports_vision()),
             supports_fast_override: None,
             pricing: crate::model::ModelPricing::default(),
+            pricing_schedule: None,
             max_output_tokens: Some(8192),
             turn_output_tokens: None,
             context_window: 200_000,

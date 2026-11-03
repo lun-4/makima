@@ -34,6 +34,17 @@ const ANSWERED_URL: &str = "http://example.test";
 const RETURNED_MODEL: &str = "fake-2";
 const NO_URL: &str = "none";
 const BOUND: Duration = Duration::from_secs(10);
+const BUNDLED_PLUGIN: &str = "providers";
+const BUNDLED_SOURCE: &str = include_str!("../../plugins/providers/init.lua");
+const PLAN_PROVIDER: &str = "zai";
+const PLAN_PROVIDER_NAME: &str = "Z.AI";
+const PLAN: &str = "coding";
+const PLAN_MODEL: &str = "zai/glm-5-code";
+const BROWSER_NOTICE: &str = "";
+const BUNDLED_KEY: &str = "zk-bundled-login-key";
+const MASKED_KEY: &str = "key: zk-b...-key, coding";
+const PLAN_PROVIDER_KEY_ENV: &str = "ZHIPU_API_KEY";
+const PLAN_LOGIN_URL: &str = "https://z.ai/manage-apikey/apikey-list";
 
 const SOURCE: &str = r#"
     maki.api.register_provider({
@@ -97,6 +108,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_plugin(PLUGIN, SOURCE)
+    }
+
+    fn with_plugin(plugin: &str, source: &str) -> Self {
         let state = TempDir::new().unwrap();
         maki_storage::paths::init_at(state.path().to_path_buf()).unwrap();
         let host = PluginHost::with_session_provider_preparer(
@@ -109,7 +124,7 @@ impl Fixture {
             HostUi::Frontend,
         )
         .unwrap();
-        host.load_source(PLUGIN, SOURCE).unwrap();
+        host.load_source(plugin, source).unwrap();
         Self {
             registry: host.provider_registry(Timeouts::default()).unwrap(),
             _host: host,
@@ -271,4 +286,55 @@ fn default_auth_status_and_logout_use_credentials_file() {
     assert_eq!(name.unwrap().as_deref(), Some(DISPLAY_NAME));
     assert!(load_provider_credentials(&fixture.storage, PROVIDER).is_none());
     assert_eq!(state_of(PROVIDER), Some(AuthState::Missing));
+}
+
+#[test]
+fn bundled_provider_logs_in_with_its_plan() {
+    // SAFETY: nextest runs each test in its own process.
+    unsafe { std::env::remove_var(PLAN_PROVIDER_KEY_ENV) };
+    let fixture = Fixture::with_plugin(BUNDLED_PLUGIN, BUNDLED_SOURCE);
+    let (answers, answers_rx) = scripted(&[PLAN, BROWSER_NOTICE, BUNDLED_KEY]);
+
+    let (asked, login) = fixture.start_login(PLAN_PROVIDER, answers_rx);
+    let outcome = login.join().unwrap().unwrap();
+    drop(answers);
+
+    assert_eq!(
+        outcome,
+        LoginOutcome::LoggedIn {
+            provider: PLAN_PROVIDER.into(),
+            display_name: PLAN_PROVIDER_NAME.into(),
+            model: Some(PLAN_MODEL.into()),
+        }
+    );
+    let asks: Vec<_> = asked.drain().collect();
+    assert!(matches!(asks[0], InteractionRequest::Choice { .. }));
+    assert_eq!(
+        asks[1],
+        InteractionRequest::OpenBrowser(PLAN_LOGIN_URL.into())
+    );
+    assert!(matches!(
+        asks[2],
+        InteractionRequest::Input { secret: true, .. }
+    ));
+    let saved = load_provider_credentials(&fixture.storage, PLAN_PROVIDER).unwrap();
+    assert_eq!(saved.api_key, BUNDLED_KEY);
+    let config = ProvidersConfig::try_load().unwrap();
+    assert_eq!(
+        config.get(PLAN_PROVIDER).unwrap().plan.as_deref(),
+        Some(PLAN)
+    );
+    let status = fixture
+        .states()
+        .into_iter()
+        .find(|(id, _, _)| id == PLAN_PROVIDER)
+        .unwrap();
+    assert_eq!(
+        status,
+        (
+            PLAN_PROVIDER.into(),
+            AuthState::Saved,
+            Some(MASKED_KEY.into())
+        )
+    );
 }

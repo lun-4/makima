@@ -528,7 +528,7 @@ fn rejected_session_prompt_preserves_shell_context(oversized: bool) {
 
 const GLM_4: &str = "ollama/glm-4";
 const GLM_5: &str = "ollama/glm-5";
-const OTHER_PROVIDER: &str = "zai/glm-5";
+const OTHER_PROVIDER: &str = "google/glm-5";
 const UNREACHABLE_OLLAMA_HOST: &str = "http://127.0.0.1:1";
 
 #[test_case(&[GLM_5, OTHER_PROVIDER], "ollama", Ok(GLM_5) ; "provider_section_switches")]

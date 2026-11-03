@@ -39,7 +39,6 @@ static PROCESS_TAG: LazyLock<String> = LazyLock::new(|| {
 
 pub(crate) struct OpenAiCompatConfig {
     pub slug: &'static str,
-    pub api_key_env: &'static str,
     pub base_url: &'static str,
     pub max_tokens_field: &'static str,
     pub include_stream_usage: bool,

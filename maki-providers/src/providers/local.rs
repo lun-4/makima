@@ -546,7 +546,6 @@ pub(crate) const OLLAMA: LocalEndpointConfig = LocalEndpointConfig {
     discovery_mode: DiscoveryMode::Ollama,
     compat: OpenAiCompatConfig {
         slug: "ollama",
-        api_key_env: "",
         base_url: "http://localhost:11434/v1",
         max_tokens_field: "max_tokens",
         include_stream_usage: true,
@@ -566,7 +565,6 @@ pub(crate) const LLAMACPP: LocalEndpointConfig = LocalEndpointConfig {
     discovery_mode: DiscoveryMode::LlamaCpp,
     compat: OpenAiCompatConfig {
         slug: "llama-cpp",
-        api_key_env: "",
         base_url: "http://localhost:8080/v1",
         max_tokens_field: "max_tokens",
         include_stream_usage: true,

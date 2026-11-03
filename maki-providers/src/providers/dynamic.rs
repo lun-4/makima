@@ -27,18 +27,10 @@ use super::ResolvedAuth;
 use super::anthropic::Anthropic;
 use super::aperture::Aperture;
 use super::copilot::Copilot;
-use super::deepseek::DeepSeek;
 use super::google::Google;
 use super::local::{LLAMACPP, LocalEndpoint, OLLAMA};
-use super::mistral::Mistral;
 use super::openai::OpenAi;
 use super::opencode::Opencode;
-use super::openrouter::OpenRouter;
-use super::regolo::Regolo;
-use super::requesty::Requesty;
-use super::synthetic::Synthetic;
-use super::tensorx::TensorX;
-use super::zai::Zai;
 
 const INFO_TIMEOUT: Duration = Duration::from_secs(5);
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -105,6 +97,7 @@ impl ScriptModel {
             supports_vision_override: self.supports_vision,
             supports_fast_override: None,
             pricing: self.pricing.clone().unwrap_or_default(),
+            pricing_schedule: None,
             max_output_tokens: Some(self.max_output_tokens),
             turn_output_tokens: None,
             context_window: self.context_window,
@@ -578,37 +571,6 @@ pub(crate) fn create(
         ),
         ProviderKind::LlamaCpp => Box::new(
             LocalEndpoint::with_auth(&LLAMACPP, auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::Mistral => Box::new(
-            Mistral::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::Zai => Box::new(
-            Zai::with_auth(auth.clone(), timeouts).with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::Synthetic => Box::new(
-            Synthetic::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::DeepSeek => Box::new(
-            DeepSeek::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::OpenRouter => Box::new(
-            OpenRouter::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::Requesty => Box::new(
-            Requesty::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::Regolo => Box::new(
-            Regolo::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::TensorX => Box::new(
-            TensorX::with_auth(auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
         ProviderKind::Opencode => Box::new(
@@ -1168,10 +1130,6 @@ esac
     #[cfg(unix)]
     #[test_case("ollama", ProviderKind::Ollama ; "base_ollama")]
     #[test_case("llama-cpp", ProviderKind::LlamaCpp ; "base_llama_cpp")]
-    #[test_case("mistral", ProviderKind::Mistral ; "base_mistral")]
-    #[test_case("zai", ProviderKind::Zai ; "base_zai")]
-    #[test_case("synthetic", ProviderKind::Synthetic ; "base_synthetic")]
-    #[test_case("deepseek", ProviderKind::DeepSeek ; "base_deepseek")]
     #[test_case("opencode", ProviderKind::Opencode ; "base_opencode")]
     fn discover_accepts_all_bases(base: &str, expected: ProviderKind) {
         let tmp = TempDir::new().unwrap();

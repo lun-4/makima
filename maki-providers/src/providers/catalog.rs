@@ -296,7 +296,8 @@ impl CatalogData {
 
         for (provider_id, provider) in index {
             let slug = builtin_slug(&provider_id);
-            if builtin_provider(slug).is_some() && !OPENCODE_FAMILY_SLUGS.contains(&slug) {
+            let builtin = builtin_provider(slug).is_some() || slug != provider_id;
+            if builtin && !OPENCODE_FAMILY_SLUGS.contains(&slug) {
                 let models = parse_models(&provider.models);
                 debug!(
                     provider = %provider_id,
@@ -391,7 +392,6 @@ pub(crate) fn config_error(message: String) -> AgentError {
 
 static CATALOG_PROVIDER_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "",
-    api_key_env: "",
     base_url: "",
     max_tokens_field: "max_tokens",
     include_stream_usage: true,
@@ -1060,7 +1060,7 @@ mod tests {
     use crate::manifest::ManifestRegistry;
     use crate::model::{Model, ModelInfo, ModelPricing};
     use crate::provider::Provider;
-    use crate::providers::{Timeouts, deepseek};
+    use crate::providers::{Timeouts, google};
     use crate::{
         AgentError, Invocation, InvocationPurpose, ModelFamily, ModelTier, RequestOptions,
     };
@@ -1129,6 +1129,7 @@ mod tests {
             supports_vision_override: None,
             supports_fast_override: None,
             pricing: ModelPricing::default(),
+            pricing_schedule: None,
             max_output_tokens: None,
             turn_output_tokens: None,
             context_window: 0,
@@ -1758,7 +1759,7 @@ mod tests {
     }
 
     /// A builtin with a static model table, so it is never a catalog provider.
-    const BUILTIN_SLUG: &str = "deepseek";
+    const BUILTIN_SLUG: &str = "google";
     /// Stands in for a model released after our tables were written, so no
     /// curated row of any provider starts with it.
     const UNLISTED_MODEL: &str = "v9-turbo";
@@ -1799,13 +1800,13 @@ mod tests {
             "the manifest default is true, so only the catalog can say no"
         );
 
-        let curated = &deepseek::models()[0];
+        let curated = &google::models()[0];
         let listed = Model::from_spec(&format!("{BUILTIN_SLUG}/{}", curated_flash())).unwrap();
         assert_eq!(listed.pricing.input, curated.pricing.input);
         assert_eq!(listed.context_window, curated.context_window);
     }
 
-    /// Curated rows match by prefix, so `deepseek-flash` answers for every id
+    /// Curated rows match by prefix, so a curated id answers for every id
     /// starting with it. That guess loses to models.dev naming the exact model,
     /// or the next release in an existing family bills at its predecessor's
     /// rates forever without ever looking stale. A date stamp is the exception:
@@ -1814,7 +1815,7 @@ mod tests {
     fn a_relative_matched_by_prefix_loses_to_the_catalog_naming_the_model() {
         let (_tmp, state_dir) = temp_state_dir();
         let _lock = super::seed_catalog_for_tests(builtin_catalog(), state_dir);
-        let curated = &deepseek::models()[0];
+        let curated = &google::models()[0];
 
         let sibling = Model::from_spec(&format!("{BUILTIN_SLUG}/{}", sibling_model())).unwrap();
         assert_eq!(sibling.pricing.input, UNLISTED_INPUT_PRICE);
@@ -1845,7 +1846,7 @@ mod tests {
     fn fields_the_catalog_omits_fall_through() {
         let (_tmp, state_dir) = temp_state_dir();
         let _lock = super::seed_catalog_for_tests(builtin_catalog(), state_dir);
-        let curated = &deepseek::models()[0];
+        let curated = &google::models()[0];
         let manifest = ManifestRegistry::for_slug(BUILTIN_SLUG).unwrap();
 
         let quiet = Model::from_spec(&format!("{BUILTIN_SLUG}/{}", quiet_sibling_model())).unwrap();
@@ -1860,18 +1861,14 @@ mod tests {
     }
 
     /// models.dev leaves `limit` off plenty of entries, and a builtin manifest
-    /// carries a real number for its provider (DeepSeek serves 1M context)
+    /// carries a real number for its provider (Google serves 1M context)
     /// against the 128k/64k the catalog guesses for everyone else. An
     /// unpublished limit must not read as a published one, or every gap in the
     /// catalog silently shrinks the window we paid for.
     #[test]
     fn a_limit_the_catalog_omits_falls_through_to_the_manifest() {
         let (_tmp, state_dir) = temp_state_dir();
-        let index = single_provider_catalog(
-            BUILTIN_SLUG,
-            "@ai-sdk/openai-compatible",
-            Some("https://api.deepseek.com"),
-        );
+        let index = single_provider_catalog(BUILTIN_SLUG, "@ai-sdk/google", None);
         let _lock = super::seed_catalog_for_tests(index, state_dir);
 
         let manifest = ManifestRegistry::for_slug(BUILTIN_SLUG).unwrap();
@@ -1890,11 +1887,8 @@ mod tests {
     /// there. None of them may reach the provider map: they have a client of
     /// their own, so a second entry would show up twice in the login pickers.
     #[test_case("anthropic", "anthropic", "@ai-sdk/anthropic", None; "sdk we speak but no base url")]
-    #[test_case("deepseek", "deepseek", "@ai-sdk/openai-compatible", Some("https://api.deepseek.com"); "everything it takes to be servable")]
     #[test_case("openai", "openai", "@ai-sdk/openai", Some("https://api.openai.com/v1"); "sdk we do not speak")]
     #[test_case("google", "google", "@ai-sdk/google", None; "sdk we do not speak and no base url")]
-    #[test_case("openrouter", "openrouter", "@openrouter/ai-sdk-provider", Some("https://openrouter.ai/api/v1"); "vendor sdk")]
-    #[test_case("zai", "zai", "@ai-sdk/openai-compatible", Some("https://api.z.ai/api/paas/v4"); "pay as you go rates")]
     #[test_case("github-copilot", "copilot", "@ai-sdk/openai-compatible", Some("https://api.githubcopilot.com"); "renamed")]
     #[test_case("regolo-ai", "regolo", "@ai-sdk/openai-compatible", Some("https://api.regolo.ai/v1"); "renamed too")]
     fn builtins_keep_their_catalog_metadata(
@@ -1934,13 +1928,12 @@ mod tests {
         assert!(data.model_meta("zai", UNLISTED_MODEL).is_none());
     }
 
-    /// A renamed builtin only reaches its metadata while both halves hold: the
-    /// slug is one we ship, and the catalog id is not (or the alias is dead
-    /// weight, since the plain path would already have matched).
+    /// A renamed builtin's catalog id is not one we ship, or the alias would
+    /// be dead weight, since the plain path would already have matched.
     #[test]
-    fn renamed_builtins_map_a_foreign_id_onto_a_slug_we_ship() {
+    fn renamed_builtins_map_a_foreign_id_onto_another_slug() {
         for (catalog_id, slug) in super::BUILTIN_CATALOG_IDS {
-            assert!(super::builtin_provider(slug).is_some(), "{slug}");
+            assert_ne!(catalog_id, slug);
             assert!(
                 super::builtin_provider(catalog_id).is_none(),
                 "{catalog_id}"
@@ -2011,7 +2004,7 @@ mod tests {
     }
 
     fn curated_flash() -> &'static str {
-        deepseek::models()[0].prefixes[0]
+        google::models()[0].prefixes[0]
     }
 
     fn sibling_model() -> String {
@@ -2036,12 +2029,7 @@ mod tests {
                 priced_row(UNLISTED_INPUT_PRICE, UNLISTED_OUTPUT_PRICE),
             ),
         ]);
-        catalog_index(
-            BUILTIN_SLUG,
-            "@ai-sdk/openai-compatible",
-            Some("https://api.deepseek.com"),
-            models,
-        )
+        catalog_index(BUILTIN_SLUG, "@ai-sdk/google", None, models)
     }
 
     #[test]

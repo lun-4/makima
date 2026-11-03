@@ -1193,15 +1193,18 @@ already owns fails and names both plugins.
   made of ASCII letters, digits, `-`, `_` and `.`, not starting with `.`.
   `display_name` (string) Required.
   `models` (table) Model descriptors: `id` plus optional
-  `context_window`, `max_output_tokens`, `pricing`, `supports_thinking`,
+  `context_window`, `max_output_tokens`, `pricing`, `pricing_schedule`
+  (`{ windows = { { start, end } }, weekdays_only?, multiplier }`, whole
+  UTC hours that scale `pricing` by `multiplier`), `supports_thinking`,
   `requires_thinking`, `supports_vision`, `supports_fast`,
   `supports_tool_examples`, `tier` and `provider_data`. The first
   descriptor with a tier is that tier's default.
-  `prepare` (function) Required. `prepare(ctx, model)` returns an instance
-  for one model descriptor, optionally followed by an adjusted descriptor
-  with the same id, or nil plus an error.
-  `discover` (function) Optional. `discover(ctx)` returns the descriptors
-  the provider offers now.
+  `prepare` (function) Required. `prepare(ctx, model, config)` returns an
+  instance for one model descriptor, optionally followed by an adjusted
+  descriptor with the same id, or nil plus an error. `config` is the
+  provider's `providers.toml` section as a table, read at each call.
+  `discover` (function) Optional. `discover(ctx, config)` returns the
+  descriptors the provider offers now.
   `config` (table) Optional. `providers.toml` fields asked before login:
   `{ key, prompt, default?, secret?, optional?, choices? }`, where
   `choices` is a list of `{ id, label, detail? }`. Keys are the text
@@ -1261,7 +1264,7 @@ maki.api.register_provider({
       return ctx.credentials:write({ api_key = key })
     end },
   },
-  prepare = function(ctx, model)
+  prepare = function(ctx, model, config)
     return {
       stream = function(ctx, request, emit)
         emit({ type = "text_delta", text = "hi" })
@@ -4786,8 +4789,8 @@ ui:device_code("https://example.com/device", "ABCD-1234")
 LoginUi:open_browser({url})
 ```
 
-Show {url} and open it in the user's browser, like `maki.host.open`. The
-URL stays on screen in case the browser does not open. Returns at once.
+Ask the frontend to open {url} in the user's browser. It also shows the
+URL, in case the browser does not open. Returns at once.
 
 **Parameters:**
 

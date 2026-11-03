@@ -5,6 +5,7 @@ use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 
 use maki_providers::ProviderRegistry;
+use maki_providers::login::{AuthState, auth_status};
 use maki_providers::manifest::ManifestRegistry;
 use maki_providers::model::{Model, ModelError, ModelTier};
 use maki_storage::StateDir;
@@ -63,7 +64,7 @@ pub fn resolve_model(
         return from_spec_or_warm_catalog(providers, spec)
             .context("invalid default_model in config");
     }
-    auto_detect_model(providers, policy).ok_or_else(|| {
+    auto_detect_model(providers, policy, storage).ok_or_else(|| {
         let policy_note = if policy.is_restrictive() {
             "\nnote: an allowed_models/excluded_models policy is active and may exclude every candidate"
         } else {
@@ -91,13 +92,24 @@ fn from_spec_or_warm_catalog(
     }
 }
 
+/// A registered provider counts once it reports credentials; a native one
+/// once it can be built.
 fn auto_detect_model(
     providers: &ProviderRegistry,
     policy: &maki_config::ModelPolicy,
+    storage: &StateDir,
 ) -> Option<Model> {
+    let statuses = smol::block_on(auth_status(providers, storage));
+    let usable = |slug: &str| match statuses.iter().find(|provider| *provider.id == *slug) {
+        Some(provider) => !matches!(
+            provider.status.state,
+            AuthState::Missing | AuthState::Failed
+        ),
+        None => providers.available(slug),
+    };
     for tier in [ModelTier::Strong, ModelTier::Medium] {
         for &slug in PROVIDER_PRIORITY {
-            if providers.available(slug)
+            if usable(slug)
                 && let Ok(model) = providers.model_for_tier(slug, tier, policy)
             {
                 return Some(model);

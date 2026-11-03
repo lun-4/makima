@@ -23,7 +23,6 @@ static CUSTOM_OPENAI_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     // Custom providers resolve their own base URL (including any override) from
     // config, so the compat-layer fallback slug is unused here.
     slug: "",
-    api_key_env: "",
     base_url: "",
     max_tokens_field: "max_tokens",
     include_stream_usage: true,
@@ -155,6 +154,7 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
         supports_vision_override,
         supports_fast_override: None,
         pricing,
+        pricing_schedule: None,
         max_output_tokens,
         turn_output_tokens: None,
         context_window,
