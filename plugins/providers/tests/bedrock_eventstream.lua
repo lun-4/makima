@@ -62,6 +62,7 @@ t.case("exception_frame_is_an_api_error", function()
     throttlingException = { 429, "rate_limit" },
     ThrottlingException = { 429, "rate_limit" },
     modelStreamErrorException = { 500, "transient" },
+    modelTimeoutException = { 500, "transient" },
   }
   for name, case in pairs(cases) do
     local wire = frame({ [":message-type"] = "exception", [":exception-type"] = name }, THROTTLED)

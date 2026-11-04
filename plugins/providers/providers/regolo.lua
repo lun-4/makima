@@ -96,10 +96,10 @@ function M.spend_rows(entries)
       by_model[entry.model_group] = row
       order[#order + 1] = row
     end
-    row.input_tokens += entry.prompt_tokens
-    row.output_tokens += entry.completion_tokens
-    row.total_tokens += entry.total_tokens
-    row.spend += entry.spend
+    row.input_tokens = row.input_tokens + entry.prompt_tokens
+    row.output_tokens = row.output_tokens + entry.completion_tokens
+    row.total_tokens = row.total_tokens + entry.total_tokens
+    row.spend = row.spend + entry.spend
   end
   for _, row in ipairs(order) do
     row.spend_microdollars = math.floor(row.spend * compat.PER_MILLION + 0.5)

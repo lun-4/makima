@@ -201,9 +201,20 @@ fn build_stack(
             (last_model, false)
         }
         (Err(e), None) if !cli.print => {
-            let placeholder = providers
-                .spec_for_tier_any(ModelTier::Medium)
-                .and_then(|spec| providers.model(&spec).ok())
+            let placeholder = [ModelTier::Strong, ModelTier::Medium, ModelTier::Weak]
+                .into_iter()
+                .find_map(|tier| {
+                    providers
+                        .spec_for_tier_any(tier)
+                        .filter(|spec| config.provider.model_policy.allows(spec))
+                        .and_then(|spec| providers.model(&spec).ok())
+                })
+                .or_else(|| {
+                    providers
+                        .offline_specs(&config.provider.model_policy)
+                        .into_iter()
+                        .find_map(|spec| providers.model(&spec).ok())
+                })
                 .ok_or(e)?;
             (placeholder, true)
         }

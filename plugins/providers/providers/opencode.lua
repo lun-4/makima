@@ -102,19 +102,11 @@ end
 -- An instance for {model_id} of catalog provider {sub}, keyed from its own
 -- variables only, since its saved credentials belong to it.
 local function delegate(ctx, config, sub, entry, model_id)
-  local env = catalog.env_name(type(entry.env) == "table" and entry.env or {})
-  if (env and maki.uv.os_getenv(env) or "") == "" then
-    return nil,
-      http.config_error(
-        string.format(
-          "authentication required for provider '%s'; set its key variable or use `%s/%s`",
-          sub,
-          sub,
-          model_id
-        )
-      )
+  local keys, key_err = catalog.api_keys(ctx, {}, entry)
+  if not keys then
+    return nil, key_err
   end
-  local client, err = catalog.client(sub, entry, http.key_pool(http.api_keys(ctx, {}, env)), config)
+  local client, err = catalog.client(sub, entry, http.key_pool(keys), config)
   if not client then
     return nil, err
   end

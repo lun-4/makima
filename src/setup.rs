@@ -82,13 +82,11 @@ fn auto_detect_model(
             )
         })
         .collect();
-    [ModelTier::Strong, ModelTier::Medium]
-        .into_iter()
-        .find_map(|tier| {
-            usable
-                .iter()
-                .find_map(|provider| providers.model_for_tier(&provider.id, tier, policy).ok())
-        })
+    usable.iter().find_map(|provider| {
+        [ModelTier::Strong, ModelTier::Medium]
+            .into_iter()
+            .find_map(|tier| providers.model_for_tier(&provider.id, tier, policy).ok())
+    })
 }
 
 pub fn install_panic_log_hook() {

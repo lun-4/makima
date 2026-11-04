@@ -755,15 +755,17 @@ impl ActorBackend for HeadlessBackend {
                         history.snapshot().clone(),
                     )
                     .await;
-                    if result.is_err() {
-                        history.replace_snapshot(previous);
-                    }
-                    if let Ok(config) = self.config(&context).await {
-                        end_conversation_detached(
-                            &config.settings.provider,
-                            ended,
-                            ConversationEnd::Closed,
-                        );
+                    match &result {
+                        Ok(()) => {
+                            if let Some(config) = &context.policy {
+                                end_conversation_detached(
+                                    &config.settings.provider,
+                                    ended,
+                                    ConversationEnd::Closed,
+                                );
+                            }
+                        }
+                        Err(_) => history.restore_snapshot(previous),
                     }
                     let _ = reply.send(result);
                 }
@@ -1228,6 +1230,33 @@ pub(crate) mod tests {
     struct RecordingProvider {
         name: &'static str,
         requests: flume::Sender<(&'static str, String, String, bool)>,
+    }
+
+    struct EndRecordingProvider(flume::Sender<(String, ConversationEnd)>);
+
+    impl Provider for EndRecordingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<maki_providers::ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+            _: &'a Invocation,
+        ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
+            Box::pin(async { unreachable!() })
+        }
+
+        fn end_conversation(
+            &self,
+            conversation_id: &str,
+            reason: ConversationEnd,
+        ) -> BoxFuture<'_, ()> {
+            let _ = self.0.send((conversation_id.to_owned(), reason));
+            Box::pin(async {})
+        }
     }
 
     impl Provider for RecordingProvider {
@@ -1733,6 +1762,51 @@ pub(crate) mod tests {
                 )
             );
             assert!(received.is_empty());
+            handle.task.cancel().await;
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn failed_reset_restores_history_and_does_not_close_conversation() {
+        smol::block_on(async {
+            let (attempted_tx, attempted_rx) = flume::bounded(1);
+            let checkpoint: Checkpoint = Arc::new(
+                move |request: CheckpointRequest<crate::session_coordinator::SessionCheckpoint>| {
+                    let attempted_tx = attempted_tx.clone();
+                    Box::pin(async move {
+                        attempted_tx
+                            .send_async(request.snapshot.history.clone().unwrap())
+                            .await
+                            .unwrap();
+                        Err(CheckpointError::Save {
+                            session_id: request.session_id,
+                            message: Arc::from(SAVE_ERROR),
+                        })
+                    }) as CheckpointFuture
+                },
+            );
+            let (ended_tx, ended_rx) = flume::unbounded();
+            let history = vec![Message::user("kept".into())];
+            let (handle, coordinator) = fixture(
+                history.clone(),
+                checkpoint,
+                Arc::new(EndRecordingProvider(ended_tx)),
+            );
+            let root = handle.initialized_root().await.unwrap();
+            let (reply, response) = flume::bounded(1);
+
+            handle
+                .control_tx
+                .send(InteractiveControl::Reset(reply))
+                .await
+                .unwrap();
+
+            assert!(bounded(response.recv_async()).await.unwrap().is_err());
+            let attempted = bounded(attempted_rx.recv_async()).await.unwrap();
+            assert!(attempted.messages.is_empty());
+            assert_eq!(root.actor().unwrap().committed_history().as_ref(), &history);
+            assert!(ended_rx.is_empty());
             handle.task.cancel().await;
             coordinator.close().await.unwrap();
         });

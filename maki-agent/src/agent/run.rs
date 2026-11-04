@@ -671,7 +671,7 @@ impl<'h> Agent<'h> {
         }
     }
 
-    fn request_tools(&self) -> Result<Cow<'_, Value>, AgentError> {
+    fn request_tools(&self) -> Result<Value, AgentError> {
         let def = self.mode_def.as_ref().ok_or_else(|| AgentError::Config {
             message: format!("mode '{}' is not defined", self.mode.id().key()),
         })?;
@@ -695,7 +695,7 @@ impl<'h> Agent<'h> {
                     .is_some_and(|name| tool_dispatch::authorize_advertised(&ctx, name))
             });
         }
-        Ok(tools)
+        Ok(tools.into_owned())
     }
 
     async fn turn(&mut self) -> Result<TurnProgress, AgentError> {
@@ -704,8 +704,8 @@ impl<'h> Agent<'h> {
         }
         self.consume_turn_inbox()?;
         self.pending_instruction_request = false;
-        self.history.mark_sent();
         let tools = self.request_tools()?;
+        self.history.mark_sent();
         if let Some(inbox) = &self.turn_inbox {
             inbox.instructions_submitted();
         }
@@ -720,7 +720,7 @@ impl<'h> Agent<'h> {
             &self.model,
             self.history.as_slice(),
             &self.system,
-            tools.as_ref(),
+            &tools,
             &self.event_tx,
             &self.cancel,
             self.opts,
@@ -3300,6 +3300,10 @@ mod tests {
         ));
         assert!(matches!(outcome, TurnOutcome::Failed { num_turns: 0, .. }));
         assert!(agent.mode_def.is_none());
+        assert_eq!(agent.history.conversation().sent, None);
+        let unsent = Arc::clone(agent.history.conversation_id());
+        assert_eq!(agent.history.continue_conversation(), unsent);
+        assert_eq!(agent.history.conversation().previous, None);
     }
 
     #[test]
@@ -3400,7 +3404,6 @@ mod tests {
             .unwrap();
         let tools = agent.request_tools().unwrap();
         let names: Vec<&str> = tools
-            .as_ref()
             .as_array()
             .unwrap()
             .iter()
@@ -3423,7 +3426,6 @@ mod tests {
         let names: Vec<String> = agent
             .request_tools()
             .unwrap()
-            .as_ref()
             .as_array()
             .unwrap()
             .iter()

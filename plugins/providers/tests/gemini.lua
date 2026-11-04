@@ -204,6 +204,11 @@ t.case("additional_properties_are_stripped_at_every_depth", function()
   })
 end)
 
+t.case("null_stream_event_is_ignored", function()
+  local result = assert(gemini.stream(t.response({ "data: null\n\n" }), t.recorder()))
+  t.same(result.message.content, {})
+end)
+
 t.case("stream_call_ids_signatures_and_max_tokens", function()
   local call = { functionCall = { name = "bash", args = { cmd = "ls" }, thoughtSignature = "nested" } }
   local result = assert(

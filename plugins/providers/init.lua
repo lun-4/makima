@@ -26,10 +26,12 @@ end
 
 -- Providers the user defines: a bad one is logged and left out instead of
 -- taking every provider down with it.
-local function register_user(spec, source)
-  local ok, err = pcall(register, spec)
+local function register_user(id, source, make_spec)
+  local ok, err = pcall(function()
+    register(make_spec())
+  end)
   if not ok then
-    maki.log.warn(string.format("%s: provider %s left out: %s", source, spec.id, tostring(err)))
+    maki.log.warn(string.format("%s: provider %s left out: %s", source, id, tostring(err)))
   end
 end
 
@@ -79,7 +81,9 @@ end
 table.sort(ids)
 for _, id in ipairs(ids) do
   if not registered[id] then
-    register_user(custom.provider(id, sections[id]), "providers.toml")
+    register_user(id, "providers.toml", function()
+      return custom.provider(id, sections[id])
+    end)
   end
 end
 
@@ -90,7 +94,9 @@ if config_dir then
     if registered[script.slug] then
       maki.log.warn(string.format("%s: provider id %s is already taken, skipping", script.path, script.slug))
     else
-      register_user(executable.provider(script, bases[script.info.base]), script.path)
+      register_user(script.slug, script.path, function()
+        return executable.provider(script, bases[script.info.base])
+      end)
     end
   end
 end

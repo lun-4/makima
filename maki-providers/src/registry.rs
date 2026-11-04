@@ -7,6 +7,7 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use maki_config::ModelPolicy;
 use serde::Deserialize;
 use serde_json::Value;
@@ -111,14 +112,6 @@ impl Entry {
 
     fn models(&self) -> Arc<[ModelInfo]> {
         Arc::clone(&self.models.read().unwrap())
-    }
-
-    fn info(&self, model_id: &str) -> ModelInfo {
-        self.models()
-            .iter()
-            .find(|info| info.id == model_id)
-            .cloned()
-            .unwrap_or_else(|| ModelInfo::id_only(model_id.to_string()))
     }
 
     /// The descriptor whose id is the longest prefix of {model_id}, as the
@@ -283,7 +276,7 @@ impl ProviderRegistry {
                 message: format!("unknown provider '{}'", model.provider),
             });
         };
-        let info = entry.info(&model.id);
+        let info = entry.resolved(&model.id);
         entry.backend.prepare(model, info).await
     }
 
@@ -303,20 +296,16 @@ impl ProviderRegistry {
         refresh: bool,
         mut on_ready: impl FnMut(ModelBatch) + Send,
     ) {
-        let (tx, rx) = flume::unbounded();
-        for (provider, entry) in self.entries() {
-            let Some(discovery) = entry.backend.discover(refresh) else {
-                continue;
-            };
-            let tx = tx.clone();
-            let provider = Arc::clone(provider);
-            smol::spawn(async move {
-                let _ = tx.send_async((provider, discovery.await)).await;
+        let discoveries = self
+            .entries()
+            .filter_map(|(provider, entry)| {
+                let discovery = entry.backend.discover(refresh)?;
+                let provider = Arc::clone(provider);
+                Some(async move { (provider, discovery.await) })
             })
-            .detach();
-        }
-        drop(tx);
-        while let Ok((provider, result)) = rx.recv_async().await {
+            .collect::<FuturesUnordered<_>>();
+        futures::pin_mut!(discoveries);
+        while let Some((provider, result)) = discoveries.next().await {
             on_ready(self.apply_discovery(provider, result, policy));
         }
     }

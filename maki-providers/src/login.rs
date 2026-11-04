@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use futures::future::join_all;
+use maki_config::ModelPolicy;
 use maki_config::providers::ProvidersConfig;
 use maki_storage::StateDir;
 use maki_storage::auth::{delete_credentials, load_credentials, save_credentials};
@@ -131,7 +132,6 @@ impl AuthState {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AuthStatus {
     pub state: AuthState,
     #[serde(default)]
@@ -173,6 +173,7 @@ pub async fn drive_login(
     registry: &ProviderRegistry,
     ui: Arc<dyn InteractionService>,
     storage: &StateDir,
+    policy: &ModelPolicy,
     request: LoginRequest,
 ) -> Result<LoginOutcome, AgentError> {
     let name = match request.provider {
@@ -223,14 +224,8 @@ pub async fn drive_login(
     };
 
     let config = serde_json::to_value(&pending)?;
-    let snapshot = load_credentials(storage, id);
-    let model = match checked_login(entry, id, storage, method, config, ui).await {
-        Ok(model) => model,
-        Err(error) => {
-            restore(storage, id, snapshot);
-            return Err(error);
-        }
-    };
+    let mut rollback = CredentialRollback::new(storage, id);
+    let model = checked_login(entry, id, storage, method, config, ui).await?;
     if !answers.is_empty() {
         let mut providers = ProvidersConfig::try_load().map_err(config_error)?;
         providers.upsert(id.to_string(), pending);
@@ -238,11 +233,16 @@ pub async fn drive_login(
     }
     let model = match model {
         Some(model) => Some(format!("{id}/{model}")),
-        None => registry.spec_for_tier(id, ModelTier::Strong),
-    };
+        None => [ModelTier::Strong, ModelTier::Medium]
+            .into_iter()
+            .find_map(|tier| registry.model_for_tier(id, tier, policy).ok())
+            .map(|model| model.spec()),
+    }
+    .filter(|spec| policy.allows(spec));
     if let Some(spec) = &model {
         persist_model(storage, spec);
     }
+    rollback.disarm();
     Ok(LoginOutcome {
         provider: Arc::clone(id),
         display_name: Arc::clone(&entry.display_name),
@@ -344,6 +344,34 @@ async fn status_of(
             },
             detail: None,
         }),
+    }
+}
+
+struct CredentialRollback<'a> {
+    storage: &'a StateDir,
+    id: &'a str,
+    snapshot: Option<Option<Value>>,
+}
+
+impl<'a> CredentialRollback<'a> {
+    fn new(storage: &'a StateDir, id: &'a str) -> Self {
+        Self {
+            storage,
+            id,
+            snapshot: Some(load_credentials(storage, id)),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.snapshot = None;
+    }
+}
+
+impl Drop for CredentialRollback<'_> {
+    fn drop(&mut self) {
+        if let Some(snapshot) = self.snapshot.take() {
+            restore(self.storage, self.id, snapshot);
+        }
     }
 }
 
@@ -595,6 +623,7 @@ mod tests {
                 registry,
                 ui,
                 &self.storage,
+                &ModelPolicy::default(),
                 LoginRequest {
                     provider: provider.map(str::to_owned),
                 },
@@ -836,6 +865,30 @@ mod tests {
         assert_eq!(matches!(error, AgentError::Cancelled), cancelled, "{error}");
         assert_eq!(saved_url(), None);
         assert_eq!(fixture.saved_key(), Some(json!(OLD_KEY)));
+        assert_eq!(read_model(&fixture.storage), None);
+    }
+
+    #[test]
+    fn disallowed_login_model_is_not_returned_or_persisted() {
+        let fixture = Fixture::new();
+        let registry = fixture.registry(
+            FakeAuthBackend::new(&fixture.storage, Status::CredentialsFile),
+            &[KEY_METHOD],
+        );
+        let policy = ModelPolicy::new(&[], &[format!("{PROVIDER}/{STRONG_MODEL}")]).unwrap();
+        let outcome = smol::block_on(drive_login(
+            &registry,
+            ScriptedInteraction::new(&[ANSWERED_URL, KEY]),
+            &fixture.storage,
+            &policy,
+            LoginRequest {
+                provider: Some(PROVIDER.into()),
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(outcome.model, None);
+        assert_eq!(fixture.saved_key(), Some(json!(KEY)));
         assert_eq!(read_model(&fixture.storage), None);
     }
 

@@ -64,7 +64,7 @@ use maki_lua::{
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::Provider;
-use maki_providers::{Message, Model, PreparedProvider, ProviderRegistry};
+use maki_providers::{Message, Model, ModelTier, PreparedProvider, ProviderRegistry};
 use maki_storage::StateDir;
 use maki_storage::StorageError;
 use maki_storage::checkpoint::CheckpointPublication;
@@ -3436,6 +3436,16 @@ impl<'t> EventLoop<'t> {
         } = old;
         let retired_id = app.state.session.id;
         let replaced_session = retired_id != self.sessions[idx].id();
+        let ended_conversation = replaced_session
+            .then(|| handles.history.load().conversation.clone())
+            .flatten()
+            .filter(|conversation| conversation.sent.is_some())
+            .map(|conversation| {
+                (
+                    Arc::clone(&app.root_config().settings.provider),
+                    conversation.id,
+                )
+            });
         if let Err(error) = release_lock_state(session_lock) {
             warn!(%error, "old session lock release failed");
         }
@@ -3446,6 +3456,11 @@ impl<'t> EventLoop<'t> {
             shutdown.await;
             drop(held);
             if replaced_session {
+                if let Some((provider, conversation_id)) = ended_conversation {
+                    provider
+                        .end_conversation(&conversation_id, maki_providers::ConversationEnd::Closed)
+                        .await;
+                }
                 let _ = coordinator.close().await;
                 storage_writer.forget(retired_id);
             }
@@ -4447,7 +4462,29 @@ impl<'t> EventLoop<'t> {
         let model = self.sessions[idx].model_slot.load().model.clone();
         if model.provider.to_string() == slug {
             self.reprepare_root_model(idx, model.spec());
+            return;
         }
+        let Some(spec) = [ModelTier::Strong, ModelTier::Medium, ModelTier::Weak]
+            .into_iter()
+            .find_map(|tier| {
+                self.ctx
+                    .providers
+                    .model_for_tier(&slug, tier, &self.ctx.model_policy)
+                    .ok()
+            })
+            .map(|model| model.spec())
+        else {
+            return;
+        };
+        self.dispatch_model_selection(
+            idx,
+            self.selected_target(idx),
+            maki_commands::ModelSelection {
+                spec: Some(Arc::from(spec)),
+                ..Default::default()
+            },
+            None,
+        );
     }
 
     fn shutdown(mut self) -> ShutdownReport {
@@ -4944,7 +4981,6 @@ mod tests {
     const OBSERVATION: &str = "failed";
     const PENDING_FAST_MODEL: &str = "pending-fast-model";
     const SWITCHED_FAST_MODEL: &str = "switched-fast-model";
-    /// Re-preparing needs a constructible native provider.
     const DISCOVERY_PROVIDER: &str = "tui-discovery";
     const STARTUP_MODEL_ID: &str = "tui-discovery-startup";
     const RESUMED_MODEL_ID: &str = "tui-discovery-resumed";

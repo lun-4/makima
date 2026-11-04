@@ -4345,6 +4345,7 @@ mod tests {
     }
 
     #[test_case("claude-opus-4-6", "anthropic/claude-opus-4-6"; "bare_id_of_a_known_spec")]
+    #[test_case("claude-future", "claude-future"; "bare_claude_id_not_in_registry")]
     #[test_case("openai/gpt-4", "openai/gpt-4"; "explicit_provider")]
     #[test_case("gpt-4o", "gpt-4o"; "unknown_passthrough")]
     fn resolve_model_spec_cases(input: &str, expected: &str) {

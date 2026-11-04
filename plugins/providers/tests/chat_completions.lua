@@ -96,6 +96,11 @@ t.case("stream_text_reasoning_and_usage", function()
   })
 end)
 
+t.case("done_marker_allows_whitespace", function()
+  local result = assert(chat.stream(t.response({ "data: [DONE]  \n\n" }), t.recorder()))
+  t.same(result.message.content, {})
+end)
+
 t.case("stream_tool_calls_by_wire_index", function()
   local emit, events = t.recorder()
   local result = assert(chat.stream(

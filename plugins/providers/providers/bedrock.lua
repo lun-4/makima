@@ -79,7 +79,7 @@ function M.parse_container_credentials(body)
     access_key = body.AccessKeyId,
     secret_key = body.SecretAccessKey,
     session_token = type(body.Token) == "string" and body.Token or nil,
-    expires_at = expires and expires // MILLIS,
+    expires_at = expires and math.floor(expires / MILLIS),
   }
 end
 
@@ -206,8 +206,8 @@ function M.amz_timestamp(secs)
   return string.format(
     "%sT%02d%02d%02dZ",
     (clock.utc_date(secs):gsub("-", "")),
-    of_day // 3600,
-    of_day % 3600 // 60,
+    math.floor(of_day / 3600),
+    math.floor(of_day % 3600 / 60),
     of_day % 60
   )
 end

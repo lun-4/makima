@@ -16,7 +16,7 @@ local UNKNOWN_EXCEPTION_STATUS = 500
 local EXCEPTION_STATUS = {
   throttlingexception = 429,
   validationexception = 400,
-  modeltimeoutexception = 408,
+  modeltimeoutexception = 500,
   serviceunavailableexception = 503,
   internalserverexception = 500,
 }
@@ -37,11 +37,11 @@ local function parse_headers(bytes)
     local name_length = string.byte(bytes, pos)
     local name = bytes:sub(pos + 1, pos + name_length)
     local kind = string.byte(bytes, pos + 1 + name_length)
-    pos += 2 + name_length
+    pos = pos + 2 + name_length
     local length = FIXED_HEADER_BYTES[kind]
     if (kind == STRING_HEADER or kind == BYTES_HEADER) and pos + 1 <= #bytes then
       length = uint(bytes, pos, 2)
-      pos += 2
+      pos = pos + 2
     end
     if not length or pos + length - 1 > #bytes then
       return nil, INVALID .. "malformed header"
@@ -49,7 +49,7 @@ local function parse_headers(bytes)
     if kind == STRING_HEADER then
       headers[name] = bytes:sub(pos, pos + length - 1)
     end
-    pos += length
+    pos = pos + length
   end
   return headers
 end
@@ -77,8 +77,8 @@ function M.frames(response)
       end
       local length = math.min(count - size, #pending - offset + 1)
       parts[#parts + 1] = pending:sub(offset, offset + length - 1)
-      offset += length
-      size += length
+      offset = offset + length
+      size = size + length
     end
     return table.concat(parts)
   end
@@ -107,10 +107,13 @@ end
 -- The Messages event inside a `chunk` frame: `{ bytes }` holding base64 JSON.
 local function chunk_event(payload)
   local envelope = maki.json.decode(payload)
-  if type(envelope) ~= "table" or type(envelope.bytes) ~= "string" then
+  if type(envelope) ~= "table" then
     return nil, INVALID .. "invalid chunk"
   end
-  local value = maki.json.decode(maki.base64.decode(envelope.bytes))
+  local value = envelope
+  if type(envelope.bytes) == "string" then
+    value = maki.json.decode(maki.base64.decode(envelope.bytes))
+  end
   if type(value) ~= "table" then
     return nil, INVALID .. "invalid chunk payload"
   end

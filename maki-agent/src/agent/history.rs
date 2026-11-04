@@ -76,11 +76,11 @@ impl History {
         &self.conversation.id
     }
 
-    /// Records that the whole history went out as a request. Published with
-    /// the next change, since an undercount only costs a provider its cache.
+    /// Records that the whole history went out as a request.
     pub fn mark_sent(&mut self) {
         self.conversation.sent = Some(self.len());
         self.snapshot.conversation = Some(self.conversation.clone());
+        self.publish();
     }
 
     /// The link a copy of the first `kept` messages carries.
@@ -165,6 +165,15 @@ impl History {
             conversation: Some(self.conversation.clone()),
             ..snapshot
         };
+        self.publish();
+    }
+
+    pub(crate) fn restore_snapshot(&mut self, snapshot: HistorySnapshot) {
+        if let Some(conversation) = &snapshot.conversation {
+            self.conversation = conversation.clone();
+        }
+        self.snapshot = snapshot;
+        self.snapshot.conversation = Some(self.conversation.clone());
         self.publish();
     }
 
@@ -362,6 +371,8 @@ mod tests {
 
         let previous = history.snapshot().clone();
         history.mark_sent();
+        let sent = history.conversation().clone();
+        assert_eq!(mirror_conversation(&mirror), sent);
         let ended = history.continue_conversation();
         assert_eq!(ended.as_ref(), STORED);
         let current = history.conversation().clone();

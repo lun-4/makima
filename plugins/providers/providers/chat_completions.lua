@@ -172,7 +172,7 @@ function M.stream(response, emit)
       end
       break
     end
-    if event.data == DONE then
+    if event.data:match("^%s*(.-)%s*$") == DONE then
       break
     end
     local chunk = maki.json.decode(event.data)

@@ -42,7 +42,7 @@ pub struct Cli {
     #[arg(long = "image", value_name = "PATH")]
     pub images: Vec<PathBuf>,
 
-    /// Model spec (provider/model-id). Defaults to last used model, or claude-opus-4-6
+    /// Model spec (provider/model-id). Defaults to the saved, configured, or auto-detected model
     #[arg(short, long)]
     pub model: Option<String>,
 
@@ -366,11 +366,13 @@ pub fn normalize_tool_name(name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use clap::error::ErrorKind;
     use test_case::test_case;
 
     const PROMPT: &str = "hello";
     const PROMPT_EQUALS_ARG: &str = "--prompt=hello";
+    const MODEL_HELP: &str = "Defaults to the saved, configured, or auto-detected model";
 
     #[test_case("Read", "read")]
     #[test_case("Bash", "bash")]
@@ -390,6 +392,16 @@ mod tests {
     #[test]
     fn normalize_tool_name_multi_edit_rejects_snake_variant() {
         assert!(normalize_tool_name("MultiEdit").is_err());
+    }
+
+    #[test]
+    fn model_help_describes_resolution_order() {
+        assert!(
+            Cli::command()
+                .render_long_help()
+                .to_string()
+                .contains(MODEL_HELP)
+        );
     }
 
     #[test]

@@ -108,11 +108,11 @@ pub async fn run_isolated_turn(
     .await;
     drop(provider_tx);
     forwarder.await;
-    let reason = match result {
-        Err(crate::AgentError::Cancelled) => ConversationEnd::Cancelled,
-        _ => ConversationEnd::Closed,
-    };
-    end_conversation_detached(&provider, invocation.conversation_id, reason);
+    end_conversation_detached(
+        &provider,
+        invocation.conversation_id,
+        ConversationEnd::Closed,
+    );
     let terminal = match result {
         Ok(_) => IsolatedTurnEvent::Done,
         Err(crate::AgentError::Cancelled) => IsolatedTurnEvent::Cancelled,
@@ -256,13 +256,9 @@ mod tests {
         }
     }
 
-    #[test_case(ProviderOutcome::Success, false, ConversationEnd::Closed ; "finished")]
-    #[test_case(ProviderOutcome::Pending, true, ConversationEnd::Cancelled ; "cancelled")]
-    fn isolated_turn_ends_its_own_conversation(
-        outcome: ProviderOutcome,
-        cancelled: bool,
-        reason: ConversationEnd,
-    ) {
+    #[test_case(ProviderOutcome::Success, false ; "finished")]
+    #[test_case(ProviderOutcome::Pending, true ; "cancelled")]
+    fn isolated_turn_ends_its_own_conversation(outcome: ProviderOutcome, cancelled: bool) {
         smol::block_on(async {
             let (trigger, cancel) = CancelToken::new();
             if cancelled {
@@ -298,7 +294,7 @@ mod tests {
             assert_eq!(invocation.previous, Some(link()));
             assert_eq!(
                 ended_rx.recv_async().await.unwrap(),
-                (invocation.conversation_id, reason)
+                (invocation.conversation_id, ConversationEnd::Closed)
             );
         });
     }

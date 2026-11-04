@@ -554,7 +554,11 @@ impl App {
         let model_picker_models = Arc::new(ArcSwapOption::from(Some(Arc::new(Vec::new()))));
         let prepared_command_target = command_runtime.prepare_target();
         let command_target = prepared_command_target.handle().clone();
-        let login_picker = LoginPicker::new(Arc::clone(&providers), storage.clone());
+        let login_picker = LoginPicker::new(
+            Arc::clone(&providers),
+            storage.clone(),
+            Arc::clone(&model_policy),
+        );
         let mut app = Self {
             chats: vec![Chat::new(
                 "Main".into(),

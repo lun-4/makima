@@ -1,5 +1,7 @@
+use std::fs;
 use std::future::Future;
 use std::net::TcpListener;
+use std::process::Command;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -51,6 +53,12 @@ const LOCAL_MODEL: &str = "llama-cpp/local-model";
 const LOCAL_HOST_ENV: &str = "LLAMA_CPP_HOST";
 const LOOPBACK: &str = "127.0.0.1:0";
 const CONVERSATION: &str = "conversation";
+const MALFORMED_PROVIDER: &str = "broken-custom";
+const VALID_CUSTOM_PROVIDER: &str = "valid-custom";
+const VALID_CUSTOM_MODEL: &str = "valid-custom/model";
+const MALFORMED_CONFIG: &str = "[broken\n";
+const PROVIDER_CONFIG_FATAL_CHILD: &str = "provider_config_fatal_child";
+const BAD_CONFIG_EXIT_CODE: i32 = 2;
 const AUTO_DETECT_ORDER: &[&str] = &[
     "anthropic",
     "openai",
@@ -127,7 +135,10 @@ impl Fixture {
     }
 
     fn with_plugin(plugin: &str, source: &str) -> Self {
-        let state = TempDir::new().unwrap();
+        Self::with_plugin_state(plugin, source, TempDir::new().unwrap())
+    }
+
+    fn with_plugin_state(plugin: &str, source: &str, state: TempDir) -> Self {
         maki_storage::paths::init_at(state.path().to_path_buf()).unwrap();
         let host = PluginHost::with_session_provider_preparer(
             Arc::new(ToolRegistry::new()),
@@ -167,7 +178,13 @@ impl Fixture {
             provider: Some(provider.into()),
         };
         let login = thread::spawn(move || {
-            smol::block_on(bounded(drive_login(&registry, ui, &storage, request)))
+            smol::block_on(bounded(drive_login(
+                &registry,
+                ui,
+                &storage,
+                &maki_config::ModelPolicy::default(),
+                request,
+            )))
         });
         (asked_rx, login)
     }
@@ -308,6 +325,49 @@ fn bundled_providers_keep_auto_detect_order() {
     let fixture = Fixture::with_plugin(BUNDLED_PLUGIN, BUNDLED_SOURCE);
     let ids: Vec<_> = fixture.states().into_iter().map(|(id, ..)| id).collect();
     assert_eq!(ids[..AUTO_DETECT_ORDER.len()], *AUTO_DETECT_ORDER);
+}
+
+#[test]
+fn malformed_provider_section_is_skipped_without_aborting_bundled_plugin() {
+    let state = TempDir::new().unwrap();
+    fs::write(
+        state.path().join("providers.toml"),
+        format!(
+            "[{MALFORMED_PROVIDER}]\nprotocol = \"opneai\"\n\n[{VALID_CUSTOM_PROVIDER}]\nprotocol = \"openai\"\nbase_url = \"http://example.test/v1\"\n\n[[{VALID_CUSTOM_PROVIDER}.models]]\nid = \"model\"\n"
+        ),
+    )
+    .unwrap();
+
+    let fixture = Fixture::with_plugin_state(BUNDLED_PLUGIN, BUNDLED_SOURCE, state);
+
+    let ids: Vec<_> = fixture
+        .registry
+        .listings()
+        .map(|provider| provider.id)
+        .collect();
+    assert!(!ids.contains(&MALFORMED_PROVIDER));
+    assert!(ids.contains(&VALID_CUSTOM_PROVIDER));
+    assert!(fixture.registry.model(VALID_CUSTOM_MODEL).is_ok());
+}
+
+#[test]
+fn malformed_provider_config_remains_fatal_during_bundled_registration() {
+    if std::env::var_os(PROVIDER_CONFIG_FATAL_CHILD).is_some() {
+        let state = TempDir::new().unwrap();
+        fs::write(state.path().join("providers.toml"), MALFORMED_CONFIG).unwrap();
+        let _fixture = Fixture::with_plugin_state(BUNDLED_PLUGIN, BUNDLED_SOURCE, state);
+        panic!("malformed providers.toml did not exit");
+    }
+
+    let output = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("malformed_provider_config_remains_fatal_during_bundled_registration")
+        .arg("--nocapture")
+        .env(PROVIDER_CONFIG_FATAL_CHILD, "1")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(BAD_CONFIG_EXIT_CODE));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid"));
 }
 
 /// The bundled plugin classes every provider's stream errors, so a local

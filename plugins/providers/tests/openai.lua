@@ -15,7 +15,7 @@ local spec = openai.provider()
 
 local function now_ms()
   local now = maki.time.now()
-  return now.secs * 1000 + now.nanosecs // 1000000
+  return now.secs * 1000 + math.floor(now.nanosecs / 1000000)
 end
 
 local function jwt(claims)
@@ -561,6 +561,14 @@ t.case("discovery_lists_the_account_plan_models", function()
   t.eq(#assert(spec.discover(ctx, {})), #spec.models)
 end)
 
+t.case("state_setup_errors_are_reported", function()
+  local config = { headers = { ["X-Gateway"] = "${MISSING_GATEWAY}" } }
+  local _, discover_err = spec.discover(t.provider_ctx({}), config)
+  local _, prepare_err = spec.prepare(t.provider_ctx({}), { id = "gpt-4.1" }, config)
+  t.same(discover_err, prepare_err)
+  t.eq(discover_err.kind, http.CONFIG_KIND)
+end)
+
 t.case("discovery_with_an_api_key_lists_platform_models", function()
   local ctx = t.provider_ctx({ json({ data = { { id = "gpt-new" }, { id = "gpt-4.1" } } }) })
   local models
@@ -570,6 +578,16 @@ t.case("discovery_with_an_api_key_lists_platform_models", function()
   t.eq(ctx.requests[1].url, API .. "/models")
   t.eq(models[#models].id, "gpt-new")
   t.eq(#models, #spec.models + 1)
+end)
+
+t.case("unreadable_oauth_falls_back_to_api_key_status", function()
+  local ctx = t.provider_ctx({})
+  ctx.credentials.read = function()
+    return nil, "keyring locked"
+  end
+  t.with_env({ [KEY_ENV] = "sk" }, function()
+    t.same(spec.auth_status(ctx, {}), { state = "env", detail = "via " .. KEY_ENV })
+  end)
 end)
 
 t.case("login_methods_alias_and_status", function()

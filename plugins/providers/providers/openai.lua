@@ -163,7 +163,7 @@ end
 
 local function now_ms()
   local now = maki.time.now()
-  return now.secs * MILLIS + now.nanosecs // NANOS_PER_MILLI
+  return now.secs * MILLIS + math.floor(now.nanosecs / NANOS_PER_MILLI)
 end
 
 local function starts_with(text, prefix)
@@ -481,9 +481,9 @@ local function usage_window(seconds)
   if seconds == SECONDS_PER_WEEK then
     return { Weekly = {} }
   elseif seconds % SECONDS_PER_DAY == 0 then
-    return { Days = seconds // SECONDS_PER_DAY }
+    return { Days = math.floor(seconds / SECONDS_PER_DAY) }
   elseif seconds % SECONDS_PER_HOUR == 0 then
-    return { Hours = seconds // SECONDS_PER_HOUR }
+    return { Hours = math.floor(seconds / SECONDS_PER_HOUR) }
   end
   return { Other = seconds .. "-second usage" }
 end
@@ -574,10 +574,7 @@ function M.provider()
   spec.aliases = { CODEX_ALIAS }
 
   function spec.auth_status(ctx, config)
-    local saved, err = ctx.credentials:read()
-    if err then
-      return nil, err
-    end
+    local saved = ctx.credentials:read()
     if oauth_tokens(saved) then
       return { state = "saved", detail = OAUTH_DETAIL }
     end
@@ -585,9 +582,9 @@ function M.provider()
   end
 
   function spec.discover(ctx, config)
-    local state = new_state(ctx, config)
+    local state, state_err = new_state(ctx, config)
     if not state then
-      return compat.descriptors(M.def)
+      return nil, state_err
     end
     if state.tokens then
       local url = M.BACKEND_URL .. PLAN_MODELS_PATH .. M.CODEX_CLIENT_VERSION

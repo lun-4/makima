@@ -89,12 +89,12 @@ An executable file in the config `providers/` directory (`~/.config/makima/provi
 Only `id` is required. Optional fields: `tier` (default `medium`), `context_window` (default 128K), `max_output_tokens` (default 16K), `pricing` (`{input, output, cache_write, cache_read}` per 1M tokens), and `supports_tool_examples`, `supports_thinking`, `requires_thinking` and `supports_vision`, which default to the base's. A `llama-cpp` based model can also declare `thinking_fields`: the JSON merged into the request body for `off`, `adaptive` and each effort level it accepts.
 
 Script models are `<file name>/<model id>`. The name starts with a letter or digit, continues with letters, digits, `_` and `-`, and cannot take an id that is already registered.]],
-    M.INFO_TIMEOUT_MS // 1000,
-    M.INFO_TIMEOUT_MS // 1000,
-    M.SCRIPT_TIMEOUT_MS // 1000,
-    M.SCRIPT_TIMEOUT_MS // 1000,
-    M.SCRIPT_TIMEOUT_MS // 1000,
-    M.SCRIPT_TIMEOUT_MS // 1000,
+    math.floor(M.INFO_TIMEOUT_MS / 1000),
+    math.floor(M.INFO_TIMEOUT_MS / 1000),
+    math.floor(M.SCRIPT_TIMEOUT_MS / 1000),
+    math.floor(M.SCRIPT_TIMEOUT_MS / 1000),
+    math.floor(M.SCRIPT_TIMEOUT_MS / 1000),
+    math.floor(M.SCRIPT_TIMEOUT_MS / 1000),
     table.concat(ids, ", ")
   )
 end
@@ -113,7 +113,7 @@ function M.run(path, command, timeout_ms, owner)
   end
   if not result then
     maki.fn.jobstop(id)
-    return nil, failure(string.format("%s timed out after %ds", label, timeout_ms // 1000))
+    return nil, failure(string.format("%s timed out after %ds", label, math.floor(timeout_ms / 1000)))
   end
   if result.exit_code ~= 0 then
     local stderr = trim(result.stderr)
@@ -488,7 +488,7 @@ function M.provider(script, route, run)
         -- event: replaying a partly delivered answer would repeat it.
         local emitted = 0
         local result, stream_err = attempt(call_ctx, request, function(event)
-          emitted += 1
+          emitted = emitted + 1
           return emit(event)
         end)
         if result or emitted > 0 or type(stream_err) ~= "table" or stream_err.status ~= UNAUTHORIZED then

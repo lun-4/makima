@@ -54,7 +54,10 @@ impl ProviderStore {
     fn foreign_owner(&self, id: &str, plugin: &str) -> Option<Arc<str>> {
         self.0
             .iter()
-            .find(|spec| *spec.id == *id && *spec.plugin != *plugin)
+            .find(|spec| {
+                *spec.plugin != *plugin
+                    && (*spec.id == *id || spec.auth.aliases.iter().any(|alias| alias.id == id))
+            })
             .map(|spec| Arc::clone(&spec.plugin))
     }
 }
@@ -301,6 +304,14 @@ fn register_provider(
         section: fields.section,
     };
     validate_auth(&fields.id, &auth).map_err(spec_error)?;
+    for (index, alias) in auth.aliases.iter().enumerate() {
+        if auth.aliases[..index]
+            .iter()
+            .any(|other| other.id == alias.id)
+        {
+            return Err(spec_error(format!("alias {:?} is listed twice", alias.id)));
+        }
+    }
     let logins = match spec.get::<Option<Table>>("auth")? {
         Some(methods) => methods
             .sequence_values::<Table>()
@@ -321,7 +332,10 @@ fn register_provider(
         .or_else(|| {
             pending
                 .iter()
-                .find(|spec| *spec.id == *fields.id)
+                .find(|spec| {
+                    *spec.id == *fields.id
+                        || spec.auth.aliases.iter().any(|alias| alias.id == fields.id)
+                })
                 .map(|spec| Arc::clone(&spec.plugin))
         });
     if let Some(owner) = owner {
@@ -329,6 +343,26 @@ fn register_provider(
             "provider {:?} from plugin {plugin:?} is already registered by plugin {owner:?}",
             fields.id
         )));
+    }
+    for alias in &auth.aliases {
+        let owner = lua
+            .app_data_ref::<ProviderStore>()
+            .and_then(|store| store.foreign_owner(&alias.id, &plugin))
+            .or_else(|| {
+                pending
+                    .iter()
+                    .find(|spec| {
+                        *spec.id == *alias.id
+                            || spec.auth.aliases.iter().any(|other| other.id == alias.id)
+                    })
+                    .map(|spec| Arc::clone(&spec.plugin))
+            });
+        if let Some(owner) = owner {
+            return Err(spec_error(format!(
+                "alias {:?} from plugin {plugin:?} is already registered by plugin {owner:?}",
+                alias.id
+            )));
+        }
     }
     pending.push(ProviderSpec {
         plugin,
@@ -360,7 +394,7 @@ fn register_provider(
 /// for id, section in pairs(maki.api.provider_config()) do print(id, section.protocol) end
 #[lua_fn(guard = Env)]
 fn provider_config(lua: &Lua, id: Option<String>) -> LuaResult<Value> {
-    let config = ProvidersConfig::load_or_default();
+    let config = ProvidersConfig::load();
     match id {
         Some(id) => config.get(&id).map_or(Ok(Value::Nil), |def| {
             lua.to_value_with(def, serialize_options())
@@ -380,6 +414,9 @@ fn provider_config(lua: &Lua, id: Option<String>) -> LuaResult<Value> {
 /// maki.api.save_provider_config("my-llm", { protocol = "openai", base_url = "http://localhost:8000/v1" })
 #[lua_fn(guard = FsWrite)]
 fn save_provider_config(lua: &Lua, id: String, section: Value) -> LuaResult<Pair<bool>> {
+    if !valid_id(&id) {
+        return Ok((None, Some(format!("id {id:?} {BAD_ID_ERR}"))));
+    }
     let def: ProviderDef = try_pair!(lua.from_value(section));
     let mut config = try_pair!(ProvidersConfig::try_load());
     config.upsert(id, def);

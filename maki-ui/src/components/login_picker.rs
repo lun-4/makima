@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Wrap;
 use smol::Task;
 
+use maki_config::ModelPolicy;
 use maki_providers::login::{
     ChoiceOption, InteractionRequest, InteractionService, LoginOutcome, LoginRequest, drive_login,
 };
@@ -110,6 +111,7 @@ pub struct LoginPicker {
     step: Step,
     providers: Arc<ProviderRegistry>,
     storage: StateDir,
+    model_policy: Arc<ModelPolicy>,
     login: Option<LoginTask>,
     /// Notices from the provider's login, shown until the picker closes.
     notes: Vec<String>,
@@ -128,11 +130,16 @@ impl LoginPicker {
         }
     }
 
-    pub fn new(providers: Arc<ProviderRegistry>, storage: StateDir) -> Self {
+    pub fn new(
+        providers: Arc<ProviderRegistry>,
+        storage: StateDir,
+        model_policy: Arc<ModelPolicy>,
+    ) -> Self {
         Self {
             step: Step::Closed,
             providers,
             storage,
+            model_policy,
             login: None,
             notes: Vec::new(),
             browser: Box::new(open_in_browser),
@@ -145,10 +152,11 @@ impl LoginPicker {
         let (events_tx, events) = flume::unbounded();
         let providers = Arc::clone(&self.providers);
         let storage = self.storage.clone();
+        let model_policy = Arc::clone(&self.model_policy);
         let request = LoginRequest { provider: None };
         let task = smol::spawn(async move {
             let ui = Arc::new(TuiInteraction(events_tx.clone()));
-            let outcome = drive_login(&providers, ui, &storage, request).await;
+            let outcome = drive_login(&providers, ui, &storage, &model_policy, request).await;
             let _ = events_tx.send(LoginEvent::Finished(outcome));
         });
         self.login = Some(LoginTask {
@@ -261,7 +269,7 @@ impl LoginPicker {
                     let _ = reply.send(item.0.id);
                     StepAction::Wait
                 }
-                PickerAction::Close => StepAction::Wait,
+                PickerAction::Close => StepAction::Close,
                 PickerAction::Consumed | PickerAction::Toggle(..) | PickerAction::Delete(..) => {
                     return LoginPickerAction::Consumed;
                 }
@@ -271,7 +279,7 @@ impl LoginPicker {
                     let _ = reply.send(input.value().trim().to_owned());
                     StepAction::Wait
                 }
-                KeyCode::Esc => StepAction::Wait,
+                KeyCode::Esc => StepAction::Close,
                 _ => {
                     input.handle_key(key);
                     return LoginPickerAction::Consumed;
@@ -499,7 +507,7 @@ mod tests {
                         let _ = opened_tx.send(url.to_owned());
                         Ok(())
                     }),
-                    ..LoginPicker::new(registry, storage.clone())
+                    ..LoginPicker::new(registry, storage.clone(), Arc::new(ModelPolicy::default()))
                 },
                 _host: host,
                 storage,
@@ -626,12 +634,9 @@ mod tests {
         fixture.picker.handle_key(key(KeyCode::Enter));
         assert!(fixture.next_event().is_none());
 
-        fixture.picker.handle_key(key(KeyCode::Esc));
-        assert!(matches!(fixture.picker.step, Step::Waiting));
-
         assert!(matches!(
-            fixture.next_event(),
-            Some(LoginPickerAction::Close)
+            fixture.picker.handle_key(key(KeyCode::Esc)),
+            LoginPickerAction::Close
         ));
         assert!(!fixture.picker.is_open());
         assert!(load_credentials(&fixture.storage, PROVIDER).is_none());

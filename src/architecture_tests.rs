@@ -217,8 +217,6 @@ fn rust_source_names_no_provider() {
     let roots: Vec<&str> = roots.iter().map(String::as_str).collect();
     let mut found = Vec::new();
     for source in production_sources(&roots).expect(SOURCE_SCAN_ERROR) {
-        // A file named for tests holds a module its parent gates behind
-        // `cfg(test)`.
         if source.path.to_string_lossy().contains("test") {
             continue;
         }
@@ -370,15 +368,33 @@ fn is_test_item(node: Node<'_>, text: &[u8]) -> bool {
         if attribute.kind() != "attribute_item" {
             break;
         }
-        if attribute
-            .utf8_text(text)
-            .is_ok_and(|value| value.contains("test"))
-        {
+        if attribute.utf8_text(text).is_ok_and(attribute_is_test) {
             return true;
         }
         sibling = attribute.prev_named_sibling();
     }
     false
+}
+
+fn attribute_is_test(attribute: &str) -> bool {
+    let Some(attribute) = attribute.trim().strip_prefix("#[") else {
+        return false;
+    };
+    let name_end = attribute.find(['(', ']', ' ']).unwrap_or(attribute.len());
+    match &attribute[..name_end] {
+        "test" | "test_case" => true,
+        "cfg" => attribute[name_end..]
+            .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+            .any(|predicate| predicate == "test"),
+        "cfg_attr" => attribute[name_end..]
+            .split_once(',')
+            .is_some_and(|(_, attributes)| {
+                attributes
+                    .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                    .any(|attribute| matches!(attribute, "test" | "test_case"))
+            }),
+        _ => false,
+    }
 }
 
 fn terminal_identifier(node: Node<'_>, text: &[u8]) -> Option<String> {
@@ -389,6 +405,20 @@ fn terminal_identifier(node: Node<'_>, text: &[u8]) -> Option<String> {
     node.named_children(&mut cursor)
         .filter_map(|child| terminal_identifier(child, text))
         .last()
+}
+
+#[test_case::test_case("#[test]\nfn test_only() { \"provider/model\"; }", false ; "test")]
+#[test_case::test_case("#[test_case(1)]\nfn test_only(_: u8) { \"provider/model\"; }", false ; "test_case")]
+#[test_case::test_case("#[cfg(test)]\nmod tests { fn test_only() { \"provider/model\"; } }", false ; "cfg_test")]
+#[test_case::test_case("#[cfg_attr(test, test)]\nfn test_only() { \"provider/model\"; }", false ; "cfg_attr_test")]
+#[test_case::test_case("#[cfg_attr(test, inline)]\nfn production() { \"provider/model\"; }", true ; "cfg_attr_non_test")]
+#[test_case::test_case("#[doc = \"test\"]\nfn production() { \"provider/model\"; }", true ; "non_test_attribute")]
+fn source_scan_filters_only_test_attributes(source: &str, collected: bool) {
+    let source = parse_source_text(PathBuf::from("attestation.rs"), source).unwrap();
+    assert_eq!(
+        source.strings.contains(&"provider/model".to_owned()),
+        collected
+    );
 }
 
 #[test]

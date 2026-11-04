@@ -492,7 +492,7 @@ impl Runner {
     async fn run_control(&mut self, control: ControlWork) {
         let correlation = control.correlation.clone();
         let (active, plain, reasoned) = ActiveCancel::new(Some(correlation.clone()));
-        {
+        let policy = {
             let mut state = self
                 .inner
                 .state
@@ -507,7 +507,8 @@ impl Runner {
                 return;
             }
             state.active = Some(active);
-        }
+            state.policy.clone()
+        };
         if plain.is_cancelled() {
             let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
             state.active = None;
@@ -526,7 +527,7 @@ impl Runner {
                     cancel: plain,
                     cancel_reason: reasoned,
                     generation: 0,
-                    policy: None,
+                    policy,
                     interrupt: None,
                     inbox: None,
                     managed_turn: None,

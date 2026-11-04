@@ -50,7 +50,7 @@ function M.events(response)
   local function next_line()
     if skip_lf and pos <= #buffer then
       if buffer:sub(pos, pos) == "\n" then
-        pos += 1
+        pos = pos + 1
       end
       skip_lf = false
     end

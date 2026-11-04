@@ -169,7 +169,7 @@ function M.tool_id(prefix)
     local now = maki.time.now()
     tool_id_seed = now.secs .. "." .. now.nanosecs
   end
-  tool_id_count += 1
+  tool_id_count = tool_id_count + 1
   local digest = maki.crypto.sha256(tool_id_seed .. ":" .. tool_id_count):sub(1, TOOL_ID_HEX_BYTES)
   return prefix .. digest:gsub(".", function(byte)
     return string.format("%02x", string.byte(byte))

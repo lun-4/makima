@@ -203,9 +203,9 @@ fn returned_error(error: &LuaValue) -> AgentError {
         .ok()
         .flatten()
         .and_then(|class| retry_class(&class, &message));
-    match fields.get::<Option<u16>>("status").ok().flatten() {
-        Some(status) => AgentError::Api {
-            status,
+    match fields.get::<LuaValue>("status").unwrap_or(LuaValue::Nil) {
+        LuaValue::Integer(status) if u16::try_from(status).is_ok() => AgentError::Api {
+            status: status as u16,
             message,
             retry_after: fields
                 .get::<Option<f64>>("retry_after")
@@ -219,7 +219,8 @@ fn returned_error(error: &LuaValue) -> AgentError {
                 .unwrap_or_default(),
             retry,
         },
-        None => transport_error(message, retry),
+        LuaValue::Nil => transport_error(message, retry),
+        _ => config_error("provider error status must be an integer from 0 through 65535"),
     }
 }
 
@@ -563,7 +564,6 @@ struct StreamRequest {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct StreamResult {
     message: Message,
     #[serde(default)]

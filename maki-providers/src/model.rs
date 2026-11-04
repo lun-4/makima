@@ -26,14 +26,10 @@ pub enum ModelError {
     InvalidFormat,
     #[error("unsupported provider '{0}'")]
     UnsupportedProvider(String),
-    #[error("unknown model '{0}'")]
-    UnknownModel(String),
     #[error("invalid model tier '{0}' (expected: strong, medium, weak)")]
     InvalidTier(String),
     #[error("no allowed model for {0}/{1}")]
     NoAllowedModel(String, ModelTier),
-    #[error("no default model for {0}/{1}")]
-    NoDefault(String, ModelTier),
     #[error("model '{0}' is not allowed by provider model policy")]
     NotAllowed(String),
 }
@@ -54,7 +50,6 @@ pub struct ModelPricing {
 /// What is known about one model, from a curated descriptor or discovery.
 /// Absent fields stay unknown.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ModelInfo {
     pub id: String,
     #[serde(default)]

@@ -13,22 +13,25 @@ local RFC3339 = "^(%d%d%d%d)-(%d%d)-(%d%d)[Tt ](%d%d):(%d%d):(%d%d)(%.?%d*)(.*)$
 -- Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's
 -- days_from_civil).
 local function days_from_civil(year, month, day)
-  year -= month <= 2 and 1 or 0
-  local era = (year >= 0 and year or year - 399) // 400
+  year = year - (month <= 2 and 1 or 0)
+  local era = math.floor((year >= 0 and year or year - 399) / 400)
   local year_of_era = year - era * 400
-  local day_of_year = (153 * (month + (month > 2 and -3 or 9)) + 2) // 5 + day - 1
-  local day_of_era = year_of_era * 365 + year_of_era // 4 - year_of_era // 100 + day_of_year
+  local day_of_year = math.floor((153 * (month + (month > 2 and -3 or 9)) + 2) / 5) + day - 1
+  local day_of_era = year_of_era * 365 + math.floor(year_of_era / 4) - math.floor(year_of_era / 100) + day_of_year
   return era * DAYS_PER_ERA + day_of_era - DAYS_TO_EPOCH
 end
 
 local function civil_from_days(days)
-  days += DAYS_TO_EPOCH
-  local era = (days >= 0 and days or days - DAYS_PER_ERA + 1) // DAYS_PER_ERA
+  days = days + DAYS_TO_EPOCH
+  local era = math.floor((days >= 0 and days or days - DAYS_PER_ERA + 1) / DAYS_PER_ERA)
   local day_of_era = days - era * DAYS_PER_ERA
-  local year_of_era = (day_of_era - day_of_era // 1460 + day_of_era // 36524 - day_of_era // 146096) // 365
-  local day_of_year = day_of_era - (365 * year_of_era + year_of_era // 4 - year_of_era // 100)
-  local month_index = (5 * day_of_year + 2) // 153
-  local day = day_of_year - (153 * month_index + 2) // 5 + 1
+  local year_of_era = math.floor(
+    (day_of_era - math.floor(day_of_era / 1460) + math.floor(day_of_era / 36524) - math.floor(day_of_era / 146096))
+      / 365
+  )
+  local day_of_year = day_of_era - (365 * year_of_era + math.floor(year_of_era / 4) - math.floor(year_of_era / 100))
+  local month_index = math.floor((5 * day_of_year + 2) / 153)
+  local day = day_of_year - math.floor((153 * month_index + 2) / 5) + 1
   local month = month_index + (month_index < 10 and 3 or -9)
   return year_of_era + era * 400 + (month <= 2 and 1 or 0), month, day
 end
@@ -62,12 +65,12 @@ end
 
 -- `YYYY-MM-DD` of the UTC day containing {secs}.
 function M.utc_date(secs)
-  return string.format("%04d-%02d-%02d", civil_from_days(secs // SECONDS_PER_DAY))
+  return string.format("%04d-%02d-%02d", civil_from_days(math.floor(secs / SECONDS_PER_DAY)))
 end
 
 -- Epoch milliseconds of the UTC midnight after {secs}.
 function M.next_utc_midnight(secs)
-  return (secs // SECONDS_PER_DAY + 1) * SECONDS_PER_DAY * MILLIS
+  return (math.floor(secs / SECONDS_PER_DAY) + 1) * SECONDS_PER_DAY * MILLIS
 end
 
 return M

@@ -7,6 +7,7 @@ local M = {}
 
 local MAX_ERROR_BYTES = 64 * 1024
 local MAX_JSON_BYTES = 16 * 1024 * 1024
+local ERROR_BODY_TRUNCATED = "\n[response body truncated]"
 local RETRY_AFTER_HEADER = "retry-after"
 local CONTENT_TYPE = "Content-Type"
 local JSON_TYPE = "application/json"
@@ -93,14 +94,14 @@ function M.api_keys(ctx, config, env_var)
     end
   end
   local saved, err = ctx.credentials:read()
-  if err then
-    return nil, err
-  end
   if saved and type(saved.api_key) == "string" and saved.api_key ~= "" then
     return { saved.api_key }, "saved"
   end
   if type(config.api_key) == "string" and config.api_key ~= "" then
     return { config.api_key }, "configured"
+  end
+  if err then
+    return nil, err
   end
   local missing = env_var and env_var .. " not set and no saved credentials" or "no saved credentials"
   return nil, M.config_error(string.format("%s for '%s'; run `maki auth login %s`", missing, ctx.id, ctx.id))
@@ -206,17 +207,29 @@ end
 -- Closes a failed {response} and returns the stream error for it: the status,
 -- the start of the body as the message, and `retry_after`.
 function M.error(response)
-  local chunks, size = {}, 0
-  while size < MAX_ERROR_BYTES do
+  local chunks, size, truncated = {}, 0, false
+  while true do
     local chunk = response:read()
     if not chunk then
       break
     end
+    local remaining = MAX_ERROR_BYTES - size
+    if #chunk > remaining then
+      chunks[#chunks + 1] = chunk:sub(1, remaining)
+      truncated = true
+      break
+    end
     chunks[#chunks + 1] = chunk
-    size += #chunk
+    size = size + #chunk
+  end
+  if not truncated and response:read() then
+    truncated = true
   end
   response:close()
-  local message = table.concat(chunks):sub(1, MAX_ERROR_BYTES)
+  local message = table.concat(chunks)
+  if truncated then
+    message = message:sub(1, MAX_ERROR_BYTES - #ERROR_BODY_TRUNCATED) .. ERROR_BODY_TRUNCATED
+  end
   if trim(message) == "" then
     message = "HTTP " .. response.status
   end
@@ -262,7 +275,7 @@ function M.read_body(response, max_bytes)
     if not chunk then
       return table.concat(chunks)
     end
-    size += #chunk
+    size = size + #chunk
     if size > max_bytes then
       return nil, "response body exceeds " .. max_bytes .. " bytes"
     end

@@ -226,7 +226,6 @@ fn invalid_spec_fields_are_rejected(extra: &str, expected: &str) {
 #[test_case(r#"maki.api.register_provider({ id = 1, display_name = "X", prepare = print })"#, INVALID_TYPE_ERR ; "id of wrong type")]
 #[test_case(r#"maki.api.register_provider({ id = "x/y", display_name = "X", prepare = print })"#, BAD_ID_ERR ; "id with slash")]
 #[test_case(r#"maki.api.register_provider({ id = "..", display_name = "X", prepare = print })"#, BAD_ID_ERR ; "id with leading dot")]
-#[test_case(r#"maki.api.register_provider({ id = "x", display_name = "X", prepare = print, models = { { id = "m", colour = 1 } } })"#, UNKNOWN_FIELD_ERR ; "model descriptor field")]
 #[test_case(r#"maki.async.run(function() maki.api.register_provider({ id = "x", display_name = "X", prepare = print }) end)"#, TOP_LEVEL_ERR ; "outside plugin load")]
 fn invalid_registrations_are_rejected(source: &str, expected: &str) {
     let host = host();
@@ -239,6 +238,21 @@ fn invalid_registrations_are_rejected(source: &str, expected: &str) {
     }
     let error = result.unwrap_err();
     assert!(error.to_string().contains(expected), "{error}");
+}
+
+#[test]
+fn unknown_model_descriptor_fields_are_ignored() {
+    let host = host();
+    host.load_source(
+        PLUGIN,
+        r#"maki.api.register_provider({
+            id = "x", display_name = "X",
+            models = { { id = "m", future_capability = true } },
+            prepare = function() return { stream = function() end } end,
+        })"#,
+    )
+    .unwrap();
+    assert!(registry(&host).model("x/m").is_ok());
 }
 
 #[test]
@@ -258,6 +272,22 @@ fn duplicate_id_names_both_plugins_and_unload_frees_it() {
         registry(&host).display_name(PROVIDER).as_deref(),
         Some(DISPLAY_NAME)
     );
+}
+
+#[test]
+fn aliases_cannot_collide_globally() {
+    let host = host();
+    let first = r#"maki.api.register_provider({
+        id = "first", display_name = "First",
+        auth = { { id = "key", label = "Key", login = print } },
+        aliases = { { id = "shared", label = "Shared", method = "key" } },
+        prepare = function() return {} end,
+    })"#;
+    host.load_source(PLUGIN, first).unwrap();
+    let error = host
+        .load_source(OTHER_PLUGIN, &spec_source("shared", "", ECHO_INSTANCE))
+        .unwrap_err();
+    assert!(error.to_string().contains("already registered"), "{error}");
 }
 
 #[test]
@@ -352,6 +382,10 @@ fn prepare_may_adjust_the_model_but_not_its_id() {
     assert!(matches!(error, AgentError::Config { .. }), "{error}");
 }
 
+#[test_case(
+    "return nil, { status = 70000, message = 'bad status' }",
+    |e| matches!(e, AgentError::Config { message } if message.contains("0 through 65535"))
+    ; "out of range status is rejected")]
 #[test_case(
     &format!("return nil, {{ status = {API_STATUS}, message = '{API_MESSAGE}', retry_after = {RETRY_AFTER_SECS} }}"),
     |e| matches!(e, AgentError::Api { status: API_STATUS, message, retry_after: Some(after), overflow: false, retry: None }

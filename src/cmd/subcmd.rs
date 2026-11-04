@@ -5,11 +5,12 @@ use std::sync::Arc;
 
 use color_eyre::Result;
 use color_eyre::eyre::{Context, bail};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use maki_agent::mcp::{config as mcp_config, oauth as mcp_oauth};
 use maki_agent::tools::ToolRegistry;
 use maki_config::project::{self, ProjectConfig, TrustMode};
-use maki_config::{Config, load_env_files, load_permissions};
+use maki_config::{Config, ModelPolicy, load_env_files, load_permissions};
 use maki_lua::PluginHost;
 use maki_lua::ui_sink::{HeadlessUi, HostUi};
 use maki_providers::login::{
@@ -39,6 +40,7 @@ pub fn auth_login(
     provider: Option<&str>,
     storage: &StateDir,
     registry: &ProviderRegistry,
+    model_policy: &ModelPolicy,
 ) -> Result<()> {
     let request = LoginRequest {
         provider: provider.map(str::to_owned),
@@ -48,7 +50,7 @@ pub fn auth_login(
         display_name,
         model,
         ..
-    } = smol::block_on(drive_login(registry, ui, storage, request))?;
+    } = smol::block_on(drive_login(registry, ui, storage, model_policy, request))?;
     println!();
     println!("  {SAVED_MARK} Authenticated: {display_name}");
     if let Some(model) = model {
@@ -68,6 +70,14 @@ impl InteractionService for TerminalInteraction {
             {
                 tracing::warn!(%error, url, "failed to open browser");
             }
+            if let InteractionRequest::Input {
+                prompt,
+                secret: true,
+                default,
+            } = request
+            {
+                return terminal_secret_input(&prompt, default);
+            }
             terminal_interact(request, &mut io::stdin().lock(), &mut io::stdout())
         }))
     }
@@ -81,11 +91,13 @@ fn terminal_interact(
 ) -> Result<String, AgentError> {
     match request {
         InteractionRequest::Input {
-            prompt, default, ..
+            prompt,
+            secret,
+            default,
         } => {
-            match &default {
-                Some(default) => write!(out, "  {prompt} [{default}]: ")?,
-                None => write!(out, "  {prompt}: ")?,
+            match (&default, secret) {
+                (Some(default), false) => write!(out, "  {prompt} [{default}]: ")?,
+                _ => write!(out, "  {prompt}: ")?,
             }
             out.flush()?;
             let answer = read_answer(input)?;
@@ -155,6 +167,49 @@ fn run_on_terminal(argv: &[String]) -> Result<(), AgentError> {
         false => Err(AgentError::Config {
             message: format!("{program} exited with {status}"),
         }),
+    }
+}
+
+fn terminal_secret_input(prompt: &str, default: Option<String>) -> Result<String, AgentError> {
+    struct RawMode;
+
+    impl Drop for RawMode {
+        fn drop(&mut self) {
+            let _ = crossterm::terminal::disable_raw_mode();
+            let _ = writeln!(io::stdout());
+        }
+    }
+
+    print!("  {prompt}: ");
+    io::stdout().flush()?;
+    crossterm::terminal::enable_raw_mode()?;
+    let _raw_mode = RawMode;
+    let mut answer = String::new();
+    loop {
+        let Event::Key(key) = crossterm::event::read()? else {
+            continue;
+        };
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            continue;
+        }
+        match key.code {
+            KeyCode::Enter => {
+                return Ok(if answer.is_empty() {
+                    default.unwrap_or_default()
+                } else {
+                    answer
+                });
+            }
+            KeyCode::Backspace => {
+                answer.pop();
+            }
+            KeyCode::Esc => return Err(AgentError::Cancelled),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Err(AgentError::Cancelled);
+            }
+            KeyCode::Char(c) => answer.push(c),
+            _ => {}
+        }
     }
 }
 
@@ -518,6 +573,23 @@ mod tests {
             default: Some(DEFAULT.into()),
         };
         assert_eq!(answer(request, typed).as_deref(), expected);
+    }
+
+    #[test]
+    fn terminal_secret_input_does_not_show_saved_value() {
+        let request = InteractionRequest::Input {
+            prompt: PROMPT.into(),
+            secret: true,
+            default: Some(KEY.into()),
+        };
+        let mut out = Vec::new();
+
+        let answer = terminal_interact(request, &mut Cursor::new("\n"), &mut out).unwrap();
+        let shown = String::from_utf8(out).unwrap();
+
+        assert_eq!(answer, KEY);
+        assert!(shown.contains(PROMPT));
+        assert!(!shown.contains(KEY));
     }
 
     #[test]

@@ -22,6 +22,16 @@ t.case("api_keys_blank_env_falls_back_to_saved", function()
   end)
 end)
 
+t.case("api_keys_unreadable_saved_falls_back_to_config", function()
+  local ctx = t.provider_ctx({})
+  ctx.credentials.read = function()
+    return nil, "keyring locked"
+  end
+  local keys, source = http.api_keys(ctx, { api_key = "configured" }, KEY_ENV)
+  t.same(keys, { "configured" })
+  t.eq(source, "configured")
+end)
+
 t.case("api_keys_config_is_one_literal_key", function()
   t.with_env({}, function()
     local keys, source = http.api_keys(t.provider_ctx({}), { api_key = "a,b" }, KEY_ENV)
@@ -95,6 +105,14 @@ end)
 t.case("error_without_body_names_status", function()
   local err = http.error(t.response({}, { status = 503, headers = { ["retry-after"] = "0" } }))
   t.same(err, { status = 503, message = "HTTP 503", retry = "transient" })
+end)
+
+t.case("error_marks_truncated_bodies", function()
+  local response = t.response({ string.rep("x", 64 * 1024), "tail" }, { status = 400 })
+  local err = http.error(response)
+  t.eq(#err.message, 64 * 1024)
+  t.eq(err.message:sub(-26), "\n[response body truncated]")
+  t.eq(response.closed, true)
 end)
 
 t.case("send_passes_transport_errors_through", function()
