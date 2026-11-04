@@ -234,13 +234,14 @@ impl HistoryEditWork {
                 let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
                 let change = replacement.map(|snapshot| {
                     history.replace_snapshot(snapshot.clone());
-                    let ended = history.rotate_conversation();
+                    // Nothing kept is a fresh start, not a rewind to build on.
+                    let (ended, reason) = if history.is_empty() {
+                        (history.restart_conversation(), ConversationEnd::Closed)
+                    } else {
+                        (history.continue_conversation(), ConversationEnd::Rewound)
+                    };
                     if let Some(policy) = &state.policy {
-                        end_conversation_detached(
-                            &policy.settings.provider,
-                            ended,
-                            ConversationEnd::Rewound,
-                        );
+                        end_conversation_detached(&policy.settings.provider, ended, reason);
                     }
                     HistoryChange {
                         agent_id: actor.agent_id(),
@@ -1352,8 +1353,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rewind_ends_the_outgoing_conversation_and_close_keeps_the_new_one() {
+    #[test_case(1, ConversationEnd::Rewound ; "keeping_messages_rewinds")]
+    #[test_case(0, ConversationEnd::Closed ; "keeping_nothing_closes")]
+    fn rewind_ends_the_outgoing_conversation_and_close_keeps_the_new_one(
+        boundary: usize,
+        expected: ConversationEnd,
+    ) {
         smol::block_on(async {
             let (ended_tx, ended_rx) = flume::unbounded();
             let (actor, runner) = AgentActorHandle::spawn(
@@ -1369,10 +1374,10 @@ mod tests {
             actor
                 .initialize_config(EffectiveAgentConfig::new(settings, AgentMode::Build))
                 .unwrap();
-            let boundary = actor.history_boundaries().unwrap().remove(1);
+            let boundary = actor.history_boundaries().unwrap().remove(boundary);
             rewind(&actor, &boundary, published()).await.unwrap();
             let (rewound, reason) = ended_rx.recv_async().await.unwrap();
-            assert_eq!(reason, ConversationEnd::Rewound);
+            assert_eq!(reason, expected);
             assert!(!rewound.is_empty());
             actor.close();
             runner.await;

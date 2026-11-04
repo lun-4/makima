@@ -2,11 +2,12 @@ use std::mem;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use maki_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, Role};
+use maki_providers::{
+    ContentBlock, ConversationLink, ConversationRelation, EMPTY_RESPONSE_MARKER, Message, Role,
+};
+use maki_storage::conversation::ConversationState;
 use maki_storage::sessions::next_epoch;
 use tracing::warn;
-
-use super::streaming::fresh_id;
 
 const CANCEL_MARKER: &str = "[Cancelled by user]";
 pub const UNAVAILABLE_RESULT: &str = "[Tool result not available]";
@@ -19,29 +20,29 @@ pub struct History {
     /// disagree and so a new run can never inherit the last one's epoch.
     snapshot: HistorySnapshot,
     mirror: Option<SharedMessages>,
-    /// The authority over `snapshot.conversation_id`, which only copies it
-    /// for persistence: a rollback restores messages, never a conversation id
-    /// that may already have been ended.
-    conversation_id: Arc<str>,
+    /// The authority over `snapshot.conversation`, which only copies it for
+    /// persistence: a rollback restores messages, never a conversation that
+    /// may already have been ended.
+    conversation: ConversationState,
 }
 
 impl History {
     pub fn new(messages: Vec<Message>) -> Self {
-        let conversation_id = fresh_id();
+        let conversation = ConversationState::fresh(None);
         let mut snapshot = HistorySnapshot::new(messages);
-        snapshot.conversation_id = Some(Arc::clone(&conversation_id));
+        snapshot.conversation = Some(conversation.clone());
         Self {
             snapshot,
             mirror: None,
-            conversation_id,
+            conversation,
         }
     }
 
     pub fn restored_snapshot(snapshot: HistorySnapshot) -> Self {
         let mut history = Self::restored(Arc::unwrap_or_clone(snapshot.messages));
         history.snapshot.compacted = snapshot.compacted;
-        if let Some(id) = snapshot.conversation_id {
-            history.set_conversation(id);
+        if let Some(conversation) = snapshot.conversation {
+            history.set_conversation(conversation);
         }
         history
     }
@@ -55,8 +56,8 @@ impl History {
     pub fn with_mirror(mut self, mirror: SharedMessages) -> Self {
         let seed = mirror.load_full();
         self.snapshot.compacted |= seed.compacted;
-        if let Some(id) = &seed.conversation_id {
-            self.set_conversation(Arc::clone(id));
+        if let Some(conversation) = &seed.conversation {
+            self.set_conversation(conversation.clone());
         }
         self.mirror = Some(mirror);
         self.publish();
@@ -67,20 +68,50 @@ impl History {
         &self.snapshot
     }
 
+    pub fn conversation(&self) -> &ConversationState {
+        &self.conversation
+    }
+
     pub fn conversation_id(&self) -> &Arc<str> {
-        &self.conversation_id
+        &self.conversation.id
     }
 
-    /// Starts a new conversation id and returns the outgoing one.
-    pub fn rotate_conversation(&mut self) -> Arc<str> {
-        let ended = self.set_conversation(fresh_id());
+    /// Records that the whole history went out as a request. Published with
+    /// the next change, since an undercount only costs a provider its cache.
+    pub fn mark_sent(&mut self) {
+        self.conversation.sent = Some(self.len());
+        self.snapshot.conversation = Some(self.conversation.clone());
+    }
+
+    /// The link a copy of the first `kept` messages carries.
+    pub fn branch(&self, kept: usize) -> Option<ConversationLink> {
+        self.conversation.link(ConversationRelation::Branches, kept)
+    }
+
+    /// Starts a new conversation that carries on from the current one over
+    /// the messages it still holds, and returns the outgoing id.
+    pub fn continue_conversation(&mut self) -> Arc<str> {
+        let previous = self
+            .conversation
+            .link(ConversationRelation::Continues, self.len());
+        self.rotate(previous)
+    }
+
+    /// Starts a new conversation whose history does not come from the
+    /// current one, and returns the outgoing id.
+    pub fn restart_conversation(&mut self) -> Arc<str> {
+        self.rotate(None)
+    }
+
+    fn rotate(&mut self, previous: Option<ConversationLink>) -> Arc<str> {
+        let ended = self.set_conversation(ConversationState::fresh(previous));
         self.publish();
-        ended
+        ended.id
     }
 
-    fn set_conversation(&mut self, id: Arc<str>) -> Arc<str> {
-        self.snapshot.conversation_id = Some(Arc::clone(&id));
-        mem::replace(&mut self.conversation_id, id)
+    fn set_conversation(&mut self, conversation: ConversationState) -> ConversationState {
+        self.snapshot.conversation = Some(conversation.clone());
+        mem::replace(&mut self.conversation, conversation)
     }
 
     pub fn as_slice(&self) -> &[Message] {
@@ -131,7 +162,7 @@ impl History {
 
     pub fn replace_snapshot(&mut self, snapshot: HistorySnapshot) {
         self.snapshot = HistorySnapshot {
-            conversation_id: Some(Arc::clone(&self.conversation_id)),
+            conversation: Some(self.conversation.clone()),
             ..snapshot
         };
         self.publish();
@@ -141,7 +172,7 @@ impl History {
     pub fn replace_compacted(&mut self, messages: Vec<Message>) -> Arc<str> {
         self.snapshot.compacted = true;
         self.replace(messages);
-        self.rotate_conversation()
+        self.restart_conversation()
     }
 
     pub fn truncate(&mut self, len: usize) {
@@ -314,36 +345,99 @@ mod tests {
         assert_eq!(restored.len(), 2);
     }
 
+    fn mirror_conversation(mirror: &SharedMessages) -> ConversationState {
+        mirror.load().conversation.clone().unwrap()
+    }
+
     #[test]
-    fn conversation_id_resumes_from_mirror_and_never_rolls_back() {
+    fn conversation_resumes_from_mirror_and_never_rolls_back() {
         const STORED: &str = "stored-conversation";
         let mut seed = HistorySnapshot::new(vec![Message::user(FIRST.into())]);
-        seed.conversation_id = Some(STORED.into());
+        seed.conversation = Some(ConversationState::new(STORED.into()));
         let mirror = Arc::new(ArcSwap::from_pointee(seed));
         let mut history =
             History::restored(vec![Message::user(FIRST.into())]).with_mirror(Arc::clone(&mirror));
         assert_eq!(history.conversation_id().as_ref(), STORED);
-        assert_eq!(mirror.load().conversation_id.as_deref(), Some(STORED));
+        assert_eq!(mirror_conversation(&mirror).id.as_ref(), STORED);
 
         let previous = history.snapshot().clone();
-        let ended = history.rotate_conversation();
+        history.mark_sent();
+        let ended = history.continue_conversation();
         assert_eq!(ended.as_ref(), STORED);
-        let current = Arc::clone(history.conversation_id());
-        assert_eq!(mirror.load().conversation_id.as_ref(), Some(&current));
+        let current = history.conversation().clone();
+        assert_eq!(mirror_conversation(&mirror), current);
 
         history.replace_snapshot(previous);
-        assert_eq!(history.conversation_id(), &current);
-        assert_eq!(mirror.load().conversation_id.as_ref(), Some(&current));
+        assert_eq!(history.conversation(), &current);
+        assert_eq!(mirror_conversation(&mirror), current);
     }
 
     #[test]
-    fn fresh_history_publishes_its_minted_conversation_id() {
+    fn fresh_history_publishes_its_minted_conversation() {
         let mirror = Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
         let history = History::new(Vec::new()).with_mirror(Arc::clone(&mirror));
+        assert_eq!(&mirror_conversation(&mirror), history.conversation());
+    }
+
+    fn sent_history(sent: usize, total: usize) -> History {
+        let messages = (0..total).map(|i| Message::user(i.to_string())).collect();
+        let mut history = History::new(messages);
+        history.truncate(sent);
+        history.mark_sent();
+        for i in sent..total {
+            history.push(Message::user(i.to_string()));
+        }
+        history
+    }
+
+    #[test_case(3, 5, 5, 3 ; "cancel_keeps_the_sent_request")]
+    #[test_case(4, 4, 2, 2 ; "rewind_keeps_its_cut")]
+    fn continue_conversation_links_to_the_last_request(
+        sent: usize,
+        total: usize,
+        kept: usize,
+        shared: usize,
+    ) {
+        let mut history = sent_history(sent, total);
+        history.truncate(kept);
+        let ended = history.continue_conversation();
         assert_eq!(
-            mirror.load().conversation_id.as_ref(),
-            Some(history.conversation_id())
+            history.conversation().previous,
+            Some(ConversationLink {
+                id: ended,
+                relation: ConversationRelation::Continues,
+                shared,
+            })
         );
+        assert_eq!(history.conversation().sent, None);
+    }
+
+    #[test]
+    fn a_conversation_that_never_sent_passes_its_link_on() {
+        let mut history = sent_history(3, 3);
+        let first = history.continue_conversation();
+        history.truncate(1);
+        history.continue_conversation();
+        assert_eq!(
+            history.conversation().previous,
+            Some(ConversationLink {
+                id: first,
+                relation: ConversationRelation::Continues,
+                shared: 1,
+            })
+        );
+        assert_eq!(
+            history.branch(history.len()).map(|link| link.relation),
+            Some(ConversationRelation::Branches)
+        );
+    }
+
+    #[test]
+    fn restart_drops_the_link() {
+        let mut history = sent_history(2, 2);
+        history.continue_conversation();
+        history.restart_conversation();
+        assert_eq!(history.conversation().previous, None);
     }
 
     #[track_caller]

@@ -534,7 +534,7 @@ impl<'h> Agent<'h> {
                 sanitize_cancelled_history(self.history, self.rollback_len);
                 end_conversation_detached(
                     &self.provider,
-                    self.history.rotate_conversation(),
+                    self.history.continue_conversation(),
                     ConversationEnd::Cancelled,
                 );
                 let reason = match &self.cancel_reason_source {
@@ -704,6 +704,7 @@ impl<'h> Agent<'h> {
         }
         self.consume_turn_inbox()?;
         self.pending_instruction_request = false;
+        self.history.mark_sent();
         let tools = self.request_tools()?;
         if let Some(inbox) = &self.turn_inbox {
             inbox.instructions_submitted();
@@ -714,6 +715,7 @@ impl<'h> Agent<'h> {
                 id: Arc::clone(self.history.conversation_id()),
                 purpose: InvocationPurpose::Agent,
                 agent_id: Some(self.agent_id.to_string().into()),
+                previous: self.history.conversation().previous.clone(),
             },
             &self.model,
             self.history.as_slice(),
@@ -1185,8 +1187,8 @@ mod tests {
 
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        ContentBlock, Invocation, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
-        StreamResponse, TokenUsage,
+        ContentBlock, ConversationLink, ConversationRelation, Invocation, Message, Model,
+        ProviderEvent, RequestOptions, Role, StopReason, StreamResponse, TokenUsage,
     };
     use serde_json::Value;
     use test_case::test_case;
@@ -1366,7 +1368,8 @@ mod tests {
     /// so a caller that waited on it would hang.
     struct ConversationProbe {
         cancel_first: Mutex<Option<crate::cancel::CancelTrigger>>,
-        conversations: Arc<Mutex<Vec<Arc<str>>>>,
+        /// Each request's invocation and message count.
+        conversations: Arc<Mutex<Vec<(Invocation, usize)>>>,
         ended: flume::Sender<Ended>,
     }
 
@@ -1374,7 +1377,7 @@ mod tests {
         fn stream_message<'a>(
             &'a self,
             _: &'a Model,
-            _: &'a [Message],
+            messages: &'a [Message],
             _: &'a str,
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
@@ -1385,7 +1388,7 @@ mod tests {
             self.conversations
                 .lock()
                 .unwrap()
-                .push(Arc::clone(&invocation.conversation_id));
+                .push((invocation.clone(), messages.len()));
             let cancel = self.cancel_first.lock().unwrap().take();
             Box::pin(async move {
                 match cancel {
@@ -2974,9 +2977,20 @@ mod tests {
             assert!(matches!(outcome, TurnOutcome::Completed { .. }));
             drop(agent);
             let conversations = conversations.lock().unwrap();
-            assert_eq!(conversations[0], original);
-            assert_ne!(conversations[1], original);
-            assert_eq!(&conversations[1], history.conversation_id());
+            let [(cancelled, sent), (next, _)] = &conversations[..] else {
+                panic!("expected two requests, got {}", conversations.len());
+            };
+            assert_eq!(cancelled.conversation_id, original);
+            assert_eq!(cancelled.previous, None);
+            assert_eq!(&next.conversation_id, history.conversation_id());
+            assert_eq!(
+                next.previous,
+                Some(ConversationLink {
+                    id: original,
+                    relation: ConversationRelation::Continues,
+                    shared: *sent,
+                })
+            );
         });
     }
 

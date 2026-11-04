@@ -4,8 +4,8 @@ use std::time::Duration;
 use maki_providers::provider::Provider;
 use maki_providers::retry::{RetryPolicy, RetryState};
 use maki_providers::{
-    ContentBlock, ConversationEnd, Invocation, InvocationPurpose, Message, Model, ProviderEvent,
-    RequestOptions, StreamResponse,
+    ContentBlock, ConversationEnd, ConversationLink, Invocation, InvocationPurpose, Message, Model,
+    ProviderEvent, RequestOptions, StreamResponse,
 };
 use maki_storage::id::{MakiId, SessionRef};
 use serde_json::Value;
@@ -27,6 +27,7 @@ pub(crate) struct Conversation {
     pub id: Arc<str>,
     pub purpose: InvocationPurpose,
     pub agent_id: Option<Arc<str>>,
+    pub previous: Option<ConversationLink>,
 }
 
 impl Conversation {
@@ -37,6 +38,7 @@ impl Conversation {
             attempt: 0,
             purpose: self.purpose,
             agent_id: self.agent_id,
+            previous: self.previous,
         }
     }
 }
@@ -356,6 +358,7 @@ mod tests {
             id: CONVERSATION.into(),
             purpose: InvocationPurpose::Agent,
             agent_id: None,
+            previous: None,
         }
     }
 

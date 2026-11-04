@@ -223,10 +223,15 @@ fn spec_error(message: impl fmt::Display) -> mlua::Error {
 /// `refresh_auth`, for a pool those can change). `request` has `model`
 /// (`id`, `max_output_tokens`, `context_window`), `system`, `messages`,
 /// `tools`, `thinking`, `fast`, `session_id` and `invocation`
-/// (`conversation_id`, `operation_id`, `attempt`, `purpose`, `agent_id`).
-/// `max_output_tokens` is what the model declares. `reason` is `cancelled`,
-/// `closed`, `compacted` or `rewound`; the host never uses an ended
-/// conversation id again. `emit(event)` takes `{ type = "text_delta", text }`
+/// (`conversation_id`, `operation_id`, `attempt`, `purpose`, `agent_id`,
+/// `previous`). `previous` is `{ id, relation, shared }` on every request of
+/// a conversation started from another: `relation` is `continues` (after a
+/// cancel or rewind) or `branches` (a fork, isolated turn or compaction
+/// summary), and the first `shared` messages equal those of the last request
+/// sent under `id`. `max_output_tokens` is what the model declares. `reason`
+/// is `cancelled`, `closed`, `compacted` or `rewound`; the host never uses an
+/// ended conversation id again, but a successor may name a `cancelled` or
+/// `rewound` one in `previous`. `emit(event)` takes `{ type = "text_delta", text }`
 /// and the other provider events, and returns false once the call is over.
 /// `stream` returns `{ message, usage, stop_reason }`. A failure returns nil
 /// plus an error: `{ kind = "config", message }` is a configuration error,

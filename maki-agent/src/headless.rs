@@ -749,7 +749,7 @@ impl ActorBackend for HeadlessBackend {
                     let previous = history.snapshot().clone();
                     history.replace(Vec::new());
                     // Rotated before the write, so the reset log never stores the ended id.
-                    let ended = history.rotate_conversation();
+                    let ended = history.restart_conversation();
                     let result = persist_history(
                         self.params.session_id.as_ref().unwrap().id(),
                         history.snapshot().clone(),
@@ -797,6 +797,7 @@ impl ActorBackend for HeadlessBackend {
                             provider: Arc::clone(&config.provider),
                             model: config.model.clone(),
                             history: history.as_slice().to_vec(),
+                            previous: history.branch(history.len()),
                             system: self.system(&config, &instructions, &slots),
                             question,
                             images,

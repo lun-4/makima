@@ -275,7 +275,7 @@ impl EventLoop<'_> {
             let replacement = request.clear_context.then(|| HistorySnapshot::<Message> {
                 epoch: source.history.epoch.wrapping_add(1),
                 compacted: false,
-                conversation_id: None,
+                conversation: None,
                 messages: Arc::new(Vec::new()),
             });
             let observer = async move {

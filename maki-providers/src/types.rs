@@ -11,6 +11,7 @@ use std::fmt;
 use std::sync::{Arc, OnceLock};
 
 pub use maki_domain::{Effort, ThinkingConfig};
+pub use maki_storage::conversation::{ConversationLink, ConversationRelation};
 use maki_storage::sessions::TitleSource;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -236,7 +237,7 @@ pub async fn adapt_images_for_model<'a>(
     Cow::Owned(adapted)
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     #[default]
@@ -250,7 +251,7 @@ impl Role {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text {
@@ -327,7 +328,7 @@ pub enum ObservationSource {
     ChildResult { agent_id: String, turn_id: String },
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: Vec<ContentBlock>,
@@ -491,6 +492,8 @@ pub struct Invocation {
     pub attempt: u32,
     pub purpose: InvocationPurpose,
     pub agent_id: Option<Arc<str>>,
+    /// The conversation this one started from, on every request under it.
+    pub previous: Option<ConversationLink>,
 }
 
 /// Why the host will never send another request for a conversation id.

@@ -85,6 +85,7 @@ use maki_lua::{
 };
 use maki_providers::{ContentBlock, Message, Model, ProviderRegistry, add_cost, format_tokens};
 use maki_storage::StateDir;
+use maki_storage::conversation::ConversationState;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
 use maki_storage::sessions::StoredPost;
@@ -2167,7 +2168,7 @@ impl App {
                             &HistorySnapshot {
                                 epoch: history_epoch,
                                 compacted: false,
-                                conversation_id,
+                                conversation: conversation_id.map(ConversationState::new),
                                 messages: Arc::new(messages),
                             },
                         );
@@ -2256,7 +2257,7 @@ impl App {
                 &HistorySnapshot {
                     epoch: history_epoch,
                     compacted: false,
-                    conversation_id,
+                    conversation: conversation_id.map(ConversationState::new),
                     messages: Arc::new(messages),
                 },
             );
@@ -2872,6 +2873,7 @@ impl App {
             provider: Arc::clone(&admission.template.provider),
             model: (*admission.template.model).clone(),
             history,
+            previous: None,
             system,
             question: turn.content.text.to_string(),
             images,

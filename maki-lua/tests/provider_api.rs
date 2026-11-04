@@ -11,9 +11,9 @@ use maki_agent::tools::ToolRegistry;
 use maki_config::providers::{ProviderDef, ProvidersConfig};
 use maki_lua::PluginHost;
 use maki_providers::{
-    AgentError, ContentBlock, ConversationEnd, Invocation, InvocationPurpose, Message,
-    PreparedProvider, ProviderEvent, ProviderRegistry, RequestOptions, RetryKind, Role, StopReason,
-    Timeouts, UsageLimit, UsageWindow,
+    AgentError, ContentBlock, ConversationEnd, ConversationLink, ConversationRelation, Invocation,
+    InvocationPurpose, Message, PreparedProvider, ProviderEvent, ProviderRegistry, RequestOptions,
+    RetryKind, Role, StopReason, Timeouts, UsageLimit, UsageWindow,
 };
 use serde_json::json;
 use test_case::test_case;
@@ -29,6 +29,8 @@ const BOUND: Duration = Duration::from_secs(10);
 const CONVERSATION: &str = "conv-1";
 const OPERATION: &str = "op-1";
 const AGENT: &str = "agent-1";
+const PREVIOUS: &str = "conv-0";
+const SHARED: usize = 12;
 const ATTEMPT: u32 = 2;
 const USER_TEXT: &str = "hello";
 const SYSTEM: &str = "be brief";
@@ -117,7 +119,8 @@ const ECHO_INSTANCE: &str = r#"
                 ctx.id, request.model.id, tostring(request.model.context_window),
                 request.system, request.messages[1].content[1].text,
                 inv.conversation_id, inv.operation_id, tostring(inv.attempt),
-                inv.purpose, inv.agent_id, tostring(request.fast),
+                inv.purpose, inv.agent_id, inv.previous.id, inv.previous.relation,
+                tostring(inv.previous.shared), tostring(request.fast),
                 tostring(request.session_id), tostring(type(ctx.send)),
             }, "|")
             return {
@@ -162,6 +165,11 @@ fn invocation() -> Invocation {
         attempt: ATTEMPT,
         purpose: InvocationPurpose::Agent,
         agent_id: Some(AGENT.into()),
+        previous: Some(ConversationLink {
+            id: PREVIOUS.into(),
+            relation: ConversationRelation::Continues,
+            shared: SHARED,
+        }),
     }
 }
 
@@ -303,6 +311,9 @@ fn stream_delivers_events_response_and_request_fields() {
         &ATTEMPT.to_string(),
         "agent",
         AGENT,
+        PREVIOUS,
+        "continues",
+        &SHARED.to_string(),
         "false",
         "nil",
         "function",

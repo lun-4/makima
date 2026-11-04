@@ -222,7 +222,10 @@ impl LuaActorState {
         let event = AgentEvent::SubagentHistory {
             tool_use_id: self.ui_id.clone(),
             history_epoch: snapshot.epoch,
-            conversation_id: snapshot.conversation_id.clone(),
+            conversation_id: snapshot
+                .conversation
+                .as_ref()
+                .map(|conversation| Arc::clone(&conversation.id)),
             messages: snapshot.messages.as_ref().clone(),
         };
         let _ = match self.subagent_info.get() {

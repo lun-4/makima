@@ -113,6 +113,7 @@ fn invocation() -> Invocation {
         attempt: 0,
         purpose: InvocationPurpose::Agent,
         agent_id: None,
+        previous: None,
     }
 }
 

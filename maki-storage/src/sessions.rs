@@ -17,6 +17,7 @@ use std::time::UNIX_EPOCH;
 use tempfile::NamedTempFile;
 use tracing::{info, warn};
 
+use crate::conversation::ConversationState;
 use crate::id::MakiId;
 use crate::offload_cleanup::Root;
 use crate::session_lock::SessionPublicationGuard;
@@ -149,7 +150,7 @@ pub struct SessionMeta {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub compacted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub conversation_id: Option<Arc<str>>,
+    pub conversation: Option<ConversationState>,
     #[serde(default)]
     pub mode: Option<StoredMode>,
     #[serde(default)]
@@ -190,7 +191,7 @@ pub enum HistoryDestination {
 pub struct HistorySnapshot<M> {
     pub epoch: u64,
     pub compacted: bool,
-    pub conversation_id: Option<Arc<str>>,
+    pub conversation: Option<ConversationState>,
     pub messages: Arc<Vec<M>>,
 }
 
@@ -205,7 +206,7 @@ impl<M> HistorySnapshot<M> {
         Self {
             epoch: next_epoch(),
             compacted: false,
-            conversation_id: None,
+            conversation: None,
             messages: Arc::new(messages),
         }
     }
@@ -1345,7 +1346,7 @@ where
         HistorySnapshot {
             epoch: self.epoch,
             compacted: self.meta.compacted,
-            conversation_id: self.meta.conversation_id.clone(),
+            conversation: self.meta.conversation.clone(),
             messages: Arc::clone(&self.messages),
         }
     }
@@ -1428,7 +1429,7 @@ where
         self.messages = Arc::clone(&snapshot.messages);
         self.epoch = snapshot.epoch;
         self.meta.compacted = snapshot.compacted;
-        self.meta.conversation_id = snapshot.conversation_id.clone();
+        self.meta.conversation = snapshot.conversation.clone();
         self.touch();
     }
 
@@ -1448,15 +1449,15 @@ where
     {
         if let Some(snapshot) = history {
             meta.compacted = snapshot.compacted;
-            meta.conversation_id = snapshot.conversation_id.clone();
+            meta.conversation = snapshot.conversation.clone();
         } else {
             meta.compacted = this.meta.compacted;
-            meta.conversation_id = this.meta.conversation_id.clone();
+            meta.conversation = this.meta.conversation.clone();
         }
         let history = history.filter(|h| {
             !Arc::ptr_eq(&this.messages, &h.messages)
                 || h.compacted != this.meta.compacted
-                || h.conversation_id != this.meta.conversation_id
+                || h.conversation != this.meta.conversation
         });
         if history.is_none() && this.meta == meta && this.token_usage == token_usage {
             return;
@@ -1492,7 +1493,11 @@ where
                     .copied()
                     .unwrap_or_default(),
                 compacted: false,
-                conversation_id: self.subagent_conversations.get(id).cloned(),
+                conversation: self
+                    .subagent_conversations
+                    .get(id)
+                    .cloned()
+                    .map(ConversationState::new),
                 messages: Arc::clone(messages),
             })
     }
@@ -1509,9 +1514,9 @@ where
         self.subagent_history_epochs
             .insert(id.clone(), snapshot.epoch);
         // Frontend replays of a child transcript carry no id; keep the last known one.
-        if let Some(conversation_id) = &snapshot.conversation_id {
+        if let Some(conversation) = &snapshot.conversation {
             self.subagent_conversations
-                .insert(id.clone(), Arc::clone(conversation_id));
+                .insert(id.clone(), Arc::clone(&conversation.id));
         }
         if self
             .subagent_messages
@@ -1867,6 +1872,7 @@ mod tests {
     use super::{Post, PostLevel, StoredPost};
     use super::{Prefs, read_prefs, write_prefs};
     use crate::StateDir;
+    use crate::conversation::{ConversationLink, ConversationRelation, ConversationState};
     use crate::id::MakiId;
     use crate::session_lock;
     use serde_json::Value;
@@ -2428,7 +2434,7 @@ mod tests {
     }
 
     #[test]
-    fn conversation_ids_round_trip_and_a_rotation_alone_reaches_disk() {
+    fn conversations_round_trip_and_a_rotation_alone_reaches_disk() {
         const FIRST: &str = "conversation-1";
         const ROTATED: &str = "conversation-2";
         const CHILD: &str = "child-conversation";
@@ -2437,18 +2443,26 @@ mod tests {
         let dir = tmp.path();
         let mut session: Arc<TestSession> = Arc::new(Session::new("m", "/project"));
         let mut snapshot = HistorySnapshot::new(vec![user_message("hi")]);
-        snapshot.conversation_id = Some(FIRST.into());
+        snapshot.conversation = Some(ConversationState::new(FIRST.into()));
         let mut child = HistorySnapshot::new(vec![user_message("child")]);
-        child.conversation_id = Some(CHILD.into());
+        child.conversation = Some(ConversationState::new(CHILD.into()));
         let meta = session.meta.clone();
         Session::checkpoint(&mut session, Some(&snapshot), meta.clone(), Value::Null);
         let writable = Arc::make_mut(&mut session);
         assert!(writable.adopt_subagent_history(CHILD_KEY.into(), &child));
-        child.conversation_id = None;
+        child.conversation = None;
         assert!(writable.adopt_subagent_history(CHILD_KEY.into(), &child));
         let mut log = SessionLog::rewrite(dir, &session).unwrap();
 
-        snapshot.conversation_id = Some(ROTATED.into());
+        snapshot.conversation = Some(ConversationState {
+            previous: Some(ConversationLink {
+                id: FIRST.into(),
+                relation: ConversationRelation::Continues,
+                shared: 1,
+            }),
+            sent: Some(1),
+            ..ConversationState::new(ROTATED.into())
+        });
         let revision = session.revision();
         Session::checkpoint(&mut session, Some(&snapshot), meta, Value::Null);
         assert_ne!(session.revision(), revision);
@@ -2456,13 +2470,14 @@ mod tests {
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
         assert_eq!(
-            loaded.history_snapshot().conversation_id.as_deref(),
-            Some(ROTATED)
+            loaded.history_snapshot().conversation,
+            snapshot.conversation
         );
         assert_eq!(
             loaded
                 .subagent_history_snapshot(CHILD_KEY)
-                .and_then(|child| child.conversation_id)
+                .and_then(|child| child.conversation)
+                .map(|conversation| conversation.id)
                 .as_deref(),
             Some(CHILD)
         );
@@ -2476,7 +2491,7 @@ mod tests {
         let run = HistorySnapshot {
             epoch: next_epoch(),
             compacted: false,
-            conversation_id: None,
+            conversation: None,
             messages: Arc::new(vec![user_message("hi")]),
         };
         let meta = session.meta.clone();
@@ -2490,7 +2505,7 @@ mod tests {
         let advanced = HistorySnapshot {
             epoch: run.epoch,
             compacted: run.compacted,
-            conversation_id: None,
+            conversation: None,
             messages: Arc::new(vec![user_message("hi"), assistant_message("reply")]),
         };
         Session::checkpoint(&mut session, Some(&advanced), meta, Value::Null);

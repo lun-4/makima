@@ -52,6 +52,7 @@ use maki_providers::{
     ImageSource, Message, ProviderRegistry, StopReason, Timeouts, TokenUsage, add_cost,
 };
 use maki_storage::StateDir;
+use maki_storage::conversation::{ConversationRelation, ConversationState};
 use maki_storage::id::SessionRef;
 use maki_storage::session_lock;
 use maki_storage::sessions::{SESSIONS_DIR, Session, SessionMeta, read_prefs};
@@ -1305,7 +1306,11 @@ fn resolve_session(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<ResolvedS
             let mut history = session.history_snapshot();
             // A fork mints its own id, so two copies never address the same remote state.
             if cli.fork_session {
-                history.conversation_id = None;
+                history.conversation = history.conversation.take().map(|source| {
+                    ConversationState::fresh(
+                        source.link(ConversationRelation::Branches, history.messages.len()),
+                    )
+                });
             }
             (resumed, history, Some(model), meta)
         } else if cli.last_session {
@@ -2808,12 +2813,22 @@ mod tests {
     #[test_case(true; "fork")]
     fn sdk_restoration_preserves_compacted_history(fork: bool) {
         use clap::Parser;
+        use maki_storage::conversation::ConversationLink;
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         const STORED_CONVERSATION: &str = "stored-conversation";
+        const STORED_SENT: usize = 2;
         let mut session = StoredSession::new(STARTUP_MODEL, THIS_CWD);
+        session.adopt_history(&maki_storage::sessions::HistorySnapshot::new(vec![
+            Message::user("first".into()),
+            Message::user("second".into()),
+            Message::user("third".into()),
+        ]));
         session.meta.compacted = true;
-        session.meta.conversation_id = Some(STORED_CONVERSATION.into());
+        session.meta.conversation = Some(ConversationState {
+            sent: Some(STORED_SENT),
+            ..ConversationState::new(STORED_CONVERSATION.into())
+        });
         session.save(&storage).unwrap();
         let mut args = vec!["makima".to_owned(), "-c".to_owned(), session.id.to_string()];
         if fork {
@@ -2827,6 +2842,12 @@ mod tests {
             history.conversation_id().as_ref() == STORED_CONVERSATION,
             !fork
         );
+        let link = fork.then(|| ConversationLink {
+            id: STORED_CONVERSATION.into(),
+            relation: ConversationRelation::Branches,
+            shared: STORED_SENT,
+        });
+        assert_eq!(history.conversation().previous, link);
         assert_eq!(
             serde_json::to_value(restored.history.messages.as_ref()).unwrap(),
             serde_json::to_value(session.history_snapshot().messages.as_ref()).unwrap()

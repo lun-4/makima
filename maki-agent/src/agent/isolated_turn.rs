@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use maki_providers::provider::Provider;
 use maki_providers::{
-    ConversationEnd, ImageSource, Invocation, InvocationPurpose, Message, Model, ProviderEvent,
-    RequestOptions,
+    ConversationEnd, ConversationLink, ImageSource, Invocation, InvocationPurpose, Message, Model,
+    ProviderEvent, RequestOptions,
 };
 use maki_storage::id::SessionRef;
 use serde_json::Value;
@@ -32,6 +32,8 @@ pub struct IsolatedTurnRequest {
     pub provider: Arc<dyn Provider>,
     pub model: Model,
     pub history: Vec<Message>,
+    /// The link of the conversation `history` was copied from.
+    pub previous: Option<ConversationLink>,
     pub system: String,
     pub question: String,
     pub images: Vec<ImageSource>,
@@ -47,6 +49,7 @@ pub async fn run_isolated_turn(
         provider,
         model,
         mut history,
+        previous,
         system,
         question,
         images,
@@ -84,6 +87,7 @@ pub async fn run_isolated_turn(
         attempt: 0,
         purpose: InvocationPurpose::Isolated,
         agent_id: None,
+        previous,
     };
     let result = futures_lite::future::race(
         provider.stream_message(
@@ -123,11 +127,15 @@ mod tests {
 
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        ContentBlock, ProviderEvent, Role, StopReason, StreamResponse, TokenUsage,
+        ContentBlock, ConversationRelation, ProviderEvent, Role, StopReason, StreamResponse,
+        TokenUsage,
     };
     use test_case::test_case;
 
     use super::*;
+
+    const SOURCE_CONVERSATION: &str = "source";
+    const SOURCE_SHARED: usize = 4;
 
     #[derive(Default)]
     struct Captured {
@@ -227,6 +235,7 @@ mod tests {
                 provider,
                 model: Model::from_spec("openai/gpt-4o").unwrap(),
                 history: original.clone(),
+                previous: None,
                 system: "system".into(),
                 question: "why?".into(),
                 images: Vec::new(),
@@ -237,6 +246,14 @@ mod tests {
         )
         .await;
         rx.iter().collect()
+    }
+
+    fn link() -> ConversationLink {
+        ConversationLink {
+            id: SOURCE_CONVERSATION.into(),
+            relation: ConversationRelation::Branches,
+            shared: SOURCE_SHARED,
+        }
     }
 
     #[test_case(ProviderOutcome::Success, false, ConversationEnd::Closed ; "finished")]
@@ -264,6 +281,7 @@ mod tests {
                     provider,
                     model: Model::from_spec("openai/gpt-4o").unwrap(),
                     history: Vec::new(),
+                    previous: Some(link()),
                     system: "system".into(),
                     question: "why?".into(),
                     images: Vec::new(),
@@ -277,6 +295,7 @@ mod tests {
             let invocation = captured.lock().unwrap().invocation.clone().unwrap();
             assert_eq!(invocation.purpose, InvocationPurpose::Isolated);
             assert_eq!(invocation.attempt, 0);
+            assert_eq!(invocation.previous, Some(link()));
             assert_eq!(
                 ended_rx.recv_async().await.unwrap(),
                 (invocation.conversation_id, reason)
@@ -331,6 +350,7 @@ mod tests {
                     provider,
                     model: Model::from_spec("openai/gpt-4o").unwrap(),
                     history: original.clone(),
+                    previous: None,
                     system: "system".into(),
                     question: "why?".into(),
                     images: Vec::new(),
@@ -374,6 +394,7 @@ mod tests {
                     provider,
                     model: Model::from_spec("openai/gpt-4o").unwrap(),
                     history: original.clone(),
+                    previous: None,
                     system: "system".into(),
                     question: "why?".into(),
                     images: Vec::new(),

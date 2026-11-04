@@ -3165,7 +3165,8 @@ fn subagent_history_stores_the_child_conversation_id() {
     let stored = app.state.session.subagent_history_snapshot(CHILD_KEY);
     assert_eq!(
         stored
-            .and_then(|history| history.conversation_id)
+            .and_then(|history| history.conversation)
+            .map(|conversation| conversation.id)
             .as_deref(),
         Some(CHILD_CONVERSATION)
     );

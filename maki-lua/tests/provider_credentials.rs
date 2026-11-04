@@ -212,6 +212,7 @@ async fn run_script(prepared: &PreparedProvider, script: &str) -> String {
         attempt: 0,
         purpose: InvocationPurpose::Agent,
         agent_id: None,
+        previous: None,
     };
     let response = prepared
         .provider

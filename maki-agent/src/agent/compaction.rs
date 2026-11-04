@@ -79,10 +79,9 @@ pub(super) async fn compact_history(
     strip_old_tool_results(&mut compaction_history);
     compaction_history.push(Message::user(summary_prompt(config, instructions)));
 
-    let summary_id = fresh_id();
     let result = summarize(
         provider,
-        &summary_id,
+        history,
         model,
         compaction_history,
         &event_tx,
@@ -90,7 +89,6 @@ pub(super) async fn compact_history(
         session_id,
     )
     .await;
-    end_conversation_detached(provider, summary_id, ConversationEnd::Closed);
     finish_compact(
         result?,
         history,
@@ -101,9 +99,11 @@ pub(super) async fn compact_history(
     )
 }
 
+/// Each attempt is its own conversation, because truncating the oldest round
+/// changes the messages a conversation's link counts.
 async fn summarize(
     provider: &Arc<dyn Provider>,
-    summary_id: &Arc<str>,
+    history: &History,
     model: &Model,
     mut compaction_history: Vec<Message>,
     event_tx: &EventSender,
@@ -115,12 +115,20 @@ async fn summarize(
     let mut last_error = None;
 
     for attempt in 0..max_attempts {
-        match stream_with_retry(
+        let summary_id = fresh_id();
+        let kept = history
+            .as_slice()
+            .iter()
+            .zip(&compaction_history)
+            .take_while(|(kept, sent)| kept == sent)
+            .count();
+        let result = stream_with_retry(
             &**provider,
             Conversation {
-                id: Arc::clone(summary_id),
+                id: Arc::clone(&summary_id),
                 purpose: InvocationPurpose::Compaction,
                 agent_id: None,
+                previous: history.branch(kept),
             },
             model,
             &compaction_history,
@@ -132,8 +140,9 @@ async fn summarize(
             session_id,
             maki_providers::retry::RetryPolicy::default(),
         )
-        .await
-        {
+        .await;
+        end_conversation_detached(provider, summary_id, ConversationEnd::Closed);
+        match result {
             Ok(response) => {
                 if attempt > 0 {
                     info!(
@@ -337,8 +346,8 @@ mod tests {
 
     use maki_providers::provider::BoxFuture;
     use maki_providers::{
-        ContentBlock, Invocation, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
-        StreamResponse, TokenUsage,
+        ContentBlock, ConversationLink, ConversationRelation, Invocation, Message, Model,
+        ProviderEvent, RequestOptions, Role, StopReason, StreamResponse, TokenUsage,
     };
     use maki_storage::id::SessionRef;
     use serde_json::Value;
@@ -548,6 +557,7 @@ mod tests {
             let summarizer = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
             let agent = MockProvider::new(Vec::new());
             let mut history = History::new(vec![Message::user("work".into())]);
+            history.mark_sent();
             let original = Arc::clone(history.conversation_id());
             let (raw_tx, _rx) = flume::unbounded();
 
@@ -569,6 +579,14 @@ mod tests {
             assert_eq!(summary.purpose, InvocationPurpose::Compaction);
             assert_ne!(summary.conversation_id, original);
             assert_eq!(
+                summary.previous,
+                Some(ConversationLink {
+                    id: Arc::clone(&original),
+                    relation: ConversationRelation::Branches,
+                    shared: 1,
+                })
+            );
+            assert_eq!(
                 summarizer.ended.1.recv_async().await.unwrap(),
                 (summary.conversation_id, ConversationEnd::Closed)
             );
@@ -577,6 +595,7 @@ mod tests {
                 (Arc::clone(&original), ConversationEnd::Compacted)
             );
             assert_ne!(history.conversation_id(), &original);
+            assert_eq!(history.conversation().previous, None);
         });
     }
 

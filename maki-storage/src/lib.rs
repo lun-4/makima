@@ -4,6 +4,7 @@
 
 pub mod auth;
 pub mod checkpoint;
+pub mod conversation;
 pub mod id;
 pub mod input_history;
 pub mod intern;
