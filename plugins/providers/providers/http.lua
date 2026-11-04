@@ -1,6 +1,8 @@
 -- HTTP plumbing every provider shares: API key lookup, configured headers,
 -- error responses and buffered bodies.
 
+local codec = require("providers.codec")
+
 local M = {}
 
 local MAX_ERROR_BYTES = 64 * 1024
@@ -173,7 +175,7 @@ function M.error(response)
   if trim(message) == "" then
     message = "HTTP " .. response.status
   end
-  return { status = response.status, message = message, retry_after = M.retry_after(response) }
+  return codec.api_error(response.status, message, M.retry_after(response))
 end
 
 -- `ctx.send(request)`, with a non-2xx response turned into nil plus `M.error`.

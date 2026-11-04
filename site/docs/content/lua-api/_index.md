@@ -1255,7 +1255,9 @@ and the other provider events, and returns false once the call is over.
 `stream` returns `{ message, usage, stop_reason }`. A failure returns nil
 plus an error: `{ kind = "config", message }` is a configuration error,
 such as a missing key or setting, and is not retried; a table with
-`status`, `message` and optional `retry_after` seconds is an API error;
+`status`, `message` and optional `retry_after` seconds is an API error,
+and `overflow = true` on it says the request does not fit the model's
+context, which the host answers by compacting instead of retrying;
 anything else is a retryable transport error. A raised error is not
 retried. Every callback that returns nil plus an error follows these
 rules.

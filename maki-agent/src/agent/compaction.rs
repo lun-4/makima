@@ -935,7 +935,12 @@ mod tests {
             const TOOL_USE_ID: &str = "call_dMZDTpEfz2JxMvFbqFHua1Zy";
 
             let provider = MockProvider::new(vec![
-                Err(AgentError::api(413, "prompt is too long")),
+                Err(AgentError::Api {
+                    status: 413,
+                    message: "prompt is too long".into(),
+                    retry_after: None,
+                    overflow: true,
+                }),
                 Ok(text_response(StopReason::EndTurn)),
             ]);
             let mut history = History::new(vec![

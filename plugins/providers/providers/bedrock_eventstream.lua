@@ -2,6 +2,7 @@
 -- frame CRCs are not checked; TLS already guards the bytes in transit.
 
 local anthropic = require("providers.anthropic")
+local codec = require("providers.codec")
 
 local M = {}
 
@@ -129,10 +130,10 @@ function M.events(response)
       local exception = frame.headers[":exception-type"]
       if exception then
         return nil,
-          {
-            status = EXCEPTION_STATUS[exception:lower()] or UNKNOWN_EXCEPTION_STATUS,
-            message = utf8.len(frame.payload) and frame.payload or exception,
-          }
+          codec.api_error(
+            EXCEPTION_STATUS[exception:lower()] or UNKNOWN_EXCEPTION_STATUS,
+            utf8.len(frame.payload) and frame.payload or exception
+          )
       end
       if frame.headers[":event-type"] == "chunk" and frame.payload ~= "" then
         return chunk_event(frame.payload)

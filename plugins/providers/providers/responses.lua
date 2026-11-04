@@ -191,15 +191,15 @@ function M.stream(response, emit)
         return nil, codec.frame_error(data.error)
       end
       local message = type(data.message) == "string" and data.message or "unknown error"
-      return nil, { status = UNKNOWN_ERROR_STATUS, message = message }
+      return nil, codec.api_error(UNKNOWN_ERROR_STATUS, message)
     elseif kind == "response.failed" and valid then
       local detail = type(data.response) == "table" and type(data.response.error) == "table" and data.response.error
         or {}
       return nil,
-        {
-          status = codec.error_status(detail.code) or UNKNOWN_ERROR_STATUS,
-          message = type(detail.message) == "string" and detail.message or FAILED_MESSAGE,
-        }
+        codec.api_error(
+          codec.error_status(detail.code) or UNKNOWN_ERROR_STATUS,
+          type(detail.message) == "string" and detail.message or FAILED_MESSAGE
+        )
     elseif kind == "response.output_text.delta" and delta ~= "" then
       if leading then
         leading = false

@@ -55,6 +55,7 @@ impl ProviderBackend for SlowFailingBackend {
                 status: FAILURE_STATUS,
                 message: FAILURE_MESSAGE.into(),
                 retry_after: None,
+                overflow: false,
             })
         }))
     }

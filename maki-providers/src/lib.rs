@@ -13,7 +13,7 @@ pub mod test_util;
 pub mod tokens;
 pub(crate) mod types;
 
-pub use error::{AgentError, Overflow};
+pub use error::AgentError;
 pub use maki_domain::{Effort, ThinkingConfig};
 pub use maki_storage::sessions::add_cost;
 pub use model::{

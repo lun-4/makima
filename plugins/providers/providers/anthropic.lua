@@ -278,7 +278,7 @@ function M.stream(response, emit)
     end
     local value, decode_err = maki.json.decode(event.data)
     if decode_err and event.event == "error" then
-      return nil, { status = UNPARSED_ERROR_STATUS, message = event.data }
+      return nil, codec.api_error(UNPARSED_ERROR_STATUS, event.data)
     end
     if event.event ~= "message" then
       return event.event, value

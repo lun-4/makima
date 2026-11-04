@@ -29,6 +29,18 @@ local ERROR_STATUS = {
   invalid_api_key = 401,
 }
 
+-- Request fields that cap the output. A refusal naming one is about the cap
+-- we sent, which compacting the session cannot fix.
+local OUTPUT_CAP_FIELDS = { "max_tokens", "max_completion_tokens", "max_output_tokens" }
+local OVERFLOW_SCOPES = { "context", "token", "prompt", "input" }
+local OVERFLOW_WORDS = { "exceeds", "exceeded", "too long", "too many", "maximum" }
+-- `10000 tokens (6000 in the messages, 4000 in the completion)`.
+local COMPLETION_HALF = "(%d+)%s* in the completion"
+-- `input length and max_tokens exceed context limit: 199773 + 8192 > 200000`.
+local SUM_OVER_LIMIT = "%d%s* %+ %s*%d.- > %s*%d"
+local BAD_REQUEST = 400
+local TOO_LARGE = 413
+
 local tool_id_seed
 local tool_id_count = 0
 
@@ -57,6 +69,53 @@ local function http_status(code)
   end
 end
 
+local function contains_any(text, words)
+  for _, word in ipairs(words) do
+    if text:find(word, 1, true) then
+      return true
+    end
+  end
+  return false
+end
+
+-- The prompt plus the output budget does not fit. Servers that enforce
+-- `prompt + max_tokens <= window` name `max_tokens` here, so this is checked
+-- before the output cap.
+local function over_budget(message)
+  if message:find(SUM_OVER_LIMIT) then
+    return true
+  end
+  local completion = tonumber(message:match(COMPLETION_HALF))
+  return completion ~= nil and completion > 0
+end
+
+-- Whether the server refused the request because it does not fit the
+-- model's context, which the host answers by compacting the session.
+function M.overflows(status, message)
+  if status ~= BAD_REQUEST and status ~= TOO_LARGE then
+    return false
+  end
+  local lower = message:lower()
+  if over_budget(lower) or status == TOO_LARGE then
+    return true
+  end
+  if contains_any(lower, OUTPUT_CAP_FIELDS) then
+    return false
+  end
+  return contains_any(lower, OVERFLOW_SCOPES) and contains_any(lower, OVERFLOW_WORDS)
+end
+
+-- The error table the host reads as an API error, with `overflow = true`
+-- when the request does not fit the model's context.
+function M.api_error(status, message, retry_after)
+  return {
+    status = status,
+    message = message,
+    retry_after = retry_after,
+    overflow = M.overflows(status, message) or nil,
+  }
+end
+
 -- The HTTP status an error code or type stands for, if it is a known one.
 function M.error_status(code)
   return ERROR_STATUS[code]
@@ -70,14 +129,14 @@ function M.frame_error(detail)
   if type(message) ~= "string" or message:match("^%s*$") then
     message = EMPTY_FRAME_MESSAGE
   end
-  return {
-    status = ERROR_STATUS[detail.code]
+  return M.api_error(
+    ERROR_STATUS[detail.code]
       or http_status(detail.code)
       or ERROR_STATUS[detail.type]
       or ERROR_STATUS[metadata.error_type]
       or UNMAPPED_STATUS,
-    message = message,
-  }
+    message
+  )
 end
 
 -- Decodes streamed tool arguments. Anything that is not JSON becomes `{}`.

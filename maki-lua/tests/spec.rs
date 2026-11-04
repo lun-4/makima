@@ -20,6 +20,7 @@ use test_case::test_case;
 #[test_case("providers_catalog", include_str!("../../plugins/providers/tests/catalog.lua") ; "providers_catalog_spec")]
 #[test_case("providers_chat_completions", include_str!("../../plugins/providers/tests/chat_completions.lua") ; "providers_chat_completions_spec")]
 #[test_case("providers_clock", include_str!("../../plugins/providers/tests/clock.lua") ; "providers_clock_spec")]
+#[test_case("providers_codec", include_str!("../../plugins/providers/tests/codec.lua") ; "providers_codec_spec")]
 #[test_case("providers_copilot", include_str!("../../plugins/providers/tests/copilot.lua") ; "providers_copilot_spec")]
 #[test_case("providers_custom", include_str!("../../plugins/providers/tests/custom.lua") ; "providers_custom_spec")]
 #[test_case("providers_deepseek", include_str!("../../plugins/providers/tests/deepseek.lua") ; "providers_deepseek_spec")]

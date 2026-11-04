@@ -342,9 +342,13 @@ fn prepare_may_adjust_the_model_but_not_its_id() {
 
 #[test_case(
     &format!("return nil, {{ status = {API_STATUS}, message = '{API_MESSAGE}', retry_after = {RETRY_AFTER_SECS} }}"),
-    |e| matches!(e, AgentError::Api { status: API_STATUS, message, retry_after: Some(after) }
+    |e| matches!(e, AgentError::Api { status: API_STATUS, message, retry_after: Some(after), overflow: false }
         if message == API_MESSAGE && *after == Duration::from_secs_f64(RETRY_AFTER_SECS))
     ; "error table with status is an api error")]
+#[test_case(
+    &format!("return nil, {{ status = {API_STATUS}, message = '{API_MESSAGE}', overflow = true }}"),
+    |e| e.is_context_overflow() && e.retry_kind().is_none()
+    ; "error table marked overflow is a context overflow")]
 #[test_case(
     &format!("return nil, {{ message = '{TRANSPORT_MESSAGE}' }}"),
     |e| matches!(e, AgentError::Io(io) if io.to_string() == TRANSPORT_MESSAGE) && e.retry_kind().is_some()

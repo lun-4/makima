@@ -1,6 +1,6 @@
 //! Provider error types with retry semantics.
-//! Retryable: 429, 5xx, IO, stream timeouts. Non-retryable: other 4xx, JSON parse, config,
-//! channel closed, user cancel. `user_message()` returns human-readable text for each variant.
+//! Retryable: 429, 5xx, IO, stream timeouts. Non-retryable: other 4xx, context overflow,
+//! JSON parse, config, channel closed, user cancel. `user_message()` returns human-readable text for each variant.
 
 use std::{io, time::Duration};
 
@@ -8,82 +8,6 @@ use crate::retry::RetryKind;
 
 const CONNECT_FAILED_MESSAGE: &str =
     "could not connect, check the server is running and the base URL is correct";
-
-/// Request fields that cap the *output*. A 400 naming one of them is about the
-/// cap we sent, never about the prompt being too big.
-const OUTPUT_CAP_FIELDS: [&str; 3] = ["max_tokens", "max_completion_tokens", "max_output_tokens"];
-/// Markers of servers that quote the two halves separately:
-/// `you requested 10000 tokens (6000 in the messages, 4000 in the completion)`.
-const MESSAGES_HALF: &str = " in the messages";
-const COMPLETION_HALF: &str = " in the completion";
-const CONTEXT_LIMIT: &str = "maximum context length is ";
-
-/// Why a provider refused a request for size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Overflow {
-    /// The transcript alone does not fit. Dropping context is the only way
-    /// through.
-    Prompt,
-    /// The transcript plus the output budget does not fit, though the
-    /// transcript by itself may well. Asking for less output costs nothing, so
-    /// this must never be answered by summarizing the transcript away.
-    ///
-    /// The fields are whatever the server quoted. A server that counts the
-    /// halves out loud also hands over an exact measurement of a prompt maki
-    /// could only estimate.
-    Budget {
-        prompt: Option<u32>,
-        limit: Option<u32>,
-    },
-}
-
-fn trailing_number(text: &str) -> Option<u32> {
-    let text = text.trim_end();
-    let start = text.len() - text.bytes().rev().take_while(u8::is_ascii_digit).count();
-    text[start..].parse().ok()
-}
-
-fn leading_number(text: &str) -> Option<u32> {
-    let text = text.trim_start();
-    let end = text.bytes().take_while(u8::is_ascii_digit).count();
-    text[..end].parse().ok()
-}
-
-/// Digits just before `marker`, e.g. the `6000` of `6000 in the messages`.
-fn number_before(text: &str, marker: &str) -> Option<u32> {
-    trailing_number(text.split_once(marker)?.0)
-}
-
-/// Digits just after `marker`, e.g. the `8192` of
-/// `maximum context length is 8192 tokens`.
-fn number_after(text: &str, marker: &str) -> Option<u32> {
-    leading_number(text.split_once(marker)?.1)
-}
-
-/// Some servers report the condition as arithmetic:
-/// ``input length and `max_tokens` exceed context limit: 199773 + 8192 > 200000``.
-/// All three numbers have to parse, or any prose with a `+` and a `>` would
-/// match.
-fn sum_over_limit(text: &str) -> Option<Overflow> {
-    let (head, limit) = text.split_once(" > ")?;
-    let (prompt, output) = head.rsplit_once(" + ")?;
-    leading_number(output)?;
-    Some(Overflow::Budget {
-        prompt: Some(trailing_number(prompt)?),
-        limit: Some(leading_number(limit)?),
-    })
-}
-
-fn budget_overflow(m: &str) -> Option<Overflow> {
-    sum_over_limit(m).or_else(|| {
-        // A zero-token completion half means the prompt alone is the problem,
-        // and no budget is small enough to fix that.
-        (number_before(m, COMPLETION_HALF)? > 0).then(|| Overflow::Budget {
-            prompt: number_before(m, MESSAGES_HALF),
-            limit: number_after(m, CONTEXT_LIMIT),
-        })
-    })
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
@@ -93,6 +17,9 @@ pub enum AgentError {
         message: String,
         /// What the server's `Retry-After` header asked for, when it sent one.
         retry_after: Option<Duration>,
+        /// The request does not fit the model's context, as the provider
+        /// read the refusal. Compacting the session is the remedy.
+        overflow: bool,
     },
     #[error("{message}")]
     Config { message: String },
@@ -120,6 +47,7 @@ impl AgentError {
             status,
             message: message.into(),
             retry_after: None,
+            overflow: false,
         }
     }
 
@@ -150,57 +78,8 @@ impl AgentError {
         self.retry_kind().is_some()
     }
 
-    /// Refused for size, either cause.
     pub fn is_context_overflow(&self) -> bool {
-        self.overflow().is_some()
-    }
-
-    /// Why a provider refused the request for size, and what it said about the
-    /// numbers. The two causes have opposite remedies: one is fixed by asking
-    /// for less output, the other only by dropping context.
-    ///
-    /// Matches the shapes servers use for these refusals: a 413, arithmetic
-    /// like `A + B > C`, the two halves quoted separately, or a message
-    /// naming the context, tokens, prompt or input together with exceeding
-    /// a limit. Provider plugins report the server's status and body as is.
-    pub fn overflow(&self) -> Option<Overflow> {
-        let Self::Api {
-            status, message, ..
-        } = self
-        else {
-            return None;
-        };
-        if !matches!(status, 400 | 413) {
-            return None;
-        }
-        let m = message.to_lowercase();
-        // Before the output-cap guard below: servers that enforce
-        // `prompt + max_tokens <= window` name `max_tokens` while reporting a
-        // budget overflow, and reading that as "our cap was malformed" turns a
-        // one-field fix into an unrecoverable error.
-        if let Some(budget) = budget_overflow(&m) {
-            return Some(budget);
-        }
-        if *status == 413 {
-            return Some(Overflow::Prompt);
-        }
-        // `Invalid 'max_tokens': integer above maximum value` reads as "token"
-        // plus "maximum" and would sail through the sniff below. The caller
-        // answers a prompt overflow by summarizing the session away, and no
-        // amount of that fixes a cap we guessed too high.
-        if OUTPUT_CAP_FIELDS.iter().any(|field| m.contains(field)) {
-            return None;
-        }
-        let is_scope = m.contains("context")
-            || m.contains("token")
-            || m.contains("prompt")
-            || m.contains("input");
-        let is_overflow = m.contains("exceeds")
-            || m.contains("exceeded")
-            || m.contains("too long")
-            || m.contains("too many")
-            || m.contains("maximum");
-        (is_scope && is_overflow).then_some(Overflow::Prompt)
+        matches!(self, Self::Api { overflow: true, .. })
     }
 
     pub fn is_auth_error(&self) -> bool {
@@ -295,10 +174,6 @@ mod tests {
         }
     }
 
-    fn api_msg(status: u16, message: &str) -> AgentError {
-        AgentError::api(status, message)
-    }
-
     #[test_case(429, RetryKind::RateLimit ; "rate_limit")]
     #[test_case(500, RetryKind::Transient  ; "server_error")]
     #[test_case(529, RetryKind::Transient  ; "overloaded")]
@@ -370,48 +245,14 @@ mod tests {
         assert!(timeout().is_retryable());
     }
 
-    // llama.cpp: https://github.com/ggml-org/llama.cpp/blob/master/tools/server/server-context.cpp
-    #[test_case(400, "request (268914 tokens) exceeds the available context size (262144 tokens)", true   ; "llama_cpp_overshoot")]
-    // OpenAI: https://platform.openai.com/docs/guides/error-codes
-    #[test_case(400, "Input exceeds context limit", true                                                 ; "openai_style")]
-    // OpenAI: https://platform.openai.com/docs/guides/error-codes
-    #[test_case(400, "This model's maximum context length is 8192 tokens. However, you requested 9850 tokens", true ; "openai_max_context")]
-    // Gemini: https://ai.google.dev/gemini-api/docs/troubleshooting
-    #[test_case(400, "The input token count exceeds the maximum number of tokens allowed", true           ; "gemini_exceeds")]
-    // Gemini: https://ai.google.dev/gemini-api/docs/troubleshooting
-    #[test_case(400, "Request contains too many tokens. Please reduce the input size.", true              ; "gemini_too_many")]
-    // Gemini: https://ai.google.dev/gemini-api/docs/troubleshooting
-    #[test_case(400, "Your input context is too long.", true                                              ; "gemini_500_input")]
-    // Ollama: https://docs.ollama.com/api/errors
-    #[test_case(400, "context length exceeded", true                                                      ; "ollama")]
-    // Anthropic: https://docs.anthropic.com/en/docs/errors
-    #[test_case(413, "prompt is too long", true                                                           ; "anthropic_413")]
-    // HTTP 413: https://www.rfc-editor.org/rfc/rfc9110.html#name-413-content-too-large
-    #[test_case(413, "Payload too large", true                                                            ; "generic_413")]
-    // DeepSeek: https://api-docs.deepseek.com/quick_start/pricing
-    #[test_case(400, "This model's maximum context length is 131072 tokens. However, you requested 168754 tokens", true ; "deepseek")]
-    // Mistral: https://docs.mistral.ai/resources/known-limitations
-    #[test_case(400, "Prompt contains 321774 tokens and 0 draft tokens, too large for model with 262144 maximum context length", true ; "mistral")]
-    // OpenRouter: https://openrouter.ai/docs/api/reference/errors-and-debugging.mdx
-    #[test_case(400, "This endpoint's maximum context length is 200000 tokens. However, you requested about 5028244 tokens", true ; "openrouter")]
-    // Bedrock: https://repost.aws/knowledge-center/bedrock-validation-exception-errors
-    #[test_case(400, "Input is too long for requested model.", true                                                          ; "bedrock")]
-    #[test_case(400, "Input is too long for the model", true                                              ; "too_long_input")]
-    #[test_case(400, "Rate limit exceeded", false                                                         ; "not_context")]
-    #[test_case(400, "Invalid API key", false                                                             ; "auth_error")]
-    #[test_case(500, "Internal server error", false                                                       ; "server_error")]
-    #[test_case(400, "The output is too long", false                                                      ; "output_not_context")]
-    // A cap we sent, not a prompt we grew. Compacting cannot fix either of these.
-    #[test_case(400, "Invalid 'max_tokens': integer above maximum value. Expected a value <= 32768", false ; "openai_max_tokens_cap")]
-    #[test_case(400, "max_completion_tokens is too large: 100000", false                                  ; "openai_max_completion_tokens_cap")]
-    #[test_case(400, "max_output_tokens exceeds the model maximum", false                                 ; "max_output_tokens_cap")]
-    fn is_context_overflow(status: u16, message: &str, expected: bool) {
-        assert_eq!(api_msg(status, message).is_context_overflow(), expected);
-    }
-
     #[test]
     fn context_overflow_is_not_retryable() {
-        let err = api_msg(400, "request exceeds the available context size");
+        let err = AgentError::Api {
+            status: 400,
+            message: String::new(),
+            retry_after: None,
+            overflow: true,
+        };
         assert!(err.is_context_overflow());
         assert!(!err.is_retryable());
     }

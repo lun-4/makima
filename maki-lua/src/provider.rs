@@ -200,6 +200,11 @@ fn returned_error(error: &LuaValue) -> AgentError {
                 .ok()
                 .flatten()
                 .and_then(|secs| Duration::try_from_secs_f64(secs).ok()),
+            overflow: fields
+                .get::<Option<bool>>("overflow")
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
         },
         None => transport_error(message),
     }
