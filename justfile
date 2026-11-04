@@ -44,7 +44,7 @@ gen-docs-check:
 machete:
     cargo-machete
 
-# Criterion benches (maki-lua: luau_perf, splash_perf). Pass a filter to pick
+# Criterion benches (maki-lua: luau_perf, splash_perf, provider_perf). Pass a filter to pick
 # one, e.g. `just bench -- pull_roundtrip`; slow meters are sample_size 10.
 bench *ARGS:
     cargo bench -p maki-lua {{ARGS}}
