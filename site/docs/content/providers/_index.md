@@ -375,6 +375,20 @@ No curated models. The provider lists them once it is configured.
 
 Talks to the server at the `base_url` saved by `makima auth login llama-cpp`, else at `LLAMA_CPP_HOST`. Models come from the server: a router lists many, a single-model server one. The key is optional.
 
+### Claude Agent
+
+- **Id**: `claude-agent`
+- **API**: `unix:<state dir>/claude-agent/bridge.sock`
+- **Login**: `makima auth login claude-agent` (Claude Code login)
+
+| Tier | Model | Pricing (in/out per 1M tokens) | Limits |
+|------|-------|-------------------------------|--------|
+| weak | **haiku** (default) |  |  |
+| medium | **sonnet** (default) |  |  |
+| strong | **opus** (default) |  |  |
+
+Uses your Claude Code login through the Claude Agent SDK. Start the bridge first: `npm install --omit=optional` and then `node src/main.ts` in `claude-agent-bridge/` (Node 24 or later). It runs your installed `claude` with its own tools, settings, hooks, MCP servers and CLAUDE.md files turned off, and offers Claude Maki's tools instead, so Maki's permissions apply to every call. `socket` in the `[claude-agent]` section of `providers.toml` points at a bridge listening elsewhere. Claude Code retries failed requests itself, so Maki does not retry this provider.
+
 ### Opencode Zen
 
 - **Id**: `opencode`
