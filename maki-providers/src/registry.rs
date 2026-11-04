@@ -3,6 +3,7 @@
 //! Resolution reads descriptors held here and never calls into a backend, so
 //! it stays cheap enough for the UI thread.
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -124,6 +125,22 @@ impl Entry {
             .unwrap_or_else(|| ModelInfo::id_only(model_id.to_string()))
     }
 
+    /// The descriptor whose id is the longest prefix of {model_id}, as the
+    /// providers' own lookup matches a dated or suffixed id, renamed to it.
+    fn resolved(&self, model_id: &str) -> ModelInfo {
+        self.models()
+            .iter()
+            .filter(|info| model_id.starts_with(info.id.as_str()))
+            .min_by_key(|info| Reverse(info.id.len()))
+            .map_or_else(
+                || ModelInfo::id_only(model_id.to_string()),
+                |info| ModelInfo {
+                    id: model_id.to_string(),
+                    ..info.clone()
+                },
+            )
+    }
+
     fn specs(&self, provider: &str) -> Vec<String> {
         self.models()
             .iter()
@@ -211,7 +228,7 @@ impl ProviderRegistry {
         let entry = self
             .get(provider)
             .ok_or_else(|| ModelError::UnsupportedProvider(provider.to_string()))?;
-        Ok(Model::from_info(provider, &entry.info(model_id)))
+        Ok(Model::from_info(provider, &entry.resolved(model_id)))
     }
 
     /// User overrides first, then the first descriptor declaring the tier
@@ -346,6 +363,7 @@ mod tests {
     use super::*;
 
     const FAKE: &str = "fake-registered";
+    const STRONG: &str = "strong";
     const STRONG_FIRST: &str = "strong-first";
     const STRONG_SECOND: &str = "strong-second";
     const WEAK: &str = "weak-only";
@@ -460,6 +478,22 @@ mod tests {
         let prepared = smol::block_on(registry.prepare(model)).unwrap();
         assert!(backend.prepared.load(Ordering::SeqCst));
         assert_eq!(prepared.model.id, STRONG_FIRST);
+    }
+
+    #[test_case("strong-first-20260101", ModelTier::Strong ; "dated_variant_of_the_longer_id")]
+    #[test_case("strong-second", ModelTier::Medium ; "exact_id_beats_a_shorter_prefix")]
+    #[test_case("strong-other", ModelTier::Weak ; "falls_back_to_the_shorter_prefix")]
+    fn longest_descriptor_prefix_describes_a_model(model_id: &str, tier: ModelTier) {
+        let discovered = vec![
+            info(STRONG, Some(ModelTier::Weak)),
+            info(STRONG_FIRST, Some(ModelTier::Strong)),
+            info(STRONG_SECOND, Some(ModelTier::Medium)),
+        ];
+        let (registry, _) = registry_with(FAKE, Some(Ok(discovered)));
+        smol::block_on(registry.fetch_all(&ModelPolicy::default(), false, |_| {}));
+        let model = registry.model(&format!("{FAKE}/{model_id}")).unwrap();
+        assert_eq!((model.id.as_str(), model.tier), (model_id, tier));
+        assert_eq!(model.context_window, CONTEXT_WINDOW);
     }
 
     #[test]
