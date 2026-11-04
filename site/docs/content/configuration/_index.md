@@ -35,7 +35,7 @@ maki.setup({
     },
     provider = {
         default_model = "anthropic/claude-sonnet-5",
-        allowed_models = { "anthropic/*", "copilot/gpt-5.6-terra" },
+        allowed_models = { "anthropic/*", "openai/gpt-5.6-terra" },
         excluded_models = { "*/*-preview" },
     },
 

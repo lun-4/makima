@@ -3,7 +3,7 @@
 //! Resolution reads descriptors held here and never calls into a backend, so
 //! it stays cheap enough for the UI thread.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use maki_config::ModelPolicy;
@@ -140,14 +140,17 @@ impl Entry {
     }
 }
 
+/// Providers in registration order, which is the order auto-detect, the
+/// login picker and the docs follow.
 #[derive(Default)]
 pub struct ProviderRegistry {
-    entries: BTreeMap<Arc<str>, Entry>,
+    entries: Vec<(Arc<str>, Entry)>,
+    positions: HashMap<Arc<str>, usize>,
 }
 
 impl ProviderRegistry {
     pub fn new(providers: Vec<RegisteredProvider>) -> Self {
-        let entries = providers
+        let entries: Vec<_> = providers
             .into_iter()
             .map(|provider| {
                 let entry = Entry {
@@ -160,16 +163,29 @@ impl ProviderRegistry {
                 (provider.id, entry)
             })
             .collect();
-        Self { entries }
+        let positions = entries
+            .iter()
+            .enumerate()
+            .map(|(position, (id, _))| (Arc::clone(id), position))
+            .collect();
+        Self { entries, positions }
     }
 
     pub(crate) fn entries(&self) -> impl Iterator<Item = (&Arc<str>, &Entry)> {
-        self.entries.iter()
+        self.entries.iter().map(|(id, entry)| (id, entry))
     }
 
-    /// Every provider, ordered by id.
+    fn get(&self, provider: &str) -> Option<&Entry> {
+        self.get_key_value(provider).map(|(_, entry)| entry)
+    }
+
+    fn get_key_value(&self, provider: &str) -> Option<(&Arc<str>, &Entry)> {
+        let (id, entry) = &self.entries[*self.positions.get(provider)?];
+        Some((id, entry))
+    }
+
     pub fn listings(&self) -> impl Iterator<Item = ProviderListing<'_>> {
-        self.entries.iter().map(|(id, entry)| ProviderListing {
+        self.entries().map(|(id, entry)| ProviderListing {
             id,
             display_name: &entry.display_name,
             models: entry.models(),
@@ -181,10 +197,10 @@ impl ProviderRegistry {
     /// A provider id, or else the first alias named {name}, with the
     /// alias's preset method.
     pub(crate) fn login_target(&self, name: &str) -> Option<(&Arc<str>, &Entry, Option<&str>)> {
-        if let Some((id, entry)) = self.entries.get_key_value(name) {
+        if let Some((id, entry)) = self.get_key_value(name) {
             return Some((id, entry, None));
         }
-        self.entries.iter().find_map(|(id, entry)| {
+        self.entries().find_map(|(id, entry)| {
             let alias = entry.auth.aliases.iter().find(|alias| alias.id == name)?;
             Some((id, entry, Some(alias.method.as_str())))
         })
@@ -193,7 +209,6 @@ impl ProviderRegistry {
     pub fn model(&self, spec: &str) -> Result<Model, ModelError> {
         let (provider, model_id) = Model::parse_spec(spec)?;
         let entry = self
-            .entries
             .get(provider)
             .ok_or_else(|| ModelError::UnsupportedProvider(provider.to_string()))?;
         Ok(Model::from_info(provider, &entry.info(model_id)))
@@ -202,7 +217,7 @@ impl ProviderRegistry {
     /// User overrides first, then the first descriptor declaring the tier
     /// that no override already gave to another tier.
     pub fn spec_for_tier(&self, provider: &str, tier: ModelTier) -> Option<String> {
-        let entry = self.entries.get(provider)?;
+        let entry = self.get(provider)?;
         let prefix = format!("{provider}/");
         model_registry::tier_override(tier)
             .filter(|spec| spec.starts_with(&prefix))
@@ -218,8 +233,8 @@ impl ProviderRegistry {
     pub fn spec_for_tier_any(&self, tier: ModelTier) -> Option<String> {
         model_registry::tier_override(tier).or_else(|| {
             self.entries
-                .keys()
-                .find_map(|provider| self.spec_for_tier(provider, tier))
+                .iter()
+                .find_map(|(provider, _)| self.spec_for_tier(provider, tier))
         })
     }
 
@@ -230,7 +245,6 @@ impl ProviderRegistry {
         policy: &ModelPolicy,
     ) -> Result<Model, ModelError> {
         let entry = self
-            .entries
             .get(provider)
             .ok_or_else(|| ModelError::UnsupportedProvider(provider.to_string()))?;
         self.spec_for_tier(provider, tier)
@@ -246,13 +260,12 @@ impl ProviderRegistry {
     }
 
     pub fn display_name(&self, provider: &str) -> Option<Arc<str>> {
-        self.entries
-            .get(provider)
+        self.get(provider)
             .map(|entry| Arc::clone(&entry.display_name))
     }
 
     pub async fn prepare(&self, model: Model) -> Result<PreparedProvider, AgentError> {
-        let Some(entry) = self.entries.get(&*model.provider) else {
+        let Some(entry) = self.get(&model.provider) else {
             return Err(AgentError::Config {
                 message: format!("unknown provider '{}'", model.provider),
             });
@@ -263,8 +276,7 @@ impl ProviderRegistry {
 
     /// Specs known without any network call.
     pub fn offline_specs(&self, policy: &ModelPolicy) -> Vec<String> {
-        self.entries
-            .iter()
+        self.entries()
             .flat_map(|(provider, entry)| entry.specs(provider))
             .filter(|spec| policy.allows(spec))
             .collect()
@@ -279,7 +291,7 @@ impl ProviderRegistry {
         mut on_ready: impl FnMut(ModelBatch) + Send,
     ) {
         let (tx, rx) = flume::unbounded();
-        for (provider, entry) in &self.entries {
+        for (provider, entry) in self.entries() {
             let Some(discovery) = entry.backend.discover(refresh) else {
                 continue;
             };
@@ -302,7 +314,7 @@ impl ProviderRegistry {
         result: Result<Vec<ModelInfo>, AgentError>,
         policy: &ModelPolicy,
     ) -> ModelBatch {
-        let entry = &self.entries[&provider];
+        let entry = &self.entries[self.positions[&provider]].1;
         let warnings = match result {
             Ok(models) => {
                 *entry.models.write().unwrap() = models.into();
@@ -340,6 +352,8 @@ mod tests {
     const DISCOVERED: &str = "discovered";
     const CONTEXT_WINDOW: u32 = 42_000;
     const DISCOVERY_FAILURE: &str = "listing failed";
+    const REGISTERED_FIRST: &str = "zeta";
+    const REGISTERED_SECOND: &str = "alpha";
 
     struct FakeBackend {
         discovered: Option<Result<Vec<ModelInfo>, String>>,
@@ -400,15 +414,8 @@ mod tests {
         }
     }
 
-    fn registry_with(
-        id: &str,
-        discovered: Option<Result<Vec<ModelInfo>, String>>,
-    ) -> (ProviderRegistry, Arc<FakeBackend>) {
-        let backend = Arc::new(FakeBackend {
-            discovered,
-            prepared: AtomicBool::new(false),
-        });
-        let registry = ProviderRegistry::new(vec![RegisteredProvider {
+    fn registered(id: &str, backend: Arc<FakeBackend>) -> RegisteredProvider {
+        RegisteredProvider {
             id: id.into(),
             display_name: id.into(),
             models: vec![
@@ -416,10 +423,25 @@ mod tests {
                 info(STRONG_SECOND, Some(ModelTier::Strong)),
                 info(WEAK, Some(ModelTier::Weak)),
             ],
-            backend: Arc::clone(&backend) as Arc<dyn ProviderBackend>,
+            backend,
             auth: AuthSpec::default(),
             docs: None,
-        }]);
+        }
+    }
+
+    fn backend(discovered: Option<Result<Vec<ModelInfo>, String>>) -> Arc<FakeBackend> {
+        Arc::new(FakeBackend {
+            discovered,
+            prepared: AtomicBool::new(false),
+        })
+    }
+
+    fn registry_with(
+        id: &str,
+        discovered: Option<Result<Vec<ModelInfo>, String>>,
+    ) -> (ProviderRegistry, Arc<FakeBackend>) {
+        let backend = backend(discovered);
+        let registry = ProviderRegistry::new(vec![registered(id, Arc::clone(&backend))]);
         (registry, backend)
     }
 
@@ -473,6 +495,25 @@ mod tests {
             .model_for_tier(FAKE, ModelTier::Strong, &policy(allowed))
             .unwrap();
         assert_eq!(model.id, expected);
+    }
+
+    #[test]
+    fn providers_keep_registration_order() {
+        let registry = ProviderRegistry::new(vec![
+            registered(REGISTERED_FIRST, backend(None)),
+            registered(REGISTERED_SECOND, backend(None)),
+        ]);
+        let ids: Vec<_> = registry.listings().map(|listing| listing.id).collect();
+        assert_eq!(ids, [REGISTERED_FIRST, REGISTERED_SECOND]);
+        assert_eq!(
+            registry.spec_for_tier_any(ModelTier::Strong),
+            Some(format!("{REGISTERED_FIRST}/{STRONG_FIRST}"))
+        );
+        assert!(
+            registry
+                .model(&format!("{REGISTERED_SECOND}/{WEAK}"))
+                .is_ok()
+        );
     }
 
     #[test]

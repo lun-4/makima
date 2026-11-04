@@ -102,6 +102,8 @@ Pick **Custom provider...** to add an endpoint of your own. An [executable provi
 
 `status` lists each provider as saved (credentials on disk), env (key from an environment variable), configured (key in `providers.toml`), error (the check failed, with the reason), or missing.
 
+The list is in the order Makima picks a default model when you have not chosen one: Anthropic, OpenAI, Copilot, Z.AI, Synthetic, DeepSeek, Regolo, then the other built-in providers, Ollama, llama.cpp and OpenCode, your own providers, and the models.dev catalog providers last. So with both `ANTHROPIC_API_KEY` and `GEMINI_API_KEY` set, a fresh start uses Anthropic.
+
 ### `makima models`
 
 ```bash

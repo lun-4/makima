@@ -23,16 +23,22 @@ local function register_user(spec, source)
   end
 end
 
+local function register_compat(names)
+  for _, name in ipairs(names) do
+    register(compat.provider(require("providers." .. name).def))
+  end
+end
+
+-- Registration order is auto-detect order: with no model chosen, the first
+-- provider that has credentials supplies the default model.
 register(require("providers.anthropic_provider").provider())
 register(require("providers.openai").provider())
 register(require("providers.copilot").provider())
+register_compat({ "zai", "synthetic", "deepseek", "regolo" })
 register(require("providers.google").provider())
 register(require("providers.vertex").provider())
 register(aperture.provider())
-
-for _, name in ipairs({ "synthetic", "mistral", "zai", "deepseek", "openrouter", "requesty", "regolo", "tensorx" }) do
-  register(compat.provider(require("providers." .. name).def))
-end
+register_compat({ "mistral", "openrouter", "requesty", "tensorx" })
 
 for _, name in ipairs({ "ollama", "llama_cpp" }) do
   register(local_server.provider(require("providers." .. name).def))

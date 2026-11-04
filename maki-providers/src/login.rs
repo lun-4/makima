@@ -357,7 +357,7 @@ fn restore(storage: &StateDir, id: &str, snapshot: Option<Value>) {
     }
 }
 
-/// Every registered provider's status, in registry order with sectioned
+/// Every registered provider's status, in registration order with sectioned
 /// providers last. A failing check is reported as `Failed` and the listing
 /// continues.
 pub async fn auth_status(registry: &ProviderRegistry, storage: &StateDir) -> Vec<ProviderStatus> {

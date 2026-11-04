@@ -45,6 +45,15 @@ const BUNDLED_KEY: &str = "zk-bundled-login-key";
 const MASKED_KEY: &str = "key: zk-b...-key, coding";
 const PLAN_PROVIDER_KEY_ENV: &str = "ZHIPU_API_KEY";
 const PLAN_LOGIN_URL: &str = "https://z.ai/manage-apikey/apikey-list";
+const AUTO_DETECT_ORDER: &[&str] = &[
+    "anthropic",
+    "openai",
+    "copilot",
+    "zai",
+    "synthetic",
+    "deepseek",
+    "regolo",
+];
 
 const SOURCE: &str = r#"
     maki.api.register_provider({
@@ -287,6 +296,13 @@ fn default_auth_status_and_logout_use_credentials_file() {
     assert_eq!(name.unwrap().as_deref(), Some(DISPLAY_NAME));
     assert!(load_provider_credentials(&fixture.storage, PROVIDER).is_none());
     assert_eq!(state_of(PROVIDER), Some(AuthState::Missing));
+}
+
+#[test]
+fn bundled_providers_keep_auto_detect_order() {
+    let fixture = Fixture::with_plugin(BUNDLED_PLUGIN, BUNDLED_SOURCE);
+    let ids: Vec<_> = fixture.states().into_iter().map(|(id, ..)| id).collect();
+    assert_eq!(ids[..AUTO_DETECT_ORDER.len()], *AUTO_DETECT_ORDER);
 }
 
 #[test]
