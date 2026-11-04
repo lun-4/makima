@@ -62,7 +62,9 @@ use crate::text_buffer::is_newline_key;
 use arc_swap::{ArcSwap, ArcSwapOption};
 #[cfg(test)]
 pub(crate) use crossterm::event::KeyEventKind;
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind as CrosstermKeyEventKind, MouseEvent};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind as CrosstermKeyEventKind, KeyModifiers, MouseEvent,
+};
 use maki_agent::actor::{EffectiveAgentConfig, TranscriptRequest};
 use maki_agent::agent::isolated_turn::IsolatedTurnRequest;
 use maki_agent::permissions::PermissionManager;
@@ -1650,11 +1652,15 @@ impl App {
     }
 
     fn dispatch_override(&self, key: KeyEvent) -> Option<u64> {
+        let (code, modifiers) = match key.code {
+            KeyCode::BackTab => (KeyCode::Tab, key.modifiers | KeyModifiers::SHIFT),
+            _ => (key.code, key.modifiers),
+        };
         self.keymap_reader
             .load()
             .entries
             .iter()
-            .find(|entry| entry.key == key.code && entry.modifiers == key.modifiers)
+            .find(|entry| entry.key == code && entry.modifiers == modifiers)
             .filter(|_| !self.lua_event_handle.is_disconnected())
             .map(|entry| entry.id)
     }
@@ -1803,7 +1809,12 @@ impl App {
                         self.active_chat().scroll(-1);
                         vec![]
                     }
-                    KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
+                    KeyCode::BackTab if !self.is_bash_input() => self.toggle_mode(),
+                    KeyCode::Tab
+                        if key.modifiers.contains(KeyModifiers::SHIFT) && !self.is_bash_input() =>
+                    {
+                        self.toggle_mode()
+                    }
                     KeyCode::Esc => {
                         if let Some(t) = self.last_esc.take()
                             && t.elapsed() < self.status_bar.flash_duration

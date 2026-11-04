@@ -1025,11 +1025,14 @@ fn standalone_compaction_returns_to_idle_without_ending_the_session() {
 }
 
 #[test]
-fn toggle_mode_emits_change_mode_without_mutating_state() {
+fn shift_tab_toggles_mode_without_mutating_state() {
     let mut app = test_app();
     assert_eq!(app.root_mode(), Mode::Build);
 
-    let actions = app.update(Msg::Key(key(KeyCode::Tab)));
+    assert!(app.update(Msg::Key(key(KeyCode::Tab))).is_empty());
+    assert_eq!(app.root_mode(), Mode::Build);
+
+    let actions = app.update(Msg::Key(key(KeyCode::BackTab)));
     assert!(matches!(&actions[..], [Action::ChangeMode(id)] if id == "plan"));
     assert_eq!(app.root_mode(), Mode::Build);
 }
@@ -7315,12 +7318,12 @@ fn override_shadows_quit_builtin() {
 }
 
 #[test]
-fn override_shadows_tab_mode_toggle() {
+fn override_shadows_shift_tab_mode_toggle() {
     let mut app = test_app();
     let initial_mode = app.root_mode().clone();
-    let _probe = install_override(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    let _probe = install_override(&mut app, KeyCode::Tab, KeyModifiers::SHIFT);
 
-    let actions = app.update(Msg::Key(key(KeyCode::Tab)));
+    let actions = app.update(Msg::Key(key(KeyCode::BackTab)));
 
     assert!(
         matches!(actions[..], [Action::RunKeybind(OVERRIDE_ID)]),
@@ -7329,7 +7332,7 @@ fn override_shadows_tab_mode_toggle() {
     assert_eq!(
         app.root_mode(),
         initial_mode,
-        "override must consume Tab before the built-in mode toggle runs"
+        "override must consume Shift+Tab before the built-in mode toggle runs"
     );
 }
 
@@ -7489,11 +7492,11 @@ fn bash_prefix_overrides_mode() {
     app.input_box.set_input("! ls".into());
     assert_eq!(&*app.mode_label().0, "[BASH]");
 
-    app.update(Msg::Key(key(KeyCode::Tab)));
+    app.update(Msg::Key(key(KeyCode::BackTab)));
     assert_eq!(
         app.root_mode(),
         Mode::Build,
-        "tab must not toggle while bash prefix present"
+        "shift+tab must not toggle while bash prefix present"
     );
 
     app.input_box.set_input("ls".into());
