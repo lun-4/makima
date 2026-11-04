@@ -83,7 +83,9 @@ function M.provider()
       return nil, err
     end
     return {
-      key_count = client.pool.count,
+      key_count = function()
+        return client.pool.count
+      end,
       rotate_key = function()
         return client.pool.rotate()
       end,

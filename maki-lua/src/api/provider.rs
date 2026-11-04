@@ -219,7 +219,8 @@ fn spec_error(message: impl fmt::Display) -> mlua::Error {
 /// `stream(ctx, request, emit)` and optionally `fetch_usage(ctx)`,
 /// `refresh_auth(ctx)`, `reload_auth(ctx)`, `rotate_key(ctx)`,
 /// `end_conversation(ctx, conversation_id, reason)` and `key_count` (a
-/// number, or a function read once at prepare). `request` has `model`
+/// number, or a function read at prepare and after each `reload_auth` or
+/// `refresh_auth`, for a pool those can change). `request` has `model`
 /// (`id`, `max_output_tokens`, `context_window`), `system`, `messages`,
 /// `tools`, `thinking`, `fast`, `session_id` and `invocation`
 /// (`conversation_id`, `operation_id`, `attempt`, `purpose`, `agent_id`).

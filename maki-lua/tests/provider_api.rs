@@ -665,13 +665,14 @@ fn failing_end_conversation_is_swallowed() {
 }
 
 #[test]
-fn key_count_is_read_once_at_prepare() {
+fn key_count_is_read_at_prepare_and_after_an_auth_reload() {
     let (_host, prepared) = prepare_fake(&format!(
         r#"
-        local reads = 0
+        local reads, keys = 0, {KEY_COUNT}
         return {{
             stream = function() end,
-            key_count = function() reads = reads + 1; return {KEY_COUNT} end,
+            key_count = function() reads = reads + 1; return keys end,
+            reload_auth = function() keys = keys + 1 end,
             fetch_usage = function() return {{ plan = tostring(reads), limits = {{}} }} end,
         }}
         "#
@@ -679,10 +680,17 @@ fn key_count_is_read_once_at_prepare() {
     let provider = &prepared.provider;
     assert_eq!(provider.key_count(), KEY_COUNT);
     assert_eq!(provider.key_count(), KEY_COUNT);
-    let usage = smol::block_on(bounded(provider.fetch_usage()))
-        .unwrap()
-        .unwrap();
-    assert_eq!(usage.plan.as_deref(), Some("1"));
+    let reads = || {
+        smol::block_on(bounded(provider.fetch_usage()))
+            .unwrap()
+            .unwrap()
+            .plan
+    };
+    assert_eq!(reads().as_deref(), Some("1"));
+
+    smol::block_on(bounded(provider.reload_auth())).unwrap();
+    assert_eq!(provider.key_count(), KEY_COUNT + 1);
+    assert_eq!(reads().as_deref(), Some("2"));
 
     let (_host, prepared) = prepare_fake(&format!(
         "return {{ stream = function() end, key_count = {KEY_COUNT} }}"

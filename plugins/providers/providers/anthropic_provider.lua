@@ -298,7 +298,9 @@ local function api_instance(ctx, model, config)
     return nil, err
   end
   return {
-    key_count = api.pool.count,
+    key_count = function()
+      return api.pool.count
+    end,
     rotate_key = function()
       return api.pool.rotate()
     end,

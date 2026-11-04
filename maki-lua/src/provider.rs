@@ -4,7 +4,7 @@
 
 use std::future::Future;
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
@@ -349,7 +349,7 @@ impl ProviderBackend for LuaBackend {
                     requests,
                     callbacks,
                     instance: Arc::new(instance),
-                    key_count,
+                    key_count: AtomicUsize::new(key_count),
                 }),
             })
         })
@@ -502,16 +502,24 @@ async fn prepare_instance(
         None | Some(LuaValue::Nil) => None,
         Some(model) => Some(lua.from_value(model)?),
     };
-    let key_count = match instance.get::<LuaValue>("key_count")? {
-        LuaValue::Nil => DEFAULT_KEY_COUNT,
-        LuaValue::Function(key_count) => key_count.call_async(callbacks.ctx(lua)?).await?,
-        key_count => lua.from_value(key_count)?,
-    };
+    let key_count = instance_key_count(lua, callbacks, &instance).await?;
     Ok(Ok((
         lua.create_registry_value(instance)?,
         adjusted,
         key_count,
     )))
+}
+
+async fn instance_key_count(
+    lua: &Lua,
+    callbacks: &Callbacks,
+    instance: &Table,
+) -> mlua::Result<usize> {
+    match instance.get::<LuaValue>("key_count")? {
+        LuaValue::Nil => Ok(DEFAULT_KEY_COUNT),
+        LuaValue::Function(key_count) => key_count.call_async(callbacks.ctx(lua)?).await,
+        key_count => lua.from_value(key_count),
+    }
 }
 
 #[derive(Serialize)]
@@ -574,7 +582,9 @@ struct LuaProvider {
     requests: Sender<Request>,
     callbacks: Arc<Callbacks>,
     instance: Arc<RegistryKey>,
-    key_count: usize,
+    /// Read at prepare and again after each auth reload or refresh, which
+    /// may change the key pool.
+    key_count: AtomicUsize,
 }
 
 impl LuaProvider {
@@ -601,8 +611,23 @@ impl LuaProvider {
         }
     }
 
-    fn call_unit(&self, name: &'static str) -> BoxFuture<'_, Result<(), AgentError>> {
-        Box::pin(self.call(name, no_args, |_, _| Ok(Ok(()))))
+    /// Calls auth function {name}, then rereads the key count it may have
+    /// changed.
+    fn call_auth(&self, name: &'static str) -> BoxFuture<'_, Result<(), AgentError>> {
+        Box::pin(async move {
+            self.call(name, no_args, |_, _| Ok(Ok(()))).await?;
+            let callbacks = Arc::clone(&self.callbacks);
+            let instance = Arc::clone(&self.instance);
+            let key_count = invoke(&self.requests, move |lua| {
+                Box::pin(async move {
+                    let instance: Table = lua.registry_value(&instance)?;
+                    Ok(Ok(instance_key_count(&lua, &callbacks, &instance).await?))
+                })
+            })
+            .await?;
+            self.key_count.store(key_count, Ordering::Relaxed);
+            Ok(())
+        })
     }
 }
 
@@ -671,15 +696,15 @@ impl Provider for LuaProvider {
     }
 
     fn refresh_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
-        self.call_unit("refresh_auth")
+        self.call_auth("refresh_auth")
     }
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
-        self.call_unit("reload_auth")
+        self.call_auth("reload_auth")
     }
 
     fn key_count(&self) -> usize {
-        self.key_count
+        self.key_count.load(Ordering::Relaxed)
     }
 
     fn rotate_key(&self) -> BoxFuture<'_, bool> {
