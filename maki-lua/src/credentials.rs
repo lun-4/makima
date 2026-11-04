@@ -3,12 +3,10 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use futures::FutureExt;
 use futures::channel::oneshot;
 use futures::future::Shared;
-use futures_lite::future;
 use maki_agent::cancel::CancelToken;
 use maki_lua_macro::{lua_class, lua_fn};
 use maki_storage::StateDir;
@@ -17,18 +15,13 @@ use mlua::{
     Function, Lua, LuaSerdeExt, MultiValue, Result as LuaResult, UserDataRef, Value as LuaValue,
 };
 use serde_json::Value;
-use smol::{Timer, unblock};
+use smol::unblock;
 use tracing::warn;
 
 use crate::api::env::host_state_dir;
 use crate::api::util::pair::{Pair, pair, try_pair};
 use crate::provider::{HOST_STOPPED, ProviderJob, serialize_options};
 use crate::runtime::{Request, RequestTx, strip_traceback};
-
-/// Bounds a refresh whose Lua function never returns, which would otherwise
-/// block every later refresh of that provider.
-const REFRESH_TIMEOUT: Duration = Duration::from_secs(120);
-const REFRESH_TIMEOUT_ERR: &str = "credential refresh timed out";
 
 /// The error is what the refresh function returned, a string or a table such
 /// as `{ status, message, retry_after }`, handed back to every caller as is.
@@ -133,7 +126,9 @@ async fn refresh(
 }
 
 /// Runs the refresh as its own uncancellable job, so dropping the caller
-/// cannot lose a token the server already rotated.
+/// cannot lose a token the server already rotated. Nothing bounds the whole
+/// run for the same reason: the token request is bounded by `ctx.send`'s
+/// timeouts instead.
 fn start_refresh(lua: &Lua, id: Arc<str>, refresh: Function) -> Result<Flight, String> {
     let requests = lua
         .app_data_ref::<RequestTx>()
@@ -144,11 +139,7 @@ fn start_refresh(lua: &Lua, id: Arc<str>, refresh: Function) -> Result<Flight, S
     let job_id = Arc::clone(&id);
     let job: ProviderJob = Box::new(move |lua| {
         Box::pin(async move {
-            let timeout = async {
-                Timer::after(REFRESH_TIMEOUT).await;
-                Err(REFRESH_TIMEOUT_ERR.into())
-            };
-            let result = future::or(run_refresh(&lua, &job_id, refresh), timeout).await;
+            let result = run_refresh(&lua, &job_id, refresh).await;
             if let Some(mut flights) = lua.app_data_mut::<RefreshFlights>() {
                 flights.0.remove(&job_id);
             }
