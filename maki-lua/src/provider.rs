@@ -6,12 +6,12 @@ use std::future::Future;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use flume::Sender;
 use futures::future::LocalBoxFuture;
 use maki_agent::cancel::CancelToken;
-use maki_config::providers::ProvidersConfig;
+use maki_config::providers::{self, ProvidersConfig};
 use maki_providers::login::{AuthStatus, InteractionService};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -61,13 +61,14 @@ pub(crate) fn build_registry(
     requests: &Sender<Request>,
     timeouts: Timeouts,
 ) -> ProviderRegistry {
+    let configs = Arc::new(ProviderConfigs::default());
     let providers = lua
         .app_data_ref::<ProviderStore>()
         .map(|store| {
             store
                 .specs()
                 .iter()
-                .filter_map(|spec| match registered(lua, requests, spec, timeouts) {
+                .filter_map(|spec| match registered(lua, requests, spec, timeouts, &configs) {
                     Ok(provider) => Some(provider),
                     Err(error) => {
                         warn!(provider = %spec.id, plugin = %spec.plugin, %error, "provider left out of registry");
@@ -85,9 +86,11 @@ fn registered(
     requests: &Sender<Request>,
     spec: &ProviderSpec,
     timeouts: Timeouts,
+    configs: &Arc<ProviderConfigs>,
 ) -> mlua::Result<RegisteredProvider> {
     let callbacks = Callbacks {
         id: Arc::clone(&spec.id),
+        configs: Arc::clone(configs),
         prepare: lua.create_registry_value(spec.prepare.clone())?,
         discover: optional_key(lua, &spec.discover)?,
         logins: spec
@@ -254,6 +257,7 @@ pub(crate) fn serialize_options() -> SerializeOptions {
 
 struct Callbacks {
     id: Arc<str>,
+    configs: Arc<ProviderConfigs>,
     prepare: RegistryKey,
     discover: Option<RegistryKey>,
     logins: Vec<(String, RegistryKey)>,
@@ -263,6 +267,10 @@ struct Callbacks {
 }
 
 impl Callbacks {
+    fn config(&self) -> Value {
+        self.configs.section(&self.id)
+    }
+
     fn ctx(&self, lua: &Lua) -> mlua::Result<Table> {
         let ctx = lua.create_table()?;
         ctx.set("id", &*self.id)?;
@@ -277,6 +285,7 @@ impl Callbacks {
     }
 }
 
+#[derive(Clone)]
 struct LuaBackend {
     requests: Sender<Request>,
     callbacks: Arc<Callbacks>,
@@ -317,7 +326,7 @@ impl ProviderBackend for LuaBackend {
         let callbacks = Arc::clone(&self.callbacks);
         Box::pin(async move {
             let job_callbacks = Arc::clone(&callbacks);
-            let config = provider_config(&callbacks.id);
+            let config = callbacks.config();
             let (instance, adjusted, key_count) = invoke(&requests, move |lua| {
                 Box::pin(
                     async move { prepare_instance(&lua, &job_callbacks, &info, &config).await },
@@ -346,23 +355,25 @@ impl ProviderBackend for LuaBackend {
         })
     }
 
-    fn discovers(&self) -> bool {
-        self.callbacks.discover.is_some()
-    }
-
     fn discover(
         &self,
         refresh: bool,
     ) -> Option<BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>> {
         self.callbacks.discover.as_ref()?;
-        let config = provider_config(&self.callbacks.id);
-        Some(self.call_callback(
-            |callbacks| callbacks.discover.as_ref(),
-            move |lua| {
-                (lua.to_value_with(&config, serialize_options())?, refresh).into_lua_multi(lua)
-            },
-            |lua, models| Ok(Ok(lua.from_value(models.unwrap_or(LuaValue::Nil))?)),
-        ))
+        let backend = self.clone();
+        Some(Box::pin(async move {
+            let config = backend.callbacks.config();
+            backend
+                .call_callback(
+                    |callbacks| callbacks.discover.as_ref(),
+                    move |lua| {
+                        (lua.to_value_with(&config, serialize_options())?, refresh)
+                            .into_lua_multi(lua)
+                    },
+                    |lua, models| Ok(Ok(lua.from_value(models.unwrap_or(LuaValue::Nil))?)),
+                )
+                .await
+        }))
     }
 
     fn login(
@@ -429,14 +440,33 @@ impl ProviderBackend for LuaBackend {
     }
 }
 
-/// The provider's `providers.toml` section, read at call time so a login
-/// earlier in the session is seen. Serializing a parsed section cannot fail.
-fn provider_config(id: &str) -> Value {
-    let section = ProvidersConfig::load_or_default()
-        .get(id)
-        .cloned()
-        .unwrap_or_default();
-    serde_json::to_value(section).unwrap_or_default()
+type ConfigStamp = Option<(SystemTime, u64)>;
+
+/// `providers.toml` as of its last change, shared by a registry's providers
+/// so a discovery round across all of them parses it once. A login or a hand
+/// edit changes the file, and the next read sees it.
+#[derive(Default)]
+pub(crate) struct ProviderConfigs(Mutex<Option<(ConfigStamp, Arc<ProvidersConfig>)>>);
+
+impl ProviderConfigs {
+    fn current(&self) -> Arc<ProvidersConfig> {
+        let stamp = providers::file_stamp();
+        let mut cached = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((cached_stamp, config)) = &*cached
+            && *cached_stamp == stamp
+        {
+            return Arc::clone(config);
+        }
+        let config = Arc::new(ProvidersConfig::load_or_default());
+        *cached = Some((stamp, Arc::clone(&config)));
+        config
+    }
+
+    /// {id}'s section. Serializing a parsed section cannot fail.
+    fn section(&self, id: &str) -> Value {
+        let section = self.current().get(id).cloned().unwrap_or_default();
+        serde_json::to_value(section).unwrap_or_default()
+    }
 }
 
 fn config_arg(lua: &Lua, config: &Value) -> mlua::Result<MultiValue> {
@@ -681,5 +711,39 @@ impl Provider for LuaProvider {
                 warn!(provider = %self.callbacks.id, conversation_id, %error, "end_conversation failed");
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    const PROVIDER: &str = "local";
+    const FIRST_URL: &str = "http://first.test";
+    const EDITED_URL: &str = "http://edited.example.test";
+
+    fn write_section(dir: &TempDir, base_url: &str) {
+        let file = format!("[{PROVIDER}]\nbase_url = \"{base_url}\"\n");
+        fs::write(dir.path().join("providers.toml"), file).unwrap();
+    }
+
+    #[test]
+    fn provider_configs_parse_again_only_when_the_file_changes() {
+        let dir = TempDir::new().unwrap();
+        maki_storage::paths::init_at(dir.path().to_path_buf()).unwrap();
+        let configs = ProviderConfigs::default();
+        assert_eq!(configs.section(PROVIDER), json!({}));
+
+        write_section(&dir, FIRST_URL);
+        assert_eq!(configs.section(PROVIDER), json!({ "base_url": FIRST_URL }));
+        assert!(Arc::ptr_eq(&configs.current(), &configs.current()));
+
+        write_section(&dir, EDITED_URL);
+        assert_eq!(configs.section(PROVIDER), json!({ "base_url": EDITED_URL }));
     }
 }

@@ -29,15 +29,11 @@ pub trait ProviderBackend: Send + Sync {
 
     /// Lists the models the provider offers right now; `None` when it only
     /// offers its curated descriptors. {refresh} asks it to bypass any cache.
+    /// Building the future starts nothing, so a caller may only check it.
     fn discover(
         &self,
         refresh: bool,
     ) -> Option<BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>>;
-
-    /// Whether `discover` can list models, without starting it.
-    fn discovers(&self) -> bool {
-        false
-    }
 
     /// Logs in with {method}, given the provider's `providers.toml` section
     /// with this login's answers applied. Returns the model id to default to.
@@ -110,7 +106,7 @@ pub(crate) struct Entry {
 impl Entry {
     /// Whether the provider serves any model, curated or discovered.
     pub(crate) fn offers_models(&self) -> bool {
-        !self.models().is_empty() || self.backend.discovers()
+        !self.models().is_empty() || self.backend.discover(false).is_some()
     }
 
     fn models(&self) -> Arc<[ModelInfo]> {

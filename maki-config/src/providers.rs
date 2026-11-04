@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process;
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use tracing::debug;
@@ -100,6 +101,13 @@ impl ProvidersConfig {
     pub fn remove(&mut self, slug: &str) -> bool {
         self.providers.remove(slug).is_some()
     }
+}
+
+/// When `providers.toml` last changed and how long it is, `None` while it
+/// does not exist, for a reader that keeps the parsed file until it changes.
+pub fn file_stamp() -> Option<(SystemTime, u64)> {
+    let metadata = fs::metadata(providers_file_path()).ok()?;
+    Some((metadata.modified().ok()?, metadata.len()))
 }
 
 fn providers_file_path() -> PathBuf {
