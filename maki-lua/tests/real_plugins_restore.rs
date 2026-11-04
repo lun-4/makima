@@ -545,7 +545,9 @@ fn offloading(store: &Arc<OffloadStore>) -> impl FnOnce(&mut ToolContext) {
 fn grep_offload_restore_keeps_preview_and_notice() {
     let dir = many_match_dir();
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(OffloadStore::on_disk(store_dir.path().to_path_buf()));
+    let store = Arc::new(OffloadStore::on_disk(
+        store_dir.path().canonicalize().unwrap(),
+    ));
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
     let input = json!({ "pattern": "fn", "path": dir.path().to_str().unwrap() });

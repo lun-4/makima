@@ -91,7 +91,7 @@ local function invoke(selection, input)
   -- The fallback draws the chain below the picker (user set_slot layers, then
   -- the slot default), so wrapping the default keeps working.
   if selection.name == FALLBACK_NAME then
-    return pcall(input.prev, input.w, input.h, input.t, input.fade)
+    return true, input.prev(input.w, input.h, input.t, input.fade)
   end
   return pcall(selection.renderer, input.w, input.h, input.t, input.fade)
 end

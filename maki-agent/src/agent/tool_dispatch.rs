@@ -2316,7 +2316,9 @@ mod tests {
             let dir = tempfile::TempDir::new().unwrap();
             let text = format!("{}\n{MCP_SECRET}", many_lines());
             let mut ctx = answering_ctx(&text);
-            ctx.offload = Some(Arc::new(OffloadStore::on_disk(dir.path().to_path_buf())));
+            ctx.offload = Some(Arc::new(OffloadStore::on_disk(
+                dir.path().canonicalize().unwrap(),
+            )));
             let hook = RecordingHook::answering(redact_mcp_output);
             ctx.registry.set_hook(hook.clone());
             let done = run(
@@ -2355,7 +2357,9 @@ mod tests {
         smol::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let mut ctx = answering_ctx(&many_lines());
-            ctx.offload = Some(Arc::new(OffloadStore::on_disk(dir.path().to_path_buf())));
+            ctx.offload = Some(Arc::new(OffloadStore::on_disk(
+                dir.path().canonicalize().unwrap(),
+            )));
             ctx.registry
                 .set_hook(RecordingHook::answering(deny_mcp_output));
             let done = run(
@@ -2531,7 +2535,9 @@ mod tests {
             let dir = tempfile::TempDir::new().unwrap();
             let text = many_lines();
             let mut ctx = answering_ctx(&text);
-            ctx.offload = Some(Arc::new(OffloadStore::on_disk(dir.path().to_path_buf())));
+            ctx.offload = Some(Arc::new(OffloadStore::on_disk(
+                dir.path().canonicalize().unwrap(),
+            )));
 
             let done = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
             let out = done.output.as_text();
@@ -2551,7 +2557,9 @@ mod tests {
             let dir = tempfile::TempDir::new().unwrap();
             let mcp = stub_mcp(&[PROBE_QUALIFIED]);
             let mut ctx = mcp_ctx(&mcp);
-            ctx.offload = Some(Arc::new(OffloadStore::on_disk(dir.path().to_path_buf())));
+            ctx.offload = Some(Arc::new(OffloadStore::on_disk(
+                dir.path().canonicalize().unwrap(),
+            )));
             ctx.registry
                 .set_hook(RecordingHook::answering(replace_mcp_large));
             let done = run(

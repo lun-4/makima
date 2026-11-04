@@ -558,9 +558,11 @@ fn lua_cwd_admission_order_is_target_local(spawn_child: bool) {
     const QUEUED: &str = "alignment queued old cwd";
     const AFTER: &str = "alignment queued new cwd";
     smol::block_on(async {
-        let old = tempfile::tempdir().unwrap();
-        let new = tempfile::tempdir().unwrap();
-        let fixture = Fixture::with_context(None, Some(old.path()));
+        let old_dir = tempfile::tempdir().unwrap();
+        let new_dir = tempfile::tempdir().unwrap();
+        let old = old_dir.path().canonicalize().unwrap();
+        let new = new_dir.path().canonicalize().unwrap();
+        let fixture = Fixture::with_context(None, Some(old.as_path()));
         let task = fixture.spawn(INITIAL);
         let first = fixture.request().await;
         let root = fixture.manager.root().unwrap();
@@ -572,9 +574,7 @@ fn lua_cwd_admission_order_is_target_local(spawn_child: bool) {
             actor
                 .reserve_prepared_operation(None)
                 .unwrap()
-                .commit_when_ready(Some(ConfigChange::WorkingDirectory(
-                    new.path().to_path_buf(),
-                ))),
+                .commit_when_ready(Some(ConfigChange::WorkingDirectory(new.clone()))),
         );
         let after = actor
             .submit(
@@ -587,9 +587,9 @@ fn lua_cwd_admission_order_is_target_local(spawn_child: bool) {
         assert_ne!(queued.turn_id(), after.turn_id());
         let mut request = first;
         for (prompt, cwd) in [
-            (INITIAL, old.path()),
-            (QUEUED, old.path()),
-            (AFTER, new.path()),
+            (INITIAL, old.as_path()),
+            (QUEUED, old.as_path()),
+            (AFTER, new.as_path()),
         ] {
             assert!(request.contains(prompt));
             assert!(
@@ -637,7 +637,10 @@ fn lua_cwd_admission_order_is_target_local(spawn_child: bool) {
                 TurnOutcome::Completed { .. }
             ));
         }
-        assert_eq!(actor.effective_config().unwrap().context.cwd(), new.path());
+        assert_eq!(
+            actor.effective_config().unwrap().context.cwd(),
+            new.as_path()
+        );
         assert_eq!(
             root.actor()
                 .unwrap()
@@ -645,7 +648,7 @@ fn lua_cwd_admission_order_is_target_local(spawn_child: bool) {
                 .unwrap()
                 .context
                 .cwd(),
-            old.path()
+            old.as_path()
         );
         assert!(fixture.requests.is_empty());
         fixture.close(&task);

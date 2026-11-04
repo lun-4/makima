@@ -775,7 +775,9 @@ maki.api.register_tool({{
     let mut ctx = stub_ctx(&AgentMode::Build);
     ctx.registry = Arc::clone(&reg);
     ctx.mcp = Some(stub_session_with_result(&[(MCP_QUALIFIED_TOOL, "")], &text));
-    ctx.offload = Some(Arc::new(OffloadStore::on_disk(dir.path().to_path_buf())));
+    ctx.offload = Some(Arc::new(OffloadStore::on_disk(
+        dir.path().canonicalize().unwrap(),
+    )));
     ctx.config.max_output_lines = MCP_PREVIEW_LINES;
     ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
         &ctx.registry,
@@ -1018,7 +1020,9 @@ end)
     let mut ctx = stub_ctx(&AgentMode::Build);
     ctx.registry = Arc::clone(&reg);
     ctx.deadline = Deadline::None;
-    ctx.offload = Some(Arc::new(OffloadStore::on_disk(dir.path().to_path_buf())));
+    ctx.offload = Some(Arc::new(OffloadStore::on_disk(
+        dir.path().canonicalize().unwrap(),
+    )));
     ctx.turn_bindings = Arc::new(TurnToolBindings::capture(&reg, &ctx.local_tools, None));
 
     within(async {
