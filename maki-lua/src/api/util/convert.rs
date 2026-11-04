@@ -1,6 +1,8 @@
 use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 use serde_json::Value as JsonValue;
 
+use crate::api::util::memory::unlimited;
+
 pub(crate) const NIL_TOOL_RESULT_ERR: &str = "tool returned nil without an error message";
 
 /// How many nulls an array encoding may invent for keys the table does not
@@ -41,6 +43,10 @@ pub(crate) fn lua_tool_result(values: mlua::MultiValue) -> Result<String, String
 /// end up with a Lua table where they asked for a number. We walk the tree
 /// ourselves to keep numbers as numbers.
 pub(crate) fn json_to_lua(lua: &Lua, value: &JsonValue) -> LuaResult<Value> {
+    unlimited(lua, || build_lua(lua, value))
+}
+
+fn build_lua(lua: &Lua, value: &JsonValue) -> LuaResult<Value> {
     Ok(match value {
         JsonValue::Null => Value::Nil,
         JsonValue::Bool(b) => Value::Boolean(*b),
@@ -53,7 +59,7 @@ pub(crate) fn json_to_lua(lua: &Lua, value: &JsonValue) -> LuaResult<Value> {
         JsonValue::Array(items) => {
             let table = lua.create_table_with_capacity(items.len(), 0)?;
             for (idx, item) in items.iter().enumerate() {
-                table.set(idx + 1, json_to_lua(lua, item)?)?;
+                table.set(idx + 1, build_lua(lua, item)?)?;
             }
             table.set_metatable(Some(lua.array_metatable()))?;
             Value::Table(table)
@@ -61,7 +67,7 @@ pub(crate) fn json_to_lua(lua: &Lua, value: &JsonValue) -> LuaResult<Value> {
         JsonValue::Object(map) => {
             let table = lua.create_table_with_capacity(0, map.len())?;
             for (key, val) in map {
-                table.set(key.as_str(), json_to_lua(lua, val)?)?;
+                table.set(key.as_str(), build_lua(lua, val)?)?;
             }
             Value::Table(table)
         }

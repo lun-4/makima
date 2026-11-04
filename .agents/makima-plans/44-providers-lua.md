@@ -107,7 +107,7 @@ In Lua this is an optional instance method `end_conversation(ctx, conversation_i
 
 ### Request conversion
 
-The message history is converted from Rust types to Lua tables once per request with `mlua` serde, without a JSON intermediate. The first attempt converted the full history to JSON and then to Lua twice per turn on the shared Lua thread. `cargo bench -p maki-lua --bench provider_perf` measures it. On the build box the host spends about 5.5 µs per message (5 ms for 1,000 messages, 28 ms for 5,000, each attempt), about the same as a codec spends JSON-encoding the same history in Lua. Avoiding the per-request copy of the history and the per-attempt conversion is follow-up work.
+The message history is converted from Rust types to Lua tables once per request with `mlua` serde, without a JSON intermediate. The first attempt converted the full history to JSON and then to Lua twice per turn on the shared Lua thread. `cargo bench -p maki-lua --bench provider_perf` measures it, and `provider_wire` times a whole request against a loopback server, at the branch base too. Host conversions run with the Lua memory limit lifted, because mlua guards every allocation with a protected call while a limit is set. On the build box a request with 1,000 messages takes 7 ms end to end, against 2.8 ms for the native providers; the host's conversion is 2.3 ms of it.
 
 ### HTTP
 

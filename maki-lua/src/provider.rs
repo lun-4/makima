@@ -30,6 +30,7 @@ use tracing::warn;
 
 use crate::api::net::send::{CONNECT_FAILED_ERR, IDLE_TIMEOUT_ERR};
 use crate::api::provider::{ProviderSpec, ProviderStore};
+use crate::api::util::memory::unlimited;
 use crate::credentials::Credentials;
 use crate::login_ui::LoginUi;
 use crate::runtime::{Request, strip_traceback};
@@ -668,7 +669,8 @@ impl Provider for LuaProvider {
                 let emit = lua.create_function(move |lua, event: LuaValue| {
                     Ok(emitter.send(lua.from_value(event)?))
                 })?;
-                (lua.to_value_with(&request, serialize_options())?, emit).into_lua_multi(lua)
+                let request = unlimited(lua, || lua.to_value_with(&request, serialize_options()))?;
+                (request, emit).into_lua_multi(lua)
             },
             |lua, result| {
                 let Some(result) = result else {
