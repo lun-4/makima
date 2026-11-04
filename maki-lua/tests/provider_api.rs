@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use flume::RecvTimeoutError;
 use futures_lite::future;
 use maki_agent::tools::ToolRegistry;
 use maki_config::providers::{ProviderDef, ProvidersConfig};
@@ -497,7 +498,10 @@ fn dropping_the_stream_cancels_the_call_and_closes_the_emitter() {
     drop(call);
     drop(events_tx);
     assert!(
-        events_rx.recv_timeout(BOUND).is_err(),
+        matches!(
+            events_rx.recv_timeout(BOUND),
+            Err(RecvTimeoutError::Disconnected)
+        ),
         "the emitter must not keep the event channel open"
     );
     wait_until("on_cancel", || {
