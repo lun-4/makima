@@ -814,8 +814,8 @@ mod tests {
         CommandError, CommandFuture, FrontendFeedback, TargetCapabilities, TargetCapability,
     };
     use maki_providers::{
-        ContentBlock, Invocation, Message, ModelInfo, ProviderEvent, RequestOptions, Role,
-        StopReason, StreamResponse, TokenUsage,
+        ContentBlock, FastSupport, Invocation, Message, ModelInfo, ProviderEvent, RequestOptions,
+        Role, StopReason, StreamResponse, TokenUsage,
         provider::{BoxFuture, ModelBatch, Provider},
     };
     use maki_storage::sessions::{SESSIONS_DIR, offload_dir};
@@ -854,7 +854,7 @@ mod tests {
         Arc::new(maki_providers::test_util::offline_registry(vec![(
             provider,
             vec![maki_providers::ModelInfo {
-                supports_fast: Some(true),
+                supports_fast: Some(FastSupport::Supported),
                 supports_thinking: Some(true),
                 ..maki_providers::ModelInfo::id_only(id.into())
             }],

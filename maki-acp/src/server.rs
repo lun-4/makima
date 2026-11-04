@@ -2445,7 +2445,9 @@ mod tests {
     use maki_agent::{AgentMode, TurnTicket};
     use maki_commands::TargetCapabilities;
     use maki_lua::orchestration::{OrchestrationServices, TurnCompletion};
-    use maki_providers::{ContentBlock as MsgBlock, Invocation, ModelInfo, Role, TokenUsage};
+    use maki_providers::{
+        ContentBlock as MsgBlock, FastSupport, Invocation, ModelInfo, Role, TokenUsage,
+    };
     use maki_storage::StateDir;
     use maki_storage::checkpoint::{ClaimingWriter, accept_all};
     use maki_storage::sessions::StoredMode;
@@ -2478,7 +2480,7 @@ mod tests {
             let info = ModelInfo {
                 supports_thinking: Some(true),
                 supports_vision: Some(true),
-                supports_fast: Some(fast),
+                supports_fast: Some(FastSupport::from(fast)),
                 ..ModelInfo::id_only(id.into())
             };
             (provider, vec![info])

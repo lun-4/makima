@@ -232,7 +232,6 @@ t.case("fast_is_bound_to_the_logged_in_account", function()
     { tokens({ account_id = false }), plan_data(true, ACCOUNT), false },
     { tokens(), plan_data(true, nil), false },
     { tokens({ account_id = "" }), plan_data(true, ""), false },
-    { tokens(), nil, false },
   }) do
     local saved = case[1]
     saved.account_id = saved.account_id or nil
@@ -256,6 +255,22 @@ t.case("fast_is_bound_to_the_logged_in_account", function()
     }
   )
   t.eq(model.supports_fast, nil)
+end)
+
+t.case("fast_is_pending_until_the_plan_listing_answers", function()
+  local fresh = openai.provider()
+  local unlisted = { id = "gpt-7-nova" }
+  local ctx = t.provider_ctx({ responses_sse("ok") }, tokens())
+  local instance, model = fresh.prepare(ctx, unlisted, {})
+  assert(instance, model)
+  t.eq(model.supports_fast, openai.FAST_PENDING)
+  local result, err = instance.stream(ctx, request(unlisted.id, { fast = true }), t.recorder())
+  assert(result, err)
+  t.eq(body(ctx.requests[1]).service_tier, nil)
+
+  assert(fresh.discover(t.provider_ctx({ t.response({ "down" }, { status = 503 }) }, tokens()), {}))
+  local _, after = fresh.prepare(t.provider_ctx({}, tokens()), unlisted, {})
+  t.eq(after.supports_fast, false)
 end)
 
 t.case("fast_off_keeps_the_body_unchanged", function()

@@ -31,7 +31,8 @@ export type ModelDescriptor = {
   supports_thinking: boolean?,
   requires_thinking: boolean?,
   supports_vision: boolean?,
-  supports_fast: boolean?,
+  -- "pending" while discovery has not said yet; the host keeps a /fast wish.
+  supports_fast: (boolean | "pending")?,
   supports_tool_examples: boolean?,
   tier: ("weak" | "medium" | "strong")?,
   free: boolean?,

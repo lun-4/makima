@@ -72,6 +72,7 @@ local SECONDS_PER_DAY = 24 * SECONDS_PER_HOUR
 local SECONDS_PER_WEEK = 7 * SECONDS_PER_DAY
 local MAX_PERCENT = 100
 local CHATGPT_METHOD = { id = "chatgpt", label = "ChatGPT login" }
+M.FAST_PENDING = "pending"
 local CODEX_ALIAS = { id = "openai-codex", label = "OpenAI Codex (ChatGPT login)", method = CHATGPT_METHOD.id }
 local OAUTH_DETAIL = "oauth"
 local INVALID_DEVICE_RESPONSE = "invalid OpenAI device authorization response"
@@ -560,6 +561,9 @@ end
 
 function M.provider()
   local spec = compat.provider(M.def)
+  -- Until the plan listing answers, a ChatGPT login cannot tell whether a
+  -- model has fast, so it says "pending" and the host keeps a /fast wish.
+  local discovered = false
   local key_status = spec.auth_status
   spec.auth[#spec.auth + 1] = { id = CHATGPT_METHOD.id, label = CHATGPT_METHOD.label, login = chatgpt_login }
   spec.aliases = { CODEX_ALIAS }
@@ -589,6 +593,7 @@ function M.provider()
         end
         return M.parse_plan_models(body, state.tokens and state.tokens.account_id)
       end)
+      discovered = true
       -- A failed listing falls back to the curated plan models.
       return compat.merge(M.def, rows or {})
     end
@@ -609,7 +614,14 @@ function M.provider()
     local model = compat.describe(M.def, info)
     -- API-key users get no opinion on fast; the host's pricing gate decides.
     if state.tokens then
-      model.supports_fast = fast_eligible(model, state.tokens)
+      local listed = type(model.provider_data) == "table" and model.provider_data.fast ~= nil
+      if fast_eligible(model, state.tokens) then
+        model.supports_fast = true
+      elseif not listed and not discovered then
+        model.supports_fast = M.FAST_PENDING
+      else
+        model.supports_fast = false
+      end
       local window = M.plan_window(model.id)
       if window and model.context_window then
         model.context_window = math.min(model.context_window, window)

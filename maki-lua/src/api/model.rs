@@ -77,7 +77,7 @@ mod tests {
     use super::*;
     use crate::api::util::convert::lua_to_json;
     use maki_providers::test_util::offline_registry;
-    use maki_providers::{ModelInfo, ModelPricing};
+    use maki_providers::{FastSupport, ModelInfo, ModelPricing};
     use mlua::Value;
 
     const SPEC: &str = "priced/model";
@@ -108,7 +108,7 @@ mod tests {
             provider,
             vec![ModelInfo {
                 context_window: Some(CONTEXT_WINDOW),
-                supports_fast: Some(true),
+                supports_fast: Some(FastSupport::Supported),
                 pricing: Some(ModelPricing {
                     input: INPUT_RATE,
                     cache_read: CACHE_READ_RATE,

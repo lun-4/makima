@@ -9,13 +9,15 @@ use std::sync::Arc;
 
 use jiff::Timestamp;
 use maki_storage::sessions::StoredTokenUsage;
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::model_registry;
 use crate::pricing::PricingSchedule;
 
 const PER_MILLION: f64 = 1_000_000.0;
+const FAST_PENDING: &str = "pending";
 pub const UNKNOWN_CONTEXT_WINDOW: u32 = 128_000;
 
 #[derive(Debug, thiserror::Error)]
@@ -70,8 +72,9 @@ pub struct ModelInfo {
     pub requires_thinking: Option<bool>,
     #[serde(default)]
     pub supports_vision: Option<bool>,
+    /// `true`, `false`, or `"pending"` while the provider cannot tell yet.
     #[serde(default)]
-    pub supports_fast: Option<bool>,
+    pub supports_fast: Option<FastSupport>,
     #[serde(default)]
     pub supports_tool_examples: Option<bool>,
     #[serde(default)]
@@ -220,9 +223,49 @@ impl ThinkingSupport {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FastSupport {
+    /// The provider learns it from discovery, which has not answered yet.
     Pending,
     Supported,
     Unsupported,
+}
+
+impl Serialize for FastSupport {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Pending => serializer.serialize_str(FAST_PENDING),
+            Self::Supported => serializer.serialize_bool(true),
+            Self::Unsupported => serializer.serialize_bool(false),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FastSupport {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Declared {
+            Known(bool),
+            Word(String),
+        }
+        match Declared::deserialize(deserializer)? {
+            Declared::Known(true) => Ok(Self::Supported),
+            Declared::Known(false) => Ok(Self::Unsupported),
+            Declared::Word(word) if word == FAST_PENDING => Ok(Self::Pending),
+            Declared::Word(word) => Err(D::Error::custom(format!(
+                "supports_fast must be a boolean or \"{FAST_PENDING}\", not \"{word}\""
+            ))),
+        }
+    }
+}
+
+impl From<bool> for FastSupport {
+    fn from(supported: bool) -> Self {
+        if supported {
+            Self::Supported
+        } else {
+            Self::Unsupported
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -259,13 +302,7 @@ impl Model {
                 info.requires_thinking == Some(true),
             ),
             supports_vision_override: info.supports_vision,
-            supports_fast_override: info.supports_fast.map(|fast| {
-                if fast {
-                    FastSupport::Supported
-                } else {
-                    FastSupport::Unsupported
-                }
-            }),
+            supports_fast_override: info.supports_fast,
             pricing: info.pricing.clone().unwrap_or_default(),
             pricing_schedule: info.pricing_schedule.clone(),
             max_output_tokens: info.max_output_tokens,
@@ -348,7 +385,7 @@ impl Model {
             &ModelInfo {
                 supports_thinking: Some(true),
                 supports_vision: Some(true),
-                supports_fast: Some(true),
+                supports_fast: Some(FastSupport::Supported),
                 supports_tool_examples: Some(true),
                 ..ModelInfo::id_only(model_id.to_string())
             },
@@ -499,6 +536,7 @@ mod tests {
     const COMPACTION_DECLARED_LAST: u8 = 3;
     const SCHEDULED_PROVIDER: &str = "scheduled";
     const SCHEDULED_MODEL: &str = "peak-priced";
+    const UNKNOWN_FAST_WORD: &str = "maybe";
     const SCHEDULED_INPUT_RATE: f64 = 0.66;
     const MILLION: u32 = 1_000_000;
     const INPUT_ONLY: TokenUsage = TokenUsage {
@@ -693,12 +731,31 @@ mod tests {
         ));
     }
 
+    #[test_case(json!(true), FastSupport::Supported ; "supported")]
+    #[test_case(json!(false), FastSupport::Unsupported ; "unsupported")]
+    #[test_case(json!(FAST_PENDING), FastSupport::Pending ; "pending")]
+    fn fast_support_round_trips(declared: Value, expected: FastSupport) {
+        let info: ModelInfo =
+            serde_json::from_value(json!({ "id": SCHEDULED_MODEL, "supports_fast": declared }))
+                .unwrap();
+        assert_eq!(info.supports_fast, Some(expected));
+        assert_eq!(serde_json::to_value(expected).unwrap(), declared);
+        let model = Model::from_info(SCHEDULED_PROVIDER, &info);
+        assert_eq!(model.fast_pending(), expected == FastSupport::Pending);
+    }
+
+    #[test]
+    fn fast_support_rejects_other_words() {
+        let declared = json!({ "id": SCHEDULED_MODEL, "supports_fast": UNKNOWN_FAST_WORD });
+        assert!(serde_json::from_value::<ModelInfo>(declared).is_err());
+    }
+
     #[test_case(None, false ; "undeclared_is_unsupported")]
     #[test_case(Some(true), true ; "declared")]
     #[test_case(Some(false), false ; "declared_off")]
     fn fast_follows_the_descriptor(declared: Option<bool>, expected: bool) {
         let info = ModelInfo {
-            supports_fast: declared,
+            supports_fast: declared.map(FastSupport::from),
             pricing: Some(ModelPricing {
                 fast: Some(FastPricing {
                     input: FAST_RATE,

@@ -17,8 +17,8 @@ pub use error::{AgentError, Overflow};
 pub use maki_domain::{Effort, ThinkingConfig};
 pub use maki_storage::sessions::add_cost;
 pub use model::{
-    FastPricing, Model, ModelError, ModelInfo, ModelPricing, ModelTier, ThinkingSupport,
-    TokenUsage, format_tokens,
+    FastPricing, FastSupport, Model, ModelError, ModelInfo, ModelPricing, ModelTier,
+    ThinkingSupport, TokenUsage, format_tokens,
 };
 pub use pricing::{model_cost, settle_session};
 pub use provider::Timeouts;

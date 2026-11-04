@@ -32,8 +32,9 @@ use maki_lua::orchestration::{AgentOrchestration, CommandRunner, TrustedTarget};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::test_util::offline_registry;
 use maki_providers::{
-    AgentError, ContentBlock, Invocation, Message, Model, ModelInfo, ModelTier, ProviderEvent,
-    ProviderRegistry, RequestOptions, Role, StopReason, StreamResponse, ThinkingConfig, TokenUsage,
+    AgentError, ContentBlock, FastSupport, Invocation, Message, Model, ModelInfo, ModelTier,
+    ProviderEvent, ProviderRegistry, RequestOptions, Role, StopReason, StreamResponse,
+    ThinkingConfig, TokenUsage,
 };
 use maki_storage::id::SessionRef;
 use serde_json::Value;
@@ -120,7 +121,7 @@ pub fn test_providers() -> Arc<ProviderRegistry> {
         tier: Some(tier),
         supports_thinking: Some(true),
         supports_vision: Some(true),
-        supports_fast: Some(true),
+        supports_fast: Some(FastSupport::Supported),
         supports_tool_examples: Some(true),
         ..ModelInfo::id_only(id.into())
     };

@@ -170,7 +170,9 @@ fn spec_error(message: impl fmt::Display) -> mlua::Error {
 ///   `requires_thinking`, `supports_vision`, `supports_fast`,
 ///   `supports_tool_examples`, `tier`, `free` (offered at no charge, marked
 ///   in the model picker) and `provider_data`. The first descriptor with a
-///   tier is that tier's default.
+///   tier is that tier's default. `supports_fast` may be `"pending"` while
+///   the provider cannot tell before its discovery answers: a saved or typed
+///   `/fast` then waits for the model prepared after discovery.
 ///   `prepare` (function) Required. `prepare(ctx, model, config)` returns an
 ///   instance for one model descriptor, optionally followed by an adjusted
 ///   descriptor with the same id, or nil plus an error. `config` is the
