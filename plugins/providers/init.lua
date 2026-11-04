@@ -3,13 +3,23 @@ local catalog = require("providers.catalog")
 local compat = require("providers.openai_compat")
 local custom = require("providers.custom")
 local executable = require("providers.executable")
+local http = require("providers.http")
 local local_server = require("providers.local_server")
 local opencode = require("providers.opencode")
 local routes = require("providers.routes")
 
 local registered = {}
 
+-- Every provider registered here has its stream errors classed for retry.
 local function register(spec)
+  local prepare = spec.prepare
+  spec.prepare = function(...)
+    local results = table.pack(prepare(...))
+    if type(results[1]) == "table" and results[1].stream then
+      http.classify_stream(results[1])
+    end
+    return table.unpack(results, 1, results.n)
+  end
   maki.api.register_provider(spec)
   registered[spec.id] = true
 end

@@ -58,10 +58,15 @@ t.case("chunks_feed_the_anthropic_decoder", function()
 end)
 
 t.case("exception_frame_is_an_api_error", function()
-  for name, status in pairs({ throttlingException = 429, ThrottlingException = 429, modelStreamErrorException = 500 }) do
+  local cases = {
+    throttlingException = { 429, "rate_limit" },
+    ThrottlingException = { 429, "rate_limit" },
+    modelStreamErrorException = { 500, "transient" },
+  }
+  for name, case in pairs(cases) do
     local wire = frame({ [":message-type"] = "exception", [":exception-type"] = name }, THROTTLED)
     local _, err = eventstream.stream(t.response({ wire }), t.recorder())
-    t.same(err, { status = status, message = THROTTLED }, name)
+    t.same(err, { status = case[1], message = THROTTLED, retry = case[2] }, name)
   end
 end)
 

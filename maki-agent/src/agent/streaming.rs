@@ -255,7 +255,7 @@ pub(crate) async fn stream_with_retry(
 
 #[cfg(test)]
 mod tests {
-    use maki_providers::Role;
+    use maki_providers::{RetryKind, Role};
     use serde_json::json;
     use test_case::test_case;
 
@@ -353,6 +353,16 @@ mod tests {
 
     const CONVERSATION: &str = "conversation";
 
+    fn rejected(status: u16, retry: Option<RetryKind>) -> AgentError {
+        AgentError::Api {
+            status,
+            message: REJECTED_BODY.into(),
+            retry_after: None,
+            overflow: false,
+            retry,
+        }
+    }
+
     fn test_conversation() -> Conversation {
         Conversation {
             id: CONVERSATION.into(),
@@ -408,7 +418,7 @@ mod tests {
                     })
                     .unwrap();
                 if attempt == 0 {
-                    return Err(AgentError::api(RATE_LIMITED, REJECTED_BODY));
+                    return Err(rejected(RATE_LIMITED, Some(RetryKind::RateLimit)));
                 }
                 Ok(StreamResponse {
                     message: Message {
@@ -551,7 +561,8 @@ mod tests {
                 let relents = self.relents_for == Some(key.as_str());
                 self.seen.lock().unwrap().push(key);
                 if !relents {
-                    return Err(AgentError::api(self.status, REJECTED_BODY));
+                    let retry = (self.status == RATE_LIMITED).then_some(RetryKind::RateLimit);
+                    return Err(rejected(self.status, retry));
                 }
                 Ok(StreamResponse {
                     message: Message::user("ok".into()),

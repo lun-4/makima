@@ -10,6 +10,9 @@ local MAX_JSON_BYTES = 16 * 1024 * 1024
 local RETRY_AFTER_HEADER = "retry-after"
 local CONTENT_TYPE = "Content-Type"
 local JSON_TYPE = "application/json"
+-- How `maki.net.send` reports a connection never made and a stalled read.
+local CONNECT_FAILED = "could not connect"
+local IDLE_TIMEOUT = "idle timeout"
 
 M.CONFIG_KIND = "config"
 
@@ -26,6 +29,48 @@ end
 -- The text of an error, whether a string or a table.
 function M.message(err)
   return type(err) == "table" and err.message or err
+end
+
+-- {err} with the retry class the host reads. A table that names one, and a
+-- config error, stay as they are. A status names it through
+-- `codec.status_retry`; anything else is a transport failure, classed by
+-- the `maki.net.send` text it carries, even inside a provider's own words:
+-- a connection never made, a stalled read, or else a transient failure.
+function M.classify(err)
+  if type(err) ~= "table" then
+    err = { message = tostring(err) }
+  end
+  if err.retry or err.kind == M.CONFIG_KIND then
+    return err
+  end
+  local classified = table.clone(err)
+  if err.status then
+    classified.retry = codec.status_retry(err.status)
+  else
+    local message = err.message or ""
+    if message:find(CONNECT_FAILED, 1, true) then
+      classified.retry = "connect"
+    elseif message:find(IDLE_TIMEOUT, 1, true) then
+      classified.retry = "timeout"
+    else
+      classified.retry = "transient"
+    end
+  end
+  return classified
+end
+
+-- Passes every `stream` failure of {instance} through `M.classify`, in
+-- place, so a provider retries like the native ones did without classing
+-- each error itself.
+function M.classify_stream(instance)
+  local stream = instance.stream
+  instance.stream = function(ctx, request, emit)
+    local result, err = stream(ctx, request, emit)
+    if result == nil and err ~= nil then
+      return nil, M.classify(err)
+    end
+    return result, err
+  end
 end
 
 -- Keys in precedence order: {env_var} (or `config.api_key_env`) as a

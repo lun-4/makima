@@ -116,7 +116,7 @@ t.case("api_errors_keep_status_and_retry_after", function()
   })
   local result, err = instance.stream(ctx, request("gemini-2.5-pro"), t.recorder())
   t.eq(result, nil)
-  t.same(err, { status = 429, message = "quota", retry_after = 7 })
+  t.same(err, { status = 429, message = "quota", retry_after = 7, retry = "rate_limit" })
 end)
 
 t.case("prepare_describes_curated_prefixes_and_unknown_models", function()

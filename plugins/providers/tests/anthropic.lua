@@ -176,7 +176,7 @@ end)
 t.case("error_events", function()
   local _, err =
     anthropic.stream(sse({ { type = "error", error = { type = "overloaded_error", message = "busy" } } }), t.recorder())
-  t.same(err, { status = 529, message = "busy" })
+  t.same(err, { status = 529, message = "busy", retry = "transient" })
   _, err = anthropic.stream(t.response({ "event: error\ndata: " .. UNPARSED_ERROR .. "\n\n" }), t.recorder())
   t.same(err, { status = 400, message = UNPARSED_ERROR })
 end)

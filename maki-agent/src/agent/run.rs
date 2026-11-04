@@ -1188,7 +1188,7 @@ mod tests {
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
         ContentBlock, ConversationLink, ConversationRelation, Invocation, Message, Model,
-        ProviderEvent, RequestOptions, Role, StopReason, StreamResponse, TokenUsage,
+        ProviderEvent, RequestOptions, RetryKind, Role, StopReason, StreamResponse, TokenUsage,
     };
     use serde_json::Value;
     use test_case::test_case;
@@ -1326,12 +1326,12 @@ mod tests {
     }
 
     /// Streams `delta` (if any), fires `cancel_after_delta` (if any),
-    /// then fails with `fail_status` or hangs until cancelled.
+    /// then fails with `fail` (status and retry class) or hangs until cancelled.
     #[derive(Default)]
     struct StubStreamProvider {
         delta: Option<&'static str>,
         cancel_after_delta: Mutex<Option<crate::cancel::CancelTrigger>>,
-        fail_status: Option<u16>,
+        fail: Option<(u16, Option<RetryKind>)>,
     }
 
     impl Provider for StubStreamProvider {
@@ -1354,8 +1354,8 @@ mod tests {
                 if let Some(trigger) = self.cancel_after_delta.lock().unwrap().take() {
                     trigger.cancel();
                 }
-                match self.fail_status {
-                    Some(status) => Err(AgentError::api(status, "stub")),
+                match self.fail {
+                    Some((status, retry)) => Err(api_error(status, retry)),
                     None => futures_lite::future::pending().await,
                 }
             })
@@ -1363,6 +1363,16 @@ mod tests {
     }
 
     type Ended = (Arc<str>, ConversationEnd);
+
+    fn api_error(status: u16, retry: Option<RetryKind>) -> AgentError {
+        AgentError::Api {
+            status,
+            message: "stub".into(),
+            retry_after: None,
+            overflow: false,
+            retry,
+        }
+    }
 
     /// Cancels its first request if armed. `end_conversation` never resolves,
     /// so a caller that waited on it would hang.
@@ -2527,7 +2537,7 @@ mod tests {
         smol::block_on(async {
             let mut history = History::new(Vec::new());
             let provider = StubStreamProvider {
-                fail_status: Some(400),
+                fail: Some((400, None)),
                 ..Default::default()
             };
             let (mut agent, event_rx) = make_agent(provider, &mut history);
@@ -2661,7 +2671,7 @@ mod tests {
             const TEXT: &str = "response";
             let mut results = VecDeque::new();
             if retry {
-                results.push_back(Err(AgentError::api(429, "retry fixture")));
+                results.push_back(Err(api_error(429, Some(RetryKind::RateLimit))));
             }
             if tools {
                 results.push_back(Ok(tool_use_response(TOOL, serde_json::json!({"ok":true}))));
@@ -3032,7 +3042,7 @@ mod tests {
             let (trigger, cancel) = CancelToken::new();
             let provider = StubStreamProvider {
                 delta: Some(PARTIAL),
-                fail_status: Some(529),
+                fail: Some((529, Some(RetryKind::Transient))),
                 ..Default::default()
             };
             let mut history = History::new(Vec::new());

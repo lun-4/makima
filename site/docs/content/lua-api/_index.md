@@ -1265,7 +1265,10 @@ such as a missing key or setting, and is not retried; a table with
 `status`, `message` and optional `retry_after` seconds is an API error,
 and `overflow = true` on it says the request does not fit the model's
 context, which the host answers by compacting instead of retrying;
-anything else is a retryable transport error. A raised error is not
+anything else is a transport error. An error is retried only when it
+names `retry`: `rate_limit`, `transient`, `connect`, `timeout` or `none`.
+The bundled `http.classify` names it from the status or the
+`maki.net.send` failure. A bare string and a raised error are not
 retried. Every callback that returns nil plus an error follows these
 rules.
 
@@ -4350,8 +4353,8 @@ blocks `send` until its first byte or until `low_speed_timeout` fires.
 
 A connection that is refused or a host name that does not resolve fails
 with an error starting `could not connect`. A `read()` that times out
-fails with an error containing `idle timeout`. Provider callbacks that
-return these errors as they are get bounded retries.
+fails with an error containing `idle timeout`. The providers plugin's
+`http.classify` reads these to name a provider error's retry class.
 
 {request} fields:
   `url` (string) Required, `http://` or `https://`.

@@ -1,8 +1,8 @@
-//! Provider error types with retry semantics.
-//! Retryable: 429, 5xx, IO, stream timeouts. Non-retryable: other 4xx, context overflow,
-//! JSON parse, config, channel closed, user cancel. `user_message()` returns human-readable text for each variant.
+//! Provider error types with retry semantics. The provider names how a
+//! failure is retried; the host never derives it. `user_message()` returns
+//! human-readable text for each variant.
 
-use std::{io, time::Duration};
+use std::time::Duration;
 
 use crate::retry::RetryKind;
 
@@ -20,6 +20,13 @@ pub enum AgentError {
         /// The request does not fit the model's context, as the provider
         /// read the refusal. Compacting the session is the remedy.
         overflow: bool,
+        retry: Option<RetryKind>,
+    },
+    /// A provider failure with no response status.
+    #[error("{message}")]
+    Transport {
+        message: String,
+        retry: Option<RetryKind>,
     },
     #[error("{message}")]
     Config { message: String },
@@ -33,42 +40,34 @@ pub enum AgentError {
     Channel,
     #[error("cancelled")]
     Cancelled,
-    #[error("stream timed out: {message}")]
-    Timeout { message: String },
     #[error("compaction returned no summary")]
     EmptySummary,
 }
 
 impl AgentError {
-    /// An API error with no `Retry-After` behind it. Everything that is not a
-    /// response we read the headers of lands here, SSE error frames included.
+    /// An API error that is not retried and has no `Retry-After` behind it.
     pub fn api(status: u16, message: impl Into<String>) -> Self {
         Self::Api {
             status,
             message: message.into(),
             retry_after: None,
             overflow: false,
+            retry: None,
         }
     }
 
-    /// Which budget trying again would draw from, or `None` when trying again
-    /// is pointless. The kinds are priced differently, so the retry loop needs
-    /// more than a yes or no.
+    /// Which budget trying again would draw from, as the provider named it,
+    /// or `None` when it is not retried. The kinds are priced differently, so
+    /// the retry loop needs more than a yes or no.
     pub fn retry_kind(&self) -> Option<RetryKind> {
-        if self.is_context_overflow() {
-            return None;
-        }
         match self {
-            Self::Api { status: 429, .. } => Some(RetryKind::RateLimit),
-            Self::Api { status, .. } if *status >= 500 => Some(RetryKind::Transient),
-            Self::Io(e) if e.kind() == io::ErrorKind::ConnectionRefused => Some(RetryKind::Connect),
-            Self::Io(_) => Some(RetryKind::Transient),
-            Self::Timeout { .. } => Some(RetryKind::Timeout),
-            Self::Api { .. }
-            | Self::Config { .. }
+            Self::Api { overflow: true, .. } => None,
+            Self::Api { retry, .. } | Self::Transport { retry, .. } => *retry,
+            Self::Config { .. }
             | Self::Tool { .. }
-            | Self::Channel
+            | Self::Io(_)
             | Self::Json(_)
+            | Self::Channel
             | Self::Cancelled
             | Self::EmptySummary => None,
         }
@@ -102,12 +101,17 @@ impl AgentError {
             Self::Api {
                 status, message, ..
             } => format!("API error ({status}): {message}"),
+            Self::Transport {
+                retry: Some(RetryKind::Connect),
+                ..
+            } => CONNECT_FAILED_MESSAGE.into(),
+            Self::Transport {
+                retry: Some(RetryKind::Timeout),
+                ..
+            } => "stream timed out, retrying".into(),
+            Self::Transport { message, .. } => format!("I/O error: {message}"),
             Self::Tool { tool, message } => format!("{tool}: {message}"),
-            Self::Io(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
-                CONNECT_FAILED_MESSAGE.into()
-            }
             Self::Io(e) => format!("I/O error: {e}"),
-            Self::Timeout { .. } => "stream timed out, retrying".into(),
             Self::Json(_) => "received an invalid response from the API".into(),
             Self::Channel => "internal error, try again".into(),
             Self::Cancelled => "cancelled".into(),
@@ -129,8 +133,11 @@ impl AgentError {
             Self::Api { status: 429, .. } => "Rate limited".into(),
             Self::Api { status: 529, .. } => "Provider is overloaded".into(),
             Self::Api { status, .. } if *status >= 500 => format!("Server error ({status})"),
-            Self::Io(_) => "Connection error".into(),
-            Self::Timeout { .. } => "Stream timed out".into(),
+            Self::Transport {
+                retry: Some(RetryKind::Timeout),
+                ..
+            } => "Stream timed out".into(),
+            Self::Transport { .. } => "Connection error".into(),
             _ => self.to_string(),
         }
     }
@@ -154,67 +161,57 @@ impl From<maki_storage::StorageError> for AgentError {
 
 #[cfg(test)]
 mod tests {
-    use maki_config::DEFAULT_MAX_RETRIES;
     use test_case::test_case;
 
     use super::*;
-    use crate::retry::{RetryPolicy, RetryState};
-
-    /// More rounds than any bounded budget allows, so a budget that survives
-    /// all of them is the unbounded one.
-    const ROUNDS: u32 = DEFAULT_MAX_RETRIES * 2;
 
     fn api(status: u16) -> AgentError {
         AgentError::api(status, "")
     }
 
-    fn timeout() -> AgentError {
-        AgentError::Timeout {
+    fn transport(retry: Option<RetryKind>) -> AgentError {
+        AgentError::Transport {
             message: String::new(),
+            retry,
         }
     }
 
-    #[test_case(429, RetryKind::RateLimit ; "rate_limit")]
-    #[test_case(500, RetryKind::Transient  ; "server_error")]
-    #[test_case(529, RetryKind::Transient  ; "overloaded")]
-    fn api_retry_kind(status: u16, expected: RetryKind) {
-        assert_eq!(api(status).retry_kind(), Some(expected));
-    }
-
-    #[test_case(429, true  ; "rate_limit")]
-    #[test_case(500, true  ; "server_error")]
-    #[test_case(529, true  ; "overloaded")]
-    #[test_case(400, false ; "bad_request")]
-    #[test_case(401, false ; "unauthorized")]
-    fn api_retryable(status: u16, expected: bool) {
-        assert_eq!(api(status).is_retryable(), expected);
-    }
-
-    #[test]
-    fn a_timeout_is_its_own_kind() {
-        assert_eq!(timeout().retry_kind(), Some(RetryKind::Timeout));
-    }
-
-    /// Retries this error is granted before the loop has to give up, stopping
-    /// at `ROUNDS` for a budget with no ceiling.
-    fn retries_granted(error: &AgentError) -> u32 {
-        let kind = error.retry_kind().expect("a transport failure retries");
-        let mut state = RetryState::new(RetryPolicy::default(), 1);
-        (0..ROUNDS)
-            .take_while(|_| state.next_delay(kind, error.retry_after()).is_some())
-            .count() as u32
-    }
-
-    #[test_case(io::ErrorKind::ConnectionRefused, DEFAULT_MAX_RETRIES ; "a_refused_socket_gives_up")]
-    #[test_case(io::ErrorKind::UnexpectedEof, ROUNDS                  ; "a_truncated_read_keeps_retrying")]
-    fn an_io_failure_gives_up_when_nothing_is_listening(kind: io::ErrorKind, expected: u32) {
-        assert_eq!(retries_granted(&AgentError::Io(kind.into())), expected);
+    #[test_case(Some(RetryKind::RateLimit) ; "named")]
+    #[test_case(None                       ; "unnamed")]
+    fn the_named_class_is_the_retry_kind(retry: Option<RetryKind>) {
+        let api = AgentError::Api {
+            status: 500,
+            message: String::new(),
+            retry_after: None,
+            overflow: false,
+            retry,
+        };
+        assert_eq!(api.retry_kind(), retry);
+        assert_eq!(transport(retry).retry_kind(), retry);
     }
 
     #[test]
-    fn a_refused_connection_names_the_server() {
-        let error = AgentError::Io(io::ErrorKind::ConnectionRefused.into());
-        assert_eq!(error.user_message(), CONNECT_FAILED_MESSAGE);
+    fn a_server_error_without_a_class_is_not_retried() {
+        assert!(!api(500).is_retryable());
+    }
+
+    #[test]
+    fn context_overflow_is_never_retried() {
+        let err = AgentError::Api {
+            status: 400,
+            message: String::new(),
+            retry_after: None,
+            overflow: true,
+            retry: Some(RetryKind::Transient),
+        };
+        assert!(err.is_context_overflow());
+        assert!(!err.is_retryable());
+    }
+
+    #[test_case(Some(RetryKind::Connect), CONNECT_FAILED_MESSAGE      ; "connect_names_the_server")]
+    #[test_case(Some(RetryKind::Timeout), "stream timed out, retrying" ; "timeout")]
+    fn transport_user_message(retry: Option<RetryKind>, expected: &str) {
+        assert_eq!(transport(retry).user_message(), expected);
     }
 
     #[test_case(401, true  ; "unauthorized")]
@@ -238,22 +235,5 @@ mod tests {
     fn user_message_api(status: u16, expected: &str) {
         let err = AgentError::api(status, "bad input");
         assert_eq!(err.user_message(), expected);
-    }
-
-    #[test]
-    fn timeout_is_retryable() {
-        assert!(timeout().is_retryable());
-    }
-
-    #[test]
-    fn context_overflow_is_not_retryable() {
-        let err = AgentError::Api {
-            status: 400,
-            message: String::new(),
-            retry_after: None,
-            overflow: true,
-        };
-        assert!(err.is_context_overflow());
-        assert!(!err.is_retryable());
     }
 }

@@ -239,7 +239,10 @@ fn spec_error(message: impl fmt::Display) -> mlua::Error {
 /// `status`, `message` and optional `retry_after` seconds is an API error,
 /// and `overflow = true` on it says the request does not fit the model's
 /// context, which the host answers by compacting instead of retrying;
-/// anything else is a retryable transport error. A raised error is not
+/// anything else is a transport error. An error is retried only when it
+/// names `retry`: `rate_limit`, `transient`, `connect`, `timeout` or `none`.
+/// The bundled `http.classify` names it from the status or the
+/// `maki.net.send` failure. A bare string and a raised error are not
 /// retried. Every callback that returns nil plus an error follows these
 /// rules.
 ///

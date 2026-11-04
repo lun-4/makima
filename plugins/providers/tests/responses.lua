@@ -123,9 +123,9 @@ t.case("failed_response_maps_its_code", function()
     sse({ { type = "response.failed", response = { error = { code = "rate_limit_exceeded", message = "slow down" } } } }),
     t.recorder()
   )
-  t.same(err, { status = 429, message = "slow down" })
+  t.same(err, { status = 429, message = "slow down", retry = "rate_limit" })
   _, err = responses.stream(sse({ { type = "response.failed", response = {} } }), t.recorder())
-  t.same(err, { status = 500, message = "response generation failed" })
+  t.same(err, { status = 500, message = "response generation failed", retry = "transient" })
 end)
 
 t.report()

@@ -37,12 +37,12 @@ const USER_AGENT: &str = concat!("maki/", env!("CARGO_PKG_VERSION"));
 const HEADER_VALUE_SEPARATOR: &str = ", ";
 const CLOSED_ERR: &str = "response is closed";
 /// Starts the error for a connection that was never established: refused, or
-/// a host name that does not resolve. The provider host reads it back to pick
+/// a host name that does not resolve. `http.classify` reads it back to pick
 /// the retry budget.
-pub(crate) const CONNECT_FAILED_ERR: &str = "could not connect";
-/// The error for a read that got no byte within `idle_timeout`. The provider
-/// host reads it back to pick the retry budget.
-pub(crate) const IDLE_TIMEOUT_ERR: &str = "idle timeout waiting for response body";
+const CONNECT_FAILED_ERR: &str = "could not connect";
+/// The error for a read that got no byte within `idle_timeout`.
+/// `http.classify` reads it back to pick the retry budget.
+const IDLE_TIMEOUT_ERR: &str = "idle timeout waiting for response body";
 #[cfg(not(unix))]
 const UNIX_SOCKET_UNSUPPORTED_ERR: &str = "unix_socket is not supported on this platform";
 
@@ -256,8 +256,8 @@ async fn open(params: SendParams) -> Result<LuaResponse, String> {
 ///
 /// A connection that is refused or a host name that does not resolve fails
 /// with an error starting `could not connect`. A `read()` that times out
-/// fails with an error containing `idle timeout`. Provider callbacks that
-/// return these errors as they are get bounded retries.
+/// fails with an error containing `idle timeout`. The providers plugin's
+/// `http.classify` reads these to name a provider error's retry class.
 ///
 /// {request} fields:
 ///   `url` (string) Required, `http://` or `https://`.

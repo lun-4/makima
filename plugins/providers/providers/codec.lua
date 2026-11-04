@@ -7,6 +7,8 @@ local M = {}
 -- `__metatable = false`.
 local ARRAY_MARK = getmetatable(maki.json.decode("[]"))
 local UNMAPPED_STATUS = 400
+local TOO_MANY_REQUESTS = 429
+local FIRST_SERVER_ERROR = 500
 local EMPTY_FRAME_MESSAGE = "provider sent an error frame with no detail"
 local TOOL_ID_HEX_BYTES = 4
 local ERROR_STATUS = {
@@ -105,14 +107,26 @@ function M.overflows(status, message)
   return contains_any(lower, OVERFLOW_SCOPES) and contains_any(lower, OVERFLOW_WORDS)
 end
 
+-- The retry class a response status names: a rate limit or a server error.
+-- Any other status is not retried.
+function M.status_retry(status)
+  if status == TOO_MANY_REQUESTS then
+    return "rate_limit"
+  elseif status >= FIRST_SERVER_ERROR then
+    return "transient"
+  end
+end
+
 -- The error table the host reads as an API error, with `overflow = true`
--- when the request does not fit the model's context.
+-- when the request does not fit the model's context, and the retry class of
+-- its status.
 function M.api_error(status, message, retry_after)
   return {
     status = status,
     message = message,
     retry_after = retry_after,
     overflow = M.overflows(status, message) or nil,
+    retry = M.status_retry(status),
   }
 end
 

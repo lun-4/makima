@@ -9,7 +9,8 @@ use flume::{Receiver, Sender};
 use maki_config::ToolKey;
 use maki_domain::Post;
 use maki_providers::{
-    AgentError, ContentBlock, ImageSource, Message, Role, StopReason, TokenUsage, add_cost,
+    AgentError, ContentBlock, ImageSource, Message, RetryKind, Role, StopReason, TokenUsage,
+    add_cost,
 };
 use maki_storage::id::{MakiId, MakiIdParseError};
 use serde::{Deserialize, Serialize};
@@ -616,9 +617,12 @@ impl TurnFailure {
         let kind = match error {
             AgentError::Api { status: 401, .. } => TurnFailureKind::Authentication,
             AgentError::Api { .. } => TurnFailureKind::Provider,
-            AgentError::Timeout { .. } => TurnFailureKind::Timeout,
+            AgentError::Transport {
+                retry: Some(RetryKind::Timeout),
+                ..
+            } => TurnFailureKind::Timeout,
             AgentError::Tool { .. } => TurnFailureKind::Tool,
-            AgentError::Io(_) => TurnFailureKind::Transport,
+            AgentError::Transport { .. } | AgentError::Io(_) => TurnFailureKind::Transport,
             AgentError::Json(_) | AgentError::Config { .. } => TurnFailureKind::InvalidResponse,
             AgentError::Channel => TurnFailureKind::Internal,
             AgentError::EmptySummary => TurnFailureKind::Compaction,
@@ -1747,7 +1751,8 @@ mod tests {
 
     #[test_case(AgentError::api(500, "down"), TurnFailureKind::Provider ; "provider")]
     #[test_case(AgentError::api(401, "bad key"), TurnFailureKind::Authentication ; "authentication")]
-    #[test_case(AgentError::Timeout { message: String::new() }, TurnFailureKind::Timeout ; "timeout")]
+    #[test_case(AgentError::Transport { message: String::new(), retry: Some(RetryKind::Timeout) }, TurnFailureKind::Timeout ; "timeout")]
+    #[test_case(AgentError::Transport { message: String::new(), retry: Some(RetryKind::Transient) }, TurnFailureKind::Transport ; "transport")]
     #[test_case(AgentError::Tool { tool: "read".into(), message: "bad".into() }, TurnFailureKind::Tool ; "tool")]
     #[test_case(AgentError::Io(std::io::Error::other("disk")), TurnFailureKind::Transport ; "io")]
     #[test_case(AgentError::Json(serde_json::from_str::<serde_json::Value>("{").unwrap_err()), TurnFailureKind::InvalidResponse ; "json")]

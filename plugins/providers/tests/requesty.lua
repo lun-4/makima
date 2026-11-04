@@ -116,7 +116,7 @@ t.case("one_failed_listing_keeps_the_other", function()
   t.eq(models[1].id, "vendor/full")
   local both, err = list({ t.response({ "down" }, { status = 500 }), t.response({ "down" }, { status = 502 }) })
   t.eq(both, nil)
-  t.same(err, { status = 500, message = "down" })
+  t.same(err, { status = 500, message = "down", retry = "transient" })
 end)
 
 t.case("auto_cache_effort_and_attribution", function()

@@ -134,15 +134,15 @@ end)
 
 t.case("error_frame_is_classified", function()
   for _, case in ipairs({
-    { { code = "server_is_overloaded", message = OVERLOADED }, 529 },
-    { { code = 503, message = OVERLOADED }, 503 },
-    { { type = "rate_limit_error", message = OVERLOADED }, 429 },
+    { { code = "server_is_overloaded", message = OVERLOADED }, 529, "transient" },
+    { { code = 503, message = OVERLOADED }, 503, "transient" },
+    { { type = "rate_limit_error", message = OVERLOADED }, 429, "rate_limit" },
     { { metadata = { error_type = "invalid_api_key" }, message = OVERLOADED }, 401 },
     { { code = "unknown", message = OVERLOADED }, 400 },
   }) do
     local result, err = chat.stream(sse({ { error = case[1] } }), t.recorder())
     t.eq(result, nil)
-    t.same(err, { status = case[2], message = OVERLOADED })
+    t.same(err, { status = case[2], message = OVERLOADED, retry = case[3] })
   end
   local _, err = chat.stream(sse({ { error = { message = " " } } }), t.recorder())
   t.same(err, { status = 400, message = "provider sent an error frame with no detail" })

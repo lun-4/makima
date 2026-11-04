@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::net::TcpListener;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -15,7 +16,9 @@ use maki_providers::login::{
     drive_login, logout,
 };
 use maki_providers::provider::BoxFuture;
-use maki_providers::{AgentError, ProviderRegistry};
+use maki_providers::{
+    AgentError, Invocation, InvocationPurpose, Message, ProviderRegistry, RequestOptions, RetryKind,
+};
 use maki_storage::StateDir;
 use maki_storage::auth::{load_credentials, save_credentials};
 use serde_json::json;
@@ -44,6 +47,10 @@ const BUNDLED_KEY: &str = "zk-bundled-login-key";
 const MASKED_KEY: &str = "key: zk-b...-key, coding";
 const PLAN_PROVIDER_KEY_ENV: &str = "ZHIPU_API_KEY";
 const PLAN_LOGIN_URL: &str = "https://z.ai/manage-apikey/apikey-list";
+const LOCAL_MODEL: &str = "llama-cpp/local-model";
+const LOCAL_HOST_ENV: &str = "LLAMA_CPP_HOST";
+const LOOPBACK: &str = "127.0.0.1:0";
+const CONVERSATION: &str = "conversation";
 const AUTO_DETECT_ORDER: &[&str] = &[
     "anthropic",
     "openai",
@@ -301,6 +308,41 @@ fn bundled_providers_keep_auto_detect_order() {
     let fixture = Fixture::with_plugin(BUNDLED_PLUGIN, BUNDLED_SOURCE);
     let ids: Vec<_> = fixture.states().into_iter().map(|(id, ..)| id).collect();
     assert_eq!(ids[..AUTO_DETECT_ORDER.len()], *AUTO_DETECT_ORDER);
+}
+
+/// The bundled plugin classes every provider's stream errors, so a local
+/// server that is not running draws from the bounded connect budget.
+#[test]
+fn bundled_stream_errors_carry_a_retry_class() {
+    let listener = TcpListener::bind(LOOPBACK).unwrap();
+    let host = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    // SAFETY: nextest runs each test in its own process.
+    unsafe { std::env::set_var(LOCAL_HOST_ENV, host) };
+    let fixture = Fixture::with_plugin(BUNDLED_PLUGIN, BUNDLED_SOURCE);
+    let model = fixture.registry.model(LOCAL_MODEL).unwrap();
+    let prepared = smol::block_on(bounded(fixture.registry.prepare(model))).unwrap();
+    let (events, _events_rx) = flume::unbounded();
+    let invocation = Invocation {
+        conversation_id: CONVERSATION.into(),
+        operation_id: CONVERSATION.into(),
+        attempt: 0,
+        purpose: InvocationPurpose::Agent,
+        agent_id: None,
+        previous: None,
+    };
+    let error = smol::block_on(bounded(prepared.provider.stream_message(
+        &prepared.model,
+        &[Message::user(CONVERSATION.into())],
+        "",
+        &json!([]),
+        &events,
+        RequestOptions::default(),
+        None,
+        &invocation,
+    )))
+    .unwrap_err();
+    assert_eq!(error.retry_kind(), Some(RetryKind::Connect), "{error:?}");
 }
 
 #[test]

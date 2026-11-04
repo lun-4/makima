@@ -88,13 +88,13 @@ t.case("non_2xx_becomes_api_error", function()
   local ctx = t.provider_ctx({ failed })
   local response, err = http.send(ctx, { url = "https://example.invalid" })
   t.eq(response, nil)
-  t.same(err, { status = 429, message = "rate limited", retry_after = 7 })
+  t.same(err, { status = 429, message = "rate limited", retry_after = 7, retry = "rate_limit" })
   t.eq(failed.closed, true)
 end)
 
 t.case("error_without_body_names_status", function()
   local err = http.error(t.response({}, { status = 503, headers = { ["retry-after"] = "0" } }))
-  t.same(err, { status = 503, message = "HTTP 503" })
+  t.same(err, { status = 503, message = "HTTP 503", retry = "transient" })
 end)
 
 t.case("send_passes_transport_errors_through", function()
@@ -104,6 +104,46 @@ t.case("send_passes_transport_errors_through", function()
     end,
   }
   t.same({ http.send(ctx, { url = "https://example.invalid" }) }, { nil, "connection refused" })
+end)
+
+local CONNECT_FAILED = "token request: could not connect: Connection refused"
+local IDLE_TIMEOUT = "idle timeout waiting for response body"
+local RESET = "connection reset"
+
+t.case("classify_names_a_retry_class", function()
+  for _, case in ipairs({
+    { CONNECT_FAILED, "connect" },
+    { { message = IDLE_TIMEOUT }, "timeout" },
+    { RESET, "transient" },
+    { { status = 429, message = RESET }, "rate_limit" },
+    { { status = 502, message = RESET }, "transient" },
+    { { status = 401, message = RESET }, nil },
+  }) do
+    t.eq(http.classify(case[1]).retry, case[2], http.message(case[1]))
+  end
+end)
+
+t.case("classify_keeps_a_named_class_and_config_errors", function()
+  local named = { status = 500, message = RESET, retry = "none" }
+  t.same(http.classify(named), named)
+  t.same(http.classify(http.config_error(RESET)), http.config_error(RESET))
+end)
+
+t.case("classify_stream_classes_only_failures", function()
+  local result, failing = { message = {} }, false
+  local instance = {
+    stream = function()
+      if failing then
+        return nil, RESET
+      end
+      return result
+    end,
+  }
+  http.classify_stream(instance)
+  t.eq(instance.stream(), result)
+  failing = true
+  local _, err = instance.stream()
+  t.same(err, { message = RESET, retry = "transient" })
 end)
 
 t.case("read_json_decodes_and_caps", function()

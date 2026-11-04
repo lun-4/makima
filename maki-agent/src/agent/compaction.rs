@@ -959,6 +959,7 @@ mod tests {
                     message: "prompt is too long".into(),
                     retry_after: None,
                     overflow: true,
+                    retry: None,
                 }),
                 Ok(text_response(StopReason::EndTurn)),
             ]);

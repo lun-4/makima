@@ -41,6 +41,7 @@ const RETRY_AFTER_SECS: f64 = 1.5;
 const TRANSPORT_MESSAGE: &str = "connection reset";
 const LOOPBACK: &str = "127.0.0.1:0";
 const SHORT_IDLE_SECS: f64 = 0.2;
+const IDLE_TIMEOUT: &str = "idle timeout";
 /// Headers and one body byte, so `send` returns and the next read stalls.
 const STALLED_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nx";
 const RAISED_MESSAGE: &str = "boom";
@@ -353,19 +354,23 @@ fn prepare_may_adjust_the_model_but_not_its_id() {
 
 #[test_case(
     &format!("return nil, {{ status = {API_STATUS}, message = '{API_MESSAGE}', retry_after = {RETRY_AFTER_SECS} }}"),
-    |e| matches!(e, AgentError::Api { status: API_STATUS, message, retry_after: Some(after), overflow: false }
+    |e| matches!(e, AgentError::Api { status: API_STATUS, message, retry_after: Some(after), overflow: false, retry: None }
         if message == API_MESSAGE && *after == Duration::from_secs_f64(RETRY_AFTER_SECS))
     ; "error table with status is an api error")]
 #[test_case(
-    &format!("return nil, {{ status = {API_STATUS}, message = '{API_MESSAGE}', overflow = true }}"),
+    &format!("return nil, {{ status = {API_STATUS}, message = '{API_MESSAGE}', overflow = true, retry = 'transient' }}"),
     |e| e.is_context_overflow() && e.retry_kind().is_none()
     ; "error table marked overflow is a context overflow")]
 #[test_case(
     &format!("return nil, {{ message = '{TRANSPORT_MESSAGE}' }}"),
-    |e| matches!(e, AgentError::Io(io) if io.to_string() == TRANSPORT_MESSAGE) && e.retry_kind().is_some()
-    ; "error table without status is retryable")]
+    |e| matches!(e, AgentError::Transport { message, retry: None } if message == TRANSPORT_MESSAGE)
+    ; "error table without status or class is not retried")]
 #[test_case(
-    &format!("return nil, {{ kind = 'config', message = '{CONFIG_MESSAGE}' }}"),
+    &format!("return nil, '{TRANSPORT_MESSAGE}'"),
+    |e| matches!(e, AgentError::Transport { message, retry: None } if message == TRANSPORT_MESSAGE)
+    ; "bare string is not retried")]
+#[test_case(
+    &format!("return nil, {{ kind = 'config', message = '{CONFIG_MESSAGE}', retry = 'transient' }}"),
     |e| matches!(e, AgentError::Config { message } if message == CONFIG_MESSAGE) && e.retry_kind().is_none()
     ; "config kind is not retried")]
 #[test_case(
@@ -377,35 +382,36 @@ fn prepare_may_adjust_the_model_but_not_its_id() {
     |e| matches!(e, AgentError::Config { message } if message.contains(RAISED_MESSAGE)) && e.retry_kind().is_none()
     ; "raised error is not retried")]
 fn stream_errors_map_to_agent_errors(body: &str, expected: fn(&AgentError) -> bool) {
-    let instance = format!("return {{ stream = function(ctx, request, emit) {body} end }}");
-    let (_host, prepared) = prepare_fake(&instance);
-    let (events_tx, _events_rx) = flume::unbounded();
-    let error = stream(&prepared, &events_tx).err().unwrap();
+    let error = stream_error(body);
     assert!(expected(&error), "{error:?}");
 }
 
-/// A refused connection draws from the bounded connect budget, even after the
-/// provider wraps the error in its own words.
-#[test]
-fn refused_connection_is_a_connect_failure() {
-    let listener = TcpListener::bind(LOOPBACK).unwrap();
-    let url = format!("http://{}/", listener.local_addr().unwrap());
-    drop(listener);
-    let instance = format!(
-        r#"return {{ stream = function(ctx)
-            local _, err = ctx.send({{ url = "{url}" }})
-            return nil, {{ message = "token request: " .. err }}
-        end }}"#
-    );
+fn stream_error(body: &str) -> AgentError {
+    let instance = format!("return {{ stream = function(ctx, request, emit) {body} end }}");
     let (_host, prepared) = prepare_fake(&instance);
     let (events_tx, _events_rx) = flume::unbounded();
-    let error = stream(&prepared, &events_tx).err().unwrap();
-    assert_eq!(error.retry_kind(), Some(RetryKind::Connect), "{error:?}");
+    stream(&prepared, &events_tx).err().unwrap()
 }
 
-/// Streams a body that stops after one byte, with {request_fields} added to
-/// the `ctx.send` request, and returns the provider's error.
-fn stall_body(request_fields: &str, timeouts: Timeouts) -> AgentError {
+#[test_case("rate_limit", Some(RetryKind::RateLimit) ; "rate_limit")]
+#[test_case("transient", Some(RetryKind::Transient)  ; "transient")]
+#[test_case("connect", Some(RetryKind::Connect)      ; "connect")]
+#[test_case("timeout", Some(RetryKind::Timeout)      ; "timeout")]
+#[test_case("none", None                             ; "none")]
+#[test_case("sometimes", None                        ; "unknown")]
+fn the_named_retry_class_is_the_budget(class: &str, expected: Option<RetryKind>) {
+    for status in ["", &format!("status = {API_STATUS},")] {
+        let error = stream_error(&format!(
+            "return nil, {{ {status} message = '{TRANSPORT_MESSAGE}', retry = '{class}' }}"
+        ));
+        assert_eq!(error.retry_kind(), expected, "{error:?}");
+    }
+}
+
+/// The configured stream timeout is the default for provider requests; with
+/// the 300 s send default this would run into `BOUND` instead.
+#[test]
+fn configured_stream_timeout_reaches_send() {
     let listener = TcpListener::bind(LOOPBACK).unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     let (release_tx, release_rx) = flume::bounded::<()>(1);
@@ -416,7 +422,7 @@ fn stall_body(request_fields: &str, timeouts: Timeouts) -> AgentError {
     });
     let instance = format!(
         r#"return {{ stream = function(ctx)
-            local res = assert(ctx.send({{ url = "{url}", {request_fields} }}))
+            local res = assert(ctx.send({{ url = "{url}" }}))
             local chunk, err = res:read()
             while chunk do
                 chunk, err = res:read()
@@ -424,34 +430,19 @@ fn stall_body(request_fields: &str, timeouts: Timeouts) -> AgentError {
             return nil, err
         end }}"#
     );
+    let timeouts = Timeouts {
+        stream: Duration::from_secs_f64(SHORT_IDLE_SECS),
+        ..Timeouts::default()
+    };
     let (_host, prepared) = prepare_fake_with(&instance, timeouts);
     let (events_tx, _events_rx) = flume::unbounded();
     let error = stream(&prepared, &events_tx).err().unwrap();
     release_tx.send(()).unwrap();
     server.join().unwrap();
-    error
-}
-
-/// A body that stops arriving draws from the bounded timeout budget.
-#[test]
-fn stalled_body_is_a_timeout() {
-    let error = stall_body(
-        &format!("idle_timeout = {SHORT_IDLE_SECS}"),
-        Timeouts::default(),
+    assert!(
+        matches!(&error, AgentError::Transport { message, .. } if message.contains(IDLE_TIMEOUT)),
+        "{error:?}"
     );
-    assert_eq!(error.retry_kind(), Some(RetryKind::Timeout), "{error:?}");
-}
-
-/// The configured stream timeout is the default for provider requests; with
-/// the 300 s send default this would run into `BOUND` instead.
-#[test]
-fn configured_stream_timeout_reaches_send() {
-    let timeouts = Timeouts {
-        stream: Duration::from_secs_f64(SHORT_IDLE_SECS),
-        ..Timeouts::default()
-    };
-    let error = stall_body("", timeouts);
-    assert_eq!(error.retry_kind(), Some(RetryKind::Timeout), "{error:?}");
 }
 
 fn wait_until(what: &str, mut done: impl FnMut() -> bool) {

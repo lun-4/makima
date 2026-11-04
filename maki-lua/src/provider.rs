@@ -3,7 +3,6 @@
 //! any other thread.
 
 use std::future::Future;
-use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
@@ -17,7 +16,7 @@ use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
     AgentError, ConversationEnd, Invocation, Message, Model, ModelInfo, PreparedProvider,
     ProviderBackend, ProviderEvent, ProviderRegistry, ProviderUsage, RegisteredProvider,
-    RequestOptions, StopReason, StreamResponse, Timeouts, TokenUsage,
+    RequestOptions, RetryKind, StopReason, StreamResponse, Timeouts, TokenUsage,
 };
 use maki_storage::id::SessionRef;
 use mlua::{
@@ -28,7 +27,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::warn;
 
-use crate::api::net::send::{CONNECT_FAILED_ERR, IDLE_TIMEOUT_ERR};
 use crate::api::provider::{ProviderSpec, ProviderStore};
 use crate::api::util::memory::unlimited;
 use crate::credentials::Credentials;
@@ -40,6 +38,11 @@ const NO_STREAM: &str = "provider instance has no stream function";
 const DEFAULT_KEY_COUNT: usize = 1;
 const LOGIN_INCOMPLETE: &str = "login did not complete";
 const CONFIG_KIND: &str = "config";
+const RETRY_RATE_LIMIT: &str = "rate_limit";
+const RETRY_TRANSIENT: &str = "transient";
+const RETRY_CONNECT: &str = "connect";
+const RETRY_TIMEOUT: &str = "timeout";
+const RETRY_NONE: &str = "none";
 const SEND_WITH_DEFAULTS: &str = r#"
     local send, defaults = ...
     return function(request)
@@ -183,8 +186,8 @@ fn returned(values: MultiValue) -> Result<MultiValue, AgentError> {
 fn returned_error(error: &LuaValue) -> AgentError {
     let fields = match error {
         LuaValue::Table(fields) => fields,
-        LuaValue::String(message) => return transport_error(message.to_string_lossy()),
-        other => return AgentError::Io(io::Error::other(other.type_name())),
+        LuaValue::String(message) => return transport_error(message.to_string_lossy(), None),
+        other => return transport_error(other.type_name().to_owned(), None),
     };
     let message = fields
         .get::<Option<String>>("message")
@@ -195,6 +198,11 @@ fn returned_error(error: &LuaValue) -> AgentError {
     if kind.as_deref() == Some(CONFIG_KIND) {
         return config_error(message);
     }
+    let retry = fields
+        .get::<Option<String>>("retry")
+        .ok()
+        .flatten()
+        .and_then(|class| retry_class(&class, &message));
     match fields.get::<Option<u16>>("status").ok().flatten() {
         Some(status) => AgentError::Api {
             status,
@@ -209,21 +217,33 @@ fn returned_error(error: &LuaValue) -> AgentError {
                 .ok()
                 .flatten()
                 .unwrap_or_default(),
+            retry,
         },
-        None => transport_error(message),
+        None => transport_error(message, retry),
     }
 }
 
-/// A failure with no status, classified by the `maki.net.send` error it
-/// carries, so a refused connection and a stalled stream draw from their
-/// bounded retry budgets. Wrapping the error in more text keeps its class.
-fn transport_error(message: String) -> AgentError {
-    if message.contains(CONNECT_FAILED_ERR) {
-        AgentError::Io(io::Error::new(io::ErrorKind::ConnectionRefused, message))
-    } else if message.contains(IDLE_TIMEOUT_ERR) {
-        AgentError::Timeout { message }
-    } else {
-        AgentError::Io(io::Error::other(message))
+fn transport_error(message: String, retry: Option<RetryKind>) -> AgentError {
+    AgentError::Transport { message, retry }
+}
+
+/// The budget an error's `retry` names. `none` and an unknown name are not
+/// retried; the unknown one is a provider bug worth a log line.
+fn retry_class(class: &str, message: &str) -> Option<RetryKind> {
+    match class {
+        RETRY_RATE_LIMIT => Some(RetryKind::RateLimit),
+        RETRY_TRANSIENT => Some(RetryKind::Transient),
+        RETRY_CONNECT => Some(RetryKind::Connect),
+        RETRY_TIMEOUT => Some(RetryKind::Timeout),
+        RETRY_NONE => None,
+        unknown => {
+            warn!(
+                retry = unknown,
+                error = message,
+                "unknown retry class, not retrying"
+            );
+            None
+        }
     }
 }
 
