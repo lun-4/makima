@@ -1786,10 +1786,10 @@ mod tests {
     fn test_model(spec: &str) -> Model {
         let mut model = Model::from_spec(spec).unwrap();
         if spec != CAPABLE_MODEL {
-            model.supports_fast_override = Some(FastSupport::Unsupported);
+            model.fast_support = Some(FastSupport::Unsupported);
         }
         if spec != CAPABLE_MODEL && spec != FAST_TIER_TARGET {
-            model.thinking_override = Some(ThinkingSupport::No);
+            model.thinking_support = Some(ThinkingSupport::No);
         }
         model
     }

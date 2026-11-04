@@ -228,10 +228,10 @@ fn same_model(left: &Model, right: &Model) -> bool {
     left.id == right.id
         && left.provider == right.provider
         && left.tier == right.tier
-        && left.supports_tool_examples_override == right.supports_tool_examples_override
-        && left.thinking_override == right.thinking_override
-        && left.supports_vision_override == right.supports_vision_override
-        && left.supports_fast_override == right.supports_fast_override
+        && left.tool_examples == right.tool_examples
+        && left.thinking_support == right.thinking_support
+        && left.vision == right.vision
+        && left.fast_support == right.fast_support
         && left.max_output_tokens == right.max_output_tokens
         && left.context_window == right.context_window
         && left.pricing.input == right.pricing.input

@@ -76,7 +76,7 @@ fn fast_change(fast: bool) -> super::ConfigChange {
 
 pub(super) fn policy(fast: bool) -> crate::RunSettings {
     let mut model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
-    model.supports_fast_override = Some(maki_providers::model::FastSupport::Supported);
+    model.fast_support = Some(maki_providers::model::FastSupport::Supported);
     crate::RunSettings {
         provider: Arc::new(PolicyTestProvider),
         model,
@@ -1046,7 +1046,7 @@ fn failed_admission_delivers_fifo_predecessor_before_backend(preparation_panic: 
             .unwrap();
         assert!(ticket.peek().is_none());
         let mut model = Model::from_spec(MODEL).unwrap();
-        model.supports_fast_override = Some(maki_providers::model::FastSupport::Supported);
+        model.fast_support = Some(maki_providers::model::FastSupport::Supported);
         barrier
             .commit_when_ready(Some(super::ConfigChange::PatchAndMode {
                 patch: super::ConfigPatch {

@@ -273,11 +273,11 @@ pub struct Model {
     pub id: String,
     pub provider: Arc<str>,
     pub tier: ModelTier,
-    pub supports_tool_examples_override: Option<bool>,
+    pub tool_examples: Option<bool>,
     /// `None` when the descriptor does not say, which reads as no thinking.
-    pub thinking_override: Option<ThinkingSupport>,
-    pub supports_vision_override: Option<bool>,
-    pub supports_fast_override: Option<FastSupport>,
+    pub thinking_support: Option<ThinkingSupport>,
+    pub vision: Option<bool>,
+    pub fast_support: Option<FastSupport>,
     pub pricing: ModelPricing,
     pub pricing_schedule: Option<PricingSchedule>,
     /// What the model declares it can generate, `None` when unknown.
@@ -296,13 +296,13 @@ impl Model {
             id: info.id.clone(),
             provider: Arc::from(provider),
             tier: model_registry::tier_for(&spec, info.tier),
-            supports_tool_examples_override: info.supports_tool_examples,
-            thinking_override: ThinkingSupport::from_flags(
+            tool_examples: info.supports_tool_examples,
+            thinking_support: ThinkingSupport::from_flags(
                 info.supports_thinking,
                 info.requires_thinking == Some(true),
             ),
-            supports_vision_override: info.supports_vision,
-            supports_fast_override: info.supports_fast,
+            vision: info.supports_vision,
+            fast_support: info.supports_fast,
             pricing: info.pricing.clone().unwrap_or_default(),
             pricing_schedule: info.pricing_schedule.clone(),
             max_output_tokens: info.max_output_tokens,
@@ -312,30 +312,30 @@ impl Model {
     }
 
     pub fn supports_thinking(&self) -> bool {
-        self.thinking_override
+        self.thinking_support
             .is_some_and(|thinking| thinking != ThinkingSupport::No)
     }
 
     pub fn requires_thinking(&self) -> bool {
-        self.thinking_override == Some(ThinkingSupport::Required)
+        self.thinking_support == Some(ThinkingSupport::Required)
     }
 
     pub fn supports_vision(&self) -> bool {
-        self.supports_vision_override == Some(true)
+        self.vision == Some(true)
     }
 
     pub fn supports_tool_examples(&self) -> bool {
-        self.supports_tool_examples_override == Some(true)
+        self.tool_examples == Some(true)
     }
 
     pub fn supports_fast(&self) -> bool {
-        self.supports_fast_override == Some(FastSupport::Supported)
+        self.fast_support == Some(FastSupport::Supported)
     }
 
     /// Discovery has not answered yet, so the `false` from [`Self::supports_fast`]
     /// is provisional. Frontends park the user's wish instead of rejecting it.
     pub fn fast_pending(&self) -> bool {
-        self.supports_fast_override == Some(FastSupport::Pending)
+        self.fast_support == Some(FastSupport::Pending)
     }
 
     pub fn spec(&self) -> String {
@@ -774,7 +774,7 @@ mod tests {
     #[test]
     fn fast_without_fast_pricing_uses_standard_rates() {
         let model = Model {
-            supports_fast_override: Some(FastSupport::Supported),
+            fast_support: Some(FastSupport::Supported),
             pricing: ModelPricing {
                 input: SCHEDULED_INPUT_RATE,
                 ..ModelPricing::ZERO

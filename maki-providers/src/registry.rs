@@ -502,8 +502,8 @@ mod tests {
         let model = registry.model(&format!("{FAKE}/not-listed")).unwrap();
         assert_eq!(model.context_window, crate::model::UNKNOWN_CONTEXT_WINDOW);
         assert_eq!(model.max_output_tokens, None);
-        assert_eq!(model.thinking_override, None);
-        assert_eq!(model.supports_vision_override, None);
+        assert_eq!(model.thinking_support, None);
+        assert_eq!(model.vision, None);
     }
 
     #[test]

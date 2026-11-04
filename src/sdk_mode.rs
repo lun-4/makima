@@ -2112,7 +2112,7 @@ mod tests {
     /// {spec} without fast mode, which none of these models offer.
     fn sdk_model(spec: &str) -> Model {
         Model {
-            supports_fast_override: Some(maki_providers::model::FastSupport::Unsupported),
+            fast_support: Some(maki_providers::model::FastSupport::Unsupported),
             ..Model::from_spec(spec).unwrap()
         }
     }

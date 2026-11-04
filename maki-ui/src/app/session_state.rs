@@ -353,7 +353,7 @@ mod tests {
         let mut session = session_with_counters();
         session.meta.fast = fast;
         let model = Model {
-            supports_fast_override: Some(FastSupport::Supported),
+            fast_support: Some(FastSupport::Supported),
             pricing: ModelPricing {
                 fast: Some(FastPricing {
                     input: FAST_INPUT_RATE,
@@ -374,7 +374,7 @@ mod tests {
         let mut session = session_with_counters();
         session.meta.fast = true;
         let mut model = test_model();
-        model.supports_fast_override = Some(support);
+        model.fast_support = Some(support);
         model.pricing.fast = Some(FastPricing {
             input: FAST_INPUT_RATE,
             output: test_pricing().output,
@@ -415,13 +415,13 @@ mod tests {
         let mut session = session_with_counters();
         session.meta.fast = true;
         let mut model = test_model();
-        model.supports_fast_override = Some(FastSupport::Pending);
+        model.fast_support = Some(FastSupport::Pending);
         let mut state = resumed(session, &model);
         assert!(state.fast_pending);
         if switch {
             model.id = UNRESOLVABLE_MODEL.into();
         }
-        model.supports_fast_override = Some(support);
+        model.fast_support = Some(support);
         state.update_model(&model);
         assert_eq!(state.fast_pending, ready || support == FastSupport::Pending);
         assert_eq!(state.resolve_pending_fast(false, &model), ready);

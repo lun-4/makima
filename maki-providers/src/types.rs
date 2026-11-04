@@ -755,7 +755,7 @@ mod tests {
         ));
 
         let mut text_only_model = model;
-        text_only_model.supports_vision_override = Some(false);
+        text_only_model.vision = Some(false);
         let no_images = vec![Message::user("hi".into())];
         assert!(matches!(
             smol::block_on(adapt_images_for_model(&text_only_model, &no_images)),
@@ -869,7 +869,7 @@ mod tests {
     #[test]
     fn adapt_images_replaces_blocks_for_text_only_model() {
         let mut model = test_model();
-        model.supports_vision_override = Some(false);
+        model.vision = Some(false);
         let tool_result = ContentBlock::ToolResult {
             tool_use_id: "t1".into(),
             content: "[image: pic.png 1KB]".into(),
@@ -918,7 +918,7 @@ mod tests {
 
     fn test_model() -> Model {
         Model {
-            supports_vision_override: Some(true),
+            vision: Some(true),
             ..Model::from_spec("test/test-model").unwrap()
         }
     }
@@ -929,12 +929,12 @@ mod tests {
     #[test_case(Some(Support::Required), ThinkingConfig::Off,      ThinkingConfig::Effort(Minimal) ; "required_raises_off_to_minimal")]
     #[test_case(Some(Support::Required), ThinkingConfig::Adaptive, ThinkingConfig::Adaptive        ; "required_keeps_enabled")]
     fn request_options_clamped_thinking(
-        thinking_override: Option<Support>,
+        thinking_support: Option<Support>,
         thinking: ThinkingConfig,
         expected: ThinkingConfig,
     ) {
         let mut model = test_model();
-        model.thinking_override = thinking_override;
+        model.thinking_support = thinking_support;
         let opts = RequestOptions {
             thinking,
             fast: false,
@@ -945,7 +945,7 @@ mod tests {
     #[test]
     fn request_options_clamped_fast_requires_model_support() {
         let model = Model {
-            supports_fast_override: None,
+            fast_support: None,
             ..test_model()
         };
         let opts = RequestOptions {

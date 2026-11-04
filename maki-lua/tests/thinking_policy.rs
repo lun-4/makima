@@ -100,7 +100,7 @@ fn thinking_clamped_to_off_for_non_supporting_model() {
     let (mut ctx, _rx, _trigger) = ctx_with_provider(Arc::clone(&provider));
     ctx.opts.thinking = ThinkingConfig::Effort(Effort::High);
     let non_thinking = Arc::new(Model {
-        thinking_override: Some(ThinkingSupport::No),
+        thinking_support: Some(ThinkingSupport::No),
         ..Model::from_spec("ollama/qwen3").unwrap()
     });
     assert!(

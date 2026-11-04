@@ -1223,8 +1223,9 @@ already owns fails and names both plugins.
   `section` (string) Optional. The heading the provider is listed under
   in the login picker, after the providers without one.
   `auth_status` (function) Optional. `auth_status(ctx, config)` returns
-  `{ state, detail? }`, where `state` is `saved`, `env`, `configured` or
-  `missing`. It must work without credentials. Without it, the
+  `{ state, detail? }`, where `state` is `saved`, `env`, `configured`,
+  `missing` or `failed` (the check could not tell, shown as an error and
+  treated as missing). It must work without credentials. Without it, the
   provider counts as logged in while its credentials file exists.
   `logout` (function) Optional. `logout(ctx)`. Without it, logout
   deletes the credentials file.

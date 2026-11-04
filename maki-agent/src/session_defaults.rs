@@ -59,12 +59,12 @@ mod tests {
 
     fn model(supported: bool) -> Model {
         let mut model = Model::from_spec(SPEC).unwrap();
-        model.supports_fast_override = Some(if supported {
+        model.fast_support = Some(if supported {
             FastSupport::Supported
         } else {
             FastSupport::Unsupported
         });
-        model.thinking_override = Some(if supported {
+        model.thinking_support = Some(if supported {
             ThinkingSupport::Yes
         } else {
             ThinkingSupport::No

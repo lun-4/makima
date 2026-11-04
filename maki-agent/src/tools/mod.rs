@@ -1184,7 +1184,7 @@ mod tests {
     #[test_case(false ; "text_only_model_loses_view_image")]
     fn from_config_gates_view_image_on_vision(vision: bool) {
         let mut model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
-        model.supports_vision_override = Some(vision);
+        model.vision = Some(vision);
         let filter = ToolFilter::from_config(&AgentConfig::default(), &model, &[]);
         assert_eq!(filter.matches(VIEW_IMAGE_TOOL_NAME), vision);
         assert!(

@@ -66,6 +66,7 @@ local REFRESH_MARGIN_MS = 60000
 local MILLIS = 1000
 local NANOS_PER_MILLI = 1000000
 local UNAUTHORIZED = 401
+local REFRESH_REJECTED = { [400] = true, [401] = true }
 local PENDING_STATUS = { [403] = true, [404] = true }
 local SECONDS_PER_HOUR = 3600
 local SECONDS_PER_DAY = 24 * SECONDS_PER_HOUR
@@ -343,8 +344,9 @@ end
 
 -- Swaps expired (or, with {force}, rejected) tokens for fresh ones under the
 -- credential lock. Credentials another process already replaced are taken
--- as they are. When the refresh fails the stale tokens are deleted and an API
--- key, if there is one, takes over; otherwise the refresh error is returned.
+-- as they are. When the token endpoint rejects the refresh token, the stale
+-- tokens are deleted and an API key, if there is one, takes over; otherwise
+-- the refresh error is returned. Any other failure keeps the tokens.
 local function fresh(ctx, config, state, force)
   if not state.tokens or not (force or expired(state.tokens)) then
     return true
@@ -366,6 +368,9 @@ local function fresh(ctx, config, state, force)
     return true
   end
   if err then
+    if not (type(err) == "table" and REFRESH_REJECTED[err.status]) then
+      return nil, err
+    end
     ctx.credentials:delete()
   end
   local loaded, load_err = load_auth(ctx, config, state)

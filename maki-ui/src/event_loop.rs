@@ -1668,12 +1668,14 @@ impl StartupPrepare {
             let result = prepare(Arc::clone(&self.spec))
                 .await
                 .map_err(|error| error.to_string());
-            self.pending.fill(
-                result
-                    .as_ref()
-                    .map(|prepared| Arc::clone(&prepared.provider))
-                    .map_err(|error| Arc::from(error.as_str())),
-            );
+            self.pending
+                .fill(
+                    result
+                        .as_ref()
+                        .map(|prepared| Arc::clone(&prepared.provider))
+                        .map_err(|error| Arc::from(error.as_str())),
+                )
+                .await;
             let _ = internal_tx.send(InternalEvent::StartupPrepared {
                 spec: self.spec,
                 root: self.root,
@@ -5150,7 +5152,7 @@ mod tests {
 
     fn fast_model(id: &str, support: FastSupport) -> Model {
         let mut model = model_named(id);
-        model.supports_fast_override = Some(support);
+        model.fast_support = Some(support);
         model
     }
 
@@ -5260,7 +5262,7 @@ mod tests {
             let predecessor = actor.reserve_prepared_operation(None).unwrap();
             let combined = actor.reserve_prepared_operation(None).unwrap();
             let mut model = model_named("replacement");
-            model.thinking_override = Some(maki_providers::ThinkingSupport::Yes);
+            model.thinking_support = Some(maki_providers::ThinkingSupport::Yes);
             let combined = smol::spawn(combined.commit_when_ready(Some(ConfigChange::Patch(
                 ConfigPatch {
                     model: Some(maki_agent::actor::PreparedModel {
@@ -6785,8 +6787,8 @@ mod tests {
 
         fn model(spec: &str) -> Model {
             let mut model = Model::from_spec(spec).unwrap();
-            model.supports_fast_override = Some(FastSupport::Supported);
-            model.thinking_override = Some(maki_providers::ThinkingSupport::Yes);
+            model.fast_support = Some(FastSupport::Supported);
+            model.thinking_support = Some(maki_providers::ThinkingSupport::Yes);
             model
         }
 
@@ -7916,7 +7918,7 @@ mod tests {
         with_event_loop(|event_loop| {
             if !workflow {
                 let mut model = model_named("fast-model");
-                model.supports_fast_override = Some(FastSupport::Supported);
+                model.fast_support = Some(FastSupport::Supported);
                 let replacement = test_runtime(model);
                 let old = std::mem::replace(&mut event_loop.sessions[0], replacement);
                 release_runtime(old);

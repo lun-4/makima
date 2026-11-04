@@ -200,7 +200,7 @@ fn live_slash_controls_commit_on_the_admitted_actor(command: &str) {
         if command == "/fast" {
             let config = actor.effective_config().unwrap();
             let mut model = config.model.clone();
-            model.supports_fast_override = Some(maki_providers::model::FastSupport::Supported);
+            model.fast_support = Some(maki_providers::model::FastSupport::Supported);
             let ticket = actor.reserve_prepared_operation(None).unwrap();
             smol::block_on(
                 ticket.commit_when_ready(Some(ConfigChange::Patch(ConfigPatch {

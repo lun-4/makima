@@ -20,8 +20,8 @@ pub(crate) struct PendingProvider {
 impl PendingProvider {
     /// Settles the provider every waiting and later request uses. Only the
     /// first call counts.
-    pub(crate) fn fill(&self, result: Result<Arc<dyn Provider>, Arc<str>>) {
-        let _ = self.ready.set_blocking(result);
+    pub(crate) async fn fill(&self, result: Result<Arc<dyn Provider>, Arc<str>>) {
+        let _ = self.ready.set(result).await;
     }
 
     async fn provider(&self) -> Result<&Arc<dyn Provider>, AgentError> {
@@ -112,7 +112,7 @@ mod tests {
             let pending = Arc::clone(&pending);
             async move { pending.fetch_usage().await }
         });
-        pending.fill(Err(FAILURE.into()));
+        smol::block_on(pending.fill(Err(FAILURE.into())));
         let error = smol::block_on(waiting).unwrap_err();
         assert!(matches!(error, AgentError::Config { message } if message == FAILURE));
     }

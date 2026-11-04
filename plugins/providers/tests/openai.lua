@@ -9,6 +9,7 @@ local ACCOUNT = "account-a"
 local OTHER_ACCOUNT = "account-b"
 local HOUR_MS = 3600000
 local DONE = "data: [DONE]\n\n"
+local TRANSPORT_ERROR = "could not connect: connection refused"
 
 local spec = openai.provider()
 
@@ -416,6 +417,20 @@ t.case("failed_refresh_deletes_tokens_and_falls_back_to_the_api_key", function()
   t.eq(no_result, nil)
   t.eq(err.status, 400)
   t.eq(no_key_ctx.saved, nil)
+end)
+
+t.case("refresh_that_never_reached_the_server_keeps_the_tokens", function()
+  local saved = tokens({ expires = 0 })
+  local ctx, instance = prepared({ [KEY_ENV] = "sk-1" }, { id = "gpt-4.1" }, saved)
+  ctx.send = function(sent)
+    ctx.requests[#ctx.requests + 1] = sent
+    return nil, TRANSPORT_ERROR
+  end
+  local result, err = instance.stream(ctx, request("gpt-4.1"), t.recorder())
+  t.eq(result, nil)
+  t.has(tostring(err), TRANSPORT_ERROR)
+  t.eq(#ctx.requests, 1)
+  t.eq(ctx.saved, saved)
 end)
 
 t.case("device_login_polls_at_the_server_interval_and_saves_tokens", function()

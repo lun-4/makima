@@ -488,7 +488,7 @@ mod tests {
         entries: &[(&str, Option<f64>)],
     ) -> Option<f64> {
         let mut current = model(CURRENT, INPUT_RATE);
-        current.supports_fast_override = Some(FastSupport::Supported);
+        current.fast_support = Some(FastSupport::Supported);
         current.pricing.fast = Some(FastPricing {
             input: FAST_INPUT_RATE,
             output: 0.0,
