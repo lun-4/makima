@@ -102,6 +102,7 @@ peach        = "#ffb08a"
 amber        = "#e8b06a"
 current_line = "#241818"
 selection    = "#331d1d"
+mode_plan    = "#b98bdb"
 
 [ui]
 user_bg            = { bg = "current_line" }
