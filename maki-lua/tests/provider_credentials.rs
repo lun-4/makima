@@ -14,11 +14,8 @@ use maki_providers::{
     ContentBlock, Invocation, InvocationPurpose, PreparedProvider, RequestOptions,
 };
 use maki_storage::StateDir;
-use maki_storage::auth::{
-    OAuthTokens, ProviderCredentials, load_credentials, load_provider_credentials, load_tokens,
-    lock_tokens, save_provider_credentials, save_tokens,
-};
-use serde_json::json;
+use maki_storage::auth::{load_credentials, lock_tokens, save_credentials};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use test_case::test_case;
 
@@ -271,13 +268,12 @@ fn serve() -> Server {
     }
 }
 
-fn tokens(access: &str) -> OAuthTokens {
-    OAuthTokens {
-        access: access.into(),
-        refresh: REFRESH.into(),
-        expires: EXPIRES,
-        account_id: None,
-    }
+fn tokens(access: &str) -> Value {
+    json!({ "access": access, "refresh": REFRESH, "expires": EXPIRES })
+}
+
+fn stored_access(dir: &StateDir) -> Value {
+    load_credentials(dir, PROVIDER).unwrap()["access"].clone()
 }
 
 #[test_case(Shape::ApiKey ; "api_key")]
@@ -288,30 +284,23 @@ fn credentials_use_existing_file_formats(shape: Shape) {
     match shape {
         Shape::ApiKey => {
             assert_eq!(fixture.run("write_api_key"), "true");
-            let saved = load_provider_credentials(&dir, PROVIDER).unwrap();
-            assert_eq!(saved.api_key, API_KEY);
-            assert_eq!(saved.host.as_deref(), Some(HOST));
-            let other = ProviderCredentials {
-                api_key: OTHER_API_KEY.into(),
-                host: None,
-            };
-            save_provider_credentials(&dir, PROVIDER, &other).unwrap();
             assert_eq!(
-                serde_json::from_str::<serde_json::Value>(&fixture.run("read")).unwrap(),
+                load_credentials(&dir, PROVIDER),
+                Some(json!({ "api_key": API_KEY, "host": HOST }))
+            );
+            save_credentials(&dir, PROVIDER, &json!({ "api_key": OTHER_API_KEY })).unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&fixture.run("read")).unwrap(),
                 json!({ "api_key": OTHER_API_KEY })
             );
         }
         Shape::OAuth => {
             assert_eq!(fixture.run("write_oauth"), "true");
-            let saved = load_tokens(&dir, PROVIDER).unwrap();
+            assert_eq!(load_credentials(&dir, PROVIDER), Some(tokens(ACCESS)));
+            save_credentials(&dir, PROVIDER, &tokens(OTHER_ACCESS)).unwrap();
             assert_eq!(
-                (saved.access.as_str(), saved.refresh.as_str(), saved.expires),
-                (ACCESS, REFRESH, EXPIRES)
-            );
-            save_tokens(&dir, PROVIDER, &tokens(OTHER_ACCESS)).unwrap();
-            assert_eq!(
-                serde_json::from_str::<serde_json::Value>(&fixture.run("read")).unwrap(),
-                json!({ "access": OTHER_ACCESS, "refresh": REFRESH, "expires": EXPIRES })
+                serde_json::from_str::<Value>(&fixture.run("read")).unwrap(),
+                tokens(OTHER_ACCESS)
             );
         }
     }
@@ -324,18 +313,18 @@ fn refresh_skips_when_reread_under_lock_is_already_fresh() {
     let server = serve();
     let fixture = Fixture::new(&server.url);
     let dir = fixture.dir();
-    save_tokens(&dir, PROVIDER, &tokens(STALE)).unwrap();
+    save_credentials(&dir, PROVIDER, &tokens(STALE)).unwrap();
     let lock = lock_tokens(&dir, PROVIDER).unwrap();
     let result = thread::scope(|scope| {
         let refresh = scope.spawn(|| fixture.run("reread"));
         server.requests.recv_timeout(BOUND).unwrap();
         server.replies.send(String::new()).unwrap();
-        save_tokens(&dir, PROVIDER, &tokens(FRESH)).unwrap();
+        save_credentials(&dir, PROVIDER, &tokens(FRESH)).unwrap();
         drop(lock);
         refresh.join().unwrap()
     });
     assert_eq!(result, FRESH);
-    assert_eq!(load_tokens(&dir, PROVIDER).unwrap().access, FRESH);
+    assert_eq!(stored_access(&dir), FRESH);
 }
 
 #[test]
@@ -343,10 +332,7 @@ fn concurrent_refreshes_share_one_call() {
     let fixture = Fixture::new("");
     let expected = format!("1,{REFRESHED}1,{REFRESHED}1");
     assert_eq!(fixture.run("share"), expected);
-    assert_eq!(
-        load_tokens(&fixture.dir(), PROVIDER).unwrap().access,
-        format!("{REFRESHED}1")
-    );
+    assert_eq!(stored_access(&fixture.dir()), format!("{REFRESHED}1"));
 }
 
 #[test]
@@ -364,10 +350,7 @@ fn cancelled_caller_still_writes_refreshed_token() {
     server.replies.send(rotated.to_string()).unwrap();
 
     assert_eq!(fixture.run("stored"), ROTATED);
-    assert_eq!(
-        load_tokens(&fixture.dir(), PROVIDER).unwrap().access,
-        ROTATED
-    );
+    assert_eq!(stored_access(&fixture.dir()), ROTATED);
 }
 
 #[test]

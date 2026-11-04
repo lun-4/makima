@@ -6,7 +6,7 @@ use std::sync::Arc;
 use futures::future::join_all;
 use maki_config::providers::ProvidersConfig;
 use maki_storage::StateDir;
-use maki_storage::auth::{delete_provider_credentials, load_credentials, save_credentials};
+use maki_storage::auth::{delete_credentials, load_credentials, save_credentials};
 use maki_storage::model::persist_model;
 use serde::Deserialize;
 use serde_json::Value;
@@ -350,7 +350,7 @@ async fn status_of(
 fn restore(storage: &StateDir, id: &str, snapshot: Option<Value>) {
     let restored = match snapshot {
         Some(value) => save_credentials(storage, id, &value),
-        None => delete_provider_credentials(storage, id).map(drop),
+        None => delete_credentials(storage, id).map(drop),
     };
     if let Err(error) = restored {
         warn!(provider = id, %error, "credentials not restored after failed login");
@@ -403,8 +403,7 @@ pub async fn logout(
     match entry.backend.logout() {
         Some(logout) => logout.await?,
         None => {
-            delete_provider_credentials(storage, id)
-                .map_err(|error| config_error(error.to_string()))?;
+            delete_credentials(storage, id).map_err(|error| config_error(error.to_string()))?;
         }
     }
     let mut providers = ProvidersConfig::try_load().map_err(config_error)?;

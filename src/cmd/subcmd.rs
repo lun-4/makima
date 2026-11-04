@@ -458,10 +458,9 @@ mod tests {
     use super::*;
     use maki_lua::test_support::InMemoryFs;
     use maki_providers::login::ChoiceOption;
-    use maki_storage::auth::{
-        ProviderCredentials, load_provider_credentials, save_provider_credentials,
-    };
+    use maki_storage::auth::{load_credentials, save_credentials};
     use maki_storage::sessions::SessionSummary;
+    use serde_json::json;
     use std::collections::BTreeSet;
     use std::io::Cursor;
     use tempfile::TempDir;
@@ -538,11 +537,7 @@ mod tests {
         .unwrap();
         host.load_source("fake_plugin", SOURCE).unwrap();
         let registry = host.provider_registry(Timeouts::default()).unwrap();
-        let credentials = ProviderCredentials {
-            api_key: KEY.into(),
-            host: None,
-        };
-        save_provider_credentials(&storage, PROVIDER, &credentials).unwrap();
+        save_credentials(&storage, PROVIDER, &json!({ "api_key": KEY })).unwrap();
         let status = || {
             smol::block_on(login::auth_status(&registry, &storage))
                 .iter()
@@ -554,7 +549,7 @@ mod tests {
 
         auth_logout(PROVIDER, &storage, &registry).unwrap();
 
-        assert!(load_provider_credentials(&storage, PROVIDER).is_none());
+        assert!(load_credentials(&storage, PROVIDER).is_none());
         assert!(status().contains(MISSING_MARK));
     }
 

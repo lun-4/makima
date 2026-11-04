@@ -104,6 +104,8 @@ enum StepAction {
     Close,
 }
 
+type Browser = Box<dyn Fn(&str) -> io::Result<()> + Send>;
+
 pub struct LoginPicker {
     step: Step,
     providers: Arc<ProviderRegistry>,
@@ -111,8 +113,8 @@ pub struct LoginPicker {
     login: Option<LoginTask>,
     /// Notices from the provider's login, shown until the picker closes.
     notes: Vec<String>,
-    /// Opens a URL in the user's browser; tests swap in one that does not.
-    browser: fn(&str) -> io::Result<()>,
+    /// Opens a URL in the user's browser; tests swap in one that records it.
+    browser: Browser,
 }
 
 fn open_in_browser(url: &str) -> io::Result<()> {
@@ -133,7 +135,7 @@ impl LoginPicker {
             storage,
             login: None,
             notes: Vec::new(),
-            browser: open_in_browser,
+            browser: Box::new(open_in_browser),
         }
     }
 
@@ -410,8 +412,9 @@ mod tests {
     use maki_lua::PluginHost;
     use maki_lua::test_support::InMemoryFs;
     use maki_lua::ui_sink::HostUi;
-    use maki_storage::auth::load_provider_credentials;
+    use maki_storage::auth::load_credentials;
     use maki_storage::model::read_model;
+    use serde_json::json;
     use tempfile::TempDir;
 
     use super::*;
@@ -426,6 +429,9 @@ mod tests {
     const KEY: &str = "sk-from-tui";
     const MODEL_SPEC: &str = "deepseek/fake-2";
     const BOUND: Duration = Duration::from_secs(10);
+    const BROWSER_PROVIDER: &str = "browser-login";
+    const BROWSER_URL: &str = "https://keys.example.test/new";
+    const BROWSER_KEY: &str = "sk-from-browser";
 
     const SOURCE: &str = r#"
         maki.api.register_provider({
@@ -445,12 +451,25 @@ mod tests {
                 end },
             },
         })
+        maki.api.register_provider({
+            id = "browser-login",
+            display_name = "Browser Login",
+            prepare = function() return {} end,
+            auth = {
+                { id = "browser", label = "Browser", login = function(ctx, ui)
+                    assert(ui:open_browser("https://keys.example.test/new"))
+                    assert(ctx.credentials:write({ api_key = "sk-from-browser" }))
+                    return true
+                end },
+            },
+        })
     "#;
 
     struct Fixture {
         _host: PluginHost,
         picker: LoginPicker,
         storage: StateDir,
+        opened: Receiver<String>,
         _state: TempDir,
     }
 
@@ -473,13 +492,18 @@ mod tests {
                 .provider_registry(maki_providers::Timeouts::default())
                 .unwrap();
             let storage = StateDir::from_path(state.path().to_path_buf());
+            let (opened_tx, opened) = flume::unbounded();
             Self {
                 picker: LoginPicker {
-                    browser: no_browser,
+                    browser: Box::new(move |url| {
+                        let _ = opened_tx.send(url.to_owned());
+                        Ok(())
+                    }),
                     ..LoginPicker::new(registry, storage.clone())
                 },
                 _host: host,
                 storage,
+                opened,
                 _state: state,
             }
         }
@@ -489,6 +513,14 @@ mod tests {
             let login = self.picker.login.as_ref().expect("login running");
             let event = login.events.recv_timeout(BOUND).expect("login event");
             self.picker.handle_event(event)
+        }
+
+        fn choose(&mut self, id: &str) {
+            let Step::Choice { picker, .. } = &mut self.picker.step else {
+                panic!("expected a choice");
+            };
+            assert!(picker.select_item_by(|item| item.0.id == id));
+            self.picker.handle_key(key(KeyCode::Enter));
         }
 
         fn input(&self) -> (String, String, bool) {
@@ -502,10 +534,6 @@ mod tests {
                 _ => panic!("expected an input step"),
             }
         }
-    }
-
-    fn no_browser(_: &str) -> io::Result<()> {
-        Ok(())
     }
 
     fn ctrl(c: char) -> KeyEvent {
@@ -548,15 +576,42 @@ mod tests {
         assert!(
             matches!(&fixture.picker.step, Step::Done { message } if message.contains(DISPLAY_NAME))
         );
-        let saved = load_provider_credentials(&fixture.storage, PROVIDER).unwrap();
-        assert_eq!(saved.api_key, KEY);
-        assert_eq!(saved.host.as_deref(), Some(ANSWERED_URL));
+        assert_eq!(
+            load_credentials(&fixture.storage, PROVIDER),
+            Some(json!({ "api_key": KEY, "host": ANSWERED_URL }))
+        );
         let section = ProvidersConfig::try_load().unwrap();
         assert_eq!(
             section.get(PROVIDER).unwrap().0["base_url"].as_str(),
             Some(ANSWERED_URL)
         );
         assert_eq!(read_model(&fixture.storage).as_deref(), Some(MODEL_SPEC));
+    }
+
+    #[test]
+    fn login_opens_the_url_the_provider_named() {
+        let mut fixture = Fixture::new();
+        fixture.picker.open();
+        assert!(fixture.next_event().is_none());
+        fixture.choose(BROWSER_PROVIDER);
+
+        assert!(fixture.next_event().is_none());
+        assert_eq!(fixture.opened.try_recv().as_deref(), Ok(BROWSER_URL));
+        assert!(
+            fixture
+                .picker
+                .notes
+                .iter()
+                .any(|note| note.contains(BROWSER_URL))
+        );
+        assert!(matches!(
+            fixture.next_event(),
+            Some(LoginPickerAction::Configured { slug }) if slug == BROWSER_PROVIDER
+        ));
+        assert_eq!(
+            load_credentials(&fixture.storage, BROWSER_PROVIDER),
+            Some(json!({ "api_key": BROWSER_KEY }))
+        );
     }
 
     #[test]
@@ -579,6 +634,6 @@ mod tests {
             Some(LoginPickerAction::Close)
         ));
         assert!(!fixture.picker.is_open());
-        assert!(load_provider_credentials(&fixture.storage, PROVIDER).is_none());
+        assert!(load_credentials(&fixture.storage, PROVIDER).is_none());
     }
 }

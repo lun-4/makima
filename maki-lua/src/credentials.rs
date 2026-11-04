@@ -12,9 +12,7 @@ use futures_lite::future;
 use maki_agent::cancel::CancelToken;
 use maki_lua_macro::{lua_class, lua_fn};
 use maki_storage::StateDir;
-use maki_storage::auth::{
-    delete_provider_credentials, load_credentials, lock_tokens, save_credentials,
-};
+use maki_storage::auth::{delete_credentials, load_credentials, lock_tokens, save_credentials};
 use mlua::{
     Function, Lua, LuaSerdeExt, MultiValue, Result as LuaResult, UserDataRef, Value as LuaValue,
 };
@@ -88,9 +86,7 @@ async fn write(lua: Lua, this: UserDataRef<Credentials>, value: LuaValue) -> Lua
 #[lua_fn]
 async fn delete(lua: Lua, this: UserDataRef<Credentials>) -> LuaResult<Pair<bool>> {
     let (dir, id) = try_pair!(location(&lua, &this));
-    Ok(pair(
-        unblock(move || delete_provider_credentials(&dir, &id)).await,
-    ))
+    Ok(pair(unblock(move || delete_credentials(&dir, &id)).await))
 }
 
 /// Refresh the stored credentials as one transaction. {fn}`(current)` runs

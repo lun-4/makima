@@ -17,9 +17,8 @@ use maki_providers::login::{
 use maki_providers::provider::BoxFuture;
 use maki_providers::{AgentError, ProviderRegistry};
 use maki_storage::StateDir;
-use maki_storage::auth::{
-    ProviderCredentials, load_provider_credentials, save_provider_credentials,
-};
+use maki_storage::auth::{load_credentials, save_credentials};
+use serde_json::json;
 use tempfile::TempDir;
 
 const PLUGIN: &str = "fake_plugin";
@@ -218,9 +217,10 @@ fn drive_login_through_lua_provider() {
         }
     );
     assert_eq!(asked.len(), 3);
-    let saved = load_provider_credentials(&fixture.storage, PROVIDER).unwrap();
-    assert_eq!(saved.api_key, KEY);
-    assert_eq!(saved.host.as_deref(), Some(ANSWERED_URL));
+    assert_eq!(
+        load_credentials(&fixture.storage, PROVIDER),
+        Some(json!({ "api_key": KEY, "host": ANSWERED_URL }))
+    );
     let section = ProvidersConfig::try_load().unwrap();
     assert_eq!(
         section.get(PROVIDER).unwrap().0["base_url"].as_str(),
@@ -254,8 +254,10 @@ fn login_suspends_on_interaction() {
 
     answers.send(KEY.into()).unwrap();
     login.join().unwrap().unwrap();
-    let saved = load_provider_credentials(&fixture.storage, PROVIDER).unwrap();
-    assert_eq!(saved.api_key, KEY);
+    assert_eq!(
+        load_credentials(&fixture.storage, PROVIDER).unwrap()["api_key"],
+        KEY
+    );
 }
 
 #[test]
@@ -273,11 +275,7 @@ fn cancelled_interaction_maps_to_cancelled() {
 #[test]
 fn default_auth_status_and_logout_use_credentials_file() {
     let fixture = Fixture::new();
-    let credentials = ProviderCredentials {
-        api_key: KEY.into(),
-        host: None,
-    };
-    save_provider_credentials(&fixture.storage, PROVIDER, &credentials).unwrap();
+    save_credentials(&fixture.storage, PROVIDER, &json!({ "api_key": KEY })).unwrap();
     let state_of = |id: &str| {
         fixture
             .states()
@@ -294,7 +292,7 @@ fn default_auth_status_and_logout_use_credentials_file() {
     )));
 
     assert_eq!(name.unwrap().as_deref(), Some(DISPLAY_NAME));
-    assert!(load_provider_credentials(&fixture.storage, PROVIDER).is_none());
+    assert!(load_credentials(&fixture.storage, PROVIDER).is_none());
     assert_eq!(state_of(PROVIDER), Some(AuthState::Missing));
 }
 
@@ -334,8 +332,10 @@ fn bundled_provider_logs_in_with_its_plan() {
         asks[2],
         InteractionRequest::Input { secret: true, .. }
     ));
-    let saved = load_provider_credentials(&fixture.storage, PLAN_PROVIDER).unwrap();
-    assert_eq!(saved.api_key, BUNDLED_KEY);
+    assert_eq!(
+        load_credentials(&fixture.storage, PLAN_PROVIDER).unwrap()["api_key"],
+        BUNDLED_KEY
+    );
     let config = ProvidersConfig::try_load().unwrap();
     assert_eq!(
         config.get(PLAN_PROVIDER).unwrap().0["plan"].as_str(),
