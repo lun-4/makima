@@ -97,6 +97,9 @@ const SCRIPTS: &str = r#"
         stored = function(ctx)
             return token(ctx.credentials:refresh(function() return nil end))
         end,
+        empty = function(ctx)
+            return token(ctx.credentials:refresh(function() return nil end))
+        end,
         fail = function(ctx)
             local calls = 0
             local function attempt()
@@ -376,6 +379,15 @@ fn cancelled_caller_still_writes_refreshed_token() {
 
     assert_eq!(fixture.run("stored"), ROTATED);
     assert_eq!(stored_access(&fixture.dir()), ROTATED);
+}
+
+#[test]
+fn nil_refresh_without_stored_credentials_returns_an_error() {
+    let fixture = Fixture::new("");
+    assert_eq!(
+        fixture.run("empty"),
+        "refresh returned nil with no stored credentials"
+    );
 }
 
 #[test]

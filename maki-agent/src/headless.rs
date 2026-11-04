@@ -22,10 +22,10 @@ use crate::actor::{
     PreparedModel, PreparedReadiness, TurnAdmissionOptions, TurnOrigin, TurnProvenance,
 };
 use crate::agent::isolated_turn::IsolatedTurnEvent;
-use crate::agent::streaming::end_conversation_detached;
 use crate::agent::{self, History, PromptSlotSource, TurnSetup};
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::config_change::{ConfigChangeError, unresolved_model};
+use crate::end_conversation_detached;
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
 use crate::session_coordinator::{ModelPreparer, SessionCoordinatorHandle};

@@ -69,14 +69,16 @@ end
 function M.convert_tools(tools)
   local out = {}
   for _, tool in ipairs(tools or {}) do
-    local schema = tool.input_schema
-    if type(schema) ~= "table" or codec.is_array(schema) then
-      schema = { type = "object", properties = {} }
+    if type(tool.description) == "string" and tool.description:match("%S") then
+      local schema = tool.input_schema
+      if type(schema) ~= "table" or codec.is_array(schema) then
+        schema = { type = "object", properties = {} }
+      end
+      out[#out + 1] = {
+        type = "function",
+        ["function"] = { name = tool.name, description = tool.description, parameters = schema },
+      }
     end
-    out[#out + 1] = {
-      type = "function",
-      ["function"] = { name = tool.name, description = tool.description, parameters = schema },
-    }
   end
   return out
 end

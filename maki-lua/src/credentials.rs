@@ -23,6 +23,8 @@ use crate::api::util::pair::{Pair, pair, try_pair};
 use crate::provider::{HOST_STOPPED, ProviderJob, serialize_options};
 use crate::runtime::{Request, RequestTx, strip_traceback};
 
+const EMPTY_REFRESH: &str = "refresh returned nil with no stored credentials";
+
 /// The error is what the refresh function returned, a string or a table such
 /// as `{ status, message, retry_after }`, handed back to every caller as is.
 type RefreshResult = Result<Option<Value>, Value>;
@@ -207,7 +209,9 @@ async fn run_refresh(lua: &Lua, id: &Arc<str>, refresh: Function) -> RefreshResu
                 .from_value(error.clone())
                 .unwrap_or_else(|_| error.type_name().into()));
         }
-        (None | Some(LuaValue::Nil), _) => return Ok(current),
+        (None | Some(LuaValue::Nil), _) => {
+            return current.map_or_else(|| Err(EMPTY_REFRESH.into()), |value| Ok(Some(value)));
+        }
         (Some(value), _) => lua
             .from_value(value.clone())
             .map_err(|error| error.to_string())?,

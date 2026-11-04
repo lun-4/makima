@@ -34,7 +34,10 @@ t.case("build_request", function()
         },
       },
     },
-    tools = { { name = "search", description = "find", input_schema = maki.json.decode('["x"]') } },
+    tools = {
+      { name = "search", description = "find", input_schema = maki.json.decode('["x"]') },
+      { name = "hidden", input_schema = { type = "object" } },
+    },
   }, { max_tokens_field = "max_completion_tokens", include_stream_usage = true })
   t.same(body, {
     model = "m",

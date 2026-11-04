@@ -295,7 +295,7 @@ local function create(ui)
   end
   ui:instructions(
     string.format(
-      "Added %s. Restart maki, then set %s or run `maki auth login %s`; use it as %s/<model>.",
+      "Added %s. Restart makima, then set %s or run `makima auth login %s`; use it as %s/<model>.",
       id,
       env,
       id,
@@ -329,7 +329,7 @@ function M.creator(notes)
       return { state = created and "configured" or "missing" }
     end,
     prepare = function()
-      return nil, http.config_error("`custom` only adds providers; run `maki auth login custom`")
+      return nil, http.config_error("`custom` only adds providers; run `makima auth login custom`")
     end,
   }
 end

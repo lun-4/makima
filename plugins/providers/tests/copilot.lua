@@ -316,6 +316,16 @@ t.case("discovery_keeps_enabled_chat_models_default_first", function()
   end)
 end)
 
+t.case("discovery_reports_credential_read_errors", function()
+  local ctx = t.provider_ctx({})
+  ctx.credentials.read = function()
+    return nil, "credentials unavailable"
+  end
+  local models, err = spec.discover(ctx, {})
+  t.eq(models, nil)
+  t.eq(err, "credentials unavailable")
+end)
+
 t.case("import_reads_config_files_then_the_keyring", function()
   t.same(
     copilot.import(

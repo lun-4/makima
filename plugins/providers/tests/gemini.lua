@@ -65,6 +65,7 @@ t.case("build_request", function()
         input_schema = { type = "object", additionalProperties = false, properties = { p = { type = "string" } } },
       },
       { name = "noop", description = "n", input_schema = { type = "object", properties = {} } },
+      { name = "hidden", input_schema = { type = "object", properties = {} } },
     },
   })
   t.same(body, {
@@ -80,6 +81,7 @@ t.case("build_request", function()
             parameters = { type = "object", properties = { p = { type = "string" } } },
           },
           { name = "noop", description = "n" },
+          { name = "hidden", description = "" },
         },
       },
     },
@@ -155,6 +157,7 @@ t.case("tool_results_are_always_objects_and_unknown_names_fall_back", function()
   t.same(response("not json"), { name = "unknown", response = { result = "not json" } })
   t.same(response('"a json string"').response, { result = "a json string" })
   t.same(response("42").response, { result = 42 })
+  t.same(response("null").response, { result = "null" })
   t.same(response("[1]").response, { result = { 1 } })
   t.same(response('{"out":"ok"}').response, { out = "ok" })
 end)

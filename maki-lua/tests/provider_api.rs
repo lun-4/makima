@@ -213,6 +213,7 @@ fn text(message: &Message) -> &str {
 #[test_case(r#"auth = { { id = "k", label = "K", login = print }, { id = "k", label = "K", login = print } },"# , DUPLICATE_METHOD_ERR ; "duplicate method")]
 #[test_case(r#"auth = { { id = "k", label = "K", login = print } }, aliases = { { id = "a", label = "A", method = "x" } },"# , UNKNOWN_METHOD_ERR ; "alias naming unknown method")]
 #[test_case(r#"auth = { { id = "k", label = "K", login = print } }, aliases = { { id = "a/b", label = "A", method = "k" } },"# , BAD_ALIAS_ERR ; "alias with bad id")]
+#[test_case(r#"auth = { { id = "k", label = "K", login = print } }, aliases = { { id = "fake", label = "Fake", method = "k" } },"# , BAD_ALIAS_ERR ; "alias equal to provider id")]
 #[test_case(r#"docs = { env = "KEY" },"# , INVALID_TYPE_ERR ; "docs env not a list")]
 #[test_case(r#"auth_status = 1,"# , EXPECTED_FUNCTION_ERR ; "auth_status of wrong type")]
 fn invalid_spec_fields_are_rejected(extra: &str, expected: &str) {
@@ -272,6 +273,18 @@ fn duplicate_id_names_both_plugins_and_unload_frees_it() {
         registry(&host).display_name(PROVIDER).as_deref(),
         Some(DISPLAY_NAME)
     );
+}
+
+#[test]
+fn duplicate_id_in_one_plugin_names_the_plugin_once() {
+    let host = host();
+    let source = spec_source(PROVIDER, "", ECHO_INSTANCE).repeat(2);
+    let error = host.load_source(PLUGIN, &source).unwrap_err().to_string();
+    assert!(
+        error.contains("already registered by plugin \"fake_plugin\""),
+        "{error}"
+    );
+    assert!(!error.contains("from plugin"), "{error}");
 }
 
 #[test]
@@ -586,6 +599,32 @@ fn optional_methods_dispatch_with_their_arguments() {
         .unwrap()
         .unwrap();
     assert_eq!(usage.plan.as_deref(), Some(CALL_LOG));
+}
+
+#[test]
+fn provider_config_is_nonfatal_after_startup() {
+    let state = tempfile::tempdir().unwrap();
+    maki_storage::paths::init_at(state.path().to_path_buf()).unwrap();
+    let host = host();
+    host.load_source(
+        PLUGIN,
+        &spec_source(
+            PROVIDER,
+            "discover = function() local config = maki.api.provider_config('fake') or {}; return config.models or {} end,",
+            "return {}",
+        ),
+    )
+    .unwrap();
+    std::fs::write(state.path().join("providers.toml"), "[broken\n").unwrap();
+    let providers = registry(&host);
+
+    let mut batches = Vec::new();
+    smol::block_on(bounded(providers.fetch_all(
+        &Default::default(),
+        false,
+        |batch| batches.extend(batch.models),
+    )));
+    assert!(batches.is_empty());
 }
 
 #[test]

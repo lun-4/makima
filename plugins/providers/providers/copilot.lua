@@ -12,7 +12,7 @@ local thinking = require("providers.thinking")
 local M = {}
 
 M.DEFAULT_ENDPOINT = "https://api.githubcopilot.com"
-M.NOT_AUTHENTICATED = "not authenticated, run `maki auth login copilot` or set GH_COPILOT_TOKEN"
+M.NOT_AUTHENTICATED = "not authenticated, run `makima auth login copilot` or set GH_COPILOT_TOKEN"
 M.NOT_FOUND =
   "Copilot token not found. Run `gh auth login --web`, sign in with the Copilot client, or set GH_COPILOT_TOKEN."
 M.ALREADY_AUTHENTICATED = "Already authenticated with Copilot."
@@ -533,8 +533,11 @@ function M.provider()
       if not state then
         return nil, err
       end
-      local auth = connect(ctx, state)
+      local auth, auth_err = connect(ctx, state)
       if not auth then
+        if auth_err and http.message(auth_err) ~= M.NOT_AUTHENTICATED then
+          return nil, auth_err
+        end
         return compat.descriptors(M.def)
       end
       local models, list_err = list(ctx, state, auth)

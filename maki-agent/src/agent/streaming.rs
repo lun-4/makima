@@ -45,7 +45,7 @@ impl Conversation {
 
 /// Best effort: never delays the caller, never retried, bounded by
 /// [`END_CONVERSATION_TIMEOUT`].
-pub(crate) fn end_conversation_detached(
+pub fn end_conversation_detached(
     provider: &Arc<dyn Provider>,
     conversation_id: Arc<str>,
     reason: ConversationEnd,

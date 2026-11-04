@@ -30,7 +30,7 @@ const TITLE: &str = " Login ";
 const WAITING_MESSAGE: &str = "Waiting... (Esc to cancel)";
 const SECRET_MASK: &str = "*";
 const NO_TERMINAL_ERR: &str =
-    "this login runs a program on the terminal; run `maki auth login` in a shell";
+    "this login runs a program on the terminal; run `makima auth login` in a shell";
 
 struct ChoiceItem(ChoiceOption);
 
@@ -196,6 +196,9 @@ impl LoginPicker {
                     }
                     InteractionRequest::Choice { prompt, options } => {
                         let mut picker = ListPicker::new();
+                        if !self.notes.is_empty() {
+                            picker = picker.with_footer_line(Line::from(self.notes.join(" · ")));
+                        }
                         picker.open(
                             options.into_iter().map(ChoiceItem).collect(),
                             format!(" {prompt} "),

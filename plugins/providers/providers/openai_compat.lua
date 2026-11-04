@@ -189,13 +189,13 @@ end
 -- Keys, base URL and headers for one provider, resolved from `providers.toml`
 -- {config}. Nil plus an error without a key or with an unset header variable.
 function M.client(ctx, def, config)
+  local configured, header_err = http.headers(def.id, {}, config.headers)
+  if not configured then
+    return nil, header_err, true
+  end
   local keys, err = http.api_keys(ctx, config, def.env)
   if not keys then
     return nil, err
-  end
-  local configured, header_err = http.headers(def.id, {}, config.headers)
-  if not configured then
-    return nil, header_err
   end
   local client = { base = M.base_url(def, config), pool = http.key_pool(keys) }
   -- {extra} plus the key, with configured headers replacing any of them.
@@ -357,8 +357,11 @@ function M.provider(def)
 
   local list = def.list_models or M.list_models(def)
   function spec.discover(ctx, config)
-    local client = M.client(ctx, def, config)
+    local client, err, setup_error = M.client(ctx, def, config)
     if not client then
+      if setup_error then
+        return nil, err
+      end
       return M.descriptors(def)
     end
     local rows, err = list(ctx, client)

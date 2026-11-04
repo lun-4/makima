@@ -7,7 +7,7 @@ local KEY_ENV = "MY_PROXY_API_KEY"
 local BASE = "https://llm.example.invalid/v1"
 local DONE = "data: [DONE]\n\n"
 local CREATED_NOTE =
-  "Added my-proxy. Restart maki, then set MY_PROXY_API_KEY or run `maki auth login my-proxy`; use it as my-proxy/<model>."
+  "Added my-proxy. Restart makima, then set MY_PROXY_API_KEY or run `makima auth login my-proxy`; use it as my-proxy/<model>."
 
 local function section(overrides)
   local result = {

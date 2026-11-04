@@ -1314,9 +1314,10 @@ maki.api.provider_config({id?})
 
 Read `providers.toml`: the section of provider {id}, or every section by
 provider id when {id} is nil. The file is read at each call, so a section
-saved earlier in the session is seen. A section has the fields a
-provider's `config` argument has. Use it for a setting another provider's
-section holds, or to register providers the file defines.
+saved earlier in the session is seen. A malformed file is logged and
+treated as empty because this API may run during an active session. A
+section has the fields a provider's `config` argument has. Use it for a
+setting another provider's section holds.
 
 Requires the `env` [plugin permission](#plugin-permissions).
 
@@ -1332,6 +1333,23 @@ Requires the `env` [plugin permission](#plugin-permissions).
 local opencode = maki.api.provider_config("opencode") or {}
 for id, section in pairs(maki.api.provider_config()) do print(id, section.protocol) end
 ```
+
+---
+
+### `maki.api.startup_provider_config()` {#maki-api-startup_provider_config}
+
+```lua
+maki.api.startup_provider_config()
+```
+
+Read every `providers.toml` section while registering providers. Unlike
+`provider_config`, malformed TOML is fatal so startup cannot silently
+continue with an empty provider registry. This function is only available
+while the calling plugin is loading.
+
+Requires the `env` [plugin permission](#plugin-permissions).
+
+**Returns:** table Sections by provider id.
 
 ---
 
@@ -4975,7 +4993,7 @@ LoginUi:run({argv})
 
 Run the program {argv} on the user's terminal, handing it input and
 output until it exits, for a login that is an interactive program. Only
-`maki auth login` has a terminal to hand over; the TUI fails this.
+`makima auth login` has a terminal to hand over; the TUI fails this.
 
 **Parameters:**
 

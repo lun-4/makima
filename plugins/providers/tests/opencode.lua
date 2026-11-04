@@ -14,7 +14,7 @@ local ROLLING_RESET_MS = 1787983276964
 local WEEKLY_RESET_MS = 1788134400964
 local MONTHLY_RESET_MS = 1789744986964
 local GATED_ERROR =
-  "provider 'opencode-go' has no API key; run `maki auth login opencode-go` or set providers.opencode.enable_free_models = true to use its free models"
+  "provider 'opencode-go' has no API key; run `makima auth login opencode-go` or set providers.opencode.enable_free_models = true to use its free models"
 
 -- What `[opencode]` holds, which Go reads `enable_free_models` from.
 local zen_section = {}
@@ -170,9 +170,18 @@ t.case("zen_sends_catalog_prefixed_models_to_that_provider", function()
   t.eq(req.headers.Authorization, "Bearer n")
   t.eq(req.headers[opencode.SESSION_HEADER], nil)
   t.eq(maki.json.decode(req.body).model, "openai/gpt-oss-120b")
-  local saved_ctx, saved_instance = prepare(opencode.ZEN, "nvidia/openai/gpt-oss-120b", {}, {}, nil, { api_key = "n" })
-  assert(saved_instance.stream(saved_ctx, request("nvidia/openai/gpt-oss-120b"), t.recorder()))
-  t.eq(saved_ctx.requests[1].headers.Authorization, "Bearer n")
+  local saved_ctx, saved_instance, saved_err = prepare(
+    opencode.ZEN,
+    "nvidia/openai/gpt-oss-120b",
+    {},
+    {},
+    nil,
+    { api_key = "opencode-secret" }
+  )
+  t.eq(saved_instance, nil)
+  t.eq(saved_err.kind, http.CONFIG_KIND)
+  t.eq(#saved_ctx.requests, 0)
+  assert(saved_err.message:find("NVIDIA_API_KEY not set", 1, true))
 end)
 
 t.case("own_prefix_names_the_own_model", function()

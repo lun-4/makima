@@ -74,6 +74,27 @@ function M.classify_stream(instance)
   end
 end
 
+local function env_keys(env_var)
+  local keys = {}
+  for part in (maki.uv.os_getenv(env_var) or ""):gmatch("[^,]+") do
+    local key = trim(part)
+    if key ~= "" then
+      keys[#keys + 1] = key
+    end
+  end
+  return #keys > 0 and keys or nil
+end
+
+-- Read a comma-separated key pool from {env_var}, with no credential fallback.
+function M.env_api_keys(ctx, env_var)
+  local keys = env_var and env_keys(env_var)
+  if keys then
+    return keys, "env"
+  end
+  local missing = env_var and env_var .. " not set" or "no API key environment variable"
+  return nil, M.config_error(string.format("%s for '%s'; run `makima auth login %s`", missing, ctx.id, ctx.id))
+end
+
 -- Keys in precedence order: {env_var} (or `config.api_key_env`) as a
 -- comma-separated pool, then the saved `api_key`, then `config.api_key`. An
 -- empty variable counts as unset. Returns the keys and their source (`env`,
@@ -81,17 +102,9 @@ end
 -- a config error that says how to log in.
 function M.api_keys(ctx, config, env_var)
   env_var = config.api_key_env or env_var
-  if env_var then
-    local keys = {}
-    for part in (maki.uv.os_getenv(env_var) or ""):gmatch("[^,]+") do
-      local key = trim(part)
-      if key ~= "" then
-        keys[#keys + 1] = key
-      end
-    end
-    if #keys > 0 then
-      return keys, "env"
-    end
+  local keys = env_var and env_keys(env_var)
+  if keys then
+    return keys, "env"
   end
   local saved, err = ctx.credentials:read()
   if saved and type(saved.api_key) == "string" and saved.api_key ~= "" then
@@ -104,7 +117,7 @@ function M.api_keys(ctx, config, env_var)
     return nil, err
   end
   local missing = env_var and env_var .. " not set and no saved credentials" or "no saved credentials"
-  return nil, M.config_error(string.format("%s for '%s'; run `maki auth login %s`", missing, ctx.id, ctx.id))
+  return nil, M.config_error(string.format("%s for '%s'; run `makima auth login %s`", missing, ctx.id, ctx.id))
 end
 
 -- Round-robin over {keys}, for an instance's `key_count` and `rotate_key`.

@@ -9,8 +9,7 @@ use super::{
     ActorError, ActorIdleGuard, ActorLifecycle, AgentActorHandle, PreparedCommit,
     PreparedOperationTicket, PreparedTransaction,
 };
-use crate::agent::streaming::end_conversation_detached;
-use crate::{AgentId, History};
+use crate::{AgentId, History, end_conversation_detached};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryBoundary {

@@ -339,9 +339,11 @@ fn register_provider(
                 .map(|spec| Arc::clone(&spec.plugin))
         });
     if let Some(owner) = owner {
+        let origin = (*owner != *plugin).then(|| format!(" from plugin {plugin:?}"));
         return Err(spec_error(format!(
-            "provider {:?} from plugin {plugin:?} is already registered by plugin {owner:?}",
-            fields.id
+            "provider {:?}{} is already registered by plugin {owner:?}",
+            fields.id,
+            origin.as_deref().unwrap_or_default()
         )));
     }
     for alias in &auth.aliases {
@@ -358,9 +360,11 @@ fn register_provider(
                     .map(|spec| Arc::clone(&spec.plugin))
             });
         if let Some(owner) = owner {
+            let origin = (*owner != *plugin).then(|| format!(" from plugin {plugin:?}"));
             return Err(spec_error(format!(
-                "alias {:?} from plugin {plugin:?} is already registered by plugin {owner:?}",
-                alias.id
+                "alias {:?}{} is already registered by plugin {owner:?}",
+                alias.id,
+                origin.as_deref().unwrap_or_default()
             )));
         }
     }
@@ -383,9 +387,10 @@ fn register_provider(
 
 /// Read `providers.toml`: the section of provider {id}, or every section by
 /// provider id when {id} is nil. The file is read at each call, so a section
-/// saved earlier in the session is seen. A section has the fields a
-/// provider's `config` argument has. Use it for a setting another provider's
-/// section holds, or to register providers the file defines.
+/// saved earlier in the session is seen. A malformed file is logged and
+/// treated as empty because this API may run during an active session. A
+/// section has the fields a provider's `config` argument has. Use it for a
+/// setting another provider's section holds.
 ///
 /// @param id string? Provider id.
 /// @return (table?) The section, nil when there is none, or every section.
@@ -394,13 +399,25 @@ fn register_provider(
 /// for id, section in pairs(maki.api.provider_config()) do print(id, section.protocol) end
 #[lua_fn(guard = Env)]
 fn provider_config(lua: &Lua, id: Option<String>) -> LuaResult<Value> {
-    let config = ProvidersConfig::load();
+    let config = ProvidersConfig::load_or_default();
     match id {
         Some(id) => config.get(&id).map_or(Ok(Value::Nil), |def| {
             lua.to_value_with(def, serialize_options())
         }),
         None => lua.to_value_with(&config.providers, serialize_options()),
     }
+}
+
+/// Read every `providers.toml` section while registering providers. Unlike
+/// `provider_config`, malformed TOML is fatal so startup cannot silently
+/// continue with an empty provider registry. This function is only available
+/// while the calling plugin is loading.
+///
+/// @return table Sections by provider id.
+#[lua_fn(guard = Env)]
+fn startup_provider_config(lua: &Lua, #[ctx] plugin: Arc<str>) -> LuaResult<Value> {
+    require_plugin_load(lua, &plugin, "startup_provider_config")?;
+    lua.to_value_with(&ProvidersConfig::load().providers, serialize_options())
 }
 
 /// Save {section} as provider {id}'s `providers.toml` section, replacing
@@ -433,6 +450,7 @@ lua_table! {
     ), DOCS [
         register_provider(pending, plugin, send),
         provider_config(perms),
+        startup_provider_config(perms, plugin),
         save_provider_config(perms),
     ]
 }

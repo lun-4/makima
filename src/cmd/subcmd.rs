@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -74,13 +74,18 @@ impl InteractionService for TerminalInteraction {
                 prompt,
                 secret: true,
                 default,
-            } = request
+            } = &request
+                && use_raw_secret_input(io::stdin().is_terminal())
             {
-                return terminal_secret_input(&prompt, default);
+                return terminal_secret_input(prompt, default.clone());
             }
             terminal_interact(request, &mut io::stdin().lock(), &mut io::stdout())
         }))
     }
+}
+
+fn use_raw_secret_input(stdin_is_terminal: bool) -> bool {
+    stdin_is_terminal
 }
 
 /// End of input counts as backing out.
@@ -588,6 +593,24 @@ mod tests {
         let shown = String::from_utf8(out).unwrap();
 
         assert_eq!(answer, KEY);
+        assert!(shown.contains(PROMPT));
+        assert!(!shown.contains(KEY));
+    }
+
+    #[test]
+    fn piped_secret_input_uses_line_input_without_echoing_default() {
+        let request = InteractionRequest::Input {
+            prompt: PROMPT.into(),
+            secret: true,
+            default: Some(KEY.into()),
+        };
+        let mut out = Vec::new();
+
+        assert!(!use_raw_secret_input(false));
+        let answer = terminal_interact(request, &mut Cursor::new("piped-key\n"), &mut out).unwrap();
+        let shown = String::from_utf8(out).unwrap();
+
+        assert_eq!(answer, "piped-key");
         assert!(shown.contains(PROMPT));
         assert!(!shown.contains(KEY));
     }

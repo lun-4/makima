@@ -125,7 +125,7 @@ async fn open_browser(_lua: Lua, this: UserDataRef<LoginUi>, url: String) -> Lua
 
 /// Run the program {argv} on the user's terminal, handing it input and
 /// output until it exits, for a login that is an interactive program. Only
-/// `maki auth login` has a terminal to hand over; the TUI fails this.
+/// `makima auth login` has a terminal to hand over; the TUI fails this.
 ///
 /// @param argv table The program and its arguments.
 /// @return (boolean?, string?) true once the program exited successfully, or nil plus an error.

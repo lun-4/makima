@@ -4,7 +4,7 @@ mod history;
 mod instructions;
 pub mod isolated_turn;
 mod run;
-pub(crate) mod streaming;
+mod streaming;
 pub mod tool_dispatch;
 
 pub use admission::{PROMPT_INPUTS_CLOSED, PROMPT_SLOTS_CLOSED, PromptSlotSource, TurnSetup};
@@ -22,3 +22,4 @@ pub use run::{
     RunSettings, SharedModel, TurnAdmissionSnapshot, TurnPromptInputs, estimate_message_tokens,
     resolve_compaction_model,
 };
+pub use streaming::end_conversation_detached;

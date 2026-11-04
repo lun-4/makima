@@ -71,7 +71,7 @@ register(custom.creator(executable.notes(bases) .. "\n\n" .. catalog.NOTES))
 -- Sections with a protocol, then scripts, each win over a models.dev
 -- provider of the same id but never over a built-in one. A built-in
 -- provider's section may name a protocol of its own.
-local sections = maki.api.provider_config()
+local sections = maki.api.startup_provider_config()
 local ids = {}
 for id, section in pairs(sections) do
   if section.protocol then

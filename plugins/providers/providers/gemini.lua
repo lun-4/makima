@@ -101,17 +101,20 @@ end
 function M.convert_tools(tools)
   local result = {}
   for _, tool in ipairs(tools or {}) do
-    local declaration = { name = tool.name, description = tool.description or "" }
-    local schema = tool.input_schema
-    if
-      type(schema) == "table"
-      and type(schema.properties) == "table"
-      and not codec.is_array(schema.properties)
-      and next(schema.properties) ~= nil
-    then
-      declaration.parameters = strip_additional_properties(schema)
+    if type(tool.name) == "string" then
+      local declaration =
+        { name = tool.name, description = type(tool.description) == "string" and tool.description or "" }
+      local schema = tool.input_schema
+      if
+        type(schema) == "table"
+        and type(schema.properties) == "table"
+        and not codec.is_array(schema.properties)
+        and next(schema.properties) ~= nil
+      then
+        declaration.parameters = strip_additional_properties(schema)
+      end
+      result[#result + 1] = declaration
     end
-    result[#result + 1] = declaration
   end
   return result
 end

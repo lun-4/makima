@@ -44,7 +44,7 @@ local LANES = {
 local function gated_error(id)
   return http.config_error(
     string.format(
-      "provider '%s' has no API key; run `maki auth login %s` or set providers.%s.enable_free_models = true to use its free models",
+      "provider '%s' has no API key; run `makima auth login %s` or set providers.%s.enable_free_models = true to use its free models",
       id,
       id,
       M.ZEN.id
@@ -99,10 +99,11 @@ function M.parse_usage(body)
   return { limits = limits }
 end
 
--- An instance for {model_id} of catalog provider {sub}, keyed from its own
--- variables only, since its saved credentials belong to it.
+-- An instance for {model_id} of catalog provider {sub}, keyed only from its
+-- environment. The Opencode context cannot access another provider's saved
+-- credentials and must never substitute its own.
 local function delegate(ctx, config, sub, entry, model_id)
-  local keys, key_err = catalog.api_keys(ctx, {}, entry)
+  local keys, key_err = http.env_api_keys({ id = sub }, catalog.env_name(entry.env or {}))
   if not keys then
     return nil, key_err
   end

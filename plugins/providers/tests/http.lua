@@ -3,7 +3,7 @@ local t = require("maki.test_helpers")
 
 local KEY_ENV = "TEST_API_KEY"
 local HEADER_ERROR = "provider 'test' header 'X-Gateway': environment variable 'GATEWAY' is unset or empty"
-local MISSING_KEY = "TEST_API_KEY not set and no saved credentials for 'test'; run `maki auth login test`"
+local MISSING_KEY = "TEST_API_KEY not set and no saved credentials for 'test'; run `makima auth login test`"
 
 t.case("api_keys_env_pool_wins", function()
   t.with_env({ [KEY_ENV] = " a , ,b " }, function()

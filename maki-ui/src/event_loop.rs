@@ -29,6 +29,7 @@ use maki_agent::command::CustomCommand;
 use maki_agent::config_change::{
     ConfigChangeError, ConfigChangeTicket, prepare_model, prepare_patch,
 };
+use maki_agent::end_conversation_detached;
 use maki_agent::headless::default_model_preparer;
 #[cfg(test)]
 use maki_agent::permissions::PermissionAnswer;
@@ -3457,9 +3458,11 @@ impl<'t> EventLoop<'t> {
             drop(held);
             if replaced_session {
                 if let Some((provider, conversation_id)) = ended_conversation {
-                    provider
-                        .end_conversation(&conversation_id, maki_providers::ConversationEnd::Closed)
-                        .await;
+                    end_conversation_detached(
+                        &provider,
+                        conversation_id,
+                        maki_providers::ConversationEnd::Closed,
+                    );
                 }
                 let _ = coordinator.close().await;
                 storage_writer.forget(retired_id);

@@ -65,7 +65,7 @@ const EVENT_STREAM_ENDED: &str = "session event stream ended";
 const ROOT_CONFIG_UNAVAILABLE: &str = "session root configuration is unavailable";
 const GRAPH_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const AUTH_FAILED_MSG: &str =
-    "Authentication failed. Run `maki auth login`, then send the prompt again.";
+    "Authentication failed. Run `makima auth login`, then send the prompt again.";
 
 /// Ids come from here and are never reused, so a late answer for a closed
 /// session cannot match a request of the session that replaced it.

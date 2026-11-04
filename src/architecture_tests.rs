@@ -217,9 +217,6 @@ fn rust_source_names_no_provider() {
     let roots: Vec<&str> = roots.iter().map(String::as_str).collect();
     let mut found = Vec::new();
     for source in production_sources(&roots).expect(SOURCE_SCAN_ERROR) {
-        if source.path.to_string_lossy().contains("test") {
-            continue;
-        }
         for value in &source.strings {
             if let Some(knowledge) = provider_knowledge(value, &hosts) {
                 found.push(format!(
@@ -290,7 +287,14 @@ fn rust_files(root: &Path) -> Result<Vec<PathBuf>, String> {
         } else if path.extension().is_some_and(|extension| extension == "rs")
             && path
                 .file_name()
-                .is_none_or(|name| name != "architecture_tests.rs")
+                .is_none_or(|name| name != "architecture_tests.rs" && name != "tests.rs")
+            && !path
+                .components()
+                .any(|component| component.as_os_str() == "tests")
+            && !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with("_tests.rs"))
         {
             files.push(path);
         }
@@ -384,14 +388,17 @@ fn attribute_is_test(attribute: &str) -> bool {
     match &attribute[..name_end] {
         "test" | "test_case" => true,
         "cfg" => attribute[name_end..]
-            .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-            .any(|predicate| predicate == "test"),
+            .trim()
+            .strip_prefix('(')
+            .and_then(|value| value.strip_suffix(")]"))
+            .is_some_and(|predicate| predicate.trim() == "test"),
         "cfg_attr" => attribute[name_end..]
-            .split_once(',')
-            .is_some_and(|(_, attributes)| {
-                attributes
-                    .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-                    .any(|attribute| matches!(attribute, "test" | "test_case"))
+            .trim()
+            .strip_prefix('(')
+            .and_then(|value| value.strip_suffix(")]"))
+            .and_then(|value| value.split_once(','))
+            .is_some_and(|(predicate, applied)| {
+                predicate.trim() == "test" && matches!(applied.trim(), "test" | "test_case")
             }),
         _ => false,
     }
@@ -411,6 +418,9 @@ fn terminal_identifier(node: Node<'_>, text: &[u8]) -> Option<String> {
 #[test_case::test_case("#[test_case(1)]\nfn test_only(_: u8) { \"provider/model\"; }", false ; "test_case")]
 #[test_case::test_case("#[cfg(test)]\nmod tests { fn test_only() { \"provider/model\"; } }", false ; "cfg_test")]
 #[test_case::test_case("#[cfg_attr(test, test)]\nfn test_only() { \"provider/model\"; }", false ; "cfg_attr_test")]
+#[test_case::test_case("#[cfg(not(test))]\nfn production() { \"provider/model\"; }", true ; "cfg_not_test")]
+#[test_case::test_case("#[cfg(any(test, feature = \"extra\"))]\nfn production() { \"provider/model\"; }", true ; "cfg_may_be_production")]
+#[test_case::test_case("#[cfg_attr(not(test), test)]\nfn production() { \"provider/model\"; }", true ; "cfg_attr_not_test")]
 #[test_case::test_case("#[cfg_attr(test, inline)]\nfn production() { \"provider/model\"; }", true ; "cfg_attr_non_test")]
 #[test_case::test_case("#[doc = \"test\"]\nfn production() { \"provider/model\"; }", true ; "non_test_attribute")]
 fn source_scan_filters_only_test_attributes(source: &str, collected: bool) {

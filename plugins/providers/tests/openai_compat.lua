@@ -190,6 +190,17 @@ t.case("discover_without_key_keeps_curated_models", function()
   end)
 end)
 
+t.case("discover_reports_header_setup_errors", function()
+  t.with_env({ [KEY_ENV] = "k" }, function()
+    local config = { headers = { ["X-Gateway"] = "${MISSING_GATEWAY}" } }
+    local spec = compat.provider(def())
+    local _, discover_err = spec.discover(t.provider_ctx({}), config)
+    local _, prepare_err = spec.prepare(t.provider_ctx({}), { id = "row-1" }, config)
+    t.same(discover_err, prepare_err)
+    t.eq(discover_err.kind, http.CONFIG_KIND)
+  end)
+end)
+
 t.case("discover_merges_listing_over_curated_rows", function()
   t.with_env({ [KEY_ENV] = "k" }, function()
     local listing = t.response({ '{"data":[{"id":"new"},{"id":"row-1","context_length":3000}]}' })
