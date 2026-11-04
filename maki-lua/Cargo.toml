@@ -116,3 +116,7 @@ harness = false
 [[bench]]
 name = "provider_perf"
 harness = false
+
+[[bench]]
+name = "provider_wire"
+harness = false
