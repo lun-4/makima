@@ -29,6 +29,7 @@ The native providers in `maki-providers/src/providers/` are 22k lines and are de
 - Live reload of providers. The registry is built once at startup. A reload rebuilds the plugin host and the registry together.
 - Luau static type checking, and tests that compare Luau annotations with Rust types.
 - New providers or changes to wire behaviour, except the regressions fixed below.
+- A compaction that keeps the prompt cache. Today the summary request strips thinking, images and old tool results and so changes the prefix. Asking for the summary as one user message appended to the unchanged history would let providers reuse their cache; that is a separate redesign of compaction.
 
 ## Design
 
@@ -104,6 +105,47 @@ An `operation_id` is generated for each logical request, which is one call of th
 - Exiting an agent, including at shutdown, does not end its conversation. The id is persisted with the session and a resume continues it, so a remote service relies on its own orphan cleanup for sessions that are never resumed.
 
 In Lua this is an optional instance method `end_conversation(ctx, conversation_id, reason)`. Its return values are ignored, and a raised error is logged like any other failure. Native providers ignore the invocation and do not implement `end_conversation`.
+
+### Conversation lineage (not implemented yet)
+
+A provider that keeps remote state per conversation, such as the Claude Agent bridge (`claude-agent-bridge-design.md`), needs to know when a new conversation id carries on from an old one. Without that, every cancel, rewind or fork makes it rebuild its remote session from the full history, which loses the remote transcript and its prompt cache.
+
+The first request under a new conversation id carries `invocation.previous` when the host started that conversation from another one:
+
+```lua
+previous = {
+  id = "...",            -- the conversation this one starts from
+  relation = "continues", -- or "branches"
+  shared = 12,           -- leading messages equal to the last request sent under `id`
+}
+```
+
+- `continues`: the same agent goes on after its previous conversation ended. A cancelled turn and a rewind continue. `previous.id` is ended with `cancelled` or `rewound` before the first request under the new id.
+- `branches`: a second history starts from a copy of another one, which may still be in use. A forked session, an isolated turn and a compaction summary branch from the conversation they copy.
+- `shared` counts the leading messages of this request that are equal to the same messages of the last request sent under `previous.id`. The host knows it exactly: rewind cuts to a length, a fork copies one, a cancelled turn keeps its prefix, and an isolated turn appends to a copy. A history change the host cannot measure gives `shared = 0`. Compaction's summary request rewrites old messages, so it branches with the length of the prefix it left untouched, often 0.
+- `/new` and the conversation that follows a compaction carry no `previous`: their history does not start from the old one.
+
+`previous` is saved with the session together with the conversation id, so a resume before the first request still links the two. Only the first request under a conversation carries it; later requests and retries of that first request carry the same value.
+
+`end_conversation` keeps its contract with one addition: a conversation ended as `cancelled` or `rewound` may still be named by a successor's `previous`, so a provider that wants to continue it keeps its state for a bounded time instead of discarding it at once. A provider without remote state ignores `previous`.
+
+### Retry classes (not implemented yet)
+
+Today the host derives how to retry a provider failure from its status and from the `maki.net.send` text it carries. The provider knows better: the Claude Agent bridge cannot have a step retried once the remote session has advanced, and Claude Code already retries on its own.
+
+An error table names its class with `retry`:
+
+| `retry` | Budget | Typical source |
+|---|---|---|
+| `rate_limit` | rate limit, honouring `retry_after` | 429 |
+| `transient` | unbounded transient | 5xx, a dropped stream |
+| `connect` | `max_retries` | refused connection, unknown host |
+| `timeout` | `max_timeout_retries` | idle read timeout |
+| `none` | not retried | everything else |
+
+The shared helpers set it on every error they build: `codec.api_error` from the status, and `http.send` from the `maki.net.send` failure text, which is part of that function's documented contract. Classifying the send text moves from `maki-lua/src/provider.rs` into `http.lua`, so the host stops reading error prose. An `overflow = true` error and a `kind = "config"` error are never retried whatever `retry` says. A table without `retry` keeps today's derivation, so a small user provider that returns `{ status, message }` still behaves as it does now.
+
+`AgentError` carries the class the provider named, and `retry_kind()` returns it when present.
 
 ### Request conversion
 
@@ -196,6 +238,8 @@ Fixes on the first attempt that are unrelated to providers become separate commi
    7. Custom and executable providers from `providers.toml`.
 9. Removal of `ProviderKind`, the static manifests and model tables, `maki-providers/src/providers/`, and dependencies that are no longer used. Docgen moves to the registry. The architecture test is added.
 10. Documentation: generated provider and Lua API pages, the hand-written CLI and permissions pages following the tone rules in `AGENTS.md`, and a short section in `AGENTS.md` on adding a provider.
+11. Conversation lineage: `invocation.previous` set at every place that starts a conversation from another, saved with the session, the `end_conversation` addition, and a host test per relation (cancel, rewind, fork, isolated turn, compaction summary, `/new`).
+12. Retry classes: the `retry` field, set by `codec.api_error` and `http.send`, read by the host; the `maki.net.send` text classification moves to Lua. A host test per class and Lua specs for the helpers.
 
 ## Review findings and their resolution
 
