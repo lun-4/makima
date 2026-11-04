@@ -262,7 +262,7 @@ pub fn generate() -> color_eyre::Result<String> {
     .unwrap();
     writeln!(
         out,
-        "- **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only)."
+        "- **Plan / build**: not a slash command. Press `Shift+Tab` in the input to toggle plan mode (plan-file writes only)."
     )
     .unwrap();
     writeln!(

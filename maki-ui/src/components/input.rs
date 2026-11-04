@@ -125,7 +125,9 @@ impl InputBox {
                 self.history_down();
                 return InputAction::PaletteSync(self.buffer.value());
             }
-            KeyCode::Tab | KeyCode::Esc => return InputAction::Passthrough(key),
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Esc => {
+                return InputAction::Passthrough(key);
+            }
             _ if is_newline_key(&key) => {
                 self.buffer.add_line();
                 return InputAction::ContinueLine;

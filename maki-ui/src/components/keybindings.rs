@@ -377,7 +377,7 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single("Tab"),
+        label: KeyLabel::Single("Shift+Tab"),
         description: "Toggle mode",
         context: KeybindContext::Editing,
         platform: Platform::All,
