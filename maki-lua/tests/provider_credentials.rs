@@ -107,6 +107,12 @@ const SCRIPTS: &str = r#"
             end
             return attempt() .. "," .. attempt() .. "," .. calls
         end,
+        locked = function(ctx)
+            body(assert(ctx.send({ url = SERVER })))
+            return ctx.credentials:lock(function()
+                return ctx.credentials:read().access
+            end)
+        end,
         fail_table = function(ctx)
             local _, err = ctx.credentials:refresh(function()
                 return nil, { status = REFRESH_STATUS, message = REFRESH_ERR, retry_after = RETRY_AFTER }
@@ -325,6 +331,24 @@ fn refresh_skips_when_reread_under_lock_is_already_fresh() {
     });
     assert_eq!(result, FRESH);
     assert_eq!(stored_access(&dir), FRESH);
+}
+
+#[test]
+fn lock_runs_its_function_after_another_holder_releases() {
+    let server = serve();
+    let fixture = Fixture::new(&server.url);
+    let dir = fixture.dir();
+    save_credentials(&dir, PROVIDER, &tokens(STALE)).unwrap();
+    let lock = lock_tokens(&dir, PROVIDER).unwrap();
+    let result = thread::scope(|scope| {
+        let locked = scope.spawn(|| fixture.run("locked"));
+        server.requests.recv_timeout(BOUND).unwrap();
+        server.replies.send(String::new()).unwrap();
+        save_credentials(&dir, PROVIDER, &tokens(FRESH)).unwrap();
+        drop(lock);
+        locked.join().unwrap()
+    });
+    assert_eq!(result, FRESH);
 }
 
 #[test]

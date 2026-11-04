@@ -65,8 +65,8 @@ function M.response(chunks, opts)
 end
 
 -- A provider `ctx` whose `send` records each request and returns the next of
--- {responses}, and whose credentials live in memory. `refresh` runs its
--- function at once, without a lock.
+-- {responses}, and whose credentials live in memory. `refresh` and `lock`
+-- run their function at once, without a lock.
 function M.provider_ctx(responses, saved)
   local ctx = { id = "test", requests = {}, saved = saved }
   ctx.send = function(request)
@@ -95,6 +95,9 @@ function M.provider_ctx(responses, saved)
         ctx.saved = value
       end
       return ctx.saved
+    end,
+    lock = function(_, fn)
+      return fn()
     end,
   }
   return ctx

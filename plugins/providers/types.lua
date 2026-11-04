@@ -139,6 +139,7 @@ export type Credentials = {
   write: (self: Credentials, value: Json) -> (boolean?, string?),
   delete: (self: Credentials) -> (boolean?, string?),
   refresh: (self: Credentials, fn: (current: Json?) -> (Json?, string?)) -> (Json?, string?),
+  lock: <T...>(self: Credentials, fn: () -> T...) -> T...,
 }
 
 export type Context = {

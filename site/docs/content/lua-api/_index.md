@@ -4806,6 +4806,33 @@ local tokens, err = ctx.credentials:refresh(function(current)
 end)
 ```
 
+---
+
+### `Credentials:lock()` {#Credentials-lock}
+
+```lua
+Credentials:lock({fn})
+```
+
+Run {fn} with the provider's cross-process credential lock held, the same
+lock `refresh` takes, for work that must not overlap another process
+changing these credentials. Unlike `refresh`, every call runs its own
+{fn}, nothing is reread or written, and dropping the caller ends {fn}.
+
+**Parameters:**
+
+- `{fn}` (`function`) Called with no arguments.
+
+**Returns:** any Whatever {fn} returns.
+
+**Example:**
+
+```lua
+local result, err = ctx.credentials:lock(function()
+  return run_login_script()
+end)
+```
+
 
 ## maki.provider.LoginUi {#maki-provider-LoginUi}
 
@@ -7804,8 +7831,8 @@ function M.rmtree(dir)
 function M.response(chunks, opts)
 
 -- A provider `ctx` whose `send` records each request and returns the next of
--- {responses}, and whose credentials live in memory. `refresh` runs its
--- function at once, without a lock.
+-- {responses}, and whose credentials live in memory. `refresh` and `lock`
+-- run their function at once, without a lock.
 function M.provider_ctx(responses, saved)
 
 -- An `emit` for provider streams, plus the list it records into.

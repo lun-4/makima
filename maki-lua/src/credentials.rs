@@ -125,6 +125,31 @@ async fn refresh(
     }
 }
 
+/// Run {fn} with the provider's cross-process credential lock held, the same
+/// lock `refresh` takes, for work that must not overlap another process
+/// changing these credentials. Unlike `refresh`, every call runs its own
+/// {fn}, nothing is reread or written, and dropping the caller ends {fn}.
+///
+/// @param fn function Called with no arguments.
+/// @return any Whatever {fn} returns.
+/// @example
+/// local result, err = ctx.credentials:lock(function()
+///   return run_login_script()
+/// end)
+#[lua_fn]
+async fn lock(lua: Lua, this: UserDataRef<Credentials>, r#fn: Function) -> LuaResult<MultiValue> {
+    let (dir, id) = location(&lua, &this).map_err(mlua::Error::runtime)?;
+    drop(this);
+    let lock_id = Arc::clone(&id);
+    let lock = unblock(move || lock_tokens(&dir, &lock_id)).await;
+    if lock.is_none() {
+        warn!(provider = %id, "credential lock not acquired, running unlocked");
+    }
+    let values = r#fn.call_async::<MultiValue>(()).await;
+    drop(lock);
+    values
+}
+
 /// Runs the refresh as its own uncancellable job, so dropping the caller
 /// cannot lose a token the server already rotated. Nothing bounds the whole
 /// run for the same reason: the token request is bounded by `ctx.send`'s
@@ -203,5 +228,5 @@ lua_class! {
     /// It always addresses that provider's own credentials file. The value is
     /// whatever JSON table the provider stores, such as `{ api_key }` or
     /// `{ access, refresh, expires }`.
-    "maki.provider.Credentials" => Credentials, CREDENTIALS_DOCS [read, write, delete, refresh]
+    "maki.provider.Credentials" => Credentials, CREDENTIALS_DOCS [read, write, delete, refresh, lock]
 }

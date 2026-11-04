@@ -367,18 +367,11 @@ function M.provider(script, route, run)
   end
 
   -- Runs {command} under the provider's credential lock, which other
-  -- processes take too. Concurrent callers share one run.
+  -- processes take too.
   local function locked(ctx, command)
-    local _, err = ctx.credentials:refresh(function()
-      local fresh, fetch_err = fetch(command)
-      if not fresh then
-        return nil, http.message(fetch_err)
-      end
+    return ctx.credentials:lock(function()
+      return fetch(command)
     end)
-    if err then
-      return nil, failure(err)
-    end
-    return auth
   end
 
   local function client(config)
