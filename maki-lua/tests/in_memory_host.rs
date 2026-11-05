@@ -422,6 +422,37 @@ fn splash_picker_command_switches_to_default() {
 }
 
 #[test]
+fn splash_picker_keeps_selection_when_render_is_killed_at_deadline() {
+    const SOURCE: &str = r##"
+local killed = false
+maki.store.register("splash", "vortex", {
+  renderer = function(w, h, t)
+    if t > 0 and not killed then
+      killed = true
+      while true do end
+    end
+    return { { { glyphs = "sss", style = "field" } } }
+  end,
+})
+"##;
+    let fs = Arc::new(InMemoryFs::new());
+    fs.seed(&selection_path(), SELECTION_STALE.as_bytes().to_vec());
+    let (handle, guard) = maki_lua::test_support::spawn_host_with_fs_for_tests(
+        &["splashes", "splashes_default"],
+        fs,
+        Some(SOURCE),
+    );
+
+    pull_frame(&handle, Some("sss"));
+    assert!(
+        selection_content(&guard)
+            .unwrap()
+            .contains(SELECTION_VORTEX),
+        "a render the host killed must not roll the selection back"
+    );
+}
+
+#[test]
 fn splash_picker_default_recovers_after_transient_render_error() {
     const SOURCE: &str = r##"
 local calls = 0
