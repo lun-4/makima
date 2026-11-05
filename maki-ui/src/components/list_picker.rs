@@ -86,6 +86,7 @@ pub struct ListPicker<T> {
     state: Option<State<T>>,
     picker: Option<PickerId>,
     scrollbar_hit: Option<ScrollbarHit>,
+    row_hits: Vec<(Rect, usize)>,
     title: String,
     max_visible: Option<u16>,
     footer: Option<Footer>,
@@ -363,6 +364,7 @@ impl<T: PickerItem> ListPicker<T> {
             state: None,
             picker: None,
             scrollbar_hit: None,
+            row_hits: Vec::new(),
             title: String::new(),
             max_visible: None,
             footer: None,
@@ -700,7 +702,7 @@ impl<T: PickerItem> ListPicker<T> {
             Footer::Static(line) => line.clone(),
         });
         let rendered = match self.state.as_mut() {
-            None => (Rect::default(), None),
+            None => (Rect::default(), None, Vec::new()),
             Some(s) => render_ready(
                 frame,
                 area,
@@ -712,6 +714,7 @@ impl<T: PickerItem> ListPicker<T> {
             ),
         };
         self.scrollbar_hit = rendered.1;
+        self.row_hits = rendered.2;
         rendered.0
     }
 
@@ -721,13 +724,24 @@ impl<T: PickerItem> ListPicker<T> {
     }
 
     pub fn hits(&self) -> Vec<HitTarget> {
-        match (self.picker, self.scrollbar_hit) {
-            (Some(picker), Some(hit)) => vec![HitTarget {
+        let Some(picker) = self.picker else {
+            return Vec::new();
+        };
+        let mut hits: Vec<HitTarget> = self
+            .row_hits
+            .iter()
+            .map(|&(rect, index)| HitTarget {
+                rect,
+                target: ClickTarget::PickerRow { picker, index },
+            })
+            .collect();
+        if let Some(hit) = self.scrollbar_hit {
+            hits.push(HitTarget {
                 rect: hit.area,
                 target: ClickTarget::Scrollbar(ScrollOwner::Picker(picker)),
-            }],
-            _ => Vec::new(),
+            });
         }
+        hits
     }
 
     pub fn content_len(&self) -> Option<u16> {
@@ -782,7 +796,7 @@ fn render_ready<T: PickerItem>(
     max_visible: Option<u16>,
     footer: Option<Line<'static>>,
     error_text: Option<&str>,
-) -> (Rect, Option<ScrollbarHit>) {
+) -> (Rect, Option<ScrollbarHit>, Vec<(Rect, usize)>) {
     let footer_rows = if footer.is_some() { 1u16 } else { 0 };
     let content_rows = if s.filtered().is_empty() {
         1
@@ -839,7 +853,7 @@ fn render_ready<T: PickerItem>(
     let search_area = areas[area_idx];
     area_idx += 1;
 
-    render_list(
+    let row_hits = render_list(
         frame,
         list_area,
         s.filtered(),
@@ -865,7 +879,7 @@ fn render_ready<T: PickerItem>(
     };
 
     s.inner_area = inner;
-    (popup, scrollbar_hit)
+    (popup, scrollbar_hit, row_hits)
 }
 
 fn section_gap<T: PickerItem>(filtered: &[usize], items: &[T], idx: usize, start: usize) -> usize {
@@ -1000,17 +1014,18 @@ fn render_list<T: PickerItem>(
     scroll_offset: usize,
     viewport_height: usize,
     enabled: Option<&[bool]>,
-) {
+) -> Vec<(Rect, usize)> {
     if filtered.is_empty() {
         let line = Line::from(Span::styled(
             format!("  {NO_MATCHES}"),
             theme::current().item_desc,
         ));
         frame.render_widget(Paragraph::new(vec![line]), area);
-        return;
+        return Vec::new();
     }
 
     let mut lines: Vec<Line> = Vec::new();
+    let mut row_hits: Vec<(Rect, usize)> = Vec::new();
     let mut i = scroll_offset;
     let mut last_section: Option<&str> = None;
 
@@ -1144,11 +1159,16 @@ fn render_list<T: PickerItem>(
             }
             Line::from(spans)
         };
+        row_hits.push((
+            Rect::new(area.x, area.y + lines.len() as u16, area.width, 1),
+            i,
+        ));
         lines.push(line);
         i += 1;
     }
 
     frame.render_widget(Paragraph::new(lines), area);
+    row_hits
 }
 
 fn render_search(frame: &mut Frame, area: Rect, search: &TextBuffer) {

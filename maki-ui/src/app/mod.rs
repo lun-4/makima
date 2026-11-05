@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use crate::AppSession;
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
-use crate::click::{ClickTarget, HitRegistry, PickerId, ScrollOwner};
+use crate::click::{ClickTarget, CompletionGrid, HitRegistry, PickerId, ScrollOwner};
 use crate::clipboard::ClipboardState;
 use crate::command_runtime::{CommandRuntime, PreparedCommandTarget};
 use maki_agent::HistorySnapshot;
@@ -1171,6 +1171,41 @@ impl App {
                 self.active_chat().enable_auto_scroll();
                 vec![]
             }
+            ClickTarget::CompletionRow { grid, index } => {
+                let selected = match grid {
+                    CompletionGrid::PaletteCommands => self.command_palette.select_command(index),
+                    CompletionGrid::PaletteArguments => self.command_palette.select_argument(index),
+                    CompletionGrid::PaletteGrid => self.command_palette.select_grid(index),
+                    CompletionGrid::FileCompletion => self.file_completion.select_grid(index),
+                };
+                if selected {
+                    self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                } else {
+                    vec![]
+                }
+            }
+            ClickTarget::PlanRow(row) => {
+                if self.plan_form.select_row(row as usize) {
+                    self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                } else {
+                    vec![]
+                }
+            }
+            ClickTarget::QueueRow(index) => {
+                if self.queue.focus() == Some(index) {
+                    self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                } else {
+                    self.queue.set_focus_at(index);
+                    vec![]
+                }
+            }
+            ClickTarget::PickerRow { picker, index } => {
+                if self.select_picker_row(picker, index) {
+                    self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                } else {
+                    vec![]
+                }
+            }
             ClickTarget::MenuRow(index) => {
                 let action = self.menu.click_row(index as usize);
                 if let Some(action) = action {
@@ -1182,6 +1217,21 @@ impl App {
             }
             _ => vec![],
         }
+    }
+
+    fn select_picker_row(&mut self, picker: PickerId, index: usize) -> bool {
+        match picker {
+            PickerId::Model => self.model_picker.select(index),
+            PickerId::Task => self.task_picker.select(index),
+            PickerId::Theme => self.theme_picker.select(index),
+            PickerId::Rewind => self.rewind_picker.select(index),
+            PickerId::Login => return self.login_picker.click_row(index),
+            PickerId::Mcp => self.mcp_picker.select(index),
+            PickerId::Lua => self.lua_picker.select(index),
+            PickerId::Search => self.search_modal.select(index),
+            PickerId::File => self.file_picker.select(index),
+        }
+        true
     }
 
     fn apply_menu_action(&mut self, action: MenuAction) -> Vec<Action> {

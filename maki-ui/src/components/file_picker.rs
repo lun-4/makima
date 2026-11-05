@@ -22,6 +22,7 @@ use tracing::warn;
 use unicode_width::UnicodeWidthChar;
 
 use crate::animation::spinner_frame;
+use crate::click::{ClickTarget, HitTarget, PickerId, ScrollOwner};
 use crate::components::Overlay;
 use crate::components::coherent_completion::{CoherentCompletion, Publication};
 use crate::components::keybindings::key;
@@ -87,6 +88,7 @@ impl Drop for Session {
 
 pub struct FilePickerModal {
     scrollbar_hit: Option<ScrollbarHit>,
+    row_hits: Vec<(Rect, usize)>,
     session: Option<Session>,
 }
 
@@ -162,6 +164,7 @@ impl FilePickerModal {
     pub fn new() -> Self {
         Self {
             scrollbar_hit: None,
+            row_hits: Vec::new(),
             session: None,
         }
     }
@@ -345,6 +348,14 @@ impl FilePickerModal {
         (dirty, None)
     }
 
+    pub fn select(&mut self, index: usize) {
+        let Some(s) = &mut self.session else { return };
+        if index < s.matches.len() {
+            s.selected = index;
+            ensure_visible(s);
+        }
+    }
+
     pub fn scroll_to_line(&mut self, line: u16) {
         let Some(s) = &mut self.session else { return };
         let content_len = s.matches.len() + usize::from(s.truncated);
@@ -353,8 +364,25 @@ impl FilePickerModal {
         s.selected = s.selected.min(s.matches.len().saturating_sub(1));
     }
 
-    pub fn scrollbar_hit(&self) -> Option<ScrollbarHit> {
-        self.scrollbar_hit
+    pub fn hits(&self) -> Vec<HitTarget> {
+        let mut hits: Vec<HitTarget> = self
+            .row_hits
+            .iter()
+            .map(|&(rect, index)| HitTarget {
+                rect,
+                target: ClickTarget::PickerRow {
+                    picker: PickerId::File,
+                    index,
+                },
+            })
+            .collect();
+        if let Some(hit) = self.scrollbar_hit {
+            hits.push(HitTarget {
+                rect: hit.area,
+                target: ClickTarget::Scrollbar(ScrollOwner::Picker(PickerId::File)),
+            });
+        }
+        hits
     }
 
     pub fn scroll_line(&self) -> u16 {
@@ -368,6 +396,7 @@ impl FilePickerModal {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        self.row_hits = Vec::new();
         let s = match &mut self.session {
             Some(s) if s.visible => s,
             _ => {
@@ -400,9 +429,10 @@ impl FilePickerModal {
         let [list_area, search_area] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
 
-        render_list(frame, list_area, s);
+        let row_hits = render_list(frame, list_area, s);
         render_search(frame, search_area, s);
 
+        self.row_hits = row_hits;
         let content_len = s.matches.len() + usize::from(s.truncated);
         self.scrollbar_hit = if content_len > s.viewport_height {
             render_vertical_scrollbar(frame, list_area, content_len as u16, s.scroll_offset as u16)
@@ -527,7 +557,7 @@ fn ensure_visible(s: &mut Session) {
     }
 }
 
-fn render_list(frame: &mut Frame, area: Rect, s: &Session) {
+fn render_list(frame: &mut Frame, area: Rect, s: &Session) -> Vec<(Rect, usize)> {
     let t = theme::current();
 
     if s.matches.is_empty() {
@@ -537,7 +567,7 @@ fn render_list(frame: &mut Frame, area: Rect, s: &Session) {
                 area,
             );
         }
-        return;
+        return Vec::new();
     }
 
     let content_len = s.matches.len() + usize::from(s.truncated);
@@ -548,20 +578,22 @@ fn render_list(frame: &mut Frame, area: Rect, s: &Session) {
     let max_label_width = area.width.saturating_sub(LABEL_INDENT.len() as u16) as usize;
     let end = (s.scroll_offset + visible_rows).min(s.matches.len());
 
-    let mut lines: Vec<Line> = s.matches[s.scroll_offset..end]
-        .iter()
-        .enumerate()
-        .map(|(i, m)| {
-            let selected = s.scroll_offset + i == s.selected;
-            build_highlighted_line(
-                &m.path,
-                &m.completion.indices,
-                max_label_width,
-                selected,
-                &t,
-            )
-        })
-        .collect();
+    let mut lines: Vec<Line> = Vec::new();
+    let mut row_hits = Vec::new();
+    for (i, m) in s.matches[s.scroll_offset..end].iter().enumerate() {
+        let selected = s.scroll_offset + i == s.selected;
+        row_hits.push((
+            Rect::new(area.x, area.y + lines.len() as u16, area.width, 1),
+            s.scroll_offset + i,
+        ));
+        lines.push(build_highlighted_line(
+            &m.path,
+            &m.completion.indices,
+            max_label_width,
+            selected,
+            &t,
+        ));
+    }
 
     if hint_row > 0 {
         let n = s.coarse_match_count - s.materialized_count;
@@ -572,6 +604,7 @@ fn render_list(frame: &mut Frame, area: Rect, s: &Session) {
     }
 
     frame.render_widget(Paragraph::new(lines), area);
+    row_hits
 }
 
 fn render_search(frame: &mut Frame, area: Rect, s: &Session) {
@@ -1039,7 +1072,9 @@ mod tests {
         let backend = TestBackend::new(80, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render_list(frame, frame.area(), session))
+            .draw(|frame| {
+                render_list(frame, frame.area(), session);
+            })
             .unwrap();
         let rendered: String = terminal
             .backend()

@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use crate::click::{ClickTarget, HitTarget};
 use crate::components::keybindings::key;
 use crate::theme;
 
@@ -26,9 +27,14 @@ pub fn height(queue_len: usize) -> u16 {
     }
 }
 
-pub fn view(frame: &mut Frame, area: Rect, entries: &[QueueEntry], focus: Option<usize>) {
+pub fn view(
+    frame: &mut Frame,
+    area: Rect,
+    entries: &[QueueEntry],
+    focus: Option<usize>,
+) -> Vec<HitTarget> {
     if entries.is_empty() {
-        return;
+        return Vec::new();
     }
     let content_width = area.width.saturating_sub(2) as usize;
     let lines: Vec<Line> = entries
@@ -66,6 +72,19 @@ pub fn view(frame: &mut Frame, area: Rect, entries: &[QueueEntry], focus: Option
         .block(block);
 
     frame.render_widget(paragraph, area);
+    entries
+        .iter()
+        .enumerate()
+        .map(|(i, _)| HitTarget {
+            rect: Rect::new(
+                area.x + 1,
+                area.y + 1 + i as u16,
+                area.width.saturating_sub(2),
+                1,
+            ),
+            target: ClickTarget::QueueRow(i),
+        })
+        .collect()
 }
 
 fn truncate_line(

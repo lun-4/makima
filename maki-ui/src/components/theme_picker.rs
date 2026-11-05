@@ -103,6 +103,10 @@ impl ThemePicker {
         self.picker.contains(pos)
     }
 
+    pub fn select(&mut self, index: usize) {
+        self.picker.select(index);
+    }
+
     pub fn scroll(&mut self, delta: i32) {
         self.picker.scroll(delta);
     }

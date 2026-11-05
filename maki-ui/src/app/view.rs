@@ -1,7 +1,7 @@
 use maki_providers::ThinkingConfigExt;
 use std::sync::atomic::Ordering;
 
-use crate::click::{ClickTarget, HitTarget, PickerId, ScrollOwner};
+use crate::click::{ClickTarget, HitTarget, ScrollOwner};
 use crate::components::Overlay;
 use crate::components::input::Placeholder;
 #[cfg(test)]
@@ -310,10 +310,13 @@ impl App {
             // (`render_active_input`) so it lands above pickers/modals.
         } else if self.plan_form_active() {
             let model = self.focused_model_spec();
-            self.plan_form.view(frame, layout.bottom_area, &model);
+            let hits = self.plan_form.view(frame, layout.bottom_area, &model);
+            self.absorb_hits(hits);
         } else if layout.bottom_area.height > 0 {
             let queue_entries = self.queue.panel_entries();
-            queue_panel::view(frame, layout.queue_area, &queue_entries, self.queue.focus());
+            let hits =
+                queue_panel::view(frame, layout.queue_area, &queue_entries, self.queue.focus());
+            self.absorb_hits(hits);
             for &(idx, rect) in &layout.panel_windows {
                 self.float_mgr.view_panel(frame, idx, rect);
             }
@@ -349,6 +352,8 @@ impl App {
             }
             if !streaming && !self.command_palette.is_active() && !self.any_overlay_open() {
                 self.file_completion.view(frame, layout.input_area);
+                let hits = self.file_completion.hits();
+                self.absorb_hits(hits);
             }
             if !self.any_overlay_open() {
                 self.command_palette.view(
@@ -356,6 +361,8 @@ impl App {
                     layout.input_area,
                     self.ui_config.autocomplete_height,
                 );
+                let hits = self.command_palette.hits();
+                self.absorb_hits(hits);
             }
         }
     }
@@ -398,12 +405,8 @@ impl App {
 
         if self.search_modal.is_open() {
             rects.push(self.search_modal.view(frame, layout.msg_area));
-            if let Some(hit) = self.search_modal.scrollbar_hit() {
-                self.hits.push(
-                    hit.area,
-                    ClickTarget::Scrollbar(ScrollOwner::Picker(PickerId::Search)),
-                );
-            }
+            let hits = self.search_modal.hits();
+            self.absorb_hits(hits);
         }
 
         if self.task_picker.is_open() {
@@ -420,12 +423,8 @@ impl App {
 
         if self.file_picker.is_open() {
             rects.push(self.file_picker.view(frame, full));
-            if let Some(hit) = self.file_picker.scrollbar_hit() {
-                self.hits.push(
-                    hit.area,
-                    ClickTarget::Scrollbar(ScrollOwner::Picker(PickerId::File)),
-                );
-            }
+            let hits = self.file_picker.hits();
+            self.absorb_hits(hits);
         }
 
         macro_rules! render_if_open {

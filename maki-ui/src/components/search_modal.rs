@@ -1,5 +1,6 @@
 use std::cmp::Reverse;
 
+use crate::click::{ClickTarget, HitTarget, PickerId, ScrollOwner};
 use crate::components::Overlay;
 use crate::components::coherent_completion::Published;
 use crate::components::keybindings::key;
@@ -47,6 +48,7 @@ pub struct SearchModal {
     open: bool,
     saved_scroll: Option<(u16, bool)>,
     scrollbar_hit: Option<ScrollbarHit>,
+    row_hits: Vec<(Rect, usize)>,
     popup: Rect,
     matcher: Matcher,
 }
@@ -62,6 +64,7 @@ impl SearchModal {
             open: false,
             saved_scroll: None,
             scrollbar_hit: None,
+            row_hits: Vec::new(),
             popup: Rect::default(),
             matcher: Matcher::new(Config::DEFAULT),
         }
@@ -232,13 +235,37 @@ impl SearchModal {
         self.scroll_offset = offset.min(max);
     }
 
+    pub fn select(&mut self, index: usize) {
+        if index < self.matches().len() {
+            self.selected = index;
+            self.ensure_visible();
+        }
+    }
+
     pub fn scroll_to_line(&mut self, line: u16) {
         let max = self.matches().len().saturating_sub(self.viewport_height) as u16;
         self.scroll_offset = line.min(max) as usize;
     }
 
-    pub fn scrollbar_hit(&self) -> Option<ScrollbarHit> {
-        self.scrollbar_hit
+    pub fn hits(&self) -> Vec<HitTarget> {
+        let mut hits: Vec<HitTarget> = self
+            .row_hits
+            .iter()
+            .map(|&(rect, index)| HitTarget {
+                rect,
+                target: ClickTarget::PickerRow {
+                    picker: PickerId::Search,
+                    index,
+                },
+            })
+            .collect();
+        if let Some(hit) = self.scrollbar_hit {
+            hits.push(HitTarget {
+                rect: hit.area,
+                target: ClickTarget::Scrollbar(ScrollOwner::Picker(PickerId::Search)),
+            });
+        }
+        hits
     }
 
     pub fn content_len(&self) -> u16 {
@@ -251,6 +278,7 @@ impl SearchModal {
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
         self.scrollbar_hit = None;
+        self.row_hits = Vec::new();
         self.popup = Rect::default();
         if !self.open {
             return Rect::default();
@@ -275,7 +303,7 @@ impl SearchModal {
         let [list_area, search_area] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
 
-        self.render_list(frame, list_area, viewport_h);
+        self.row_hits = self.render_list(frame, list_area, viewport_h);
         self.render_search(frame, search_area);
 
         let total = self.matches().len() as u16;
@@ -287,7 +315,12 @@ impl SearchModal {
         popup
     }
 
-    fn render_list(&self, frame: &mut Frame, area: Rect, viewport_height: usize) {
+    fn render_list(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        viewport_height: usize,
+    ) -> Vec<(Rect, usize)> {
         let t = theme::current();
 
         if self.matches().is_empty() {
@@ -295,11 +328,12 @@ impl SearchModal {
                 let line = Line::from(Span::styled(NO_MATCHES, t.item_desc));
                 frame.render_widget(Paragraph::new(vec![line]), area);
             }
-            return;
+            return Vec::new();
         }
 
         let max_label_width = area.width.saturating_sub(LABEL_INDENT.len() as u16) as usize;
         let mut lines: Vec<Line> = Vec::new();
+        let mut row_hits = Vec::new();
         let end = (self.scroll_offset + viewport_height).min(self.matches().len());
 
         for i in self.scroll_offset..end {
@@ -312,10 +346,15 @@ impl SearchModal {
                 is_selected,
                 &t,
             );
+            row_hits.push((
+                Rect::new(area.x, area.y + lines.len() as u16, area.width, 1),
+                i,
+            ));
             lines.push(line);
         }
 
         frame.render_widget(Paragraph::new(lines), area);
+        row_hits
     }
 
     fn render_search(&self, frame: &mut Frame, area: Rect) {

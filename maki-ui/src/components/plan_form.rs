@@ -1,7 +1,9 @@
+use crate::click::{ClickTarget, HitTarget};
 use crate::components::form::{form_height, render_form, selected_prefix};
 use crate::components::hint_line;
 use crate::components::keybindings::key;
 use crate::theme::{self, Theme};
+use crate::wrap::Measure;
 
 use std::borrow::Cow;
 
@@ -225,19 +227,37 @@ impl PlanForm {
         }
     }
 
-    pub fn view(&self, frame: &mut Frame, area: Rect, current_model: &str) {
+    pub fn view(&self, frame: &mut Frame, area: Rect, current_model: &str) -> Vec<HitTarget> {
         if !self.is_visible() {
-            return;
+            return Vec::new();
+        }
+        let lines = self.lines(current_model);
+        let width = area.width.saturating_sub(2);
+        let mut measure = Measure::new(width);
+        let mut row = 0u16;
+        let menu_len = Self::menu_len(self.implementation_model.is_some());
+        let mut hits = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            let rows = measure.rows(line).max(1);
+            if index < menu_len {
+                hits.push(HitTarget {
+                    rect: Rect::new(area.x + 1, area.y + 1 + row, width, rows),
+                    target: ClickTarget::PlanRow(index as u16),
+                });
+            }
+            row = row.saturating_add(rows);
         }
         let t = theme::current();
-        render_form(
-            &t,
-            FORM_LABEL,
-            frame,
-            area,
-            self.lines(current_model),
-            (0, 0),
-        );
+        render_form(&t, FORM_LABEL, frame, area, lines, (0, 0));
+        hits
+    }
+
+    pub fn select_row(&mut self, row: usize) -> bool {
+        if row >= Self::menu_len(self.implementation_model.is_some()) {
+            return false;
+        }
+        self.selected = row;
+        true
     }
 
     fn lines(&self, current_model: &str) -> Vec<Line<'static>> {
@@ -310,7 +330,9 @@ mod tests {
         let height = form.height(width, current_model);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| form.view(frame, frame.area(), current_model))
+            .draw(|frame| {
+                form.view(frame, frame.area(), current_model);
+            })
             .unwrap();
         buffer_text(terminal.backend().buffer())
     }

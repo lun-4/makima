@@ -23,6 +23,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tracing::warn;
 use unicode_width::UnicodeWidthChar;
 
+use crate::click::{ClickTarget, CompletionGrid, HitTarget};
 use crate::components::coherent_completion::{CoherentCompletion, Publication};
 use crate::repaint::{Cadence, Dirty};
 use crate::text_buffer::TextBuffer;
@@ -599,6 +600,7 @@ pub struct FileCompletionMenu {
     session: Option<Session>,
     discovery: PathDiscovery,
     walker_spawner: WalkerSpawner,
+    last_hits: Vec<HitTarget>,
 }
 
 impl FileCompletionMenu {
@@ -622,6 +624,7 @@ impl FileCompletionMenu {
             session: None,
             discovery,
             walker_spawner,
+            last_hits: Vec::new(),
         }
     }
 
@@ -969,7 +972,37 @@ impl FileCompletionMenu {
                 kind: &candidate.item.kind,
             })
             .collect();
-        render_completion_grid(frame, input_area, &items, &mut s.grid)
+        let rendered = render_completion_grid(frame, input_area, &items, &mut s.grid);
+        self.last_hits = rendered
+            .as_ref()
+            .map(|(_, hits)| {
+                hits.iter()
+                    .map(|&(rect, index)| HitTarget {
+                        rect,
+                        target: ClickTarget::CompletionRow {
+                            grid: CompletionGrid::FileCompletion,
+                            index,
+                        },
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        rendered.map(|(popup, _)| popup)
+    }
+
+    pub fn hits(&self) -> Vec<HitTarget> {
+        self.last_hits.clone()
+    }
+
+    pub fn select_grid(&mut self, index: usize) -> bool {
+        let Some(s) = &mut self.session else {
+            return false;
+        };
+        if index >= s.matches.len() {
+            return false;
+        }
+        s.grid.set_selected(index);
+        true
     }
 }
 
@@ -1172,7 +1205,7 @@ pub(crate) fn render_completion_grid(
     input_area: Rect,
     items: &[CompletionGridItem<'_>],
     grid: &mut CompletionGridState,
-) -> Option<Rect> {
+) -> Option<(Rect, Vec<(Rect, usize)>)> {
     if items.is_empty() || input_area.y == 0 {
         return None;
     }
@@ -1235,7 +1268,20 @@ pub(crate) fn render_completion_grid(
     frame.render_widget(block, popup);
     frame.render_widget(Paragraph::new(lines), inner);
 
-    Some(popup)
+    let mut hits = Vec::new();
+    for row_offset in 0..view_rows {
+        let screen_y = inner.y + row_offset as u16;
+        let mut x = inner.x;
+        for (column, width) in col_widths.iter().enumerate() {
+            let index = (grid.scroll_offset() + row_offset) * cols + column;
+            if index < len {
+                hits.push((Rect::new(x, screen_y, *width as u16, 1), index));
+            }
+            x = x.saturating_add(*width as u16 + COL_GAP as u16);
+        }
+    }
+
+    Some((popup, hits))
 }
 
 fn completion_item_width(item: &CompletionGridItem<'_>) -> usize {

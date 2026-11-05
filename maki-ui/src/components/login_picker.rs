@@ -839,6 +839,16 @@ impl LoginPicker {
         }
     }
 
+    pub fn click_row(&mut self, index: usize) -> bool {
+        match &mut self.step {
+            Step::PickProvider(picker) => picker.select(index),
+            Step::PickPlan { picker, .. } => picker.select(index),
+            Step::CustomProtocol { picker, .. } => picker.select(index),
+            _ => return false,
+        }
+        true
+    }
+
     pub fn hits(&self) -> Vec<HitTarget> {
         match &self.step {
             Step::PickProvider(picker) => picker.hits(),
