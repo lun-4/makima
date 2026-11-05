@@ -420,6 +420,10 @@ impl FloatManager {
         self.render_window(frame, idx, rect);
     }
 
+    pub fn focused_rect(&self) -> Option<Rect> {
+        self.focused_rect
+    }
+
     pub fn panel_reqs(&self) -> Vec<(usize, u16)> {
         let mut reqs: Vec<(usize, u16)> = self
             .windows

@@ -6,6 +6,8 @@
 pub mod animation;
 pub mod app;
 pub mod chat;
+#[allow(dead_code)]
+mod click;
 mod clipboard;
 mod clock;
 mod color_compat;

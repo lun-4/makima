@@ -6333,6 +6333,7 @@ fn overlay_zone_click_gating() {
     let overlay = Rect::new(10, 3, 60, 10);
     set_zone(&mut app, SelectionZone::Messages, msg);
     set_zone(&mut app, SelectionZone::Overlay, overlay);
+    app.hits.set_modal_rects([overlay]);
     app.help_modal.toggle();
 
     app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 1));

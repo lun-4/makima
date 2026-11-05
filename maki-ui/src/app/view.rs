@@ -51,6 +51,7 @@ struct ViewLayout {
 
 impl App {
     pub fn view(&mut self, frame: &mut Frame) {
+        self.hits.clear();
         self.sync_focused_queue();
         self.status_bar.set_cwd(self.focused_cwd());
         let form_visible = self.permission_active() || self.plan_form_active();
@@ -62,10 +63,29 @@ impl App {
         self.render_messages(frame, &layout, render_chat);
         self.render_bottom_panel(frame, &layout);
         self.render_splits(frame, &layout);
-        let mut overlay_rect = self.render_picker_overlays(frame, &layout);
+        let mut modal_rects = self.render_picker_overlays(frame, &layout);
         self.render_status_bar(frame, layout.status_area, render_chat);
         self.render_defer_hint(frame, layout.defer_hint_area);
-        overlay_rect = self.render_top_modals(frame, overlay_rect);
+        self.render_top_modals(frame, &mut modal_rects);
+        if self.permission_active() {
+            modal_rects.push(layout.bottom_area);
+        } else if self.question_active()
+            && let Some(rect) = layout.splits.rect(Split::Below)
+        {
+            modal_rects.push(selection::inset_border(rect));
+        }
+        self.hits.set_modal_rects(modal_rects.iter().copied());
+        let overlay_rect = modal_rects
+            .iter()
+            .copied()
+            .reduce(|a, b| {
+                let x = a.x.min(b.x);
+                let y = a.y.min(b.y);
+                let right = a.right().max(b.right());
+                let bottom = a.bottom().max(b.bottom());
+                Rect::new(x, y, right.saturating_sub(x), bottom.saturating_sub(y))
+            })
+            .unwrap_or_default();
         self.register_zones(&layout, overlay_rect);
         let dirty = self.validate_middle_scroll();
         self.pending_dirty |= dirty;
@@ -347,30 +367,30 @@ impl App {
         }
     }
 
-    fn render_picker_overlays(&mut self, frame: &mut Frame, layout: &ViewLayout) -> Rect {
-        let mut overlay_rect = Rect::default();
+    fn render_picker_overlays(&mut self, frame: &mut Frame, layout: &ViewLayout) -> Vec<Rect> {
+        let mut rects = Vec::new();
         let full = frame.area();
 
         if self.search_modal.is_open() {
-            overlay_rect = self.search_modal.view(frame, layout.msg_area);
+            rects.push(self.search_modal.view(frame, layout.msg_area));
         }
 
         if self.task_picker.is_open() {
-            overlay_rect = self.task_picker.view(frame, full);
+            rects.push(self.task_picker.view(frame, full));
         }
 
         if self.lua_picker.is_open() {
-            overlay_rect = self.lua_picker.view(frame, full);
+            rects.push(self.lua_picker.view(frame, full));
         }
 
         if self.file_picker.is_open() {
-            overlay_rect = self.file_picker.view(frame, full);
+            rects.push(self.file_picker.view(frame, full));
         }
 
         macro_rules! render_if_open {
             ($overlay:expr) => {
                 if $overlay.is_open() {
-                    overlay_rect = $overlay.view(frame, full);
+                    rects.push($overlay.view(frame, full));
                 }
             };
         }
@@ -381,26 +401,25 @@ impl App {
         render_if_open!(self.login_picker);
         render_if_open!(self.mcp_picker);
 
-        overlay_rect
+        rects
     }
 
-    fn render_top_modals(&mut self, frame: &mut Frame, mut overlay_rect: Rect) -> Rect {
+    fn render_top_modals(&mut self, frame: &mut Frame, rects: &mut Vec<Rect>) {
         let full = frame.area();
         let r = self
             .btw_modal
             .view(frame, full, self.theme_provider.generation());
         if r.width > 0 {
-            overlay_rect = r;
+            rects.push(r);
         }
         let r = self.help_modal.view(frame, full);
         if r.width > 0 {
-            overlay_rect = r;
+            rects.push(r);
         }
-        let r = self.float_mgr.view(frame, full);
-        if r.width > 0 {
-            overlay_rect = r;
+        self.float_mgr.view(frame, full);
+        if let Some(rect) = self.float_mgr.focused_rect() {
+            rects.push(rect);
         }
-        overlay_rect
     }
 
     fn render_status_bar(&mut self, frame: &mut Frame, status_area: Rect, render_chat: usize) {

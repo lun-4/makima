@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use crate::AppSession;
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
+use crate::click::{ClickTarget, HitRegistry, ScrollOwner};
 use crate::clipboard::ClipboardState;
 use crate::command_runtime::{CommandRuntime, PreparedCommandTarget};
 use maki_agent::HistorySnapshot;
@@ -421,6 +422,10 @@ pub struct App {
     pub(crate) run_model: Option<String>,
     pub(crate) run_context_window: Option<u32>,
     pub(super) zones: ZoneRegistry,
+    pub(super) hits: HitRegistry,
+    pub(super) pending_click: Option<(ClickTarget, Position)>,
+    scroll_drag: Option<mouse::ScrollDrag>,
+    pub(super) hover: Option<ClickTarget>,
     pub(super) selection_state: Option<SelectionState>,
     middle_scroll: Option<MiddleScroll>,
     pub(super) clipboard: ClipboardState,
@@ -619,6 +624,10 @@ impl App {
             run_model: None,
             run_context_window: None,
             zones: ZoneRegistry::new(),
+            hits: HitRegistry::default(),
+            pending_click: None,
+            scroll_drag: None,
+            hover: None,
             selection_state: None,
             middle_scroll: None,
             clipboard: ClipboardState::new(),
@@ -997,9 +1006,9 @@ impl App {
                 vec![]
             }
             Msg::Mouse(event) => {
-                let dirty = self.handle_mouse(event);
+                let (dirty, actions) = self.handle_mouse(event);
                 self.pending_dirty |= dirty;
-                vec![]
+                actions
             }
             Msg::Scroll { column, row, delta } => {
                 self.handle_scroll(column, row, delta);
@@ -1043,6 +1052,34 @@ impl App {
         } else {
             self.send_answer(answer);
         }
+    }
+
+    pub(super) fn scroll_content_len(&self, _owner: ScrollOwner) -> Option<u16> {
+        None
+    }
+
+    pub(super) fn scroll_line(&self, _owner: ScrollOwner) -> u16 {
+        0
+    }
+
+    pub(super) fn scroll_owner_to(&mut self, _owner: ScrollOwner, _line: u16) {}
+
+    fn dismissible_modal_open(&self) -> bool {
+        self.search_modal.is_open()
+            || self.file_picker.is_open()
+            || self.task_picker.is_open()
+            || self.lua_picker.is_open()
+            || self.rewind_picker.is_open()
+            || self.theme_picker.is_open()
+            || self.model_picker.is_open()
+            || self.login_picker.is_open()
+            || self.mcp_picker.is_open()
+            || self.help_modal.is_open()
+            || self.btw_modal.is_open()
+    }
+
+    pub(super) fn dispatch_click(&mut self, _target: ClickTarget, _pos: Position) -> Vec<Action> {
+        vec![]
     }
 
     fn scroll_at(&mut self, column: u16, row: u16, delta: i32) -> Option<SelectionZone> {
