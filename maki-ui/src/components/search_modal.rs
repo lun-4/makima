@@ -235,11 +235,13 @@ impl SearchModal {
         self.scroll_offset = offset.min(max);
     }
 
-    pub fn select(&mut self, index: usize) {
-        if index < self.matches().len() {
-            self.selected = index;
-            self.ensure_visible();
+    pub fn select(&mut self, index: usize) -> bool {
+        if index >= self.matches().len() {
+            return false;
         }
+        self.selected = index;
+        self.ensure_visible();
+        true
     }
 
     pub fn scroll_to_line(&mut self, line: u16) {

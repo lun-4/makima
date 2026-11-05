@@ -245,8 +245,8 @@ impl LuaPicker {
         self.picker.contains(pos)
     }
 
-    pub fn select(&mut self, index: usize) {
-        self.picker.select(index);
+    pub fn select(&mut self, index: usize) -> bool {
+        self.picker.select(index)
     }
 
     pub fn scroll(&mut self, delta: i32) {

@@ -426,11 +426,16 @@ impl<T: PickerItem> ListPicker<T> {
         self.state = Some(State::new(items));
     }
 
-    pub fn select(&mut self, index: usize) {
-        if let Some(s) = self.state.as_mut() {
-            s.selected = index.min(s.filtered().len().saturating_sub(1));
-            s.ensure_visible();
+    pub fn select(&mut self, index: usize) -> bool {
+        let Some(s) = self.state.as_mut() else {
+            return false;
+        };
+        if index >= s.filtered().len() {
+            return false;
         }
+        s.selected = index;
+        s.ensure_visible();
+        true
     }
 
     pub fn select_item_by(&mut self, predicate: impl Fn(&T) -> bool) -> bool {
@@ -2123,5 +2128,61 @@ mod tests {
             .unwrap();
         let lines = buffer_lines(&terminal, area);
         assert!(lines.iter().any(|l| l.contains("Anthropic 2 models")));
+    }
+
+    struct Sectioned {
+        label: String,
+        section: String,
+    }
+
+    impl PickerItem for Sectioned {
+        fn label(&self) -> &str {
+            &self.label
+        }
+        fn section(&self) -> Option<&str> {
+            Some(&self.section)
+        }
+    }
+
+    #[test]
+    fn item_at_visual_row_skips_section_headers() {
+        let items = vec![
+            Sectioned {
+                label: "a".into(),
+                section: "A".into(),
+            },
+            Sectioned {
+                label: "b".into(),
+                section: "A".into(),
+            },
+            Sectioned {
+                label: "c".into(),
+                section: "B".into(),
+            },
+        ];
+        let filtered = [0, 1, 2];
+        assert_eq!(item_at_visual_row(&filtered, &items, 0), 0);
+        assert_eq!(item_at_visual_row(&filtered, &items, 1), 0);
+        assert_eq!(item_at_visual_row(&filtered, &items, 2), 1);
+        assert_eq!(item_at_visual_row(&filtered, &items, 4), 2);
+        assert_eq!(item_at_visual_row(&filtered, &items, 99), 2);
+    }
+
+    #[test]
+    fn scroll_to_line_converts_visual_rows_to_item_indices() {
+        let mut p = ListPicker::new();
+        p.open(entries(&["a", "b", "c", "d", "e", "f", "g", "h"]), " Test ");
+        ready_state_mut(&mut p).viewport_height = 2;
+        p.scroll_to_line(3);
+        assert_eq!(ready_state(&p).scroll_offset, 3);
+    }
+
+    #[test]
+    fn select_rejects_out_of_range_indices() {
+        let mut p = ListPicker::new();
+        p.open(entries(&["a", "b"]), " Test ");
+        assert!(!p.select(2));
+        assert!(p.select(1));
+        assert_eq!(p.selected_index(), Some(1));
     }
 }

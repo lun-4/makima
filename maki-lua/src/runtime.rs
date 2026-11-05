@@ -5438,10 +5438,26 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                 .lua
                                 .app_data_ref::<ClickRegions>()
                                 .and_then(|regions| regions.function(&rt.lua, id));
-                            if let Some(func) = func
-                                && let Err(e) = func.call::<()>(())
-                            {
-                                tracing::warn!(id, error = %e, "status click failed");
+                            if let Some(func) = func {
+                                let handle = TaskCell::new(CancelToken::none(), None, None)
+                                    .into_handle();
+                                let lua = rt.lua.clone();
+                                let g = Rc::clone(&gate);
+                                ex.spawn(async move {
+                                    let slot = Some(g.acquire().await);
+                                    let call = covered(
+                                        slot,
+                                        ScopedFuture::new(
+                                            lua.clone(),
+                                            handle,
+                                            func.call_async::<()>(()),
+                                        ),
+                                    );
+                                    if let Err(e) = call.await {
+                                        tracing::warn!(id, error = %e, "status click failed");
+                                    }
+                                })
+                                .detach();
                             }
                         }
                         Request::ObserveAgents(manager) => {

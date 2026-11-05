@@ -891,6 +891,9 @@ pub(crate) fn create_ui_table(
         "set_status_content",
         lua.create_function(move |lua, value: mlua::Value| {
             if matches!(value, mlua::Value::Nil) {
+                if let Some(mut regions) = lua.app_data_mut::<ClickRegions>() {
+                    regions.remove_plugin(lua, &p);
+                }
                 let changed = lua
                     .app_data_mut::<StatusContentStore>()
                     .is_some_and(|mut store| store.set(Arc::clone(&p), Vec::new()));
@@ -942,6 +945,11 @@ pub(crate) fn create_ui_table(
                     }
                 };
                 content.push(crate::api::util::command::StatusEntry { text, style, click });
+            }
+            if content.is_empty()
+                && let Some(mut regions) = lua.app_data_mut::<ClickRegions>()
+            {
+                regions.remove_plugin(lua, &p);
             }
             if let Some(mut regions) = lua.app_data_mut::<ClickRegions>() {
                 let len = content.len();

@@ -195,6 +195,13 @@ impl App {
                 .hits
                 .target_at(pos)
                 .filter(|target| Self::is_modal_target(*target));
+            if let Some(ClickTarget::Scrollbar(owner)) = target
+                && self.hits.inside_modal(pos)
+            {
+                self.pending_click = None;
+                self.start_scroll_drag(owner, pos);
+                return Dirty::NO;
+            }
             self.pending_click = target.map(|target| (target, pos));
             if self.hits.inside_modal(pos) {
                 self.start_selection(pos);
@@ -203,6 +210,17 @@ impl App {
         }
 
         let target = self.hits.target_at(pos);
+        if self.menu.is_open() {
+            let owns = matches!(target, Some(ClickTarget::MenuRow(_)))
+                || (self.menu.kind() == Some(crate::components::menu::MenuKind::Mode)
+                    && target == Some(ClickTarget::ModeChip))
+                || (self.menu.kind() == Some(crate::components::menu::MenuKind::Thinking)
+                    && target == Some(ClickTarget::ThinkingChip));
+            if !owns {
+                self.menu.close();
+                return Dirty::NO;
+            }
+        }
         if let Some(ClickTarget::Scrollbar(owner)) = target {
             self.pending_click = None;
             self.start_scroll_drag(owner, pos);
@@ -332,7 +350,7 @@ impl App {
             area: rect,
             content_len,
             grab,
-            chat: self.active_chat,
+            chat: self.resolve_render_chat(),
         });
         self.scroll_owner_to(owner, line);
     }
@@ -357,7 +375,7 @@ impl App {
 
     pub(super) fn validate_scroll_drag(&mut self) -> Dirty {
         let invalid = self.scroll_drag.as_ref().is_some_and(|drag| {
-            drag.chat != self.active_chat
+            drag.chat != self.resolve_render_chat()
                 || self
                     .hits
                     .rect_of(ClickTarget::Scrollbar(drag.owner))

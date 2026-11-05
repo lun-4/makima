@@ -397,6 +397,8 @@ impl App {
             && let Some(rect) = layout.splits.rect(Split::Below)
         {
             self.float_mgr.view_split(frame, Split::Below, rect);
+            let hits = self.float_mgr.hits();
+            self.absorb_hits(hits);
         }
     }
 

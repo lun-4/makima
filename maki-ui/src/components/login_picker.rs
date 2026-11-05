@@ -844,9 +844,8 @@ impl LoginPicker {
             Step::PickProvider(picker) => picker.select(index),
             Step::PickPlan { picker, .. } => picker.select(index),
             Step::CustomProtocol { picker, .. } => picker.select(index),
-            _ => return false,
+            _ => false,
         }
-        true
     }
 
     pub fn hits(&self) -> Vec<HitTarget> {

@@ -1065,7 +1065,7 @@ impl App {
 
     pub(super) fn scroll_content_len(&self, owner: ScrollOwner) -> Option<u16> {
         match owner {
-            ScrollOwner::Messages => Some(self.chats[self.active_chat].content_len()),
+            ScrollOwner::Messages => Some(self.chats[self.resolve_render_chat()].content_len()),
             ScrollOwner::Input => Some(self.input_box.content_len()),
             ScrollOwner::Picker(picker) => match picker {
                 PickerId::Model => self.model_picker.content_len(),
@@ -1099,7 +1099,7 @@ impl App {
 
     pub(super) fn scroll_line(&self, owner: ScrollOwner) -> u16 {
         match owner {
-            ScrollOwner::Messages => self.chats[self.active_chat].scroll_top(),
+            ScrollOwner::Messages => self.chats[self.resolve_render_chat()].scroll_top(),
             ScrollOwner::Input => self.input_box.scroll_y(),
             ScrollOwner::Picker(picker) => match picker {
                 PickerId::Model => self.model_picker.scroll_line().unwrap_or(0),
@@ -1119,8 +1119,9 @@ impl App {
     }
 
     pub(super) fn scroll_owner_to(&mut self, owner: ScrollOwner, line: u16) {
+        let chat = self.resolve_render_chat();
         match owner {
-            ScrollOwner::Messages => self.chats[self.active_chat].scroll_to_line(line),
+            ScrollOwner::Messages => self.chats[chat].scroll_to_line(line),
             ScrollOwner::Input => self.input_box.scroll_to_line(line),
             ScrollOwner::Picker(picker) => match picker {
                 PickerId::Model => self.model_picker.scroll_to_line(line),
@@ -1140,6 +1141,9 @@ impl App {
     }
 
     fn dismissible_modal_open(&self) -> bool {
+        if self.float_mgr.is_focused() {
+            return false;
+        }
         self.search_modal.is_open()
             || self.file_picker.is_open()
             || self.task_picker.is_open()
@@ -1251,13 +1255,12 @@ impl App {
             PickerId::Task => self.task_picker.select(index),
             PickerId::Theme => self.theme_picker.select(index),
             PickerId::Rewind => self.rewind_picker.select(index),
-            PickerId::Login => return self.login_picker.click_row(index),
+            PickerId::Login => self.login_picker.click_row(index),
             PickerId::Mcp => self.mcp_picker.select(index),
             PickerId::Lua => self.lua_picker.select(index),
             PickerId::Search => self.search_modal.select(index),
             PickerId::File => self.file_picker.select(index),
         }
-        true
     }
 
     fn apply_menu_action(&mut self, action: MenuAction) -> Vec<Action> {

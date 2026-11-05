@@ -348,12 +348,16 @@ impl FilePickerModal {
         (dirty, None)
     }
 
-    pub fn select(&mut self, index: usize) {
-        let Some(s) = &mut self.session else { return };
-        if index < s.matches.len() {
-            s.selected = index;
-            ensure_visible(s);
+    pub fn select(&mut self, index: usize) -> bool {
+        let Some(s) = &mut self.session else {
+            return false;
+        };
+        if index >= s.matches.len() {
+            return false;
         }
+        s.selected = index;
+        ensure_visible(s);
+        true
     }
 
     pub fn scroll_to_line(&mut self, line: u16) {
