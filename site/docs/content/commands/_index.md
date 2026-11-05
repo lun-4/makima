@@ -76,7 +76,7 @@ Sessions run concurrently. `/new` starts a fresh session while the old one keeps
 
 - **`/yolo`**: skip permission prompts for this session (deny rules still apply). Config: `always_yolo = true`.
 - **`/thinking`**: bare opens the selector; an optional setting applies and persists the default. Completion lists the finite options supplied by the host. Positive numeric token budgets are accepted as arguments but are not suggested. Config: `always_thinking`.
-- **`/fast`**: faster responses on Anthropic Opus, and on eligible Codex models when you sign in with a ChatGPT subscription. OpenAI API keys and every other model ignore it. Config: `always_fast = true`.
+- **`/fast`**: toggle fast mode when the selected model reports support for it. Availability can depend on the provider, model, and signed-in account. Config: `always_fast = true`.
 - **`/workflow`**: let `code_execution` call the task tools (and other workflow-only tools) from inside the Python sandbox. Config: `always_workflow = true`.
 - **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only).
 - **`/reload`**: rebuild plugins and config without leaving the app.

@@ -384,7 +384,7 @@ enable_free_models = true
 
 Zen and Go both read it from `[opencode]`.
 
-Zen also takes `<catalog provider>/<model>` ids and sends them to that provider.
+Zen also takes `<catalog provider>/<model>` ids and sends them to that provider. A delegated model reads the catalog provider's API key from its environment variable. Saved credentials are provider-scoped: `makima auth login nvidia`, for example, configures the direct NVIDIA provider and does not configure `opencode/nvidia/<model>`. Set the delegated provider's environment variable separately. It can contain the same API key.
 
 ### Opencode Go
 

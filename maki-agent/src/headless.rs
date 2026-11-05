@@ -1232,7 +1232,10 @@ pub(crate) mod tests {
         requests: flume::Sender<(&'static str, String, String, bool)>,
     }
 
-    struct EndRecordingProvider(flume::Sender<(String, ConversationEnd)>);
+    struct EndRecordingProvider {
+        requests: flume::Sender<Arc<str>>,
+        ended: flume::Sender<(String, ConversationEnd)>,
+    }
 
     impl Provider for EndRecordingProvider {
         fn stream_message<'a>(
@@ -1244,9 +1247,10 @@ pub(crate) mod tests {
             _: &'a flume::Sender<maki_providers::ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
-            _: &'a Invocation,
+            invocation: &'a Invocation,
         ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
-            Box::pin(async { unreachable!() })
+            let _ = self.requests.send(Arc::clone(&invocation.conversation_id));
+            Box::pin(async { Ok(response(SAVED_OUTPUT)) })
         }
 
         fn end_conversation(
@@ -1254,7 +1258,7 @@ pub(crate) mod tests {
             conversation_id: &str,
             reason: ConversationEnd,
         ) -> BoxFuture<'_, ()> {
-            let _ = self.0.send((conversation_id.to_owned(), reason));
+            let _ = self.ended.send((conversation_id.to_owned(), reason));
             Box::pin(async {})
         }
     }
@@ -1786,12 +1790,16 @@ pub(crate) mod tests {
                     }) as CheckpointFuture
                 },
             );
+            let (_requests_tx, requests_rx) = flume::unbounded();
             let (ended_tx, ended_rx) = flume::unbounded();
             let history = vec![Message::user("kept".into())];
             let (handle, coordinator) = fixture(
                 history.clone(),
                 checkpoint,
-                Arc::new(EndRecordingProvider(ended_tx)),
+                Arc::new(EndRecordingProvider {
+                    requests: _requests_tx,
+                    ended: ended_tx,
+                }),
             );
             let root = handle.initialized_root().await.unwrap();
             let (reply, response) = flume::bounded(1);
@@ -1806,6 +1814,44 @@ pub(crate) mod tests {
             let attempted = bounded(attempted_rx.recv_async()).await.unwrap();
             assert!(attempted.messages.is_empty());
             assert_eq!(root.actor().unwrap().committed_history().as_ref(), &history);
+            assert!(requests_rx.is_empty());
+            assert!(ended_rx.is_empty());
+            handle.task.cancel().await;
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn successful_reset_closes_the_sent_conversation() {
+        smol::block_on(async {
+            let (requests_tx, requests_rx) = flume::unbounded();
+            let (ended_tx, ended_rx) = flume::unbounded();
+            let (handle, coordinator) = fixture(
+                Vec::new(),
+                checkpoint(),
+                Arc::new(EndRecordingProvider {
+                    requests: requests_tx,
+                    ended: ended_tx,
+                }),
+            );
+            let root = handle.initialized_root().await.unwrap();
+            let turn = handle.input_tx.admit(first_input()).await.unwrap();
+            bounded(turn.wait()).await;
+            let sent = bounded(requests_rx.recv_async()).await.unwrap();
+            let (reply, response) = flume::bounded(1);
+
+            handle
+                .control_tx
+                .send(InteractiveControl::Reset(reply))
+                .await
+                .unwrap();
+
+            bounded(response.recv_async()).await.unwrap().unwrap();
+            assert_eq!(root.actor().unwrap().committed_message_count(), 0);
+            assert_eq!(
+                bounded(ended_rx.recv_async()).await.unwrap(),
+                (sent.to_string(), ConversationEnd::Closed)
+            );
             assert!(ended_rx.is_empty());
             handle.task.cancel().await;
             coordinator.close().await.unwrap();
