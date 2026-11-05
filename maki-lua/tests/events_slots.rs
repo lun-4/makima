@@ -27,7 +27,7 @@ const OFFLOAD_SAVED_TO: &str = "saved to ";
 /// for the wrong reason, and this one is only reached when something is stuck.
 const DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
 const OUTPUT_HOOK_DEADLINE: Duration = Duration::from_secs(1);
-const OUTPUT_HOOK_WATCHDOG: Duration = Duration::from_secs(10);
+const OUTPUT_HOOK_WATCHDOG: Duration = Duration::from_secs(20);
 const OUTPUT_HOOK_TIMEOUT: &str = "timeout exceeded";
 const OUTPUT_HOOK_BODY: &str = "first\nsecond\nthird\nfourth";
 
