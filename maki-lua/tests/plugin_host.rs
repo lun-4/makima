@@ -6861,8 +6861,11 @@ fn cancelled_output_hook_does_not_offload_raw_output() {
 const BASH_TIMEOUT_SENTINEL: &str = "timeout-cleanup-sentinel";
 #[cfg(unix)]
 const BASH_TIMEOUT_REDACTED: &str = "filtered-timeout-cleanup";
+/// The cut races the shell's startup and first print on the wall clock, so
+/// this is headroom for a starved CI box, not a wait the test wants: it is
+/// what the test costs on every run.
 #[cfg(unix)]
-const BASH_TIMEOUT_TRAILER: &str = "[timed out after 1s; output above is partial]";
+const BASH_TIMEOUT_SECS: u64 = 5;
 #[cfg(unix)]
 const BASH_CANCEL_OUTPUT_BYTES: usize = 60 * 1024;
 
@@ -6894,7 +6897,7 @@ fn timed_out_bash_keeps_hooked_partial_output_offloaded() {
         tool_dispatch::run(
             OFFLOAD_HOOK_ID.to_owned(),
             "bash",
-            &json!({ "command": command, "timeout": 1 }),
+            &json!({ "command": command, "timeout": BASH_TIMEOUT_SECS }),
             &ctx,
             CallOrigin::Nested,
         ),
@@ -6905,7 +6908,8 @@ fn timed_out_bash_keeps_hooked_partial_output_offloaded() {
     ));
     let output = done.output.as_text();
     assert!(done.is_error, "{output}");
-    assert!(output.ends_with(BASH_TIMEOUT_TRAILER), "{output}");
+    let trailer = format!("[timed out after {BASH_TIMEOUT_SECS}s; output above is partial]");
+    assert!(output.ends_with(&trailer), "{output}");
     let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
     assert_eq!(files.len(), 1);
     let saved = std::fs::read_to_string(files[0].as_ref().unwrap().path()).unwrap();
