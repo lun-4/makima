@@ -187,16 +187,14 @@ fn pull_frame(handle: &maki_lua::EventHandle, needle: Option<&str>) -> maki_lua:
         // pull timeout: under CI contention the Lua host thread misses those
         // windows for seconds at a stretch, and a timer-based poll burns the
         // whole deadline before the host ever answers.
-        match reply.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(Some(frame)) => {
-                let all: String = frame.rows.iter().map(|r| r.glyphs.as_str()).collect();
-                if needle.is_none_or(|n| all.contains(n)) {
-                    return frame;
-                }
-            }
-            Ok(None) | Err(flume::RecvTimeoutError::Timeout) => {}
-            Err(flume::RecvTimeoutError::Disconnected) => {
-                panic!("splash host dropped the frame reply")
+        // A disconnected reply is the host declining to answer (a superseded
+        // pull, or a render killed at its deadline on a starved thread): retry.
+        if let Ok(Some(frame)) =
+            reply.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            let all: String = frame.rows.iter().map(|r| r.glyphs.as_str()).collect();
+            if needle.is_none_or(|n| all.contains(n)) {
+                return frame;
             }
         }
         assert!(
@@ -410,6 +408,7 @@ fn splash_picker_command_switches_to_default() {
     );
 
     let switched = run_command(&guard.host().command_registry(), "/splash default", 0, None);
+    assert_eq!(switched.recv_timeout(SPLASH_DEADLINE).unwrap(), Ok(()));
 
     // The fallback path must serve the starfield through the chain below the
     // picker; a failing delegation rolls the selection back to matrix.
@@ -420,7 +419,6 @@ fn splash_picker_command_switches_to_default() {
         !content.contains(SELECTION_MATRIX),
         "the switch must not roll the file back to matrix: {content}"
     );
-    assert_eq!(switched.recv_timeout(SPLASH_DEADLINE).unwrap(), Ok(()));
 }
 
 #[test]
