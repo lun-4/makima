@@ -36,7 +36,8 @@ t.case("build_request", function()
     },
     tools = {
       { name = "search", description = "find", input_schema = maki.json.decode('["x"]') },
-      { name = "hidden", input_schema = { type = "object" } },
+      { name = "empty", description = "", input_schema = { type = "object" } },
+      { input_schema = { type = "object" } },
     },
   }, { max_tokens_field = "max_completion_tokens", include_stream_usage = true })
   t.same(body, {
@@ -67,6 +68,10 @@ t.case("build_request", function()
       {
         type = "function",
         ["function"] = { name = "search", description = "find", parameters = { type = "object", properties = {} } },
+      },
+      {
+        type = "function",
+        ["function"] = { name = "empty", description = "", parameters = { type = "object" } },
       },
     },
   })

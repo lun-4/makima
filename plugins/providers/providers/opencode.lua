@@ -103,7 +103,8 @@ end
 -- environment. The Opencode context cannot access another provider's saved
 -- credentials and must never substitute its own.
 local function delegate(ctx, config, sub, entry, model_id)
-  local keys, key_err = http.env_api_keys({ id = sub }, catalog.env_name(entry.env or {}))
+  local env = catalog.env_name(type(entry.env) == "table" and entry.env or {})
+  local keys, key_err = http.env_api_keys({ id = sub }, env)
   if not keys then
     return nil, key_err
   end

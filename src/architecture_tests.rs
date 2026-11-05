@@ -48,7 +48,9 @@ const PROVIDER_IDS: &[&str] = &[
     "mistral",
     "ollama",
     "openai",
+    "openai-codex",
     "opencode",
+    "opencode-go",
     "openrouter",
     "regolo",
     "requesty",
@@ -60,7 +62,11 @@ const PROVIDER_IDS: &[&str] = &[
 const VENDOR_MODEL_PREFIXES: &[&str] = &["claude-", "gpt-", "gemini-"];
 const VENDOR_ENV_PREFIXES: &[&str] = &["AWS_", "CLAUDE_", "GEMINI_"];
 const PROVIDER_MODULES: &str = "plugins/providers/providers";
-const SHARED_HOSTS: &[&str] = &["github.com", "localhost", "makima.ln4.net", "maki.sh"];
+const SHARED_HOSTS: &[&str] = &["localhost", "makima.ln4.net", "maki.sh"];
+const NON_PROVIDER_HOST_VALUES: &[&str] = &[
+    "Rewrite bash commands with [rtk](https://github.com/rtk-ai/rtk) when it is installed",
+    "https://api.github.com/repos/lun-4/makima/releases/latest",
+];
 const URL_SCHEMES: &[&str] = &["https://", "http://"];
 const FORBIDDEN_ACP_COMMANDS: &[&str] = &[
     "/compact",
@@ -201,6 +207,8 @@ fn provider_knowledge(value: &str, hosts: &[String]) -> Option<String> {
         .find(|p| value.contains(p.as_str()))
     {
         Some(format!("env var prefix `{prefix}`"))
+    } else if NON_PROVIDER_HOST_VALUES.contains(&value) {
+        None
     } else {
         hosts
             .iter()

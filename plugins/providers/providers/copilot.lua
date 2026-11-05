@@ -310,7 +310,7 @@ local function connect(ctx, state)
   end
   local auth, err = M.token(ctx)
   if not auth then
-    return nil, err or http.config_error(M.NOT_AUTHENTICATED)
+    return nil, err or http.config_error(M.NOT_AUTHENTICATED), err == nil
   end
   auth.endpoint = discover_endpoint(ctx, auth)
   state.auth = auth
@@ -533,9 +533,9 @@ function M.provider()
       if not state then
         return nil, err
       end
-      local auth, auth_err = connect(ctx, state)
+      local auth, auth_err, missing = connect(ctx, state)
       if not auth then
-        if auth_err and http.message(auth_err) ~= M.NOT_AUTHENTICATED then
+        if not missing then
           return nil, auth_err
         end
         return compat.descriptors(M.def)

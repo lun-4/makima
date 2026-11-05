@@ -92,7 +92,7 @@ function M.env_api_keys(ctx, env_var)
     return keys, "env"
   end
   local missing = env_var and env_var .. " not set" or "no API key environment variable"
-  return nil, M.config_error(string.format("%s for '%s'; run `makima auth login %s`", missing, ctx.id, ctx.id))
+  return nil, M.config_error(string.format("%s for '%s'", missing, ctx.id))
 end
 
 -- Keys in precedence order: {env_var} (or `config.api_key_env`) as a

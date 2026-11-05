@@ -75,17 +75,13 @@ impl InteractionService for TerminalInteraction {
                 secret: true,
                 default,
             } = &request
-                && use_raw_secret_input(io::stdin().is_terminal())
+                && io::stdin().is_terminal()
             {
                 return terminal_secret_input(prompt, default.clone());
             }
             terminal_interact(request, &mut io::stdin().lock(), &mut io::stdout())
         }))
     }
-}
-
-fn use_raw_secret_input(stdin_is_terminal: bool) -> bool {
-    stdin_is_terminal
 }
 
 /// End of input counts as backing out.
@@ -606,7 +602,6 @@ mod tests {
         };
         let mut out = Vec::new();
 
-        assert!(!use_raw_secret_input(false));
         let answer = terminal_interact(request, &mut Cursor::new("piped-key\n"), &mut out).unwrap();
         let shown = String::from_utf8(out).unwrap();
 
