@@ -26,7 +26,7 @@ use crate::components::Overlay;
 use crate::components::coherent_completion::{CoherentCompletion, Publication};
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
-use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::scrollbar::{ScrollbarHit, render_vertical_scrollbar};
 use crate::repaint::{Cadence, Dirty};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
@@ -86,6 +86,7 @@ impl Drop for Session {
 }
 
 pub struct FilePickerModal {
+    scrollbar_hit: Option<ScrollbarHit>,
     session: Option<Session>,
 }
 
@@ -159,7 +160,10 @@ pub(super) fn spawn_file_walker(
 
 impl FilePickerModal {
     pub fn new() -> Self {
-        Self { session: None }
+        Self {
+            scrollbar_hit: None,
+            session: None,
+        }
     }
 
     pub fn open(&mut self, cwd: &str) {
@@ -341,10 +345,35 @@ impl FilePickerModal {
         (dirty, None)
     }
 
+    pub fn scroll_to_line(&mut self, line: u16) {
+        let Some(s) = &mut self.session else { return };
+        let content_len = s.matches.len() + usize::from(s.truncated);
+        let max = content_len.saturating_sub(s.viewport_height);
+        s.scroll_offset = (line as usize).min(max);
+        s.selected = s.selected.min(s.matches.len().saturating_sub(1));
+    }
+
+    pub fn scrollbar_hit(&self) -> Option<ScrollbarHit> {
+        self.scrollbar_hit
+    }
+
+    pub fn scroll_line(&self) -> u16 {
+        self.session.as_ref().map_or(0, |s| s.scroll_offset as u16)
+    }
+
+    pub fn content_len(&self) -> Option<u16> {
+        self.session
+            .as_ref()
+            .map(|s| (s.matches.len() + usize::from(s.truncated)) as u16)
+    }
+
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
         let s = match &mut self.session {
             Some(s) if s.visible => s,
-            _ => return Rect::default(),
+            _ => {
+                self.scrollbar_hit = None;
+                return Rect::default();
+            }
         };
 
         let match_count = s.matches.len() as u16;
@@ -374,9 +403,12 @@ impl FilePickerModal {
         render_list(frame, list_area, s);
         render_search(frame, search_area, s);
 
-        if match_count > s.viewport_height as u16 {
-            render_vertical_scrollbar(frame, list_area, match_count, s.scroll_offset as u16);
-        }
+        let content_len = s.matches.len() + usize::from(s.truncated);
+        self.scrollbar_hit = if content_len > s.viewport_height {
+            render_vertical_scrollbar(frame, list_area, content_len as u16, s.scroll_offset as u16)
+        } else {
+            None
+        };
 
         popup
     }
@@ -481,8 +513,9 @@ fn clamp_selection(s: &mut Session) {
 
 fn ensure_visible(s: &mut Session) {
     let len = s.matches.len();
-    if len > s.viewport_height {
-        s.scroll_offset = s.scroll_offset.min(len - s.viewport_height);
+    let content_len = len + usize::from(s.truncated);
+    if content_len > s.viewport_height {
+        s.scroll_offset = s.scroll_offset.min(content_len - s.viewport_height);
     } else {
         s.scroll_offset = 0;
     }
@@ -507,7 +540,8 @@ fn render_list(frame: &mut Frame, area: Rect, s: &Session) {
         return;
     }
 
-    let at_bottom = s.scroll_offset + s.viewport_height >= s.matches.len();
+    let content_len = s.matches.len() + usize::from(s.truncated);
+    let at_bottom = s.scroll_offset + s.viewport_height >= content_len;
     let hint_row = usize::from(s.truncated && at_bottom);
     let visible_rows = s.viewport_height - hint_row;
 
@@ -997,7 +1031,7 @@ mod tests {
         let mut picker = picker_with_matches(MAX_MATERIALIZED as usize);
         let session = picker.session.as_mut().unwrap();
         session.viewport_height = 10;
-        session.scroll_offset = MAX_MATERIALIZED as usize - session.viewport_height;
+        session.scroll_offset = MAX_MATERIALIZED as usize + 1 - session.viewport_height;
         session.truncated = true;
         session.coarse_match_count = MAX_MATERIALIZED + 3;
         session.materialized_count = MAX_MATERIALIZED;

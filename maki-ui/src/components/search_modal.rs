@@ -4,14 +4,14 @@ use crate::components::Overlay;
 use crate::components::coherent_completion::Published;
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
-use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::scrollbar::{ScrollbarHit, render_vertical_scrollbar};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 use crossterm::event::{KeyCode, KeyEvent};
 use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -46,6 +46,8 @@ pub struct SearchModal {
     viewport_height: usize,
     open: bool,
     saved_scroll: Option<(u16, bool)>,
+    scrollbar_hit: Option<ScrollbarHit>,
+    popup: Rect,
     matcher: Matcher,
 }
 
@@ -59,6 +61,8 @@ impl SearchModal {
             viewport_height: 0,
             open: false,
             saved_scroll: None,
+            scrollbar_hit: None,
+            popup: Rect::default(),
             matcher: Matcher::new(Config::DEFAULT),
         }
     }
@@ -213,7 +217,41 @@ impl SearchModal {
         self.matches().get(self.selected).map(|m| m.segment_index)
     }
 
+    pub fn contains(&self, pos: Position) -> bool {
+        self.open && self.popup.contains(pos)
+    }
+
+    pub fn scroll(&mut self, delta: i32) {
+        let max = self.matches().len().saturating_sub(self.viewport_height);
+        let offset = if delta > 0 {
+            self.scroll_offset.saturating_sub(delta as usize)
+        } else {
+            self.scroll_offset
+                .saturating_add(delta.unsigned_abs() as usize)
+        };
+        self.scroll_offset = offset.min(max);
+    }
+
+    pub fn scroll_to_line(&mut self, line: u16) {
+        let max = self.matches().len().saturating_sub(self.viewport_height) as u16;
+        self.scroll_offset = line.min(max) as usize;
+    }
+
+    pub fn scrollbar_hit(&self) -> Option<ScrollbarHit> {
+        self.scrollbar_hit
+    }
+
+    pub fn content_len(&self) -> u16 {
+        self.matches().len() as u16
+    }
+
+    pub fn scroll_line(&self) -> u16 {
+        self.scroll_offset as u16
+    }
+
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        self.scrollbar_hit = None;
+        self.popup = Rect::default();
         if !self.open {
             return Rect::default();
         }
@@ -230,6 +268,7 @@ impl SearchModal {
             max_height_percent: MODAL_MAX_HEIGHT_PERCENT,
         };
         let (popup, inner) = modal.render(frame, area, content_rows + SEARCH_ROW);
+        self.popup = popup;
         let viewport_h = inner.height.saturating_sub(SEARCH_ROW) as usize;
         self.viewport_height = viewport_h;
 
@@ -241,7 +280,8 @@ impl SearchModal {
 
         let total = self.matches().len() as u16;
         if total > viewport_h as u16 {
-            render_vertical_scrollbar(frame, list_area, total, self.scroll_offset as u16);
+            self.scrollbar_hit =
+                render_vertical_scrollbar(frame, list_area, total, self.scroll_offset as u16);
         }
 
         popup

@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Wrap;
@@ -19,6 +19,7 @@ use maki_storage::auth::{
 };
 use maki_storage::model::persist_model;
 
+use crate::click::{HitTarget, PickerId};
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::modal::Modal;
@@ -301,7 +302,7 @@ impl LoginPicker {
         });
 
         self.provider_items = items.clone();
-        let mut picker = ListPicker::new();
+        let mut picker = ListPicker::new().with_picker(PickerId::Login);
         picker.open(items, TITLE);
         self.storage = Some(storage);
         self.step = Step::PickProvider(picker);
@@ -709,7 +710,7 @@ impl LoginPicker {
                     })
                     .collect();
                 let display = providers::resolve_display_name(&slug, None);
-                let mut plan_picker = ListPicker::new();
+                let mut plan_picker = ListPicker::new().with_picker(PickerId::Login);
                 plan_picker.open(plan_items, format!(" {display} plan "));
                 self.step = Step::PickPlan {
                     picker: plan_picker,
@@ -728,7 +729,7 @@ impl LoginPicker {
                     .iter()
                     .map(|(name, display)| ProtocolItem(name, display))
                     .collect();
-                let mut picker = ListPicker::new();
+                let mut picker = ListPicker::new().with_picker(PickerId::Login);
                 picker.open(items, " Protocol ");
                 self.step = Step::CustomProtocol { picker, slug };
                 LoginPickerAction::Consumed
@@ -764,7 +765,7 @@ impl LoginPicker {
                 }
             }
             StepAction::Back => {
-                let mut picker = ListPicker::new();
+                let mut picker = ListPicker::new().with_picker(PickerId::Login);
                 picker.open(self.provider_items.clone(), TITLE);
                 self.step = Step::PickProvider(picker);
                 LoginPickerAction::Consumed
@@ -817,6 +818,60 @@ impl LoginPicker {
     fn abort_codex(&mut self) {
         if let Step::CodexWaiting { abort, .. } = &self.step {
             abort.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub fn scroll(&mut self, delta: i32) {
+        match &mut self.step {
+            Step::PickProvider(picker) => picker.scroll(delta),
+            Step::PickPlan { picker, .. } => picker.scroll(delta),
+            Step::CustomProtocol { picker, .. } => picker.scroll(delta),
+            _ => {}
+        }
+    }
+
+    pub fn contains(&self, pos: Position) -> bool {
+        match &self.step {
+            Step::PickProvider(picker) => picker.contains(pos),
+            Step::PickPlan { picker, .. } => picker.contains(pos),
+            Step::CustomProtocol { picker, .. } => picker.contains(pos),
+            _ => false,
+        }
+    }
+
+    pub fn hits(&self) -> Vec<HitTarget> {
+        match &self.step {
+            Step::PickProvider(picker) => picker.hits(),
+            Step::PickPlan { picker, .. } => picker.hits(),
+            Step::CustomProtocol { picker, .. } => picker.hits(),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn scroll_line(&self) -> Option<u16> {
+        match &self.step {
+            Step::PickProvider(picker) => Some(picker.scroll_line()),
+            Step::PickPlan { picker, .. } => Some(picker.scroll_line()),
+            Step::CustomProtocol { picker, .. } => Some(picker.scroll_line()),
+            _ => None,
+        }
+    }
+
+    pub fn content_len(&self) -> Option<u16> {
+        match &self.step {
+            Step::PickProvider(picker) => picker.content_len(),
+            Step::PickPlan { picker, .. } => picker.content_len(),
+            Step::CustomProtocol { picker, .. } => picker.content_len(),
+            _ => None,
+        }
+    }
+
+    pub fn scroll_to_line(&mut self, line: u16) {
+        match &mut self.step {
+            Step::PickProvider(picker) => picker.scroll_to_line(line),
+            Step::PickPlan { picker, .. } => picker.scroll_to_line(line),
+            Step::CustomProtocol { picker, .. } => picker.scroll_to_line(line),
+            _ => {}
         }
     }
 
@@ -1058,7 +1113,7 @@ mod tests {
     #[test]
     fn vertex_picker_shows_adc_instructions() {
         let mut picker = LoginPicker {
-            step: Step::PickProvider(ListPicker::new()),
+            step: Step::PickProvider(ListPicker::new().with_picker(PickerId::Login)),
             provider_items: Vec::new(),
             storage: None,
         };

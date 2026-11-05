@@ -9,8 +9,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use crate::animation::{animation_elapsed_ms, spinner_str};
+use crate::click::{ClickTarget, HitTarget, ScrollOwner};
 use crate::components::Overlay;
-use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::scrollbar::{ScrollbarHit, render_vertical_scrollbar};
 use crate::components::split_layout::SplitReq;
 use crate::components::tool_display::{
     SPINNER_STYLE_NAME, SPINNER_STYLE_PREFIX, resolve_span_style,
@@ -74,6 +75,7 @@ struct FloatWindow {
     /// scroll math stays consistent between frames.
     viewport_h: u16,
     last_content: Rect,
+    scrollbar_hit: Option<ScrollbarHit>,
     cursor: usize,
     visible: bool,
     event_tx: flume::Sender<WinEvent>,
@@ -220,6 +222,7 @@ impl FloatManager {
             cached_lines,
             viewport_h: 1,
             last_content: Rect::default(),
+            scrollbar_hit: None,
             cursor: 0,
             visible,
             event_tx,
@@ -424,6 +427,47 @@ impl FloatManager {
         self.focused_rect
     }
 
+    fn focused_window(&self) -> Option<&FloatWindow> {
+        let id = self.focused_id?;
+        self.windows.iter().find(|w| w.id == id)
+    }
+
+    pub fn hits(&self) -> Vec<HitTarget> {
+        let Some(win) = self.focused_window() else {
+            return Vec::new();
+        };
+        win.scrollbar_hit
+            .map(|hit| {
+                vec![HitTarget {
+                    rect: hit.area,
+                    target: ClickTarget::Scrollbar(ScrollOwner::Float(win.id)),
+                }]
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn scroll_line(&self, id: u32) -> Option<u16> {
+        self.windows
+            .iter()
+            .find(|w| w.id == id)
+            .map(|w| w.scroll_offset as u16)
+    }
+
+    pub fn content_len(&self, id: u32) -> Option<u16> {
+        self.windows
+            .iter()
+            .find(|w| w.id == id)
+            .map(|w| w.layout().scrollable as u16)
+    }
+
+    pub fn scroll_to_line(&mut self, id: u32, line: u16) {
+        let Some(win) = self.windows.iter_mut().find(|w| w.id == id) else {
+            return;
+        };
+        let max_offset = win.layout().max_offset(win.viewport_h);
+        win.scroll_offset = (line as usize).min(max_offset);
+    }
+
     pub fn panel_reqs(&self) -> Vec<(usize, u16)> {
         let mut reqs: Vec<(usize, u16)> = self
             .windows
@@ -568,14 +612,16 @@ impl FloatManager {
             frame.render_widget(Paragraph::new(pinned), pa);
         }
 
-        if scrollable as u16 > win.viewport_h {
+        win.scrollbar_hit = if scrollable as u16 > win.viewport_h {
             render_vertical_scrollbar(
                 frame,
                 scroll_area,
                 scrollable as u16,
                 win.scroll_offset as u16,
-            );
-        }
+            )
+        } else {
+            None
+        };
 
         if Some(win.id) == self.focused_id {
             self.focused_rect = Some(popup);
@@ -1869,6 +1915,7 @@ mod tests {
             cached_lines,
             viewport_h: 1,
             last_content: Rect::default(),
+            scrollbar_hit: None,
             cursor: 0,
             visible: true,
             event_tx,

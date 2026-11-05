@@ -7,12 +7,13 @@ use maki_match::{
 use nucleo_matcher::pattern::{CaseMatching, Normalization};
 
 use crate::animation::{animation_elapsed_ms, spinner_str};
+use crate::click::{ClickTarget, HitTarget, PickerId, ScrollOwner};
 use crate::components::Overlay;
 use crate::components::coherent_completion::Published;
 use crate::components::is_ctrl;
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
-use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::scrollbar::{ScrollbarHit, render_vertical_scrollbar};
 use crate::repaint::Cadence;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
@@ -83,6 +84,8 @@ enum Footer {
 
 pub struct ListPicker<T> {
     state: Option<State<T>>,
+    picker: Option<PickerId>,
+    scrollbar_hit: Option<ScrollbarHit>,
     title: String,
     max_visible: Option<u16>,
     footer: Option<Footer>,
@@ -358,6 +361,8 @@ impl<T: PickerItem> ListPicker<T> {
     pub fn new() -> Self {
         Self {
             state: None,
+            picker: None,
+            scrollbar_hit: None,
             title: String::new(),
             max_visible: None,
             footer: None,
@@ -694,8 +699,8 @@ impl<T: PickerItem> ListPicker<T> {
             Footer::Builder(build) => build(),
             Footer::Static(line) => line.clone(),
         });
-        match self.state.as_mut() {
-            None => Rect::default(),
+        let rendered = match self.state.as_mut() {
+            None => (Rect::default(), None),
             Some(s) => render_ready(
                 frame,
                 area,
@@ -705,7 +710,49 @@ impl<T: PickerItem> ListPicker<T> {
                 footer,
                 self.error_text.as_deref(),
             ),
+        };
+        self.scrollbar_hit = rendered.1;
+        rendered.0
+    }
+
+    pub fn with_picker(mut self, picker: PickerId) -> Self {
+        self.picker = Some(picker);
+        self
+    }
+
+    pub fn hits(&self) -> Vec<HitTarget> {
+        match (self.picker, self.scrollbar_hit) {
+            (Some(picker), Some(hit)) => vec![HitTarget {
+                rect: hit.area,
+                target: ClickTarget::Scrollbar(ScrollOwner::Picker(picker)),
+            }],
+            _ => Vec::new(),
         }
+    }
+
+    pub fn content_len(&self) -> Option<u16> {
+        let s = self.state.as_ref()?;
+        Some(visual_rows_in_range(s.filtered(), &s.items, 0, s.filtered().len()) as u16)
+    }
+
+    pub fn scroll_line(&self) -> u16 {
+        let Some(s) = self.state.as_ref() else {
+            return 0;
+        };
+        visual_rows_in_range(s.filtered(), &s.items, 0, s.scroll_offset) as u16
+    }
+
+    pub fn scroll_to_line(&mut self, line: u16) {
+        let Some(s) = self.state.as_mut() else {
+            return;
+        };
+        let total_visual = visual_rows_in_range(s.filtered(), &s.items, 0, s.filtered().len());
+        let max_offset = if total_visual <= s.viewport_height {
+            0
+        } else {
+            find_scroll_offset_for_bottom(s.filtered(), &s.items, s.viewport_height)
+        };
+        s.scroll_offset = item_at_visual_row(s.filtered(), &s.items, line as usize).min(max_offset);
     }
 }
 
@@ -735,7 +782,7 @@ fn render_ready<T: PickerItem>(
     max_visible: Option<u16>,
     footer: Option<Line<'static>>,
     error_text: Option<&str>,
-) -> Rect {
+) -> (Rect, Option<ScrollbarHit>) {
     let footer_rows = if footer.is_some() { 1u16 } else { 0 };
     let content_rows = if s.filtered().is_empty() {
         1
@@ -810,13 +857,15 @@ fn render_ready<T: PickerItem>(
     }
 
     let total_visual = visual_rows_in_range(s.filtered(), &s.items, 0, s.filtered().len());
-    if total_visual as u16 > viewport_h {
+    let scrollbar_hit = if total_visual as u16 > viewport_h {
         let visual_offset = visual_rows_in_range(s.filtered(), &s.items, 0, s.scroll_offset);
-        render_vertical_scrollbar(frame, list_area, total_visual as u16, visual_offset as u16);
-    }
+        render_vertical_scrollbar(frame, list_area, total_visual as u16, visual_offset as u16)
+    } else {
+        None
+    };
 
     s.inner_area = inner;
-    popup
+    (popup, scrollbar_hit)
 }
 
 fn section_gap<T: PickerItem>(filtered: &[usize], items: &[T], idx: usize, start: usize) -> usize {
@@ -843,6 +892,18 @@ fn visual_rows_in_range<T: PickerItem>(
         .map(|i| section_gap(filtered, items, i, start))
         .sum();
     item_count + section_rows
+}
+
+fn item_at_visual_row<T: PickerItem>(filtered: &[usize], items: &[T], visual: usize) -> usize {
+    let mut top = 0;
+    for idx in 0..filtered.len() {
+        let item_row = top + section_gap(filtered, items, idx, 0);
+        if visual <= item_row {
+            return idx;
+        }
+        top = item_row + 1;
+    }
+    filtered.len().saturating_sub(1)
 }
 
 fn find_scroll_offset_for<T: PickerItem>(

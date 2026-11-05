@@ -1,3 +1,4 @@
+use crate::click::{HitTarget, PickerId};
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction};
 use crate::repaint::Cadence;
@@ -7,7 +8,7 @@ use std::sync::Arc;
 
 use crossterm::event::KeyEvent;
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 
 const TITLE: &str = " Themes ";
 const MAX_VISIBLE: u16 = 15;
@@ -26,7 +27,9 @@ pub struct ThemePicker {
 impl ThemePicker {
     pub fn new(provider: Arc<dyn ThemesProvider>) -> Self {
         Self {
-            picker: ListPicker::new().with_max_visible(MAX_VISIBLE),
+            picker: ListPicker::new()
+                .with_picker(PickerId::Theme)
+                .with_max_visible(MAX_VISIBLE),
             provider,
             original_theme_name: None,
         }
@@ -95,6 +98,33 @@ impl ThemePicker {
         if let Some(ref name) = self.original_theme_name {
             apply_theme(self.provider.as_ref(), name);
         }
+    }
+    pub fn contains(&self, pos: Position) -> bool {
+        self.picker.contains(pos)
+    }
+
+    pub fn scroll(&mut self, delta: i32) {
+        self.picker.scroll(delta);
+    }
+
+    pub fn hits(&self) -> Vec<HitTarget> {
+        if self.is_open() {
+            self.picker.hits()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn scroll_line(&self) -> Option<u16> {
+        self.is_open().then(|| self.picker.scroll_line())
+    }
+
+    pub fn content_len(&self) -> Option<u16> {
+        self.is_open().then(|| self.picker.content_len()).flatten()
+    }
+
+    pub fn scroll_to_line(&mut self, line: u16) {
+        self.picker.scroll_to_line(line);
     }
 }
 

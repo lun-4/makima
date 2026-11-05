@@ -13,7 +13,6 @@ pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct ScrollbarHit {
     /// The one-column rect that was actually drawn.

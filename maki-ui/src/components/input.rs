@@ -22,7 +22,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
 use super::apply_scroll_delta;
-use super::scrollbar::render_vertical_scrollbar;
+use super::scrollbar::{ScrollbarHit, render_vertical_scrollbar};
 use crate::selection::LineBreaks;
 
 const CHEVRON: &str = super::CHEVRON;
@@ -93,6 +93,7 @@ pub struct InputBox {
     max_input_lines: u16,
     last_total_lines: u16,
     last_content_height: u16,
+    scrollbar_hit: Option<ScrollbarHit>,
     last_width: u16,
     last_focused: bool,
     preferred_column: Option<usize>,
@@ -208,6 +209,7 @@ impl InputBox {
             max_input_lines,
             last_total_lines: 1,
             last_content_height: 1,
+            scrollbar_hit: None,
             last_width: u16::MAX,
             last_focused: true,
             preferred_column: None,
@@ -526,10 +528,12 @@ impl InputBox {
             .block(block);
         frame.render_widget(paragraph, area);
 
-        if max_scroll > 0 {
+        self.scrollbar_hit = if max_scroll > 0 {
             let inner = area.inner(ratatui::layout::Margin::new(0, 1));
-            render_vertical_scrollbar(frame, inner, total_vl, self.scroll_y);
-        }
+            render_vertical_scrollbar(frame, inner, total_vl, self.scroll_y)
+        } else {
+            None
+        };
     }
 
     fn max_scroll(&self) -> u16 {
@@ -539,6 +543,18 @@ impl InputBox {
 
     pub fn scroll_y(&self) -> u16 {
         self.scroll_y
+    }
+
+    pub fn scroll_to_line(&mut self, line: u16) {
+        self.scroll_y = line.min(self.max_scroll());
+    }
+
+    pub fn scrollbar_hit(&self) -> Option<ScrollbarHit> {
+        self.scrollbar_hit
+    }
+
+    pub fn content_len(&self) -> u16 {
+        self.last_total_lines
     }
 
     pub fn history(&self) -> &InputHistory {

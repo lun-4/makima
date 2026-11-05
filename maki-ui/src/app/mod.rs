@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use crate::AppSession;
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
-use crate::click::{ClickTarget, HitRegistry, ScrollOwner};
+use crate::click::{ClickTarget, HitRegistry, PickerId, ScrollOwner};
 use crate::clipboard::ClipboardState;
 use crate::command_runtime::{CommandRuntime, PreparedCommandTarget};
 use maki_agent::HistorySnapshot;
@@ -587,7 +587,7 @@ impl App {
                 command_palette_defaults(&command_runtime),
                 Arc::from(state.session.cwd.as_str()),
             ),
-            task_picker: ListPicker::new(),
+            task_picker: ListPicker::new().with_picker(PickerId::Task),
             task_picker_original: None,
             lua_picker: LuaPicker::new(lua_event_handle.clone()),
             theme_picker: ThemePicker::new(Arc::clone(&theme_provider)),
@@ -1023,6 +1023,8 @@ impl App {
         self.pending_dirty |= dirty;
         let dirty = self.validate_middle_scroll();
         self.pending_dirty |= dirty;
+        let dirty = self.validate_scroll_drag();
+        self.pending_dirty |= dirty;
         actions
     }
 
@@ -1054,15 +1056,81 @@ impl App {
         }
     }
 
-    pub(super) fn scroll_content_len(&self, _owner: ScrollOwner) -> Option<u16> {
-        None
+    pub(super) fn scroll_content_len(&self, owner: ScrollOwner) -> Option<u16> {
+        match owner {
+            ScrollOwner::Messages => Some(self.chats[self.active_chat].content_len()),
+            ScrollOwner::Input => Some(self.input_box.content_len()),
+            ScrollOwner::Picker(picker) => match picker {
+                PickerId::Model => self.model_picker.content_len(),
+                PickerId::Task => self
+                    .task_picker
+                    .is_open()
+                    .then(|| self.task_picker.content_len())
+                    .flatten(),
+                PickerId::Theme => self.theme_picker.content_len(),
+                PickerId::Rewind => self.rewind_picker.content_len(),
+                PickerId::Login => self.login_picker.content_len(),
+                PickerId::Mcp => self.mcp_picker.content_len(),
+                PickerId::Lua => self.lua_picker.content_len(),
+                PickerId::Search => self
+                    .search_modal
+                    .is_open()
+                    .then(|| self.search_modal.content_len()),
+                PickerId::File => self.file_picker.content_len(),
+            },
+            ScrollOwner::Help => self
+                .help_modal
+                .is_open()
+                .then(|| self.help_modal.content_len()),
+            ScrollOwner::Btw => self
+                .btw_modal
+                .is_open()
+                .then(|| self.btw_modal.content_len()),
+            ScrollOwner::Float(id) => self.float_mgr.content_len(id),
+        }
     }
 
-    pub(super) fn scroll_line(&self, _owner: ScrollOwner) -> u16 {
-        0
+    pub(super) fn scroll_line(&self, owner: ScrollOwner) -> u16 {
+        match owner {
+            ScrollOwner::Messages => self.chats[self.active_chat].scroll_top(),
+            ScrollOwner::Input => self.input_box.scroll_y(),
+            ScrollOwner::Picker(picker) => match picker {
+                PickerId::Model => self.model_picker.scroll_line().unwrap_or(0),
+                PickerId::Task => self.task_picker.scroll_line(),
+                PickerId::Theme => self.theme_picker.scroll_line().unwrap_or(0),
+                PickerId::Rewind => self.rewind_picker.scroll_line().unwrap_or(0),
+                PickerId::Login => self.login_picker.scroll_line().unwrap_or(0),
+                PickerId::Mcp => self.mcp_picker.scroll_line().unwrap_or(0),
+                PickerId::Lua => self.lua_picker.scroll_line().unwrap_or(0),
+                PickerId::Search => self.search_modal.scroll_line(),
+                PickerId::File => self.file_picker.scroll_line(),
+            },
+            ScrollOwner::Help => self.help_modal.scroll_line(),
+            ScrollOwner::Btw => self.btw_modal.scroll_line(),
+            ScrollOwner::Float(id) => self.float_mgr.scroll_line(id).unwrap_or(0),
+        }
     }
 
-    pub(super) fn scroll_owner_to(&mut self, _owner: ScrollOwner, _line: u16) {}
+    pub(super) fn scroll_owner_to(&mut self, owner: ScrollOwner, line: u16) {
+        match owner {
+            ScrollOwner::Messages => self.chats[self.active_chat].scroll_to_line(line),
+            ScrollOwner::Input => self.input_box.scroll_to_line(line),
+            ScrollOwner::Picker(picker) => match picker {
+                PickerId::Model => self.model_picker.scroll_to_line(line),
+                PickerId::Task => self.task_picker.scroll_to_line(line),
+                PickerId::Theme => self.theme_picker.scroll_to_line(line),
+                PickerId::Rewind => self.rewind_picker.scroll_to_line(line),
+                PickerId::Login => self.login_picker.scroll_to_line(line),
+                PickerId::Mcp => self.mcp_picker.scroll_to_line(line),
+                PickerId::Lua => self.lua_picker.scroll_to_line(line),
+                PickerId::Search => self.search_modal.scroll_to_line(line),
+                PickerId::File => self.file_picker.scroll_to_line(line),
+            },
+            ScrollOwner::Help => self.help_modal.scroll_to_line(line),
+            ScrollOwner::Btw => self.btw_modal.scroll_to_line(line),
+            ScrollOwner::Float(id) => self.float_mgr.scroll_to_line(id, line),
+        }
+    }
 
     fn dismissible_modal_open(&self) -> bool {
         self.search_modal.is_open()
@@ -1110,6 +1178,11 @@ impl App {
         try_picker!(self.task_picker);
         try_picker!(self.model_picker);
         try_picker!(self.file_picker);
+        try_picker!(self.theme_picker);
+        try_picker!(self.login_picker);
+        try_picker!(self.mcp_picker);
+        try_picker!(self.lua_picker);
+        try_picker!(self.search_modal);
         let zone = self.zone_at(row, column)?.zone;
         self.scroll_zone(zone, delta);
         Some(zone)

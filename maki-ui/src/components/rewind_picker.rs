@@ -1,3 +1,4 @@
+use crate::click::{HitTarget, PickerId};
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::Cadence;
@@ -54,7 +55,7 @@ pub struct RewindPicker {
 impl RewindPicker {
     pub fn new() -> Self {
         Self {
-            picker: ListPicker::new(),
+            picker: ListPicker::new().with_picker(PickerId::Rewind),
             target: None,
             boundaries: Vec::new(),
         }
@@ -125,6 +126,26 @@ impl RewindPicker {
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
         self.picker.view(frame, area)
+    }
+
+    pub fn hits(&self) -> Vec<HitTarget> {
+        if self.is_open() {
+            self.picker.hits()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn scroll_line(&self) -> Option<u16> {
+        self.is_open().then(|| self.picker.scroll_line())
+    }
+
+    pub fn content_len(&self) -> Option<u16> {
+        self.is_open().then(|| self.picker.content_len()).flatten()
+    }
+
+    pub fn scroll_to_line(&mut self, line: u16) {
+        self.picker.scroll_to_line(line);
     }
 }
 

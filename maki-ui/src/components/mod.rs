@@ -154,6 +154,15 @@ impl ModalScroll {
         self.auto_scroll = self.offset >= self.max_offset;
     }
 
+    pub fn scroll_to(&mut self, offset: u16) {
+        self.offset = offset.min(self.max_offset);
+        self.auto_scroll = self.offset >= self.max_offset;
+    }
+
+    pub fn content_len(&self) -> u16 {
+        self.max_offset.saturating_add(self.viewport_h)
+    }
+
     pub fn handle_key(&mut self, key_event: KeyEvent) -> bool {
         use keybindings::key;
         match key_event.code {

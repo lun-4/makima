@@ -1,6 +1,7 @@
 use maki_providers::ThinkingConfigExt;
 use std::sync::atomic::Ordering;
 
+use crate::click::{ClickTarget, HitTarget, PickerId, ScrollOwner};
 use crate::components::Overlay;
 use crate::components::input::Placeholder;
 #[cfg(test)]
@@ -281,6 +282,10 @@ impl App {
             self.selection_state.is_some() || self.middle_scroll.is_some(),
             images_visible,
         );
+        if let Some(hit) = self.chats[render_chat].scrollbar_hit() {
+            self.hits
+                .push(hit.area, ClickTarget::Scrollbar(ScrollOwner::Messages));
+        }
     }
 
     fn render_bottom_panel(&mut self, frame: &mut Frame, layout: &ViewLayout) {
@@ -322,6 +327,10 @@ impl App {
                 panel_hint,
                 &cwd,
             );
+            if let Some(hit) = self.input_box.scrollbar_hit() {
+                self.hits
+                    .push(hit.area, ClickTarget::Scrollbar(ScrollOwner::Input));
+            }
             if !streaming && !self.command_palette.is_active() && !self.any_overlay_open() {
                 self.file_completion.view(frame, layout.input_area);
             }
@@ -373,24 +382,42 @@ impl App {
 
         if self.search_modal.is_open() {
             rects.push(self.search_modal.view(frame, layout.msg_area));
+            if let Some(hit) = self.search_modal.scrollbar_hit() {
+                self.hits.push(
+                    hit.area,
+                    ClickTarget::Scrollbar(ScrollOwner::Picker(PickerId::Search)),
+                );
+            }
         }
 
         if self.task_picker.is_open() {
             rects.push(self.task_picker.view(frame, full));
+            let hits = self.task_picker.hits();
+            self.absorb_hits(hits);
         }
 
         if self.lua_picker.is_open() {
             rects.push(self.lua_picker.view(frame, full));
+            let hits = self.lua_picker.hits();
+            self.absorb_hits(hits);
         }
 
         if self.file_picker.is_open() {
             rects.push(self.file_picker.view(frame, full));
+            if let Some(hit) = self.file_picker.scrollbar_hit() {
+                self.hits.push(
+                    hit.area,
+                    ClickTarget::Scrollbar(ScrollOwner::Picker(PickerId::File)),
+                );
+            }
         }
 
         macro_rules! render_if_open {
             ($overlay:expr) => {
                 if $overlay.is_open() {
                     rects.push($overlay.view(frame, full));
+                    let hits = $overlay.hits();
+                    self.absorb_hits(hits);
                 }
             };
         }
@@ -404,22 +431,38 @@ impl App {
         rects
     }
 
+    fn absorb_hits(&mut self, hits: Vec<HitTarget>) {
+        for hit in hits {
+            self.hits.push(hit.rect, hit.target);
+        }
+    }
+
     fn render_top_modals(&mut self, frame: &mut Frame, rects: &mut Vec<Rect>) {
         let full = frame.area();
         let r = self
             .btw_modal
             .view(frame, full, self.theme_provider.generation());
         if r.width > 0 {
+            if let Some(hit) = self.btw_modal.scrollbar_hit() {
+                self.hits
+                    .push(hit.area, ClickTarget::Scrollbar(ScrollOwner::Btw));
+            }
             rects.push(r);
         }
         let r = self.help_modal.view(frame, full);
         if r.width > 0 {
+            if let Some(hit) = self.help_modal.scrollbar_hit() {
+                self.hits
+                    .push(hit.area, ClickTarget::Scrollbar(ScrollOwner::Help));
+            }
             rects.push(r);
         }
         self.float_mgr.view(frame, full);
         if let Some(rect) = self.float_mgr.focused_rect() {
             rects.push(rect);
         }
+        let hits = self.float_mgr.hits();
+        self.absorb_hits(hits);
     }
 
     fn render_status_bar(&mut self, frame: &mut Frame, status_area: Rect, render_chat: usize) {

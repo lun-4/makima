@@ -1,9 +1,10 @@
 use crossterm::event::KeyEvent;
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 
 use maki_agent::{McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader};
 
+use crate::click::{HitTarget, PickerId};
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::{Cadence, Dirty, Watch};
@@ -82,7 +83,7 @@ pub struct McpPicker {
 impl McpPicker {
     pub fn new(reader: McpSnapshotReader, config_errors: McpConfigErrors) -> Self {
         Self {
-            picker: ListPicker::new(),
+            picker: ListPicker::new().with_picker(PickerId::Mcp),
             reader,
             servers: Watch::default(),
             config_errors,
@@ -147,6 +148,33 @@ impl McpPicker {
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
         self.picker.view(frame, area)
+    }
+    pub fn contains(&self, pos: Position) -> bool {
+        self.picker.contains(pos)
+    }
+
+    pub fn scroll(&mut self, delta: i32) {
+        self.picker.scroll(delta);
+    }
+
+    pub fn hits(&self) -> Vec<HitTarget> {
+        if self.is_open() {
+            self.picker.hits()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn scroll_line(&self) -> Option<u16> {
+        self.is_open().then(|| self.picker.scroll_line())
+    }
+
+    pub fn content_len(&self) -> Option<u16> {
+        self.is_open().then(|| self.picker.content_len()).flatten()
+    }
+
+    pub fn scroll_to_line(&mut self, line: u16) {
+        self.picker.scroll_to_line(line);
     }
 }
 

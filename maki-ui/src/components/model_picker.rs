@@ -11,6 +11,7 @@ use maki_providers::dynamic;
 use maki_providers::model_registry;
 use maki_providers::provider::ProviderKind;
 
+use crate::click::{HitTarget, PickerId};
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::{Cadence, Dirty, Watch};
@@ -109,7 +110,9 @@ pub struct ModelPicker {
 impl ModelPicker {
     pub fn new(models: Arc<ArcSwapOption<Vec<String>>>) -> Self {
         Self {
-            picker: ListPicker::new().with_footer_builder(footer_line),
+            picker: ListPicker::new()
+                .with_picker(PickerId::Model)
+                .with_footer_builder(footer_line),
             models,
             available: Watch::default(),
             recents: Vec::new(),
@@ -252,6 +255,26 @@ impl ModelPicker {
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
         self.picker.view(frame, area)
+    }
+
+    pub fn hits(&self) -> Vec<HitTarget> {
+        if self.is_open() {
+            self.picker.hits()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn scroll_line(&self) -> Option<u16> {
+        self.is_open().then(|| self.picker.scroll_line())
+    }
+
+    pub fn content_len(&self) -> Option<u16> {
+        self.is_open().then(|| self.picker.content_len()).flatten()
+    }
+
+    pub fn scroll_to_line(&mut self, line: u16) {
+        self.picker.scroll_to_line(line);
     }
 }
 

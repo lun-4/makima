@@ -65,7 +65,6 @@ pub(super) struct ScrollDrag {
     pub(super) area: Rect,
     pub(super) content_len: u16,
     pub(super) grab: u16,
-    #[allow(dead_code)]
     chat: usize,
 }
 
@@ -356,7 +355,6 @@ impl App {
         self.scroll_owner_to(owner, line);
     }
 
-    #[allow(dead_code)]
     pub(super) fn validate_scroll_drag(&mut self) -> Dirty {
         let invalid = self.scroll_drag.as_ref().is_some_and(|drag| {
             drag.chat != self.active_chat
