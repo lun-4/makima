@@ -65,7 +65,9 @@ use maki_lua::{
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::Provider;
-use maki_providers::{Message, Model, ModelTier, PreparedProvider, ProviderRegistry};
+use maki_providers::{
+    ConversationEnd, Message, Model, ModelTier, PreparedProvider, ProviderRegistry,
+};
 use maki_storage::StateDir;
 use maki_storage::StorageError;
 use maki_storage::checkpoint::CheckpointPublication;
@@ -3458,11 +3460,7 @@ impl<'t> EventLoop<'t> {
             drop(held);
             if replaced_session {
                 if let Some((provider, conversation_id)) = ended_conversation {
-                    end_conversation_detached(
-                        &provider,
-                        conversation_id,
-                        maki_providers::ConversationEnd::Closed,
-                    );
+                    end_conversation_detached(&provider, conversation_id, ConversationEnd::Closed);
                 }
                 let _ = coordinator.close().await;
                 storage_writer.forget(retired_id);

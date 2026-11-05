@@ -1790,14 +1790,14 @@ pub(crate) mod tests {
                     }) as CheckpointFuture
                 },
             );
-            let (_requests_tx, requests_rx) = flume::unbounded();
+            let (requests_tx, requests_rx) = flume::unbounded();
             let (ended_tx, ended_rx) = flume::unbounded();
             let history = vec![Message::user("kept".into())];
             let (handle, coordinator) = fixture(
                 history.clone(),
                 checkpoint,
                 Arc::new(EndRecordingProvider {
-                    requests: _requests_tx,
+                    requests: requests_tx,
                     ended: ended_tx,
                 }),
             );

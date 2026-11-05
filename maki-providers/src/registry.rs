@@ -5,7 +5,7 @@
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use maki_config::ModelPolicy;
@@ -111,7 +111,7 @@ impl Entry {
     }
 
     fn models(&self) -> Arc<[ModelInfo]> {
-        Arc::clone(&self.models.read().unwrap())
+        Arc::clone(&self.models.read().unwrap_or_else(PoisonError::into_inner))
     }
 
     /// The descriptor whose id is the longest prefix of {model_id}, as the
@@ -319,7 +319,7 @@ impl ProviderRegistry {
         let entry = &self.entries[self.positions[&provider]].1;
         let warnings = match result {
             Ok(models) => {
-                *entry.models.write().unwrap() = models.into();
+                *entry.models.write().unwrap_or_else(PoisonError::into_inner) = models.into();
                 Vec::new()
             }
             Err(error) => {

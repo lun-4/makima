@@ -519,7 +519,7 @@ mod tests {
         storage: StateDir,
         status: Status,
         login_fails: bool,
-        cancel_after_write: bool,
+        pending_after_write: bool,
         model: Option<&'static str>,
         method: Arc<Mutex<Option<String>>>,
     }
@@ -530,7 +530,7 @@ mod tests {
                 storage: storage.clone(),
                 status,
                 login_fails: false,
-                cancel_after_write: false,
+                pending_after_write: false,
                 model: None,
                 method: Arc::default(),
             }
@@ -561,10 +561,10 @@ mod tests {
             ui: Arc<dyn InteractionService>,
         ) -> BoxFuture<'static, Result<Option<String>, AgentError>> {
             *self.method.lock().unwrap() = Some(method);
-            let (storage, fails, cancel_after_write, model) = (
+            let (storage, fails, pending_after_write, model) = (
                 self.storage.clone(),
                 self.login_fails,
-                self.cancel_after_write,
+                self.pending_after_write,
                 self.model,
             );
             Box::pin(async move {
@@ -576,9 +576,8 @@ mod tests {
                     })
                     .await?;
                 save_credentials(&storage, PROVIDER, &json!({ "api_key": key })).unwrap();
-                if cancel_after_write {
-                    ui.interact(InteractionRequest::Instructions("finish login".into()))
-                        .await?;
+                if pending_after_write {
+                    std::future::pending::<()>().await;
                 }
                 match fails {
                     true => Err(config_error(LOGIN_ERR)),
@@ -880,27 +879,34 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_after_provider_write_restores_credentials() {
-        let fixture = Fixture::new();
-        save_credentials(&fixture.storage, PROVIDER, &json!({ "api_key": OLD_KEY })).unwrap();
-        let backend = FakeAuthBackend {
-            cancel_after_write: true,
-            ..FakeAuthBackend::new(&fixture.storage, Status::CredentialsFile)
-        };
-        let registry = fixture.registry(backend, &[KEY_METHOD]);
-
-        let error = fixture
-            .login(
+    fn dropping_login_after_provider_write_restores_credentials() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            save_credentials(&fixture.storage, PROVIDER, &json!({ "api_key": OLD_KEY })).unwrap();
+            let backend = FakeAuthBackend {
+                pending_after_write: true,
+                ..FakeAuthBackend::new(&fixture.storage, Status::CredentialsFile)
+            };
+            let registry = fixture.registry(backend, &[KEY_METHOD]);
+            let policy = ModelPolicy::default();
+            let mut login = Box::pin(drive_login(
                 &registry,
                 ScriptedInteraction::new(&[ANSWERED_URL, KEY]),
-                Some(PROVIDER),
-            )
-            .unwrap_err();
+                &fixture.storage,
+                &policy,
+                LoginRequest {
+                    provider: Some(PROVIDER.into()),
+                },
+            ));
 
-        assert!(matches!(error, AgentError::Cancelled));
-        assert_eq!(fixture.saved_key(), Some(json!(OLD_KEY)));
-        assert_eq!(saved_url(), None);
-        assert_eq!(read_model(&fixture.storage), None);
+            assert!(futures::poll!(login.as_mut()).is_pending());
+            assert_eq!(fixture.saved_key(), Some(json!(KEY)));
+            drop(login);
+
+            assert_eq!(fixture.saved_key(), Some(json!(OLD_KEY)));
+            assert_eq!(saved_url(), None);
+            assert_eq!(read_model(&fixture.storage), None);
+        });
     }
 
     #[test]
