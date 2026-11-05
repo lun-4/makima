@@ -66,6 +66,10 @@ impl App {
         self.render_splits(frame, &layout);
         let mut modal_rects = self.render_picker_overlays(frame, &layout);
         self.render_status_bar(frame, layout.status_area, render_chat);
+        if self.menu.is_open() && !self.has_modal_overlay() && !self.permission_active() {
+            let hits = self.menu.view(frame, frame.area(), self.hover);
+            self.absorb_hits(hits);
+        }
         self.render_defer_hint(frame, layout.defer_hint_area);
         self.render_top_modals(frame, &mut modal_rects);
         if self.permission_active() {
@@ -87,7 +91,11 @@ impl App {
                 Rect::new(x, y, right.saturating_sub(x), bottom.saturating_sub(y))
             })
             .unwrap_or_default();
-        self.register_zones(&layout, overlay_rect);
+        let menu_rect = self
+            .menu
+            .area()
+            .filter(|_| !self.has_modal_overlay() && !self.permission_active());
+        self.register_zones(&layout, overlay_rect, menu_rect);
         let dirty = self.validate_middle_scroll();
         self.pending_dirty |= dirty;
         self.apply_selection(frame, render_chat);
@@ -213,7 +221,7 @@ impl App {
         bg.render(frame.area(), frame.buffer_mut());
     }
 
-    fn render_top_bar(&self, frame: &mut Frame, layout: &ViewLayout) {
+    fn render_top_bar(&mut self, frame: &mut Frame, layout: &ViewLayout) {
         let area = layout.top_bar_area;
         if area.height == 0 {
             return;
@@ -254,11 +262,19 @@ impl App {
             Constraint::Length(right_span.width() as u16),
         ])
         .areas(area);
+        let badge_rect = bar_span_rect(left_area, &left_spans, 0);
+        let task_rect = bar_span_rect(left_area, &left_spans, 1);
         frame.render_widget(Paragraph::new(Line::from(left_spans)), left_area);
         frame.render_widget(
             Paragraph::new(Line::from(right_span)).alignment(Alignment::Right),
             right_area,
         );
+        if let Some(rect) = badge_rect {
+            self.hits.push(rect, ClickTarget::AgentChip);
+        }
+        if let Some(rect) = task_rect {
+            self.hits.push(rect, ClickTarget::TasksHint);
+        }
     }
 
     fn render_messages(&mut self, frame: &mut Frame, layout: &ViewLayout, render_chat: usize) {
@@ -528,8 +544,14 @@ impl App {
             restoring: self.restoring.load(Ordering::Relaxed),
             status_content: self.status_content.get(),
             suppress_status_content: self.suppress_status_content.load(Ordering::Acquire),
+            hover: self.hover,
+            thinking_supported: config.as_ref().map_or_else(
+                || self.root_config().model.supports_thinking(),
+                |config| config.model.supports_thinking(),
+            ),
         };
-        self.status_bar.view(frame, status_area, &ctx);
+        let hits = self.status_bar.view(frame, status_area, &ctx);
+        self.absorb_hits(hits);
     }
 
     /// Left-aligned affordance pinned on the row above the status bar while an
@@ -547,7 +569,7 @@ impl App {
         frame.render_widget(Paragraph::new(line), area);
     }
 
-    fn register_zones(&mut self, layout: &ViewLayout, overlay_rect: Rect) {
+    fn register_zones(&mut self, layout: &ViewLayout, overlay_rect: Rect, menu_rect: Option<Rect>) {
         // Push order = z-order. zone_at() walks in reverse, so later entries win.
         self.zones = ZoneRegistry::new();
 
@@ -555,6 +577,10 @@ impl App {
             area: layout.msg_area,
             zone: SelectionZone::Messages,
         });
+
+        if layout.top_bar_area.height > 0 {
+            self.zones.push_overlay(layout.top_bar_area);
+        }
 
         if layout.input_area.height > 0 && !layout.bottom_takeover {
             let input_inner = Rect::new(
@@ -597,6 +623,10 @@ impl App {
         if overlay_rect.width > 0 {
             self.zones
                 .push_overlay(selection::inset_border(overlay_rect));
+        }
+
+        if let Some(rect) = menu_rect {
+            self.zones.push_overlay(rect);
         }
 
         // The active input surface is the single topmost zone so it wins clicks
@@ -709,6 +739,13 @@ impl App {
         }
         contexts
     }
+}
+
+fn bar_span_rect(area: Rect, spans: &[Span], index: usize) -> Option<Rect> {
+    let span = spans.get(index)?;
+    let x = area.x + spans[..index].iter().map(Span::width).sum::<usize>() as u16;
+    let right = x.saturating_add(span.width() as u16).min(area.right());
+    (right > x && x < area.right()).then(|| Rect::new(x, area.y, right - x, 1))
 }
 
 #[cfg(test)]

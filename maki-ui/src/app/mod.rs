@@ -45,6 +45,7 @@ use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::lua_float::FloatManager;
 use crate::components::lua_picker::{LuaPicker, LuaPickerAction};
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
+use crate::components::menu::{Menu, MenuAction, MenuItem, MenuKind};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
@@ -86,6 +87,7 @@ use maki_lua::{
     BuiltinAction, CompletionCtx, EventHandle, FloatConfig, HintReader, HintSnapshot, ItemSpec,
     KeymapReader, Split, StatusContentReader, StatusContentSnapshot, WinCommand, WinEvent, WinView,
 };
+use maki_providers::ThinkingConfig;
 use maki_providers::{ContentBlock, Message, Model, add_cost, format_tokens};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
@@ -402,6 +404,7 @@ pub struct App {
     plan_form_target: Option<AgentId>,
     plan_forms: HashMap<Option<AgentId>, (PlanForm, bool)>,
     pub(super) status_bar: StatusBar,
+    pub(super) menu: Menu,
     pub status: Status,
     pub(crate) state: session_state::SessionState,
     /// The config the root was seeded with, shown until the root answers.
@@ -609,6 +612,7 @@ impl App {
             plan_form_target: None,
             plan_forms: HashMap::new(),
             status_bar: StatusBar::new(flash, config.context.cwd().to_path_buf()),
+            menu: Menu::default(),
             status: Status::Idle,
             state,
             seed_config: Arc::new(config),
@@ -1021,6 +1025,9 @@ impl App {
         // immediately, rather than waiting for the next 100ms tick.
         let dirty = self.promote_deferred_if_ready();
         self.pending_dirty |= dirty;
+        if self.has_modal_overlay() || self.permission_active() {
+            self.menu.close();
+        }
         let dirty = self.validate_middle_scroll();
         self.pending_dirty |= dirty;
         let dirty = self.validate_scroll_drag();
@@ -1146,8 +1153,109 @@ impl App {
             || self.btw_modal.is_open()
     }
 
-    pub(super) fn dispatch_click(&mut self, _target: ClickTarget, _pos: Position) -> Vec<Action> {
-        vec![]
+    pub(super) fn dispatch_click(&mut self, target: ClickTarget, _pos: Position) -> Vec<Action> {
+        match target {
+            ClickTarget::ModeChip => {
+                self.toggle_mode_menu();
+                vec![]
+            }
+            ClickTarget::ThinkingChip => {
+                self.toggle_thinking_menu();
+                vec![]
+            }
+            ClickTarget::ModelChip => self.run_builtin(BuiltinAction::ModelPicker),
+            ClickTarget::AgentChip | ClickTarget::TasksHint => {
+                self.run_builtin(BuiltinAction::Tasks)
+            }
+            ClickTarget::AutoScrollChip => {
+                self.active_chat().enable_auto_scroll();
+                vec![]
+            }
+            ClickTarget::MenuRow(index) => {
+                let action = self.menu.click_row(index as usize);
+                if let Some(action) = action {
+                    self.menu.close();
+                    self.apply_menu_action(action)
+                } else {
+                    vec![]
+                }
+            }
+            _ => vec![],
+        }
+    }
+
+    fn apply_menu_action(&mut self, action: MenuAction) -> Vec<Action> {
+        match action {
+            MenuAction::Mode(key) => vec![Action::ChangeMode(key)],
+            MenuAction::Thinking(thinking) => {
+                vec![Action::SelectModel(maki_commands::ModelSelection {
+                    spec: None,
+                    thinking: Some(thinking),
+                    fast: None,
+                })]
+            }
+        }
+    }
+
+    fn toggle_mode_menu(&mut self) {
+        if self.menu.kind() == Some(MenuKind::Mode) {
+            self.menu.close();
+            return;
+        }
+        let Some(anchor) = self.hits.rect_of(ClickTarget::ModeChip) else {
+            return;
+        };
+        let registry = self.lua_event_handle.mode_registry();
+        let current = self.focused_mode().def(&registry).id.key().to_owned();
+        let mut defs = registry.list();
+        defs.sort_by(|a, b| {
+            let rank = |id: &maki_agent::ModeId| match id {
+                maki_agent::ModeId::Build => 0,
+                maki_agent::ModeId::Plan => 1,
+                maki_agent::ModeId::Custom(_) => 2,
+            };
+            rank(&a.id)
+                .cmp(&rank(&b.id))
+                .then_with(|| a.label.cmp(&b.label))
+        });
+        let items = defs
+            .into_iter()
+            .map(|def| {
+                let key = def.id.key().to_owned();
+                MenuItem {
+                    current: key == current,
+                    label: def.label.to_string(),
+                    action: MenuAction::Mode(key),
+                }
+            })
+            .collect();
+        self.menu.open(MenuKind::Mode, anchor, items);
+    }
+
+    fn toggle_thinking_menu(&mut self) {
+        if self.menu.kind() == Some(MenuKind::Thinking) {
+            self.menu.close();
+            return;
+        }
+        let Some(anchor) = self.hits.rect_of(ClickTarget::ThinkingChip) else {
+            return;
+        };
+        let current = self.displayed_config(self.active_chat).options().thinking;
+        let items = ThinkingConfig::options()
+            .iter()
+            .filter_map(|option| {
+                option
+                    .parse::<ThinkingConfig>()
+                    .ok()
+                    .map(|thinking| (*option, thinking))
+            })
+            .map(|(label, thinking)| MenuItem {
+                current: thinking == current,
+                label: label.to_string(),
+                action: MenuAction::Thinking(thinking),
+            })
+            .collect();
+        self.menu.open(MenuKind::Thinking, anchor, items);
     }
 
     fn scroll_at(&mut self, column: u16, row: u16, delta: i32) -> Option<SelectionZone> {
@@ -1370,6 +1478,31 @@ impl App {
                 self.send_to_agent(agent_id, encoded);
             }
             return Some(vec![]);
+        }
+
+        if self.menu.is_open() && !self.has_modal_overlay() {
+            match key.code {
+                KeyCode::Up => {
+                    self.menu.up();
+                    return Some(vec![]);
+                }
+                KeyCode::Down => {
+                    self.menu.down();
+                    return Some(vec![]);
+                }
+                KeyCode::Enter => {
+                    if let Some(action) = self.menu.take_action() {
+                        self.menu.close();
+                        return Some(self.apply_menu_action(action));
+                    }
+                    return Some(vec![]);
+                }
+                KeyCode::Esc => {
+                    self.menu.close();
+                    return Some(vec![]);
+                }
+                _ => self.menu.close(),
+            }
         }
 
         if self.help_modal.is_open() {

@@ -14,6 +14,7 @@ pub(crate) mod login_picker;
 pub(crate) mod lua_float;
 pub(crate) mod lua_picker;
 pub(crate) mod mcp_picker;
+pub(crate) mod menu;
 pub mod messages;
 pub(crate) mod modal;
 pub(crate) mod model_picker;

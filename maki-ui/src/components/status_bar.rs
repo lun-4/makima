@@ -6,12 +6,13 @@ use super::{RetryInfo, Status};
 use maki_lua::StatusContentSnapshot;
 
 use crate::animation::spinner_frame;
+use crate::click::{ClickTarget, HitTarget};
 use crate::theme;
 
 use maki_providers::format_tokens;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use tracing::info;
@@ -66,6 +67,8 @@ pub struct StatusBarContext<'a> {
     pub restoring: bool,
     pub status_content: Option<&'a StatusContentSnapshot>,
     pub suppress_status_content: bool,
+    pub hover: Option<ClickTarget>,
+    pub thinking_supported: bool,
 }
 
 pub struct StatusBar {
@@ -155,7 +158,8 @@ impl StatusBar {
         )
     }
 
-    pub fn view(&self, frame: &mut Frame, area: Rect, ctx: &StatusBarContext) {
+    pub fn view(&self, frame: &mut Frame, area: Rect, ctx: &StatusBarContext) -> Vec<HitTarget> {
+        let hovered = |target: ClickTarget| ctx.hover == Some(target);
         let mut left_spans = Vec::new();
 
         if *ctx.status == Status::Streaming {
@@ -171,13 +175,25 @@ impl StatusBar {
             ));
         }
 
-        left_spans.push(Span::styled(format!(" {}", ctx.mode_label), ctx.mode_style));
+        let mode_idx = left_spans.len();
+        let mode_style = if hovered(ClickTarget::ModeChip) {
+            ctx.mode_style.add_modifier(Modifier::UNDERLINED)
+        } else {
+            ctx.mode_style
+        };
+        left_spans.push(Span::styled(format!(" {}", ctx.mode_label), mode_style));
 
+        let mut autoscroll_idx = None;
         if !ctx.auto_scroll {
-            left_spans.push(Span::styled(
-                " auto-scroll paused",
-                theme::current().status_dim,
-            ));
+            autoscroll_idx = Some(left_spans.len());
+            let style = if hovered(ClickTarget::AutoScrollChip) {
+                theme::current()
+                    .status_dim
+                    .add_modifier(Modifier::UNDERLINED)
+            } else {
+                theme::current().status_dim
+            };
+            left_spans.push(Span::styled(" auto-scroll paused", style));
         }
 
         if let Some(retry) = ctx.retry_info {
@@ -196,6 +212,8 @@ impl StatusBar {
         }
 
         let mut right_spans = Vec::new();
+        let mut model_idx = None;
+        let mut thinking_idx = None;
 
         let yolo_span = ctx.yolo.then(|| {
             Span::styled(
@@ -219,9 +237,28 @@ impl StatusBar {
                 let mut rest_spans = Vec::new();
 
                 if let Some(ref label) = ctx.thinking_label {
+                    thinking_idx = Some(rest_spans.len());
                     rest_spans.push(Span::styled(
                         format!(" [{label}]"),
-                        theme::current().status_dim,
+                        if hovered(ClickTarget::ThinkingChip) {
+                            theme::current()
+                                .status_dim
+                                .add_modifier(Modifier::UNDERLINED)
+                        } else {
+                            theme::current().status_dim
+                        },
+                    ));
+                } else if ctx.thinking_supported {
+                    thinking_idx = Some(rest_spans.len());
+                    rest_spans.push(Span::styled(
+                        " [thinking: off]",
+                        if hovered(ClickTarget::ThinkingChip) {
+                            theme::current()
+                                .status_dim
+                                .add_modifier(Modifier::UNDERLINED)
+                        } else {
+                            theme::current().status_dim
+                        },
                     ));
                 }
 
@@ -288,7 +325,21 @@ impl StatusBar {
                 let model =
                     truncate_tail(&model_text, available.saturating_sub(plugin_width)).into_owned();
 
-                right_spans.push(Span::styled(model, theme::current().status_dim));
+                model_idx = Some(right_spans.len());
+                right_spans.push(Span::styled(
+                    model,
+                    if hovered(ClickTarget::ModelChip) {
+                        theme::current()
+                            .status_dim
+                            .add_modifier(Modifier::UNDERLINED)
+                    } else {
+                        theme::current().status_dim
+                    },
+                ));
+                let rest_base = right_spans.len();
+                if let Some(idx) = thinking_idx {
+                    thinking_idx = Some(rest_base + idx);
+                }
                 right_spans.append(&mut rest_spans);
                 right_spans.extend(plugin_spans);
             }
@@ -307,12 +358,49 @@ impl StatusBar {
         ])
         .areas(area);
 
+        let mut hits = Vec::new();
+        if let Some(rect) = span_rect(left_area, &left_spans, mode_idx) {
+            hits.push(HitTarget {
+                rect,
+                target: ClickTarget::ModeChip,
+            });
+        }
+        if let Some(idx) = autoscroll_idx
+            && let Some(rect) = span_rect(left_area, &left_spans, idx)
+        {
+            hits.push(HitTarget {
+                rect,
+                target: ClickTarget::AutoScrollChip,
+            });
+        }
+        let model_rect = model_idx.and_then(|idx| span_rect(right_area, &right_spans, idx));
+        let thinking_rect = thinking_idx.and_then(|idx| span_rect(right_area, &right_spans, idx));
         frame.render_widget(Paragraph::new(Line::from(left_spans)), left_area);
         frame.render_widget(
             Paragraph::new(Line::from(right_spans)).alignment(Alignment::Right),
             right_area,
         );
+        if let Some(rect) = model_rect {
+            hits.push(HitTarget {
+                rect,
+                target: ClickTarget::ModelChip,
+            });
+        }
+        if let Some(rect) = thinking_rect {
+            hits.push(HitTarget {
+                rect,
+                target: ClickTarget::ThinkingChip,
+            });
+        }
+        hits
     }
+}
+
+fn span_rect(area: Rect, spans: &[Span], index: usize) -> Option<Rect> {
+    let span = spans.get(index)?;
+    let x = area.x + spans[..index].iter().map(Span::width).sum::<usize>() as u16;
+    let right = x.saturating_add(span.width() as u16).min(area.right());
+    (right > x && x < area.right()).then(|| Rect::new(x, area.y, right - x, 1))
 }
 
 fn status_content_spans(snapshot: &StatusContentSnapshot, max_width: usize) -> Vec<Span<'static>> {
@@ -531,8 +619,14 @@ mod tests {
             restoring: false,
             status_content,
             suppress_status_content: false,
+            hover: None,
+            thinking_supported: false,
         };
-        terminal.draw(|f| bar.view(f, f.area(), &ctx)).unwrap();
+        terminal
+            .draw(|f| {
+                bar.view(f, f.area(), &ctx);
+            })
+            .unwrap();
         crate::components::buffer_text(terminal.backend().buffer())
     }
 
@@ -639,8 +733,14 @@ mod tests {
             restoring: false,
             status_content: None,
             suppress_status_content: false,
+            hover: None,
+            thinking_supported: false,
         };
-        terminal.draw(|f| bar.view(f, f.area(), &ctx)).unwrap();
+        terminal
+            .draw(|f| {
+                bar.view(f, f.area(), &ctx);
+            })
+            .unwrap();
         crate::components::buffer_text(terminal.backend().buffer())
     }
 
@@ -676,8 +776,14 @@ mod tests {
             restoring: false,
             status_content: None,
             suppress_status_content: false,
+            hover: None,
+            thinking_supported: false,
         };
-        terminal.draw(|f| bar.view(f, f.area(), &ctx)).unwrap();
+        terminal
+            .draw(|f| {
+                bar.view(f, f.area(), &ctx);
+            })
+            .unwrap();
         crate::components::buffer_text(terminal.backend().buffer())
             .contains(RESTRICTED_LABEL.trim())
     }
@@ -711,8 +817,14 @@ mod tests {
             restoring: false,
             status_content: None,
             suppress_status_content: false,
+            hover: None,
+            thinking_supported: false,
         };
-        terminal.draw(|f| bar.view(f, f.area(), &ctx)).unwrap();
+        terminal
+            .draw(|f| {
+                bar.view(f, f.area(), &ctx);
+            })
+            .unwrap();
         crate::components::buffer_text(terminal.backend().buffer()).contains(YOLO_LABEL.trim())
     }
 
@@ -899,9 +1011,13 @@ mod tests {
             restoring: false,
             status_content: None,
             suppress_status_content: false,
+            hover: None,
+            thinking_supported: false,
         };
-        term.draw(|frame| bar.view(frame, frame.area(), &ctx))
-            .unwrap();
+        term.draw(|frame| {
+            bar.view(frame, frame.area(), &ctx);
+        })
+        .unwrap();
         let text: String = term
             .backend()
             .buffer()
