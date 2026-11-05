@@ -72,7 +72,7 @@ All fields are optional. Typos in field names cause an error right away.
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
 | `splash_animation` | bool | `true` | - | Show splash animation on startup |
-| `scrollbar` | bool | `true` | - | Show vertical scrollbar in scrollable areas |
+| `scrollbar` | bool | `true` | - | Show a draggable vertical scrollbar in scrollable areas |
 | `inline_images` | bool | `true` | - | Render inline images in terminals with graphics support (Kitty graphics and tmux passthrough are detected automatically without manual multiplexer flags), falling back to an [image] line when off |
 | `notifications` | string | `auto` | - | Terminal notification method: auto, osc9, bell, or off |
 | `flash_duration_ms` | u64 | `1500` | - | Duration of flash messages (ms) |
