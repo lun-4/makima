@@ -15,7 +15,7 @@ use crate::components::keybindings::key;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 use crate::wrap::Measure;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::UnicodeWidthStr;
 
 const HINT_ALLOW_ROW: &[(&str, &str)] = &[
     ("y", "Allow"),
@@ -604,22 +604,20 @@ fn render_hints(
 }
 
 fn guidance_index(text: &str, width: u16, click_row: u16, click_col: u16) -> usize {
-    let prefix = "  guide ";
-    let mut row = 0u16;
-    let mut col = prefix
-        .chars()
-        .map(|c| c.width().unwrap_or(0) as u16)
-        .sum::<u16>();
-    for (index, ch) in text.chars().enumerate() {
-        let w = ch.width().unwrap_or(0) as u16;
-        if col.saturating_add(w) > width {
-            row = row.saturating_add(1);
-            col = 0;
+    for (index, _) in text.char_indices() {
+        let line = Line::from(vec![Span::raw("  guide "), Span::raw(&text[..index])]);
+        let rows = Measure::new(width).rows(&line);
+        let last_row = rows.saturating_sub(1);
+        if last_row > click_row {
+            break;
         }
-        if row == click_row && col.saturating_add(w) > click_col {
-            return index;
+        if last_row == click_row {
+            let used = "  guide ".width() + text[..index].width();
+            let col = used.saturating_sub(last_row as usize * width as usize) as u16;
+            if col >= click_col {
+                return text[..index].chars().count();
+            }
         }
-        col = col.saturating_add(w);
     }
     text.chars().count()
 }
@@ -726,5 +724,33 @@ mod tests {
         let mut prompt = PermissionPrompt::new();
         prompt.open("id".into(), ToolKey::Wildcard, vec![], None);
         assert!(matches!(prompt, PermissionPrompt::Open { .. }));
+    }
+
+    #[test]
+    fn click_hint_matches_its_key() {
+        let mut prompt = open_prompt();
+        assert_eq!(prompt.click_hint(0, 0), Some(PermissionAnswer::AllowOnce));
+        let mut prompt = open_prompt();
+        prompt.click_hint(1, 0);
+        if let PermissionPrompt::Open { state, .. } = &prompt {
+            assert_eq!(*state, PromptState::DenyEditing);
+        } else {
+            panic!("expected Open");
+        }
+    }
+
+    #[test]
+    fn click_confirm_row_accepts() {
+        let mut prompt = open_prompt();
+        prompt.click_hint(0, 1);
+        if let PermissionPrompt::Open { state, .. } = &prompt {
+            assert_eq!(*state, PromptState::ConfirmAllowAlwaysLocal);
+        } else {
+            panic!("expected Open");
+        }
+        assert_eq!(
+            prompt.click_hint(0, 0),
+            Some(PermissionAnswer::AllowAlwaysLocal)
+        );
     }
 }
