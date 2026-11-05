@@ -4189,8 +4189,9 @@ fn ctx_set_deadline_twice_errors() {
 }
 
 /// Generous: every wait below ends on an event, never on the clock, so only
-/// an already failing test pays this.
-const CANCEL_TEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// an already failing test pays this. Some waits also cover booting a host
+/// with every builtin loaded, which a starved CI box can stretch past 30s.
+const CANCEL_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 fn poll_until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
@@ -4276,6 +4277,9 @@ fn cancelled_bash_keeps_streamed_output_as_partial() {
     });
 
     let buf = poll_until("bash must publish its live buf", || {
+        if let Ok(result) = result_rx.try_recv() {
+            panic!("bash settled before publishing its live buf: {result:?}");
+        }
         recv_live_buf(&events, BASH_CANCEL_ID)
     });
     poll_until("bash output never reached the live buf", || {
@@ -7033,6 +7037,9 @@ fn cancelled_bash_large_output_keeps_partial_marker_last() {
     });
 
     let buf = poll_until("bash must publish its live buf", || {
+        if let Ok(result) = result_rx.try_recv() {
+            panic!("bash settled before publishing its live buf: {result:?}");
+        }
         recv_live_buf(&events, BASH_CANCEL_ID)
     });
     poll_until("bash output never reached the live buf", || {
