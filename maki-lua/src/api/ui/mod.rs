@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -7,7 +7,7 @@ use humantime::format_duration;
 use jiff::{Timestamp, tz::TimeZone};
 use maki_config::ClockFormat;
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{Lua, Result as LuaResult, Table, UserDataRef};
+use mlua::{Lua, RegistryKey, Result as LuaResult, Table, UserDataRef};
 use strum::VariantNames;
 
 use maki_agent::{POST_LEVELS, Post, PostLevel};
@@ -51,7 +51,7 @@ impl StatusContentStore {
     pub fn set(&mut self, plugin: Arc<str>, content: StatusContent) -> bool {
         let content: StatusContent = content
             .into_iter()
-            .filter(|(text, _)| !text.is_empty())
+            .filter(|entry| !entry.text.is_empty())
             .collect();
         if content.is_empty() {
             return self.content.remove(&plugin).is_some();
@@ -76,6 +76,67 @@ impl StatusContentStore {
             .iter()
             .map(|(plugin, content)| (Arc::clone(plugin), content.clone()))
             .collect()
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ClickRegions {
+    next_id: u32,
+    ids: HashMap<(Arc<str>, usize), u32>,
+    keys: HashMap<u32, RegistryKey>,
+}
+
+impl ClickRegions {
+    fn register(
+        &mut self,
+        lua: &Lua,
+        plugin: &Arc<str>,
+        index: usize,
+        func: mlua::Function,
+    ) -> LuaResult<u32> {
+        let id = match self.ids.get(&(Arc::clone(plugin), index)) {
+            Some(id) => *id,
+            None => {
+                self.next_id += 1;
+                self.ids.insert((Arc::clone(plugin), index), self.next_id);
+                self.next_id
+            }
+        };
+        if let Some(old) = self.keys.remove(&id) {
+            let _ = lua.remove_registry_value(old);
+        }
+        let key = lua.create_registry_value(func)?;
+        self.keys.insert(id, key);
+        Ok(id)
+    }
+
+    fn clear_entry(&mut self, lua: &Lua, plugin: &Arc<str>, index: usize) -> LuaResult<()> {
+        if let Some(id) = self.ids.remove(&(Arc::clone(plugin), index))
+            && let Some(key) = self.keys.remove(&id)
+        {
+            lua.remove_registry_value(key)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remove_plugin(&mut self, lua: &Lua, plugin: &str) {
+        let ids: Vec<u32> = self
+            .ids
+            .iter()
+            .filter(|((owner, _), _)| owner.as_ref() == plugin)
+            .map(|(_, id)| *id)
+            .collect();
+        for id in ids {
+            if let Some(key) = self.keys.remove(&id) {
+                let _ = lua.remove_registry_value(key);
+            }
+        }
+        self.ids.retain(|(owner, _), _| owner.as_ref() != plugin);
+    }
+
+    pub(crate) fn function(&self, lua: &Lua, id: u32) -> Option<mlua::Function> {
+        let key = self.keys.get(&id)?;
+        lua.registry_value::<mlua::Function>(key).ok()
     }
 }
 
@@ -681,15 +742,15 @@ fn open_win(
 pub(crate) const set_status_content__doc: FnDoc = FnDoc {
     name: "set_status_content",
     args: "{spans}",
-    desc: "Sets styled status content for your plugin. Each span is a {text, style_name} pair. An empty table clears your plugin's content. Only your own content is affected.",
+    desc: "Sets styled status content for your plugin. Each span is {text, style_name} or {text, style_name, on_click}. An empty table clears your plugin's content. Only your own content is affected. Clickable entries run their callback when clicked in the status bar.",
     params: &[ParamDoc {
         name: "{spans}",
         ty: "table",
-        desc: "Sequence of {text, style_name} string pairs.",
+        desc: "Sequence of {text, style_name} or {text, style_name, on_click} entries.",
     }],
     returns: "",
     guard: None,
-    example: "maki.ui.set_status_content({ {\"connected\", \"success\"}, {\" readonly\", \"muted\"} })\n-- later, clear it:\nmaki.ui.set_status_content({})",
+    example: "maki.ui.set_status_content({ {\"connected\", \"success\"}, {\" readonly\", \"muted\"} })\n-- clickable entry:\nmaki.ui.set_status_content({ {\"refresh\", \"accent\", function() maki.ui.flash(\"refreshing\") end} })",
 };
 
 #[allow(non_upper_case_globals)]
@@ -841,29 +902,59 @@ pub(crate) fn create_ui_table(
             let mlua::Value::Table(tbl) = value else {
                 return Err(mlua::Error::runtime("set_status_content expects a table"));
             };
-            let content = tbl
-                .sequence_values::<Table>()
-                .map(|entry| {
-                    let entry = entry?;
-                    let text = match entry.get::<mlua::Value>(1)? {
-                        mlua::Value::String(value) => value.to_str()?.to_owned(),
-                        _ => {
-                            return Err(mlua::Error::runtime(
-                                "set_status_content text must be a string",
-                            ));
+            let mut content = Vec::new();
+            for (index, entry) in tbl.sequence_values::<Table>().enumerate() {
+                let entry = entry?;
+                let text = match entry.get::<mlua::Value>(1)? {
+                    mlua::Value::String(value) => value.to_str()?.to_owned(),
+                    _ => {
+                        return Err(mlua::Error::runtime(
+                            "set_status_content text must be a string",
+                        ));
+                    }
+                };
+                let style = match entry.get::<mlua::Value>(2)? {
+                    mlua::Value::String(value) => value.to_str()?.to_owned(),
+                    _ => {
+                        return Err(mlua::Error::runtime(
+                            "set_status_content style_name must be a string",
+                        ));
+                    }
+                };
+                let click = match entry.get::<mlua::Value>(3) {
+                    Ok(mlua::Value::Function(func)) => {
+                        let id = lua
+                            .app_data_mut::<ClickRegions>()
+                            .ok_or_else(|| mlua::Error::runtime("click regions unavailable"))?
+                            .register(lua, &p, index, func)?;
+                        Some(id)
+                    }
+                    Ok(mlua::Value::Nil) | Err(_) => {
+                        if let Some(mut regions) = lua.app_data_mut::<ClickRegions>() {
+                            regions.clear_entry(lua, &p, index)?;
                         }
-                    };
-                    let style_name = match entry.get::<mlua::Value>(2)? {
-                        mlua::Value::String(value) => value.to_str()?.to_owned(),
-                        _ => {
-                            return Err(mlua::Error::runtime(
-                                "set_status_content style_name must be a string",
-                            ));
-                        }
-                    };
-                    Ok((text, style_name))
-                })
-                .collect::<LuaResult<StatusContent>>()?;
+                        None
+                    }
+                    Ok(_) => {
+                        return Err(mlua::Error::runtime(
+                            "set_status_content click must be a function or nil",
+                        ));
+                    }
+                };
+                content.push(crate::api::util::command::StatusEntry { text, style, click });
+            }
+            if let Some(mut regions) = lua.app_data_mut::<ClickRegions>() {
+                let len = content.len();
+                let stale: Vec<usize> = regions
+                    .ids
+                    .keys()
+                    .filter(|(owner, index)| owner.as_ref() == p.as_ref() && *index >= len)
+                    .map(|(_, index)| *index)
+                    .collect();
+                for index in stale {
+                    regions.clear_entry(lua, &p, index)?;
+                }
+            }
             let changed = lua
                 .app_data_mut::<StatusContentStore>()
                 .is_some_and(|mut store| store.set(Arc::clone(&p), content));
@@ -1880,9 +1971,30 @@ mod tests {
     #[test]
     fn status_content_store_orders_plugins_and_tracks_changes() {
         let mut store = StatusContentStore::new();
-        assert!(store.set(Arc::from("zzz"), vec![("z".into(), "muted".into())]));
-        assert!(store.set(Arc::from("aaa"), vec![("a".into(), "accent".into())]));
-        assert!(!store.set(Arc::from("aaa"), vec![("a".into(), "accent".into())]));
+        assert!(store.set(
+            Arc::from("zzz"),
+            vec![crate::api::util::command::StatusEntry {
+                text: "z".into(),
+                style: "muted".into(),
+                click: None
+            }]
+        ));
+        assert!(store.set(
+            Arc::from("aaa"),
+            vec![crate::api::util::command::StatusEntry {
+                text: "a".into(),
+                style: "accent".into(),
+                click: None
+            }]
+        ));
+        assert!(!store.set(
+            Arc::from("aaa"),
+            vec![crate::api::util::command::StatusEntry {
+                text: "a".into(),
+                style: "accent".into(),
+                click: None
+            }]
+        ));
 
         let entries = store.snapshot_entries();
         assert_eq!(entries[0].0.as_ref(), "aaa");
@@ -1922,7 +2034,14 @@ mod tests {
         let snapshot = reader.load_full();
         assert_eq!(snapshot.generation, 1);
         assert_eq!(snapshot.entries[0].0.as_ref(), "plug");
-        assert_eq!(snapshot.entries[0].1[0], ("ready".into(), "success".into()));
+        assert_eq!(
+            snapshot.entries[0].1[0],
+            crate::api::util::command::StatusEntry {
+                text: "ready".into(),
+                style: "success".into(),
+                click: None
+            }
+        );
 
         lua.load(r#"ui.set_status_content({ { "ready", "success" } })"#)
             .exec()

@@ -1179,6 +1179,14 @@ impl App {
                 self.active_chat().enable_auto_scroll();
                 vec![]
             }
+            ClickTarget::StatusEntry(id) => {
+                self.lua_event_handle.click_region(id);
+                vec![]
+            }
+            ClickTarget::WindowContent(id) | ClickTarget::WindowChrome(id) => {
+                self.float_mgr.click_at(id, pos);
+                vec![]
+            }
             ClickTarget::PermissionHint { row, cell } => {
                 if let Some(answer) = self.permission_prompt.click_hint(row, cell) {
                     self.answer_permission(answer);

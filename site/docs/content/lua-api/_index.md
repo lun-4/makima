@@ -6251,18 +6251,18 @@ local win = maki.ui.open_win(buf, {
 maki.ui.set_status_content({spans})
 ```
 
-Sets styled status content for your plugin. Each span is a {text, style_name} pair. An empty table clears your plugin's content. Only your own content is affected.
+Sets styled status content for your plugin. Each span is {text, style_name} or {text, style_name, on_click}. An empty table clears your plugin's content. Only your own content is affected. Clickable entries run their callback when clicked in the status bar.
 
 **Parameters:**
 
-- `{spans}` (`table`) Sequence of {text, style_name} string pairs.
+- `{spans}` (`table`) Sequence of {text, style_name} or {text, style_name, on_click} entries.
 
 **Example:**
 
 ```lua
 maki.ui.set_status_content({ {"connected", "success"}, {" readonly", "muted"} })
--- later, clear it:
-maki.ui.set_status_content({})
+-- clickable entry:
+maki.ui.set_status_content({ {"refresh", "accent", function() maki.ui.flash("refreshing") end} })
 ```
 
 ---
@@ -6348,6 +6348,7 @@ Event tables by type:
 - `{type="key", key}` -- keypress. Key is a string like "q", "j", or "esc".
 - `{type="resize", width, height}` -- terminal was resized.
 - `{type="paste", text}` -- bracketed paste.
+- `{type="click", row, col}` -- mouse click in the content; row is 1-based, 0 means the border/title/footer.
 - `{type="close"}` -- window was closed externally.
 - `{type="timeout"}` -- no event arrived within {timeout_ms}.
 
@@ -6650,7 +6651,10 @@ Registers an event handler on the buffer.
 
 Supported events:
 - "click": fires when the user clicks a line. The handler receives
-  a click-event table and may yield or mutate the buffer.
+  a click-event table whose `row` is 1-based, with `row = 0` for clicks
+  on chrome or outside the content. Transcript buffers deliver clicks
+  here; float windows deliver them from `win:recv()` as a `click` event
+  that also carries `col`.
 - "change": fires synchronously after every mutation (`line`,
   `lines`, `set_lines`). Must not yield.
 

@@ -456,6 +456,7 @@ end
 
 local function render_selecting(state, width)
   local lines = {}
+  local row_actions = {}
   local focus_row = 1
   local reserved_top = 0
   local usable = width - 1
@@ -463,6 +464,7 @@ local function render_selecting(state, width)
 
   if has_confirm(state) then
     lines[#lines + 1] = render_tab_bar(state)
+    row_actions[1] = { key = "tab_bar" }
     lines[#lines + 1] = {}
     reserved_top = 2
   end
@@ -488,9 +490,11 @@ local function render_selecting(state, width)
       opt.description,
       usable
     )
+    local first_row = #lines + 1
     for _, row in ipairs(opt_rows) do
       lines[#lines + 1] = row
     end
+    row_actions[first_row] = { key = "enter", cursor = i }
     if is_cur then
       focus_row = #lines
     end
@@ -527,9 +531,11 @@ local function render_selecting(state, width)
       custom_desc,
       usable
     )
+    local first_row = #lines + 1
     for _, row in ipairs(custom_rows) do
       lines[#lines + 1] = row
     end
+    row_actions[first_row] = { key = "enter", cursor = #opts + 1 }
 
     if custom_cur then
       focus_row = #lines + 1
@@ -547,12 +553,20 @@ local function render_selecting(state, width)
     footer = { { "Enter", "submit" }, { "Tab", "next" }, { "Esc", "dismiss" } }
   end
 
-  return { lines = lines, focus_row = focus_row, reserved_top = reserved_top, footer = footer }
+  return {
+    lines = lines,
+    focus_row = focus_row,
+    reserved_top = reserved_top,
+    footer = footer,
+    row_actions = row_actions,
+  }
 end
 
 local function render_confirming(state, width)
   local lines = {}
+  local row_actions = {}
   lines[#lines + 1] = render_tab_bar(state)
+  row_actions[1] = { key = "tab_bar" }
   lines[#lines + 1] = {}
   lines[#lines + 1] = { { " Review your answers:", "bold" } }
   lines[#lines + 1] = {}
@@ -578,7 +592,14 @@ local function render_confirming(state, width)
 
   lines[#lines + 1] = {}
   local footer = { { "Enter", "submit" }, { "Shift+Tab", "back" }, { "Esc", "dismiss" } }
-  return { lines = lines, focus_row = 1, reserved_top = 2, footer = footer }
+  row_actions[3] = { key = "enter" }
+  return {
+    lines = lines,
+    focus_row = 1,
+    reserved_top = 2,
+    footer = footer,
+    row_actions = row_actions,
+  }
 end
 
 local function render(state, width)
@@ -632,6 +653,27 @@ function QuestionForm.open(questions)
       max_h = math.floor(maki.ui.terminal_size().rows * MAX_HEIGHT_RATIO)
     elseif ev.type == "paste" and state.mode == MODE.EDITING_CUSTOM then
       state.custom_input:insert_text(ev.text)
+    elseif ev.type == "click" then
+      local action = result.row_actions and result.row_actions[ev.row]
+      if action then
+        if action.key == "tab_bar" then
+          if state.mode == MODE.SELECTING and ev.col > math.max(0, width - 9) then
+            state.tab = #state.questions
+            state = handle_key(state, "tab")
+          else
+            state = handle_key(state, "tab")
+          end
+        elseif action.cursor then
+          state.cursor = action.cursor
+          state = handle_key(state, "enter")
+        else
+          state = handle_key(state, action.key)
+        end
+        if state.done then
+          win:close()
+          return state.done
+        end
+      end
     elseif ev.type == "key" then
       state = handle_key(state, ev.key)
       if state.done then

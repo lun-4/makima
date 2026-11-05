@@ -285,6 +285,20 @@ function ListPicker.open(items, opts)
       width = ev.width
       height = ev.height
       move_cursor(cursor)
+    elseif ev.type == "click" then
+      local selected
+      for i, line in pairs(item_lines) do
+        if line == ev.row then
+          selected = i
+        end
+      end
+      if selected then
+        move_cursor(selected)
+        if #filtered > 0 then
+          win:close()
+          return { type = "choice", index = original_indices[cursor] }
+        end
+      end
     elseif ev.type == "key" then
       if ev.key == "up" then
         move_cursor((cursor - 2) % math.max(#filtered, 1) + 1)

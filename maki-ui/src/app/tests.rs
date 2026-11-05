@@ -1,11 +1,12 @@
 use super::shell::ShellEvent;
 use super::*;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT};
+use crate::click::ClickTarget;
 use crate::components::btw_modal::BtwEvent;
 use crate::components::command::ParsedCommand;
 use crate::components::file_picker::EMPTY_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
-use crate::components::{ExitRequest, buffer_text, key, test_model};
+use crate::components::{Action, ExitRequest, buffer_text, key, test_model};
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
 use arc_swap::ArcSwap;
@@ -2720,6 +2721,80 @@ fn finished_subagent_entry_is_finished_flag() {
     let done_entries = app.task_entries();
     let done = done_entries.iter().find(|e| e.chat_index == 1).unwrap();
     assert!(done.is_finished());
+}
+
+fn render_app(app: &mut App, width: u16, height: u16) {
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|frame| app.view(frame)).unwrap();
+}
+
+fn hit_center(app: &App, target: ClickTarget) -> (u16, u16) {
+    let rect = app.hits.rect_of(target).expect("target is registered");
+    (rect.x + rect.width / 2, rect.y + rect.height / 2)
+}
+
+fn click_target(app: &mut App, target: ClickTarget) -> Vec<Action> {
+    render_app(app, 100, 40);
+    let (x, y) = hit_center(app, target);
+    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), x, y));
+    app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), x, y))
+}
+
+#[test]
+fn click_mode_chip_opens_menu() {
+    let mut app = test_app();
+    click_target(&mut app, ClickTarget::ModeChip);
+    assert!(app.menu.is_open());
+}
+
+#[test]
+fn menu_mode_row_emits_change_mode() {
+    let mut app = test_app();
+    click_target(&mut app, ClickTarget::ModeChip);
+    render_app(&mut app, 100, 40);
+    let actions = click_target(&mut app, ClickTarget::MenuRow(1));
+    assert!(matches!(actions.as_slice(), [Action::ChangeMode(_)]));
+}
+
+#[test]
+fn click_model_chip_opens_model_picker() {
+    let mut app = test_app();
+    let actions = click_target(&mut app, ClickTarget::ModelChip);
+    assert!(matches!(actions.as_slice(), [Action::RefreshModels]));
+    assert!(app.model_picker.is_open());
+}
+
+#[test]
+fn click_agent_badge_opens_tasks() {
+    let mut app = test_app();
+    click_target(&mut app, ClickTarget::AgentChip);
+    assert!(app.task_picker.is_open());
+}
+
+#[test]
+fn outside_click_closes_model_picker() {
+    let mut app = test_app();
+    app.run_builtin(maki_lua::BuiltinAction::ModelPicker);
+    render_app(&mut app, 100, 40);
+    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0));
+    app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 0, 0));
+    assert!(!app.model_picker.is_open());
+}
+
+#[test]
+fn click_permission_hint_answers() {
+    let mut app = test_app();
+    app.permission_prompt.open(
+        "req".into(),
+        maki_config::ToolKey::native("bash"),
+        vec!["execute".into()],
+        None,
+    );
+    app.active_input = Some(crate::app::InputKind::Permission);
+    render_app(&mut app, 100, 40);
+    click_target(&mut app, ClickTarget::PermissionHint { row: 0, cell: 0 });
+    assert!(!app.permission_prompt.is_open());
 }
 
 fn rendered_rows(app: &mut App, width: u16, height: u16) -> Vec<String> {

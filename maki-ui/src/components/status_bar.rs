@@ -4,6 +4,8 @@ use std::time::{Duration, Instant};
 
 use super::{RetryInfo, Status};
 use maki_lua::StatusContentSnapshot;
+#[cfg(test)]
+use maki_lua::StatusEntry;
 
 use crate::animation::spinner_frame;
 use crate::click::{ClickTarget, HitTarget};
@@ -214,6 +216,8 @@ impl StatusBar {
         let mut right_spans = Vec::new();
         let mut model_idx = None;
         let mut thinking_idx = None;
+        let mut status_base = None;
+        let mut status_clicks: Vec<(usize, u32)> = Vec::new();
 
         let yolo_span = ctx.yolo.then(|| {
             Span::styled(
@@ -307,7 +311,7 @@ impl StatusBar {
                     Cow::Borrowed(ctx.model_id)
                 };
                 let model_min_width = 8.min(model_text.width());
-                let plugin_spans = if !ctx.suppress_status_content {
+                let (plugin_spans, clicks) = if !ctx.suppress_status_content {
                     ctx.status_content
                         .map(|snapshot| {
                             status_content_spans(
@@ -317,8 +321,9 @@ impl StatusBar {
                         })
                         .unwrap_or_default()
                 } else {
-                    Vec::new()
+                    (Vec::new(), Vec::new())
                 };
+                status_clicks = clicks;
                 let plugin_width: usize = plugin_spans.iter().map(Span::width).sum();
                 // `truncate_tail` keeps the tail, so a narrow bar collapses to
                 // the incoming model, which is the half worth keeping.
@@ -341,6 +346,7 @@ impl StatusBar {
                     thinking_idx = Some(rest_base + idx);
                 }
                 right_spans.append(&mut rest_spans);
+                status_base = Some(right_spans.len());
                 right_spans.extend(plugin_spans);
             }
         }
@@ -374,6 +380,16 @@ impl StatusBar {
             });
         }
         let model_rect = model_idx.and_then(|idx| span_rect(right_area, &right_spans, idx));
+        let status_rects: Vec<(Rect, u32)> = status_base
+            .map(|base| {
+                status_clicks
+                    .iter()
+                    .filter_map(|(idx, id)| {
+                        span_rect(right_area, &right_spans, base + idx).map(|rect| (rect, *id))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let thinking_rect = thinking_idx.and_then(|idx| span_rect(right_area, &right_spans, idx));
         frame.render_widget(Paragraph::new(Line::from(left_spans)), left_area);
         frame.render_widget(
@@ -392,6 +408,12 @@ impl StatusBar {
                 target: ClickTarget::ThinkingChip,
             });
         }
+        for (rect, id) in status_rects {
+            hits.push(HitTarget {
+                rect,
+                target: ClickTarget::StatusEntry(id),
+            });
+        }
         hits
     }
 }
@@ -403,22 +425,26 @@ fn span_rect(area: Rect, spans: &[Span], index: usize) -> Option<Rect> {
     (right > x && x < area.right()).then(|| Rect::new(x, area.y, right - x, 1))
 }
 
-fn status_content_spans(snapshot: &StatusContentSnapshot, max_width: usize) -> Vec<Span<'static>> {
+fn status_content_spans(
+    snapshot: &StatusContentSnapshot,
+    max_width: usize,
+) -> (Vec<Span<'static>>, Vec<(usize, u32)>) {
     let mut remaining = max_width;
     let mut spans = Vec::new();
+    let mut clicks = Vec::new();
     let mut has_content = false;
     for (_, entries) in &snapshot.entries {
         let mut owner_has_content = false;
-        for (text, style_name) in entries {
-            if text.is_empty() {
+        for entry in entries {
+            if entry.text.is_empty() {
                 continue;
             }
             let separator = usize::from(has_content && !owner_has_content);
             if remaining <= separator {
-                return spans;
+                return (spans, clicks);
             }
             remaining -= separator;
-            let clipped = truncate_head(text, remaining);
+            let clipped = truncate_head(&entry.text, remaining);
             let width = clipped.width();
             if width == 0 {
                 continue;
@@ -427,15 +453,18 @@ fn status_content_spans(snapshot: &StatusContentSnapshot, max_width: usize) -> V
                 spans.push(Span::raw(" "));
             }
             remaining -= width;
+            if let Some(id) = entry.click {
+                clicks.push((spans.len(), id));
+            }
             spans.push(Span::styled(
                 clipped.into_owned(),
-                theme::style_by_name(style_name),
+                theme::style_by_name(&entry.style),
             ));
             has_content = true;
             owner_has_content = true;
         }
     }
-    spans
+    (spans, clicks)
 }
 
 fn truncate_head(s: &str, max_width: usize) -> Cow<'_, str> {
@@ -633,7 +662,14 @@ mod tests {
     #[test]
     fn status_bar_orders_model_context_cost_then_plugin_at_right() {
         let snapshot = StatusContentSnapshot {
-            entries: vec![(Arc::from("usage"), vec![("PLUGIN".into(), "accent".into())])],
+            entries: vec![(
+                Arc::from("usage"),
+                vec![StatusEntry {
+                    text: "PLUGIN".into(),
+                    style: "accent".into(),
+                    click: None,
+                }],
+            )],
             generation: 1,
         };
         let text = render_context(Some(&snapshot), 120);
@@ -666,7 +702,14 @@ mod tests {
     #[test]
     fn status_bar_narrow_width_keeps_plugin_and_model_minimum() {
         let snapshot = StatusContentSnapshot {
-            entries: vec![(Arc::from("usage"), vec![("PLUGIN".into(), "accent".into())])],
+            entries: vec![(
+                Arc::from("usage"),
+                vec![StatusEntry {
+                    text: "PLUGIN".into(),
+                    style: "accent".into(),
+                    click: None,
+                }],
+            )],
             generation: 1,
         };
         let text = render_context(Some(&snapshot), 47);
@@ -680,14 +723,26 @@ mod tests {
             entries: vec![(
                 Arc::from("usage"),
                 vec![
-                    ("5h30%".into(), "accent".into()),
-                    (" ".into(), "dim".into()),
-                    ("w90%".into(), "accent".into()),
+                    StatusEntry {
+                        text: "5h30%".into(),
+                        style: "accent".into(),
+                        click: None,
+                    },
+                    StatusEntry {
+                        text: " ".into(),
+                        style: "dim".into(),
+                        click: None,
+                    },
+                    StatusEntry {
+                        text: "w90%".into(),
+                        style: "accent".into(),
+                        click: None,
+                    },
                 ],
             )],
             generation: 1,
         };
-        let spans = status_content_spans(&snapshot, 32);
+        let (spans, _) = status_content_spans(&snapshot, 32);
         let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
         assert_eq!(text, "5h30% w90%");
     }
@@ -696,12 +751,26 @@ mod tests {
     fn status_content_separates_plugin_entries_once() {
         let snapshot = StatusContentSnapshot {
             entries: vec![
-                (Arc::from("one"), vec![("a".into(), "accent".into())]),
-                (Arc::from("two"), vec![("b".into(), "accent".into())]),
+                (
+                    Arc::from("one"),
+                    vec![StatusEntry {
+                        text: "a".into(),
+                        style: "accent".into(),
+                        click: None,
+                    }],
+                ),
+                (
+                    Arc::from("two"),
+                    vec![StatusEntry {
+                        text: "b".into(),
+                        style: "accent".into(),
+                        click: None,
+                    }],
+                ),
             ],
             generation: 1,
         };
-        let spans = status_content_spans(&snapshot, 32);
+        let (spans, _) = status_content_spans(&snapshot, 32);
         let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
         assert_eq!(text, "a b");
     }

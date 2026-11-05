@@ -75,6 +75,9 @@ struct FloatWindow {
     /// scroll math stays consistent between frames.
     viewport_h: u16,
     last_content: Rect,
+    scroll_area: Rect,
+    pinned_top: Option<Rect>,
+    pinned_bot: Option<Rect>,
     scrollbar_hit: Option<ScrollbarHit>,
     cursor: usize,
     visible: bool,
@@ -222,6 +225,9 @@ impl FloatManager {
             cached_lines,
             viewport_h: 1,
             last_content: Rect::default(),
+            scroll_area: Rect::default(),
+            pinned_top: None,
+            pinned_bot: None,
             scrollbar_hit: None,
             cursor: 0,
             visible,
@@ -436,14 +442,60 @@ impl FloatManager {
         let Some(win) = self.focused_window() else {
             return Vec::new();
         };
-        win.scrollbar_hit
-            .map(|hit| {
-                vec![HitTarget {
-                    rect: hit.area,
-                    target: ClickTarget::Scrollbar(ScrollOwner::Float(win.id)),
-                }]
-            })
-            .unwrap_or_default()
+        let Some(popup) = self.focused_rect else {
+            return Vec::new();
+        };
+        let mut hits = vec![HitTarget {
+            rect: popup,
+            target: ClickTarget::WindowChrome(win.id),
+        }];
+        if win.last_content.width > 0 && win.last_content.height > 0 {
+            hits.push(HitTarget {
+                rect: win.last_content,
+                target: ClickTarget::WindowContent(win.id),
+            });
+        }
+        if let Some(hit) = win.scrollbar_hit {
+            hits.push(HitTarget {
+                rect: hit.area,
+                target: ClickTarget::Scrollbar(ScrollOwner::Float(win.id)),
+            });
+        }
+        hits
+    }
+
+    /// Delivers a click to the focused float, translating the pointer to a
+    /// 1-based content row. `row = 0` means the click landed on chrome or
+    /// outside the content.
+    pub fn click_at(&mut self, id: u32, pos: ratatui::layout::Position) {
+        if self.focused_id != Some(id) {
+            return;
+        }
+        let Some(win) = self.windows.iter_mut().find(|w| w.id == id) else {
+            return;
+        };
+        let (row, col) = if !win.last_content.contains(pos) {
+            (0, 1)
+        } else {
+            let top = win.layout().reserved_top;
+            let scrollable = win.layout().scrollable;
+            let row = if win.pinned_top.is_some_and(|rect| rect.contains(pos)) {
+                1 + pos.y.saturating_sub(win.pinned_top.unwrap_or_default().y)
+            } else if win.pinned_bot.is_some_and(|rect| rect.contains(pos)) {
+                1 + top as u16
+                    + scrollable as u16
+                    + pos.y.saturating_sub(win.pinned_bot.unwrap_or_default().y)
+            } else {
+                1 + top as u16 + win.scroll_offset as u16 + pos.y.saturating_sub(win.scroll_area.y)
+            };
+            let max_row = win.cached_lines.len().max(1) as u16;
+            let col = 1 + pos.x.saturating_sub(win.last_content.x);
+            (
+                row.clamp(1, max_row),
+                col.min(win.last_content.width.max(1)),
+            )
+        };
+        let _ = win.event_tx.try_send(WinEvent::Click { row, col });
     }
 
     pub fn scroll_line(&self, id: u32) -> Option<u16> {
@@ -574,6 +626,9 @@ impl FloatManager {
                 (None, content_area, None)
             };
 
+        win.scroll_area = scroll_area;
+        win.pinned_top = pinned_top_area;
+        win.pinned_bot = pinned_bot_area;
         win.refresh_layout(scroll_area.height);
         let top = layout.reserved_top;
         let scrollable = layout.scrollable;
@@ -1915,6 +1970,9 @@ mod tests {
             cached_lines,
             viewport_h: 1,
             last_content: Rect::default(),
+            scroll_area: Rect::default(),
+            pinned_top: None,
+            pinned_bot: None,
             scrollbar_hit: None,
             cursor: 0,
             visible: true,
