@@ -498,7 +498,10 @@ fn cancel_in_progress_marks_pending_as_error(cache_built: bool) {
 
 const THINKING_TEXT: &str = "a long chain of reasoning";
 const HIGHLIGHTED_CODE: &str = "fn main() {}";
-const HIGHLIGHT_DEADLINE: Duration = Duration::from_secs(10);
+/// The first job pays for loading the `SyntaxSet` and compiling the syntax's
+/// regexes on the one highlight thread, which a box running 64 test processes
+/// on 3 cores can stretch by orders of magnitude. Only a hang guard.
+const HIGHLIGHT_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Only `view` advances a typewriter, and collapsed thinking is never drawn,
 /// so its reveal can never finish. Believing it would hold the loop at full
@@ -657,14 +660,10 @@ fn tick_drains_the_highlight_worker() {
     });
     rebuild(&mut panel);
 
-    let deadline = Instant::now() + HIGHLIGHT_DEADLINE;
-    while panel.tick() == Dirty::NO {
-        assert!(
-            Instant::now() < deadline,
-            "a highlighted tool stays unstyled until some unrelated repaint"
-        );
-        std::thread::yield_now();
-    }
+    wait_for_highlight(
+        &mut panel,
+        "a highlighted tool stays unstyled until some unrelated repaint",
+    );
 
     assert!(
         seg_text(&panel, "t1").contains(HIGHLIGHTED_CODE),
@@ -2619,15 +2618,18 @@ fn code_span_styles(panel: &MessagesPanel, tool_id: &str) -> Vec<(String, Style)
         .collect()
 }
 
-fn drain_highlight_worker(panel: &mut MessagesPanel) {
+/// Parks on the worker's channel between ticks: a `yield_now` spin here takes
+/// CPU from the very thread it is waiting on.
+fn wait_for_highlight(panel: &mut MessagesPanel, failure: &str) {
     let deadline = Instant::now() + HIGHLIGHT_DEADLINE;
     while panel.tick() == Dirty::NO {
-        assert!(
-            Instant::now() < deadline,
-            "the highlight worker never delivered a result"
-        );
-        std::thread::yield_now();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(panel.hl_worker.wait_for_result(remaining), "{failure}");
     }
+}
+
+fn drain_highlight_worker(panel: &mut MessagesPanel) {
+    wait_for_highlight(panel, "the highlight worker never delivered a result");
     render(panel, 80, 20);
 }
 

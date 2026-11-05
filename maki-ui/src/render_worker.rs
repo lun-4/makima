@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::time::Duration;
 
 use crate::components::code_view::{self, RenderLimits};
 use maki_agent::{ToolInput, ToolOutput};
@@ -54,13 +56,24 @@ impl RenderWorker {
     pub fn try_recv(&self) -> Option<RenderResult> {
         self.result_rx.try_recv().ok()
     }
+
+    /// Parks until a result is queued, then puts it back for [`Self::try_recv`],
+    /// so a test can wait on the worker without spinning against it for CPU.
+    #[cfg(test)]
+    pub fn wait_for_result(&self, timeout: Duration) -> bool {
+        match self.result_rx.recv_timeout(timeout) {
+            Ok(result) => {
+                let _ = self.result_tx.send(result);
+                true
+            }
+            Err(_) => false,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use std::time::Duration;
 
     use crate::components::code_view::SectionFlags;
 
