@@ -391,7 +391,8 @@ impl App {
                 Block::default().style(Style::new().bg(theme::current().background)),
                 layout.bottom_area,
             );
-            self.permission_prompt.view(frame, layout.bottom_area);
+            let hits = self.permission_prompt.view(frame, layout.bottom_area);
+            self.absorb_hits(hits);
         } else if self.question_active()
             && let Some(rect) = layout.splits.rect(Split::Below)
         {

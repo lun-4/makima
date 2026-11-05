@@ -3,18 +3,19 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use maki_agent::permissions::{DEFAULT_DENY_GUIDANCE, PermissionAnswer, generalized_scopes};
 use maki_config::ToolKey;
 
+use crate::click::{ClickTarget, HitTarget};
 use crate::components::Overlay;
-use crate::components::form::render_form;
-use crate::components::hint_line;
 use crate::components::is_ctrl;
 use crate::components::keybindings::key;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
+use crate::wrap::Measure;
+use unicode_width::UnicodeWidthChar;
 
 const HINT_ALLOW_ROW: &[(&str, &str)] = &[
     ("y", "Allow"),
@@ -50,37 +51,6 @@ const CONFIRM_DENY_ALL_HINTS: &[(&str, &str)] = &[
 
 const DENY_GUIDANCE_HINTS: &[(&str, &str)] = &[("Enter", "Deny"), ("Esc", "Cancel")];
 
-fn aligned_hint_rows(rows: &[&[(&str, &str)]]) -> Vec<Line<'static>> {
-    let t = theme::current();
-    let max_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
-    let mut col_widths = vec![0usize; max_cols];
-    for row in rows {
-        for (i, (key, desc)) in row.iter().enumerate() {
-            let cell_len = key.len() + 1 + desc.len();
-            col_widths[i] = col_widths[i].max(cell_len);
-        }
-    }
-    rows.iter()
-        .map(|row| {
-            let mut spans = Vec::with_capacity(row.len() * 2);
-            for (i, (key, desc)) in row.iter().enumerate() {
-                spans.push(Span::styled(format!("  {key}"), t.keybind_key));
-                let cell_len = key.len() + 1 + desc.len();
-                let pad = if i + 1 < row.len() {
-                    col_widths[i].saturating_sub(cell_len)
-                } else {
-                    0
-                };
-                spans.push(Span::styled(
-                    format!(" {desc}{:width$}", "", width = pad),
-                    t.tool_dim,
-                ));
-            }
-            Line::from(spans)
-        })
-        .collect()
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum PromptState {
     #[default]
@@ -93,9 +63,57 @@ pub(crate) enum PromptState {
     DenyEditing,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HintAction {
+    Char(char),
+    Enter,
+    Esc,
+    AnyCancel,
+    Defer,
+}
+
+#[derive(Debug, Clone)]
+struct HintCell {
+    key: &'static str,
+    desc: &'static str,
+    action: HintAction,
+}
+
+impl HintCell {
+    fn new(key: &'static str, desc: &'static str, action: HintAction) -> Self {
+        Self { key, desc, action }
+    }
+}
+
+fn hint_cells(row: &[(&'static str, &'static str)]) -> Vec<HintCell> {
+    row.iter()
+        .map(|&(key, desc)| {
+            let action = key
+                .chars()
+                .next()
+                .map_or(HintAction::Defer, HintAction::Char);
+            HintCell::new(key, desc, action)
+        })
+        .collect()
+}
+
+fn confirm_row(hints: &[(&'static str, &'static str)], action: HintAction) -> Vec<Vec<HintCell>> {
+    vec![vec![
+        HintCell::new(hints[0].0, hints[0].1, action),
+        HintCell::new("any", "Cancel", HintAction::AnyCancel),
+    ]]
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GuidanceHit {
+    rect: Rect,
+}
+
+#[allow(clippy::large_enum_variant)]
 pub enum PermissionPrompt {
     Closed,
     Open {
+        guidance: Option<Box<GuidanceHit>>,
         #[allow(dead_code)]
         id: String,
         tool: ToolKey,
@@ -161,6 +179,7 @@ impl PermissionPrompt {
             allow_scopes,
             state: PromptState::Normal,
             buffer: TextBuffer::new(String::new()),
+            guidance: None,
         };
     }
 
@@ -279,7 +298,7 @@ impl PermissionPrompt {
         false
     }
 
-    fn build_lines(&self) -> Vec<Line<'static>> {
+    fn body_lines(&self) -> Vec<Line<'static>> {
         let Self::Open {
             tool,
             scopes,
@@ -350,52 +369,259 @@ impl PermissionPrompt {
         }
 
         lines.push(Line::raw(""));
-        match *state {
-            PromptState::ConfirmAllowAlwaysLocal => {
-                lines.push(hint_line(CONFIRM_ALLOW_PROJECT_HINTS));
-            }
-            PromptState::ConfirmAllowAlwaysGlobal => {
-                lines.push(hint_line(CONFIRM_ALLOW_ALL_HINTS));
-            }
-            PromptState::ConfirmAllowSession => {
-                lines.push(hint_line(CONFIRM_SESSION_HINTS));
-            }
-            PromptState::ConfirmDenyAlwaysLocal => {
-                lines.push(hint_line(CONFIRM_DENY_PROJECT_HINTS));
-            }
-            PromptState::ConfirmDenyAlwaysGlobal => {
-                lines.push(hint_line(CONFIRM_DENY_ALL_HINTS));
-            }
-            PromptState::DenyEditing => {
-                lines.push(hint_line(DENY_GUIDANCE_HINTS));
-            }
-            PromptState::Normal => {
-                lines.extend(aligned_hint_rows(&[
-                    HINT_ALLOW_ROW,
-                    HINT_DENY_ROW,
-                    HINT_DEFER_ROW,
-                ]));
-            }
-        }
-        lines.push(Line::raw(""));
         lines
     }
 
-    pub fn view(&self, frame: &mut Frame, area: Rect) {
+    fn hint_rows(&self) -> Vec<Vec<HintCell>> {
+        let Self::Open { state, .. } = self else {
+            return vec![];
+        };
+        match *state {
+            PromptState::ConfirmAllowAlwaysLocal => {
+                confirm_row(CONFIRM_ALLOW_PROJECT_HINTS, HintAction::Enter)
+            }
+            PromptState::ConfirmAllowAlwaysGlobal => {
+                confirm_row(CONFIRM_ALLOW_ALL_HINTS, HintAction::Enter)
+            }
+            PromptState::ConfirmAllowSession => {
+                confirm_row(CONFIRM_SESSION_HINTS, HintAction::Enter)
+            }
+            PromptState::ConfirmDenyAlwaysLocal => {
+                confirm_row(CONFIRM_DENY_PROJECT_HINTS, HintAction::Enter)
+            }
+            PromptState::ConfirmDenyAlwaysGlobal => {
+                confirm_row(CONFIRM_DENY_ALL_HINTS, HintAction::Enter)
+            }
+            PromptState::DenyEditing => vec![vec![
+                HintCell::new(
+                    DENY_GUIDANCE_HINTS[0].0,
+                    DENY_GUIDANCE_HINTS[0].1,
+                    HintAction::Enter,
+                ),
+                HintCell::new(
+                    DENY_GUIDANCE_HINTS[1].0,
+                    DENY_GUIDANCE_HINTS[1].1,
+                    HintAction::Esc,
+                ),
+            ]],
+            PromptState::Normal => vec![
+                hint_cells(HINT_ALLOW_ROW),
+                hint_cells(HINT_DENY_ROW),
+                vec![HintCell::new(
+                    HINT_DEFER_ROW[0].0,
+                    HINT_DEFER_ROW[0].1,
+                    HintAction::Defer,
+                )],
+            ],
+        }
+    }
+
+    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Vec<HitTarget> {
         if !self.is_open() {
+            return Vec::new();
+        }
+        let t = theme::current();
+        let block = Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(t.panel_border)
+            .title_top(Line::from(" Permission Required ").left_aligned())
+            .title_style(t.panel_title);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        frame.render_widget(Block::default().style(Style::new().bg(t.background)), inner);
+
+        let body = self.body_lines();
+        let guidance_start = {
+            let mut measure = Measure::new(inner.width);
+            let mut row = 0u16;
+            let mut start = None;
+            for (index, line) in body.iter().enumerate() {
+                if index + 2 == body.len() {
+                    start = Some(row);
+                }
+                row = row.saturating_add(measure.rows(line).max(1));
+            }
+            start
+        };
+        let body_rows = Paragraph::new(body.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(inner.width) as u16;
+        let body_h = body_rows.min(inner.height);
+        let body_area = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: body_h,
+        };
+        frame.render_widget(
+            Paragraph::new(body)
+                .style(Style::new().fg(t.foreground))
+                .wrap(Wrap { trim: false }),
+            body_area,
+        );
+
+        let rows = self.hint_rows();
+        let cell_hits = render_hints(frame, inner, body_area.bottom(), &rows);
+        let mut hits = Vec::new();
+        for (row, cells) in rows.iter().enumerate() {
+            for (cell, hint) in cells.iter().enumerate() {
+                let Some(rect) = cell_hits
+                    .iter()
+                    .find(|((r, c), _)| *r == row && *c == cell)
+                    .map(|(_, rect)| *rect)
+                else {
+                    continue;
+                };
+                if hint.action == HintAction::Defer {
+                    continue;
+                }
+                hits.push(HitTarget {
+                    rect,
+                    target: ClickTarget::PermissionHint {
+                        row: row as u16,
+                        cell: cell as u16,
+                    },
+                });
+            }
+        }
+        if let Self::Open {
+            state,
+            guidance: guidance_hit,
+            ..
+        } = self
+            && *state == PromptState::DenyEditing
+        {
+            let start = guidance_start.unwrap_or(0);
+            let rect = Rect::new(
+                inner.x,
+                inner.y.saturating_add(start),
+                inner.width,
+                body_h.saturating_sub(start),
+            );
+            *guidance_hit = (rect.height > 0).then(|| Box::new(GuidanceHit { rect }));
+            if rect.height > 0 {
+                hits.push(HitTarget {
+                    rect,
+                    target: ClickTarget::PermissionGuidance,
+                });
+            }
+        }
+        hits
+    }
+
+    pub fn click_hint(&mut self, row: u16, cell: u16) -> Option<PermissionAnswer> {
+        let rows = self.hint_rows();
+        let action = rows.get(row as usize)?.get(cell as usize)?.action;
+        let key = match action {
+            HintAction::Char(ch) => KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            HintAction::Enter => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            HintAction::Esc | HintAction::AnyCancel => {
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            }
+            HintAction::Defer => return None,
+        };
+        self.handle_key(key)
+    }
+
+    pub fn click_guidance(&mut self, pos: ratatui::layout::Position) {
+        let Self::Open {
+            state,
+            buffer,
+            guidance,
+            ..
+        } = self
+        else {
+            return;
+        };
+        if *state != PromptState::DenyEditing {
             return;
         }
-        let lines = self.build_lines();
-        let t = theme::current();
-        render_form(&t, " Permission Required ", frame, area, lines, (0, 0));
+        let Some(guidance) = guidance.as_deref() else {
+            return;
+        };
+        let row = pos.y.saturating_sub(guidance.rect.y);
+        let col = pos.x.saturating_sub(guidance.rect.x);
+        let text = if buffer.value().is_empty() {
+            DEFAULT_DENY_GUIDANCE.to_string()
+        } else {
+            buffer.value()
+        };
+        let index = guidance_index(&text, guidance.rect.width, row, col);
+        buffer.set_cursor(0, index);
     }
 
     pub fn height(&self, width: u16) -> u16 {
         let inner_width = width.saturating_sub(2);
-        let lines = self.build_lines();
-        let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-        para.line_count(inner_width) as u16 + 2
+        let body_rows = Paragraph::new(self.body_lines())
+            .wrap(Wrap { trim: false })
+            .line_count(inner_width) as u16;
+        body_rows + self.hint_rows().len() as u16 + 3
     }
+}
+
+fn render_hints(
+    frame: &mut Frame,
+    inner: Rect,
+    top: u16,
+    rows: &[Vec<HintCell>],
+) -> Vec<((usize, usize), Rect)> {
+    let t = theme::current();
+    let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let mut widths = vec![0usize; cols];
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.key.len() + cell.desc.len() + 3);
+        }
+    }
+    let mut hits = Vec::new();
+    for (row_index, row) in rows.iter().enumerate() {
+        let y = top.saturating_add(row_index as u16);
+        if y >= inner.bottom() {
+            break;
+        }
+        let mut x = inner.x;
+        for (cell_index, cell) in row.iter().enumerate() {
+            let width = widths[cell_index] as u16;
+            let right = x.saturating_add(width).min(inner.right());
+            if right <= x {
+                break;
+            }
+            let rect = Rect::new(x, y, right - x, 1);
+            let spans = vec![
+                Span::raw("  "),
+                Span::styled(format!("{} ", cell.key), t.keybind_key),
+                Span::styled(cell.desc, t.tool_dim),
+            ];
+            frame.render_widget(Paragraph::new(Line::from(spans)), rect);
+            if x.saturating_add(width) <= inner.right() {
+                hits.push(((row_index, cell_index), rect));
+            }
+            x = x.saturating_add(width);
+        }
+    }
+    hits
+}
+
+fn guidance_index(text: &str, width: u16, click_row: u16, click_col: u16) -> usize {
+    let prefix = "  guide ";
+    let mut row = 0u16;
+    let mut col = prefix
+        .chars()
+        .map(|c| c.width().unwrap_or(0) as u16)
+        .sum::<u16>();
+    for (index, ch) in text.chars().enumerate() {
+        let w = ch.width().unwrap_or(0) as u16;
+        if col.saturating_add(w) > width {
+            row = row.saturating_add(1);
+            col = 0;
+        }
+        if row == click_row && col.saturating_add(w) > click_col {
+            return index;
+        }
+        col = col.saturating_add(w);
+    }
+    text.chars().count()
 }
 
 #[cfg(test)]

@@ -1153,7 +1153,15 @@ impl App {
             || self.btw_modal.is_open()
     }
 
-    pub(super) fn dispatch_click(&mut self, target: ClickTarget, _pos: Position) -> Vec<Action> {
+    fn answer_permission(&mut self, answer: maki_agent::permissions::PermissionAnswer) {
+        let agent_id = self.permission_prompt.agent_id();
+        let request_id = self.permission_prompt.request_id().unwrap_or_default();
+        let encoded = maki_agent::permissions::TaggedAnswer::new(request_id, answer).encode();
+        self.permission_prompt.close();
+        self.send_to_agent(agent_id, encoded);
+    }
+
+    pub(super) fn dispatch_click(&mut self, target: ClickTarget, pos: Position) -> Vec<Action> {
         match target {
             ClickTarget::ModeChip => {
                 self.toggle_mode_menu();
@@ -1169,6 +1177,16 @@ impl App {
             }
             ClickTarget::AutoScrollChip => {
                 self.active_chat().enable_auto_scroll();
+                vec![]
+            }
+            ClickTarget::PermissionHint { row, cell } => {
+                if let Some(answer) = self.permission_prompt.click_hint(row, cell) {
+                    self.answer_permission(answer);
+                }
+                vec![]
+            }
+            ClickTarget::PermissionGuidance => {
+                self.permission_prompt.click_guidance(pos);
                 vec![]
             }
             ClickTarget::CompletionRow { grid, index } => {
@@ -1520,12 +1538,7 @@ impl App {
 
         if self.permission_active() {
             if let Some(answer) = self.permission_prompt.handle_key(key) {
-                let agent_id = self.permission_prompt.agent_id();
-                let request_id = self.permission_prompt.request_id().unwrap_or_default();
-                let encoded =
-                    maki_agent::permissions::TaggedAnswer::new(request_id, answer).encode();
-                self.permission_prompt.close();
-                self.send_to_agent(agent_id, encoded);
+                self.answer_permission(answer);
             }
             return Some(vec![]);
         }
