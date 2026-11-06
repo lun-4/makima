@@ -45,7 +45,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 
 use crate::repaint::{Cadence, Dirty};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use tracing::warn;
 
@@ -662,6 +662,15 @@ impl MessagesPanel {
 
     pub fn set_accent(&mut self, color: ratatui::style::Color) {
         self.accent.set(color);
+    }
+
+    pub fn post_agent_at(&self, row: u16, area: Rect) -> Option<&str> {
+        if row < area.y || row >= area.bottom() {
+            return None;
+        }
+        let doc_row = u32::from(row - area.y) + u32::from(self.scroll_top);
+        let (_, segment, _) = self.cache.segment_at_row(doc_row, self.viewport_width)?;
+        self.messages.get(segment.msg_index?)?.post_agent.as_deref()
     }
 
     pub fn handle_click(&mut self, row: u16, area: Rect) -> bool {
@@ -1793,6 +1802,11 @@ fn build_message_lines(msg: &DisplayMessage, width: u16) -> Vec<Line<'static>> {
     } else {
         plain_lines(text, prefix, style.text_style, style.prefix_style)
     };
+    if msg.post_agent.is_some() {
+        for line in &mut lines {
+            line.style = line.style.add_modifier(Modifier::UNDERLINED);
+        }
+    }
     if let Some(annotation) = &msg.annotation
         && msg.role == DisplayRole::User
     {

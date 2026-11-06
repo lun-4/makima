@@ -847,6 +847,75 @@ fn main_chat_post_is_recorded_and_restored() {
     assert_last_is_post(&app.chats[0]);
 }
 
+#[test_case(false, false, false, false ; "live_link")]
+#[test_case(true, false, false, false ; "restored_link")]
+#[test_case(false, true, false, false ; "missing_target")]
+#[test_case(false, false, true, false ; "drag_selects_text")]
+#[test_case(false, false, false, true ; "ambiguous_target")]
+fn linked_post_opens_its_agent(restored: bool, missing: bool, drag: bool, ambiguous: bool) {
+    let mut app = test_app();
+    app.resolve_or_create_chat(&subagent_info(TASK_ID, "reviewer"));
+    if ambiguous {
+        app.resolve_or_create_chat(&subagent_info_for_agent(
+            AgentId::generate(),
+            TASK_ID,
+            "other reviewer",
+            None,
+            None,
+        ));
+    }
+    app.push_post(
+        None,
+        Post {
+            text: POST_TEXT.into(),
+            level: PostLevel::Warn,
+            agent: Some(if missing { SUB_TOOL_ID } else { TASK_ID }.into()),
+        },
+        None,
+    );
+    if restored {
+        app.reset_ui_chrome();
+        app.restore_display();
+    }
+    render_app(&mut app, 100, 40);
+    let area = app.msg_area();
+    let row = (area.y..area.bottom())
+        .find(|&row| app.chats[0].post_agent_at(row, area).is_some())
+        .expect("linked post is visible");
+    let column = area.x;
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+    ));
+    let end_column = if drag { column + 5 } else { column };
+    if drag {
+        app.update(mouse_event(
+            MouseEventKind::Drag(MouseButton::Left),
+            end_column,
+            row,
+        ));
+    }
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        end_column,
+        row,
+    ));
+    assert_eq!(
+        app.active_chat,
+        usize::from(!missing && !drag && !ambiguous)
+    );
+    if missing || ambiguous {
+        assert_eq!(app.status_bar.flash_text(), Some(FLASH_NO_AGENT_CHAT));
+    }
+    if drag {
+        assert!(matches!(
+            app.selection_state,
+            Some(SelectionState::PendingCopy { .. })
+        ));
+    }
+}
+
 #[test]
 fn subagent_post_lands_in_the_child_chat() {
     let mut app = test_app();

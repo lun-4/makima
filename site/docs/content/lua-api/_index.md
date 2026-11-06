@@ -1595,8 +1595,9 @@ Requires an active managed turn or a trusted manager-backed parent.
   - `output_schema` (`table`) validated before creation; requires a valid final
     report each turn through the Rust structured-output reporting tool.
   - `silent` (`boolean`) defaults to false; suppresses parent relay and delivery.
-  - `show` (`boolean|string`) post a row for the child in its parent's chat;
-    a string adds a description. Defaults to true for trusted parents and
+  - `show` (`boolean|string`) post a clickable row for the child in its parent's chat;
+    clicking it opens the child's chat once the child starts a turn.
+    A string adds a description. Defaults to true for trusted parents and
     false otherwise. Silent children and children spawned by a tool call,
     which already have a tool row, cannot be shown.
   - `auto_deliver` (`boolean`) defaults to true; children notify their recorded
@@ -6054,8 +6055,10 @@ option.
 - `{text}` (`string`) Row text. Must not be blank.
 - `{opts?}` (`table?`) Optional fields:
   - `level` (`string?`) "info" (default), "warn" or "error".
-  - `agent` (`Agent?`) a child spawned from Lua that the post is about. Keeps
-    that child's transcript when this post survives a rewind.
+  - `agent` (`Agent?`) a child spawned from Lua that the post is about. The row
+    is underlined; clicking it opens the child's chat. If no unique chat is
+    available, a status message explains why it cannot open. Keeps that child's
+    transcript when this post survives a rewind.
 
   Any other option key is an error.
 
