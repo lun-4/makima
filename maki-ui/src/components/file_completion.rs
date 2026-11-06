@@ -23,6 +23,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tracing::warn;
 use unicode_width::UnicodeWidthChar;
 
+use crate::click::{ClickTarget, CompletionGrid, HitTarget, Surface};
 use crate::components::coherent_completion::{CoherentCompletion, Publication};
 use crate::repaint::{Cadence, Dirty};
 use crate::text_buffer::TextBuffer;
@@ -599,6 +600,7 @@ pub struct FileCompletionMenu {
     session: Option<Session>,
     discovery: PathDiscovery,
     walker_spawner: WalkerSpawner,
+    last_hits: Vec<HitTarget>,
 }
 
 impl FileCompletionMenu {
@@ -622,6 +624,7 @@ impl FileCompletionMenu {
             session: None,
             discovery,
             walker_spawner,
+            last_hits: Vec::new(),
         }
     }
 
@@ -954,6 +957,7 @@ impl FileCompletionMenu {
     }
 
     pub fn view(&mut self, frame: &mut Frame, input_area: Rect) -> Option<Rect> {
+        self.last_hits.clear();
         let s = match &mut self.session {
             Some(s) if s.visible && !s.matches.is_empty() => s,
             _ => return None,
@@ -969,7 +973,40 @@ impl FileCompletionMenu {
                 kind: &candidate.item.kind,
             })
             .collect();
-        render_completion_grid(frame, input_area, &items, &mut s.grid)
+        let rendered = render_completion_grid(frame, input_area, &items, &mut s.grid);
+        self.last_hits = rendered
+            .as_ref()
+            .map(|(popup, hits)| {
+                let mut targets = vec![HitTarget {
+                    rect: *popup,
+                    target: ClickTarget::Surface(Surface::Completion),
+                }];
+                targets.extend(hits.iter().map(|&(rect, index)| HitTarget {
+                    rect,
+                    target: ClickTarget::CompletionRow {
+                        grid: CompletionGrid::FileCompletion,
+                        index,
+                    },
+                }));
+                targets
+            })
+            .unwrap_or_default();
+        rendered.map(|(popup, _)| popup)
+    }
+
+    pub fn hits(&self) -> Vec<HitTarget> {
+        self.last_hits.clone()
+    }
+
+    pub fn select_grid(&mut self, index: usize) -> bool {
+        let Some(s) = &mut self.session else {
+            return false;
+        };
+        if index >= s.matches.len() {
+            return false;
+        }
+        s.grid.set_selected(index);
+        true
     }
 }
 
@@ -1172,7 +1209,7 @@ pub(crate) fn render_completion_grid(
     input_area: Rect,
     items: &[CompletionGridItem<'_>],
     grid: &mut CompletionGridState,
-) -> Option<Rect> {
+) -> Option<(Rect, Vec<(Rect, usize)>)> {
     if items.is_empty() || input_area.y == 0 {
         return None;
     }
@@ -1235,7 +1272,20 @@ pub(crate) fn render_completion_grid(
     frame.render_widget(block, popup);
     frame.render_widget(Paragraph::new(lines), inner);
 
-    Some(popup)
+    let mut hits = Vec::new();
+    for row_offset in 0..view_rows {
+        let screen_y = inner.y + row_offset as u16;
+        let mut x = inner.x;
+        for (column, width) in col_widths.iter().enumerate() {
+            let index = (grid.scroll_offset() + row_offset) * cols + column;
+            if index < len {
+                hits.push((Rect::new(x, screen_y, *width as u16, 1), index));
+            }
+            x = x.saturating_add(*width as u16 + COL_GAP as u16);
+        }
+    }
+
+    Some((popup, hits))
 }
 
 fn completion_item_width(item: &CompletionGridItem<'_>) -> usize {
@@ -1436,6 +1486,47 @@ mod tests {
             token_byte_range: (0, 0),
         });
         menu
+    }
+
+    #[test_case(0; "closed")]
+    #[test_case(1; "hidden")]
+    #[test_case(2; "empty")]
+    fn early_view_clears_previous_hits(transition: u8) {
+        let mut menu = session_with_items(vec![item("main", "file", "main.rs")]);
+        let session = menu.session.as_mut().unwrap();
+        session.ref_matches = fuzzy_match(
+            &session.intent,
+            session
+                .ref_items
+                .iter()
+                .enumerate()
+                .map(|(i, (label, item))| (label.clone(), item.clone(), i)),
+        );
+        rebuild_combined(session);
+        session.visible = true;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                menu.view(frame, Rect::new(0, 20, 80, 4));
+            })
+            .unwrap();
+        let hits = menu.hits();
+        assert_eq!(hits[0].target, ClickTarget::Surface(Surface::Completion));
+        assert!(hits[1..].iter().all(|hit| {
+            matches!(hit.target, ClickTarget::CompletionRow { .. })
+                && hit.rect.intersection(hits[0].rect) == hit.rect
+        }));
+        match transition {
+            0 => menu.close(),
+            1 => menu.session.as_mut().unwrap().visible = false,
+            _ => menu.session.as_mut().unwrap().matches.clear(),
+        }
+        terminal
+            .draw(|frame| {
+                assert!(menu.view(frame, Rect::new(0, 20, 80, 4)).is_none());
+            })
+            .unwrap();
+        assert!(menu.hits().is_empty());
     }
 
     struct CountingResolver {

@@ -27,7 +27,7 @@ const OFFLOAD_SAVED_TO: &str = "saved to ";
 /// for the wrong reason, and this one is only reached when something is stuck.
 const DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
 const OUTPUT_HOOK_DEADLINE: Duration = Duration::from_secs(1);
-const OUTPUT_HOOK_WATCHDOG: Duration = Duration::from_secs(10);
+const OUTPUT_HOOK_WATCHDOG: Duration = Duration::from_secs(20);
 const OUTPUT_HOOK_TIMEOUT: &str = "timeout exceeded";
 const OUTPUT_HOOK_BODY: &str = "first\nsecond\nthird\nfourth";
 
@@ -775,7 +775,9 @@ maki.api.register_tool({{
     let mut ctx = stub_ctx(&AgentMode::Build);
     ctx.registry = Arc::clone(&reg);
     ctx.mcp = Some(stub_session_with_result(&[(MCP_QUALIFIED_TOOL, "")], &text));
-    ctx.offload = Some(Arc::new(OffloadStore::on_disk(dir.path().to_path_buf())));
+    ctx.offload = Some(Arc::new(OffloadStore::on_disk(
+        dir.path().canonicalize().unwrap(),
+    )));
     ctx.config.max_output_lines = MCP_PREVIEW_LINES;
     ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
         &ctx.registry,
@@ -1018,7 +1020,9 @@ end)
     let mut ctx = stub_ctx(&AgentMode::Build);
     ctx.registry = Arc::clone(&reg);
     ctx.deadline = Deadline::None;
-    ctx.offload = Some(Arc::new(OffloadStore::on_disk(dir.path().to_path_buf())));
+    ctx.offload = Some(Arc::new(OffloadStore::on_disk(
+        dir.path().canonicalize().unwrap(),
+    )));
     ctx.turn_bindings = Arc::new(TurnToolBindings::capture(&reg, &ctx.local_tools, None));
 
     within(async {

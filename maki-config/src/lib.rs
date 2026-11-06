@@ -1296,7 +1296,10 @@ pub struct UiConfig {
     #[config(default = true, desc = "Show splash animation on startup")]
     pub splash_animation: bool,
 
-    #[config(default = true, desc = "Show vertical scrollbar in scrollable areas")]
+    #[config(
+        default = true,
+        desc = "Show a draggable vertical scrollbar in scrollable areas"
+    )]
     pub scrollbar: bool,
 
     #[config(

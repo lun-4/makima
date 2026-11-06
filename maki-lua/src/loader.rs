@@ -1222,6 +1222,12 @@ impl EventHandle {
         let _ = self.tx.send(Request::RestoreToolAsync { item, event_tx });
     }
 
+    /// Runs the callback registered for a clickable `set_status_content`
+    /// entry.
+    pub fn click_region(&self, id: u32) {
+        let _ = self.tx.send(Request::ClickRegion { id });
+    }
+
     /// `row` is the 1-based line in the tool's live buffer, 0 for clicks
     /// outside it (header line etc.).
     pub fn request_click(&self, tool_use_id: String, row: usize) {
@@ -1259,7 +1265,7 @@ impl EventHandle {
     /// the whole batch has landed, making it the batch barrier.
     #[doc(hidden)]
     pub fn wait_restore_complete_for_test(&self) {
-        const DEADLINE: Duration = Duration::from_secs(30);
+        const DEADLINE: Duration = runtime::RESTORE_ITEM_TIMEOUT.saturating_mul(2);
         let flag = Arc::new(AtomicBool::new(true));
         self.send_restore_complete(Arc::clone(&flag));
         let start = std::time::Instant::now();

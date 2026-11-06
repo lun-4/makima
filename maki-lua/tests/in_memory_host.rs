@@ -187,16 +187,14 @@ fn pull_frame(handle: &maki_lua::EventHandle, needle: Option<&str>) -> maki_lua:
         // pull timeout: under CI contention the Lua host thread misses those
         // windows for seconds at a stretch, and a timer-based poll burns the
         // whole deadline before the host ever answers.
-        match reply.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(Some(frame)) => {
-                let all: String = frame.rows.iter().map(|r| r.glyphs.as_str()).collect();
-                if needle.is_none_or(|n| all.contains(n)) {
-                    return frame;
-                }
-            }
-            Ok(None) | Err(flume::RecvTimeoutError::Timeout) => {}
-            Err(flume::RecvTimeoutError::Disconnected) => {
-                panic!("splash host dropped the frame reply")
+        // A disconnected reply is the host declining to answer (a superseded
+        // pull, or a render killed at its deadline on a starved thread): retry.
+        if let Ok(Some(frame)) =
+            reply.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            let all: String = frame.rows.iter().map(|r| r.glyphs.as_str()).collect();
+            if needle.is_none_or(|n| all.contains(n)) {
+                return frame;
             }
         }
         assert!(
@@ -410,6 +408,7 @@ fn splash_picker_command_switches_to_default() {
     );
 
     let switched = run_command(&guard.host().command_registry(), "/splash default", 0, None);
+    assert_eq!(switched.recv_timeout(SPLASH_DEADLINE).unwrap(), Ok(()));
 
     // The fallback path must serve the starfield through the chain below the
     // picker; a failing delegation rolls the selection back to matrix.
@@ -420,7 +419,84 @@ fn splash_picker_command_switches_to_default() {
         !content.contains(SELECTION_MATRIX),
         "the switch must not roll the file back to matrix: {content}"
     );
+}
+
+#[test]
+fn splash_picker_keeps_selection_when_render_is_killed_at_deadline() {
+    const SOURCE: &str = r##"
+local killed = false
+maki.store.register("splash", "vortex", {
+  renderer = function(w, h, t)
+    if t > 0 and not killed then
+      killed = true
+      while true do end
+    end
+    return { { { glyphs = "sss", style = "field" } } }
+  end,
+})
+"##;
+    let fs = Arc::new(InMemoryFs::new());
+    fs.seed(&selection_path(), SELECTION_STALE.as_bytes().to_vec());
+    let (handle, guard) = maki_lua::test_support::spawn_host_with_fs_for_tests(
+        &["splashes", "splashes_default"],
+        fs,
+        Some(SOURCE),
+    );
+
+    pull_frame(&handle, Some("sss"));
+    assert!(
+        selection_content(&guard)
+            .unwrap()
+            .contains(SELECTION_VORTEX),
+        "a render the host killed must not roll the selection back"
+    );
+}
+
+#[test]
+fn splash_picker_default_recovers_after_transient_render_error() {
+    const SOURCE: &str = r##"
+local calls = 0
+local function render_default(w, h)
+  calls = calls + 1
+  assert(calls ~= 1, "transient default render failure")
+  return { { { glyphs = "makima", style = "field" } } }
+end
+maki.api.declare_slot("splash.render", render_default)
+maki.store.register("splash", "default", { renderer = render_default })
+maki.store.register("splash", "matrix", {
+  renderer = function()
+    return { { { glyphs = "matrix", style = "field" } } }
+  end,
+})
+"##;
+    let fs = Arc::new(InMemoryFs::new());
+    fs.seed(&selection_path(), SELECTION_MATRIX_JSON.as_bytes().to_vec());
+    let (handle, guard) =
+        maki_lua::test_support::spawn_host_with_fs_for_tests(&["splashes"], fs, Some(SOURCE));
+    pull_frame(&handle, Some(SELECTION_MATRIX));
+    let switched = run_command(&guard.host().command_registry(), "/splash default", 0, None);
     assert_eq!(switched.recv_timeout(SPLASH_DEADLINE).unwrap(), Ok(()));
+
+    let frame = handle
+        .request_splash_frame(80, 20, 10.0, 1.0)
+        .unwrap()
+        .recv_timeout(SPLASH_DEADLINE)
+        .unwrap();
+    assert!(
+        frame.is_none(),
+        "a failed default render must drop the frame"
+    );
+    assert!(
+        selection_content(&guard)
+            .unwrap()
+            .contains(SELECTION_DEFAULT)
+    );
+    pull_frame(&handle, Some("makima"));
+    assert!(
+        selection_content(&guard)
+            .unwrap()
+            .contains(SELECTION_DEFAULT)
+    );
 }
 
 const SECOND_SOURCE: &str = r##"
@@ -856,7 +932,7 @@ fn splash_fps_overlay_toggles_through_store_and_readout() {
         .load_source(
             "perf-probe",
             r#"local t = maki.perf.timings()
-               assert(t.fps >= 1, "host renders land in the fps window")"#,
+               assert(t.render_ms > 0, "host records splash render timings")"#,
         )
         .expect("timings reflect real renders");
 

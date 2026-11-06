@@ -569,7 +569,8 @@ mod tests {
     #[test_case(true; "closed_store")]
     fn oversized_completion_offload_preserves_envelope(closed: bool) {
         let directory = tempfile::tempdir().unwrap();
-        let store = crate::tools::offload::OffloadStore::on_disk(directory.path().to_path_buf());
+        let store =
+            crate::tools::offload::OffloadStore::on_disk(directory.path().canonicalize().unwrap());
         if closed {
             store.request_close();
         }

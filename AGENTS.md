@@ -50,7 +50,7 @@ Dev builds skip debug info for deps and vendored C (our crates keep it); to debu
 
 Rust workspace, key crates in root dir:
 
-- maki-ui: Uses ratatui for an interactive UI (elm like architecture)
+- maki-ui: Uses ratatui for an interactive UI (elm like architecture). `maki-ui/src/click.rs` holds the per-frame hit registry: components record `HitTarget`s while they render, `App::view` appends them in render order, and `app/mouse.rs` arbitrates clicks, scrollbar drags, hover, and the modal outside-click gate.
 - maki-providers: Integration with LLM providers via APIs (e.g. Anthropic, Z.AI)
 - maki-agent: Owns the smol-based agent loop and the persistent actor shared by TUI roots and Lua agent sessions
 - maki-interpreter: code_execution tool implementation using pydantic/monty (a minimal python sandbox)

@@ -15,7 +15,14 @@ use crate::api::util::pair::{Pair, try_pair};
 
 pub(crate) use crate::ui_sink::NO_UI_ERR;
 
-pub type StatusContent = Vec<(String, String)>;
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct StatusEntry {
+    pub text: String,
+    pub style: String,
+    pub click: Option<u32>,
+}
+
+pub type StatusContent = Vec<StatusEntry>;
 pub type StatusContentEntries = Vec<(Arc<str>, StatusContent)>;
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -432,6 +439,7 @@ pub enum WinEvent {
     Key { key: String },
     Resize { width: u16, height: u16 },
     Paste { text: String },
+    Click { row: u16, col: u16 },
     Close,
 }
 
@@ -768,7 +776,14 @@ mod tests {
     #[test]
     fn status_content_publishes_only_changes() {
         let (writer, reader) = StatusContentWriter::new();
-        let entries = vec![(Arc::from("plug"), vec![("ready".into(), "success".into())])];
+        let entries = vec![(
+            Arc::from("plug"),
+            vec![StatusEntry {
+                text: "ready".into(),
+                style: "success".into(),
+                click: None,
+            }],
+        )];
 
         assert!(writer.publish(entries.clone()));
         assert_eq!(reader.load_full().generation, 1);

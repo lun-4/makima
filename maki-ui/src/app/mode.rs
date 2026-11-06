@@ -146,7 +146,7 @@ impl App {
     }
 
     /// Cycles to the next registered mode; the default two-mode case keeps
-    /// Tab toggling build<->plan.
+    /// Shift+Tab toggling build<->plan.
     pub(super) fn toggle_mode(&mut self) -> Vec<super::Action> {
         let registry = self.lua_event_handle.mode_registry();
         let modes = registry.list();

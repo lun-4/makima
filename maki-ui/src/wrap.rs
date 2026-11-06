@@ -6,6 +6,7 @@
 //! pinned to false the machine shrinks to a few scalars plus the queue of
 //! pending whitespace widths, the only scratch we keep.
 
+use std::collections::VecDeque;
 use std::mem;
 
 use ratatui::buffer::CellWidth;
@@ -79,6 +80,106 @@ pub(crate) fn breaks(line: &Line<'_>, width: u16, mut on_break: impl FnMut(Break
     {
         on_break(kind);
     }
+}
+
+pub(crate) fn index_at(line: &Line<'_>, width: u16, row: u16, col: u16) -> usize {
+    if width == 0 {
+        return 0;
+    }
+    let max = u32::from(width);
+    let mut pending_line: Vec<IndexedGrapheme> = Vec::new();
+    let mut word: Vec<IndexedGrapheme> = Vec::new();
+    let mut whitespace: VecDeque<IndexedGrapheme> = VecDeque::new();
+    let mut line_width = 0;
+    let mut word_width = 0;
+    let mut whitespace_width = 0;
+    let mut prev_was_word = false;
+    let mut current_row = 0;
+    let mut offset = 0;
+    let mut last_end = 0;
+
+    for span in &line.spans {
+        for grapheme in span.styled_graphemes(Style::default()) {
+            let symbol_width = u32::from(grapheme.symbol.cell_width());
+            if symbol_width > max {
+                continue;
+            }
+            let is_whitespace = grapheme.is_whitespace();
+            let index = offset + grapheme.symbol.as_ptr() as usize - span.content.as_ptr() as usize;
+            let indexed = IndexedGrapheme {
+                index,
+                end: index + grapheme.symbol.len(),
+                width: symbol_width,
+            };
+            if (prev_was_word && is_whitespace)
+                || (pending_line.is_empty() && word_width + whitespace_width + symbol_width > max)
+            {
+                pending_line.extend(whitespace.drain(..));
+                pending_line.append(&mut word);
+                line_width += whitespace_width + word_width;
+                whitespace_width = 0;
+                word_width = 0;
+            }
+            if line_width >= max
+                || (symbol_width > 0 && line_width + whitespace_width + word_width >= max)
+            {
+                if current_row == row {
+                    return row_index(&pending_line, col, last_end);
+                }
+                if let Some(last) = pending_line.last() {
+                    last_end = last.end;
+                }
+                pending_line.clear();
+                current_row += 1;
+                let mut remaining = max.saturating_sub(line_width);
+                line_width = 0;
+                while let Some(front) = whitespace.front() {
+                    if front.width > remaining {
+                        break;
+                    }
+                    remaining -= front.width;
+                    whitespace_width -= front.width;
+                    whitespace.pop_front();
+                }
+                if is_whitespace && whitespace.is_empty() {
+                    continue;
+                }
+            }
+            if is_whitespace {
+                whitespace_width += symbol_width;
+                whitespace.push_back(indexed);
+            } else {
+                word_width += symbol_width;
+                word.push(indexed);
+            }
+            prev_was_word = !is_whitespace;
+        }
+        offset += span.content.len();
+    }
+    pending_line.extend(whitespace);
+    pending_line.extend(word);
+    if current_row == row {
+        row_index(&pending_line, col, last_end)
+    } else {
+        pending_line.last().map_or(last_end, |last| last.end)
+    }
+}
+
+struct IndexedGrapheme {
+    index: usize,
+    end: usize,
+    width: u32,
+}
+
+fn row_index(graphemes: &[IndexedGrapheme], col: u16, fallback: usize) -> usize {
+    let mut x = 0;
+    for grapheme in graphemes {
+        x += grapheme.width;
+        if u32::from(col) < x {
+            return grapheme.index;
+        }
+    }
+    graphemes.last().map_or(fallback, |last| last.end)
 }
 
 /// The whitespace widths ratatui parks in a `VecDeque`, plus the scalars its
@@ -224,9 +325,12 @@ impl Scan {
 
 #[cfg(test)]
 mod tests {
-    use super::{Break, breaks, total_rows};
+    use super::{Break, breaks, index_at, total_rows};
+    use ratatui::buffer::{Buffer, CellWidth};
+    use ratatui::layout::{Position, Rect};
+    use ratatui::style::{Color, Style};
     use ratatui::text::{Line, Span};
-    use ratatui::widgets::{Paragraph, Wrap};
+    use ratatui::widgets::{Paragraph, Widget, Wrap};
     use std::slice;
     use test_case::test_case;
 
@@ -330,6 +434,79 @@ mod tests {
     fn breaks_see_through_span_boundaries() {
         let line = Line::from(vec![Span::raw("hello "), Span::raw("world")]);
         assert_eq!(kinds(&line, 6), [Break::Word]);
+    }
+
+    #[test]
+    fn indices_match_rendered_graphemes() {
+        for text in CORPUS.iter().copied().chain([
+            "e\u{301}cole 👩‍💻 a\u{301}b",
+            "\u{301}a \u{200b} b",
+            "     a     b     ",
+            "a\u{3000}\u{3000}b",
+        ]) {
+            let source = Span::raw(text);
+            let mut starts = Vec::new();
+            let mut ends = Vec::new();
+            let spans = source
+                .styled_graphemes(Style::default())
+                .enumerate()
+                .map(|(id, grapheme)| {
+                    let start = grapheme.symbol.as_ptr() as usize - text.as_ptr() as usize;
+                    starts.push(start);
+                    ends.push(start + grapheme.symbol.len());
+                    Span::styled(grapheme.symbol, Style::new().fg(Color::Indexed(id as u8)))
+                })
+                .collect::<Vec<_>>();
+            let line = Line::from(spans);
+            for width in 1..=40 {
+                let height = Paragraph::new(line.clone())
+                    .wrap(Wrap { trim: false })
+                    .line_count(width) as u16;
+                let area = Rect::new(0, 0, width, height);
+                let mut rendered = Buffer::empty(Rect::new(0, 0, width * 2, height));
+                Paragraph::new(line.clone())
+                    .wrap(Wrap { trim: false })
+                    .render(area, &mut rendered);
+                let mut last_end = 0;
+                for row in 0..height {
+                    let mut col = 0;
+                    while col < width {
+                        let cell = &rendered[Position::new(col, row)];
+                        let Color::Indexed(id) = cell.fg else {
+                            break;
+                        };
+                        let start = starts[usize::from(id)];
+                        last_end = ends[usize::from(id)];
+                        let grapheme_width = cell.symbol().cell_width();
+                        for inside in col..col + grapheme_width {
+                            let expected = text[..start]
+                                .chars()
+                                .filter(|ch| !ch.is_control())
+                                .collect::<String>()
+                                .len();
+                            assert_eq!(
+                                index_at(&line, width, row, inside),
+                                expected,
+                                "{text:?}, width {width}, row {row}, col {inside}"
+                            );
+                        }
+                        col += grapheme_width;
+                    }
+                    if col < width {
+                        let expected = text[..last_end]
+                            .chars()
+                            .filter(|ch| !ch.is_control())
+                            .collect::<String>()
+                            .len();
+                        assert_eq!(
+                            index_at(&line, width, row, width),
+                            expected,
+                            "row end of {text:?}, width {width}, row {row}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn kinds(line: &Line<'_>, width: u16) -> Vec<Break> {

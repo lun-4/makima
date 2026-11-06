@@ -410,9 +410,11 @@ struct LuaInvocationBackend {
     sibling: Option<SiblingInvocation>,
 }
 
-/// Receives the tool context of the managed turn, so a test can run a
-/// sibling invocation of the fixture tool under that same turn.
-type SiblingInvocation = flume::Sender<ToolContext>;
+/// Receives the result of a sibling invocation of the fixture tool, run
+/// concurrently with the managed one under the same turn context. The turn
+/// settles only after both finish, since the Lua runtime may start either
+/// call first.
+type SiblingInvocation = flume::Sender<Result<(), String>>;
 
 impl ActorBackend for LuaInvocationBackend {
     fn run_turn<'a>(
@@ -467,17 +469,19 @@ impl ActorBackend for LuaInvocationBackend {
                 .clone()
                 .unwrap_or_else(|| context.cancel.clone());
             self.context.managed_turn = context.managed_turn;
-            let invocation = self
-                .registry
-                .get(self.tool)
-                .unwrap()
-                .tool
-                .parse(&json!({}))
-                .unwrap();
-            if let Some(sibling) = &self.sibling {
-                sibling.send(self.context.clone()).unwrap();
-            }
-            let result = invocation.execute(&self.context).await.output.map(|_| ());
+            let tool = &self.registry.get(self.tool).unwrap().tool;
+            let execution = tool.parse(&json!({})).unwrap().execute(&self.context);
+            let output = match &self.sibling {
+                Some(sibling) => {
+                    let sibling_execution = tool.parse(&json!({})).unwrap().execute(&self.context);
+                    let (output, sibling_output) =
+                        futures_lite::future::zip(execution, sibling_execution).await;
+                    sibling.send(sibling_output.output.map(|_| ())).unwrap();
+                    output
+                }
+                None => execution.await,
+            };
+            let result = output.output.map(|_| ());
             let _ = self.completed.send(result.clone());
             if let Some(inbox) = &context.inbox {
                 loop {
@@ -3705,7 +3709,7 @@ fn managed_sibling_tool_call_cannot_use_another_calls_ctx() {
     const TOOL: &str = "pr5_managed_sibling";
     const FOREIGN_CONTEXT: &str = "context belongs to another invocation";
     smol::block_on(async {
-        let (sibling, sibling_context) = flume::bounded(1);
+        let (sibling, sibling_result) = flume::bounded(1);
         let fixture = Fixture::start_with_options(
             TOOL,
             FixtureOptions {
@@ -3728,20 +3732,10 @@ fn managed_sibling_tool_call_cannot_use_another_calls_ctx() {
             "#
             ),
         );
-        let context = bounded(sibling_context.recv_async(), "managed tool context")
-            .await
-            .unwrap();
-        let sibling = ToolRegistry::global()
-            .get(TOOL)
-            .unwrap()
-            .tool
-            .parse(&json!({}))
-            .unwrap();
         assert_eq!(
-            bounded(sibling.execute(&context), "sibling invocation")
+            bounded(sibling_result.recv_async(), "sibling invocation")
                 .await
-                .output
-                .map(|_| ()),
+                .unwrap(),
             Ok(())
         );
         fixture.finish().await;

@@ -2,6 +2,7 @@ local REGISTRY = "splash"
 local FALLBACK_NAME = "default"
 local STATE_DIR = "splashes"
 local STATE_FILE = "selection.json"
+local INTERRUPTED = "plugin interrupted: "
 
 local renderers = {}
 local dirty = true
@@ -91,9 +92,16 @@ local function invoke(selection, input)
   -- The fallback draws the chain below the picker (user set_slot layers, then
   -- the slot default), so wrapping the default keeps working.
   if selection.name == FALLBACK_NAME then
-    return pcall(input.prev, input.w, input.h, input.t, input.fade)
+    return true, input.prev(input.w, input.h, input.t, input.fade)
   end
-  return pcall(selection.renderer, input.w, input.h, input.t, input.fade)
+  local ok, result = pcall(selection.renderer, input.w, input.h, input.t, input.fade)
+  -- The host killed this render (deadline on a starved thread, cancel,
+  -- shutdown): that says nothing about the renderer, so let it unwind instead
+  -- of rolling the selection back.
+  if not ok and string.find(tostring(result), INTERRUPTED, 1, true) then
+    error(result, 0)
+  end
+  return ok, result
 end
 
 local function validate(selection)

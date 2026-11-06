@@ -15,6 +15,7 @@ use test_case::test_case;
 #[test_case("question", include_str!("../../plugins/question/tests/spec.lua") ; "question_plugin_spec")]
 #[test_case("read", include_str!("../../plugins/read/tests/spec.lua") ; "read_plugin_spec")]
 #[test_case("sessions", include_str!("../../plugins/sessions/tests/spec.lua") ; "sessions_plugin_spec")]
+#[test_case("thinking", include_str!("../../plugins/thinking/tests/spec.lua") ; "thinking_plugin_spec")]
 #[test_case("skill", include_str!("../../plugins/skill/tests/spec.lua") ; "skill_plugin_spec")]
 #[test_case("task", include_str!("../../plugins/task/tests/spec.lua") ; "task_plugin_spec")]
 #[test_case("usage", include_str!("../../plugins/usage/tests/spec.lua") ; "usage_plugin_spec")]
@@ -25,6 +26,15 @@ use test_case::test_case;
 fn plugin_spec(name: &str, spec: &str) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_source(&format!("{name}_spec"), spec)
+    let source = match name {
+        "sessions" => Some(include_str!("../../plugins/sessions/init.lua")),
+        "thinking" => Some(include_str!("../../plugins/thinking/init.lua")),
+        _ => None,
+    };
+    let spec = source.map_or_else(
+        || spec.to_owned(),
+        |source| format!("local function load_plugin()\n{source}\nend\n{spec}"),
+    );
+    host.load_source(&format!("{name}_spec"), &spec)
         .unwrap_or_else(|e| panic!("{name} spec failed:\n{e}"));
 }

@@ -1,12 +1,13 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Wrap;
+use ratatui::widgets::{Paragraph, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 use maki_config::providers::{
     self, Protocol, ProviderDef, ProvidersConfig, VERTEX_LOGIN_INSTRUCTIONS, slugify,
@@ -19,9 +20,11 @@ use maki_storage::auth::{
 };
 use maki_storage::model::persist_model;
 
+use crate::click::{ClickTarget, HitTarget, PickerId};
 use crate::components::Overlay;
-use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
+use crate::components::list_picker::{ListPicker, PickerAction, PickerItem, click_search_buffer};
 use crate::components::modal::Modal;
+use crate::components::plan_form::wrapped_key_hits;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 
@@ -201,6 +204,8 @@ pub struct LoginPicker {
     step: Step,
     provider_items: Vec<ProviderItem>,
     storage: Option<maki_storage::StateDir>,
+    input_area: Rect,
+    control_hits: Vec<HitTarget>,
 }
 
 impl LoginPicker {
@@ -209,6 +214,8 @@ impl LoginPicker {
             step: Step::Closed,
             provider_items: Vec::new(),
             storage: None,
+            input_area: Rect::default(),
+            control_hits: Vec::new(),
         }
     }
 
@@ -301,7 +308,7 @@ impl LoginPicker {
         });
 
         self.provider_items = items.clone();
-        let mut picker = ListPicker::new();
+        let mut picker = ListPicker::new().with_picker(PickerId::Login);
         picker.open(items, TITLE);
         self.storage = Some(storage);
         self.step = Step::PickProvider(picker);
@@ -709,7 +716,7 @@ impl LoginPicker {
                     })
                     .collect();
                 let display = providers::resolve_display_name(&slug, None);
-                let mut plan_picker = ListPicker::new();
+                let mut plan_picker = ListPicker::new().with_picker(PickerId::Login);
                 plan_picker.open(plan_items, format!(" {display} plan "));
                 self.step = Step::PickPlan {
                     picker: plan_picker,
@@ -728,7 +735,7 @@ impl LoginPicker {
                     .iter()
                     .map(|(name, display)| ProtocolItem(name, display))
                     .collect();
-                let mut picker = ListPicker::new();
+                let mut picker = ListPicker::new().with_picker(PickerId::Login);
                 picker.open(items, " Protocol ");
                 self.step = Step::CustomProtocol { picker, slug };
                 LoginPickerAction::Consumed
@@ -764,7 +771,7 @@ impl LoginPicker {
                 }
             }
             StepAction::Back => {
-                let mut picker = ListPicker::new();
+                let mut picker = ListPicker::new().with_picker(PickerId::Login);
                 picker.open(self.provider_items.clone(), TITLE);
                 self.step = Step::PickProvider(picker);
                 LoginPickerAction::Consumed
@@ -820,7 +827,79 @@ impl LoginPicker {
         }
     }
 
+    pub fn scroll(&mut self, delta: i32) {
+        match &mut self.step {
+            Step::PickProvider(picker) => picker.scroll(delta),
+            Step::PickPlan { picker, .. } => picker.scroll(delta),
+            Step::CustomProtocol { picker, .. } => picker.scroll(delta),
+            _ => {}
+        }
+    }
+
+    pub fn click_input(&mut self, pos: Position) -> bool {
+        match &mut self.step {
+            Step::PickProvider(picker) => picker.click_input(pos),
+            Step::PickPlan { picker, .. } => picker.click_input(pos),
+            Step::CustomProtocol { picker, .. } => picker.click_input(pos),
+            Step::CustomName { input }
+            | Step::CustomUrl { input, .. }
+            | Step::BuiltinUrl { input, .. }
+            | Step::EnterKey { input, .. } => {
+                click_search_buffer(input, self.input_area, pos, super::CHEVRON.width() as u16)
+            }
+            _ => false,
+        }
+    }
+
+    pub fn click_row(&mut self, index: usize) -> bool {
+        match &mut self.step {
+            Step::PickProvider(picker) => picker.select(index),
+            Step::PickPlan { picker, .. } => picker.select(index),
+            Step::CustomProtocol { picker, .. } => picker.select(index),
+            _ => false,
+        }
+    }
+
+    pub fn hits(&self) -> Vec<HitTarget> {
+        match &self.step {
+            Step::PickProvider(picker) => picker.hits(),
+            Step::PickPlan { picker, .. } => picker.hits(),
+            Step::CustomProtocol { picker, .. } => picker.hits(),
+            Step::Closed => Vec::new(),
+            _ => self.control_hits.clone(),
+        }
+    }
+
+    pub fn scroll_line(&self) -> Option<u16> {
+        match &self.step {
+            Step::PickProvider(picker) => Some(picker.scroll_line()),
+            Step::PickPlan { picker, .. } => Some(picker.scroll_line()),
+            Step::CustomProtocol { picker, .. } => Some(picker.scroll_line()),
+            _ => None,
+        }
+    }
+
+    pub fn content_len(&self) -> Option<u16> {
+        match &self.step {
+            Step::PickProvider(picker) => picker.content_len(),
+            Step::PickPlan { picker, .. } => picker.content_len(),
+            Step::CustomProtocol { picker, .. } => picker.content_len(),
+            _ => None,
+        }
+    }
+
+    pub fn scroll_to_line(&mut self, line: u16) {
+        match &mut self.step {
+            Step::PickProvider(picker) => picker.scroll_to_line(line),
+            Step::PickPlan { picker, .. } => picker.scroll_to_line(line),
+            Step::CustomProtocol { picker, .. } => picker.scroll_to_line(line),
+            _ => {}
+        }
+    }
+
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        self.input_area = Rect::default();
+        self.control_hits.clear();
         match &mut self.step {
             Step::Closed => Rect::default(),
             Step::PickProvider(picker) => picker.view(frame, area),
@@ -862,13 +941,19 @@ impl LoginPicker {
                 let (popup, inner) = modal.render(frame, area, 2);
                 let t = theme::current();
                 let hint = Span::styled("Enter provider name, then Enter", t.input_placeholder);
-                let input_line = input_line_with_cursor(input);
-                frame.render_widget(
-                    ratatui::widgets::Paragraph::new(vec![Line::from(hint), input_line])
-                        .style(Style::new().bg(t.background))
-                        .wrap(Wrap { trim: true }),
-                    inner,
-                );
+                self.control_hits.extend(wrapped_key_hits(
+                    &Line::from(hint.clone()),
+                    &[(
+                        0..hint.content.len(),
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    )],
+                    Rect::new(inner.x, inner.y, inner.width, inner.height.min(1)),
+                ));
+                self.input_area = render_input(frame, inner, input, hint);
+                self.control_hits.push(HitTarget {
+                    rect: self.input_area,
+                    target: ClickTarget::PickerInput(PickerId::Login),
+                });
                 popup
             }
             Step::CustomProtocol { picker, .. } => picker.view(frame, area),
@@ -881,13 +966,19 @@ impl LoginPicker {
                 let (popup, inner) = modal.render(frame, area, 2);
                 let t = theme::current();
                 let hint = Span::styled("Enter base URL, then Enter", t.input_placeholder);
-                let input_line = input_line_with_cursor(input);
-                frame.render_widget(
-                    ratatui::widgets::Paragraph::new(vec![Line::from(hint), input_line])
-                        .style(Style::new().bg(t.background))
-                        .wrap(Wrap { trim: true }),
-                    inner,
-                );
+                self.control_hits.extend(wrapped_key_hits(
+                    &Line::from(hint.clone()),
+                    &[(
+                        0..hint.content.len(),
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    )],
+                    Rect::new(inner.x, inner.y, inner.width, inner.height.min(1)),
+                ));
+                self.input_area = render_input(frame, inner, input, hint);
+                self.control_hits.push(HitTarget {
+                    rect: self.input_area,
+                    target: ClickTarget::PickerInput(PickerId::Login),
+                });
                 popup
             }
             Step::BuiltinUrl {
@@ -903,13 +994,19 @@ impl LoginPicker {
                 let (popup, inner) = modal.render(frame, area, 2);
                 let t = theme::current();
                 let hint = Span::styled("Edit host URL, or Enter to confirm", t.input_placeholder);
-                let input_line = input_line_with_cursor(input);
-                frame.render_widget(
-                    ratatui::widgets::Paragraph::new(vec![Line::from(hint), input_line])
-                        .style(Style::new().bg(t.background))
-                        .wrap(Wrap { trim: true }),
-                    inner,
-                );
+                self.control_hits.extend(wrapped_key_hits(
+                    &Line::from(hint.clone()),
+                    &[(
+                        0..hint.content.len(),
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    )],
+                    Rect::new(inner.x, inner.y, inner.width, inner.height.min(1)),
+                ));
+                self.input_area = render_input(frame, inner, input, hint);
+                self.control_hits.push(HitTarget {
+                    rect: self.input_area,
+                    target: ClickTarget::PickerInput(PickerId::Login),
+                });
                 popup
             }
             Step::EnterKey {
@@ -931,13 +1028,19 @@ impl LoginPicker {
                     "Paste API key, then Enter"
                 };
                 let hint = Span::styled(hint_text, t.input_placeholder);
-                let input_line = input_line_with_cursor(input);
-                frame.render_widget(
-                    ratatui::widgets::Paragraph::new(vec![Line::from(hint), input_line])
-                        .style(Style::new().bg(t.background))
-                        .wrap(Wrap { trim: true }),
-                    inner,
-                );
+                self.control_hits.extend(wrapped_key_hits(
+                    &Line::from(hint.clone()),
+                    &[(
+                        0..hint.content.len(),
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    )],
+                    Rect::new(inner.x, inner.y, inner.width, inner.height.min(1)),
+                ));
+                self.input_area = render_input(frame, inner, input, hint);
+                self.control_hits.push(HitTarget {
+                    rect: self.input_area,
+                    target: ClickTarget::PickerInput(PickerId::Login),
+                });
                 popup
             }
             Step::Instructions {
@@ -950,6 +1053,21 @@ impl LoginPicker {
                     max_height_percent: 40,
                 };
                 let (popup, inner) = modal.render(frame, area, INSTRUCTIONS_HEIGHT);
+                let message_rows = crate::wrap::total_rows(&[Line::from(*message)], inner.width);
+                let dismiss = Line::from(INSTRUCTIONS_DISMISS);
+                self.control_hits.extend(wrapped_key_hits(
+                    &dismiss,
+                    &[(
+                        0..INSTRUCTIONS_DISMISS.len(),
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    )],
+                    Rect::new(
+                        inner.x,
+                        inner.y.saturating_add(message_rows),
+                        inner.width,
+                        inner.height.saturating_sub(message_rows),
+                    ),
+                ));
                 frame.render_widget(
                     ratatui::widgets::Paragraph::new(vec![
                         Line::from(*message),
@@ -959,7 +1077,7 @@ impl LoginPicker {
                         )),
                     ])
                     .style(Style::new().bg(theme::current().background))
-                    .wrap(Wrap { trim: true }),
+                    .wrap(Wrap { trim: false }),
                     inner,
                 );
                 popup
@@ -993,6 +1111,22 @@ impl Overlay for LoginPicker {
     }
 }
 
+fn render_input(frame: &mut Frame, area: Rect, input: &TextBuffer, hint: Span<'_>) -> Rect {
+    let hint_height = area.height.min(1);
+    frame.render_widget(
+        Paragraph::new(Line::from(hint)),
+        Rect::new(area.x, area.y, area.width, hint_height),
+    );
+    let input_area = Rect::new(
+        area.x,
+        area.y + hint_height,
+        area.width,
+        area.height.saturating_sub(hint_height).min(1),
+    );
+    frame.render_widget(Paragraph::new(input_line_with_cursor(input)), input_area);
+    input_area
+}
+
 fn input_line_with_cursor(input: &TextBuffer) -> Line<'static> {
     let t = theme::current();
     let value = input.value();
@@ -1022,6 +1156,38 @@ mod tests {
 
     use super::*;
 
+    #[test_case(0, 0; "prefix")]
+    #[test_case(3, 1; "wide_character")]
+    #[test_case(20, 3; "past_end")]
+    fn text_entry_click_moves_caret(column: u16, expected: usize) {
+        let mut picker = LoginPicker::new();
+        picker.step = Step::CustomName {
+            input: TextBuffer::new("a界z".into()),
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+        let rect = picker
+            .hits()
+            .into_iter()
+            .find(|hit| hit.target == ClickTarget::PickerInput(PickerId::Login))
+            .unwrap()
+            .rect;
+        assert!(picker.click_input(Position::new(rect.x + column, rect.y)));
+        assert!(!picker.click_input(Position::new(rect.x, rect.y - 1)));
+        let Step::CustomName { input } = &picker.step else {
+            unreachable!()
+        };
+        assert_eq!(input.x(), expected);
+        picker.close();
+        assert!(!picker.click_input(Position::new(rect.x, rect.y)));
+        assert!(picker.hits().is_empty());
+    }
+
     fn provider_slugs() -> Vec<String> {
         let dir = StateDir::from_path(tempfile::tempdir().unwrap().keep());
         let mut picker = LoginPicker::new();
@@ -1042,6 +1208,8 @@ mod tests {
             },
             provider_items: Vec::new(),
             storage: None,
+            input_area: Rect::default(),
+            control_hits: Vec::new(),
         };
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
@@ -1058,9 +1226,11 @@ mod tests {
     #[test]
     fn vertex_picker_shows_adc_instructions() {
         let mut picker = LoginPicker {
-            step: Step::PickProvider(ListPicker::new()),
+            step: Step::PickProvider(ListPicker::new().with_picker(PickerId::Login)),
             provider_items: Vec::new(),
             storage: None,
+            input_area: Rect::default(),
+            control_hits: Vec::new(),
         };
         picker.transition(StepAction::GoInstructions {
             display_name: "Google Vertex AI".into(),
@@ -1091,6 +1261,8 @@ mod tests {
             },
             provider_items: Vec::new(),
             storage: None,
+            input_area: Rect::default(),
+            control_hits: Vec::new(),
         }
     }
 
@@ -1135,6 +1307,8 @@ mod tests {
             },
             provider_items: Vec::new(),
             storage: None,
+            input_area: Rect::default(),
+            control_hits: Vec::new(),
         };
         tx.send(CodexEvent::Started {
             user_code: "ABCD-EFGH".into(),

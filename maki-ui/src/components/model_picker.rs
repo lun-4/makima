@@ -13,6 +13,7 @@ use maki_providers::{
     CompleteModelSelection, ModelCapabilities, ModelOption, ModelSelection, ModelTier,
 };
 
+use crate::click::{ClickTarget, HitTarget, PickerId};
 use crate::components::Overlay;
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
@@ -27,7 +28,11 @@ const FREE_PREFIX: &str = "Free · ";
 const USE_CURRENT: &str = "Use current";
 const LOADING_OPTIONS: &str = "   Loading model options…";
 const OPTION_HINT: &str = "   ↑/↓ or Space/←/→ cycle values, empty uses current";
-const CONFIRM_HINT: &str = "  Enter confirm  Esc cancel  Tab options";
+const CONFIRM_HINTS: [(&str, KeyCode); 3] = [
+    ("  Enter confirm", KeyCode::Enter),
+    ("  Esc cancel", KeyCode::Esc),
+    ("  Tab options", KeyCode::Tab),
+];
 
 fn footer_line() -> Line<'static> {
     let t = theme::current();
@@ -147,7 +152,7 @@ impl ModelPicker {
         capabilities: Arc<ModelCapabilityCache>,
     ) -> Self {
         Self {
-            picker: ListPicker::new(),
+            picker: ListPicker::new().with_picker(PickerId::Model),
             models,
             available: Watch::default(),
             recents: Vec::new(),
@@ -201,6 +206,8 @@ impl ModelPicker {
             return Dirty::NO;
         }
         self.needs_rebuild = false;
+        let follow_selection = self.picker.selection_visible();
+        let scroll_line = self.picker.scroll_line();
         let entries = self.load_entries();
         self.picker.replace_items(entries);
         if let Some((was_recent, spec)) = &self.anchor {
@@ -213,6 +220,9 @@ impl ModelPicker {
             }
         } else {
             self.preselect_initial_model();
+        }
+        if !follow_selection {
+            self.picker.scroll_to_line(scroll_line);
         }
         Dirty::YES
     }
@@ -312,8 +322,20 @@ impl ModelPicker {
         self.draft = None;
     }
 
-    pub fn contains(&self, pos: Position) -> bool {
-        self.picker.contains(pos)
+    pub fn select(&mut self, index: usize) -> bool {
+        let selected = self.track_anchor(|p| p.picker.select(index));
+        if selected && let Some(draft) = self.draft.as_mut() {
+            draft.focus = None;
+        }
+        selected
+    }
+
+    pub fn click_input(&mut self, pos: Position) -> bool {
+        let clicked = self.picker.click_input(pos);
+        if clicked && let Some(draft) = self.draft.as_mut() {
+            draft.focus = None;
+        }
+        clicked
     }
 
     pub fn scroll(&mut self, delta: i32) {
@@ -559,13 +581,68 @@ impl ModelPicker {
             Some(_) => Line::from(Span::styled(OPTION_HINT, t.tool_dim)),
             None => footer_line(),
         });
-        lines.push(Line::from(Span::styled(CONFIRM_HINT, t.keybind_key)));
+        lines.push(Line::from(
+            CONFIRM_HINTS
+                .iter()
+                .map(|(text, _)| Span::styled(*text, t.keybind_key))
+                .collect::<Vec<_>>(),
+        ));
         lines
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
         let footer = self.footer_lines();
         self.picker.view_with_footer_lines(frame, area, footer)
+    }
+
+    pub fn hits(&self) -> Vec<HitTarget> {
+        let mut hits = self.picker.hits();
+        if let Some(area) = self.picker.footer_area() {
+            let lines = self.footer_lines();
+            let mut add_hint = |x, row, width, code| {
+                let rect = Rect::new(x, area.y.saturating_add(row), width, 1).intersection(area);
+                if !rect.is_empty() {
+                    hits.push(HitTarget {
+                        rect,
+                        target: ClickTarget::KeyHint(KeyEvent::new(code, KeyModifiers::NONE)),
+                    });
+                }
+            };
+            if self.focus().is_none() {
+                let keys = [
+                    KeyCode::Char('!'),
+                    KeyCode::Char('@'),
+                    KeyCode::Char('#'),
+                    KeyCode::Char('$'),
+                ];
+                let line = footer_line();
+                let mut x = area.x;
+                for (spans, code) in line.spans.as_chunks::<2>().0.iter().zip(keys) {
+                    let width = spans.iter().map(Span::width).sum::<usize>() as u16;
+                    add_hint(x, (lines.len() - 2) as u16, width, code);
+                    x = x.saturating_add(width);
+                }
+            }
+            let mut x = area.x;
+            for (text, code) in CONFIRM_HINTS {
+                let width = Span::raw(text).width() as u16;
+                add_hint(x, (lines.len() - 1) as u16, width, code);
+                x = x.saturating_add(width);
+            }
+        }
+        hits
+    }
+
+    pub fn scroll_line(&self) -> Option<u16> {
+        self.is_open().then(|| self.picker.scroll_line())
+    }
+
+    pub fn content_len(&self) -> Option<u16> {
+        self.is_open().then(|| self.picker.content_len()).flatten()
+    }
+
+    pub fn scroll_to_line(&mut self, line: u16) {
+        self.picker.scroll_to_line(line);
     }
 }
 
@@ -653,6 +730,7 @@ mod tests {
         FREE_PREFIX, LOADING_OPTIONS, ModelPicker, ModelPickerAction, RECENT_SECTION,
         parse_model_entry,
     };
+    use crate::click::ClickTarget;
     use crate::components::key;
     use crate::components::keybindings::key as kb;
     use crate::model_capabilities::ModelCapabilityCache;
@@ -665,7 +743,7 @@ mod tests {
         ThinkingConfig, ThinkingSupport, model_registry,
     };
     use maki_storage::StateDir;
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{Terminal, backend::TestBackend, layout::Position};
     use std::sync::{Arc, Mutex, MutexGuard};
     use tempfile::TempDir;
     use test_case::test_case;
@@ -681,6 +759,136 @@ mod tests {
         thinking: ThinkingSupport::Yes,
         fast: true,
     };
+
+    #[test_case(false; "wheel")]
+    #[test_case(true; "absolute")]
+    fn refresh_preserves_manual_viewport(absolute: bool) {
+        let models = Arc::new(ArcSwapOption::empty());
+        let specs: Vec<String> = (0..40).map(|i| format!("zai/model-{i:02}")).collect();
+        models.store(Some(Arc::new(specs.clone())));
+        let mut picker = picker(Arc::clone(&models));
+        open(&mut picker, &specs[0]);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+        if absolute {
+            picker.scroll_to_line(20);
+        } else {
+            picker.scroll(-20);
+        }
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+        let offset = picker.scroll_line();
+        assert!(offset.unwrap() > 0);
+        models.store(Some(Arc::new(specs)));
+        assert_eq!(picker.refresh(), Dirty::YES);
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+        assert_eq!(picker.scroll_line(), offset);
+        assert_eq!(picker.picker.selected_item().unwrap().spec, "zai/model-00");
+        picker.handle_key(key(KeyCode::Down));
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+        assert!(picker.scroll_line() < offset);
+    }
+
+    #[test_case(80; "wide")]
+    #[test_case(30; "clipped")]
+    fn rendered_footer_emits_clipped_key_hints(width: u16) {
+        let mut picker = picker(test_models());
+        open(&mut picker, CURRENT);
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+        let area = picker.picker.footer_area().unwrap();
+        let hints: Vec<_> = picker
+            .hits()
+            .into_iter()
+            .filter(|hit| matches!(hit.target, ClickTarget::KeyHint(_)))
+            .collect();
+        assert!(hints.len() >= 2);
+        assert!(
+            hints
+                .iter()
+                .all(|hit| hit.rect.intersection(area) == hit.rect)
+        );
+        assert_eq!(
+            hints[0].target,
+            ClickTarget::KeyHint(key(KeyCode::Char('!')))
+        );
+        let confirm = hints
+            .iter()
+            .find(|hit| hit.target == ClickTarget::KeyHint(key(KeyCode::Enter)))
+            .unwrap();
+        assert_eq!(confirm.rect.y, area.bottom() - 1);
+        assert_eq!(hints[0].rect.y, confirm.rect.y - 1);
+    }
+
+    #[test_case(6, false; "clipped_tiers")]
+    #[test_case(6, true; "clipped_focused")]
+    #[test_case(24, true; "focused")]
+    fn footer_hits_only_cover_visible_hints(height: u16, focused: bool) {
+        let mut picker = picker(test_models());
+        open(&mut picker, CURRENT);
+        if focused {
+            picker.handle_key(key(KeyCode::Tab));
+        }
+        render(&mut picker, 80, height);
+        let area = picker.picker.footer_area().unwrap();
+        let lines = picker.footer_lines();
+        let hints: Vec<_> = picker
+            .hits()
+            .into_iter()
+            .filter(|hit| matches!(hit.target, ClickTarget::KeyHint(_)))
+            .collect();
+        for hit in &hints {
+            assert_eq!(hit.rect.intersection(area), hit.rect);
+            let row = usize::from(hit.rect.y - area.y);
+            assert!(row >= lines.len() - 2);
+            if focused {
+                assert_eq!(row, lines.len() - 1);
+            }
+        }
+        if usize::from(area.height) < lines.len() - 1 {
+            assert!(hints.is_empty());
+        }
+    }
+
+    #[test_case(false; "row")]
+    #[test_case(true; "search")]
+    fn mouse_selection_returns_focus_to_model_list(search: bool) {
+        let mut picker = picker(test_models());
+        open(&mut picker, CURRENT);
+        picker.handle_key(key(KeyCode::Tab));
+        render(&mut picker, 80, 24);
+        if search {
+            let area = picker
+                .hits()
+                .into_iter()
+                .find(|hit| matches!(hit.target, ClickTarget::PickerInput(_)))
+                .unwrap()
+                .rect;
+            assert!(picker.click_input(Position::new(area.x, area.y)));
+        } else {
+            assert!(picker.select(picker.picker.selected_index().unwrap()));
+        }
+        assert_eq!(picker.focus(), None);
+    }
 
     fn models(specs: &[&str]) -> Arc<ArcSwapOption<Vec<String>>> {
         Arc::new(ArcSwapOption::from(Some(Arc::new(

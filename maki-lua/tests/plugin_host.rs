@@ -4189,8 +4189,9 @@ fn ctx_set_deadline_twice_errors() {
 }
 
 /// Generous: every wait below ends on an event, never on the clock, so only
-/// an already failing test pays this.
-const CANCEL_TEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// an already failing test pays this. Some waits also cover booting a host
+/// with every builtin loaded, which a starved CI box can stretch past 30s.
+const CANCEL_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 fn poll_until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
@@ -4276,6 +4277,9 @@ fn cancelled_bash_keeps_streamed_output_as_partial() {
     });
 
     let buf = poll_until("bash must publish its live buf", || {
+        if let Ok(result) = result_rx.try_recv() {
+            panic!("bash settled before publishing its live buf: {result:?}");
+        }
         recv_live_buf(&events, BASH_CANCEL_ID)
     });
     poll_until("bash output never reached the live buf", || {
@@ -6861,8 +6865,11 @@ fn cancelled_output_hook_does_not_offload_raw_output() {
 const BASH_TIMEOUT_SENTINEL: &str = "timeout-cleanup-sentinel";
 #[cfg(unix)]
 const BASH_TIMEOUT_REDACTED: &str = "filtered-timeout-cleanup";
+/// The cut races the shell's startup and first print on the wall clock, so
+/// this is headroom for a starved CI box, not a wait the test wants: it is
+/// what the test costs on every run.
 #[cfg(unix)]
-const BASH_TIMEOUT_TRAILER: &str = "[timed out after 1s; output above is partial]";
+const BASH_TIMEOUT_SECS: u64 = 5;
 #[cfg(unix)]
 const BASH_CANCEL_OUTPUT_BYTES: usize = 60 * 1024;
 
@@ -6894,7 +6901,7 @@ fn timed_out_bash_keeps_hooked_partial_output_offloaded() {
         tool_dispatch::run(
             OFFLOAD_HOOK_ID.to_owned(),
             "bash",
-            &json!({ "command": command, "timeout": 1 }),
+            &json!({ "command": command, "timeout": BASH_TIMEOUT_SECS }),
             &ctx,
             CallOrigin::Nested,
         ),
@@ -6905,7 +6912,8 @@ fn timed_out_bash_keeps_hooked_partial_output_offloaded() {
     ));
     let output = done.output.as_text();
     assert!(done.is_error, "{output}");
-    assert!(output.ends_with(BASH_TIMEOUT_TRAILER), "{output}");
+    let trailer = format!("[timed out after {BASH_TIMEOUT_SECS}s; output above is partial]");
+    assert!(output.ends_with(&trailer), "{output}");
     let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
     assert_eq!(files.len(), 1);
     let saved = std::fs::read_to_string(files[0].as_ref().unwrap().path()).unwrap();
@@ -6914,7 +6922,7 @@ fn timed_out_bash_keeps_hooked_partial_output_offloaded() {
 }
 
 fn disk_store(dir: &Path) -> Arc<OffloadStore> {
-    Arc::new(OffloadStore::on_disk(dir.to_path_buf()))
+    Arc::new(OffloadStore::on_disk(dir.canonicalize().unwrap()))
 }
 
 /// bash reads session options, so it needs a live coordinator: keep the
@@ -6966,7 +6974,7 @@ fn bash_zero_output_override_finishes_on_exit() {
 fn write_new_file_with_preview_cut_marker_is_rejected() {
     let (reg, host) = edit_tools_host();
     let dir = tempfile::tempdir().unwrap();
-    let (ctx, _session) = offload_ctx(&host, &disk_store(&dir.path().join("store")));
+    let (ctx, _session) = offload_ctx(&host, &disk_store(dir.path()));
     let out = exec_with_ctx(
         &reg,
         "bash",
@@ -7029,6 +7037,9 @@ fn cancelled_bash_large_output_keeps_partial_marker_last() {
     });
 
     let buf = poll_until("bash must publish its live buf", || {
+        if let Ok(result) = result_rx.try_recv() {
+            panic!("bash settled before publishing its live buf: {result:?}");
+        }
         recv_live_buf(&events, BASH_CANCEL_ID)
     });
     poll_until("bash output never reached the live buf", || {

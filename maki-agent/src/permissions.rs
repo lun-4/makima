@@ -1048,7 +1048,7 @@ mod tests {
     #[test_case("/**" => true ; "root_double_star")]
     #[test_case("//**" => true ; "doubled_root_slash")]
     #[test_case("/./**" => true ; "root_dot")]
-    #[test_case("/tmp/../**" => true ; "root_by_parent")]
+    #[test_case("/usr/../**" => true ; "root_by_parent")]
     #[test_case("/tmp/**" => false ; "directory_subtree")]
     #[test_case("cargo *" => false ; "bash_command")]
     #[test_case("/" => false ; "root_without_glob")]

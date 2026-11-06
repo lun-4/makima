@@ -1,17 +1,22 @@
+use crate::click::{ClickTarget, HitTarget};
 use crate::components::form::{form_height, render_form, selected_prefix};
 use crate::components::hint_line;
 use crate::components::keybindings::key;
 use crate::theme::{self, Theme};
+use crate::wrap::Measure;
 
 use std::borrow::Cow;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_providers::{ModelOption, ModelSelection};
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Widget, Wrap};
 
 const FORM_LABEL: &str = " Plan complete ";
 
@@ -238,19 +243,80 @@ impl PlanForm {
         }
     }
 
-    pub fn view(&self, frame: &mut Frame, area: Rect, current_model: &str) {
+    pub fn view(&self, frame: &mut Frame, area: Rect, current_model: &str) -> Vec<HitTarget> {
         if !self.is_visible() {
-            return;
+            return Vec::new();
+        }
+        let lines = self.lines(current_model);
+        let width = area.width.saturating_sub(2);
+        let mut measure = Measure::new(width);
+        let mut row = 0u16;
+        let inner = Rect::new(area.x + 1, area.y + 1, width, area.height.saturating_sub(2));
+        let mut hits = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            let rows = measure.rows(line).max(1);
+            let line_area =
+                Rect::new(inner.x, inner.y.saturating_add(row), width, rows).intersection(inner);
+            let menu_row = match index {
+                0..=MODEL_ROW => Some(index),
+                _ if !self.implementation_selection.is_empty() && index == lines.len() - 3 => {
+                    Some(USE_CURRENT_ROW)
+                }
+                _ => None,
+            };
+            if let Some(menu_row) = menu_row {
+                hits.push(HitTarget {
+                    rect: line_area,
+                    target: ClickTarget::PlanRow(menu_row as u16),
+                });
+                if index < MENU.len() && self.parallel {
+                    let end = line
+                        .spans
+                        .iter()
+                        .map(|span| span.content.len())
+                        .sum::<usize>();
+                    hits.extend(wrapped_key_hits(
+                        line,
+                        &[(
+                            end - PARALLEL_TAG.len() + 1..end,
+                            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+                        )],
+                        line_area,
+                    ));
+                }
+            } else if index == lines.len() - 1 {
+                let events = [
+                    KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                    KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    KeyEvent::new(key::OPEN_EDITOR.code, key::OPEN_EDITOR.modifiers),
+                    KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                ];
+                let mut offset = 0;
+                let ranges: Vec<_> = HINT_PAIRS
+                    .iter()
+                    .zip(events)
+                    .map(|(&(key, desc), event)| {
+                        let start = offset + 2;
+                        offset = start + key.len() + 1 + desc.len();
+                        (start..offset, event)
+                    })
+                    .collect();
+                hits.extend(wrapped_key_hits(line, &ranges, line_area));
+            }
+            row = row.saturating_add(rows);
         }
         let t = theme::current();
-        render_form(
-            &t,
-            FORM_LABEL,
-            frame,
-            area,
-            self.lines(current_model),
-            (0, 0),
-        );
+        render_form(&t, FORM_LABEL, frame, area, lines, (0, 0));
+        hits
+    }
+
+    pub fn select_row(&mut self, row: usize) -> bool {
+        if row >= Self::menu_len(!self.implementation_selection.is_empty()) {
+            return false;
+        }
+        self.selected = row;
+        true
     }
 
     fn lines(&self, current_model: &str) -> Vec<Line<'static>> {
@@ -315,16 +381,68 @@ impl PlanForm {
     }
 }
 
+pub(super) fn wrapped_key_hits(
+    line: &Line<'_>,
+    ranges: &[(Range<usize>, KeyEvent)],
+    area: Rect,
+) -> Vec<HitTarget> {
+    if area.is_empty() {
+        return Vec::new();
+    }
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    let mut spans = Vec::new();
+    let mut offset = 0;
+    for (index, (range, _)) in ranges.iter().enumerate() {
+        spans.push(Span::raw(&text[offset..range.start]));
+        spans.push(Span::styled(
+            &text[range.clone()],
+            Style::new().bg(Color::Indexed(index as u8)),
+        ));
+        offset = range.end;
+    }
+    spans.push(Span::raw(&text[offset..]));
+    let mut buffer = Buffer::empty(area);
+    Paragraph::new(Line::from(spans))
+        .wrap(Wrap { trim: false })
+        .render(area, &mut buffer);
+    let mut hits = Vec::new();
+    for y in area.top()..area.bottom() {
+        let mut x = area.left();
+        while x < area.right() {
+            let Color::Indexed(index) = buffer[(x, y)].bg else {
+                x += 1;
+                continue;
+            };
+            let start = x;
+            while x < area.right() && buffer[(x, y)].bg == Color::Indexed(index) {
+                x += 1;
+            }
+            hits.push(HitTarget {
+                rect: Rect::new(start, y, x - start, 1),
+                target: ClickTarget::KeyHint(ranges[index as usize].1),
+            });
+        }
+    }
+    hits
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         MODEL_ROW, ModelSelection, PlanForm, PlanFormAction, USE_CURRENT_LABEL, USE_CURRENT_ROW,
     };
+    use crate::click::ClickTarget;
     use crate::components::keybindings::key;
     use crate::components::{buffer_text, key};
+    use crate::wrap::Measure;
     use crossterm::event::{KeyCode, KeyEvent};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
     use std::path::Path;
     use test_case::test_case;
 
@@ -347,11 +465,119 @@ mod tests {
         selection
     }
 
+    #[test_case(30; "narrow")]
+    #[test_case(80; "normal")]
+    #[test_case(WIDE; "wide")]
+    fn visible_actions_have_clipped_hits(width: u16) {
+        let mut form = PlanForm::new();
+        form.on_plan_ready();
+        form.parallel = true;
+        let height = form.height(width, CURRENT_MODEL);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut hits = Vec::new();
+        terminal
+            .draw(|frame| {
+                hits = form.view(frame, frame.area(), CURRENT_MODEL);
+            })
+            .unwrap();
+        for target in [
+            ClickTarget::KeyHint(key(KeyCode::Char(' '))),
+            ClickTarget::KeyHint(key(KeyCode::Enter)),
+            ClickTarget::KeyHint(crate::components::keybindings::key::OPEN_EDITOR.to_key_event()),
+            ClickTarget::KeyHint(key(KeyCode::Esc)),
+        ] {
+            assert!(hits.iter().any(|hit| hit.target == target));
+        }
+        for hit in &hits {
+            assert_eq!(
+                hit.rect
+                    .intersection(Rect::new(1, 1, width - 2, height - 2)),
+                hit.rect
+            );
+        }
+        terminal
+            .draw(|frame| {
+                hits = form.view(frame, Rect::new(0, 0, width, 3), CURRENT_MODEL);
+            })
+            .unwrap();
+        assert!(
+            hits.iter()
+                .filter(|hit| !hit.rect.is_empty())
+                .all(|hit| hit.rect.bottom() <= 2)
+        );
+    }
+
+    #[test_case(30, None, true; "narrow_options_only")]
+    #[test_case(80, None, true; "normal_options_only")]
+    #[test_case(WIDE, None, true; "wide_options_only")]
+    #[test_case(30, Some(LONG_MODEL), true; "narrow_model_and_options")]
+    #[test_case(80, Some(LONG_MODEL), true; "normal_model_and_options")]
+    #[test_case(WIDE, Some(LONG_MODEL), true; "wide_model_and_options")]
+    #[test_case(30, Some(LONG_MODEL), false; "narrow_model_only")]
+    #[test_case(80, Some(LONG_MODEL), false; "normal_model_only")]
+    #[test_case(WIDE, Some(LONG_MODEL), false; "wide_model_only")]
+    fn staged_rows_keep_logical_mouse_targets(width: u16, spec: Option<&str>, has_options: bool) {
+        let mut form = PlanForm::new();
+        form.on_plan_ready();
+        let options = if has_options {
+            &[("thinking", "off"), ("fast", "false")][..]
+        } else {
+            &[]
+        };
+        form.set_implementation_selection(selection(spec, options));
+        let height = form.height(width, CURRENT_MODEL);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut hits = Vec::new();
+        terminal
+            .draw(|frame| {
+                hits = form.view(frame, frame.area(), CURRENT_MODEL);
+            })
+            .unwrap();
+        let row_targets: Vec<_> = hits
+            .iter()
+            .filter_map(|hit| match hit.target {
+                ClickTarget::PlanRow(row) => Some(row),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            row_targets,
+            (0..=USE_CURRENT_ROW as u16).collect::<Vec<_>>()
+        );
+
+        let lines = form.lines(CURRENT_MODEL);
+        let inner_width = width - 2;
+        let mut measure = Measure::new(inner_width);
+        let mut y = 1;
+        for line in lines.iter().take(MODEL_ROW + 1) {
+            y += measure.rows(line).max(1);
+        }
+        if has_options {
+            let summary_height = measure.rows(&lines[MODEL_ROW + 1]).max(1);
+            let summary_area = Rect::new(1, y, inner_width, summary_height);
+            assert!(hits.iter().all(|hit| !hit.rect.intersects(summary_area)));
+            y += summary_height;
+        }
+        assert!(hits.iter().any(|hit| {
+            hit.target == ClickTarget::PlanRow(USE_CURRENT_ROW as u16) && hit.rect.y == y
+        }));
+        assert!(form.select_row(USE_CURRENT_ROW));
+        assert_eq!(
+            form.handle_key(key(KeyCode::Enter)),
+            PlanFormAction::UseCurrentModel
+        );
+        assert!(!form.select_row(USE_CURRENT_ROW + 1));
+        form.use_current_model();
+        assert!(!form.select_row(USE_CURRENT_ROW));
+    }
+
     fn render(form: &PlanForm, width: u16) -> String {
         let height = form.height(width, CURRENT_MODEL);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| form.view(frame, frame.area(), CURRENT_MODEL))
+            .draw(|frame| {
+                form.view(frame, frame.area(), CURRENT_MODEL);
+            })
             .unwrap();
         buffer_text(terminal.backend().buffer())
     }

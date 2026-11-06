@@ -29,7 +29,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 |-----|--------|
 | `Enter` | Submit prompt |
 | `Shift+Enter` / `Ctrl+Enter` / `Ctrl+J` / `Alt+Enter` | Newline |
-| `Tab` | Toggle mode |
+| `Shift+Tab` | Toggle mode |
 | `/command` | Open command palette |
 | `Ctrl+W` | Delete word backward |
 | `Alt+←` / `Alt+→` | Move word left / right |
@@ -93,6 +93,19 @@ Some pickers add extra bindings on top of the defaults:
 | Session Picker | `Ctrl+N` | New session |
 | Session Picker | `Ctrl+R` | Rename session |
 | Session Picker | `Ctrl+D` | Delete session (press twice) |
+
+## Mouse
+
+Every scrollable surface has a draggable scrollbar. Chips, menu rows, pickers, dialogs, and plugin surfaces are clickable.
+
+| Action | Result |
+|--------|--------|
+| Click and drag a scrollbar | Scroll that surface |
+| Click a scrollbar track | Jump the scrollbar thumb to that row |
+| Click a status or top bar chip | Open its menu, picker, or action |
+| Click a picker or menu row | Select and confirm that row |
+| Click outside a modal | Close it, like `Esc` |
+| Click and drag over text | Select text as before |
 
 ## Plugins
 

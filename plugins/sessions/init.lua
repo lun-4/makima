@@ -27,6 +27,7 @@ local FILTER_KEYS = {
   { "Ctrl+N", "new" },
   { "Ctrl+R", "rename" },
   { "Ctrl+D", "delete" },
+  { "Esc", "cancel" },
 }
 local RENAME_KEYS = {
   { "Enter", "save" },
@@ -122,15 +123,17 @@ local function filter_changed()
 end
 
 local function dispw(s)
-  return utf8.len(s) or #s
+  return maki.ui.display_width(s)
 end
 
 local function render()
   local lines = {}
+  board.confirm_columns = {}
   local inner = board.width - 4
   local input = board.rename and board.rename.input or board.input
   local prefix = board.rename and RENAME_PREFIX or FILTER_PREFIX
-  for _, ln in ipairs(input:render(prefix, dispw(prefix), inner).lines) do
+  board.input_render = input:render(prefix, dispw(prefix), inner)
+  for _, ln in ipairs(board.input_render.lines) do
     lines[#lines + 1] = ln
   end
   lines[#lines + 1] = Helpers.header_spans(inner)
@@ -164,6 +167,11 @@ local function render()
     end
     title_spans = Helpers.clip_spans(title_spans, Helpers.title_width_budget(confirm_width, inner))
     if board.confirm == s.id then
+      local first = 1
+      for _, span in ipairs(title_spans) do
+        first = first + dispw(span[1])
+      end
+      board.confirm_columns[#lines + 1] = { first = first, last = first + dispw(CONFIRM_HINT) - 1 }
       title_spans[#title_spans + 1] = { CONFIRM_HINT, selected and "match_selected" or "error" }
     end
     local count_text, pad = Helpers.row_right_columns(Helpers.spans_width(title_spans), inner, s.message_count)
@@ -490,6 +498,23 @@ local function open(query)
         refresh()
       elseif board.frame % AGE_TICKS == 0 then
         render()
+      end
+    elseif ev.type == "click" then
+      if ev.row > 0 and ev.row <= #board.input_render.lines then
+        local input = board.rename and board.rename.input or board.input
+        input:click(board.input_render, ev.row, ev.col)
+        render()
+      elseif not board.rename then
+        local index = ev.row - board.reserved
+        if board.items[index] then
+          local confirm = board.confirm_columns[ev.row]
+          if confirm and ev.col and ev.col >= confirm.first and ev.col <= confirm.last then
+            delete_selected()
+          else
+            set_sel(index)
+            open_selected()
+          end
+        end
       end
     elseif ev.type == "key" then
       handle_key(ev.key)
