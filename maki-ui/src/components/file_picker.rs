@@ -26,8 +26,9 @@ use crate::click::{ClickTarget, HitTarget, PickerId, ScrollOwner};
 use crate::components::Overlay;
 use crate::components::coherent_completion::{CoherentCompletion, Publication};
 use crate::components::keybindings::key;
+use crate::components::list_picker::{SEARCH_PREFIX_WIDTH, click_search_buffer};
 use crate::components::modal::Modal;
-use crate::components::scrollbar::{ScrollbarHit, render_vertical_scrollbar};
+use crate::components::scrollbar::{ScrollbarHit, render_vertical_scrollbar, saturating_u16};
 use crate::repaint::{Cadence, Dirty};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
@@ -69,6 +70,7 @@ struct Session {
     scroll_offset: usize,
     viewport_height: usize,
     inner_area: Rect,
+    input_area: Rect,
 
     cancel: Arc<AtomicBool>,
     done_rx: flume::Receiver<()>,
@@ -189,6 +191,7 @@ impl FilePickerModal {
             scroll_offset: 0,
             viewport_height: 0,
             inner_area: Rect::default(),
+            input_area: Rect::default(),
             cancel: cancel_clone,
             done_rx,
             started_at: Instant::now(),
@@ -206,6 +209,7 @@ impl FilePickerModal {
         self.session.is_some()
     }
 
+    #[cfg(test)]
     pub fn contains(&self, pos: Position) -> bool {
         self.session
             .as_ref()
@@ -214,11 +218,13 @@ impl FilePickerModal {
 
     pub fn scroll(&mut self, delta: i32) {
         let Some(s) = &mut self.session else { return };
-        if delta > 0 {
-            move_selection(s, -(delta as isize));
+        s.scroll_offset = if delta > 0 {
+            s.scroll_offset.saturating_sub(delta as usize)
         } else {
-            move_selection(s, delta.unsigned_abs() as isize);
-        }
+            s.scroll_offset
+                .saturating_add(delta.unsigned_abs() as usize)
+        };
+        clamp_scroll(s);
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
@@ -360,6 +366,14 @@ impl FilePickerModal {
         true
     }
 
+    pub fn click_input(&mut self, pos: Position) -> bool {
+        let Some(s) = self.session.as_mut().filter(|s| s.visible) else {
+            return false;
+        };
+        let prefix_width = SEARCH_PREFIX_WIDTH * if s.walking { 2 } else { 1 };
+        click_search_buffer(&mut s.search, s.input_area, pos, prefix_width)
+    }
+
     pub fn scroll_to_line(&mut self, line: u16) {
         let Some(s) = &mut self.session else { return };
         let content_len = s.matches.len() + usize::from(s.truncated);
@@ -369,6 +383,9 @@ impl FilePickerModal {
     }
 
     pub fn hits(&self) -> Vec<HitTarget> {
+        let Some(s) = self.session.as_ref().filter(|s| s.visible) else {
+            return Vec::new();
+        };
         let mut hits: Vec<HitTarget> = self
             .row_hits
             .iter()
@@ -380,6 +397,12 @@ impl FilePickerModal {
                 },
             })
             .collect();
+        if !s.input_area.is_empty() {
+            hits.push(HitTarget {
+                rect: s.input_area,
+                target: ClickTarget::PickerInput(PickerId::File),
+            });
+        }
         if let Some(hit) = self.scrollbar_hit {
             hits.push(HitTarget {
                 rect: hit.area,
@@ -390,13 +413,15 @@ impl FilePickerModal {
     }
 
     pub fn scroll_line(&self) -> u16 {
-        self.session.as_ref().map_or(0, |s| s.scroll_offset as u16)
+        self.session
+            .as_ref()
+            .map_or(0, |s| saturating_u16(s.scroll_offset))
     }
 
     pub fn content_len(&self) -> Option<u16> {
         self.session
             .as_ref()
-            .map(|s| (s.matches.len() + usize::from(s.truncated)) as u16)
+            .map(|s| saturating_u16(s.matches.len() + usize::from(s.truncated)))
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
@@ -409,7 +434,7 @@ impl FilePickerModal {
             }
         };
 
-        let match_count = s.matches.len() as u16;
+        let match_count = saturating_u16(s.matches.len());
         let title = if s.walking { TITLE_WALKING } else { TITLE };
 
         let has_query_without_matches = s.matches.is_empty() && !s.search.value().is_empty();
@@ -427,19 +452,32 @@ impl FilePickerModal {
         };
         let (popup, inner) = modal.render(frame, area, content_rows + SEARCH_ROW);
         s.inner_area = inner;
-        s.viewport_height = inner.height.saturating_sub(SEARCH_ROW) as usize;
-        ensure_visible(s);
+        let follow_selection = s.viewport_height == 0 || selection_visible(s);
+        let viewport_height = inner.height.saturating_sub(SEARCH_ROW) as usize;
+        let resized = s.viewport_height != viewport_height;
+        s.viewport_height = viewport_height;
+        if resized && follow_selection {
+            ensure_visible(s);
+        } else {
+            clamp_scroll(s);
+        }
 
         let [list_area, search_area] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
 
         let row_hits = render_list(frame, list_area, s);
+        s.input_area = search_area;
         render_search(frame, search_area, s);
 
         self.row_hits = row_hits;
         let content_len = s.matches.len() + usize::from(s.truncated);
         self.scrollbar_hit = if content_len > s.viewport_height {
-            render_vertical_scrollbar(frame, list_area, content_len as u16, s.scroll_offset as u16)
+            render_vertical_scrollbar(
+                frame,
+                list_area,
+                saturating_u16(content_len),
+                saturating_u16(s.scroll_offset),
+            )
         } else {
             None
         };
@@ -541,24 +579,33 @@ fn clamp_selection(s: &mut Session) {
         s.scroll_offset = 0;
     } else {
         s.selected = s.selected.min(s.matches.len() - 1);
-        ensure_visible(s);
+        clamp_scroll(s);
     }
 }
 
-fn ensure_visible(s: &mut Session) {
-    let len = s.matches.len();
-    let content_len = len + usize::from(s.truncated);
+fn selection_visible(s: &Session) -> bool {
+    s.selected >= s.scroll_offset && s.selected < s.scroll_offset + s.viewport_height
+}
+
+fn clamp_scroll(s: &mut Session) {
+    let content_len = s.matches.len() + usize::from(s.truncated);
     if content_len > s.viewport_height {
         s.scroll_offset = s.scroll_offset.min(content_len - s.viewport_height);
     } else {
         s.scroll_offset = 0;
     }
+}
 
+fn ensure_visible(s: &mut Session) {
+    if s.viewport_height == 0 {
+        return;
+    }
     if s.selected < s.scroll_offset {
         s.scroll_offset = s.selected;
     } else if s.selected >= s.scroll_offset + s.viewport_height {
         s.scroll_offset = s.selected + 1 - s.viewport_height;
     }
+    clamp_scroll(s);
 }
 
 fn render_list(frame: &mut Frame, area: Rect, s: &Session) -> Vec<(Rect, usize)> {
@@ -577,7 +624,7 @@ fn render_list(frame: &mut Frame, area: Rect, s: &Session) -> Vec<(Rect, usize)>
     let content_len = s.matches.len() + usize::from(s.truncated);
     let at_bottom = s.scroll_offset + s.viewport_height >= content_len;
     let hint_row = usize::from(s.truncated && at_bottom);
-    let visible_rows = s.viewport_height - hint_row;
+    let visible_rows = s.viewport_height.saturating_sub(hint_row);
 
     let max_label_width = area.width.saturating_sub(LABEL_INDENT.len() as u16) as usize;
     let end = (s.scroll_offset + visible_rows).min(s.matches.len());
@@ -726,6 +773,85 @@ mod tests {
         }
     }
 
+    #[test_case(u16::MAX as usize; "maximum")]
+    #[test_case(u16::MAX as usize + 2; "over_maximum")]
+    fn large_picker_saturates_rendered_ranges(count: usize) {
+        let mut picker = picker_with_matches(count);
+        picker.session.as_mut().unwrap().scroll_offset = count - 1;
+        assert_eq!(picker.scroll_line(), saturating_u16(count - 1));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+        assert_eq!(picker.content_len(), Some(u16::MAX));
+        assert_eq!(picker.scrollbar_hit.unwrap().content_len, u16::MAX);
+        assert_eq!(picker.session.as_ref().unwrap().matches.len(), count);
+    }
+
+    #[test_case(false; "wheel")]
+    #[test_case(true; "absolute")]
+    fn manual_viewport_survives_render_and_resize(absolute: bool) {
+        let mut picker = picker_with_matches(40);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut render = |picker: &mut FilePickerModal, height| {
+            terminal
+                .draw(|frame| {
+                    picker.view(frame, Rect::new(0, 0, 80, height));
+                })
+                .unwrap();
+        };
+        render(&mut picker, 24);
+        if absolute {
+            picker.scroll_to_line(20);
+        } else {
+            picker.scroll(-20);
+        }
+        render(&mut picker, 24);
+        assert_eq!(picker.scroll_line(), 20);
+        assert_eq!(picker.row_hits.first().unwrap().1, 20);
+        assert_eq!(picker.session.as_ref().unwrap().selected, 0);
+        clamp_selection(picker.session.as_mut().unwrap());
+        render(&mut picker, 18);
+        assert_eq!(picker.scroll_line(), 20);
+        picker.handle_key(key(KeyCode::Down));
+        render(&mut picker, 18);
+        assert_eq!(picker.row_hits.first().unwrap().1, 1);
+        picker.scroll_to_line(u16::MAX);
+        render(&mut picker, 24);
+        let session = picker.session.as_ref().unwrap();
+        assert_eq!(session.scroll_offset, 40 - session.viewport_height);
+    }
+
+    #[test_case(false; "settled")]
+    #[test_case(true; "walking_spinner")]
+    fn rendered_search_click_accounts_for_prefix(walking: bool) {
+        let mut picker = picker_with_matches(1);
+        let session = picker.session.as_mut().unwrap();
+        session.walking = walking;
+        session.search = TextBuffer::new("a界z".into());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+        let hit = picker
+            .hits()
+            .into_iter()
+            .find(|hit| hit.target == ClickTarget::PickerInput(PickerId::File))
+            .unwrap();
+        let prefix = SEARCH_PREFIX_WIDTH * if walking { 2 } else { 1 };
+        assert!(!picker.click_input(Position::new(hit.rect.x, hit.rect.y - 1)));
+        assert!(picker.click_input(Position::new(hit.rect.x + prefix + 2, hit.rect.y)));
+        assert_eq!(picker.session.as_ref().unwrap().search.x(), 1);
+        assert!(picker.click_input(Position::new(hit.rect.x + prefix + 3, hit.rect.y)));
+        assert_eq!(picker.session.as_ref().unwrap().search.x(), 2);
+        picker.close();
+        assert!(picker.hits().is_empty());
+    }
+
     fn pending_picker() -> (FilePickerModal, flume::Sender<()>) {
         let mut picker = FilePickerModal::new();
         let notify = Arc::new(|| {});
@@ -744,6 +870,7 @@ mod tests {
             scroll_offset: 0,
             viewport_height: 0,
             inner_area: Rect::default(),
+            input_area: Rect::default(),
             cancel: Arc::new(AtomicBool::new(false)),
             done_rx,
             started_at: Instant::now(),
@@ -1232,13 +1359,14 @@ mod tests {
 
     #[test_case(0, -3, 3 ; "negative_scrolls_down")]
     #[test_case(5, 2, 3 ; "positive_scrolls_up")]
-    fn scroll_updates_selection(start: usize, delta: i32, expected: usize) {
+    fn scroll_updates_viewport(start: usize, delta: i32, expected: usize) {
         let mut picker = picker_with_matches(10);
         let s = picker.session.as_mut().unwrap();
         s.viewport_height = 5;
-        s.selected = start;
+        s.scroll_offset = start;
         picker.scroll(delta);
-        assert_eq!(picker.session.as_ref().unwrap().selected, expected);
+        assert_eq!(picker.scroll_line() as usize, expected);
+        assert_eq!(picker.session.as_ref().unwrap().selected, 0);
     }
 
     #[test]
