@@ -37,6 +37,8 @@ const PROBE_POLL_SLICE: Duration = Duration::from_millis(50);
 #[cfg(unix)]
 const PROBE_QUIET: Duration = Duration::from_millis(20);
 #[cfg(unix)]
+const PROBE_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
+#[cfg(unix)]
 const PROBE_KITTY_DIRECT: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
 #[cfg(unix)]
 const PROBE_SENTINELS: &[u8] = b"\x1b[>c\x1b[c\x1b[5n";
@@ -230,16 +232,13 @@ fn write_probe(bytes: &[u8]) -> Option<()> {
 }
 
 #[cfg(unix)]
-fn drain_stdin() {
-    while wait_readable(libc::STDIN_FILENO, PROBE_QUIET) {
+fn drain_stdin(fd: RawFd, deadline: Instant) {
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        if !wait_readable(fd, remaining.min(PROBE_QUIET)) {
+            break;
+        }
         let mut discard = [0u8; 256];
-        let n = unsafe {
-            libc::read(
-                libc::STDIN_FILENO,
-                discard.as_mut_ptr().cast(),
-                discard.len(),
-            )
-        };
+        let n = unsafe { libc::read(fd, discard.as_mut_ptr().cast(), discard.len()) };
         if n <= 0 {
             break;
         }
@@ -292,7 +291,7 @@ pub(crate) fn probe_terminal_graphics(timeout: Duration) -> Option<DetectedGraph
         }
     }
 
-    drain_stdin();
+    drain_stdin(libc::STDIN_FILENO, Instant::now() + PROBE_DRAIN_TIMEOUT);
     detected
 }
 
@@ -707,6 +706,55 @@ mod tests {
             "{EXPECTED_PENDING}"
         );
         Ok(())
+    }
+
+    #[cfg(unix)]
+    mod drain {
+        use std::fs::File;
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        use color_eyre::eyre::Result;
+        use test_case::test_case;
+
+        use super::super::{PROBE_DRAIN_TIMEOUT, drain_stdin, wait_readable};
+
+        const CONTINUOUS_INPUT_PATH: &str = "/dev/zero";
+        const HANG_GUARD: Duration = Duration::from_secs(5);
+        const PENDING_REPLY: &[u8] = b"\x1b[0n";
+
+        #[test_case(Duration::ZERO; "expired_deadline")]
+        #[test_case(PROBE_DRAIN_TIMEOUT; "deadline_during_continuous_input")]
+        fn continuous_input_cannot_extend_deadline(budget: Duration) -> Result<()> {
+            let input = File::open(CONTINUOUS_INPUT_PATH)?;
+            let (done_tx, done_rx) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                drain_stdin(input.as_raw_fd(), Instant::now() + budget);
+                done_tx.send(()).unwrap();
+            });
+
+            done_rx.recv_timeout(HANG_GUARD)?;
+            worker.join().unwrap();
+            Ok(())
+        }
+
+        #[test_case(false; "drains_pending_reply")]
+        #[test_case(true; "expired_deadline_preserves_input")]
+        fn pending_input_respects_deadline(expired: bool) -> Result<()> {
+            let (input, mut output) = UnixStream::pair()?;
+            output.write_all(PENDING_REPLY)?;
+            assert!(wait_readable(input.as_raw_fd(), HANG_GUARD));
+            let deadline = Instant::now() + if expired { Duration::ZERO } else { HANG_GUARD };
+
+            drain_stdin(input.as_raw_fd(), deadline);
+
+            assert_eq!(wait_readable(input.as_raw_fd(), Duration::ZERO), expired);
+            Ok(())
+        }
     }
 
     #[test]
