@@ -277,6 +277,38 @@ fn rebuild(panel: &mut MessagesPanel) {
     render(panel, 80, 24);
 }
 
+#[test_case(false ; "plain_post")]
+#[test_case(true ; "linked_post")]
+fn post_agent_target_follows_wrapping_and_scroll(linked: bool) {
+    const AGENT_ID: &str = "reviewer";
+    const POST_TEXT: &str = "reviewer started checking the pending changes";
+    const WIDTH: u16 = 16;
+    const HEIGHT: u16 = 2;
+    const SCROLL_ROW: u16 = 1;
+    let mut panel = panel_with_tools(&[]);
+    let mut post = DisplayMessage::new(
+        DisplayRole::Post(maki_agent::PostLevel::Info),
+        POST_TEXT.into(),
+    );
+    post.post_agent = linked.then(|| AGENT_ID.into());
+    panel.push(post);
+    render(&mut panel, WIDTH, HEIGHT);
+    panel.set_scroll_top(SCROLL_ROW);
+    let terminal = render(&mut panel, WIDTH, HEIGHT);
+    assert_eq!(panel.scroll_top(), SCROLL_ROW);
+    let area = Rect::new(0, 0, WIDTH, HEIGHT);
+    let expected = linked.then_some(AGENT_ID);
+    for row in 0..HEIGHT {
+        assert_eq!(panel.post_agent_at(row, area), expected);
+        let cell = &terminal.backend().buffer()[(0, row)];
+        assert_eq!(
+            cell.modifier.contains(ratatui::style::Modifier::UNDERLINED),
+            linked
+        );
+    }
+    assert_eq!(panel.post_agent_at(HEIGHT, area), None);
+}
+
 #[test]
 fn ctrl_d_to_bottom_re_enables_auto_scroll() {
     let mut panel = MessagesPanel::new(

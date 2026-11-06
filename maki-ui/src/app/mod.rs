@@ -128,6 +128,7 @@ const FLASH_CANCEL: &str = "Press esc again to stop...";
 const FLASH_REWIND: &str = "Press esc again to rewind...";
 const AUTH_EXPIRED_MSG: &str =
     "Token expired. Run `makima auth login` in another terminal, then press Enter to retry.";
+const FLASH_NO_AGENT_CHAT: &str = "Agent chat is unavailable";
 const FLASH_NO_PLAN: &str = "No plan file";
 const FLASH_NO_PLAN_BODY: &str = "Plan file is empty or unreadable";
 const PLAN_SUBMIT_TOOL: &str = "plan_submit";
@@ -2923,7 +2924,7 @@ impl App {
             ),
             None => (0, None),
         };
-        self.chats[chat_idx].push_post(&post.text, post.level);
+        self.chats[chat_idx].push_post(&post);
         let session = &self.state.session;
         let after_message = committed_messages.unwrap_or_else(|| match &chat {
             Some(id) => session
