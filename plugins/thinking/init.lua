@@ -21,14 +21,19 @@ local function wrap_index(cursor, delta, levels)
 end
 
 local function render_ladder(active, levels)
-  local spans = {}
+  local spans, ranges = {}, {}
+  local col = 1
   for i, level in ipairs(levels) do
     if i > 1 then
       spans[#spans + 1] = { "  ", "dim" }
+      col = col + 2
     end
+    local cells = maki.ui.display_width(level)
+    ranges[#ranges + 1] = { first = col, last = col + cells - 1, index = i }
+    col = col + cells
     spans[#spans + 1] = { level, (i == active) and "selected" or "item" }
   end
-  return spans
+  return spans, ranges
 end
 
 local function fail(err)
@@ -81,13 +86,13 @@ local function open_selector(ctx)
   local levels = maki.model.thinking_levels()
   local cursor = index_of(levels, selection.thinking) or 1
   local buf = maki.ui.buf()
-  buf:set_lines({ render_ladder(cursor, levels) })
 
   local win = maki.ui.open_win(buf, {
     title = "Thinking",
     height = 3,
     footer = {
-      { "h/l", "level" },
+      { "left", "less" },
+      { "right", "more" },
       { "enter", "set" },
       { "esc", "cancel" },
     },
@@ -95,6 +100,8 @@ local function open_selector(ctx)
 
   local opened = false
   while true do
+    local ladder, ranges = render_ladder(cursor, levels)
+    buf:set_lines({ ladder })
     local ev = win:recv()
     if not ev and not opened then
       error(NO_SELECTOR)
@@ -103,18 +110,25 @@ local function open_selector(ctx)
     if not ev or ev.type == "close" then
       break
     end
+    if ev.type == "click" and ev.row == 1 and ev.col then
+      for _, range in ipairs(ranges) do
+        if ev.col >= range.first and ev.col <= range.last then
+          win:close()
+          set_thinking(ctx, agent, levels[range.index])
+          return
+        end
+      end
+    end
     if ev.type == "key" then
       if ev.key == "left" or ev.key == "h" then
         cursor = wrap_index(cursor, -1, levels)
-        buf:set_lines({ render_ladder(cursor, levels) })
       elseif ev.key == "right" or ev.key == "l" then
         cursor = wrap_index(cursor, 1, levels)
-        buf:set_lines({ render_ladder(cursor, levels) })
       elseif ev.key == "enter" then
         win:close()
         set_thinking(ctx, agent, levels[cursor])
         return
-      elseif ev.key == "esc" then
+      elseif ev.key == "esc" or ev.key == "ctrl+c" then
         win:close()
         return
       end

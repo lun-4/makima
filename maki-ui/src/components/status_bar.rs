@@ -4,14 +4,17 @@ use std::time::{Duration, Instant};
 
 use super::{RetryInfo, Status};
 use maki_lua::StatusContentSnapshot;
+#[cfg(test)]
+use maki_lua::StatusEntry;
 
 use crate::animation::spinner_frame;
+use crate::click::{ClickTarget, HitTarget};
 use crate::theme;
 
 use maki_providers::format_tokens;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use tracing::info;
@@ -23,6 +26,7 @@ const TRUNCATE_PREFIX: &str = "..";
 const FAST_LABEL: &str = " [fast]";
 const WORKFLOW_LABEL: &str = " [workflow]";
 const RESTRICTED_LABEL: &str = " [restricted]";
+const NORMAL_LABEL: &str = " [normal]";
 const YOLO_LABEL: &str = " [yolo]";
 const YOLO_DIM_FACTOR: f32 = 0.15;
 const SUBAGENT_LABEL_PREFIX: &str = "\u{21b3} ";
@@ -66,6 +70,8 @@ pub struct StatusBarContext<'a> {
     pub restoring: bool,
     pub status_content: Option<&'a StatusContentSnapshot>,
     pub suppress_status_content: bool,
+    pub hover: Option<ClickTarget>,
+    pub thinking_supported: bool,
 }
 
 pub struct StatusBar {
@@ -155,7 +161,36 @@ impl StatusBar {
         )
     }
 
-    pub fn view(&self, frame: &mut Frame, area: Rect, ctx: &StatusBarContext) {
+    pub fn view(&self, frame: &mut Frame, area: Rect, ctx: &StatusBarContext) -> Vec<HitTarget> {
+        let hovered = |target: ClickTarget| ctx.hover == Some(target);
+        let permission_label = if ctx.yolo { YOLO_LABEL } else { NORMAL_LABEL };
+        let permission_width = (permission_label.width() as u16).min(area.width);
+        let permission_area = Rect::new(
+            area.right().saturating_sub(permission_width),
+            area.y,
+            permission_width,
+            area.height,
+        );
+        let area = Rect::new(
+            area.x,
+            area.y,
+            area.width.saturating_sub(permission_width),
+            area.height,
+        );
+        let permission_style = if ctx.yolo {
+            theme::dim_style(theme::current().error, YOLO_DIM_FACTOR)
+        } else {
+            theme::current().status_dim
+        };
+        let permission_style = if hovered(ClickTarget::PermissionChip) {
+            permission_style.add_modifier(Modifier::UNDERLINED)
+        } else {
+            permission_style
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(permission_label, permission_style)),
+            permission_area,
+        );
         let mut left_spans = Vec::new();
 
         if *ctx.status == Status::Streaming {
@@ -171,13 +206,25 @@ impl StatusBar {
             ));
         }
 
-        left_spans.push(Span::styled(format!(" {}", ctx.mode_label), ctx.mode_style));
+        let mode_idx = left_spans.len();
+        let mode_style = if hovered(ClickTarget::ModeChip) {
+            ctx.mode_style.add_modifier(Modifier::UNDERLINED)
+        } else {
+            ctx.mode_style
+        };
+        left_spans.push(Span::styled(format!(" {}", ctx.mode_label), mode_style));
 
+        let mut autoscroll_idx = None;
         if !ctx.auto_scroll {
-            left_spans.push(Span::styled(
-                " auto-scroll paused",
-                theme::current().status_dim,
-            ));
+            autoscroll_idx = Some(left_spans.len());
+            let style = if hovered(ClickTarget::AutoScrollChip) {
+                theme::current()
+                    .status_dim
+                    .add_modifier(Modifier::UNDERLINED)
+            } else {
+                theme::current().status_dim
+            };
+            left_spans.push(Span::styled(" auto-scroll paused", style));
         }
 
         if let Some(retry) = ctx.retry_info {
@@ -196,18 +243,14 @@ impl StatusBar {
         }
 
         let mut right_spans = Vec::new();
-
-        let yolo_span = ctx.yolo.then(|| {
-            Span::styled(
-                YOLO_LABEL,
-                theme::dim_style(theme::current().error, YOLO_DIM_FACTOR),
-            )
-        });
+        let mut model_idx = None;
+        let mut thinking_idx = None;
+        let mut status_base = None;
+        let mut status_clicks: Vec<(usize, u32)> = Vec::new();
 
         match ctx.status {
             Status::Error { message: e, .. } => {
                 left_spans.push(Span::styled(format!(" {e}"), theme::current().error));
-                right_spans.extend(yolo_span);
             }
             _ => {
                 let pct = if ctx.stats.context_window > 0 {
@@ -219,9 +262,28 @@ impl StatusBar {
                 let mut rest_spans = Vec::new();
 
                 if let Some(ref label) = ctx.thinking_label {
+                    thinking_idx = Some(rest_spans.len());
                     rest_spans.push(Span::styled(
                         format!(" [{label}]"),
-                        theme::current().status_dim,
+                        if hovered(ClickTarget::ThinkingChip) {
+                            theme::current()
+                                .status_dim
+                                .add_modifier(Modifier::UNDERLINED)
+                        } else {
+                            theme::current().status_dim
+                        },
+                    ));
+                } else if ctx.thinking_supported {
+                    thinking_idx = Some(rest_spans.len());
+                    rest_spans.push(Span::styled(
+                        " [thinking: off]",
+                        if hovered(ClickTarget::ThinkingChip) {
+                            theme::current()
+                                .status_dim
+                                .add_modifier(Modifier::UNDERLINED)
+                        } else {
+                            theme::current().status_dim
+                        },
                     ));
                 }
 
@@ -233,9 +295,6 @@ impl StatusBar {
                 }
                 if ctx.restricted {
                     rest_spans.push(Span::styled(RESTRICTED_LABEL, theme::current().status_dim));
-                }
-                if let Some(span) = yolo_span {
-                    rest_spans.push(span);
                 }
 
                 let context_text = format!(
@@ -270,7 +329,7 @@ impl StatusBar {
                     Cow::Borrowed(ctx.model_id)
                 };
                 let model_min_width = 8.min(model_text.width());
-                let plugin_spans = if !ctx.suppress_status_content {
+                let (plugin_spans, clicks) = if !ctx.suppress_status_content {
                     ctx.status_content
                         .map(|snapshot| {
                             status_content_spans(
@@ -280,16 +339,32 @@ impl StatusBar {
                         })
                         .unwrap_or_default()
                 } else {
-                    Vec::new()
+                    (Vec::new(), Vec::new())
                 };
+                status_clicks = clicks;
                 let plugin_width: usize = plugin_spans.iter().map(Span::width).sum();
                 // `truncate_tail` keeps the tail, so a narrow bar collapses to
                 // the incoming model, which is the half worth keeping.
                 let model =
                     truncate_tail(&model_text, available.saturating_sub(plugin_width)).into_owned();
 
-                right_spans.push(Span::styled(model, theme::current().status_dim));
+                model_idx = Some(right_spans.len());
+                right_spans.push(Span::styled(
+                    model,
+                    if hovered(ClickTarget::ModelChip) {
+                        theme::current()
+                            .status_dim
+                            .add_modifier(Modifier::UNDERLINED)
+                    } else {
+                        theme::current().status_dim
+                    },
+                ));
+                let rest_base = right_spans.len();
+                if let Some(idx) = thinking_idx {
+                    thinking_idx = Some(rest_base + idx);
+                }
                 right_spans.append(&mut rest_spans);
+                status_base = Some(right_spans.len());
                 right_spans.extend(plugin_spans);
             }
         }
@@ -307,30 +382,93 @@ impl StatusBar {
         ])
         .areas(area);
 
+        let mut hits = Vec::new();
+        if !permission_area.is_empty() {
+            hits.push(HitTarget {
+                rect: permission_area,
+                target: ClickTarget::PermissionChip,
+            });
+        }
+        if let Some(rect) = span_rect(left_area, &left_spans, mode_idx) {
+            hits.push(HitTarget {
+                rect,
+                target: ClickTarget::ModeChip,
+            });
+        }
+        if let Some(idx) = autoscroll_idx
+            && let Some(rect) = span_rect(left_area, &left_spans, idx)
+        {
+            hits.push(HitTarget {
+                rect,
+                target: ClickTarget::AutoScrollChip,
+            });
+        }
+        let model_rect = model_idx.and_then(|idx| span_rect(right_area, &right_spans, idx));
+        let status_rects: Vec<(Rect, u32)> = status_base
+            .map(|base| {
+                status_clicks
+                    .iter()
+                    .filter_map(|(idx, id)| {
+                        span_rect(right_area, &right_spans, base + idx).map(|rect| (rect, *id))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let thinking_rect = thinking_idx.and_then(|idx| span_rect(right_area, &right_spans, idx));
         frame.render_widget(Paragraph::new(Line::from(left_spans)), left_area);
         frame.render_widget(
             Paragraph::new(Line::from(right_spans)).alignment(Alignment::Right),
             right_area,
         );
+        if let Some(rect) = model_rect {
+            hits.push(HitTarget {
+                rect,
+                target: ClickTarget::ModelChip,
+            });
+        }
+        if let Some(rect) = thinking_rect {
+            hits.push(HitTarget {
+                rect,
+                target: ClickTarget::ThinkingChip,
+            });
+        }
+        for (rect, id) in status_rects {
+            hits.push(HitTarget {
+                rect,
+                target: ClickTarget::StatusEntry(id),
+            });
+        }
+        hits
     }
 }
 
-fn status_content_spans(snapshot: &StatusContentSnapshot, max_width: usize) -> Vec<Span<'static>> {
+fn span_rect(area: Rect, spans: &[Span], index: usize) -> Option<Rect> {
+    let span = spans.get(index)?;
+    let x = area.x + spans[..index].iter().map(Span::width).sum::<usize>() as u16;
+    let right = x.saturating_add(span.width() as u16).min(area.right());
+    (right > x && x < area.right()).then(|| Rect::new(x, area.y, right - x, 1))
+}
+
+fn status_content_spans(
+    snapshot: &StatusContentSnapshot,
+    max_width: usize,
+) -> (Vec<Span<'static>>, Vec<(usize, u32)>) {
     let mut remaining = max_width;
     let mut spans = Vec::new();
+    let mut clicks = Vec::new();
     let mut has_content = false;
     for (_, entries) in &snapshot.entries {
         let mut owner_has_content = false;
-        for (text, style_name) in entries {
-            if text.is_empty() {
+        for entry in entries {
+            if entry.text.is_empty() {
                 continue;
             }
             let separator = usize::from(has_content && !owner_has_content);
             if remaining <= separator {
-                return spans;
+                return (spans, clicks);
             }
             remaining -= separator;
-            let clipped = truncate_head(text, remaining);
+            let clipped = truncate_head(&entry.text, remaining);
             let width = clipped.width();
             if width == 0 {
                 continue;
@@ -339,15 +477,18 @@ fn status_content_spans(snapshot: &StatusContentSnapshot, max_width: usize) -> V
                 spans.push(Span::raw(" "));
             }
             remaining -= width;
+            if let Some(id) = entry.click {
+                clicks.push((spans.len(), id));
+            }
             spans.push(Span::styled(
                 clipped.into_owned(),
-                theme::style_by_name(style_name),
+                theme::style_by_name(&entry.style),
             ));
             has_content = true;
             owner_has_content = true;
         }
     }
-    spans
+    (spans, clicks)
 }
 
 fn truncate_head(s: &str, max_width: usize) -> Cow<'_, str> {
@@ -531,15 +672,28 @@ mod tests {
             restoring: false,
             status_content,
             suppress_status_content: false,
+            hover: None,
+            thinking_supported: false,
         };
-        terminal.draw(|f| bar.view(f, f.area(), &ctx)).unwrap();
+        terminal
+            .draw(|f| {
+                bar.view(f, f.area(), &ctx);
+            })
+            .unwrap();
         crate::components::buffer_text(terminal.backend().buffer())
     }
 
     #[test]
     fn status_bar_orders_model_context_cost_then_plugin_at_right() {
         let snapshot = StatusContentSnapshot {
-            entries: vec![(Arc::from("usage"), vec![("PLUGIN".into(), "accent".into())])],
+            entries: vec![(
+                Arc::from("usage"),
+                vec![StatusEntry {
+                    text: "PLUGIN".into(),
+                    style: "accent".into(),
+                    click: None,
+                }],
+            )],
             generation: 1,
         };
         let text = render_context(Some(&snapshot), 120);
@@ -548,7 +702,7 @@ mod tests {
         let cost = text.find(CHAT_COST_TEXT).unwrap();
         let plugin = text.find("PLUGIN").unwrap();
         assert!(model < context && context < cost && cost < plugin, "{text}");
-        assert!(text.trim_end().ends_with("PLUGIN"), "{text}");
+        assert!(text.trim_end().ends_with(NORMAL_LABEL.trim()), "{text}");
     }
 
     /// A run picks a changed model up at its next request, so between the
@@ -572,10 +726,17 @@ mod tests {
     #[test]
     fn status_bar_narrow_width_keeps_plugin_and_model_minimum() {
         let snapshot = StatusContentSnapshot {
-            entries: vec![(Arc::from("usage"), vec![("PLUGIN".into(), "accent".into())])],
+            entries: vec![(
+                Arc::from("usage"),
+                vec![StatusEntry {
+                    text: "PLUGIN".into(),
+                    style: "accent".into(),
+                    click: None,
+                }],
+            )],
             generation: 1,
         };
-        let text = render_context(Some(&snapshot), 47);
+        let text = render_context(Some(&snapshot), 56);
         assert!(text.contains("PLUGIN"), "{text}");
         assert!(text.contains("..-model"), "{text}");
     }
@@ -586,14 +747,26 @@ mod tests {
             entries: vec![(
                 Arc::from("usage"),
                 vec![
-                    ("5h30%".into(), "accent".into()),
-                    (" ".into(), "dim".into()),
-                    ("w90%".into(), "accent".into()),
+                    StatusEntry {
+                        text: "5h30%".into(),
+                        style: "accent".into(),
+                        click: None,
+                    },
+                    StatusEntry {
+                        text: " ".into(),
+                        style: "dim".into(),
+                        click: None,
+                    },
+                    StatusEntry {
+                        text: "w90%".into(),
+                        style: "accent".into(),
+                        click: None,
+                    },
                 ],
             )],
             generation: 1,
         };
-        let spans = status_content_spans(&snapshot, 32);
+        let (spans, _) = status_content_spans(&snapshot, 32);
         let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
         assert_eq!(text, "5h30% w90%");
     }
@@ -602,12 +775,26 @@ mod tests {
     fn status_content_separates_plugin_entries_once() {
         let snapshot = StatusContentSnapshot {
             entries: vec![
-                (Arc::from("one"), vec![("a".into(), "accent".into())]),
-                (Arc::from("two"), vec![("b".into(), "accent".into())]),
+                (
+                    Arc::from("one"),
+                    vec![StatusEntry {
+                        text: "a".into(),
+                        style: "accent".into(),
+                        click: None,
+                    }],
+                ),
+                (
+                    Arc::from("two"),
+                    vec![StatusEntry {
+                        text: "b".into(),
+                        style: "accent".into(),
+                        click: None,
+                    }],
+                ),
             ],
             generation: 1,
         };
-        let spans = status_content_spans(&snapshot, 32);
+        let (spans, _) = status_content_spans(&snapshot, 32);
         let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
         assert_eq!(text, "a b");
     }
@@ -639,8 +826,14 @@ mod tests {
             restoring: false,
             status_content: None,
             suppress_status_content: false,
+            hover: None,
+            thinking_supported: false,
         };
-        terminal.draw(|f| bar.view(f, f.area(), &ctx)).unwrap();
+        terminal
+            .draw(|f| {
+                bar.view(f, f.area(), &ctx);
+            })
+            .unwrap();
         crate::components::buffer_text(terminal.backend().buffer())
     }
 
@@ -676,20 +869,36 @@ mod tests {
             restoring: false,
             status_content: None,
             suppress_status_content: false,
+            hover: None,
+            thinking_supported: false,
         };
-        terminal.draw(|f| bar.view(f, f.area(), &ctx)).unwrap();
+        terminal
+            .draw(|f| {
+                bar.view(f, f.area(), &ctx);
+            })
+            .unwrap();
         crate::components::buffer_text(terminal.backend().buffer())
             .contains(RESTRICTED_LABEL.trim())
     }
 
-    #[test_case(true  => true  ; "a_bypassed_session_says_so")]
-    #[test_case(false => false ; "a_prompting_session_stays_quiet")]
-    fn the_bar_advertises_yolo(yolo: bool) -> bool {
-        let bar = StatusBar::new(FLASH_TTL, test_cwd());
+    #[test_case(true, false, BAR_WIDTH, false ; "yolo_idle")]
+    #[test_case(false, false, BAR_WIDTH, false ; "normal_idle")]
+    #[test_case(true, true, BAR_WIDTH, false ; "yolo_error")]
+    #[test_case(false, true, BAR_WIDTH, false ; "normal_error")]
+    #[test_case(true, false, 12, true ; "yolo_narrow_hovered")]
+    #[test_case(false, true, 12, true ; "normal_narrow_hovered")]
+    fn permission_chip_is_visible_and_clickable(yolo: bool, error: bool, width: u16, hover: bool) {
+        let mut bar = StatusBar::new(FLASH_TTL, test_cwd());
+        bar.flash(FLASH_MSG.into());
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(BAR_WIDTH, 1)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1)).unwrap();
+        let status = if error {
+            Status::error(FLASH_MSG.into())
+        } else {
+            Status::Idle
+        };
         let ctx = StatusBarContext {
-            status: &Status::Idle,
+            status: &status,
             mode_label: Cow::Borrowed("NORMAL"),
             mode_style: Style::default(),
             model_id: MODEL_ID,
@@ -711,9 +920,38 @@ mod tests {
             restoring: false,
             status_content: None,
             suppress_status_content: false,
+            hover: hover.then_some(ClickTarget::PermissionChip),
+            thinking_supported: false,
         };
-        terminal.draw(|f| bar.view(f, f.area(), &ctx)).unwrap();
-        crate::components::buffer_text(terminal.backend().buffer()).contains(YOLO_LABEL.trim())
+        let mut hits = Vec::new();
+        terminal
+            .draw(|f| {
+                hits = bar.view(f, f.area(), &ctx);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = crate::components::buffer_text(buffer);
+        let (label, other) = if yolo {
+            (YOLO_LABEL, NORMAL_LABEL)
+        } else {
+            (NORMAL_LABEL, YOLO_LABEL)
+        };
+        assert!(text.ends_with(label), "{text}");
+        assert!(!text.contains(other), "{text}");
+        let hit = hits
+            .iter()
+            .find(|hit| hit.target == ClickTarget::PermissionChip)
+            .unwrap();
+        assert_eq!(
+            hit.rect,
+            Rect::new(width - label.width() as u16, 0, label.width() as u16, 1)
+        );
+        assert_eq!(
+            buffer[(hit.rect.x + 1, 0)]
+                .modifier
+                .contains(Modifier::UNDERLINED),
+            hover,
+        );
     }
 
     /// The sigma is the whole session's bill, and only the session can hand it
@@ -899,9 +1137,13 @@ mod tests {
             restoring: false,
             status_content: None,
             suppress_status_content: false,
+            hover: None,
+            thinking_supported: false,
         };
-        term.draw(|frame| bar.view(frame, frame.area(), &ctx))
-            .unwrap();
+        term.draw(|frame| {
+            bar.view(frame, frame.area(), &ctx);
+        })
+        .unwrap();
         let text: String = term
             .backend()
             .buffer()

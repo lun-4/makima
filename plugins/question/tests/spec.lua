@@ -825,6 +825,73 @@ case("view_opts_honors_a_generous_line_limit_and_floors_a_tight_one", function()
   eq(QuestionHelpers.view_opts(ctx({ other = 1 })).max_lines, floor, "a limit too tight for a card is floored")
 end)
 
+local function click_form(state, row, col, width)
+  return QuestionForm._handle_click(state, QuestionForm._render(state, width or 80), { row = row, col = col })
+end
+
+case("tabs_use_rendered_display_ranges_including_answer_marks", function()
+  local questions = multi_questions()
+  questions[1].header = "界"
+  local state = QuestionForm._initial_state(questions)
+  press(state, "enter")
+  local rendered = QuestionForm._render(state, 80)
+  local first_width = maki.ui.display_width(rendered.lines[1][1][1])
+  click_form(state, 1, first_width + 1)
+  eq(state.tab, 2, "separator is not a tab")
+  click_form(state, 1, 2)
+  eq(state.tab, 1, "answered tab can be revisited")
+  rendered = QuestionForm._render(state, 80)
+  local review = rendered.row_actions[1].tabs[3]
+  click_form(state, 1, review.first)
+  eq(state.mode, MODE.CONFIRMING)
+  click_form(state, 1, 2)
+  eq(state.mode, MODE.SELECTING)
+  eq(state.tab, 1, "review supports returning to any question")
+  click_form(state, 1, 80)
+  eq(state.tab, 1, "blank tab-bar space does nothing")
+  click_form(state, 0, 2)
+  eq(state.tab, 1, "chrome does nothing")
+end)
+
+case("every_wrapped_option_row_selects_the_option_not_the_custom_editor", function()
+  local state = QuestionForm._initial_state(single_question({
+    options = { { label = "A long option label", description = string.rep("description ", 12) } },
+  }))
+  press_many(state, { "down", "enter" })
+  state.custom_input:insert_text("unsaved custom")
+  local rendered = QuestionForm._render(state, 28)
+  local rows = {}
+  for row, action in pairs(rendered.row_actions) do
+    if action.cursor == 1 then
+      rows[#rows + 1] = row
+    end
+  end
+  assert(#rows > 1, "fixture must wrap")
+  for _, row in ipairs(rows) do
+    local fresh = QuestionForm._initial_state(state.questions)
+    press_many(fresh, { "down", "enter" })
+    fresh.custom_input:insert_text("unsaved custom")
+    click_form(fresh, row, 2, 28)
+    eq(fresh.done.answers[1][1], "A long option label")
+  end
+end)
+
+case("custom_editor_click_places_caret_on_the_rendered_row", function()
+  local state = editing_custom_single()
+  state.custom_input:insert_text("abc\n界xyz")
+  local rendered = QuestionForm._render(state, 80)
+  for row, action in pairs(rendered.row_actions) do
+    if action.input_row == 2 then
+      click_form(state, row, 7)
+      eq(state.custom_input.line, 2)
+      eq(state.custom_input.col, #"界")
+      eq(state.mode, MODE.EDITING_CUSTOM)
+      return
+    end
+  end
+  error("missing custom input row")
+end)
+
 if #failures > 0 then
   error(#failures .. " case(s) failed:\n\n" .. table.concat(failures, "\n\n"))
 end

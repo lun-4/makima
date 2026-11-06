@@ -7,12 +7,13 @@ use maki_match::{
 use nucleo_matcher::pattern::{CaseMatching, Normalization};
 
 use crate::animation::{animation_elapsed_ms, spinner_str};
+use crate::click::{ClickTarget, HitTarget, PickerId, ScrollOwner};
 use crate::components::Overlay;
 use crate::components::coherent_completion::Published;
 use crate::components::is_ctrl;
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
-use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::scrollbar::{ScrollbarHit, render_vertical_scrollbar, saturating_u16};
 use crate::repaint::Cadence;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
@@ -29,6 +30,7 @@ const NO_MATCHES: &str = "No matches";
 const MIN_WIDTH_PERCENT: u16 = 65;
 const MAX_HEIGHT_PERCENT: u16 = 80;
 const SEARCH_ROW: u16 = 1;
+pub(super) const SEARCH_PREFIX_WIDTH: u16 = 2;
 const DETAIL_RIGHT_PAD: u16 = 1;
 
 pub trait PickerItem {
@@ -83,6 +85,9 @@ enum Footer {
 
 pub struct ListPicker<T> {
     state: Option<State<T>>,
+    picker: Option<PickerId>,
+    scrollbar_hit: Option<ScrollbarHit>,
+    row_hits: Vec<(Rect, usize)>,
     title: String,
     max_visible: Option<u16>,
     footer: Option<Footer>,
@@ -107,6 +112,7 @@ struct State<T> {
     scroll_offset: usize,
     viewport_height: usize,
     inner_area: Rect,
+    input_area: Rect,
     enabled: Option<Vec<bool>>,
 }
 
@@ -130,6 +136,7 @@ impl<T: PickerItem> State<T> {
             scroll_offset: 0,
             viewport_height: 20,
             inner_area: Rect::default(),
+            input_area: Rect::default(),
             enabled: None,
         }
     }
@@ -267,7 +274,7 @@ impl<T: PickerItem> State<T> {
             self.scroll_offset = 0;
         } else {
             self.selected = self.selected.min(self.filtered().len() - 1);
-            self.scroll_offset = self.scroll_offset.min(self.selected);
+            self.clamp_scroll();
         }
     }
 
@@ -323,6 +330,25 @@ impl<T: PickerItem> State<T> {
         self.ensure_visible();
     }
 
+    fn selection_visible(&self) -> bool {
+        !self.filtered().is_empty()
+            && self.selected >= self.scroll_offset
+            && visual_rows_in_range(
+                self.filtered(),
+                &self.items,
+                self.scroll_offset,
+                self.selected + 1,
+            ) <= self.viewport_height
+    }
+
+    fn clamp_scroll(&mut self) {
+        self.scroll_offset = self.scroll_offset.min(find_scroll_offset_for_bottom(
+            self.filtered(),
+            &self.items,
+            self.viewport_height,
+        ));
+    }
+
     fn ensure_visible(&mut self) {
         if self.filtered().is_empty() {
             return;
@@ -344,9 +370,7 @@ impl<T: PickerItem> State<T> {
                 self.viewport_height,
             );
         }
-        let max_offset =
-            find_scroll_offset_for_bottom(self.filtered(), &self.items, self.viewport_height);
-        self.scroll_offset = self.scroll_offset.min(max_offset);
+        self.clamp_scroll();
     }
 
     fn selected_item_index(&self) -> Option<usize> {
@@ -358,6 +382,9 @@ impl<T: PickerItem> ListPicker<T> {
     pub fn new() -> Self {
         Self {
             state: None,
+            picker: None,
+            scrollbar_hit: None,
+            row_hits: Vec::new(),
             title: String::new(),
             max_visible: None,
             footer: None,
@@ -419,11 +446,16 @@ impl<T: PickerItem> ListPicker<T> {
         self.state = Some(State::new(items));
     }
 
-    pub fn select(&mut self, index: usize) {
-        if let Some(s) = self.state.as_mut() {
-            s.selected = index.min(s.filtered().len().saturating_sub(1));
-            s.ensure_visible();
+    pub fn select(&mut self, index: usize) -> bool {
+        let Some(s) = self.state.as_mut() else {
+            return false;
+        };
+        if index >= s.filtered().len() {
+            return false;
         }
+        s.selected = index;
+        s.ensure_visible();
+        true
     }
 
     pub fn select_item_by(&mut self, predicate: impl Fn(&T) -> bool) -> bool {
@@ -508,12 +540,6 @@ impl<T: PickerItem> ListPicker<T> {
 
     pub fn close(&mut self) {
         self.state = None;
-    }
-
-    pub fn contains(&self, pos: Position) -> bool {
-        self.state
-            .as_ref()
-            .is_some_and(|s| s.inner_area.contains(pos))
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> PickerAction<T> {
@@ -672,6 +698,30 @@ impl<T: PickerItem> ListPicker<T> {
         true
     }
 
+    pub fn click_input(&mut self, pos: Position) -> bool {
+        let Some(s) = self.state.as_mut() else {
+            return false;
+        };
+        let clicked = click_search_buffer(&mut s.search, s.input_area, pos, SEARCH_PREFIX_WIDTH);
+        if clicked {
+            self.confirming_delete = None;
+        }
+        clicked
+    }
+
+    pub fn footer_area(&self) -> Option<Rect> {
+        let s = self.state.as_ref()?;
+        let y = s.input_area.bottom();
+        (self.footer.is_some() && y < s.inner_area.bottom())
+            .then(|| Rect::new(s.input_area.x, y, s.input_area.width, 1))
+    }
+
+    pub fn selection_visible(&self) -> bool {
+        self.state
+            .as_ref()
+            .is_some_and(|s| s.inner_area.is_empty() || s.selection_visible())
+    }
+
     pub fn scroll(&mut self, delta: i32) {
         let Some(s) = self.state.as_mut() else {
             return;
@@ -694,8 +744,8 @@ impl<T: PickerItem> ListPicker<T> {
             Footer::Builder(build) => build(),
             Footer::Static(line) => line.clone(),
         });
-        match self.state.as_mut() {
-            None => Rect::default(),
+        let rendered = match self.state.as_mut() {
+            None => (Rect::default(), None, Vec::new()),
             Some(s) => render_ready(
                 frame,
                 area,
@@ -705,7 +755,84 @@ impl<T: PickerItem> ListPicker<T> {
                 footer,
                 self.error_text.as_deref(),
             ),
+        };
+        self.scrollbar_hit = rendered.1;
+        self.row_hits = rendered.2;
+        rendered.0
+    }
+
+    pub fn with_picker(mut self, picker: PickerId) -> Self {
+        self.picker = Some(picker);
+        self
+    }
+
+    pub fn hits(&self) -> Vec<HitTarget> {
+        let Some(picker) = self.picker else {
+            return Vec::new();
+        };
+        let Some(s) = self.state.as_ref() else {
+            return Vec::new();
+        };
+        let mut hits: Vec<HitTarget> = self
+            .row_hits
+            .iter()
+            .map(|&(rect, index)| HitTarget {
+                rect,
+                target: ClickTarget::PickerRow { picker, index },
+            })
+            .collect();
+        if !s.input_area.is_empty() {
+            hits.push(HitTarget {
+                rect: s.input_area,
+                target: ClickTarget::PickerInput(picker),
+            });
         }
+        if let Some(hit) = self.scrollbar_hit {
+            hits.push(HitTarget {
+                rect: hit.area,
+                target: ClickTarget::Scrollbar(ScrollOwner::Picker(picker)),
+            });
+        }
+        hits
+    }
+
+    pub fn content_len(&self) -> Option<u16> {
+        let s = self.state.as_ref()?;
+        Some(saturating_u16(visual_rows_in_range(
+            s.filtered(),
+            &s.items,
+            0,
+            s.filtered().len(),
+        )))
+    }
+
+    pub fn scroll_line(&self) -> u16 {
+        let Some(s) = self.state.as_ref() else {
+            return 0;
+        };
+        saturating_u16(visual_rows_in_range(
+            s.filtered(),
+            &s.items,
+            0,
+            s.scroll_offset,
+        ))
+    }
+
+    pub fn scroll_to_line(&mut self, line: u16) {
+        let Some(s) = self.state.as_mut() else {
+            return;
+        };
+        let total_visual = visual_rows_in_range(s.filtered(), &s.items, 0, s.filtered().len());
+        let max_offset = if total_visual <= s.viewport_height {
+            0
+        } else {
+            find_scroll_offset_for_bottom(s.filtered(), &s.items, s.viewport_height)
+        };
+        s.scroll_offset = if usize::from(line) >= total_visual.saturating_sub(s.viewport_height) {
+            max_offset
+        } else {
+            item_at_visual_row(s.filtered(), &s.items, usize::from(line)).min(max_offset)
+        };
     }
 }
 
@@ -735,12 +862,17 @@ fn render_ready<T: PickerItem>(
     max_visible: Option<u16>,
     footer: Option<Line<'static>>,
     error_text: Option<&str>,
-) -> Rect {
+) -> (Rect, Option<ScrollbarHit>, Vec<(Rect, usize)>) {
     let footer_rows = if footer.is_some() { 1u16 } else { 0 };
     let content_rows = if s.filtered().is_empty() {
         1
     } else {
-        let rows = visual_rows_in_range(s.filtered(), &s.items, 0, s.filtered().len()) as u16;
+        let rows = saturating_u16(visual_rows_in_range(
+            s.filtered(),
+            &s.items,
+            0,
+            s.filtered().len(),
+        ));
         match max_visible {
             Some(max) => rows.min(max),
             None => rows,
@@ -755,13 +887,24 @@ fn render_ready<T: PickerItem>(
     let (popup, inner) = modal.render(
         frame,
         area,
-        content_rows + SEARCH_ROW + footer_rows + error_rows,
+        content_rows.min(
+            area.height
+                .saturating_sub(SEARCH_ROW + footer_rows + error_rows + 2),
+        ) + SEARCH_ROW
+            + footer_rows
+            + error_rows,
     );
     let viewport_h = inner
         .height
         .saturating_sub(error_rows + SEARCH_ROW + footer_rows);
+    let follow_selection = s.inner_area.is_empty() || s.selection_visible();
+    let resized = s.viewport_height != viewport_h as usize;
     s.viewport_height = viewport_h as usize;
-    s.ensure_visible();
+    if resized && follow_selection {
+        s.ensure_visible();
+    } else {
+        s.clamp_scroll();
+    }
 
     let mut constraints: Vec<Constraint> =
         Vec::with_capacity(3 + footer.is_some() as usize + error_text.is_some() as usize);
@@ -792,7 +935,7 @@ fn render_ready<T: PickerItem>(
     let search_area = areas[area_idx];
     area_idx += 1;
 
-    render_list(
+    let row_hits = render_list(
         frame,
         list_area,
         s.filtered(),
@@ -803,6 +946,7 @@ fn render_ready<T: PickerItem>(
         s.viewport_height,
         s.enabled.as_deref(),
     );
+    s.input_area = search_area;
     render_search(frame, search_area, &s.search);
 
     if let Some(line) = footer {
@@ -810,13 +954,20 @@ fn render_ready<T: PickerItem>(
     }
 
     let total_visual = visual_rows_in_range(s.filtered(), &s.items, 0, s.filtered().len());
-    if total_visual as u16 > viewport_h {
+    let scrollbar_hit = if total_visual > usize::from(viewport_h) {
         let visual_offset = visual_rows_in_range(s.filtered(), &s.items, 0, s.scroll_offset);
-        render_vertical_scrollbar(frame, list_area, total_visual as u16, visual_offset as u16);
-    }
+        render_vertical_scrollbar(
+            frame,
+            list_area,
+            saturating_u16(total_visual),
+            saturating_u16(visual_offset),
+        )
+    } else {
+        None
+    };
 
     s.inner_area = inner;
-    popup
+    (popup, scrollbar_hit, row_hits)
 }
 
 fn section_gap<T: PickerItem>(filtered: &[usize], items: &[T], idx: usize, start: usize) -> usize {
@@ -843,6 +994,18 @@ fn visual_rows_in_range<T: PickerItem>(
         .map(|i| section_gap(filtered, items, i, start))
         .sum();
     item_count + section_rows
+}
+
+fn item_at_visual_row<T: PickerItem>(filtered: &[usize], items: &[T], visual: usize) -> usize {
+    let mut top = 0;
+    for idx in 0..filtered.len() {
+        let item_row = top + section_gap(filtered, items, idx, 0);
+        if visual <= item_row {
+            return idx;
+        }
+        top = item_row + 1;
+    }
+    filtered.len().saturating_sub(1)
 }
 
 fn find_scroll_offset_for<T: PickerItem>(
@@ -939,17 +1102,18 @@ fn render_list<T: PickerItem>(
     scroll_offset: usize,
     viewport_height: usize,
     enabled: Option<&[bool]>,
-) {
+) -> Vec<(Rect, usize)> {
     if filtered.is_empty() {
         let line = Line::from(Span::styled(
             format!("  {NO_MATCHES}"),
             theme::current().item_desc,
         ));
         frame.render_widget(Paragraph::new(vec![line]), area);
-        return;
+        return Vec::new();
     }
 
     let mut lines: Vec<Line> = Vec::new();
+    let mut row_hits: Vec<(Rect, usize)> = Vec::new();
     let mut i = scroll_offset;
     let mut last_section: Option<&str> = None;
 
@@ -1083,11 +1247,40 @@ fn render_list<T: PickerItem>(
             }
             Line::from(spans)
         };
+        row_hits.push((
+            Rect::new(area.x, area.y + lines.len() as u16, area.width, 1),
+            i,
+        ));
         lines.push(line);
         i += 1;
     }
 
     frame.render_widget(Paragraph::new(lines), area);
+    row_hits
+}
+
+pub(super) fn click_search_buffer(
+    search: &mut TextBuffer,
+    area: Rect,
+    pos: Position,
+    prefix_width: u16,
+) -> bool {
+    if !area.contains(pos) {
+        return false;
+    }
+    let column = pos.x.saturating_sub(area.x + prefix_width) as usize;
+    let query = search.value();
+    let mut width = 0;
+    let mut offset = query.len();
+    for (index, ch) in query.char_indices() {
+        width += ch.width().unwrap_or(0);
+        if width > column {
+            offset = index;
+            break;
+        }
+    }
+    search.set_cursor_byte_offset(offset);
+    true
 }
 
 fn render_search(frame: &mut Frame, area: Rect, search: &TextBuffer) {
@@ -1117,6 +1310,108 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use test_case::test_case;
+
+    #[test_case(2; "bottom")]
+    #[test_case(u16::MAX; "past_bottom")]
+    fn scroll_to_line_reaches_sectioned_bottom(line: u16) {
+        let mut picker = ListPicker::new();
+        picker.open(
+            (0..3)
+                .map(|i| SectionEntry {
+                    label: i.to_string(),
+                    section: "A",
+                })
+                .collect(),
+            " Test ",
+        );
+        ready_state_mut(&mut picker).viewport_height = 2;
+        picker.scroll_to_line(line);
+        assert_eq!(ready_state(&picker).scroll_offset, 2);
+    }
+
+    #[test_case(u16::MAX as usize; "maximum")]
+    #[test_case(u16::MAX as usize + 2; "over_maximum")]
+    fn large_picker_saturates_rendered_ranges(count: usize) {
+        let mut picker = ListPicker::new();
+        picker.open(vec![String::new(); count], " Test ");
+        ready_state_mut(&mut picker).scroll_offset = count - 1;
+        assert_eq!(picker.scroll_line(), saturating_u16(count - 1));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+        assert_eq!(picker.content_len(), Some(u16::MAX));
+        assert_eq!(picker.scrollbar_hit.unwrap().content_len, u16::MAX);
+        assert_eq!(ready_state(&picker).items.len(), count);
+    }
+
+    #[test_case(false; "wheel")]
+    #[test_case(true; "absolute")]
+    fn manual_viewport_survives_render_and_resize(absolute: bool) {
+        let mut picker = ListPicker::new().with_picker(PickerId::Model);
+        picker.open((0..40).map(|i| format!("Item {i:02}")).collect(), " Test ");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut render = |picker: &mut ListPicker<String>, height| {
+            terminal
+                .draw(|frame| {
+                    picker.view(frame, Rect::new(0, 0, 80, height));
+                })
+                .unwrap();
+        };
+        render(&mut picker, 24);
+        if absolute {
+            picker.scroll_to_line(20);
+        } else {
+            picker.scroll(-20);
+        }
+        render(&mut picker, 24);
+        assert_eq!(picker.scroll_line(), 20);
+        assert_eq!(picker.selected_index(), Some(0));
+        assert_eq!(picker.row_hits.first().unwrap().1, 20);
+        picker.replace_items((0..40).map(|i| format!("Item {i:02}")).collect());
+        render(&mut picker, 24);
+        assert_eq!(picker.scroll_line(), 20);
+        render(&mut picker, 18);
+        assert_eq!(picker.scroll_line(), 20);
+        picker.handle_key(key(KeyCode::Down));
+        render(&mut picker, 18);
+        assert_eq!(picker.row_hits.first().unwrap().1, 1);
+        picker.scroll_to_line(u16::MAX);
+        render(&mut picker, 24);
+        let state = ready_state(&picker);
+        assert_eq!(state.scroll_offset, 40 - state.viewport_height);
+    }
+
+    #[test_case(0, 0; "prefix")]
+    #[test_case(3, 1; "wide_character")]
+    #[test_case(5, 2; "after_wide_character")]
+    #[test_case(6, 4; "combining_character")]
+    #[test_case(20, 5; "past_end")]
+    fn rendered_search_click_moves_caret(column: u16, expected: usize) {
+        let mut picker = ListPicker::new().with_picker(PickerId::Model);
+        picker.open(vec!["a界e\u{301}z".to_string()], " Test ");
+        picker.handle_paste("a界e\u{301}z");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+        let hit = picker
+            .hits()
+            .into_iter()
+            .find(|hit| hit.target == ClickTarget::PickerInput(PickerId::Model))
+            .unwrap();
+        assert!(!picker.click_input(Position::new(hit.rect.x, hit.rect.y - 1)));
+        assert!(picker.click_input(Position::new(hit.rect.x + column, hit.rect.y)));
+        assert_eq!(ready_state(&picker).search.x(), expected);
+        assert_eq!(ready_state(&picker).search.value(), "a界e\u{301}z");
+        assert_eq!(picker.selected_index(), Some(0));
+        picker.close();
+        assert!(picker.hits().is_empty());
+    }
 
     fn ready_state<T>(p: &ListPicker<T>) -> &State<T> {
         p.state.as_ref().expect("expected open state")
@@ -2042,5 +2337,61 @@ mod tests {
             .unwrap();
         let lines = buffer_lines(&terminal, area);
         assert!(lines.iter().any(|l| l.contains("Anthropic 2 models")));
+    }
+
+    struct Sectioned {
+        label: String,
+        section: String,
+    }
+
+    impl PickerItem for Sectioned {
+        fn label(&self) -> &str {
+            &self.label
+        }
+        fn section(&self) -> Option<&str> {
+            Some(&self.section)
+        }
+    }
+
+    #[test]
+    fn item_at_visual_row_skips_section_headers() {
+        let items = vec![
+            Sectioned {
+                label: "a".into(),
+                section: "A".into(),
+            },
+            Sectioned {
+                label: "b".into(),
+                section: "A".into(),
+            },
+            Sectioned {
+                label: "c".into(),
+                section: "B".into(),
+            },
+        ];
+        let filtered = [0, 1, 2];
+        assert_eq!(item_at_visual_row(&filtered, &items, 0), 0);
+        assert_eq!(item_at_visual_row(&filtered, &items, 1), 0);
+        assert_eq!(item_at_visual_row(&filtered, &items, 2), 1);
+        assert_eq!(item_at_visual_row(&filtered, &items, 4), 2);
+        assert_eq!(item_at_visual_row(&filtered, &items, 99), 2);
+    }
+
+    #[test]
+    fn scroll_to_line_converts_visual_rows_to_item_indices() {
+        let mut p = ListPicker::new();
+        p.open(entries(&["a", "b", "c", "d", "e", "f", "g", "h"]), " Test ");
+        ready_state_mut(&mut p).viewport_height = 2;
+        p.scroll_to_line(3);
+        assert_eq!(ready_state(&p).scroll_offset, 3);
+    }
+
+    #[test]
+    fn select_rejects_out_of_range_indices() {
+        let mut p = ListPicker::new();
+        p.open(entries(&["a", "b"]), " Test ");
+        assert!(!p.select(2));
+        assert!(p.select(1));
+        assert_eq!(p.selected_index(), Some(1));
     }
 }

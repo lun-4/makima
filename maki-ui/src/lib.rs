@@ -6,6 +6,7 @@
 pub mod animation;
 pub mod app;
 pub mod chat;
+mod click;
 mod clipboard;
 mod clock;
 mod color_compat;

@@ -1222,6 +1222,12 @@ impl EventHandle {
         let _ = self.tx.send(Request::RestoreToolAsync { item, event_tx });
     }
 
+    /// Runs the callback registered for a clickable `set_status_content`
+    /// entry.
+    pub fn click_region(&self, id: u32) {
+        let _ = self.tx.send(Request::ClickRegion { id });
+    }
+
     /// `row` is the 1-based line in the tool's live buffer, 0 for clicks
     /// outside it (header line etc.).
     pub fn request_click(&self, tool_use_id: String, row: usize) {

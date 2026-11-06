@@ -22,7 +22,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
 use super::apply_scroll_delta;
-use super::scrollbar::render_vertical_scrollbar;
+use super::scrollbar::{ScrollbarHit, render_vertical_scrollbar, saturating_u16};
 use crate::selection::LineBreaks;
 
 const CHEVRON: &str = super::CHEVRON;
@@ -93,6 +93,7 @@ pub struct InputBox {
     max_input_lines: u16,
     last_total_lines: u16,
     last_content_height: u16,
+    scrollbar_hit: Option<ScrollbarHit>,
     last_width: u16,
     last_focused: bool,
     preferred_column: Option<usize>,
@@ -125,7 +126,9 @@ impl InputBox {
                 self.history_down();
                 return InputAction::PaletteSync(self.buffer.value());
             }
-            KeyCode::Tab | KeyCode::Esc => return InputAction::Passthrough(key),
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Esc => {
+                return InputAction::Passthrough(key);
+            }
             _ if is_newline_key(&key) => {
                 self.buffer.add_line();
                 return InputAction::ContinueLine;
@@ -206,6 +209,7 @@ impl InputBox {
             max_input_lines,
             last_total_lines: 1,
             last_content_height: 1,
+            scrollbar_hit: None,
             last_width: u16::MAX,
             last_focused: true,
             preferred_column: None,
@@ -228,7 +232,7 @@ impl InputBox {
     pub fn line_breaks(&self, content_width: u16) -> LineBreaks {
         let ew = effective_width(content_width as usize);
         LineBreaks::from_heights(self.buffer.lines().iter().enumerate().map(|(y, line)| {
-            line_ranges(line, ew, self.last_focused && y == self.buffer.y()).len() as u16
+            saturating_u16(line_ranges(line, ew, self.last_focused && y == self.buffer.y()).len())
         }))
     }
 
@@ -427,14 +431,16 @@ impl InputBox {
             let visual_cursor_y = self.visual_cursor_y(ew);
             if visual_cursor_y < self.scroll_y {
                 self.scroll_y = visual_cursor_y;
-            } else if visual_cursor_y >= self.scroll_y + content_height {
-                self.scroll_y = visual_cursor_y - content_height + 1;
+            } else if visual_cursor_y >= self.scroll_y.saturating_add(content_height) {
+                self.scroll_y = visual_cursor_y
+                    .saturating_sub(content_height)
+                    .saturating_add(1);
             }
         }
 
-        let mut total_vl = total_visual_lines(&self.buffer, ew, focused) as u16;
+        let mut total_vl = saturating_u16(total_visual_lines(&self.buffer, ew, focused));
         if !self.pending_images.is_empty() {
-            total_vl += 1;
+            total_vl = total_vl.saturating_add(1);
         }
         self.last_total_lines = total_vl;
         self.last_content_height = content_height.max(1);
@@ -524,10 +530,12 @@ impl InputBox {
             .block(block);
         frame.render_widget(paragraph, area);
 
-        if max_scroll > 0 {
+        self.scrollbar_hit = if max_scroll > 0 {
             let inner = area.inner(ratatui::layout::Margin::new(0, 1));
-            render_vertical_scrollbar(frame, inner, total_vl, self.scroll_y);
-        }
+            render_vertical_scrollbar(frame, inner, total_vl, self.scroll_y)
+        } else {
+            None
+        };
     }
 
     fn max_scroll(&self) -> u16 {
@@ -537,6 +545,19 @@ impl InputBox {
 
     pub fn scroll_y(&self) -> u16 {
         self.scroll_y
+    }
+
+    pub fn scroll_to_line(&mut self, line: u16) {
+        self.scroll_y = line.min(self.max_scroll());
+        self.follow_cursor = false;
+    }
+
+    pub fn scrollbar_hit(&self) -> Option<ScrollbarHit> {
+        self.scrollbar_hit
+    }
+
+    pub fn content_len(&self) -> u16 {
+        self.last_total_lines
     }
 
     pub fn history(&self) -> &InputHistory {
@@ -934,6 +955,23 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::style::Color;
     use test_case::test_case;
+
+    #[test_case(false; "text_only")]
+    #[test_case(true; "with_image")]
+    fn large_input_saturates_rendered_ranges(with_image: bool) {
+        let count = usize::from(u16::MAX) + 2;
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.set_input("\n".repeat(count));
+        input.buffer.move_to_end();
+        if with_image {
+            input.attach_image(test_image());
+        }
+        render_input(&mut input, 20, 6);
+        assert_eq!(input.content_len(), u16::MAX);
+        assert_eq!(input.scrollbar_hit().unwrap().content_len, u16::MAX);
+        assert_eq!(input.scroll_y(), u16::MAX - 4);
+        assert_eq!(input.buffer.lines().len(), count + 1);
+    }
 
     fn type_text(input: &mut InputBox, text: &str) {
         for c in text.chars() {
@@ -1371,6 +1409,36 @@ abcdef"
         }
         let terminal = render_input(&mut input, 40, 20 + 2);
         assert_eq!(has_scrollbar_thumb(&terminal), expect_visible);
+    }
+
+    #[test_case(false; "wheel")]
+    #[test_case(true; "absolute")]
+    fn manual_viewport_survives_render_until_keyboard_navigation(absolute: bool) {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.set_input(
+            (0..30)
+                .map(|i| format!("line {i:02}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        input.buffer.move_to_end();
+        let _ = render_input(&mut input, 40, 6);
+        assert!(input.scroll_y() > 0);
+        if absolute {
+            input.scroll_to_line(0);
+        } else {
+            input.scroll(i32::MAX);
+        }
+        let terminal = render_input(&mut input, 40, 6);
+        assert_eq!(input.scroll_y(), 0);
+        assert!(rendered_row(&terminal, 1).contains("line 00"));
+        input.scroll_to_line(u16::MAX);
+        let _ = render_input(&mut input, 40, 10);
+        assert_eq!(input.scroll_y(), input.max_scroll());
+        input.scroll_to_line(0);
+        input.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        let _ = render_input(&mut input, 40, 6);
+        assert!(input.scroll_y() > 0);
     }
 
     #[test]
