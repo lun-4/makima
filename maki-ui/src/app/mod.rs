@@ -104,6 +104,7 @@ const SUBAGENT_STREAMING_STATUS: Status = Status::Streaming;
 const SUBAGENT_IDLE_STATUS: Status = Status::Idle;
 const COMPLETION_LABEL_CHARS: usize = 80;
 const COMPLETION_PREVIEW_CHARS: usize = 512;
+const COMPLETION_TRUNCATED: &str = "... [truncated]";
 
 #[cfg(test)]
 pub(crate) use crate::agent::QueuedMessage;
@@ -523,16 +524,29 @@ impl App {
             str::to_owned,
         );
         let source: String = source.chars().take(COMPLETION_LABEL_CHARS).collect();
-        let text: String = delivery
+        let mut chars = delivery.result.text.chars();
+        let text: String = chars.by_ref().take(COMPLETION_PREVIEW_CHARS).collect();
+        let reference = delivery
             .result
-            .text
-            .chars()
-            .take(COMPLETION_PREVIEW_CHARS)
-            .collect();
-        self.chats[0].push(DisplayMessage::new(
+            .output
+            .iter()
+            .find(|value| value["truncated"] == true && value["full_result"].is_object());
+        let truncated = chars.next().is_some() || reference.is_some();
+        let marker = if truncated { COMPLETION_TRUNCATED } else { "" };
+        let mut notice = DisplayMessage::new(
             DisplayRole::Done,
-            format!("[Result from {source}] {text}"),
-        ));
+            format!(
+                "[Result from {source}] {text}{marker}\n[click to view child transcript; {} for Tasks]",
+                key::TASKS.label
+            ),
+        );
+        if let Some(reference) = reference {
+            notice
+                .text
+                .push_str(&format!("\n[Full result lookup: {reference}]"));
+        }
+        notice.result_agent = Some(delivery.result.outcome.agent_id());
+        self.chats[0].push(notice);
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -305,6 +305,17 @@ impl App {
                 self.selection_state = None;
                 if zone == SelectionZone::Messages {
                     let area = self.msg_area();
+                    let result_agent = self.chats[self.active_chat]
+                        .message_at_row(row, area)
+                        .and_then(|message| message.result_agent);
+                    if let Some(id) = result_agent {
+                        if let Some(index) = self.live_chat_index.get(&id) {
+                            self.active_chat = *index;
+                        } else {
+                            self.flash(format!("Child transcript unavailable for {id}"));
+                        }
+                        return (Dirty::YES, vec![]);
+                    }
                     self.chats[self.active_chat].handle_click(row, area);
                 }
             }
