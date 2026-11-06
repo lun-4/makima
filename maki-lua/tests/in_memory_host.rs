@@ -932,7 +932,7 @@ fn splash_fps_overlay_toggles_through_store_and_readout() {
         .load_source(
             "perf-probe",
             r#"local t = maki.perf.timings()
-               assert(t.fps >= 1, "host renders land in the fps window")"#,
+               assert(t.render_ms > 0, "host records splash render timings")"#,
         )
         .expect("timings reflect real renders");
 

@@ -32,9 +32,22 @@ const DECODE_THREAD: &str = "inline-image";
 const PROBE_TIMEOUT: Duration = Duration::from_millis(350);
 #[cfg(unix)]
 const PROBE_POLL_SLICE: Duration = Duration::from_millis(50);
+/// Replies arriving after the probe stops reading become keypresses in the
+/// input box, hence this quiet window.
 #[cfg(unix)]
-const PROBE_PAYLOAD: &[u8] =
-    b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[>c\x1b[c\x1b[5n\x1bPtmux;\x1b\x1b_Gi=32,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\x1b\\\x1b\x1b[5n\x1b\\";
+const PROBE_QUIET: Duration = Duration::from_millis(20);
+#[cfg(unix)]
+const PROBE_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
+#[cfg(unix)]
+const PROBE_KITTY_DIRECT: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
+#[cfg(unix)]
+const PROBE_SENTINELS: &[u8] = b"\x1b[>c\x1b[c\x1b[5n";
+/// Ghostty resumes escape parsing inside an ignored DCS, so the doubled ESC
+/// makes it answer this wrapper even without tmux. The probe sends it only
+/// after tmux detection.
+#[cfg(unix)]
+const PROBE_KITTY_TMUX: &[u8] =
+    b"\x1bPtmux;\x1b\x1b_Gi=32,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\x1b\\\x1b\x1b[5n\x1b\\";
 #[cfg(any(unix, test))]
 const DSR_RESPONSE: &[u8] = b"\x1b[0n";
 #[cfg(any(unix, test))]
@@ -128,8 +141,8 @@ fn find_terminated_reply(buffer: &[u8], prefix: &[u8]) -> Option<(bool, bool)> {
 }
 
 #[cfg(any(unix, test))]
-fn is_tmux_detected(buffer: &[u8]) -> bool {
-    env::var_os("TMUX").is_some() || contains_subslice(buffer, TMUX_DA2_REPLY)
+fn is_tmux_detected(buffer: &[u8], env_tmux: bool) -> bool {
+    env_tmux || contains_subslice(buffer, TMUX_DA2_REPLY)
 }
 
 #[cfg(any(unix, test))]
@@ -152,20 +165,8 @@ fn has_sixel_da1(buffer: &[u8]) -> (bool, bool) {
 }
 
 #[cfg(any(unix, test))]
-pub(crate) fn parse_probe_stream(buffer: &[u8]) -> ProbeResult {
-    let in_tmux = is_tmux_detected(buffer);
-
-    if let Some((terminated, has_sentinel)) = find_terminated_reply(buffer, KITTY_PROBE_TMUX_REPLY)
-    {
-        return if terminated && has_sentinel {
-            ProbeResult::Detected(DetectedGraphics {
-                protocol: ProtocolType::Kitty,
-                is_tmux: true,
-            })
-        } else {
-            ProbeResult::Pending
-        };
-    }
+pub(crate) fn parse_probe_stream(buffer: &[u8], env_tmux: bool) -> ProbeResult {
+    let in_tmux = is_tmux_detected(buffer, env_tmux);
 
     if let Some((terminated, has_sentinel)) =
         find_terminated_reply(buffer, KITTY_PROBE_DIRECT_REPLY)
@@ -174,6 +175,20 @@ pub(crate) fn parse_probe_stream(buffer: &[u8]) -> ProbeResult {
             ProbeResult::Detected(DetectedGraphics {
                 protocol: ProtocolType::Kitty,
                 is_tmux: in_tmux,
+            })
+        } else {
+            ProbeResult::Pending
+        };
+    }
+
+    if in_tmux
+        && let Some((terminated, has_sentinel)) =
+            find_terminated_reply(buffer, KITTY_PROBE_TMUX_REPLY)
+    {
+        return if terminated && has_sentinel {
+            ProbeResult::Detected(DetectedGraphics {
+                protocol: ProtocolType::Kitty,
+                is_tmux: true,
             })
         } else {
             ProbeResult::Pending
@@ -210,16 +225,20 @@ fn ensure_tmux_passthrough() {
 }
 
 #[cfg(unix)]
-fn drain_stdin() {
-    while wait_readable(libc::STDIN_FILENO, Duration::ZERO) {
+fn write_probe(bytes: &[u8]) -> Option<()> {
+    let mut out = stdout().lock();
+    out.write_all(bytes).ok()?;
+    out.flush().ok()
+}
+
+#[cfg(unix)]
+fn drain_stdin(fd: RawFd, deadline: Instant) {
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        if !wait_readable(fd, remaining.min(PROBE_QUIET)) {
+            break;
+        }
         let mut discard = [0u8; 256];
-        let n = unsafe {
-            libc::read(
-                libc::STDIN_FILENO,
-                discard.as_mut_ptr().cast(),
-                discard.len(),
-            )
-        };
+        let n = unsafe { libc::read(fd, discard.as_mut_ptr().cast(), discard.len()) };
         if n <= 0 {
             break;
         }
@@ -231,10 +250,15 @@ pub(crate) fn probe_terminal_graphics(timeout: Duration) -> Option<DetectedGraph
     if !stdout().is_terminal() || !std::io::stdin().is_terminal() {
         return None;
     }
-    let mut out = stdout().lock();
-    out.write_all(PROBE_PAYLOAD).ok()?;
-    out.flush().ok()?;
-    drop(out);
+    let env_tmux = env::var_os("TMUX").is_some();
+    let mut tmux_query_sent = env_tmux;
+    if env_tmux {
+        write_probe(PROBE_SENTINELS)?;
+        write_probe(PROBE_KITTY_TMUX)?;
+    } else {
+        write_probe(PROBE_KITTY_DIRECT)?;
+        write_probe(PROBE_SENTINELS)?;
+    }
 
     let deadline = Instant::now() + timeout;
     let mut buf = Vec::with_capacity(256);
@@ -248,7 +272,10 @@ pub(crate) fn probe_terminal_graphics(timeout: Duration) -> Option<DetectedGraph
                 unsafe { libc::read(libc::STDIN_FILENO, chunk.as_mut_ptr().cast(), chunk.len()) };
             if n > 0 {
                 buf.extend_from_slice(&chunk[..n as usize]);
-                match parse_probe_stream(&buf) {
+                if !tmux_query_sent && is_tmux_detected(&buf, env_tmux) {
+                    tmux_query_sent = write_probe(PROBE_KITTY_TMUX).is_some();
+                }
+                match parse_probe_stream(&buf, env_tmux) {
                     ProbeResult::Detected(graphics) => {
                         detected = Some(graphics);
                         break;
@@ -264,7 +291,7 @@ pub(crate) fn probe_terminal_graphics(timeout: Duration) -> Option<DetectedGraph
         }
     }
 
-    drain_stdin();
+    drain_stdin(libc::STDIN_FILENO, Instant::now() + PROBE_DRAIN_TIMEOUT);
     detected
 }
 
@@ -681,10 +708,59 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    mod drain {
+        use std::fs::File;
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        use color_eyre::eyre::Result;
+        use test_case::test_case;
+
+        use super::super::{PROBE_DRAIN_TIMEOUT, drain_stdin, wait_readable};
+
+        const CONTINUOUS_INPUT_PATH: &str = "/dev/zero";
+        const HANG_GUARD: Duration = Duration::from_secs(5);
+        const PENDING_REPLY: &[u8] = b"\x1b[0n";
+
+        #[test_case(Duration::ZERO; "expired_deadline")]
+        #[test_case(PROBE_DRAIN_TIMEOUT; "deadline_during_continuous_input")]
+        fn continuous_input_cannot_extend_deadline(budget: Duration) -> Result<()> {
+            let input = File::open(CONTINUOUS_INPUT_PATH)?;
+            let (done_tx, done_rx) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                drain_stdin(input.as_raw_fd(), Instant::now() + budget);
+                done_tx.send(()).unwrap();
+            });
+
+            done_rx.recv_timeout(HANG_GUARD)?;
+            worker.join().unwrap();
+            Ok(())
+        }
+
+        #[test_case(false; "drains_pending_reply")]
+        #[test_case(true; "expired_deadline_preserves_input")]
+        fn pending_input_respects_deadline(expired: bool) -> Result<()> {
+            let (input, mut output) = UnixStream::pair()?;
+            output.write_all(PENDING_REPLY)?;
+            assert!(wait_readable(input.as_raw_fd(), HANG_GUARD));
+            let deadline = Instant::now() + if expired { Duration::ZERO } else { HANG_GUARD };
+
+            drain_stdin(input.as_raw_fd(), deadline);
+
+            assert_eq!(wait_readable(input.as_raw_fd(), Duration::ZERO), expired);
+            Ok(())
+        }
+    }
+
     #[test]
     fn test_parse_probe_direct_kitty() {
         assert_eq!(
-            parse_probe_stream(DIRECT_PROBE_RESPONSE),
+            parse_probe_stream(DIRECT_PROBE_RESPONSE, false),
             ProbeResult::Detected(DetectedGraphics {
                 protocol: ProtocolType::Kitty,
                 is_tmux: false,
@@ -693,9 +769,37 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_probe_direct_reply_wins_over_wrapped() {
+        let mut stream = DIRECT_PROBE_RESPONSE.to_vec();
+        stream.extend_from_slice(GHOSTTY_KITTY_RESPONSE);
+        assert_eq!(
+            parse_probe_stream(&stream, false),
+            ProbeResult::Detected(DetectedGraphics {
+                protocol: ProtocolType::Kitty,
+                is_tmux: false,
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_probe_wrapped_reply_needs_tmux() {
+        assert_eq!(
+            parse_probe_stream(GHOSTTY_KITTY_RESPONSE, false),
+            ProbeResult::Unsupported
+        );
+        assert_eq!(
+            parse_probe_stream(GHOSTTY_KITTY_RESPONSE, true),
+            ProbeResult::Detected(DetectedGraphics {
+                protocol: ProtocolType::Kitty,
+                is_tmux: true,
+            })
+        );
+    }
+
+    #[test]
     fn test_parse_probe_tmux_kitty() {
         assert_eq!(
-            parse_probe_stream(TMUX_PROBE_RESPONSE),
+            parse_probe_stream(TMUX_PROBE_RESPONSE, false),
             ProbeResult::Detected(DetectedGraphics {
                 protocol: ProtocolType::Kitty,
                 is_tmux: true,
@@ -707,13 +811,13 @@ mod tests {
     fn test_parse_probe_tmux_kitty_waits_for_trailing_sentinel() {
         let stream_without_trailing_dsr = b"\x1b[>84;0;0c\x1b[0n\x1b_Gi=32;OK\x1b\\";
         assert_eq!(
-            parse_probe_stream(stream_without_trailing_dsr),
+            parse_probe_stream(stream_without_trailing_dsr, false),
             ProbeResult::Pending,
         );
 
         let stream_with_trailing_dsr = b"\x1b[>84;0;0c\x1b[0n\x1b_Gi=32;OK\x1b\\\x1b[0n";
         assert_eq!(
-            parse_probe_stream(stream_with_trailing_dsr),
+            parse_probe_stream(stream_with_trailing_dsr, false),
             ProbeResult::Detected(DetectedGraphics {
                 protocol: ProtocolType::Kitty,
                 is_tmux: true,
@@ -724,7 +828,7 @@ mod tests {
     #[test]
     fn test_parse_probe_tmux_kitty_without_leading_underscore() {
         assert_eq!(
-            parse_probe_stream(TMUX_PROBE_RESPONSE_NO_UNDERSCORE),
+            parse_probe_stream(TMUX_PROBE_RESPONSE_NO_UNDERSCORE, false),
             ProbeResult::Detected(DetectedGraphics {
                 protocol: ProtocolType::Kitty,
                 is_tmux: true,
@@ -735,10 +839,10 @@ mod tests {
     #[test]
     fn test_parse_probe_delayed_dcs_response_after_local_dsr() {
         let mut stream = TMUX_LOCAL_DSR_RESPONSE.to_vec();
-        assert_eq!(parse_probe_stream(&stream), ProbeResult::Pending);
+        assert_eq!(parse_probe_stream(&stream, false), ProbeResult::Pending);
         stream.extend_from_slice(GHOSTTY_KITTY_RESPONSE);
         assert_eq!(
-            parse_probe_stream(&stream),
+            parse_probe_stream(&stream, false),
             ProbeResult::Detected(DetectedGraphics {
                 protocol: ProtocolType::Kitty,
                 is_tmux: true,
@@ -751,10 +855,10 @@ mod tests {
         // Real tmux DA2 + DA1 with Sixel (1;2;4c) + local DSR (0n)
         let mut stream = b"\x1b[>84;0;0c\x1b[?1;2;4c\x1b[0n".to_vec();
         // Must stay Pending rather than falsely detecting Sixel before outer Kitty response arrives
-        assert_eq!(parse_probe_stream(&stream), ProbeResult::Pending);
+        assert_eq!(parse_probe_stream(&stream, false), ProbeResult::Pending);
         stream.extend_from_slice(GHOSTTY_KITTY_RESPONSE);
         assert_eq!(
-            parse_probe_stream(&stream),
+            parse_probe_stream(&stream, false),
             ProbeResult::Detected(DetectedGraphics {
                 protocol: ProtocolType::Kitty,
                 is_tmux: true,
@@ -765,7 +869,7 @@ mod tests {
     #[test]
     fn test_parse_probe_direct_sixel() {
         assert_eq!(
-            parse_probe_stream(SIXEL_PROBE_RESPONSE),
+            parse_probe_stream(SIXEL_PROBE_RESPONSE, false),
             ProbeResult::Detected(DetectedGraphics {
                 protocol: ProtocolType::Sixel,
                 is_tmux: false,
@@ -776,7 +880,7 @@ mod tests {
     #[test]
     fn test_parse_probe_tmux_sixel() {
         assert_eq!(
-            parse_probe_stream(TMUX_SIXEL_PROBE_RESPONSE),
+            parse_probe_stream(TMUX_SIXEL_PROBE_RESPONSE, false),
             ProbeResult::Detected(DetectedGraphics {
                 protocol: ProtocolType::Sixel,
                 is_tmux: true,
@@ -787,7 +891,7 @@ mod tests {
     #[test]
     fn test_parse_probe_direct_unsupported_terminal_immediate() {
         assert_eq!(
-            parse_probe_stream(DIRECT_DSR_RESPONSE),
+            parse_probe_stream(DIRECT_DSR_RESPONSE, false),
             ProbeResult::Unsupported
         );
     }
@@ -795,13 +899,13 @@ mod tests {
     #[test]
     fn test_parse_probe_tmux_unsupported_terminal_both_dsrs() {
         let stream = b"\x1b[>84;0;0c\x1b[0n\x1b[0n";
-        assert_eq!(parse_probe_stream(stream), ProbeResult::Unsupported);
+        assert_eq!(parse_probe_stream(stream, false), ProbeResult::Unsupported);
     }
 
     #[test]
     fn test_parse_probe_unknown_dcs_ignored() {
         assert_eq!(
-            parse_probe_stream(UNKNOWN_DCS_STREAM),
+            parse_probe_stream(UNKNOWN_DCS_STREAM, false),
             ProbeResult::Detected(DetectedGraphics {
                 protocol: ProtocolType::Kitty,
                 is_tmux: false,
@@ -812,7 +916,7 @@ mod tests {
     #[test]
     fn test_parse_probe_bel_terminated_response() {
         assert_eq!(
-            parse_probe_stream(BEL_TERMINATED_RESPONSE),
+            parse_probe_stream(BEL_TERMINATED_RESPONSE, false),
             ProbeResult::Detected(DetectedGraphics {
                 protocol: ProtocolType::Kitty,
                 is_tmux: false,
@@ -823,7 +927,7 @@ mod tests {
     #[test]
     fn test_parse_probe_incomplete_response_pending() {
         assert_eq!(
-            parse_probe_stream(INCOMPLETE_KITTY_RESPONSE),
+            parse_probe_stream(INCOMPLETE_KITTY_RESPONSE, false),
             ProbeResult::Pending
         );
     }

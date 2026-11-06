@@ -1265,7 +1265,7 @@ impl EventHandle {
     /// the whole batch has landed, making it the batch barrier.
     #[doc(hidden)]
     pub fn wait_restore_complete_for_test(&self) {
-        const DEADLINE: Duration = Duration::from_secs(30);
+        const DEADLINE: Duration = runtime::RESTORE_ITEM_TIMEOUT.saturating_mul(2);
         let flag = Arc::new(AtomicBool::new(true));
         self.send_restore_complete(Arc::clone(&flag));
         let start = std::time::Instant::now();
