@@ -278,7 +278,7 @@ impl ModelPicker {
             ];
             let line = footer_line();
             let mut x = area.x;
-            for (spans, code) in line.spans.chunks_exact(2).zip(keys) {
+            for (spans, code) in line.spans.as_chunks::<2>().0.iter().zip(keys) {
                 let width = spans.iter().map(Span::width).sum::<usize>() as u16;
                 let rect = Rect::new(x, area.y, width, 1).intersection(area);
                 if !rect.is_empty() {
