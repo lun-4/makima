@@ -14,8 +14,9 @@ use crate::components::is_ctrl;
 use crate::components::keybindings::key;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
-use crate::wrap::Measure;
-use unicode_width::UnicodeWidthStr;
+use crate::wrap::{Measure, index_at};
+
+const GUIDANCE_PREFIX: &str = "  guide ";
 
 const HINT_ALLOW_ROW: &[(&str, &str)] = &[
     ("y", "Allow"),
@@ -347,24 +348,39 @@ impl PermissionPrompt {
             let (display_text, cursor_pos) = if text.is_empty() {
                 (DEFAULT_DENY_GUIDANCE, 0)
             } else {
-                (text.as_str(), TextBuffer::char_to_byte(&text, buffer.x()))
+                (text.as_str(), buffer.cursor_byte_offset())
             };
-            let (before, after) = display_text.split_at(cursor_pos);
-            let mut chars = after.chars();
-            let cursor_ch = chars.next().unwrap_or(' ');
-            let rest: String = chars.collect();
-
-            let mut spans = vec![Span::raw("  "), Span::styled("guide ", label_style)];
-            if text.is_empty() {
-                spans.push(Span::styled(cursor_ch.to_string(), Style::new().reversed()));
-                spans.push(Span::styled(rest, t.tool_dim));
-            } else {
-                spans.push(Span::raw(before.to_string()));
-                spans.push(Span::styled(cursor_ch.to_string(), Style::new().reversed()));
-                if !rest.is_empty() {
-                    spans.push(Span::raw(rest));
-                }
-            }
+            let display = Span::raw(display_text);
+            let cursor = display
+                .styled_graphemes(Style::default())
+                .find_map(|grapheme| {
+                    let start = grapheme.symbol.as_ptr() as usize - display_text.as_ptr() as usize;
+                    let end = start + grapheme.symbol.len();
+                    (cursor_pos < end).then_some((start, end))
+                });
+            let (start, end) = cursor.unwrap_or((cursor_pos, cursor_pos));
+            let cursor_text = cursor.map_or(" ", |_| &display_text[start..end]);
+            let mut spans = vec![Span::styled(GUIDANCE_PREFIX, label_style)];
+            spans.push(Span::styled(
+                display_text[..start].to_string(),
+                if text.is_empty() {
+                    t.tool_dim
+                } else {
+                    Style::default()
+                },
+            ));
+            spans.push(Span::styled(
+                cursor_text.to_string(),
+                Style::new().reversed(),
+            ));
+            spans.push(Span::styled(
+                display_text[end..].to_string(),
+                if text.is_empty() {
+                    t.tool_dim
+                } else {
+                    Style::default()
+                },
+            ));
             lines.push(Line::from(spans));
         }
 
@@ -473,14 +489,15 @@ impl PermissionPrompt {
                 else {
                     continue;
                 };
-                if hint.action == HintAction::Defer {
-                    continue;
-                }
                 hits.push(HitTarget {
                     rect,
-                    target: ClickTarget::PermissionHint {
-                        row: row as u16,
-                        cell: cell as u16,
+                    target: if hint.action == HintAction::Defer {
+                        ClickTarget::DeferInput
+                    } else {
+                        ClickTarget::PermissionHint {
+                            row: row as u16,
+                            cell: cell as u16,
+                        }
                     },
                 });
             }
@@ -525,6 +542,9 @@ impl PermissionPrompt {
     }
 
     pub fn click_guidance(&mut self, pos: ratatui::layout::Position) {
+        let Some(line) = self.body_lines().into_iter().rev().nth(1) else {
+            return;
+        };
         let Self::Open {
             state,
             buffer,
@@ -540,15 +560,15 @@ impl PermissionPrompt {
         let Some(guidance) = guidance.as_deref() else {
             return;
         };
+        if !guidance.rect.contains(pos) {
+            return;
+        }
         let row = pos.y.saturating_sub(guidance.rect.y);
         let col = pos.x.saturating_sub(guidance.rect.x);
-        let text = if buffer.value().is_empty() {
-            DEFAULT_DENY_GUIDANCE.to_string()
-        } else {
-            buffer.value()
-        };
-        let index = guidance_index(&text, guidance.rect.width, row, col);
-        buffer.set_cursor(0, index);
+        let index = index_at(&line, guidance.rect.width, row, col)
+            .saturating_sub(GUIDANCE_PREFIX.len())
+            .min(buffer.value().len());
+        buffer.set_cursor_byte_offset(index);
     }
 
     pub fn height(&self, width: u16) -> u16 {
@@ -603,30 +623,18 @@ fn render_hints(
     hits
 }
 
-fn guidance_index(text: &str, width: u16, click_row: u16, click_col: u16) -> usize {
-    for (index, _) in text.char_indices() {
-        let line = Line::from(vec![Span::raw("  guide "), Span::raw(&text[..index])]);
-        let rows = Measure::new(width).rows(&line);
-        let last_row = rows.saturating_sub(1);
-        if last_row > click_row {
-            break;
-        }
-        if last_row == click_row {
-            let used = "  guide ".width() + text[..index].width();
-            let col = used.saturating_sub(last_row as usize * width as usize) as u16;
-            if col >= click_col {
-                return text[..index].chars().count();
-            }
-        }
-    }
-    text.chars().count()
-}
-
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use maki_agent::permissions::PermissionAnswer;
     use maki_config::ToolKey;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::{Position, Rect};
+    use test_case::test_case;
+
+    use crate::click::ClickTarget;
+    use crate::text_buffer::TextBuffer;
 
     use super::{PermissionPrompt, PromptState};
 
@@ -737,6 +745,85 @@ mod tests {
         } else {
             panic!("expected Open");
         }
+    }
+
+    #[test]
+    fn defer_hint_has_actionable_hit() {
+        let mut prompt = open_prompt();
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let mut hits = Vec::new();
+        terminal
+            .draw(|frame| hits = prompt.view(frame, frame.area()))
+            .unwrap();
+        let hit = hits
+            .iter()
+            .find(|hit| hit.target == ClickTarget::DeferInput)
+            .unwrap();
+        let rendered = terminal.backend().buffer();
+        let text: String = (hit.rect.x..hit.rect.right())
+            .map(|x| rendered[Position::new(x, hit.rect.y)].symbol())
+            .collect();
+        assert!(text.contains("defer, keep typing"));
+    }
+
+    #[test_case("hello world", 16, 0, 14, 5 ; "past_word_wrapped_row_end")]
+    #[test_case("hello world", 16, 1, 0, 6 ; "continuation_word_start")]
+    #[test_case("hello world", 16, 1, 2, 8 ; "continuation_word_inside")]
+    #[test_case("hello world", 16, 1, 15, 11 ; "past_final_row_end")]
+    #[test_case("abcdefghijklmnopqrst", 12, 2, 0, 12 ; "continuation_long_word")]
+    #[test_case("漢字 abc", 16, 0, 9, 0 ; "wide_grapheme_second_cell")]
+    #[test_case("e\u{301}cole", 16, 0, 9, 3 ; "combining_grapheme")]
+    #[test_case("a    b", 12, 1, 0, 5 ; "swallowed_whitespace")]
+    #[test_case("ab\ncd", 16, 0, 10, 3 ; "filtered_newline_keeps_source_offset")]
+    fn guidance_click_matches_rendered_text(
+        text: &str,
+        width: u16,
+        row: u16,
+        col: u16,
+        expected_byte: usize,
+    ) {
+        let mut prompt = open_prompt();
+        prompt.handle_key(key(KeyCode::Char('n')));
+        prompt.handle_paste(text);
+        let mut terminal = Terminal::new(TestBackend::new(80, 60)).unwrap();
+        let mut hits = Vec::new();
+        terminal
+            .draw(|frame| hits = prompt.view(frame, Rect::new(2, 3, width + 2, 50)))
+            .unwrap();
+        let hit = hits
+            .iter()
+            .find(|hit| hit.target == ClickTarget::PermissionGuidance)
+            .unwrap();
+        let position = Position::new(hit.rect.x + col, hit.rect.y + row);
+        prompt.click_guidance(position);
+        let PermissionPrompt::Open { buffer, .. } = &mut prompt else {
+            panic!("expected Open");
+        };
+        assert_eq!(buffer.cursor_byte_offset(), expected_byte);
+        buffer.insert_text("X");
+        let mut expected = text.to_string();
+        expected.insert(expected_byte, 'X');
+        assert_eq!(buffer.value(), expected);
+        terminal
+            .draw(|frame| {
+                prompt.view(frame, Rect::new(2, 3, width + 2, 50));
+            })
+            .unwrap();
+        let rendered = terminal.backend().buffer();
+        assert!(rendered.content.iter().any(|cell| cell.symbol() == "X"));
+    }
+
+    #[test]
+    fn guidance_caret_preserves_combining_grapheme() {
+        let mut prompt = open_prompt();
+        prompt.handle_key(key(KeyCode::Char('n')));
+        if let PermissionPrompt::Open { buffer, .. } = &mut prompt {
+            *buffer = TextBuffer::new("e\u{301}cole".to_string());
+            buffer.set_cursor(0, 1);
+        }
+        let lines = prompt.body_lines();
+        let guide = &lines[lines.len() - 2];
+        assert!(guide.spans.iter().any(|span| span.content == "e\u{301}"));
     }
 
     #[test]
