@@ -1386,6 +1386,8 @@ fn public_child_mode_changes_provider_system_after_queued_turns(custom: Option<&
     const NEW_MODE: &str = "pr160_new_mode";
     const OLD_PROMPT: &str = "old mode directive";
     const NEW_PROMPT: &str = "new mode directive";
+    const MODEL_IDENTITY: &str =
+        "# Model identity\n- Model: claude-sonnet-4-20250514\n- Provider: anthropic";
     smol::block_on(async {
         let fixture = Fixture::start_with_options(
             OWNER,
@@ -1447,7 +1449,7 @@ fn public_child_mode_changes_provider_system_after_queued_turns(custom: Option<&
                 || prompt.to_owned(),
                 |system| format!("{prompt}\n\n{system}"),
             );
-            assert_eq!(request.system, expected);
+            assert_eq!(request.system, format!("{expected}\n\n{MODEL_IDENTITY}"));
             request.reply.send(common::canned_reply(reply)).unwrap();
         }
         assert_eq!(

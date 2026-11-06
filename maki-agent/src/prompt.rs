@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use maki_providers::Model;
 use strum::{Display, EnumIter, EnumString, IntoEnumIterator};
 
 pub trait ValidNames: IntoEnumIterator + std::fmt::Display {
@@ -200,6 +201,16 @@ pub fn assemble(id: PromptId, slots: &ResolvedSlots, instructions: &str) -> Stri
         out = fill_marker(&out, slot.marker(), &render_slot(slots, id, slot));
     }
     out.replace(INSTRUCTIONS_MARKER, instructions)
+}
+
+pub(crate) fn append_model_identity(system: &mut String, model: &Model) {
+    if !system.is_empty() {
+        system.push_str("\n\n");
+    }
+    system.push_str(&format!(
+        "# Model identity\n- Model: {}\n- Provider: {}",
+        model.id, model.provider
+    ));
 }
 
 /// Replace a slot marker with its content. When the content is empty, also drop

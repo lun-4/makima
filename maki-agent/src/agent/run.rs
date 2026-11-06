@@ -286,7 +286,8 @@ impl<'h> Agent<'h> {
         agent
     }
 
-    pub fn new(params: AgentParams, run: AgentRunParams<'h>) -> Self {
+    pub fn new(params: AgentParams, mut run: AgentRunParams<'h>) -> Self {
+        crate::prompt::append_model_identity(&mut run.system, &params.model);
         Self {
             agent_id: params.agent_id,
             provider: params.provider,
@@ -1208,6 +1209,7 @@ mod tests {
         responses: Mutex<Vec<StreamResponse>>,
         captured_tools: Arc<Mutex<Vec<Value>>>,
         captured_messages: Arc<Mutex<Vec<Vec<Message>>>>,
+        captured_systems: Arc<Mutex<Vec<String>>>,
     }
 
     impl MockProvider {
@@ -1216,6 +1218,7 @@ mod tests {
                 responses: Mutex::new(responses),
                 captured_tools: Arc::default(),
                 captured_messages: Arc::default(),
+                captured_systems: Arc::default(),
             }
         }
     }
@@ -1225,7 +1228,7 @@ mod tests {
             &'a self,
             _: &'a Model,
             messages: &'a [Message],
-            _: &'a str,
+            system: &'a str,
             tools: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
@@ -1237,6 +1240,10 @@ mod tests {
                     .unwrap()
                     .push(messages.to_vec());
                 self.captured_tools.lock().unwrap().push(tools.clone());
+                self.captured_systems
+                    .lock()
+                    .unwrap()
+                    .push(system.to_owned());
                 let mut responses = self.responses.lock().unwrap();
                 assert!(!responses.is_empty(), "MockProvider: no more responses");
                 Ok(responses.remove(0))
@@ -2155,15 +2162,20 @@ mod tests {
         });
     }
 
-    #[test]
-    fn actor_turn_runs_under_committed_policy() {
+    #[test_case(""; "empty_system")]
+    #[test_case("Custom system prompt"; "custom_system")]
+    fn actor_turn_runs_under_committed_policy(system: &str) {
+        const MODEL_SPEC: &str = "openai/gpt-4o";
+        const MODEL_IDENTITY: &str = "# Model identity\n- Model: gpt-4o\n- Provider: openai";
         let mut history = History::new(Vec::new());
-        let params = test_params(MockProvider::new(vec![text_response(StopReason::EndTurn)]));
+        let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+        let captured_systems = Arc::clone(&provider.captured_systems);
+        let params = test_params(provider);
         let plan = AgentMode::Plan(PathBuf::from(TEST_PLAN_PATH));
         let policy = EffectiveAgentConfig::new(
             RunSettings {
                 provider: Arc::clone(&params.provider),
-                model: params.model.clone(),
+                model: Model::from_spec(MODEL_SPEC).unwrap(),
                 fast: true,
                 workflow: true,
                 thinking: ThinkingConfig::Budget(TEST_THINKING_BUDGET),
@@ -2197,7 +2209,7 @@ mod tests {
             params,
             AgentRunParams {
                 history: &mut history,
-                system: String::new(),
+                system: system.into(),
                 event_tx: EventSender::new(raw_tx),
                 tools: RequestTools::default(),
             },
@@ -2209,6 +2221,12 @@ mod tests {
             TurnId::generate(),
             default_input(),
         ));
+        let expected_system = if system.is_empty() {
+            MODEL_IDENTITY.to_owned()
+        } else {
+            format!("{system}\n\n{MODEL_IDENTITY}")
+        };
+        assert_eq!(*captured_systems.lock().unwrap(), [expected_system]);
         assert_eq!(agent.mode, plan);
         assert!(agent.workflow && agent.opts.fast);
         assert_eq!(

@@ -1683,6 +1683,9 @@ pub(crate) mod tests {
 
     #[test]
     fn headless_queued_settings_survive_config_change() {
+        const FIRST_SYSTEM: &str = "admitted system\n\n# Model identity\n- Model: claude-sonnet-4-20250514\n- Provider: anthropic";
+        const SECOND_SYSTEM: &str =
+            "admitted system\n\n# Model identity\n- Model: claude-opus-4-8\n- Provider: anthropic";
         smol::block_on(async {
             let (requests, received) = flume::unbounded();
             let first: Arc<dyn Provider> = Arc::new(RecordingProvider {
@@ -1716,19 +1719,14 @@ pub(crate) mod tests {
             let after = bounded(received.recv_async()).await.unwrap();
             assert_eq!(
                 before,
-                (
-                    FIRST,
-                    TEST_MODEL.to_owned(),
-                    "admitted system".into(),
-                    false
-                )
+                (FIRST, TEST_MODEL.to_owned(), FIRST_SYSTEM.into(), false)
             );
             assert_eq!(
                 after,
                 (
                     SECOND,
                     "anthropic/claude-opus-4-8".into(),
-                    "admitted system".into(),
+                    SECOND_SYSTEM.into(),
                     true
                 )
             );
