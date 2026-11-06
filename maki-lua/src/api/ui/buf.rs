@@ -242,7 +242,10 @@ fn get_lines(lua: &Lua, this: &BufHandle) -> LuaResult<Table> {
 ///
 /// Supported events:
 /// - "click": fires when the user clicks a line. The handler receives
-///   a click-event table and may yield or mutate the buffer.
+///   a click-event table whose `row` is 1-based, with `row = 0` for clicks
+///   on chrome or outside the content. Transcript buffers deliver clicks
+///   here; float windows deliver them from `win:recv()` as a `click` event
+///   that also carries `col`.
 /// - "change": fires synchronously after every mutation (`line`,
 ///   `lines`, `set_lines`). Must not yield.
 ///

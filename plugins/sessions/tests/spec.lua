@@ -296,4 +296,147 @@ case("live_rows_override_stored_message_count", function()
   eq(#all, 1)
 end)
 
+local function picker(events, query)
+  local originals = {
+    buf = maki.ui.buf,
+    open_win = maki.ui.open_win,
+    flash = maki.ui.flash,
+    command = maki.api.register_command,
+    autocmd = maki.api.create_autocmd,
+    keymap = maki.keymap.set,
+    run = maki.async.run,
+    live = maki.session.live,
+    list = maki.session.list,
+    focus = maki.session.focus,
+    title = maki.session.set_title,
+    delete = maki.session.delete,
+  }
+  local command, lines, focused, renamed, closed, deleted
+  maki.api.register_command = function(spec)
+    if spec.name == "/sessions" then
+      command = spec.handler
+    end
+  end
+  maki.api.create_autocmd = function() end
+  maki.keymap.set = function() end
+  maki.async.run = function(fn)
+    fn()
+  end
+  maki.session.live = function()
+    return {}
+  end
+  maki.session.list = function()
+    return { stored_row({ id = "one", title = "first" }), stored_row({ id = "two", title = "second" }) }
+  end
+  maki.session.focus = function(id)
+    focused = id
+    return true
+  end
+  maki.session.set_title = function(opts)
+    renamed = opts
+    return true
+  end
+  maki.session.delete = function(id)
+    deleted = id
+    return true
+  end
+  maki.ui.flash = function() end
+  maki.ui.buf = function()
+    return {
+      set_lines = function(_, value)
+        lines = value
+      end,
+    }
+  end
+  local step = 0
+  maki.ui.open_win = function()
+    return {
+      width = 80,
+      height = 20,
+      set_config = function() end,
+      set_cursor = function() end,
+      close = function()
+        closed = true
+      end,
+      recv = function()
+        step = step + 1
+        local event = events[step]
+        if type(event) == "function" then
+          return event(lines)
+        end
+        return event or { type = "close" }
+      end,
+    }
+  end
+  local ok, err = pcall(function()
+    load_plugin()
+    command({ values = { query = query } })
+  end)
+  maki.ui.buf, maki.ui.open_win, maki.ui.flash = originals.buf, originals.open_win, originals.flash
+  maki.api.register_command, maki.api.create_autocmd = originals.command, originals.autocmd
+  maki.keymap.set, maki.async.run = originals.keymap, originals.run
+  maki.session.live, maki.session.list, maki.session.focus = originals.live, originals.list, originals.focus
+  maki.session.set_title, maki.session.delete = originals.title, originals.delete
+  assert(ok, tostring(err))
+  return focused, renamed, closed, deleted
+end
+
+local function row_with(lines, title)
+  for row, line in ipairs(lines) do
+    for _, span in ipairs(line) do
+      if span[1] == title then
+        return row
+      end
+    end
+  end
+  error("missing session row: " .. title)
+end
+
+case("click_opens_the_session_under_the_pointer", function()
+  local focused, _, closed = picker({
+    { type = "click", row = 0, col = 2 },
+    { type = "click", row = 2, col = 2 },
+    function(lines)
+      return { type = "click", row = row_with(lines, "second"), col = 3 }
+    end,
+  })
+  eq(focused, "two")
+  eq(closed, true)
+end)
+
+case("rename_caret_click_edits_without_opening_a_session", function()
+  local focused, renamed, closed = picker({
+    { type = "key", key = "ctrl+r" },
+    { type = "click", row = 1, col = 9 },
+    { type = "key", key = "X" },
+    { type = "key", key = "enter" },
+    { type = "key", key = "ctrl+c" },
+  }, "first")
+  eq(focused, nil)
+  eq(renamed.id, "one")
+  eq(renamed.title, "Xfirst")
+  eq(closed, true)
+end)
+
+case("clicking_delete_confirmation_deletes_instead_of_opening", function()
+  local focused, _, _, deleted = picker({
+    { type = "key", key = "ctrl+d" },
+    function(lines)
+      for row, line in ipairs(lines) do
+        local col = 1
+        for _, span in ipairs(line) do
+          if span[1]:find("again to delete", 1, true) then
+            return { type = "click", row = row, col = col + 2 }
+          end
+          col = col + maki.ui.display_width(span[1])
+        end
+      end
+      error("missing delete confirmation")
+    end,
+    { type = "key", key = "ctrl+c" },
+  }, "first")
+  eq(focused, nil)
+  eq(deleted, "one")
+end)
+
 th.report()

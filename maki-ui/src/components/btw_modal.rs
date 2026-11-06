@@ -1,7 +1,7 @@
 use crate::components::ModalScroll;
 use crate::components::Overlay;
 use crate::components::modal::Modal;
-use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::scrollbar::{ScrollbarHit, render_vertical_scrollbar, saturating_u16};
 use crate::components::streaming_content::StreamingContent;
 use crate::theme;
 
@@ -29,6 +29,7 @@ pub struct BtwModal {
     question: String,
     answer: StreamingContent,
     scroll: ModalScroll,
+    scrollbar_hit: Option<ScrollbarHit>,
     rx: Option<flume::Receiver<BtwEvent>>,
 }
 
@@ -40,6 +41,7 @@ impl BtwModal {
             question: String::new(),
             answer: StreamingContent::new("", theme.assistant, theme.assistant, ms_per_char),
             scroll: ModalScroll::new(),
+            scrollbar_hit: None,
             rx: None,
         }
     }
@@ -103,6 +105,22 @@ impl BtwModal {
         self.scroll.scroll(delta);
     }
 
+    pub fn scroll_to_line(&mut self, line: u16) {
+        self.scroll.scroll_to(line);
+    }
+
+    pub fn scrollbar_hit(&self) -> Option<ScrollbarHit> {
+        self.scrollbar_hit
+    }
+
+    pub fn content_len(&self) -> u16 {
+        self.scroll.content_len()
+    }
+
+    pub fn scroll_line(&self) -> u16 {
+        self.scroll.offset()
+    }
+
     pub fn handle_key(&mut self, key_event: KeyEvent) {
         match key_event.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ') => {
@@ -115,6 +133,7 @@ impl BtwModal {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect, theme_gen: u64) -> Rect {
+        self.scrollbar_hit = None;
         if !self.open {
             return Rect::default();
         }
@@ -134,15 +153,17 @@ impl BtwModal {
         let md_lines = self.answer.render_lines(padded_width, theme_gen);
         lines.extend_from_slice(md_lines);
 
-        let total = Paragraph::new(lines.clone())
-            .wrap(Wrap { trim: false })
-            .line_count(padded_width) as u16;
+        let total = saturating_u16(
+            Paragraph::new(lines.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(padded_width),
+        );
         let modal = Modal {
             title: TITLE,
             width_percent: WIDTH_PERCENT,
             max_height_percent: MAX_HEIGHT_PERCENT,
         };
-        let (popup, inner) = modal.render(frame, area, total);
+        let (popup, inner) = modal.render(frame, area, total.min(area.height.saturating_sub(2)));
         let padded = Rect {
             x: inner.x + H_PAD,
             width: inner.width.saturating_sub(H_PAD * 2),
@@ -158,7 +179,7 @@ impl BtwModal {
         frame.render_widget(paragraph, padded);
 
         if total > viewport_h {
-            render_vertical_scrollbar(frame, inner, total, scroll);
+            self.scrollbar_hit = render_vertical_scrollbar(frame, inner, total, scroll);
         }
 
         popup

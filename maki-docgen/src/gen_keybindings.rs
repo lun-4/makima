@@ -17,6 +17,22 @@ const LUA_CONTEXT_BINDS: &[(&str, &str, &str)] = &[
 // Built-in plugins own these globally, so they never reach `KEYBINDS`.
 const PLUGIN_BINDS: &[(&str, &str)] = &[("`Ctrl+P`", "Browse sessions")];
 
+// Mouse has no crossterm KeyEvent to read from, so the contract lives here.
+const MOUSE_BINDS: &[(&str, &str)] = &[
+    ("Click and drag a scrollbar", "Scroll that surface"),
+    (
+        "Click a scrollbar track",
+        "Jump the scrollbar thumb to that row",
+    ),
+    (
+        "Click a status or top bar chip",
+        "Open its menu, picker, or action",
+    ),
+    ("Click a picker or menu row", "Select and confirm that row"),
+    ("Click outside a modal", "Close it, like `Esc`"),
+    ("Click and drag over text", "Select text as before"),
+];
+
 const MAIN_CONTEXTS: &[KeybindContext] = &[
     KeybindContext::General,
     KeybindContext::Editing,
@@ -100,6 +116,15 @@ fn write_context_specific(out: &mut String) {
     }
 }
 
+fn write_mouse_binds(out: &mut String) {
+    out.push_str("\n## Mouse\n\n");
+    out.push_str("Every scrollable surface has a draggable scrollbar. Chips, menu rows, pickers, dialogs, and plugin surfaces are clickable.\n\n");
+    out.push_str("| Action | Result |\n|--------|--------|\n");
+    for (action, result) in MOUSE_BINDS {
+        out.push_str(&format!("| {action} | {result} |\n"));
+    }
+}
+
 fn write_plugin_binds(out: &mut String) {
     out.push_str("\n## Plugins\n\n");
     out.push_str("Built-in plugins register these themselves, and your own plugins can add more with `maki.keymap.set`:\n\n");
@@ -150,6 +175,7 @@ pub fn generate() -> String {
     }
 
     write_context_specific(&mut out);
+    write_mouse_binds(&mut out);
     write_plugin_binds(&mut out);
     write_inheritance(&mut out);
     write_overrides(&mut out);

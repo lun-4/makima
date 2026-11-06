@@ -399,7 +399,8 @@ end
 -- { lines = styled lines, cursor_row = 1-based row holding the cursor }.
 function TextInput:render(prefix, prefix_width, width)
   local result = {}
-  local pw = prefix_width or #prefix
+  local positions = {}
+  local pw = prefix_width or maki.ui.display_width(prefix)
   local pad = string.rep(" ", pw)
   local usable = math.max((width or 0x40000000) - pw, 1)
   local cursor_row = 1
@@ -412,15 +413,21 @@ function TextInput:render(prefix, prefix_width, width)
     repeat
       local chunk_start = pos + 1
       local chunk_end = pos
-      local chars = 0
-      while chunk_end < #ln and chars < usable do
-        chunk_end = (utf8.offset(ln, 2, chunk_end + 1) or (#ln + 1)) - 1
-        chars = chars + 1
+      local cells = 0
+      while chunk_end < #ln do
+        local next_end = next_codepoint_boundary(ln, chunk_end)
+        local next_width = maki.ui.display_width(ln:sub(chunk_end + 1, next_end))
+        if cells + next_width > usable and chunk_end > pos then
+          break
+        end
+        chunk_end = next_end
+        cells = cells + next_width
       end
 
       local pfx_str = first and prefix or pad
       first = false
       local chunk = ln:sub(chunk_start, chunk_end)
+      positions[#positions + 1] = { line = i, start = pos, finish = chunk_end, prefix_width = pw }
       local has_cursor = is_cursor_line and self.col >= pos and (self.col < chunk_end or chunk_end >= #ln)
 
       if has_cursor then
@@ -440,7 +447,33 @@ function TextInput:render(prefix, prefix_width, width)
     until pos >= #ln
   end
 
-  return { lines = result, cursor_row = cursor_row }
+  return { lines = result, cursor_row = cursor_row, positions = positions }
+end
+
+-- Click coordinates are 1-based display cells in the rendered input.
+function TextInput:click(rendered, row, col)
+  local position = rendered.positions[row]
+  if not position or not col or col < 1 then
+    return R.IGNORED
+  end
+  local target = math.max(col - position.prefix_width - 1, 0)
+  local text = self.lines[position.line]
+  local offset = position.start
+  local cells = 0
+  while offset < position.finish do
+    local next_offset = next_codepoint_boundary(text, offset)
+    local cell_width = maki.ui.display_width(text:sub(offset + 1, next_offset))
+    if cells + cell_width > target then
+      break
+    end
+    offset = next_offset
+    cells = cells + cell_width
+  end
+  if self.line == position.line and self.col == offset then
+    return R.IGNORED
+  end
+  self.line, self.col = position.line, offset
+  return R.MOVED
 end
 
 return TextInput

@@ -11,6 +11,7 @@ use maki_providers::dynamic;
 use maki_providers::model_registry;
 use maki_providers::provider::ProviderKind;
 
+use crate::click::{ClickTarget, HitTarget, PickerId};
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::{Cadence, Dirty, Watch};
@@ -109,7 +110,9 @@ pub struct ModelPicker {
 impl ModelPicker {
     pub fn new(models: Arc<ArcSwapOption<Vec<String>>>) -> Self {
         Self {
-            picker: ListPicker::new().with_footer_builder(footer_line),
+            picker: ListPicker::new()
+                .with_picker(PickerId::Model)
+                .with_footer_builder(footer_line),
             models,
             available: Watch::default(),
             recents: Vec::new(),
@@ -147,6 +150,8 @@ impl ModelPicker {
             return Dirty::NO;
         }
         self.needs_rebuild = false;
+        let follow_selection = self.picker.selection_visible();
+        let scroll_line = self.picker.scroll_line();
         let entries = self.load_entries();
         self.picker.replace_items(entries);
         if let Some((was_recent, spec)) = &self.anchor {
@@ -154,6 +159,9 @@ impl ModelPicker {
                 .select_item_by(|e| e.spec == *spec && e.suffix().is_some() == *was_recent);
         } else {
             self.preselect_current_model();
+        }
+        if !follow_selection {
+            self.picker.scroll_to_line(scroll_line);
         }
         Dirty::YES
     }
@@ -199,8 +207,12 @@ impl ModelPicker {
         self.picker.close();
     }
 
-    pub fn contains(&self, pos: Position) -> bool {
-        self.picker.contains(pos)
+    pub fn select(&mut self, index: usize) -> bool {
+        self.track_anchor(|p| p.picker.select(index))
+    }
+
+    pub fn click_input(&mut self, pos: Position) -> bool {
+        self.picker.click_input(pos)
     }
 
     pub fn scroll(&mut self, delta: i32) {
@@ -252,6 +264,45 @@ impl ModelPicker {
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
         self.picker.view(frame, area)
+    }
+
+    pub fn hits(&self) -> Vec<HitTarget> {
+        let mut hits = self.picker.hits();
+        if let Some(area) = self.picker.footer_area() {
+            let keys = [
+                KeyCode::Enter,
+                KeyCode::Char('!'),
+                KeyCode::Char('@'),
+                KeyCode::Char('#'),
+                KeyCode::Char('$'),
+            ];
+            let line = footer_line();
+            let mut x = area.x;
+            for (spans, code) in line.spans.as_chunks::<2>().0.iter().zip(keys) {
+                let width = spans.iter().map(Span::width).sum::<usize>() as u16;
+                let rect = Rect::new(x, area.y, width, 1).intersection(area);
+                if !rect.is_empty() {
+                    hits.push(HitTarget {
+                        rect,
+                        target: ClickTarget::KeyHint(KeyEvent::new(code, KeyModifiers::NONE)),
+                    });
+                }
+                x = x.saturating_add(width);
+            }
+        }
+        hits
+    }
+
+    pub fn scroll_line(&self) -> Option<u16> {
+        self.is_open().then(|| self.picker.scroll_line())
+    }
+
+    pub fn content_len(&self) -> Option<u16> {
+        self.is_open().then(|| self.picker.content_len()).flatten()
+    }
+
+    pub fn scroll_to_line(&mut self, line: u16) {
+        self.picker.scroll_to_line(line);
     }
 }
 
@@ -323,6 +374,82 @@ mod tests {
     use crate::components::keybindings::key as kb;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use test_case::test_case;
+
+    #[test_case(false; "wheel")]
+    #[test_case(true; "absolute")]
+    fn refresh_preserves_manual_viewport(absolute: bool) {
+        let models = Arc::new(ArcSwapOption::empty());
+        let specs: Vec<String> = (0..40).map(|i| format!("zai/model-{i:02}")).collect();
+        models.store(Some(Arc::new(specs.clone())));
+        let mut picker = ModelPicker::new(Arc::clone(&models));
+        picker.open(&specs[0]);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+        if absolute {
+            picker.scroll_to_line(20);
+        } else {
+            picker.scroll(-20);
+        }
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+        let offset = picker.scroll_line();
+        assert!(offset.unwrap() > 0);
+        models.store(Some(Arc::new(specs)));
+        assert_eq!(picker.refresh(), Dirty::YES);
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+        assert_eq!(picker.scroll_line(), offset);
+        assert_eq!(picker.picker.selected_item().unwrap().spec, "zai/model-00");
+        picker.handle_key(key(KeyCode::Down));
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+        assert!(picker.scroll_line() < offset);
+    }
+
+    #[test_case(80; "wide")]
+    #[test_case(30; "clipped")]
+    fn rendered_footer_emits_clipped_key_hints(width: u16) {
+        let mut picker = ModelPicker::new(test_models());
+        picker.open("");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+        let area = picker.picker.footer_area().unwrap();
+        let hints: Vec<_> = picker
+            .hits()
+            .into_iter()
+            .filter(|hit| matches!(hit.target, ClickTarget::KeyHint(_)))
+            .collect();
+        assert!(hints.len() >= 2);
+        assert!(
+            hints
+                .iter()
+                .all(|hit| hit.rect.intersection(area) == hit.rect)
+        );
+        assert_eq!(hints[0].target, ClickTarget::KeyHint(key(KeyCode::Enter)));
+        assert_eq!(
+            hints[1].target,
+            ClickTarget::KeyHint(key(KeyCode::Char('!')))
+        );
+    }
 
     const SAME_SIZED_LIST: &str = "a republished list of the same length is still a new list";
     const SWAPPED_SPEC: &str = "zai/glm-5";

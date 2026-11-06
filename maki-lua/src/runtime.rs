@@ -66,7 +66,7 @@ use crate::api::tool::{
     ToolCallReply, resolve_rules,
 };
 use crate::api::ui::buf::{BufHandle, BufferStore};
-use crate::api::ui::{HintStore, StatusContentStore};
+use crate::api::ui::{ClickRegions, HintStore, StatusContentStore};
 use crate::api::util::command::{
     ArgumentCompletion, CommandCompletionCallbacks, CommandGenerationMap, CommandHandlerMap,
     HintWriter, StatusContentWriter, UiAction,
@@ -330,6 +330,9 @@ pub enum Request {
         tool_use_id: String,
         row: usize,
         fallback: Option<Box<ClickFallback>>,
+    },
+    ClickRegion {
+        id: u32,
     },
     RunKeybindCallback {
         id: u64,
@@ -2784,6 +2787,7 @@ impl LuaRuntime {
         lua.set_app_data(HintStore::new());
         lua.set_app_data(hint_writer);
         lua.set_app_data(StatusContentStore::new());
+        lua.set_app_data(ClickRegions::default());
         lua.set_app_data(status_content_writer);
         lua.set_app_data(Arc::clone(&registry));
         lua.set_app_data(Arc::clone(&modes));
@@ -3954,6 +3958,9 @@ impl LuaRuntime {
             if let Some(writer) = self.lua.app_data_ref::<HintWriter>() {
                 writer.publish(entries);
             }
+        }
+        if let Some(mut regions) = self.lua.app_data_mut::<ClickRegions>() {
+            regions.remove_plugin(&self.lua, plugin);
         }
         if let Some(mut store) = self.lua.app_data_mut::<StatusContentStore>() {
             let changed = store.clear_plugin(plugin);
@@ -5425,6 +5432,33 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                 }
                             })
                             .detach();
+                        }
+                        Request::ClickRegion { id } => {
+                            let func = rt
+                                .lua
+                                .app_data_ref::<ClickRegions>()
+                                .and_then(|regions| regions.function(&rt.lua, id));
+                            if let Some(func) = func {
+                                let handle = TaskCell::new(CancelToken::none(), None, None)
+                                    .into_handle();
+                                let lua = rt.lua.clone();
+                                let g = Rc::clone(&gate);
+                                ex.spawn(async move {
+                                    let slot = Some(g.acquire().await);
+                                    let call = covered(
+                                        slot,
+                                        ScopedFuture::new(
+                                            lua.clone(),
+                                            handle,
+                                            func.call_async::<()>(()),
+                                        ),
+                                    );
+                                    if let Err(e) = call.await {
+                                        tracing::warn!(id, error = %e, "status click failed");
+                                    }
+                                })
+                                .detach();
+                            }
                         }
                         Request::ObserveAgents(manager) => {
                             crate::agent_autocmd::observe(&rt.lua, &manager);

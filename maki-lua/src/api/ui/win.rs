@@ -86,6 +86,12 @@ fn event_table(lua: &Lua, event: WinEvent) -> LuaResult<Table> {
             tbl.set("text", text)?;
             Ok(tbl)
         }
+        WinEvent::Click { row, col } => {
+            let tbl = tagged(lua, "click")?;
+            tbl.set("row", row)?;
+            tbl.set("col", col)?;
+            Ok(tbl)
+        }
         WinEvent::Close => tagged(lua, "close"),
     }
 }
@@ -102,6 +108,7 @@ const recv__doc: FnDoc = FnDoc {
         - `{type=\"key\", key}` -- keypress. Key is a string like \"q\", \"j\", or \"esc\".\n\
         - `{type=\"resize\", width, height}` -- terminal was resized.\n\
         - `{type=\"paste\", text}` -- bracketed paste.\n\
+        - `{type=\"click\", row, col}` -- mouse click in the content; row is 1-based, 0 means the border/title/footer.\n\
         - `{type=\"close\"}` -- window was closed externally.\n\
         - `{type=\"timeout\"}` -- no event arrived within {timeout_ms}.",
     params: &[ParamDoc {
@@ -498,5 +505,14 @@ mod tests {
         drop(cmd_rx);
         assert!(!handle.closed.get());
         assert!(handle.cmd_tx.is_disconnected());
+    }
+
+    #[test]
+    fn click_event_table_maps_row_and_col() {
+        let lua = mlua::Lua::new();
+        let table = event_table(&lua, WinEvent::Click { row: 3, col: 4 }).unwrap();
+        assert_eq!(table.get::<String>("type").unwrap(), "click");
+        assert_eq!(table.get::<u16>("row").unwrap(), 3);
+        assert_eq!(table.get::<u16>("col").unwrap(), 4);
     }
 }

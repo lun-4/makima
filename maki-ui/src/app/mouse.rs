@@ -1,13 +1,14 @@
 use std::time::{Duration, Instant};
 
+use crate::click::{ClickTarget, ScrollOwner, Surface};
 use crate::clipboard::CopyResult;
 use crate::selection::{self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone};
-use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
 use crate::repaint::Dirty;
 
-use super::App;
+use super::{Action, App};
 
 pub(super) const EDGE_SCROLL_LINES: i32 = 1;
 pub(super) const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -57,6 +58,14 @@ impl MiddleScroll {
         self.fractional_lines -= f64::from(delta);
         delta
     }
+}
+
+pub(super) struct ScrollDrag {
+    pub(super) owner: ScrollOwner,
+    pub(super) area: Rect,
+    pub(super) content_len: u16,
+    pub(super) grab: u16,
+    chat: usize,
 }
 
 impl App {
@@ -114,7 +123,7 @@ impl App {
         dirty | Dirty::from(before != after)
     }
 
-    pub(super) fn handle_mouse(&mut self, event: MouseEvent) -> Dirty {
+    pub(super) fn handle_mouse(&mut self, event: MouseEvent) -> (Dirty, Vec<Action>) {
         let mut dirty = Dirty::NO;
         match event.kind {
             MouseEventKind::Down(MouseButton::Middle) => {
@@ -138,7 +147,7 @@ impl App {
                     });
                     dirty |= Dirty::YES;
                 }
-                return dirty;
+                return (dirty, vec![]);
             }
             MouseEventKind::Moved | MouseEventKind::Drag(MouseButton::Middle) => {
                 let now = Instant::now();
@@ -146,7 +155,10 @@ impl App {
                 if let Some(state) = self.middle_scroll.as_mut() {
                     state.move_to(event.row, now);
                 }
-                return dirty;
+                if event.kind == MouseEventKind::Moved {
+                    dirty |= self.hover_update(Position::new(event.column, event.row));
+                }
+                return (dirty, vec![]);
             }
             MouseEventKind::Down(MouseButton::Left | MouseButton::Right)
             | MouseEventKind::ScrollUp
@@ -157,60 +169,243 @@ impl App {
             }
             _ => {}
         }
-        match event.kind {
+        let actions = match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(zone) = self.zone_at(event.row, event.column) {
-                    if self.has_modal_overlay() && zone.zone != SelectionZone::Overlay {
-                        return dirty;
-                    }
-                    // Move the cursor to the click position in the input area.
-                    if zone.zone == SelectionZone::Input {
-                        let focused = !self.any_overlay_open();
-                        self.input_box
-                            .handle_click(zone.area, event.row, event.column, focused);
-                        if focused {
-                            let input = self.input_box.buffer.value();
-                            self.sync_command_arguments(
-                                &input,
-                                self.input_box.buffer.cursor_byte_offset(),
-                            );
-                            self.sync_file_completion();
-                        }
-                    }
-                    let scroll = self.scroll_offset(zone.zone);
-                    self.selection_state = Some(SelectionState::Dragging {
-                        sel: Selection::start(
-                            event.row,
-                            event.column,
-                            zone.area,
-                            zone.zone,
-                            scroll,
-                        ),
-                        edge_scroll: None,
-                        last_drag_col: event.column,
-                    });
-                }
+                dirty |= self.left_down(event.row, event.column);
+                vec![]
             }
             MouseEventKind::Drag(MouseButton::Left) => {
-                self.handle_drag(event.row, event.column);
+                dirty |= self.left_drag(event.row, event.column);
+                vec![]
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                if let Some(SelectionState::Dragging { sel, .. }) = self.selection_state {
-                    if !sel.is_empty() {
-                        self.selection_state = Some(SelectionState::PendingCopy { sel });
-                    } else {
-                        let zone = sel.zone;
-                        self.selection_state = None;
-                        if zone == SelectionZone::Messages {
-                            let area = self.msg_area();
-                            self.chats[self.active_chat].handle_click(event.row, area);
-                        }
-                    }
+                let (d, actions) = self.left_up(event.row, event.column);
+                dirty |= d;
+                actions
+            }
+            _ => vec![],
+        };
+        (dirty, actions)
+    }
+
+    fn left_down(&mut self, row: u16, col: u16) -> Dirty {
+        let pos = Position::new(col, row);
+        self.pending_click = None;
+        self.selection_state = None;
+        if (self.hits.modal().is_some() || self.has_modal_overlay())
+            && !self.hits.inside_modal(pos)
+            && self.hits.surface_at(pos).is_none()
+        {
+            self.pending_click = self
+                .hits
+                .modal()
+                .map(|(surface, _)| (ClickTarget::DismissSurface(surface), pos));
+            return Dirty::NO;
+        }
+
+        let target = self.hits.target_at(pos);
+        if self.menu.is_open() {
+            let owns = matches!(target, Some(ClickTarget::MenuRow(_)))
+                || (self.menu.kind() == Some(crate::components::menu::MenuKind::Mode)
+                    && target == Some(ClickTarget::ModeChip))
+                || (self.menu.kind() == Some(crate::components::menu::MenuKind::Thinking)
+                    && target == Some(ClickTarget::ThinkingChip))
+                || (self.menu.kind() == Some(crate::components::menu::MenuKind::Permission)
+                    && target == Some(ClickTarget::PermissionChip))
+                || target == Some(ClickTarget::Surface(Surface::Menu));
+            if !owns {
+                self.menu.close();
+                return Dirty::NO;
+            }
+        }
+        if let Some(ClickTarget::Scrollbar(owner)) = target {
+            self.pending_click = None;
+            self.start_scroll_drag(owner, pos);
+            return Dirty::NO;
+        }
+        self.pending_click = target.map(|target| (target, pos));
+        self.start_selection(pos);
+        Dirty::NO
+    }
+
+    fn start_selection(&mut self, pos: Position) {
+        let Some(zone) = self.zone_at(pos.y, pos.x) else {
+            return;
+        };
+        if zone.zone == SelectionZone::Input {
+            let focused = !self.any_overlay_open();
+            self.input_box
+                .handle_click(zone.area, pos.y, pos.x, focused);
+            if focused {
+                let input = self.input_box.buffer.value();
+                self.sync_command_arguments(&input, self.input_box.buffer.cursor_byte_offset());
+                self.sync_file_completion();
+            }
+        }
+        let scroll = self.scroll_offset(zone.zone);
+        self.selection_state = Some(SelectionState::Dragging {
+            sel: Selection::start(pos.y, pos.x, zone.area, zone.zone, scroll),
+            edge_scroll: None,
+            last_drag_col: pos.x,
+        });
+    }
+
+    fn left_drag(&mut self, row: u16, col: u16) -> Dirty {
+        if self.scroll_drag.is_some() {
+            self.apply_scroll_drag(row);
+            Dirty::YES
+        } else {
+            self.handle_drag(row, col);
+            Dirty::NO
+        }
+    }
+
+    fn left_up(&mut self, row: u16, col: u16) -> (Dirty, Vec<Action>) {
+        if self.scroll_drag.is_some() {
+            self.apply_scroll_drag(row);
+            self.scroll_drag = None;
+            return (Dirty::YES, vec![]);
+        }
+        let pos = Position::new(col, row);
+        let target = self.hits.target_at(pos);
+        if let Some((ClickTarget::DismissSurface(surface), _)) = self
+            .pending_click
+            .take_if(|(target, _)| matches!(target, ClickTarget::DismissSurface(_)))
+        {
+            if self
+                .hits
+                .modal()
+                .is_some_and(|(current, rect)| current == surface && !rect.contains(pos))
+                && self.hits.surface_at(pos).is_none()
+            {
+                return (Dirty::YES, self.dismiss_surface(surface));
+            }
+            return (Dirty::NO, vec![]);
+        }
+        let click = self
+            .pending_click
+            .take()
+            .filter(|(pending, _)| Some(*pending) == target);
+        let empty = match &self.selection_state {
+            None => true,
+            Some(SelectionState::Dragging { sel, .. }) => sel.is_empty(),
+            Some(SelectionState::PendingCopy { .. }) => false,
+        };
+        if let Some((target, pos)) = click
+            && empty
+        {
+            self.selection_state = None;
+            return (Dirty::NO, self.dispatch_click(target, pos));
+        }
+        if let Some(SelectionState::Dragging { sel, .. }) = self.selection_state {
+            if !sel.is_empty() {
+                self.selection_state = Some(SelectionState::PendingCopy { sel });
+            } else {
+                let zone = sel.zone;
+                self.selection_state = None;
+                if zone == SelectionZone::Messages {
+                    let area = self.msg_area();
+                    self.chats[self.active_chat].handle_click(row, area);
                 }
             }
-            _ => {}
         }
-        dirty
+        (Dirty::NO, vec![])
+    }
+
+    fn hover_update(&mut self, pos: Position) -> Dirty {
+        let target = self.hits.target_at(pos);
+        if target == self.hover {
+            Dirty::NO
+        } else {
+            self.hover = target;
+            Dirty::YES
+        }
+    }
+
+    fn dismiss_surface(&mut self, surface: Surface) -> Vec<Action> {
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        match surface {
+            Surface::Picker(picker) => self.handle_picker_key(picker, key),
+            Surface::Help => {
+                self.help_modal.handle_key(key);
+                vec![]
+            }
+            Surface::Btw => {
+                self.btw_modal.handle_key(key);
+                vec![]
+            }
+            _ => vec![],
+        }
+    }
+
+    fn start_scroll_drag(&mut self, owner: ScrollOwner, pos: Position) {
+        let Some(rect) = self.hits.rect_of(ClickTarget::Scrollbar(owner)) else {
+            return;
+        };
+        let Some(content_len) = self.scroll_content_len(owner) else {
+            return;
+        };
+        let current = self.scroll_line(owner);
+        let y = pos.y.saturating_sub(rect.y);
+        let (thumb_len, thumb_start) =
+            crate::components::scrollbar::thumb(rect.height, content_len, current);
+        let on_thumb = (thumb_start..thumb_start + thumb_len).contains(&y);
+        let grab = crate::components::scrollbar::grab_at(rect.height, content_len, current, y);
+        let line = if on_thumb {
+            current
+        } else {
+            crate::components::scrollbar::position_at(rect.height, content_len, grab, y, current)
+        };
+        self.selection_state = None;
+        self.scroll_drag = Some(ScrollDrag {
+            owner,
+            area: rect,
+            content_len,
+            grab,
+            chat: self.resolve_render_chat(),
+        });
+        self.scroll_owner_to(owner, line);
+    }
+
+    fn apply_scroll_drag(&mut self, row: u16) {
+        let dirty = self.validate_scroll_drag();
+        self.pending_dirty |= dirty;
+        let Some(drag) = self.scroll_drag.as_ref() else {
+            return;
+        };
+        let y = row
+            .saturating_sub(drag.area.y)
+            .min(drag.area.height.saturating_sub(1));
+        let line = crate::components::scrollbar::position_at(
+            drag.area.height,
+            drag.content_len,
+            drag.grab,
+            y,
+            self.scroll_line(drag.owner),
+        );
+        let owner = drag.owner;
+        self.scroll_owner_to(owner, line);
+    }
+
+    pub(super) fn validate_scroll_drag(&mut self) -> Dirty {
+        let invalid = self.scroll_drag.as_ref().is_some_and(|drag| {
+            drag.chat != self.resolve_render_chat()
+                || self
+                    .hits
+                    .rect_of(ClickTarget::Scrollbar(drag.owner))
+                    .is_none_or(|rect| rect != drag.area)
+                || self.scroll_content_len(drag.owner) != Some(drag.content_len)
+                || (drag.area.y..drag.area.bottom()).any(|row| {
+                    self.hits.target_at(Position::new(drag.area.x, row))
+                        != Some(ClickTarget::Scrollbar(drag.owner))
+                })
+        });
+        if invalid {
+            self.scroll_drag = None;
+            Dirty::YES
+        } else {
+            Dirty::NO
+        }
     }
 
     pub(super) fn handle_scroll(&mut self, column: u16, row: u16, delta: i32) {

@@ -37,8 +37,8 @@ use maki_agent::session_coordinator::{
     builtin_option_definitions, canonical_directory, publication_claim,
 };
 use maki_agent::session_options::{
-    ENABLED_VALUE, FAST_OPTION_ID, SessionOptionOwner, SessionOptionsSnapshot, THINKING_OPTION_ID,
-    WORKFLOW_OPTION_ID, YOLO_OPTION_ID,
+    DISABLED_VALUE, ENABLED_VALUE, FAST_OPTION_ID, SessionOptionOwner, SessionOptionsSnapshot,
+    THINKING_OPTION_ID, WORKFLOW_OPTION_ID, YOLO_OPTION_ID,
 };
 use maki_agent::tools::offload::OffloadStore;
 use maki_agent::{
@@ -3484,6 +3484,9 @@ impl<'t> EventLoop<'t> {
             Action::ToggleSessionOption { id } => {
                 dispatch_option_toggle(&self.sessions[idx], id, &self.internal_tx);
             }
+            Action::SetSessionOption { id, enabled } => {
+                dispatch_option_change(&self.sessions[idx], id, Some(enabled), &self.internal_tx);
+            }
             Action::ChangeDirectory(path) => {
                 let result = self
                     .selected_target(idx)
@@ -4597,6 +4600,15 @@ fn dispatch_option_toggle(
     id: &'static str,
     internal_tx: &flume::Sender<InternalEvent>,
 ) {
+    dispatch_option_change(runtime, id, None, internal_tx);
+}
+
+fn dispatch_option_change(
+    runtime: &SessionRuntime,
+    id: &'static str,
+    enabled: Option<bool>,
+    internal_tx: &flume::Sender<InternalEvent>,
+) {
     let session = runtime.id();
     let identity = runtime.handles.identity();
     let coordinator = runtime.coordinator.clone();
@@ -4604,15 +4616,27 @@ fn dispatch_option_toggle(
     let slot = Arc::clone(&committed);
     let internal_tx = internal_tx.clone();
     smol::spawn(async move {
-        // A toggle prepares nothing, so it has no preparation to bound; it
-        // waits its turn behind other changes like any config change.
-        let result = coordinator
-            .toggle_boolean_option(id)
-            .await
-            .map(|(enabled, _)| {
-                *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(enabled);
-            })
-            .map_err(|error| error.to_string());
+        let result = match enabled {
+            Some(enabled) => coordinator
+                .set_option(
+                    id,
+                    if enabled {
+                        ENABLED_VALUE
+                    } else {
+                        DISABLED_VALUE
+                    },
+                )
+                .await
+                .map(|_| enabled),
+            None => coordinator
+                .toggle_boolean_option(id)
+                .await
+                .map(|(enabled, _)| enabled),
+        }
+        .map(|enabled| {
+            *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(enabled);
+        })
+        .map_err(|error| error.to_string());
         let _ = internal_tx.send(InternalEvent::SessionOp {
             session,
             runtime: identity,
@@ -4886,6 +4910,40 @@ mod tests {
             );
             drop(pending);
             release_runtime(runtime);
+        });
+    }
+
+    #[test_case(true ; "set_yolo")]
+    #[test_case(false ; "set_normal")]
+    fn permission_selection_sets_session_option_without_toggling(enabled: bool) {
+        smol::block_on(async {
+            let runtime = test_runtime(model_named("test-model"));
+            let untouched = test_runtime(model_named("test-model"));
+            let untouched_snapshot = untouched.coordinator.read().options();
+            let (internal_tx, internal_rx) = flume::unbounded();
+            for _ in 0..2 {
+                dispatch_option_change(&runtime, YOLO_OPTION_ID, Some(enabled), &internal_tx);
+                let InternalEvent::SessionOp {
+                    kind: SessionOpKind::OptionToggled { committed, .. },
+                    result,
+                    ..
+                } = internal_rx.recv_async().await.unwrap()
+                else {
+                    panic!("expected option selection completion");
+                };
+                result.unwrap();
+                assert_eq!(committed.lock().unwrap().take(), Some(enabled));
+            }
+            let mut session = (*runtime.app.state.session).clone();
+            let snapshot = runtime.coordinator.read().options();
+            apply_options_to_session(&mut session, &snapshot);
+            assert_eq!(session.meta.yolo, Some(enabled));
+            assert_eq!(
+                untouched.coordinator.read().options().options,
+                untouched_snapshot.options,
+            );
+            release_runtime(runtime);
+            release_runtime(untouched);
         });
     }
 

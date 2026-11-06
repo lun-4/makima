@@ -353,6 +353,18 @@ impl Chat {
         self.messages_panel.scroll_top()
     }
 
+    pub fn scrollbar_hit(&self) -> Option<crate::components::scrollbar::ScrollbarHit> {
+        self.messages_panel.scrollbar_hit()
+    }
+
+    pub fn content_len(&self) -> u16 {
+        self.messages_panel.content_len()
+    }
+
+    pub fn scroll_to_line(&mut self, line: u16) {
+        self.messages_panel.scroll_to_line(line);
+    }
+
     pub fn segment_heights(&self) -> Vec<u16> {
         self.messages_panel.segment_heights()
     }

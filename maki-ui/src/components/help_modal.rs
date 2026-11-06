@@ -4,7 +4,7 @@ use crate::components::keybindings::{
     ALT_SEP, KEYBINDS, KeybindContext, ResolvedLabel, all_contexts, key,
 };
 use crate::components::modal::Modal;
-use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::scrollbar::{ScrollbarHit, render_vertical_scrollbar};
 use crate::theme;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -27,6 +27,7 @@ const INPUT_PREFIXES: &[(&str, &str)] = &[
 pub struct HelpModal {
     open: bool,
     scroll: ModalScroll,
+    scrollbar_hit: Option<ScrollbarHit>,
 }
 
 fn key_spans(label: ResolvedLabel, pad: usize, prefix: &str) -> Vec<Span<'static>> {
@@ -82,6 +83,7 @@ impl HelpModal {
         Self {
             open: false,
             scroll: ModalScroll::new_top(),
+            scrollbar_hit: None,
         }
     }
 
@@ -103,6 +105,22 @@ impl HelpModal {
         self.scroll.scroll(delta);
     }
 
+    pub fn scroll_to_line(&mut self, line: u16) {
+        self.scroll.scroll_to(line);
+    }
+
+    pub fn scrollbar_hit(&self) -> Option<ScrollbarHit> {
+        self.scrollbar_hit
+    }
+
+    pub fn content_len(&self) -> u16 {
+        self.scroll.content_len()
+    }
+
+    pub fn scroll_line(&self) -> u16 {
+        self.scroll.offset()
+    }
+
     pub fn handle_key(&mut self, key_event: KeyEvent) -> bool {
         let close = key_event.code == KeyCode::Esc
             || key::HELP.matches(key_event)
@@ -116,6 +134,7 @@ impl HelpModal {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        self.scrollbar_hit = None;
         if !self.open {
             return Rect::default();
         }
@@ -215,7 +234,7 @@ impl HelpModal {
         frame.render_widget(paragraph, inner);
 
         if total > viewport_h {
-            render_vertical_scrollbar(frame, inner, total, scroll);
+            self.scrollbar_hit = render_vertical_scrollbar(frame, inner, total, scroll);
         }
 
         popup
