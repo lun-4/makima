@@ -15,7 +15,7 @@ use maki_agent::actor::HistoryChange;
 use maki_agent::agent::estimate_message_tokens;
 use maki_agent::command::{CommandScope, CustomCommand};
 use maki_agent::permissions::PermissionManager;
-use maki_agent::tools::{TASK_SPAWN_TOOL_NAME, cli_tool_ctx};
+use maki_agent::tools::{TASK_SPAWN_TOOL_NAME, ToolRegistry, cli_tool_ctx};
 use maki_agent::{
     ActorBackend, AgentId, AgentInput, AgentManagerHandle, AgentMode, AgentRef, BackendResult,
     DoneReason, EffectiveAgentConfig, History, HistorySnapshot, ImageMediaType, McpConfigErrors,
@@ -7573,29 +7573,49 @@ fn plan_submit_builtin_empty_file_does_not_show_form() {
     assert!(app.status_bar.flash_text().is_some());
 }
 
-#[test]
-fn plan_submit_mode_disables_auto_open() {
-    let registry = maki_agent::ModeRegistry::builtin();
-    registry
+#[test_case(None, true, &[], &[], false; "inherited_registered")]
+#[test_case(None, false, &[], &[], true; "inherited_absent")]
+#[test_case(None, true, &["write"], &[], true; "inherited_allowlist_excluded")]
+#[test_case(None, true, &[], &[PLAN_SUBMIT_TOOL], true; "inherited_disabled")]
+#[test_case(Some(vec![PLAN_SUBMIT_TOOL]), true, &[], &[], false; "explicit_registered")]
+#[test_case(Some(vec![PLAN_SUBMIT_TOOL]), false, &[], &[], true; "explicit_absent")]
+#[test_case(Some(vec![PLAN_SUBMIT_TOOL]), true, &[], &[PLAN_SUBMIT_TOOL], true; "explicit_disabled")]
+#[test_case(Some(vec!["write"]), true, &[], &[], true; "explicit_excluded")]
+#[test_case(Some(vec![]), true, &[], &[], true; "explicit_empty")]
+fn plan_submit_availability_gates_auto_open(
+    tools: Option<Vec<&str>>,
+    registered: bool,
+    allowed_tools: &[&str],
+    disabled_tools: &[&str],
+    expect_form: bool,
+) {
+    let host = maki_lua::PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    if registered {
+        host.load_source(
+            "plan_submit_tool",
+            include_str!("../../../plugins/plan_submit_tool/init.lua"),
+        )
+        .unwrap();
+    }
+    host.mode_registry()
         .define(ModeDefSpec {
             name: "plan".into(),
-            tools: Some(vec!["plan_submit".into()]),
+            tools: tools.map(|tools| tools.into_iter().map(String::from).collect()),
             ..Default::default()
         })
         .unwrap();
 
-    let mut app = test_app();
-    commit_root_config(
-        &app,
-        maki_agent::actor::ConfigChange::Mode {
-            mode: AgentMode::Plan("/tmp/plans/test.md".into()),
-            mode_def: registry.get(&maki_agent::ModeId::Plan),
+    let mut app = streaming_app();
+    app.tool_filter = ToolFilter::from_config(
+        &AgentConfig {
+            allowed_tools: allowed_tools.iter().map(|name| (*name).into()).collect(),
+            disabled_tools: disabled_tools.iter().map(|name| (*name).into()).collect(),
+            ..Default::default()
         },
+        &app.root_config().model,
+        &[],
     );
-    app.lua_event_handle =
-        maki_lua::EventHandle::disconnected_for_test_with_modes(Arc::new(registry));
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    app.lua_event_handle = host.event_handle();
     set_root_mode(&mut app, Mode::Plan);
     app.state.plan = PlanState::Drafting(PathBuf::from("/tmp/plans/test.md"));
 
@@ -7607,8 +7627,8 @@ fn plan_submit_mode_disables_auto_open() {
         annotation: None,
         written_path: Some("/tmp/plans/test.md".into()),
     }))));
-    assert!(!app.plan_form.is_visible());
-    assert!(!app.state.plan.is_ready());
+    assert_eq!(app.plan_form.is_visible(), expect_form);
+    assert_eq!(app.state.plan.is_ready(), expect_form);
 }
 
 #[test_case(1, true ; "clear_and_implement")]

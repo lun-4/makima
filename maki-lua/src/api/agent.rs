@@ -1079,10 +1079,6 @@ impl SessionParent {
         dispatch_ctx(lua, ctx, "session").cloned()
     }
 
-    fn restricts_writes(&self) -> bool {
-        self.context.restrict_write_to().is_some()
-    }
-
     fn revalidate(&self, lua: &Lua, ctx: &LuaCtx) -> Result<(), String> {
         ctx.validate_origin(lua)?;
         if let Some(current) = &self.managed_turn {
@@ -1168,7 +1164,7 @@ impl SessionOptions {
             .get::<Option<bool>>("inherit_provider")?
             .unwrap_or(false);
         let fast = selection.fast.unwrap_or(parent.context.opts.fast);
-        let mcp = opts.get::<Option<bool>>("mcp")?.unwrap_or(true) && !parent.restricts_writes();
+        let mcp = opts.get::<Option<bool>>("mcp")?.unwrap_or(true);
         let silent = opts.get::<Option<bool>>("silent")?.unwrap_or(false);
         let auto_deliver = opts.get::<Option<bool>>("auto_deliver")?.unwrap_or(true);
         let showable = if silent {

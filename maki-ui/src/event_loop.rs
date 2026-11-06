@@ -1399,6 +1399,7 @@ impl SpawnCtx {
         let coordinator_config = config.clone();
         let mut app = App::prepare(
             config.clone(),
+            &self.config,
             session.clone(),
             self.storage.clone(),
             self.catalog.specs(),

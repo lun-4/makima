@@ -3313,7 +3313,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_hides_mcp_tools() {
+    fn plan_mode_advertises_mcp_search_and_loaded_tools() {
         let mut history = History::new(Vec::new());
         let (mut agent, _rx) = make_agent(MockProvider::new(vec![]), &mut history);
         agent.mode = AgentMode::Plan(PathBuf::from("/tmp/plan"));
@@ -3322,18 +3322,25 @@ mod tests {
             "srv.probe",
             "probe",
         )]));
+        agent.turn_bindings = Arc::new(TurnToolBindings::capture(
+            &agent.registry,
+            &agent.local_tools,
+            agent.mcp.as_ref(),
+        ));
         admit(&mut agent);
-        let names: Vec<String> = agent
-            .request_tools()
-            .unwrap()
+        let tools = agent.request_tools().unwrap();
+        let names = tool_names(tools.as_ref());
+        assert!(names.contains(&crate::mcp::TOOL_SEARCH_TOOL_NAME));
+        assert!(!names.contains(&"srv__probe"));
+        agent
+            .mcp
             .as_ref()
-            .as_array()
             .unwrap()
-            .iter()
-            .filter_map(|definition| definition.get("name").and_then(Value::as_str))
-            .map(str::to_owned)
-            .collect();
-        assert!(!names.contains(&"srv__probe".to_owned()));
+            .search_tools("probe", crate::tools::CallOrigin::Model)
+            .unwrap();
+        let tools = agent.request_tools().unwrap();
+        let names = tool_names(tools.as_ref());
+        assert!(names.contains(&"srv__probe"));
     }
 
     #[test]
