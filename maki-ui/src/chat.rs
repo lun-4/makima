@@ -13,7 +13,7 @@ use crate::markdown::truncate_output;
 use crate::selection::Selection;
 use maki_agent::tools::{ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use maki_agent::{
-    AgentEvent, BufferSnapshot, PostLevel, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    AgentEvent, AgentId, BufferSnapshot, PostLevel, ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
 use maki_lua::WinView;
@@ -61,7 +61,8 @@ pub struct Chat {
     pub model_id: Option<String>,
     /// Compatibility identity retained for display and persistence.
     pub subagent_id: Option<String>,
-    pub agent_id: Option<maki_agent::AgentId>,
+    pub agent_id: Option<AgentId>,
+    pub(crate) parent_agent_id: Option<AgentId>,
     /// A subagent's own settings; `None` on the main chat, which reads the
     /// session's.
     pub opts: Option<maki_providers::RequestOptions>,
@@ -86,6 +87,7 @@ impl Chat {
             model_id: None,
             subagent_id: None,
             agent_id: None,
+            parent_agent_id: None,
             opts: None,
             pending_turn_usage: None,
             messages_panel: MessagesPanel::new(ui_config, lua_event_handle, theme_provider),
