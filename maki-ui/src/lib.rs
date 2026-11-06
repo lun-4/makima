@@ -38,6 +38,7 @@ mod event_loop;
 mod input;
 mod plan_approval;
 mod terminal;
+mod terminal_da;
 
 use std::time::Instant;
 
