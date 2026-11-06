@@ -9,8 +9,8 @@ pub mod selection;
 pub use post::{POST_LEVELS, Post, PostLevel};
 
 pub use selection::{
-    FAST_VALUES, MODEL_FAST_KEY, MODEL_OPTION_KEYS, MODEL_SPEC_KEY, MODEL_THINKING_KEY,
-    ModelSelection, ModelSelectionError, parse_fast, parse_thinking,
+    FAST_VALUES, MODEL_FAST_KEY, MODEL_SPEC_KEY, MODEL_THINKING_KEY, ModelOption, ModelSelection,
+    ModelSelectionError, parse_fast, parse_thinking,
 };
 
 pub use maki_thinking::{

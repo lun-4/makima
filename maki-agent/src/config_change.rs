@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::{Arc, MutexGuard};
 
 use maki_config::ModelPolicy;
+use maki_domain::ModelSelection;
 use maki_providers::Model;
 use maki_storage::StateDir;
 use maki_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
@@ -330,6 +331,20 @@ pub async fn prepare_patch(
         patch.model = Some(prepare_model(spec, policy, prepare).await?);
     }
     Ok(patch)
+}
+
+pub async fn prepare_selection(
+    selection: &ModelSelection,
+    policy: &ModelPolicy,
+    prepare: &ModelPreparer,
+) -> Result<ConfigPatch, ConfigChangeError> {
+    prepare_patch(
+        ConfigPatch::from_model_selection(selection),
+        selection.spec.as_deref(),
+        policy,
+        prepare,
+    )
+    .await
 }
 
 #[cfg(test)]

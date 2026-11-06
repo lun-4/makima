@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
 use maki_config::ModelPolicy;
+use maki_domain::ModelSelection;
 use maki_providers::{Message, Model, ThinkingConfig};
 use maki_storage::checkpoint::{
     CheckpointClaim, CheckpointError, CheckpointFuture, CheckpointPublication, CheckpointRequest,
@@ -878,14 +879,10 @@ impl SessionCoordinatorHandle {
 
     pub async fn set_model(
         &self,
-        spec: Option<Arc<str>>,
-        fast: Option<bool>,
-        thinking: Option<ThinkingConfig>,
+        selection: ModelSelection,
     ) -> Result<SessionOptionsSnapshot, ConfigChangeError> {
         self.set_model_with_claim(
-            spec,
-            fast,
-            thinking,
+            selection,
             CheckpointPublication::default(),
             publication_claim(),
         )
@@ -894,18 +891,17 @@ impl SessionCoordinatorHandle {
 
     pub async fn set_model_with_claim(
         &self,
-        spec: Option<Arc<str>>,
-        fast: Option<bool>,
-        thinking: Option<ThinkingConfig>,
+        selection: ModelSelection,
         publication: CheckpointPublication,
         claim: CheckpointClaim,
     ) -> Result<SessionOptionsSnapshot, ConfigChangeError> {
-        let patch = ConfigPatch {
-            fast,
-            thinking,
-            ..Default::default()
-        };
-        self.commit_patch(spec, patch, publication, claim).await
+        self.commit_patch(
+            selection.spec.clone(),
+            ConfigPatch::from_model_selection(&selection),
+            publication,
+            claim,
+        )
+        .await
     }
 
     pub async fn change_directory(&self, path: PathBuf) -> Result<PathBuf, ConfigChangeError> {
@@ -2124,7 +2120,10 @@ mod tests {
                 .unwrap()
                 .reserve_prepared_operation(None)
                 .unwrap();
-            let mut mutation = Box::pin(second.set_model(None, Some(false), None));
+            let mut mutation = Box::pin(second.set_model(ModelSelection {
+                fast: Some(false),
+                ..Default::default()
+            }));
             assert!(
                 futures_lite::future::poll_once(mutation.as_mut())
                     .await
@@ -2178,9 +2177,12 @@ mod tests {
                     ));
                 }
                 assert!(
-                    futures_lite::future::poll_once(first.set_model(None, Some(false), None))
-                        .await
-                        .is_none()
+                    futures_lite::future::poll_once(first.set_model(ModelSelection {
+                        fast: Some(false),
+                        ..Default::default()
+                    }))
+                    .await
+                    .is_none()
                 );
                 if close {
                     let (rollback_tx, rollback_rx) = flume::bounded(1);
@@ -2523,7 +2525,11 @@ mod tests {
             let agent = bind(&coordinator, Arc::clone(&installed));
             let before = coordinator.read().options();
             let result = coordinator
-                .set_model(Some(Arc::from(NEW)), Some(false), Some(ThinkingConfig::Off))
+                .set_model(ModelSelection {
+                    spec: Some(Arc::from(NEW)),
+                    fast: Some(false),
+                    thinking: Some(ThinkingConfig::Off),
+                })
                 .await;
             if fail {
                 assert!(result.is_err());
@@ -2618,9 +2624,10 @@ mod tests {
                 async move {
                     coordinator
                         .set_model_with_claim(
-                            Some(Arc::from(NEW)),
-                            None,
-                            None,
+                            ModelSelection {
+                                spec: Some(Arc::from(NEW)),
+                                ..Default::default()
+                            },
                             CheckpointPublication::default(),
                             claim,
                         )
@@ -2722,9 +2729,10 @@ mod tests {
                 async move {
                     coordinator
                         .set_model_with_claim(
-                            Some(Arc::from(NEW)),
-                            None,
-                            None,
+                            ModelSelection {
+                                spec: Some(Arc::from(NEW)),
+                                ..Default::default()
+                            },
                             publication,
                             publication_claim(),
                         )
@@ -2830,7 +2838,10 @@ mod tests {
             coordinator.set_option("test.choice", "b").await.unwrap();
             let before = coordinator.read().options();
             let after = coordinator
-                .set_model(Some(Arc::from(NEW)), None, None)
+                .set_model(ModelSelection {
+                    spec: Some(Arc::from(NEW)),
+                    ..Default::default()
+                })
                 .await
                 .unwrap();
             for id in [YOLO_OPTION_ID, "test.choice"] {
@@ -2908,9 +2919,16 @@ mod tests {
         });
     }
 
-    #[test_case(FAST_TIER_TARGET, FAST_OPTION_ID, DISABLED_VALUE; "model_change_disables_fast")]
-    #[test_case(NO_THINKING_TARGET, THINKING_OPTION_ID, THINKING_OFF; "model_change_disables_thinking")]
-    fn model_change_clamps_unsupported_settings(target: &str, id: &str, expected: &str) {
+    #[test_case(FAST_TIER_TARGET, FAST_OPTION_ID, DISABLED_VALUE, false; "model_change_disables_fast")]
+    #[test_case(NO_THINKING_TARGET, THINKING_OPTION_ID, THINKING_OFF, false; "model_change_disables_thinking")]
+    #[test_case(FAST_TIER_TARGET, FAST_OPTION_ID, DISABLED_VALUE, true; "selection_disables_fast")]
+    #[test_case(NO_THINKING_TARGET, THINKING_OPTION_ID, THINKING_OFF, true; "selection_disables_thinking")]
+    fn model_change_clamps_unsupported_settings(
+        target: &str,
+        id: &str,
+        expected: &str,
+        structured: bool,
+    ) {
         smol::block_on(async {
             let mut params = params(MakiId::generate(), writer(false));
             params.definitions = builtin_option_definitions(
@@ -2928,10 +2946,17 @@ mod tests {
             config.settings.thinking = ThinkingConfig::Effort(Effort::High);
             let agent = bind_config(&coordinator, config, Arc::default());
             let before = coordinator.read().options();
-            let after = coordinator
-                .set_option(MODEL_OPTION_ID, target)
-                .await
-                .unwrap();
+            let after = if structured {
+                coordinator
+                    .set_model(ModelSelection {
+                        spec: Some(target.into()),
+                        ..Default::default()
+                    })
+                    .await
+            } else {
+                coordinator.set_option(MODEL_OPTION_ID, target).await
+            }
+            .unwrap();
             assert_eq!(after.version, before.version + 1);
             let value = |id: &str| {
                 after
@@ -3006,8 +3031,14 @@ mod tests {
                     .reserve_transaction(CheckpointPublication::default())
                     .unwrap()
             });
-            let mut first = Box::pin(coordinator.set_model(Some(Arc::from(NEW)), None, None));
-            let mut second = Box::pin(coordinator.set_model(Some(Arc::from(OLD)), None, None));
+            let mut first = Box::pin(coordinator.set_model(ModelSelection {
+                spec: Some(Arc::from(NEW)),
+                ..Default::default()
+            }));
+            let mut second = Box::pin(coordinator.set_model(ModelSelection {
+                spec: Some(Arc::from(OLD)),
+                ..Default::default()
+            }));
             assert!(futures_lite::future::poll_once(&mut first).await.is_none());
             assert!(futures_lite::future::poll_once(&mut second).await.is_none());
             drop((guard, lease));
@@ -3041,7 +3072,10 @@ mod tests {
             let agent = bind(&coordinator, Arc::new(Mutex::new(Vec::new())));
             let initial = option_value(&coordinator, id);
             let guard = agent.actor().unwrap().prepare_idle().unwrap();
-            let mut model = Box::pin(coordinator.set_model(Some(Arc::from(NEW)), None, None));
+            let mut model = Box::pin(coordinator.set_model(ModelSelection {
+                spec: Some(Arc::from(NEW)),
+                ..Default::default()
+            }));
             let mut first = Box::pin(coordinator.toggle_boolean_option(id));
             let mut second = Box::pin(coordinator.toggle_boolean_option(id));
             assert!(futures_lite::future::poll_once(&mut model).await.is_none());
@@ -3068,7 +3102,10 @@ mod tests {
             let agent = bind(&coordinator, Arc::new(Mutex::new(Vec::new())));
             let guard = agent.actor().unwrap().prepare_idle().unwrap();
             let version = coordinator.read().options().version;
-            let mut model = Box::pin(coordinator.set_model(Some(Arc::from(NEW)), None, None));
+            let mut model = Box::pin(coordinator.set_model(ModelSelection {
+                spec: Some(Arc::from(NEW)),
+                ..Default::default()
+            }));
             let mut set = Box::pin(coordinator.set_option_if_version(
                 WORKFLOW_OPTION_ID,
                 ENABLED_VALUE,
@@ -3097,7 +3134,10 @@ mod tests {
             let installed = Arc::new(Mutex::new(Vec::new()));
             let agent = bind(&coordinator, Arc::clone(&installed));
             let _guard = agent.actor().unwrap().prepare_idle().unwrap();
-            let mut change = Box::pin(coordinator.set_model(Some(Arc::from(NEW)), None, None));
+            let mut change = Box::pin(coordinator.set_model(ModelSelection {
+                spec: Some(Arc::from(NEW)),
+                ..Default::default()
+            }));
             assert!(futures_lite::future::poll_once(&mut change).await.is_none());
             agent.close_subtree().unwrap();
             assert!(change.await.is_err());

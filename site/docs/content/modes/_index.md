@@ -36,13 +36,13 @@ When a plan is ready, the plan form opens below the chat. It has three actions:
 
 Space toggles parallel implementation, which asks the agent to split the work across subagents. Ctrl+O opens the plan in your editor. Esc hides the form, and Ctrl+T shows or hides it.
 
-The `Implementation model` row shows the model that will do the work. It starts as the current session model. Press Enter on that row to pick another one. Picking a model here does not change the session model yet. When a different model is picked, a `Use current model` row lets you go back. Your pick stays while you refine or edit the plan, and goes away when you leave plan mode. The [keybindings](/docs/keybindings/#form) page lists every key in the form.
+The `Implementation model` row shows the model that will do the work. It starts as the current session model. Press Enter on that row to open the [model picker](/docs/providers/#model-picker), where you can pick another model and set its thinking and fast options. Nothing changes for the session yet. Once you pick something, a `Use current model` row lets you go back. Options you leave alone follow whatever the agent uses at approval. Your pick stays while you refine or edit the plan, and goes away when you leave plan mode or the agent starts a new plan. The [keybindings](/docs/keybindings/#form) page lists every key in the form.
 
 Approval needs planning work to be finished. If the agent or one of its subagents is still running, Makima asks you to try again later and leaves that work running. While approval is getting ready, the form is locked. Esc cancels it and gives you the form back as it was.
 
 Approval is strict about the handoff turn's setup. If collecting prompt slots fails, say because a plugin stopped, the implementation cannot start and you get the form back. A turn you send yourself in that situation keeps going with default slots and a warning in the log, because planning should not lose its turn to a broken plugin.
 
-After approval, the picked model becomes the session model and the agent starts implementing. The agent gets the plan text as it was at approval, so later edits to the file do not change the task. Cancelling from here stops the implementation like any other turn. It does not bring back the planning session or the old model.
+After approval, the picked model and options become the session's settings in one step, and the agent starts implementing. If the model is not allowed or does not support an option you turned on, approval stops and you get the form back. The agent gets the plan text as it was at approval, so later edits to the file do not change the task. Cancelling from here stops the implementation like any other turn. It does not bring back the planning session or the old model.
 
 ## Configuration changes
 

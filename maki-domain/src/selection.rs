@@ -1,4 +1,4 @@
-use crate::ThinkingConfig;
+use crate::{THINKING_OPTIONS, ThinkingConfig};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::sync::Arc;
 use thiserror::Error;
@@ -6,7 +6,6 @@ use thiserror::Error;
 pub const MODEL_SPEC_KEY: &str = "spec";
 pub const MODEL_THINKING_KEY: &str = "thinking";
 pub const MODEL_FAST_KEY: &str = "fast";
-pub const MODEL_OPTION_KEYS: [&str; 2] = [MODEL_THINKING_KEY, MODEL_FAST_KEY];
 pub const FAST_VALUES: [&str; 2] = ["true", "false"];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -20,6 +19,77 @@ pub struct ModelSelection {
     pub thinking: Option<ThinkingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fast: Option<bool>,
+}
+
+/// The options a [`ModelSelection`] can override besides the model itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelOption {
+    Thinking,
+    Fast,
+}
+
+impl ModelOption {
+    pub const ALL: [Self; 2] = [Self::Thinking, Self::Fast];
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|option| option.key() == key)
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Thinking => MODEL_THINKING_KEY,
+            Self::Fast => MODEL_FAST_KEY,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Thinking => "Thinking",
+            Self::Fast => "Fast",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Thinking => "Reasoning effort used for future requests",
+            Self::Fast => "Use the model's fast service tier",
+        }
+    }
+
+    pub fn presets(self) -> &'static [&'static str] {
+        match self {
+            Self::Thinking => &THINKING_OPTIONS,
+            Self::Fast => &FAST_VALUES,
+        }
+    }
+
+    /// Whether values outside [`Self::presets`] are accepted, such as token budgets.
+    pub fn accepts_free_input(self) -> bool {
+        match self {
+            Self::Thinking => true,
+            Self::Fast => false,
+        }
+    }
+
+    pub fn get(self, selection: &ModelSelection) -> Option<String> {
+        match self {
+            Self::Thinking => selection.thinking.map(|value| value.to_string()),
+            Self::Fast => selection.fast.map(|value| value.to_string()),
+        }
+    }
+
+    /// Parses `value` into `selection`; `None` clears the override.
+    pub fn set(
+        self,
+        selection: &mut ModelSelection,
+        value: Option<&str>,
+    ) -> Result<(), ModelSelectionError> {
+        match self {
+            Self::Thinking => selection.thinking = value.map(parse_thinking).transpose()?,
+            Self::Fast => selection.fast = value.map(parse_fast).transpose()?,
+        }
+        Ok(())
+    }
 }
 
 /// Structured input goes through the same `set_spec` and `set_option`
@@ -104,19 +174,20 @@ impl ModelSelection {
     }
 
     pub fn set_option(&mut self, key: &str, value: &str) -> Result<(), ModelSelectionError> {
-        match key {
-            MODEL_THINKING_KEY if self.thinking.is_none() => {
-                self.thinking = Some(parse_thinking(value)?);
-            }
-            MODEL_FAST_KEY if self.fast.is_none() => {
-                self.fast = Some(parse_fast(value)?);
-            }
-            MODEL_THINKING_KEY | MODEL_FAST_KEY => {
-                return Err(ModelSelectionError::Duplicate(key.into()));
-            }
-            _ => return Err(ModelSelectionError::Unknown(key.into())),
+        let option =
+            ModelOption::from_key(key).ok_or_else(|| ModelSelectionError::Unknown(key.into()))?;
+        if option.get(self).is_some() {
+            return Err(ModelSelectionError::Duplicate(key.into()));
         }
-        Ok(())
+        option.set(self, Some(value))
+    }
+
+    pub fn has_option_overrides(&self) -> bool {
+        self.thinking.is_some() || self.fast.is_some()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.spec.is_none() && !self.has_option_overrides()
     }
 }
 
@@ -181,7 +252,9 @@ mod optional_thinking {
 
 #[cfg(test)]
 mod tests {
-    use super::{MODEL_FAST_KEY, MODEL_THINKING_KEY, ModelSelection, ModelSelectionError};
+    use super::{
+        MODEL_FAST_KEY, MODEL_THINKING_KEY, ModelOption, ModelSelection, ModelSelectionError,
+    };
     use serde_json::{Value, json};
     use test_case::test_case;
 
@@ -222,5 +295,16 @@ mod tests {
     #[test]
     fn structured_input_rejects_unknown_keys() {
         assert!(serde_json::from_value::<ModelSelection>(json!({"model_spec": "a/b"})).is_err());
+    }
+
+    #[test_case(ModelOption::Thinking, "on", "adaptive"; "thinking_alias_is_canonical")]
+    #[test_case(ModelOption::Thinking, "2048", "2048"; "thinking_budget")]
+    #[test_case(ModelOption::Fast, "false", "false"; "explicit_disabled_fast")]
+    fn option_set_get_round_trips_canonically(option: ModelOption, value: &str, expected: &str) {
+        let mut selection = ModelSelection::default();
+        option.set(&mut selection, Some(value)).unwrap();
+        assert_eq!(option.get(&selection).as_deref(), Some(expected));
+        option.set(&mut selection, None).unwrap();
+        assert!(selection.is_empty());
     }
 }
