@@ -2,7 +2,6 @@ use shell_words::split;
 use std::io::{Write, stdout};
 use std::path::Path;
 use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use color_eyre::Result;
@@ -45,14 +44,12 @@ struct TerminalEnvironment<'a> {
     wezterm: bool,
     iterm: bool,
     kitty: bool,
-    windows_terminal: bool,
     term: Option<&'a str>,
 }
 
 struct TmuxClient {
     term_type: String,
     term_name: String,
-    passthrough: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,12 +86,6 @@ impl TerminalNotifier {
 }
 
 fn detect_osc9_support() -> bool {
-    detect_terminal_support(|env, _, tmux| auto_supports_osc9(env, tmux))
-}
-
-fn detect_terminal_support(
-    supports: impl FnOnce(&TerminalEnvironment<'_>, TerminalMux, Option<&TmuxClient>) -> bool,
-) -> bool {
     let term_program = std::env::var("TERM_PROGRAM").ok();
     let term = std::env::var("TERM").ok();
     let env = TerminalEnvironment {
@@ -104,79 +95,13 @@ fn detect_terminal_support(
             || std::env::var_os("ITERM_PROFILE").is_some()
             || std::env::var_os("ITERM_PROFILE_NAME").is_some(),
         kitty: std::env::var_os("KITTY_WINDOW_ID").is_some(),
-        windows_terminal: std::env::var_os("WT_SESSION").is_some(),
         term: term.as_deref(),
     };
-    let mux = TerminalMux::detect();
-    let tmux = (mux == TerminalMux::Tmux
-        || env
-            .term_program
-            .is_some_and(|value| normalize_terminal_id(value) == "tmux"))
-    .then(query_tmux_client)
-    .flatten();
-    supports(&env, mux, tmux.as_ref())
-}
-
-pub(crate) fn supports_osc52() -> bool {
-    static SUPPORTS_OSC52: OnceLock<bool> = OnceLock::new();
-    *SUPPORTS_OSC52.get_or_init(|| detect_terminal_support(auto_supports_osc52))
-}
-
-fn terminal_supports_osc52(value: &str) -> bool {
-    matches!(
-        normalize_terminal_id(value).as_str(),
-        "alacritty"
-            | "ghostty"
-            | "xtermghostty"
-            | "kitty"
-            | "xtermkitty"
-            | "wezterm"
-            | "iterm"
-            | "iterm2"
-            | "itermapp"
-            | "foot"
-            | "footextra"
-            | "windowsterminal"
-    )
-}
-
-fn auto_supports_osc52(
-    env: &TerminalEnvironment<'_>,
-    mux: TerminalMux,
-    tmux: Option<&TmuxClient>,
-) -> bool {
-    if mux == TerminalMux::Screen {
-        return false;
-    }
-    if mux == TerminalMux::Tmux
-        || env
-            .term_program
-            .is_some_and(|value| normalize_terminal_id(value) == "tmux")
-    {
-        return tmux.is_some_and(|client| {
-            client.passthrough
-                && (client
-                    .term_type
-                    .split_whitespace()
-                    .next()
-                    .is_some_and(terminal_supports_osc52)
-                    || terminal_supports_osc52(&client.term_name))
-        });
-    }
-    if env
-        .term
-        .is_some_and(|term| term.starts_with("screen") || term.starts_with("tmux"))
-    {
-        return false;
-    }
-    if let Some(term_program) = env.term_program.filter(|value| !value.trim().is_empty()) {
-        return terminal_supports_osc52(term_program);
-    }
-    env.wezterm
-        || env.iterm
-        || env.kitty
-        || env.windows_terminal
-        || env.term.is_some_and(terminal_supports_osc52)
+    let tmux = env
+        .term_program
+        .filter(|value| normalize_terminal_id(value) == "tmux")
+        .and_then(|_| query_tmux_client());
+    auto_supports_osc9(&env, tmux.as_ref())
 }
 
 fn normalize_terminal_id(value: &str) -> String {
@@ -242,7 +167,7 @@ fn query_tmux_client() -> Option<TmuxClient> {
         .args([
             "display-message",
             "-p",
-            "#{client_termtype}\t#{client_termname}\t#{allow-passthrough}",
+            "#{client_termtype}\t#{client_termname}",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -259,11 +184,10 @@ fn query_tmux_client() -> Option<TmuxClient> {
     }
     let output = child.wait_with_output().ok()?;
     let output = String::from_utf8(output.stdout).ok()?;
-    let mut fields = output.trim_end_matches(['\r', '\n']).split('\t');
+    let (term_type, term_name) = output.trim_end_matches(['\r', '\n']).split_once('\t')?;
     Some(TmuxClient {
-        term_type: fields.next()?.into(),
-        term_name: fields.next()?.into(),
-        passthrough: matches!(fields.next(), Some("on" | "all")),
+        term_type: term_type.into(),
+        term_name: term_name.into(),
     })
 }
 
@@ -486,12 +410,24 @@ pub(crate) fn open_in_editor(
     }
 }
 
-pub(crate) fn copy_to_clipboard(text: &str) -> Result<(), String> {
+pub(crate) fn supports_osc52() -> bool {
+    crate::terminal_image::supports_osc52()
+}
+
+fn clipboard_sequence(text: &str, mux: TerminalMux, advertised: bool) -> Result<String, String> {
     let mut sequence = String::new();
     CopyToClipboard::to_clipboard_from(text)
         .write_ansi(&mut sequence)
         .map_err(|e| e.to_string())?;
-    let sequence = TerminalMux::detect().wrap_for_mux(sequence);
+    Ok(if advertised {
+        sequence
+    } else {
+        mux.wrap_for_mux(sequence)
+    })
+}
+
+pub(crate) fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    let sequence = clipboard_sequence(text, TerminalMux::detect(), supports_osc52())?;
     let mut stdout = stdout().lock();
     stdout
         .write_all(sequence.as_bytes())
@@ -589,75 +525,6 @@ mod tests {
         }
     }
 
-    #[test_case("Ghostty", true; "ghostty")]
-    #[test_case("kitty", true; "kitty")]
-    #[test_case("WezTerm", true; "wezterm")]
-    #[test_case(" iTerm.app ", true; "iterm_normalized")]
-    #[test_case("foot", true; "foot")]
-    #[test_case("Windows Terminal", true; "windows_terminal")]
-    #[test_case("WarpTerminal", false; "osc9_does_not_imply_osc52")]
-    #[test_case("Alacritty", true; "alacritty")]
-    #[test_case("unknown", false; "unknown")]
-    fn osc52_term_program_cases(term_program: &str, expected: bool) {
-        assert_eq!(
-            auto_supports_osc52(&env(Some(term_program)), TerminalMux::None, None),
-            expected
-        );
-    }
-
-    #[test_case(TerminalEnvironment { wezterm: true, ..env(None) }, true; "wezterm_variable")]
-    #[test_case(TerminalEnvironment { iterm: true, ..env(None) }, true; "iterm_variable")]
-    #[test_case(TerminalEnvironment { kitty: true, ..env(None) }, true; "kitty_variable")]
-    #[test_case(TerminalEnvironment { windows_terminal: true, ..env(None) }, true; "wt_session")]
-    #[test_case(TerminalEnvironment { term: Some("xterm-ghostty"), ..env(None) }, true; "ghostty_term")]
-    #[test_case(TerminalEnvironment { term: Some("xterm-kitty"), ..env(None) }, true; "kitty_term")]
-    #[test_case(TerminalEnvironment { term: Some("foot-extra"), ..env(None) }, true; "foot_term")]
-    #[test_case(TerminalEnvironment { term: Some("alacritty"), ..env(None) }, true; "alacritty_term")]
-    #[test_case(TerminalEnvironment { term: Some("xterm-256color"), ..env(None) }, false; "generic_term")]
-    #[test_case(TerminalEnvironment { wezterm: true, ..env(Some("unknown")) }, false; "program_precedes_inherited_variable")]
-    #[test_case(env(None), false; "empty_environment")]
-    fn osc52_environment_cases(terminal: TerminalEnvironment<'_>, expected: bool) {
-        assert_eq!(
-            auto_supports_osc52(&terminal, TerminalMux::None, None),
-            expected
-        );
-    }
-
-    #[test_case(TerminalMux::Screen, "WezTerm", "screen-256color", None, false; "screen_rejects_inherited_program")]
-    #[test_case(TerminalMux::None, "WezTerm", "screen-256color", None, false; "screen_term_without_sty")]
-    #[test_case(TerminalMux::None, "WezTerm", "tmux-256color", None, false; "tmux_term_without_tmux_variable")]
-    #[test_case(TerminalMux::Tmux, "WezTerm", "tmux-256color", None, false; "tmux_rejects_inherited_program")]
-    #[test_case(TerminalMux::Tmux, "tmux", "tmux-256color", Some(("ghostty 1.2.3", "xterm-256color", true)), true; "tmux_known_type")]
-    #[test_case(TerminalMux::Tmux, "WezTerm", "screen-256color", Some(("unknown", "xterm-kitty", true)), true; "tmux_known_name")]
-    #[test_case(TerminalMux::Tmux, "WezTerm", "screen-256color", Some(("unknown", "xterm-256color", true)), false; "tmux_unknown_client")]
-    #[test_case(TerminalMux::Tmux, "WezTerm", "screen-256color", Some(("ghostty", "xterm-ghostty", false)), false; "tmux_passthrough_disabled")]
-    #[test_case(TerminalMux::None, "tmux", "screen-256color", Some(("foot", "foot", true)), true; "tmux_program_queries_client")]
-    #[test_case(TerminalMux::Zellij, "WezTerm", "xterm-256color", None, true; "zellij_known_outer_terminal")]
-    #[test_case(TerminalMux::Zellij, "unknown", "xterm-256color", None, false; "zellij_unknown_outer_terminal")]
-    fn osc52_mux_cases(
-        mux: TerminalMux,
-        term_program: &str,
-        term: &str,
-        client: Option<(&str, &str, bool)>,
-        expected: bool,
-    ) {
-        let terminal = TerminalEnvironment {
-            term_program: Some(term_program),
-            term: Some(term),
-            wezterm: true,
-            ..TerminalEnvironment::default()
-        };
-        let client = client.map(|(term_type, term_name, passthrough)| TmuxClient {
-            term_type: term_type.into(),
-            term_name: term_name.into(),
-            passthrough,
-        });
-        assert_eq!(
-            auto_supports_osc52(&terminal, mux, client.as_ref()),
-            expected
-        );
-    }
-
     #[test]
     fn auto_supports_known_osc9_terminals() {
         for value in ["Ghostty", "iTerm.app", "kitty", "WarpTerminal", "WezTerm"] {
@@ -717,13 +584,11 @@ mod tests {
         let ghostty = TmuxClient {
             term_type: "ghostty 1.2.3".into(),
             term_name: "xterm-256color".into(),
-            passthrough: true,
         };
         assert!(auto_supports_osc9(&terminal, Some(&ghostty)));
         let ghostty_name = TmuxClient {
             term_type: "xterm-256color".into(),
             term_name: "xterm-ghostty".into(),
-            passthrough: true,
         };
         assert!(auto_supports_osc9(&terminal, Some(&ghostty_name)));
         assert!(!auto_supports_osc9(&terminal, None));
@@ -832,6 +697,22 @@ mod tests {
         let payload = "\u{1b}A\u{1b}B\u{1b}C\u{1b}\\";
         let wrapped = TerminalMux::Tmux.wrap_for_mux(payload.to_string());
         assert_eq!(parse_dcs_passthrough(&wrapped, "\u{1b}Ptmux;"), payload);
+    }
+
+    #[test_case(TerminalMux::None, true; "direct_advertised")]
+    #[test_case(TerminalMux::Tmux, true; "tmux_advertised")]
+    #[test_case(TerminalMux::Screen, true; "screen_advertised")]
+    #[test_case(TerminalMux::Tmux, false; "tmux_fallback")]
+    #[test_case(TerminalMux::Screen, false; "screen_fallback")]
+    fn clipboard_transport(mux: TerminalMux, advertised: bool) {
+        const TEXT: &str = "Hello";
+        let sequence = clipboard_sequence(TEXT, mux, advertised).unwrap();
+        let expected = if advertised {
+            OSC52_WITH_ST.to_string()
+        } else {
+            mux.wrap_for_mux(OSC52_WITH_ST.to_string())
+        };
+        assert_eq!(sequence, expected);
     }
 
     #[test]

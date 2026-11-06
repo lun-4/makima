@@ -39,6 +39,8 @@ const PROBE_QUIET: Duration = Duration::from_millis(20);
 #[cfg(unix)]
 const PROBE_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 #[cfg(unix)]
+const MAX_PROBE_BYTES: usize = 64 * 1024;
+#[cfg(unix)]
 const PROBE_KITTY_DIRECT: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
 #[cfg(unix)]
 const PROBE_SENTINELS: &[u8] = b"\x1b[>c\x1b[c\x1b[5n";
@@ -60,9 +62,14 @@ const KITTY_PROBE_DIRECT_REPLY: &[u8] = b"Gi=31;";
 const BEL_BYTE: u8 = 0x07;
 #[cfg(any(unix, test))]
 const ST_BYTES: &[u8] = b"\x1b\\";
+#[cfg(any(unix, test))]
+const SIXEL_DA1_FEATURE: &[u8] = b"4";
+#[cfg(any(unix, test))]
+const OSC52_DA1_FEATURE: &[u8] = b"52";
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 static DECODE_JOBS: OnceLock<flume::Sender<DecodeJob>> = OnceLock::new();
 static DETECTED_GRAPHICS: OnceLock<Option<DetectedGraphics>> = OnceLock::new();
+static OSC52_SUPPORTED: OnceLock<bool> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DetectedGraphics {
@@ -146,20 +153,26 @@ fn is_tmux_detected(buffer: &[u8], env_tmux: bool) -> bool {
 }
 
 #[cfg(any(unix, test))]
-fn has_sixel_da1(buffer: &[u8]) -> (bool, bool) {
-    let mut i = 0;
-    while i < buffer.len() {
-        if buffer[i..].starts_with(b"\x1b[?") {
-            let start = i + 3;
-            if let Some(end_rel) = buffer[start..].iter().position(|&b| b == b'c') {
-                let params = &buffer[start..start + end_rel];
-                let is_sixel = params.split(|&b| b == b';').any(|part| part == b"4");
-                let rest = &buffer[start + end_rel + 1..];
-                let has_sentinel = contains_subslice(rest, DSR_RESPONSE);
-                return (is_sixel, has_sentinel);
-            }
+fn has_da1_feature(buffer: &[u8], feature: &[u8]) -> (bool, bool) {
+    for (offset, prefix) in buffer.windows(3).enumerate() {
+        if prefix != b"\x1b[?" {
+            continue;
         }
-        i += 1;
+        let params = &buffer[offset + prefix.len()..];
+        let Some(end) = params.iter().position(|byte| (0x40..=0x7e).contains(byte)) else {
+            continue;
+        };
+        if params[end] != b'c' {
+            continue;
+        }
+        let parts = params[..end].split(|&byte| byte == b';');
+        if parts
+            .clone()
+            .all(|part| !part.is_empty() && part.iter().all(u8::is_ascii_digit))
+            && parts.skip(1).any(|part| part == feature)
+        {
+            return (true, contains_subslice(&params[end + 1..], DSR_RESPONSE));
+        }
     }
     (false, false)
 }
@@ -195,7 +208,7 @@ pub(crate) fn parse_probe_stream(buffer: &[u8], env_tmux: bool) -> ProbeResult {
         };
     }
 
-    let (is_sixel, sixel_sentinel) = has_sixel_da1(buffer);
+    let (is_sixel, sixel_sentinel) = has_da1_feature(buffer, SIXEL_DA1_FEATURE);
     let dsr_count = count_subslice(buffer, DSR_RESPONSE);
     if is_sixel && sixel_sentinel && (!in_tmux || dsr_count >= 2) {
         return ProbeResult::Detected(DetectedGraphics {
@@ -232,7 +245,7 @@ fn write_probe(bytes: &[u8]) -> Option<()> {
 }
 
 #[cfg(unix)]
-fn drain_stdin(fd: RawFd, deadline: Instant) {
+fn drain_stdin(fd: RawFd, deadline: Instant, buffer: &mut Vec<u8>) {
     while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
         if !wait_readable(fd, remaining.min(PROBE_QUIET)) {
             break;
@@ -242,6 +255,8 @@ fn drain_stdin(fd: RawFd, deadline: Instant) {
         if n <= 0 {
             break;
         }
+        let retained = (n as usize).min(MAX_PROBE_BYTES.saturating_sub(buffer.len()));
+        buffer.extend_from_slice(&discard[..retained]);
     }
 }
 
@@ -271,7 +286,11 @@ pub(crate) fn probe_terminal_graphics(timeout: Duration) -> Option<DetectedGraph
             let n =
                 unsafe { libc::read(libc::STDIN_FILENO, chunk.as_mut_ptr().cast(), chunk.len()) };
             if n > 0 {
-                buf.extend_from_slice(&chunk[..n as usize]);
+                let retained = (n as usize).min(MAX_PROBE_BYTES.saturating_sub(buf.len()));
+                buf.extend_from_slice(&chunk[..retained]);
+                if buf.len() == MAX_PROBE_BYTES {
+                    break;
+                }
                 if !tmux_query_sent && is_tmux_detected(&buf, env_tmux) {
                     tmux_query_sent = write_probe(PROBE_KITTY_TMUX).is_some();
                 }
@@ -291,7 +310,12 @@ pub(crate) fn probe_terminal_graphics(timeout: Duration) -> Option<DetectedGraph
         }
     }
 
-    drain_stdin(libc::STDIN_FILENO, Instant::now() + PROBE_DRAIN_TIMEOUT);
+    drain_stdin(
+        libc::STDIN_FILENO,
+        Instant::now() + PROBE_DRAIN_TIMEOUT,
+        &mut buf,
+    );
+    let _ = OSC52_SUPPORTED.set(has_da1_feature(&buf, OSC52_DA1_FEATURE).0);
     detected
 }
 
@@ -326,6 +350,10 @@ pub(crate) fn init_graphics_detection() {
         tracing::warn!("terminal graphics protocol handshake timed out or unsupported");
     }
     let _ = DETECTED_GRAPHICS.set(detected);
+}
+
+pub(crate) fn supports_osc52() -> bool {
+    OSC52_SUPPORTED.get().copied().unwrap_or(false)
 }
 
 pub(crate) fn detected_graphics() -> Option<DetectedGraphics> {
@@ -583,8 +611,8 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        DetectedGraphics, FALLBACK_FONT_SIZE, ImageState, InlineImage, ProbeResult, create_picker,
-        encode, parse_probe_stream, protocol_from_env,
+        DetectedGraphics, FALLBACK_FONT_SIZE, ImageState, InlineImage, OSC52_DA1_FEATURE,
+        ProbeResult, create_picker, encode, has_da1_feature, parse_probe_stream, protocol_from_env,
     };
     use crate::repaint::Dirty;
     use ratatui::buffer::Buffer;
@@ -721,7 +749,9 @@ mod tests {
         use color_eyre::eyre::Result;
         use test_case::test_case;
 
-        use super::super::{PROBE_DRAIN_TIMEOUT, drain_stdin, wait_readable};
+        use super::super::{
+            OSC52_DA1_FEATURE, PROBE_DRAIN_TIMEOUT, drain_stdin, has_da1_feature, wait_readable,
+        };
 
         const CONTINUOUS_INPUT_PATH: &str = "/dev/zero";
         const HANG_GUARD: Duration = Duration::from_secs(5);
@@ -733,12 +763,23 @@ mod tests {
             let input = File::open(CONTINUOUS_INPUT_PATH)?;
             let (done_tx, done_rx) = mpsc::channel();
             let worker = thread::spawn(move || {
-                drain_stdin(input.as_raw_fd(), Instant::now() + budget);
+                drain_stdin(input.as_raw_fd(), Instant::now() + budget, &mut Vec::new());
                 done_tx.send(()).unwrap();
             });
 
             done_rx.recv_timeout(HANG_GUARD)?;
             worker.join().unwrap();
+            Ok(())
+        }
+
+        #[test_case(b"", b"\x1b[?62;52c"; "late_complete_reply")]
+        #[test_case(b"\x1b[?62;", b"52c"; "split_reply")]
+        fn clipboard_reply_survives_drain(prefix: &[u8], suffix: &[u8]) -> Result<()> {
+            let (input, mut output) = UnixStream::pair()?;
+            output.write_all(suffix)?;
+            let mut buffer = prefix.to_vec();
+            drain_stdin(input.as_raw_fd(), Instant::now() + HANG_GUARD, &mut buffer);
+            assert!(has_da1_feature(&buffer, OSC52_DA1_FEATURE).0);
             Ok(())
         }
 
@@ -750,11 +791,31 @@ mod tests {
             assert!(wait_readable(input.as_raw_fd(), HANG_GUARD));
             let deadline = Instant::now() + if expired { Duration::ZERO } else { HANG_GUARD };
 
-            drain_stdin(input.as_raw_fd(), deadline);
+            let mut buffer = Vec::new();
+            drain_stdin(input.as_raw_fd(), deadline, &mut buffer);
+            assert_eq!(buffer, if expired { b"" } else { PENDING_REPLY });
 
             assert_eq!(wait_readable(input.as_raw_fd(), Duration::ZERO), expired);
             Ok(())
         }
+    }
+
+    #[test_case(b"\x1b[?62;22;52c", true; "clipboard_without_graphics")]
+    #[test_case(b"\x1b[?62;4;52c\x1b[0n", true; "clipboard_and_sixel")]
+    #[test_case(b"\x1b[?62;52;22c", true; "feature_before_other_features")]
+    #[test_case(b"\x1b[?62;22c", false; "no_advertisement")]
+    #[test_case(b"\x1b[?52;22c", false; "model_is_not_a_feature")]
+    #[test_case(b"\x1b[?62;152c", false; "exact_feature_only")]
+    #[test_case(b"\x1b[?62;52", false; "incomplete_reply")]
+    #[test_case(b"\x1b[?62;52n", false; "wrong_terminator")]
+    #[test_case(b"\x1b[?62;;52c", false; "empty_parameter")]
+    #[test_case(b"\x1b[?62;52;badc", false; "invalid_parameter")]
+    #[test_case(b"\x1b[>62;52c", false; "secondary_attributes")]
+    #[test_case(b"\x1b[?62;22c\x1b[?62;52c", true; "later_reply")]
+    #[test_case(b"\x1b[?62;52\x1b[?62;52c", true; "malformed_then_valid_reply")]
+    #[test_case(DIRECT_PROBE_RESPONSE, false; "graphics_does_not_imply_clipboard")]
+    fn osc52_advertisement(response: &[u8], expected: bool) {
+        assert_eq!(has_da1_feature(response, OSC52_DA1_FEATURE).0, expected);
     }
 
     #[test]
