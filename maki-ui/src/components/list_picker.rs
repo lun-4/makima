@@ -32,9 +32,14 @@ const MAX_HEIGHT_PERCENT: u16 = 80;
 const SEARCH_ROW: u16 = 1;
 pub(super) const SEARCH_PREFIX_WIDTH: u16 = 2;
 const DETAIL_RIGHT_PAD: u16 = 1;
+const LABEL_PREFIX_WIDTH: usize = 2;
+const DEPTH_INDENT_WIDTH: usize = 2;
 
 pub trait PickerItem {
     fn label(&self) -> &str;
+    fn depth(&self) -> usize {
+        0
+    }
     fn suffix(&self) -> Option<&str> {
         None
     }
@@ -233,6 +238,43 @@ impl<T: PickerItem> State<T> {
                 },
             ));
         }
+        if self.items.iter().any(|item| item.depth() > 0) {
+            let mut included = vec![false; self.items.len()];
+            let mut matches = vec![None; self.items.len()];
+            for (index, completion) in kept {
+                matches[index] = Some(completion.indices);
+            }
+            let mut ancestors: Vec<usize> = Vec::new();
+            for (index, item) in self.items.iter().enumerate() {
+                while ancestors
+                    .last()
+                    .is_some_and(|parent| self.items[*parent].depth() >= item.depth())
+                {
+                    ancestors.pop();
+                }
+                if matches[index].is_some() {
+                    included[index] = true;
+                    for &parent in ancestors.iter().rev() {
+                        if included[parent] {
+                            break;
+                        }
+                        included[parent] = true;
+                    }
+                }
+                ancestors.push(index);
+            }
+            let filtered: Vec<usize> = (0..self.items.len())
+                .filter(|&index| included[index])
+                .collect();
+            let match_indices = filtered
+                .iter()
+                .map(|&index| matches[index].take())
+                .collect();
+            return FilteredItems {
+                filtered,
+                match_indices,
+            };
+        }
         let mut runs: Vec<Vec<(usize, CompletionMatch)>> = Vec::new();
         let mut last = None;
         for (idx, completion) in kept {
@@ -280,8 +322,16 @@ impl<T: PickerItem> State<T> {
 
     fn update_search_and_clamp(&mut self) {
         self.rebuild_filter();
-        self.selected = 0;
+        self.selected = if self.items.iter().any(|item| item.depth() > 0) {
+            self.match_indices()
+                .iter()
+                .position(Option::is_some)
+                .unwrap_or(0)
+        } else {
+            0
+        };
         self.scroll_offset = 0;
+        self.ensure_visible();
     }
 
     fn move_up(&mut self) {
@@ -492,6 +542,10 @@ impl<T: PickerItem> ListPicker<T> {
         let Some(state) = self.state.as_mut() else {
             return;
         };
+        if items.iter().any(|item| item.depth() > 0) {
+            state.replace_items(items);
+            return;
+        }
         let previous_visible = state.filtered().to_vec();
         let previous_items = mem::replace(&mut state.items, items);
         let query = state.search.value();
@@ -1036,6 +1090,9 @@ fn find_scroll_offset_for_bottom<T: PickerItem>(
 }
 
 fn truncate_label(label: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
     if label.width() <= max_width {
         return label.to_string();
     }
@@ -1054,24 +1111,23 @@ fn truncate_label(label: &str, max_width: usize) -> String {
     result
 }
 
-/// Label row spans: "  " prefix plus the label truncated to `max_width`,
-/// with run-merged match codepoints in `match_style` and the rest in
-/// `base`. Returns the spans and their total display width.
 fn label_spans(
     label: &str,
     indices: Option<&[u32]>,
     base: Style,
     match_style: Style,
     max_width: usize,
+    prefix_width: usize,
 ) -> (Vec<Span<'static>>, usize) {
+    let prefix = " ".repeat(prefix_width);
     let truncated = truncate_label(label, max_width);
     let Some(indices) = indices.filter(|i| !i.is_empty()) else {
         return (
-            vec![Span::styled(format!("  {truncated}"), base)],
-            2 + truncated.width(),
+            vec![Span::styled(format!("{prefix}{truncated}"), base)],
+            prefix_width + truncated.width(),
         );
     };
-    let mut spans: Vec<Span<'static>> = vec![Span::styled("  ", base)];
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(prefix, base)];
     let mut run = String::new();
     let mut in_match = false;
     for (pos, ch) in truncated.chars().enumerate() {
@@ -1088,7 +1144,7 @@ fn label_spans(
     if !run.is_empty() {
         spans.push(Span::styled(run, if in_match { match_style } else { base }));
     }
-    (spans, 2 + truncated.width())
+    (spans, prefix_width + truncated.width())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1200,21 +1256,32 @@ fn render_list<T: PickerItem>(
         } else {
             t.item_match
         };
+        let checkbox_w = checkbox.as_ref().map_or(0, Span::width);
+        let prefix_width = item
+            .depth()
+            .saturating_mul(DEPTH_INDENT_WIDTH)
+            .saturating_add(LABEL_PREFIX_WIDTH)
+            .min((area.width as usize).saturating_sub(checkbox_w));
         let line = if !right.is_empty() {
+            let right_budget = (area.width as usize)
+                .saturating_sub(trailing_gap + 1 + DETAIL_RIGHT_PAD as usize + checkbox_w);
+            let right = truncate_label(&right, right_budget);
             let right_w = right.width();
-            let max_label = area
-                .width
-                .saturating_sub(right_w as u16 + trailing_gap as u16 + 1 + DETAIL_RIGHT_PAD)
-                as usize;
+            let max_label = (area.width as usize).saturating_sub(
+                right_w + trailing_gap + 1 + DETAIL_RIGHT_PAD as usize + checkbox_w,
+            );
+            let prefix_width = prefix_width.min(max_label);
             let (label_spans, label_w) = label_spans(
                 item.label(),
                 label_indices,
                 label_style,
                 match_style,
-                max_label.saturating_sub(2),
+                max_label.saturating_sub(prefix_width),
+                prefix_width,
             );
-            let pad = (area.width as usize)
-                .saturating_sub(label_w + trailing_gap + right_w + DETAIL_RIGHT_PAD as usize + 1);
+            let pad = (area.width as usize).saturating_sub(
+                checkbox_w + label_w + trailing_gap + right_w + DETAIL_RIGHT_PAD as usize + 1,
+            );
             let mut spans = Vec::with_capacity(8);
             if let Some(cb) = checkbox {
                 spans.push(cb);
@@ -1235,6 +1302,7 @@ fn render_list<T: PickerItem>(
                 label_style,
                 match_style,
                 usize::MAX,
+                prefix_width,
             );
             let mut spans: Vec<Span> = Vec::with_capacity(5);
             if let Some(cb) = checkbox {
@@ -1600,6 +1668,113 @@ mod tests {
         ready_state_mut(p).update_search_and_clamp();
     }
 
+    struct TreeEntry {
+        label: &'static str,
+        depth: usize,
+        detail: Option<&'static str>,
+    }
+
+    impl PickerItem for TreeEntry {
+        fn label(&self) -> &str {
+            self.label
+        }
+
+        fn depth(&self) -> usize {
+            self.depth
+        }
+
+        fn detail(&self) -> Option<&str> {
+            self.detail
+        }
+    }
+
+    fn tree_entries(items: &[(&'static str, usize)]) -> Vec<TreeEntry> {
+        items
+            .iter()
+            .map(|&(label, depth)| TreeEntry {
+                label,
+                depth,
+                detail: None,
+            })
+            .collect()
+    }
+
+    #[test_case("app", &[0, 1, 2, 3, 5, 6]; "ancestors_and_matches_in_source_order")]
+    #[test_case("sibling", &[0, 4]; "sibling_drops_previous_branch")]
+    #[test_case("unknown", &[7]; "depth_zero_resets_ancestry")]
+    #[test_case("missing", &[]; "no_matches")]
+    #[test_case("  ", &[0, 1, 2, 3, 4, 5, 6, 7]; "blank_query")]
+    fn tree_filter_retains_ancestors_in_source_order(query: &str, expected: &[usize]) {
+        let mut picker = ListPicker::new();
+        picker.open(
+            tree_entries(&[
+                ("root", 0),
+                ("branch", 1),
+                ("zzapp", 3),
+                ("app", 3),
+                ("sibling", 1),
+                ("other", 0),
+                ("application", 1),
+                ("unknown", 0),
+            ]),
+            " Test ",
+        );
+        set_query(&mut picker, query);
+        assert_eq!(ready_state(&picker).filtered(), expected);
+        if query == "app" {
+            assert_eq!(
+                ready_state(&picker).match_indices(),
+                &[
+                    None,
+                    None,
+                    Some(vec![2, 3, 4]),
+                    Some(vec![0, 1, 2]),
+                    None,
+                    Some(vec![0, 1, 2]),
+                ]
+            );
+        }
+    }
+
+    #[test_case(false; "immediate_enter_selects_match")]
+    #[test_case(true; "ancestor_remains_navigable")]
+    fn tree_search_selects_direct_match_before_ancestors(select_ancestor: bool) {
+        let mut picker = ListPicker::new();
+        picker.open(tree_entries(&[("Main", 0), ("leaf", 1)]), " Test ");
+        set_query(&mut picker, "leaf");
+        assert_eq!(picker.selected_item().unwrap().label, "leaf");
+        if select_ancestor {
+            picker.handle_key(key(KeyCode::Up));
+        }
+        let expected = if select_ancestor { "Main" } else { "leaf" };
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Enter)),
+            PickerAction::Select(item) if item.label == expected
+        ));
+    }
+
+    #[test_case(""; "unfiltered")]
+    #[test_case("app"; "filtered")]
+    fn tree_refresh_inserts_new_subtree_before_later_roots(query: &str) {
+        let mut picker = ListPicker::new();
+        picker.open(
+            tree_entries(&[("root", 0), ("apple", 1), ("other", 0), ("application", 1)]),
+            " Test ",
+        );
+        set_query(&mut picker, query);
+        picker.replace_items_preserving_order(
+            tree_entries(&[
+                ("root", 0),
+                ("apple", 1),
+                ("app", 2),
+                ("other", 0),
+                ("application", 1),
+            ]),
+            |a, b| a.label == b.label,
+        );
+        assert_eq!(ready_state(&picker).filtered(), &[0, 1, 2, 3, 4]);
+    }
+
     #[test]
     fn filter_ranks_by_score_not_source_order() {
         let mut p = ListPicker::new();
@@ -1786,6 +1961,87 @@ mod tests {
         let s = ready_state(&p);
         assert_eq!(s.filtered(), vec![0]);
         assert_eq!(s.match_indices(), vec![Some(vec![4, 5])]);
+    }
+
+    #[test_case(0, false, true, "界application"; "flat_selected")]
+    #[test_case(1, false, false, "界application"; "child_unselected")]
+    #[test_case(3, false, true, "界application"; "nested_without_metadata")]
+    #[test_case(1, true, true, "界application"; "child_with_metadata")]
+    #[test_case(3, true, false, "界applicat…"; "nested_metadata_truncates_label")]
+    fn tree_render_indents_without_shifting_match_indices(
+        depth: usize,
+        metadata: bool,
+        selected: bool,
+        expected_label: &str,
+    ) {
+        let items = [TreeEntry {
+            label: "界application",
+            depth,
+            detail: metadata.then_some("12k"),
+        }];
+        let area = Rect::new(0, 0, 24, 1);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_list(
+                    frame,
+                    area,
+                    &[0],
+                    &items,
+                    &[Some(vec![1, 2, 3])],
+                    if selected { 0 } else { usize::MAX },
+                    0,
+                    1,
+                    None,
+                );
+            })
+            .unwrap();
+        let prefix_width = LABEL_PREFIX_WIDTH + depth * DEPTH_INDENT_WIDTH;
+        let buffer = terminal.backend().buffer();
+        for column in 0..prefix_width {
+            assert_eq!(buffer[(column as u16, 0)].symbol(), " ");
+        }
+        assert_eq!(buffer[(prefix_width as u16, 0)].symbol(), "界");
+        let t = theme::current();
+        let match_style = if selected {
+            t.item_match_selected
+        } else {
+            t.item_match
+        };
+        for (offset, ch) in ["a", "p", "p"].iter().enumerate() {
+            let cell = &buffer[((prefix_width + 2 + offset) as u16, 0)];
+            assert_eq!(cell.symbol(), *ch);
+            assert_eq!(Some(cell.fg), match_style.fg);
+        }
+        let mut column = prefix_width;
+        for ch in expected_label.chars() {
+            assert_eq!(buffer[(column as u16, 0)].symbol(), ch.to_string());
+            column += ch.width().unwrap_or(0);
+        }
+        if metadata {
+            assert_eq!(buffer[(19, 0)].symbol(), "1");
+            assert_eq!(buffer[(20, 0)].symbol(), "2");
+            assert_eq!(buffer[(21, 0)].symbol(), "k");
+        }
+    }
+
+    #[test_case(1, 1, " "; "one_column")]
+    #[test_case(3, 2, "…  "; "indent_exceeds_width")]
+    #[test_case(8, usize::MAX, "   12k  "; "depth_saturates")]
+    fn tree_render_saturates_indentation_in_narrow_areas(width: u16, depth: usize, expected: &str) {
+        let items = [TreeEntry {
+            label: "apple",
+            depth,
+            detail: Some("12k"),
+        }];
+        let area = Rect::new(0, 0, width, 1);
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_list(frame, area, &[0], &items, &[Some(vec![0])], 0, 0, 1, None);
+            })
+            .unwrap();
+        assert_eq!(buffer_lines(&terminal, area), vec![expected]);
     }
 
     #[test]
