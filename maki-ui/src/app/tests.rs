@@ -8443,6 +8443,15 @@ fn plan_approval_pending_blocks_edits_and_requests_cancellation() {
     assert!(app.state.plan.is_ready());
 }
 
+fn rendered_plan_rows(app: &mut App) -> Vec<String> {
+    let rows = rendered_rows(app, 100, 40);
+    let area = app
+        .hits
+        .rect_of(ClickTarget::Surface(Surface::Plan))
+        .unwrap();
+    rows[usize::from(area.y)..usize::from(area.bottom())].to_vec()
+}
+
 #[test]
 fn pending_plan_footer_blocks_space_and_requests_cancellation() {
     let mut app = plan_app();
@@ -8451,10 +8460,10 @@ fn pending_plan_footer_blocks_space_and_requests_cancellation() {
     app.update(Msg::Key(key(KeyCode::Down)));
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(app.plan_approval_pending);
-    let before = rendered_rows(&mut app, 100, 40);
+    let before = rendered_plan_rows(&mut app);
     assert!(click_target(&mut app, ClickTarget::KeyHint(key(KeyCode::Char(' ')))).is_empty());
     assert!(!app.plan_form.parallel());
-    assert_eq!(rendered_rows(&mut app, 100, 40), before);
+    assert_eq!(rendered_plan_rows(&mut app), before);
     assert!(click_target(&mut app, ClickTarget::ModelChip).is_empty());
     assert!(!app.model_picker.is_open());
     assert!(matches!(
@@ -8478,9 +8487,9 @@ fn pending_plan_row_cannot_change_selection_or_submit(row: u16) {
     app.update(Msg::Key(key(KeyCode::Down)));
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(app.plan_approval_pending);
-    let before = rendered_rows(&mut app, 100, 40);
+    let before = rendered_plan_rows(&mut app);
     assert!(click_target(&mut app, ClickTarget::PlanRow(row)).is_empty());
-    assert_eq!(rendered_rows(&mut app, 100, 40), before);
+    assert_eq!(rendered_plan_rows(&mut app), before);
     assert!(app.plan_approval_pending);
     assert!(app.plan_form.is_visible());
     assert!(!app.model_picker.is_open());
