@@ -356,6 +356,7 @@ local function spawn(spec, input, ctx)
     agent = agent,
     turns = turns,
     owner = agent:_maki_task_owner(ctx),
+    description = input.description,
     closed = false,
     writes = spec.subagent_type == "general",
   }
@@ -474,25 +475,153 @@ local wait_schema = {
   },
 }
 
+local function wait_label(input, state)
+  if state and state.description then
+    return state.description
+  end
+  return input.task_id:sub(-8)
+end
+
+local function wait_header(input, state)
+  local buf = maki.ui.buf()
+  buf:line(wait_label(input, state))
+  return buf
+end
+
+local function wait_view(input, output, is_error, ctx, state)
+  local decoded = not is_error and maki.json.decode(output) or nil
+  local envelope = type(decoded) == "table" and decoded or {}
+  local result = type(envelope.result) == "table" and envelope.result or {}
+  local status, style, report = "Completed", "dim", result.text
+  if is_error then
+    local errors = {
+      [TURN_UNAVAILABLE_ERR] = "Cannot retrieve this turn: its result is no longer retained.",
+      [UNKNOWN_TASK_ERR] = "Cannot retrieve this task: it is no longer available.",
+      [TASK_ACCESS_ERR] = "Cannot retrieve this task: it belongs to another agent branch.",
+    }
+    status, style = errors[output] and (errors[output] .. " (" .. output .. ")") or ("Wait failed: " .. output), "error"
+  elseif envelope.status == "running" then
+    status = "Still running when checked. The wait timed out; the task was not cancelled."
+  elseif result.status == "cancelled" then
+    status, style =
+      "Subagent cancelled: " .. tostring(result.error or result.cancellation_reason or "cancelled"), "error"
+  elseif envelope.error or result.error or result.status == "failed" then
+    local err = result.user_message or result.error or envelope.error or "unknown error"
+    status, style = "Subagent failed: " .. tostring(err), "error"
+  elseif envelope.status ~= "done" then
+    status, report = "Wait result", output
+  end
+  if type(result.duration_ms) == "number" then
+    status = status .. " · " .. maki.ui.humantime(result.duration_ms / 1000)
+  end
+
+  local tol = ctx:tool_output_lines()
+  local preview = maki.ui.buf()
+  local view = ToolView.new(preview, {
+    max_lines = (tol and tol.task_spawn) or DEFAULT_OUTPUT_LINES,
+    keep = "head",
+    max_line_bytes = output_limits.DEFAULT_MAX_LINE_BYTES,
+  })
+  if type(report) == "string" and report ~= "" then
+    local ok, lines =
+      pcall(maki.ui.markdown, report, math.max(maki.ui.terminal_size().cols - BODY_INDENT_COLS, MIN_MD_WIDTH))
+    if ok then
+      for _, line in ipairs(lines) do
+        view:append(line)
+      end
+    else
+      view:append_text(report)
+    end
+  elseif envelope.status == "done" and style ~= "error" then
+    view:append({
+      { result.captured ~= nil and "Structured result available in details." or "No report returned.", "dim" },
+    })
+  end
+  view:finish()
+
+  local buf = maki.ui.buf()
+  local function render()
+    buf:set_lines({ { { status, style } } })
+    if preview:len() > 0 then
+      buf:line("")
+      buf:lines(preview:get_lines())
+    end
+    if view.expanded then
+      buf:line("")
+      buf:line({ { "Task: " .. input.task_id, "dim" } })
+      local turn_id = result.turn_id or input.turn_id
+      if turn_id then
+        buf:line({ { "Turn: " .. turn_id, "dim" } })
+      end
+      if result.input_tokens or result.output_tokens then
+        buf:line({
+          {
+            "Tokens: "
+              .. tostring(result.input_tokens or 0)
+              .. " input, "
+              .. tostring(result.output_tokens or 0)
+              .. " output",
+            "dim",
+          },
+        })
+      end
+      if result.captured ~= nil then
+        buf:line({
+          {
+            "Captured: "
+              .. maki.text.truncate_line(maki.json.encode(result.captured), output_limits.DEFAULT_MAX_LINE_BYTES),
+            "dim",
+          },
+        })
+      end
+    elseif view.skipped < 2 then
+      buf:line({ { "Details (click to expand)", "dim" } })
+    end
+  end
+  render()
+  buf:on("click", function()
+    view:toggle()
+    render()
+  end)
+  return { body = buf, header = wait_header(input, state) }
+end
+
 local function wait_handler(input, ctx)
   local task, access_err = resolve_task(input.task_id)
-  if not task then
-    return { llm_output = access_err, is_error = true }
+  local state = task and { description = task.description } or nil
+  local function reply(output, is_error)
+    local rendered = wait_view(input, output, is_error, ctx, state)
+    rendered.llm_output = output
+    rendered.is_error = is_error
+    rendered.state = state
+    return rendered
   end
+  if not task then
+    return reply(access_err, true)
+  end
+  local waiting = maki.ui.buf()
+  waiting:line({ { wait_label(input, state), "dim" } })
+  waiting:line({ { "Waiting for the subagent…", "dim" } })
+  ctx:live_buf(waiting)
+  maki.async.on_cancel(function(reason)
+    waiting:set_lines({ { { "Wait failed: " .. reason, "error" } } })
+  end)
   local result, wait_err = task.turns:wait(ctx, input.turn_id, input.timeout)
   if wait_err == TURN_WAIT_TIMEOUT then
-    return { llm_output = maki.json.encode({ status = "running" }) }
+    return reply(maki.json.encode({ status = "running" }))
   end
   if wait_err then
-    return { llm_output = tostring(wait_err), is_error = true }
+    return reply(tostring(wait_err), true)
   end
-  return {
-    llm_output = maki.json.encode(result and {
-      status = "done",
-      result = result,
-      error = result.error,
-    } or { status = "running" }),
-  }
+  return reply(maki.json.encode(result and {
+    status = "done",
+    result = result,
+    error = result.error,
+  } or { status = "running" }))
+end
+
+local function restore_wait(input, output, is_error, ctx)
+  return wait_view(input, output, is_error, ctx, ctx:state())
 end
 local function header(input)
   return input.description
@@ -531,9 +660,10 @@ maki.api.register_tool({
   schema = wait_schema,
   handler = wait_handler,
   header = function(input)
-    return "task_wait → " .. input.task_id
+    local task = resolve_task(input.task_id)
+    return wait_label(input, task)
   end,
-  restore = restore,
+  restore = restore_wait,
 })
 
 maki.api.register_tool({
