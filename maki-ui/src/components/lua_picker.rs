@@ -241,12 +241,12 @@ impl LuaPicker {
             self.event_handle.picker_event(id, PickerEvent::Done);
         }
     }
-    pub fn contains(&self, pos: Position) -> bool {
-        self.picker.contains(pos)
-    }
-
     pub fn select(&mut self, index: usize) -> bool {
         self.picker.select(index)
+    }
+
+    pub fn click_input(&mut self, pos: Position) -> bool {
+        self.picker.click_input(pos)
     }
 
     pub fn scroll(&mut self, delta: i32) {

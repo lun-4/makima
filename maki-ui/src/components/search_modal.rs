@@ -4,8 +4,9 @@ use crate::click::{ClickTarget, HitTarget, PickerId, ScrollOwner};
 use crate::components::Overlay;
 use crate::components::coherent_completion::Published;
 use crate::components::keybindings::key;
+use crate::components::list_picker::click_search_buffer;
 use crate::components::modal::Modal;
-use crate::components::scrollbar::{ScrollbarHit, render_vertical_scrollbar};
+use crate::components::scrollbar::{ScrollbarHit, render_vertical_scrollbar, saturating_u16};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -50,6 +51,7 @@ pub struct SearchModal {
     scrollbar_hit: Option<ScrollbarHit>,
     row_hits: Vec<(Rect, usize)>,
     popup: Rect,
+    input_area: Rect,
     matcher: Matcher,
 }
 
@@ -66,6 +68,7 @@ impl SearchModal {
             scrollbar_hit: None,
             row_hits: Vec::new(),
             popup: Rect::default(),
+            input_area: Rect::default(),
             matcher: Matcher::new(Config::DEFAULT),
         }
     }
@@ -91,6 +94,9 @@ impl SearchModal {
         self.selected = 0;
         self.scroll_offset = 0;
         self.saved_scroll = None;
+        self.input_area = Rect::default();
+        self.row_hits.clear();
+        self.scrollbar_hit = None;
     }
 
     pub fn is_open(&self) -> bool {
@@ -220,10 +226,6 @@ impl SearchModal {
         self.matches().get(self.selected).map(|m| m.segment_index)
     }
 
-    pub fn contains(&self, pos: Position) -> bool {
-        self.open && self.popup.contains(pos)
-    }
-
     pub fn scroll(&mut self, delta: i32) {
         let max = self.matches().len().saturating_sub(self.viewport_height);
         let offset = if delta > 0 {
@@ -233,6 +235,16 @@ impl SearchModal {
                 .saturating_add(delta.unsigned_abs() as usize)
         };
         self.scroll_offset = offset.min(max);
+    }
+
+    pub fn click_input(&mut self, pos: Position) -> bool {
+        self.open
+            && click_search_buffer(
+                &mut self.search,
+                self.input_area,
+                pos,
+                SEARCH_PREFIX.len() as u16,
+            )
     }
 
     pub fn select(&mut self, index: usize) -> bool {
@@ -245,8 +257,8 @@ impl SearchModal {
     }
 
     pub fn scroll_to_line(&mut self, line: u16) {
-        let max = self.matches().len().saturating_sub(self.viewport_height) as u16;
-        self.scroll_offset = line.min(max) as usize;
+        let max = self.matches().len().saturating_sub(self.viewport_height);
+        self.scroll_offset = usize::from(line).min(max);
     }
 
     pub fn hits(&self) -> Vec<HitTarget> {
@@ -261,6 +273,12 @@ impl SearchModal {
                 },
             })
             .collect();
+        if !self.input_area.is_empty() {
+            hits.push(HitTarget {
+                rect: self.input_area,
+                target: ClickTarget::PickerInput(PickerId::Search),
+            });
+        }
         if let Some(hit) = self.scrollbar_hit {
             hits.push(HitTarget {
                 rect: hit.area,
@@ -271,17 +289,18 @@ impl SearchModal {
     }
 
     pub fn content_len(&self) -> u16 {
-        self.matches().len() as u16
+        saturating_u16(self.matches().len())
     }
 
     pub fn scroll_line(&self) -> u16 {
-        self.scroll_offset as u16
+        saturating_u16(self.scroll_offset)
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
         self.scrollbar_hit = None;
         self.row_hits = Vec::new();
         self.popup = Rect::default();
+        self.input_area = Rect::default();
         if !self.open {
             return Rect::default();
         }
@@ -289,7 +308,7 @@ impl SearchModal {
         let content_rows = if self.matches().is_empty() && !self.search.value().is_empty() {
             1
         } else {
-            self.matches().len() as u16
+            saturating_u16(self.matches().len())
         };
 
         let modal = Modal {
@@ -297,6 +316,7 @@ impl SearchModal {
             width_percent: MODAL_WIDTH_PERCENT,
             max_height_percent: MODAL_MAX_HEIGHT_PERCENT,
         };
+        let content_rows = content_rows.min(area.height.saturating_sub(SEARCH_ROW + 2));
         let (popup, inner) = modal.render(frame, area, content_rows + SEARCH_ROW);
         self.popup = popup;
         let viewport_h = inner.height.saturating_sub(SEARCH_ROW) as usize;
@@ -306,12 +326,17 @@ impl SearchModal {
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
 
         self.row_hits = self.render_list(frame, list_area, viewport_h);
+        self.input_area = search_area;
         self.render_search(frame, search_area);
 
-        let total = self.matches().len() as u16;
+        let total = saturating_u16(self.matches().len());
         if total > viewport_h as u16 {
-            self.scrollbar_hit =
-                render_vertical_scrollbar(frame, list_area, total, self.scroll_offset as u16);
+            self.scrollbar_hit = render_vertical_scrollbar(
+                frame,
+                list_area,
+                total,
+                saturating_u16(self.scroll_offset),
+            );
         }
 
         popup
@@ -456,6 +481,68 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
     use test_case::test_case;
+
+    #[test_case(u16::MAX as usize; "maximum")]
+    #[test_case(u16::MAX as usize + 2; "over_maximum")]
+    fn large_search_saturates_rendered_ranges(count: usize) {
+        let mut modal = SearchModal::new();
+        modal.open(0, true);
+        let query = "item".to_string();
+        modal.search = TextBuffer::new(query.clone());
+        let matches = (0..count)
+            .map(|segment_index| SearchMatch {
+                segment_index,
+                score: 0,
+                display_indices: Vec::new(),
+                display_line: String::new(),
+            })
+            .collect();
+        let generation = modal.publication.begin(query.clone());
+        modal.publication.commit(generation, query, matches);
+        modal.scroll_offset = count - 1;
+        assert_eq!(modal.scroll_line(), saturating_u16(count - 1));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                modal.view(frame, frame.area());
+            })
+            .unwrap();
+        assert_eq!(modal.content_len(), u16::MAX);
+        assert_eq!(modal.scrollbar_hit.unwrap().content_len, u16::MAX);
+        modal.scroll_to_line(u16::MAX);
+        assert_eq!(
+            modal.scroll_offset,
+            usize::from(u16::MAX).min(count - modal.viewport_height)
+        );
+        assert_eq!(modal.matches().len(), count);
+    }
+
+    #[test_case(0, 0; "prefix")]
+    #[test_case(3, 1; "wide_character")]
+    #[test_case(6, 4; "combining_character")]
+    #[test_case(20, 5; "past_end")]
+    fn query_click_moves_caret(column: u16, expected: usize) {
+        let mut modal = modal_with_query("a界e\u{301}z", &[]);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                modal.view(frame, frame.area());
+            })
+            .unwrap();
+        let rect = modal
+            .hits()
+            .into_iter()
+            .find(|hit| hit.target == ClickTarget::PickerInput(PickerId::Search))
+            .unwrap()
+            .rect;
+        assert!(modal.click_input(Position::new(rect.x + column, rect.y)));
+        assert_eq!(modal.search.x(), expected);
+        modal.close();
+        assert!(!modal.click_input(Position::new(rect.x, rect.y)));
+        assert!(modal.hits().is_empty());
+    }
 
     fn key_event(code: KeyCode) -> KeyEvent {
         KeyEvent {
