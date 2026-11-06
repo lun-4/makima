@@ -43,12 +43,13 @@ pub async fn run_isolated_turn(
         provider,
         model,
         mut history,
-        system,
+        mut system,
         question,
         images,
         session_id,
         cancel,
     } = request;
+    crate::prompt::append_model_identity(&mut system, &model);
     close_dangling_tool_calls(&mut history, UNAVAILABLE_RESULT);
     history.push(Message::user_with_images(
         format!("{BTW_REMINDER}\n\n{question}"),
@@ -286,6 +287,8 @@ mod tests {
 
     #[test]
     fn isolated_turn_uses_copy_and_empty_tools() {
+        const EXPECTED_SYSTEM: &str =
+            "system\n\n# Model identity\n- Model: gpt-4o\n- Provider: openai";
         smol::block_on(async {
             let original = vec![Message::user("primary".into())];
             let captured = Arc::new(Mutex::new(Captured::default()));
@@ -313,8 +316,8 @@ mod tests {
             assert_eq!(captured.tools, Value::Array(Vec::new()));
             assert_eq!(captured.messages.len(), original.len() + 1);
             assert_eq!(
-                captured.system, "system",
-                "the isolated turn must send the caller's Build system text"
+                captured.system, EXPECTED_SYSTEM,
+                "the isolated turn must preserve the caller's system text and identify its model"
             );
             assert!(rx.iter().any(|event| event == IsolatedTurnEvent::Done));
         });
