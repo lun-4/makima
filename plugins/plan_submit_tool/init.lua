@@ -1,10 +1,3 @@
--- Mode-scoped `plan_submit` tool: prints the plan inline and shows the review
--- form for accept / refine / cancel. Requires plan mode; registered to load only
--- when plan's toolset includes it (see plugins/mode_plan_override).
--- Enable with:
---   [plugins.plan_submit_tool]
---   enabled = true
-
 local function handler(_input, ctx)
   if ctx:mode() ~= "plan" then
     return {

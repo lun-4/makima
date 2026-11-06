@@ -20,7 +20,9 @@ Tab toggles between them (build is the default).
 - **plan `[PLAN]`** - analyse and plan. The mode names one plan file as its
   intended write target, and the model gets a directive not to change other files.
 
-Switching to plan mode allocates a plan file under `plans/`. Native write and edit tools can change only the designated plan file. The host checks normalized target paths, including arguments changed by input hooks. A custom mode can explicitly offer third-party local tools; tool origin does not determine whether a mode offers them. MCP execution and deferred MCP search remain unavailable in write-restricted modes, even with YOLO enabled.
+Switching to plan mode allocates a plan file under `plans/`. Native write and edit tools can change only the designated plan file. The host checks normalized target paths, including arguments changed by input hooks. A custom mode can explicitly offer third-party local tools; tool origin does not determine whether a mode offers them.
+
+Plan mode inherits the normal toolset, including command execution, `code_execution`, and MCP tools. The prompt permits read-only investigation, such as `gh issue view`, `git status`, and `git log`. Calls use the normal [permission flow](/docs/permissions/), including configured rules, auto mode, and YOLO. The prompt requires explicit human confirmation before side effects such as builds, package installation, or changes to local or remote state. A permission approval does not establish that a command is read-only.
 
 A mode is not a sandbox for plugin effects. Lua filesystem writes require the plugin's `fs_write` permission and are not restricted to the plan path. Tool selection and native write-target checks do not constrain every effect of a selected plugin.
 
@@ -62,7 +64,7 @@ Under the hood a mode is a definition in a shared registry:
 - **restrict_write_to** (optional) - names the only write target for bundled native write and edit tools. The host compares normalized path keys before allowing those tools to write. Lua filesystem writes are not restricted to this path; they require the plugin's `fs_write` permission.
 - **tools** (optional) - when set, the model sees *only* this exact toolset for
   that mode. When absent, the mode inherits the default (build) set. This is how
-  a tool like `plan_submit` exists only while you are in plan mode.
+  a custom mode can limit the tools available to the model. Tools can also enforce their own mode requirements, as `plan_submit` does.
 
 The built-in `build` and `plan` are pre-registered entries. Overriding one is
 the same call as defining a new mode: it fully replaces the definition.
@@ -128,8 +130,8 @@ maki.setup({
 })
 ```
 
-- `mode_plan_override` replaces the built-in `plan` mode with a verbatim clone of polytoken's plan directive (via the `plan` plugin override). It focuses the model on producing a reviewable artifact, restricts writes to the plan file, swaps the toolset to `read`, `grep`, `glob`, `webfetch`, `write`, `edit`, `plan_submit`, and the task tools (`task_spawn`, `task_wait`, `task_send`, `task_despawn`), and adds `/plan` and `/build` slash commands. The directive and the plan reviewer splice one shared plan specification, so both always see the exact same document.
-- `plan_submit_tool` is a mode-scoped tool: it prints the finished plan inline as a display-only message (kept out of the model context) and opens the [plan form](#plan-approval). It only exists in plan mode because plan's toolset lists it. While `plan_submit` is in an active mode's toolset, the built-in auto-hooks that open the plan form on a plan-file write are skipped; the model calls `plan_submit` explicitly when the plan is ready. The form works the same way as after a plan-file write.
+- `mode_plan_override` replaces the built-in `plan` directive with one based on polytoken's planning workflow. It focuses the model on producing a reviewable artifact, restricts native writes to the plan file, inherits the normal toolset, and adds `/plan` and `/build` slash commands. The directive and the plan reviewer splice one shared plan specification, so both always see the exact same document.
+- `plan_submit_tool` prints the finished plan inline as a display-only message (kept out of the model context) and opens the [plan form](#plan-approval). Its handler rejects calls outside plan mode. While `plan_submit` is available in the active plan mode's toolset, the built-in auto-hooks that open the plan form on a plan-file write are skipped; the model calls `plan_submit` explicitly when the plan is ready. The form works the same way as after a plan-file write.
 
 The built-in task tools grow a `plan_reviewer` subagent type when the plan
 override is active: a read-only audit that verifies the plan follows the shared
@@ -140,10 +142,9 @@ work stays read-only. A reviewer finding about a missing test harness is handled
 by revising the plan to build the infrastructure, confirmed via the `question`
 tool when the gap is out of scope.
 
-With all three enabled, a typical loop is:
+With both enabled, a typical loop is:
 
-1. Switch to plan mode (`/plan`). The model drafts `plan.md` using the cloned
-   directive and the reduced toolset.
+1. Switch to plan mode (`/plan`). The model investigates with the normal toolset and drafts the designated plan file.
 2. The model calls `task_spawn` with `subagent_type = "plan_reviewer"` to audit
    the plan, collects the verdict with `task_wait`, then iterates until
    `VERDICT: pass`.

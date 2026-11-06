@@ -70,10 +70,11 @@ use crossterm::event::{
 use maki_agent::actor::{EffectiveAgentConfig, TranscriptRequest};
 use maki_agent::agent::isolated_turn::IsolatedTurnRequest;
 use maki_agent::permissions::PermissionManager;
+use maki_agent::tools::ToolFilter;
 use maki_agent::{
-    ActorWorkKind, AgentEvent, AgentId, AgentInput, AgentMode, AgentRef, Envelope, ImageMediaType,
-    ImageSource, McpConfigErrors, McpPromptRef, McpSnapshotReader, Post, SharedBuf, SharedMessages,
-    SubagentInfo, TurnCompleteEvent,
+    ActorWorkKind, AgentConfig, AgentEvent, AgentId, AgentInput, AgentMode, AgentRef, Envelope,
+    ImageMediaType, ImageSource, McpConfigErrors, McpPromptRef, McpSnapshotReader, Post, SharedBuf,
+    SharedMessages, SubagentInfo, TurnCompleteEvent,
 };
 use maki_commands::{
     AgentTurn, BuiltinOperation, CommandAttachment, CommandContent, CommandError,
@@ -462,6 +463,7 @@ pub struct App {
     pub(crate) coordinator: Option<maki_agent::session_coordinator::SessionCoordinatorHandle>,
     pub(crate) model_policy: Arc<ModelPolicy>,
     pub(crate) lua_event_handle: EventHandle,
+    tool_filter: ToolFilter,
     pub(super) keymap_reader: KeymapReader,
     pub(super) hint_reader: HintReader,
     hints: Watch<HintSnapshot>,
@@ -538,6 +540,7 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare(
         config: EffectiveAgentConfig,
+        agent_config: &AgentConfig,
         session: AppSession,
         storage: StateDir,
         available_models: Arc<ArcSwapOption<Vec<String>>>,
@@ -615,6 +618,7 @@ impl App {
             menu: Menu::default(),
             status: Status::Idle,
             state,
+            tool_filter: ToolFilter::from_config(agent_config, &config.model, &[]),
             seed_config: Arc::new(config),
             exit_request: ExitRequest::None,
             exit_on_done: false,
@@ -714,6 +718,7 @@ impl App {
                 );
         Self::prepare(
             config,
+            &AgentConfig::default(),
             session,
             storage,
             available_models,
@@ -1919,8 +1924,6 @@ impl App {
         }
     }
 
-    /// True when `plan_submit` is in the active mode's toolset (set by
-    /// `mode_plan_override`), flipping the plan auto-hooks on/off.
     fn plan_submit_active(&self) -> bool {
         if self.focused_plan_path().is_none() {
             return false;
@@ -1934,7 +1937,9 @@ impl App {
             });
         def.tools
             .as_deref()
-            .is_some_and(|tools| tools.iter().any(|t| t.as_str() == PLAN_SUBMIT_TOOL))
+            .is_none_or(|tools| tools.iter().any(|t| t.as_str() == PLAN_SUBMIT_TOOL))
+            && self.tool_filter.matches(PLAN_SUBMIT_TOOL)
+            && self.lua_event_handle.has_native_tool(PLAN_SUBMIT_TOOL)
     }
 
     fn submit_plan(&mut self) -> Vec<Action> {

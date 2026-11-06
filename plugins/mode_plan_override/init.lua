@@ -1,21 +1,6 @@
--- Opt-in override of the built-in `plan` mode. Enable with:
---   [plugins.mode_plan_override]
---   enabled = true
---
--- Replaces plan with a verbatim clone of polytoken's plan directive (analyse +
--- write only the plan file), swaps the active toolset to read-only tools +
--- webfetch + write/edit/plan_submit, and adds /plan and /build slash commands.
-
 local PLAN_FILE = "plan.md"
 local plan_spec = require("maki.plan_spec")
 
--- Directive spliced into the system prompt while plan mode is active. It is a
--- verbatim port of polytoken's plan facet (pi-luna plan_prompt.md): keep prose,
--- ordering, and sentences identical to upstream except for the tool-name and
--- embedded-spec substitutions. One deliberate divergence: the webfetch sentence
--- in "Side-effect discipline" has no upstream counterpart (polytoken's plan
--- facet predates webfetch there). The plan specification is spliced from
--- `maki.plan_spec` so the directive and the reviewer prompt share one document.
 local PLAN_DIRECTIVE = [[
 You are in **Plan mode**. The plan file is `{plan_path}`. This is a read-only planning and investigation mode.
 
@@ -23,9 +8,9 @@ You are in **Plan mode**. The plan file is `{plan_path}`. This is a read-only pl
 
 You must not perform any action that writes project files, modifies the working tree, runs builds or deploys, installs packages, starts servers, or causes any other side effect unless a human explicitly asks you to. The plan-mode tools `write` and `edit` are the single exception, and only on the plan file itself.
 
-There is no shell in plan mode: `bash` is not part of your toolset, so nothing can be built, installed, or served. Use the read-only tools for everything file inspection needs — `read` to read files, `grep` for content search, `glob`/`list` for listing; do not wish for a shell to do these jobs. `webfetch` is part of the plan toolset: fetching a page is a read, not a side effect — use it for upstream docs, issues, and release notes while researching. If a human request seems like it might require a side effect (writing a scratch file, running a command that changes state to gather information, etc.), ask the user for confirmation with `question` before doing anything. Do not assume permission, and do not rationalize a mutating action as "just investigation."
+Use `read`, `grep`, `glob`, and `list` for file inspection. Use `webfetch` for upstream docs, issues, and release notes: fetching a page is a read. Command execution through `bash`, `code_execution`, or other available tools is allowed for read-only investigation, such as `gh issue view`, `git status`, and `git log`. MCP tools may also be used for read-only investigation. All tool calls follow the normal permission flow, including configured rules, auto mode, and YOLO. Tool availability or permission approval does not authorize side effects in plan mode. If a request or command might cause a side effect (writing a scratch file, running a build, installing packages, changing local or remote state, etc.), ask the user for confirmation with `question` before doing anything. Do not assume permission, and do not rationalize a mutating action as "just investigation."
 
-Everything above applies to delegated work too: any subagent you spawn is strictly read-only and must never write files, edit code, or execute shell commands.
+Everything above applies to delegated work too: any subagent you spawn is strictly read-only and must never write files, edit code, or cause other side effects. Subagents must stay within their available toolsets.
 
 ## Subagents
 
@@ -77,20 +62,6 @@ local ok, err = maki.api.mode.define({
   label = "[PLAN]",
   system_prompt = PLAN_DIRECTIVE,
   restrict_write_to = PLAN_FILE,
-  tools = {
-    "read",
-    "grep",
-    "glob",
-    "webfetch",
-    "write",
-    "edit",
-    "plan_submit",
-    "task_spawn",
-    "task_wait",
-    "task_send",
-    "task_despawn",
-  },
-  -- tool search / mcp stay available through the per-request MCP injection.
 })
 if not ok then
   maki.log.warn("mode_plan_override: define failed: " .. err)
