@@ -252,6 +252,10 @@ pub enum Action {
     ToggleSessionOption {
         id: &'static str,
     },
+    SetSessionOption {
+        id: &'static str,
+        enabled: bool,
+    },
     /// `/cd`, adopted through the coordinator off the event-loop thread.
     ChangeDirectory(PathBuf),
     RefreshProvider {

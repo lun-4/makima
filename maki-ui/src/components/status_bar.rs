@@ -26,6 +26,7 @@ const TRUNCATE_PREFIX: &str = "..";
 const FAST_LABEL: &str = " [fast]";
 const WORKFLOW_LABEL: &str = " [workflow]";
 const RESTRICTED_LABEL: &str = " [restricted]";
+const NORMAL_LABEL: &str = " [normal]";
 const YOLO_LABEL: &str = " [yolo]";
 const YOLO_DIM_FACTOR: f32 = 0.15;
 const SUBAGENT_LABEL_PREFIX: &str = "\u{21b3} ";
@@ -162,6 +163,34 @@ impl StatusBar {
 
     pub fn view(&self, frame: &mut Frame, area: Rect, ctx: &StatusBarContext) -> Vec<HitTarget> {
         let hovered = |target: ClickTarget| ctx.hover == Some(target);
+        let permission_label = if ctx.yolo { YOLO_LABEL } else { NORMAL_LABEL };
+        let permission_width = (permission_label.width() as u16).min(area.width);
+        let permission_area = Rect::new(
+            area.right().saturating_sub(permission_width),
+            area.y,
+            permission_width,
+            area.height,
+        );
+        let area = Rect::new(
+            area.x,
+            area.y,
+            area.width.saturating_sub(permission_width),
+            area.height,
+        );
+        let permission_style = if ctx.yolo {
+            theme::dim_style(theme::current().error, YOLO_DIM_FACTOR)
+        } else {
+            theme::current().status_dim
+        };
+        let permission_style = if hovered(ClickTarget::PermissionChip) {
+            permission_style.add_modifier(Modifier::UNDERLINED)
+        } else {
+            permission_style
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(permission_label, permission_style)),
+            permission_area,
+        );
         let mut left_spans = Vec::new();
 
         if *ctx.status == Status::Streaming {
@@ -219,17 +248,9 @@ impl StatusBar {
         let mut status_base = None;
         let mut status_clicks: Vec<(usize, u32)> = Vec::new();
 
-        let yolo_span = ctx.yolo.then(|| {
-            Span::styled(
-                YOLO_LABEL,
-                theme::dim_style(theme::current().error, YOLO_DIM_FACTOR),
-            )
-        });
-
         match ctx.status {
             Status::Error { message: e, .. } => {
                 left_spans.push(Span::styled(format!(" {e}"), theme::current().error));
-                right_spans.extend(yolo_span);
             }
             _ => {
                 let pct = if ctx.stats.context_window > 0 {
@@ -274,9 +295,6 @@ impl StatusBar {
                 }
                 if ctx.restricted {
                     rest_spans.push(Span::styled(RESTRICTED_LABEL, theme::current().status_dim));
-                }
-                if let Some(span) = yolo_span {
-                    rest_spans.push(span);
                 }
 
                 let context_text = format!(
@@ -365,6 +383,12 @@ impl StatusBar {
         .areas(area);
 
         let mut hits = Vec::new();
+        if !permission_area.is_empty() {
+            hits.push(HitTarget {
+                rect: permission_area,
+                target: ClickTarget::PermissionChip,
+            });
+        }
         if let Some(rect) = span_rect(left_area, &left_spans, mode_idx) {
             hits.push(HitTarget {
                 rect,
@@ -678,7 +702,7 @@ mod tests {
         let cost = text.find(CHAT_COST_TEXT).unwrap();
         let plugin = text.find("PLUGIN").unwrap();
         assert!(model < context && context < cost && cost < plugin, "{text}");
-        assert!(text.trim_end().ends_with("PLUGIN"), "{text}");
+        assert!(text.trim_end().ends_with(NORMAL_LABEL.trim()), "{text}");
     }
 
     /// A run picks a changed model up at its next request, so between the
@@ -712,7 +736,7 @@ mod tests {
             )],
             generation: 1,
         };
-        let text = render_context(Some(&snapshot), 47);
+        let text = render_context(Some(&snapshot), 56);
         assert!(text.contains("PLUGIN"), "{text}");
         assert!(text.contains("..-model"), "{text}");
     }
@@ -857,14 +881,24 @@ mod tests {
             .contains(RESTRICTED_LABEL.trim())
     }
 
-    #[test_case(true  => true  ; "a_bypassed_session_says_so")]
-    #[test_case(false => false ; "a_prompting_session_stays_quiet")]
-    fn the_bar_advertises_yolo(yolo: bool) -> bool {
-        let bar = StatusBar::new(FLASH_TTL, test_cwd());
+    #[test_case(true, false, BAR_WIDTH, false ; "yolo_idle")]
+    #[test_case(false, false, BAR_WIDTH, false ; "normal_idle")]
+    #[test_case(true, true, BAR_WIDTH, false ; "yolo_error")]
+    #[test_case(false, true, BAR_WIDTH, false ; "normal_error")]
+    #[test_case(true, false, 12, true ; "yolo_narrow_hovered")]
+    #[test_case(false, true, 12, true ; "normal_narrow_hovered")]
+    fn permission_chip_is_visible_and_clickable(yolo: bool, error: bool, width: u16, hover: bool) {
+        let mut bar = StatusBar::new(FLASH_TTL, test_cwd());
+        bar.flash(FLASH_MSG.into());
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(BAR_WIDTH, 1)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1)).unwrap();
+        let status = if error {
+            Status::error(FLASH_MSG.into())
+        } else {
+            Status::Idle
+        };
         let ctx = StatusBarContext {
-            status: &Status::Idle,
+            status: &status,
             mode_label: Cow::Borrowed("NORMAL"),
             mode_style: Style::default(),
             model_id: MODEL_ID,
@@ -886,15 +920,38 @@ mod tests {
             restoring: false,
             status_content: None,
             suppress_status_content: false,
-            hover: None,
+            hover: hover.then_some(ClickTarget::PermissionChip),
             thinking_supported: false,
         };
+        let mut hits = Vec::new();
         terminal
             .draw(|f| {
-                bar.view(f, f.area(), &ctx);
+                hits = bar.view(f, f.area(), &ctx);
             })
             .unwrap();
-        crate::components::buffer_text(terminal.backend().buffer()).contains(YOLO_LABEL.trim())
+        let buffer = terminal.backend().buffer();
+        let text = crate::components::buffer_text(buffer);
+        let (label, other) = if yolo {
+            (YOLO_LABEL, NORMAL_LABEL)
+        } else {
+            (NORMAL_LABEL, YOLO_LABEL)
+        };
+        assert!(text.ends_with(label), "{text}");
+        assert!(!text.contains(other), "{text}");
+        let hit = hits
+            .iter()
+            .find(|hit| hit.target == ClickTarget::PermissionChip)
+            .unwrap();
+        assert_eq!(
+            hit.rect,
+            Rect::new(width - label.width() as u16, 0, label.width() as u16, 1)
+        );
+        assert_eq!(
+            buffer[(hit.rect.x + 1, 0)]
+                .modifier
+                .contains(Modifier::UNDERLINED),
+            hover,
+        );
     }
 
     /// The sigma is the whole session's bill, and only the session can hand it
