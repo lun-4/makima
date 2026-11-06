@@ -1138,11 +1138,18 @@ fn submit_during_streaming_queues_message() {
     assert_eq!(app.queue.len(), 1);
 }
 
-#[test]
-fn typed_completion_notices_render_once_and_skip_withdrawn() {
+#[test_case(COMPLETION_PREVIEW_CHARS - 1, false, false; "short")]
+#[test_case(COMPLETION_PREVIEW_CHARS, false, false; "at_limit")]
+#[test_case(COMPLETION_PREVIEW_CHARS + 1, false, true; "ui_truncated")]
+#[test_case(10, true, true; "delivery_truncated")]
+fn typed_completion_notices_render_once_and_skip_withdrawn(
+    chars: usize,
+    delivery_truncated: bool,
+    truncated: bool,
+) {
     use maki_agent::actor::{ActorEvent, ChildDelivery, DeliveryEvent, DeliveryStatus, TurnResult};
     const LABEL: &str = "research child";
-    const TEXT: &str = "bounded child result";
+    const TEXT: &str = "界";
     let mut app = test_app();
     let delivery = Arc::new(ChildDelivery {
         label: Some(LABEL.into()),
@@ -1154,8 +1161,15 @@ fn typed_completion_notices_render_once_and_skip_withdrawn() {
                 1,
                 DoneReason::EndTurn,
             ),
-            text: TEXT.repeat(COMPLETION_PREVIEW_CHARS),
-            output: Vec::new(),
+            text: TEXT.repeat(chars),
+            output: if delivery_truncated {
+                vec![serde_json::json!({
+                    "truncated": true,
+                    "full_result": {"lookup": "retained turn result"},
+                })]
+            } else {
+                Vec::new()
+            },
             provenance: Default::default(),
             duration_ms: 0,
         },
@@ -1165,6 +1179,7 @@ fn typed_completion_notices_render_once_and_skip_withdrawn() {
         status: DeliveryStatus::Discarded(maki_agent::TurnCancellationReason::User),
     }));
     assert_eq!(app.main_chat().message_count(), 0);
+    let agent_id = delivery.result.outcome.agent_id();
     app.handle_actor_event(ActorEvent::Delivery(DeliveryEvent {
         delivery,
         status: DeliveryStatus::Executed {
@@ -1176,7 +1191,129 @@ fn typed_completion_notices_render_once_and_skip_withdrawn() {
     let notice = chat.message_at(0).unwrap();
     assert_eq!(notice.role, DisplayRole::Done);
     assert!(notice.text.contains(LABEL));
-    assert!(notice.text.chars().count() <= COMPLETION_LABEL_CHARS + COMPLETION_PREVIEW_CHARS + 20);
+    let marker = if truncated { COMPLETION_TRUNCATED } else { "" };
+    let preview = TEXT.repeat(chars.min(COMPLETION_PREVIEW_CHARS));
+    assert_eq!(notice.result_agent, Some(agent_id));
+    assert!(notice.text.starts_with(&format!(
+        "[Result from {LABEL}] {preview}{marker}\n[click to view child transcript; {} for Tasks]",
+        key::TASKS.label
+    )));
+    assert_eq!(
+        notice.text.contains("Full result lookup:"),
+        delivery_truncated
+    );
+}
+
+#[test_case(0, false, false, false; "first_child")]
+#[test_case(1, false, false, false; "second_child_same_label")]
+#[test_case(0, true, false, false; "drag_selects_without_navigation")]
+#[test_case(0, false, true, false; "child_unavailable_after_delivery")]
+#[test_case(0, false, false, true; "delivery_preview_opens_full_transcript")]
+fn completion_notice_navigates_to_child(
+    target: usize,
+    drag: bool,
+    unavailable: bool,
+    delivery_preview: bool,
+) {
+    use maki_agent::actor::{ActorEvent, ChildDelivery, DeliveryEvent, DeliveryStatus, TurnResult};
+    const LABEL: &str = "research child";
+    const TAIL: &str = "full result tail";
+    let mut app = app_without_splash();
+    let mut children = Vec::new();
+    for _ in 0..2 {
+        let agent_id = AgentId::generate();
+        let info = subagent_info_for_agent(agent_id, TASK_ID, LABEL, None, None);
+        let index = app.resolve_or_create_chat(&info);
+        let text = format!("{}{TAIL}", "界".repeat(COMPLETION_PREVIEW_CHARS + 1));
+        app.chats[index].push(DisplayMessage::new(DisplayRole::Assistant, text.clone()));
+        app.handle_actor_event(ActorEvent::Delivery(DeliveryEvent {
+            delivery: Arc::new(ChildDelivery {
+                label: Some(LABEL.into()),
+                result: TurnResult {
+                    outcome: TurnOutcome::completed(
+                        agent_id,
+                        TurnId::generate(),
+                        Default::default(),
+                        1,
+                        DoneReason::EndTurn,
+                    ),
+                    text: if delivery_preview { LABEL.into() } else { text },
+                    output: if delivery_preview {
+                        vec![serde_json::json!({
+                            "truncated": true,
+                            "full_result": {"agent_id": agent_id},
+                            "offload": {"path": IMAGE_PATH_PASTE, "complete": true},
+                        })]
+                    } else {
+                        Vec::new()
+                    },
+                    provenance: Default::default(),
+                    duration_ms: 0,
+                },
+            }),
+            status: DeliveryStatus::Executed {
+                parent_turn_id: TurnId::generate(),
+            },
+        }));
+        children.push((agent_id, index));
+    }
+    render_app(&mut app, 80, 60);
+    let (agent_id, index) = children[target];
+    let notice = (0..app.chats[0].message_count())
+        .filter_map(|index| app.chats[0].message_at(index))
+        .find(|message| message.result_agent == Some(agent_id))
+        .unwrap();
+    assert!(notice.text.contains(COMPLETION_TRUNCATED));
+    assert!(notice.text.contains(key::TASKS.label));
+    if delivery_preview {
+        assert!(notice.text.contains(IMAGE_PATH_PASTE));
+    }
+    let area = app.msg_area();
+    let row = (area.y..area.bottom())
+        .find(|&row| {
+            app.chats[0]
+                .message_at_row(row, area)
+                .is_some_and(|message| message.result_agent == Some(agent_id))
+        })
+        .unwrap();
+    if unavailable {
+        app.live_chat_index.remove(&agent_id);
+    }
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        area.x,
+        row,
+    ));
+    if drag {
+        app.update(mouse_event(
+            MouseEventKind::Drag(MouseButton::Left),
+            area.x + 3,
+            row,
+        ));
+    }
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        area.x + if drag { 3 } else { 0 },
+        row,
+    ));
+    if drag || unavailable {
+        assert_eq!(app.active_chat, 0);
+    } else {
+        assert_eq!(app.active_chat, index);
+        assert!(app.chats[index].last_message_text().ends_with(TAIL));
+    }
+    if drag {
+        assert!(matches!(
+            app.selection_state,
+            Some(SelectionState::PendingCopy { .. })
+        ));
+    }
+    if unavailable {
+        assert_eq!(
+            app.status_bar.flash_text(),
+            Some(format!("Child transcript unavailable for {agent_id}").as_str())
+        );
+    }
 }
 
 #[test_case(false; "deferred_input_drawn_on_consumption")]

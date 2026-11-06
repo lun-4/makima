@@ -377,6 +377,10 @@ impl Chat {
         self.messages_panel.extract_selection_text(sel, msg_area)
     }
 
+    pub fn message_at_row(&self, row: u16, area: Rect) -> Option<&DisplayMessage> {
+        self.messages_panel.message_at_row(row, area)
+    }
+
     pub fn handle_click(&mut self, row: u16, area: Rect) {
         self.messages_panel.handle_click(row, area);
     }
@@ -677,6 +681,7 @@ pub fn history_to_display(
                                 live_output: None,
                                 annotation,
                                 plan_path: None,
+                                result_agent: None,
                                 timestamp: None,
                                 turn_usage: None,
                                 truncated_lines,

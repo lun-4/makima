@@ -664,6 +664,15 @@ impl MessagesPanel {
         self.accent.set(color);
     }
 
+    pub fn message_at_row(&self, row: u16, area: Rect) -> Option<&DisplayMessage> {
+        if row < area.y || row >= area.bottom() {
+            return None;
+        }
+        let doc_row = u32::from(row - area.y) + u32::from(self.scroll_top);
+        let (_, segment, _) = self.cache.segment_at_row(doc_row, self.viewport_width)?;
+        self.messages.get(segment.msg_index?)
+    }
+
     pub fn handle_click(&mut self, row: u16, area: Rect) -> bool {
         if area.height == 0 {
             return false;
