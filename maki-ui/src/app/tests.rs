@@ -1,7 +1,7 @@
 use super::shell::ShellEvent;
 use super::*;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT};
-use crate::click::ClickTarget;
+use crate::click::{ClickTarget, PickerId, ScrollOwner, Surface};
 use crate::components::btw_modal::BtwEvent;
 use crate::components::command::ParsedCommand;
 use crate::components::file_picker::EMPTY_DIR_MSG;
@@ -2741,6 +2741,470 @@ fn click_target(app: &mut App, target: ClickTarget) -> Vec<Action> {
     app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), x, y))
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ScrollbarFixture {
+    Model,
+    Task,
+    Input,
+    Search,
+    Help,
+    Btw,
+    Split,
+    Float,
+    Transcript,
+}
+
+const SCROLLBAR_ROWS: usize = 80;
+const PINNED_TOP: &str = "pinned header";
+const PINNED_BOTTOM: &str = "pinned footer";
+
+fn scrollbar_fixture(fixture: ScrollbarFixture) -> (App, ScrollOwner) {
+    let mut app = app_without_splash();
+    let owner = match fixture {
+        ScrollbarFixture::Model => {
+            app = app_with_tall_model_picker();
+            ScrollOwner::Picker(PickerId::Model)
+        }
+        ScrollbarFixture::Task => {
+            for i in 0..SCROLLBAR_ROWS {
+                app = with_subagent(app, &format!("scroll-task-{i}"));
+            }
+            app.open_tasks();
+            ScrollOwner::Picker(PickerId::Task)
+        }
+        ScrollbarFixture::Input => {
+            app.update(Msg::Paste(
+                (0..SCROLLBAR_ROWS)
+                    .map(|i| format!("draft row {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ));
+            ScrollOwner::Input
+        }
+        ScrollbarFixture::Search => {
+            app = middle_scroll_transcript();
+            open_search(&mut app);
+            app.update(Msg::Paste("transcript".into()));
+            ScrollOwner::Picker(PickerId::Search)
+        }
+        ScrollbarFixture::Help => {
+            app.help_modal.toggle();
+            ScrollOwner::Help
+        }
+        ScrollbarFixture::Btw => {
+            app.btw_modal = crate::components::btw_modal::BtwModal::new(0);
+            let (tx, rx) = flume::bounded(2);
+            app.btw_modal.open("scroll regression", rx);
+            tx.send(BtwEvent::TextDelta(
+                (0..SCROLLBAR_ROWS)
+                    .map(|i| format!("answer row {i}\n\n"))
+                    .collect(),
+            ))
+            .unwrap();
+            tx.send(BtwEvent::Done).unwrap();
+            let _ = app.btw_modal.poll();
+            ScrollOwner::Btw
+        }
+        ScrollbarFixture::Split | ScrollbarFixture::Float => {
+            open_scrollbar_window(
+                &mut app,
+                if matches!(fixture, ScrollbarFixture::Split) {
+                    maki_lua::Split::Above
+                } else {
+                    maki_lua::Split::None
+                },
+            );
+            ScrollOwner::Float(0)
+        }
+        ScrollbarFixture::Transcript => {
+            app = middle_scroll_transcript();
+            ScrollOwner::Messages
+        }
+    };
+    render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
+    assert!(app.hits.rect_of(ClickTarget::Scrollbar(owner)).is_some());
+    (app, owner)
+}
+
+fn open_scrollbar_window(app: &mut App, split: maki_lua::Split) {
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+    buf.append(maki_agent::SnapshotLine::plain(PINNED_TOP.into()));
+    for i in 0..SCROLLBAR_ROWS {
+        buf.append(maki_agent::SnapshotLine::plain(format!("window row {i}")));
+    }
+    buf.append(maki_agent::SnapshotLine::plain(PINNED_BOTTOM.into()));
+    let config = maki_lua::FloatConfig {
+        width: maki_lua::Dimension::Abs(40),
+        height: maki_lua::Dimension::Abs(10),
+        reserved_top: 1,
+        reserved_bottom: 1,
+        split,
+        ..maki_lua::FloatConfig::default()
+    };
+    let (event_tx, _event_rx) = flume::bounded(8);
+    let (_cmd_tx, cmd_rx) = flume::bounded(8);
+    app.float_mgr.open(buf, config, false, event_tx, cmd_rx);
+}
+
+fn scrollbar_mouse_frame(app: &mut App, kind: MouseEventKind, x: u16, y: u16) {
+    assert!(app.update(mouse_event(kind, x, y)).is_empty());
+    render_app(app, RENDER_AREA.width, RENDER_AREA.height);
+    assert!(app.selection_state.is_none());
+    assert!(app.pending_click.is_none());
+}
+
+fn scrollbar_selection(app: &App) -> (Option<usize>, Option<usize>, usize, usize) {
+    (
+        app.task_picker.selected_index(),
+        app.search_modal.current_segment_index(),
+        app.input_box.buffer.cursor_byte_offset(),
+        app.active_chat,
+    )
+}
+
+#[test_case(ScrollbarFixture::Model; "model")]
+#[test_case(ScrollbarFixture::Task; "task_list_picker")]
+#[test_case(ScrollbarFixture::Input; "input")]
+#[test_case(ScrollbarFixture::Search; "search")]
+#[test_case(ScrollbarFixture::Help; "help")]
+#[test_case(ScrollbarFixture::Btw; "btw")]
+#[test_case(ScrollbarFixture::Split; "passive_split_pinned")]
+#[test_case(ScrollbarFixture::Float; "passive_float_pinned")]
+#[test_case(ScrollbarFixture::Transcript; "transcript")]
+fn scrollbar_drag_survives_each_render(fixture: ScrollbarFixture) {
+    let (mut app, owner) = scrollbar_fixture(fixture);
+    let selection = scrollbar_selection(&app);
+    app.scroll_owner_to(owner, u16::MAX);
+    render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
+    let bottom = app.scroll_line(owner);
+    assert!(bottom > 0);
+    app.scroll_owner_to(owner, bottom / 3);
+    render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
+    let initial = app.scroll_line(owner);
+    let rect = app.hits.rect_of(ClickTarget::Scrollbar(owner)).unwrap();
+    let content = app.scroll_content_len(owner).unwrap();
+    let (_, thumb_start) = crate::components::scrollbar::thumb(rect.height, content, initial);
+    let thumb_y = rect.y + thumb_start;
+    scrollbar_mouse_frame(
+        &mut app,
+        MouseEventKind::Down(MouseButton::Left),
+        rect.x,
+        thumb_y,
+    );
+    assert_eq!(app.scroll_line(owner), initial);
+    assert!(app.scroll_drag.is_some());
+    scrollbar_mouse_frame(
+        &mut app,
+        MouseEventKind::Drag(MouseButton::Left),
+        rect.x,
+        thumb_y,
+    );
+    assert_eq!(app.scroll_line(owner), initial);
+    scrollbar_mouse_frame(
+        &mut app,
+        MouseEventKind::Up(MouseButton::Left),
+        rect.x,
+        thumb_y,
+    );
+    assert_eq!(app.scroll_line(owner), initial);
+    assert!(app.scroll_drag.is_none());
+
+    app.scroll_owner_to(owner, 0);
+    render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
+    scrollbar_mouse_frame(
+        &mut app,
+        MouseEventKind::Down(MouseButton::Left),
+        rect.x,
+        rect.y,
+    );
+    scrollbar_mouse_frame(
+        &mut app,
+        MouseEventKind::Drag(MouseButton::Left),
+        rect.x,
+        rect.bottom() - 1,
+    );
+    assert_eq!(app.scroll_line(owner), bottom);
+    assert!(app.scroll_drag.is_some());
+    scrollbar_mouse_frame(&mut app, MouseEventKind::Up(MouseButton::Left), 0, 0);
+    assert_eq!(app.scroll_line(owner), 0);
+    assert!(app.scroll_drag.is_none());
+    assert_eq!(scrollbar_selection(&app), selection);
+
+    if matches!(fixture, ScrollbarFixture::Split | ScrollbarFixture::Float) {
+        let rows = rendered_area(&mut app);
+        assert!(rows.iter().any(|row| row.contains(PINNED_TOP)));
+        assert!(rows.iter().any(|row| row.contains(PINNED_BOTTOM)));
+        assert!(!app.float_mgr.is_focused());
+    }
+    if matches!(fixture, ScrollbarFixture::Model) {
+        assert!(matches!(
+            app.model_picker.handle_key(key(KeyCode::Enter)),
+            crate::components::model_picker::ModelPickerAction::Select(spec)
+                if spec == "anthropic/model-0"
+        ));
+    }
+}
+
+#[test_case(ScrollbarFixture::Model; "model")]
+#[test_case(ScrollbarFixture::Task; "task_list_picker")]
+#[test_case(ScrollbarFixture::Input; "input")]
+#[test_case(ScrollbarFixture::Search; "search")]
+#[test_case(ScrollbarFixture::Help; "help")]
+#[test_case(ScrollbarFixture::Btw; "btw")]
+#[test_case(ScrollbarFixture::Split; "passive_split")]
+#[test_case(ScrollbarFixture::Float; "passive_float")]
+#[test_case(ScrollbarFixture::Transcript; "transcript")]
+fn scrollbar_track_jumps_and_release_uses_final_coordinates(fixture: ScrollbarFixture) {
+    let (mut app, owner) = scrollbar_fixture(fixture);
+    app.scroll_owner_to(owner, u16::MAX);
+    render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
+    let bottom = app.scroll_line(owner);
+    let selection = scrollbar_selection(&app);
+    app.scroll_owner_to(owner, 0);
+    render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
+    let rect = app.hits.rect_of(ClickTarget::Scrollbar(owner)).unwrap();
+    scrollbar_mouse_frame(
+        &mut app,
+        MouseEventKind::Down(MouseButton::Left),
+        rect.x,
+        rect.bottom() - 1,
+    );
+    assert_eq!(app.scroll_line(owner), bottom);
+    scrollbar_mouse_frame(
+        &mut app,
+        MouseEventKind::Drag(MouseButton::Left),
+        rect.x,
+        rect.y,
+    );
+    assert_eq!(app.scroll_line(owner), 0);
+    scrollbar_mouse_frame(
+        &mut app,
+        MouseEventKind::Up(MouseButton::Left),
+        RENDER_AREA.width - 1,
+        RENDER_AREA.height - 1,
+    );
+    assert_eq!(app.scroll_line(owner), bottom);
+    assert!(app.scroll_drag.is_none());
+    assert_eq!(scrollbar_selection(&app), selection);
+}
+
+#[test_case(0; "resize")]
+#[test_case(1; "upper_overlay")]
+#[test_case(2; "content_change")]
+fn scrollbar_render_invalidates_stale_drag(change: u8) {
+    let (mut app, owner) = scrollbar_fixture(ScrollbarFixture::Input);
+    app.scroll_owner_to(owner, 0);
+    render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
+    let rect = app.hits.rect_of(ClickTarget::Scrollbar(owner)).unwrap();
+    scrollbar_mouse_frame(
+        &mut app,
+        MouseEventKind::Down(MouseButton::Left),
+        rect.x,
+        rect.y,
+    );
+    assert!(app.scroll_drag.is_some());
+    match change {
+        0 => render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height + 8),
+        1 => {
+            app.help_modal.toggle();
+            render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
+        }
+        _ => {
+            app.input_box.buffer.clear();
+            render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
+        }
+    }
+    assert!(app.scroll_drag.is_none());
+    let offset = app.scroll_line(owner);
+    let height = RENDER_AREA.height + if change == 0 { 8 } else { 0 };
+    if change == 1 {
+        let (_, help) = app.hits.modal().unwrap();
+        assert!(!help.contains(ratatui::layout::Position::new(rect.x, rect.bottom())));
+    }
+    assert!(
+        app.update(mouse_event(
+            MouseEventKind::Drag(MouseButton::Left),
+            rect.x,
+            rect.bottom()
+        ))
+        .is_empty()
+    );
+    render_app(&mut app, RENDER_AREA.width, height);
+    assert!(
+        app.update(mouse_event(
+            MouseEventKind::Up(MouseButton::Left),
+            rect.x,
+            rect.bottom()
+        ))
+        .is_empty()
+    );
+    render_app(&mut app, RENDER_AREA.width, height);
+    assert_eq!(app.scroll_line(owner), offset);
+    assert!(app.selection_state.is_none());
+    if change == 1 {
+        assert!(app.help_modal.is_open());
+        assert_eq!(
+            app.hits.modal().map(|(surface, _)| surface),
+            Some(Surface::Help)
+        );
+    }
+}
+
+#[test_case(0; "permission")]
+#[test_case(1; "question")]
+#[test_case(2; "upper_help_modal")]
+fn rendered_upper_surface_blocks_covered_picker_and_wheel(surface: u8) {
+    let mut app = app_with_tall_model_picker();
+    render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
+    let covered_rows: Vec<_> = (0..40)
+        .filter_map(|index| {
+            let target = ClickTarget::PickerRow {
+                picker: PickerId::Model,
+                index,
+            };
+            app.hits.rect_of(target).map(|rect| (target, rect))
+        })
+        .collect();
+    match surface {
+        0 => {
+            app.permission_prompt.open(
+                "scroll-permission".into(),
+                maki_config::ToolKey::native(PERM_TOOL),
+                vec![PERM_SCOPE.into()],
+                None,
+            );
+            app.active_input = Some(InputKind::Permission);
+        }
+        1 => {
+            let buf = Arc::new(maki_agent::SharedBuf::new());
+            let (event_tx, _event_rx) = flume::bounded(8);
+            let (_cmd_tx, cmd_rx) = flume::bounded(8);
+            app.float_mgr
+                .open(buf, below_input_config(10), true, event_tx, cmd_rx);
+            app.active_input = Some(InputKind::Question);
+        }
+        _ => app.help_modal.toggle(),
+    }
+    render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
+    let upper = match surface {
+        0 => Surface::Permission,
+        1 => Surface::Float(0),
+        _ => Surface::Help,
+    };
+    let upper_rect = app.hits.rect_of(ClickTarget::Surface(upper)).unwrap();
+    let (covered, pos) = covered_rows
+        .iter()
+        .flat_map(|&(target, rect)| {
+            (rect.y..rect.bottom()).flat_map(move |y| {
+                (rect.x..rect.right()).map(move |x| (target, ratatui::layout::Position::new(x, y)))
+            })
+        })
+        .find(|&(_, pos)| {
+            upper_rect.contains(pos)
+                && (app.hits.target_at(pos) == Some(ClickTarget::Surface(upper))
+                    || (surface == 1
+                        && app.hits.target_at(pos) == Some(ClickTarget::WindowContent(0))))
+        })
+        .expect("upper surface has an opaque blank area over a picker row");
+    let picker_offset = app.scroll_line(ScrollOwner::Picker(PickerId::Model));
+    let chat_offset = app.chats[0].scroll_top();
+    assert_eq!(app.hits.surface_at(pos), Some(upper));
+    assert_ne!(app.hits.target_at(pos), Some(covered));
+    assert!(
+        app.update(mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            pos.x,
+            pos.y
+        ))
+        .is_empty()
+    );
+    render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
+    assert!(
+        app.update(mouse_event(
+            MouseEventKind::Up(MouseButton::Left),
+            pos.x,
+            pos.y
+        ))
+        .is_empty()
+    );
+    render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
+    assert!(app.model_picker.is_open());
+    assert!(
+        app.update(Msg::Scroll {
+            column: pos.x,
+            row: pos.y,
+            delta: -4
+        })
+        .is_empty()
+    );
+    render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
+    assert_eq!(
+        app.scroll_line(ScrollOwner::Picker(PickerId::Model)),
+        picker_offset
+    );
+    assert_eq!(app.chats[0].scroll_top(), chat_offset);
+    assert!(
+        app.update(Msg::Scroll {
+            column: 0,
+            row: 0,
+            delta: -4
+        })
+        .is_empty()
+    );
+    render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
+    assert_eq!(
+        app.scroll_line(ScrollOwner::Picker(PickerId::Model)),
+        picker_offset
+    );
+    assert_eq!(app.chats[0].scroll_top(), chat_offset);
+}
+
+#[test]
+fn rendered_outside_click_dismisses_only_upper_modal() {
+    let mut app = app_with_tall_model_picker();
+    app.help_modal.toggle();
+    render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
+    assert_eq!(
+        app.hits.modal().map(|(surface, _)| surface),
+        Some(Surface::Help)
+    );
+    assert!(
+        app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0))
+            .is_empty()
+    );
+    render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
+    assert!(
+        app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 0, 0))
+            .is_empty()
+    );
+    render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
+    assert!(!app.help_modal.is_open());
+    assert!(app.model_picker.is_open());
+    assert_eq!(
+        app.hits.modal().map(|(surface, _)| surface),
+        Some(Surface::Picker(PickerId::Model))
+    );
+    assert!(app.selection_state.is_none());
+}
+
+#[test_case(false, false; "normal_current_choice")]
+#[test_case(false, true; "normal_to_yolo")]
+#[test_case(true, true; "yolo_current_choice")]
+#[test_case(true, false; "yolo_to_normal")]
+fn permission_chip_menu_sets_explicit_value(current: bool, enabled: bool) {
+    let mut app = test_app();
+    app.permissions.set_yolo(current);
+    let rows = rendered_area(&mut app);
+    let chip = if current { "[yolo]" } else { "[normal]" };
+    assert!(rows.last().unwrap().contains(chip));
+    assert!(click_target(&mut app, ClickTarget::PermissionChip).is_empty());
+    assert_eq!(app.permissions.is_yolo(), current);
+    assert!(app.menu.is_open());
+    assert!(click_target(&mut app, ClickTarget::MenuRow(u16::from(enabled))).is_empty());
+    assert_eq!(app.permissions.is_yolo(), enabled);
+    assert!(!app.menu.is_open());
+}
+
 #[test]
 fn click_mode_chip_opens_menu() {
     let mut app = test_app();
@@ -2780,6 +3244,54 @@ fn outside_click_closes_model_picker() {
     app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0));
     app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 0, 0));
     assert!(!app.model_picker.is_open());
+}
+
+#[test]
+fn model_footer_enter_does_not_answer_active_permission_confirmation() {
+    let (mut app, models) = app_with_model_slot();
+    models.store(Some(Arc::new(vec![
+        MODEL_SPEC_GLM4.into(),
+        MODEL_SPEC_GPT9.into(),
+    ])));
+    app.run_builtin(BuiltinAction::ModelPicker);
+    let (answer_tx, answer_rx) = flume::bounded(1);
+    app.answer_tx = Some(answer_tx);
+    app.permission_prompt.open(
+        "footer-permission".into(),
+        maki_config::ToolKey::native(PERM_TOOL),
+        vec![PERM_SCOPE.into()],
+        None,
+    );
+    app.active_input = Some(InputKind::Permission);
+    assert!(app.update(Msg::Key(key(KeyCode::Char('a')))).is_empty());
+    render_app(&mut app, TEST_AREA.width, TEST_AREA.height);
+    let target = ClickTarget::KeyHint(key(KeyCode::Enter));
+    let (x, y) = hit_center(&app, target);
+    let pos = ratatui::layout::Position::new(x, y);
+    assert_eq!(app.hits.target_at(pos), Some(target));
+    assert_eq!(
+        app.hits.surface_at(pos),
+        Some(Surface::Picker(PickerId::Model))
+    );
+    assert!(
+        app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), x, y))
+            .is_empty()
+    );
+    render_app(&mut app, TEST_AREA.width, TEST_AREA.height);
+    let actions = app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), x, y));
+    render_app(&mut app, TEST_AREA.width, TEST_AREA.height);
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::ChangeModel(_) | Action::ChangePinnedModel { .. }]
+    ));
+    assert!(!app.model_picker.is_open());
+    assert!(app.permission_active());
+    assert!(app.permission_prompt.is_open());
+    assert!(answer_rx.try_recv().is_err());
+    assert!(matches!(
+        app.permission_prompt.handle_key(key(KeyCode::Enter)),
+        Some(maki_agent::permissions::PermissionAnswer::AllowAlwaysLocal)
+    ));
 }
 
 #[test]
@@ -6408,7 +6920,7 @@ fn overlay_zone_click_gating() {
     let overlay = Rect::new(10, 3, 60, 10);
     set_zone(&mut app, SelectionZone::Messages, msg);
     set_zone(&mut app, SelectionZone::Overlay, overlay);
-    app.hits.set_modal_rects([overlay]);
+    app.hits.surface(crate::click::Surface::Help, overlay, true);
     app.help_modal.toggle();
 
     app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 1));

@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use crate::AppSession;
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
-use crate::click::{ClickTarget, CompletionGrid, HitRegistry, PickerId, ScrollOwner};
+use crate::click::{ClickTarget, CompletionGrid, HitRegistry, PickerId, ScrollOwner, Surface};
 use crate::clipboard::ClipboardState;
 use crate::command_runtime::{CommandRuntime, PreparedCommandTarget};
 use maki_agent::HistorySnapshot;
@@ -1140,23 +1140,6 @@ impl App {
         }
     }
 
-    fn dismissible_modal_open(&self) -> bool {
-        if self.float_mgr.is_focused() {
-            return false;
-        }
-        self.search_modal.is_open()
-            || self.file_picker.is_open()
-            || self.task_picker.is_open()
-            || self.lua_picker.is_open()
-            || self.rewind_picker.is_open()
-            || self.theme_picker.is_open()
-            || self.model_picker.is_open()
-            || self.login_picker.is_open()
-            || self.mcp_picker.is_open()
-            || self.help_modal.is_open()
-            || self.btw_modal.is_open()
-    }
-
     fn answer_permission(&mut self, answer: maki_agent::permissions::PermissionAnswer) {
         let agent_id = self.permission_prompt.agent_id();
         let request_id = self.permission_prompt.request_id().unwrap_or_default();
@@ -1167,6 +1150,36 @@ impl App {
 
     pub(super) fn dispatch_click(&mut self, target: ClickTarget, pos: Position) -> Vec<Action> {
         match target {
+            ClickTarget::DeferInput => {
+                self.toggle_defer_input();
+                vec![]
+            }
+            ClickTarget::KeyHint(key) => match self.hits.surface_at(pos) {
+                Some(Surface::Picker(picker)) => self.handle_picker_key(picker, key),
+                Some(Surface::Plan) => {
+                    let action = self.plan_form.handle_key(key);
+                    self.handle_plan_form_action(action)
+                }
+                _ => vec![],
+            },
+            ClickTarget::PermissionChip => {
+                self.toggle_permission_menu();
+                vec![]
+            }
+            ClickTarget::PickerInput(picker) => {
+                match picker {
+                    PickerId::Model => self.model_picker.click_input(pos),
+                    PickerId::Task => self.task_picker.click_input(pos),
+                    PickerId::Theme => self.theme_picker.click_input(pos),
+                    PickerId::Rewind => self.rewind_picker.click_input(pos),
+                    PickerId::Login => self.login_picker.click_input(pos),
+                    PickerId::Mcp => self.mcp_picker.click_input(pos),
+                    PickerId::Lua => self.lua_picker.click_input(pos),
+                    PickerId::Search => self.search_modal.click_input(pos),
+                    PickerId::File => self.file_picker.click_input(pos),
+                };
+                vec![]
+            }
             ClickTarget::ModeChip => {
                 self.toggle_mode_menu();
                 vec![]
@@ -1185,6 +1198,10 @@ impl App {
             }
             ClickTarget::StatusEntry(id) => {
                 self.lua_event_handle.click_region(id);
+                vec![]
+            }
+            ClickTarget::WindowFooter { id, index } => {
+                self.float_mgr.click_footer(id, index);
                 vec![]
             }
             ClickTarget::WindowContent(id) | ClickTarget::WindowChrome(id) => {
@@ -1231,7 +1248,10 @@ impl App {
             }
             ClickTarget::PickerRow { picker, index } => {
                 if self.select_picker_row(picker, index) {
-                    self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                    self.handle_picker_key(
+                        picker,
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    )
                 } else {
                     vec![]
                 }
@@ -1246,6 +1266,114 @@ impl App {
                 }
             }
             _ => vec![],
+        }
+    }
+
+    fn handle_picker_key(&mut self, picker: PickerId, key: KeyEvent) -> Vec<Action> {
+        match picker {
+            PickerId::Lua => match self.lua_picker.handle_key(key) {
+                LuaPickerAction::Confirming(msg) => {
+                    self.flash(msg);
+                    vec![]
+                }
+                LuaPickerAction::Consumed
+                | LuaPickerAction::Choice(..)
+                | LuaPickerAction::Delete(..)
+                | LuaPickerAction::Close => vec![],
+            },
+            PickerId::Search => {
+                match self.search_modal.handle_key(key) {
+                    SearchAction::Consumed => self.refresh_search_matches(),
+                    SearchAction::Navigate => {
+                        sync_search_highlight(
+                            &self.search_modal,
+                            &mut self.chats[self.active_chat],
+                        );
+                    }
+                    SearchAction::Select(idx) => {
+                        let chat = &mut self.chats[self.active_chat];
+                        chat.scroll_to_segment(idx);
+                        chat.set_highlight_segment(None);
+                        self.search_modal.close();
+                    }
+                    SearchAction::Close(saved) => {
+                        let chat = &mut self.chats[self.active_chat];
+                        chat.set_highlight_segment(None);
+                        if let Some((top, auto)) = saved {
+                            chat.restore_scroll(top, auto);
+                        }
+                        self.search_modal.close();
+                    }
+                }
+                vec![]
+            }
+            PickerId::File => match self.file_picker.handle_key(key) {
+                FilePickerModalAction::Consumed => vec![],
+                FilePickerModalAction::Select(path) => {
+                    self.file_picker.close();
+                    if let InputAction::PaletteSync(val) =
+                        self.input_box.handle_paste_with_spaces(&path)
+                    {
+                        self.pending_dirty |= self.command_palette.sync(&val);
+                        self.sync_command_arguments(
+                            &val,
+                            self.input_box.buffer.cursor_byte_offset(),
+                        );
+                        self.sync_file_completion();
+                    }
+                    vec![]
+                }
+                FilePickerModalAction::Close => {
+                    self.file_picker.close();
+                    vec![]
+                }
+            },
+            PickerId::Task => {
+                if key::TASKS.matches(key) {
+                    self.task_picker.close();
+                    return vec![];
+                }
+                match self.task_picker.handle_key(key) {
+                    PickerAction::Consumed
+                    | PickerAction::Toggle(..)
+                    | PickerAction::Delete(..) => {
+                        vec![]
+                    }
+                    PickerAction::Select(entry) => {
+                        self.task_picker_original = None;
+                        self.active_chat = entry.chat_index;
+                        vec![]
+                    }
+                    PickerAction::Close => {
+                        self.active_chat = self.task_picker_original.take().unwrap_or(0);
+                        vec![]
+                    }
+                }
+            }
+            PickerId::Rewind => match self.rewind_picker.handle_key(key) {
+                RewindPickerAction::Consumed => vec![],
+                RewindPickerAction::Select(entry) => self.rewind_to(entry),
+                RewindPickerAction::Close => vec![],
+            },
+            PickerId::Theme => match self.theme_picker.handle_key(key) {
+                ThemePickerAction::Consumed => vec![],
+                ThemePickerAction::Closed => vec![],
+            },
+            PickerId::Model => self.handle_model_picker_key(key),
+            PickerId::Login => {
+                let action = self.login_picker.handle_key(key);
+                self.login_picker_actions(action)
+            }
+            PickerId::Mcp => match self.mcp_picker.handle_key(key) {
+                McpPickerAction::Consumed => vec![],
+                McpPickerAction::Toggle {
+                    server_name,
+                    enabled,
+                } => {
+                    vec![Action::ToggleMcp(server_name, enabled)]
+                }
+                McpPickerAction::Close => vec![],
+            },
         }
     }
 
@@ -1265,6 +1393,18 @@ impl App {
 
     fn apply_menu_action(&mut self, action: MenuAction) -> Vec<Action> {
         match action {
+            MenuAction::Permission(enabled) => {
+                if self.coordinator.is_none() {
+                    self.permissions.set_yolo(enabled);
+                    self.apply_toggled_option(maki_agent::session_options::YOLO_OPTION_ID, enabled);
+                    vec![]
+                } else {
+                    vec![Action::SetSessionOption {
+                        id: maki_agent::session_options::YOLO_OPTION_ID,
+                        enabled,
+                    }]
+                }
+            }
             MenuAction::Mode(key) => vec![Action::ChangeMode(key)],
             MenuAction::Thinking(thinking) => {
                 vec![Action::SelectModel(maki_commands::ModelSelection {
@@ -1274,6 +1414,18 @@ impl App {
                 })]
             }
         }
+    }
+
+    fn toggle_permission_menu(&mut self) {
+        if self.menu.kind() == Some(MenuKind::Permission) {
+            self.menu.close();
+            return;
+        }
+        let Some(anchor) = self.hits.rect_of(ClickTarget::PermissionChip) else {
+            return;
+        };
+        self.menu
+            .open_permission(anchor, self.permissions.is_yolo());
     }
 
     fn toggle_mode_menu(&mut self) {
@@ -1337,39 +1489,33 @@ impl App {
         self.menu.open(MenuKind::Thinking, anchor, items);
     }
 
+    fn scroll_surface(&mut self, surface: Surface, delta: i32) {
+        match surface {
+            Surface::Picker(PickerId::Model) => self.model_picker.scroll(delta),
+            Surface::Picker(PickerId::Task) => self.task_picker.scroll(delta),
+            Surface::Picker(PickerId::Theme) => self.theme_picker.scroll(delta),
+            Surface::Picker(PickerId::Rewind) => self.rewind_picker.scroll(delta),
+            Surface::Picker(PickerId::Login) => self.login_picker.scroll(delta),
+            Surface::Picker(PickerId::Mcp) => self.mcp_picker.scroll(delta),
+            Surface::Picker(PickerId::Lua) => self.lua_picker.scroll(delta),
+            Surface::Picker(PickerId::Search) => self.search_modal.scroll(delta),
+            Surface::Picker(PickerId::File) => self.file_picker.scroll(delta),
+            Surface::Help => self.help_modal.scroll(delta),
+            Surface::Btw => self.btw_modal.scroll(delta),
+            Surface::Float(id) => self.float_mgr.scroll_window(id, delta),
+            _ => {}
+        }
+    }
+
     fn scroll_at(&mut self, column: u16, row: u16, delta: i32) -> Option<SelectionZone> {
-        if self.btw_modal.is_open() {
-            self.btw_modal.scroll(delta);
-            return None;
-        }
-        if self.help_modal.is_open() {
-            self.help_modal.scroll(delta);
-            return None;
-        }
         let pos = Position::new(column, row);
-        if self.float_mgr.is_focused() && self.float_mgr.contains(pos) {
-            self.float_mgr.scroll(delta);
+        if let Some(surface) = self.hits.surface_at(pos) {
+            self.scroll_surface(surface, delta);
             return None;
         }
-        macro_rules! try_picker {
-            ($picker:expr) => {
-                if $picker.is_open() {
-                    if $picker.contains(pos) {
-                        $picker.scroll(delta);
-                    }
-                    return None;
-                }
-            };
+        if self.hits.modal().is_some() || self.has_modal_overlay() {
+            return None;
         }
-        try_picker!(self.rewind_picker);
-        try_picker!(self.task_picker);
-        try_picker!(self.model_picker);
-        try_picker!(self.file_picker);
-        try_picker!(self.theme_picker);
-        try_picker!(self.login_picker);
-        try_picker!(self.mcp_picker);
-        try_picker!(self.lua_picker);
-        try_picker!(self.search_modal);
         let zone = self.zone_at(row, column)?.zone;
         self.scroll_zone(zone, delta);
         Some(zone)
@@ -1614,16 +1760,7 @@ impl App {
         }
 
         if self.lua_picker.is_open() {
-            return Some(match self.lua_picker.handle_key(key) {
-                LuaPickerAction::Confirming(msg) => {
-                    self.flash(msg);
-                    vec![]
-                }
-                LuaPickerAction::Consumed
-                | LuaPickerAction::Choice(..)
-                | LuaPickerAction::Delete(..)
-                | LuaPickerAction::Close => vec![],
-            });
+            return Some(self.handle_picker_key(PickerId::Lua, key));
         }
 
         if !self.permission_active() && self.float_mgr.handle_key(key) {
@@ -1631,51 +1768,11 @@ impl App {
         }
 
         if self.search_modal.is_open() {
-            match self.search_modal.handle_key(key) {
-                SearchAction::Consumed => self.refresh_search_matches(),
-                SearchAction::Navigate => {
-                    sync_search_highlight(&self.search_modal, &mut self.chats[self.active_chat]);
-                }
-                SearchAction::Select(idx) => {
-                    let chat = &mut self.chats[self.active_chat];
-                    chat.scroll_to_segment(idx);
-                    chat.set_highlight_segment(None);
-                    self.search_modal.close();
-                }
-                SearchAction::Close(saved) => {
-                    let chat = &mut self.chats[self.active_chat];
-                    chat.set_highlight_segment(None);
-                    if let Some((top, auto)) = saved {
-                        chat.restore_scroll(top, auto);
-                    }
-                    self.search_modal.close();
-                }
-            }
-            return Some(vec![]);
+            return Some(self.handle_picker_key(PickerId::Search, key));
         }
 
         if self.file_picker.is_open() {
-            return Some(match self.file_picker.handle_key(key) {
-                FilePickerModalAction::Consumed => vec![],
-                FilePickerModalAction::Select(path) => {
-                    self.file_picker.close();
-                    if let InputAction::PaletteSync(val) =
-                        self.input_box.handle_paste_with_spaces(&path)
-                    {
-                        self.pending_dirty |= self.command_palette.sync(&val);
-                        self.sync_command_arguments(
-                            &val,
-                            self.input_box.buffer.cursor_byte_offset(),
-                        );
-                        self.sync_file_completion();
-                    }
-                    vec![]
-                }
-                FilePickerModalAction::Close => {
-                    self.file_picker.close();
-                    vec![]
-                }
-            });
+            return Some(self.handle_picker_key(PickerId::File, key));
         }
 
         if self.queue.focus().is_some() {
@@ -1696,61 +1793,27 @@ impl App {
         }
 
         if self.task_picker.is_open() {
-            if key::TASKS.matches(key) {
-                self.task_picker.close();
-                return Some(vec![]);
-            }
-            return Some(match self.task_picker.handle_key(key) {
-                PickerAction::Consumed | PickerAction::Toggle(..) | PickerAction::Delete(..) => {
-                    vec![]
-                }
-                PickerAction::Select(entry) => {
-                    self.task_picker_original = None;
-                    self.active_chat = entry.chat_index;
-                    vec![]
-                }
-                PickerAction::Close => {
-                    self.active_chat = self.task_picker_original.take().unwrap_or(0);
-                    vec![]
-                }
-            });
+            return Some(self.handle_picker_key(PickerId::Task, key));
         }
 
         if self.rewind_picker.is_open() {
-            return Some(match self.rewind_picker.handle_key(key) {
-                RewindPickerAction::Consumed => vec![],
-                RewindPickerAction::Select(entry) => self.rewind_to(entry),
-                RewindPickerAction::Close => vec![],
-            });
+            return Some(self.handle_picker_key(PickerId::Rewind, key));
         }
 
         if self.theme_picker.is_open() {
-            return Some(match self.theme_picker.handle_key(key) {
-                ThemePickerAction::Consumed => vec![],
-                ThemePickerAction::Closed => vec![],
-            });
+            return Some(self.handle_picker_key(PickerId::Theme, key));
         }
 
         if self.model_picker.is_open() {
-            return Some(self.handle_model_picker_key(key));
+            return Some(self.handle_picker_key(PickerId::Model, key));
         }
 
         if self.login_picker.is_open() {
-            let action = self.login_picker.handle_key(key);
-            return Some(self.login_picker_actions(action));
+            return Some(self.handle_picker_key(PickerId::Login, key));
         }
 
         if self.mcp_picker.is_open() {
-            return Some(match self.mcp_picker.handle_key(key) {
-                McpPickerAction::Consumed => vec![],
-                McpPickerAction::Toggle {
-                    server_name,
-                    enabled,
-                } => {
-                    vec![Action::ToggleMcp(server_name, enabled)]
-                }
-                McpPickerAction::Close => vec![],
-            });
+            return Some(self.handle_picker_key(PickerId::Mcp, key));
         }
 
         if key::PLAN_TOGGLE.matches(key) && self.plan_toggle_ready() {

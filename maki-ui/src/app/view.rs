@@ -1,7 +1,7 @@
 use maki_providers::ThinkingConfigExt;
 use std::sync::atomic::Ordering;
 
-use crate::click::{ClickTarget, HitTarget, ScrollOwner};
+use crate::click::{ClickTarget, HitTarget, PickerId, ScrollOwner, Surface};
 use crate::components::Overlay;
 use crate::components::input::Placeholder;
 #[cfg(test)]
@@ -53,6 +53,7 @@ struct ViewLayout {
 impl App {
     pub fn view(&mut self, frame: &mut Frame) {
         self.hits.clear();
+        self.float_mgr.begin_frame();
         self.sync_focused_queue();
         self.status_bar.set_cwd(self.focused_cwd());
         let form_visible = self.permission_active() || self.plan_form_active();
@@ -64,10 +65,13 @@ impl App {
         self.render_messages(frame, &layout, render_chat);
         self.render_bottom_panel(frame, &layout);
         self.render_splits(frame, &layout);
-        let mut modal_rects = self.render_picker_overlays(frame, &layout);
         self.render_status_bar(frame, layout.status_area, render_chat);
+        let mut modal_rects = self.render_picker_overlays(frame, &layout);
         if self.menu.is_open() && !self.has_modal_overlay() && !self.permission_active() {
             let hits = self.menu.view(frame, frame.area(), self.hover);
+            if let Some(rect) = self.menu.area() {
+                self.hits.surface(Surface::Menu, rect, false);
+            }
             self.absorb_hits(hits);
         }
         self.render_defer_hint(frame, layout.defer_hint_area);
@@ -79,7 +83,6 @@ impl App {
         {
             modal_rects.push(selection::inset_border(rect));
         }
-        self.hits.set_modal_rects(modal_rects.iter().copied());
         let overlay_rect = modal_rects
             .iter()
             .copied()
@@ -107,6 +110,8 @@ impl App {
                 .set_style(Style::new().fg(theme::current().mode_build));
         }
         self.render_active_input(frame, &layout);
+        let dirty = self.validate_scroll_drag();
+        self.pending_dirty |= dirty;
     }
 
     fn compute_layout(&self, area: Rect, form_visible: bool) -> ViewLayout {
@@ -310,15 +315,19 @@ impl App {
             // (`render_active_input`) so it lands above pickers/modals.
         } else if self.plan_form_active() {
             let model = self.focused_model_spec();
+            self.hits.surface(Surface::Plan, layout.bottom_area, false);
             let hits = self.plan_form.view(frame, layout.bottom_area, &model);
             self.absorb_hits(hits);
         } else if layout.bottom_area.height > 0 {
             let queue_entries = self.queue.panel_entries();
+            self.hits.surface(Surface::Queue, layout.queue_area, false);
             let hits =
                 queue_panel::view(frame, layout.queue_area, &queue_entries, self.queue.focus());
             self.absorb_hits(hits);
             for &(idx, rect) in &layout.panel_windows {
                 self.float_mgr.view_panel(frame, idx, rect);
+                let hits = self.float_mgr.take_hits();
+                self.absorb_hits(hits);
             }
             let streaming = self.focused_streaming();
             let placeholder = if streaming {
@@ -356,11 +365,14 @@ impl App {
                 self.absorb_hits(hits);
             }
             if !self.any_overlay_open() {
-                self.command_palette.view(
+                let popup = self.command_palette.view(
                     frame,
                     layout.input_area,
                     self.ui_config.autocomplete_height,
                 );
+                if let Some(rect) = popup {
+                    self.hits.surface(Surface::Completion, rect, false);
+                }
                 let hits = self.command_palette.hits();
                 self.absorb_hits(hits);
             }
@@ -376,6 +388,8 @@ impl App {
             }
             if let Some(rect) = layout.splits.rect(dir) {
                 self.float_mgr.view_split(frame, dir, rect);
+                let hits = self.float_mgr.take_hits();
+                self.absorb_hits(hits);
             }
         }
     }
@@ -391,13 +405,15 @@ impl App {
                 Block::default().style(Style::new().bg(theme::current().background)),
                 layout.bottom_area,
             );
+            self.hits
+                .surface(Surface::Permission, layout.bottom_area, false);
             let hits = self.permission_prompt.view(frame, layout.bottom_area);
             self.absorb_hits(hits);
         } else if self.question_active()
             && let Some(rect) = layout.splits.rect(Split::Below)
         {
             self.float_mgr.view_split(frame, Split::Below, rect);
-            let hits = self.float_mgr.hits();
+            let hits = self.float_mgr.take_hits();
             self.absorb_hits(hits);
         }
     }
@@ -407,51 +423,71 @@ impl App {
         let full = frame.area();
 
         if self.search_modal.is_open() {
-            rects.push(self.search_modal.view(frame, layout.msg_area));
+            let rect = self.search_modal.view(frame, layout.msg_area);
+            self.hits
+                .surface(Surface::Picker(PickerId::Search), rect, true);
+            rects.push(rect);
             let hits = self.search_modal.hits();
             self.absorb_hits(hits);
         }
 
         if self.task_picker.is_open() {
-            rects.push(self.task_picker.view(frame, full));
+            let rect = self.task_picker.view(frame, full);
+            self.hits
+                .surface(Surface::Picker(PickerId::Task), rect, true);
+            rects.push(rect);
             let hits = self.task_picker.hits();
             self.absorb_hits(hits);
         }
 
         if self.lua_picker.is_open() {
-            rects.push(self.lua_picker.view(frame, full));
+            let rect = self.lua_picker.view(frame, full);
+            self.hits
+                .surface(Surface::Picker(PickerId::Lua), rect, true);
+            rects.push(rect);
             let hits = self.lua_picker.hits();
             self.absorb_hits(hits);
         }
 
         if self.file_picker.is_open() {
-            rects.push(self.file_picker.view(frame, full));
+            let rect = self.file_picker.view(frame, full);
+            self.hits
+                .surface(Surface::Picker(PickerId::File), rect, true);
+            rects.push(rect);
             let hits = self.file_picker.hits();
             self.absorb_hits(hits);
         }
 
         macro_rules! render_if_open {
-            ($overlay:expr) => {
+            ($overlay:expr, $id:ident) => {
                 if $overlay.is_open() {
-                    rects.push($overlay.view(frame, full));
+                    let rect = $overlay.view(frame, full);
+                    self.hits
+                        .surface(Surface::Picker(PickerId::$id), rect, true);
+                    rects.push(rect);
                     let hits = $overlay.hits();
                     self.absorb_hits(hits);
                 }
             };
         }
 
-        render_if_open!(self.rewind_picker);
-        render_if_open!(self.theme_picker);
-        render_if_open!(self.model_picker);
-        render_if_open!(self.login_picker);
-        render_if_open!(self.mcp_picker);
+        render_if_open!(self.rewind_picker, Rewind);
+        render_if_open!(self.theme_picker, Theme);
+        render_if_open!(self.model_picker, Model);
+        render_if_open!(self.login_picker, Login);
+        render_if_open!(self.mcp_picker, Mcp);
 
         rects
     }
 
     fn absorb_hits(&mut self, hits: Vec<HitTarget>) {
         for hit in hits {
-            self.hits.push(hit.rect, hit.target);
+            if let ClickTarget::Surface(surface) = hit.target {
+                let modal = matches!(surface, Surface::Float(id) if self.float_mgr.is_focused_window(id) && !self.question_active());
+                self.hits.surface(surface, hit.rect, modal);
+            } else {
+                self.hits.push(hit.rect, hit.target);
+            }
         }
     }
 
@@ -461,6 +497,7 @@ impl App {
             .btw_modal
             .view(frame, full, self.theme_provider.generation());
         if r.width > 0 {
+            self.hits.surface(Surface::Btw, r, true);
             if let Some(hit) = self.btw_modal.scrollbar_hit() {
                 self.hits
                     .push(hit.area, ClickTarget::Scrollbar(ScrollOwner::Btw));
@@ -469,6 +506,7 @@ impl App {
         }
         let r = self.help_modal.view(frame, full);
         if r.width > 0 {
+            self.hits.surface(Surface::Help, r, true);
             if let Some(hit) = self.help_modal.scrollbar_hit() {
                 self.hits
                     .push(hit.area, ClickTarget::Scrollbar(ScrollOwner::Help));
@@ -479,7 +517,7 @@ impl App {
         if let Some(rect) = self.float_mgr.focused_rect() {
             rects.push(rect);
         }
-        let hits = self.float_mgr.hits();
+        let hits = self.float_mgr.take_hits();
         self.absorb_hits(hits);
     }
 
@@ -558,7 +596,7 @@ impl App {
 
     /// Left-aligned affordance pinned on the row above the status bar while an
     /// Alt+M-deferred prompt waits: how to bring it back without submitting.
-    fn render_defer_hint(&self, frame: &mut Frame, area: Rect) {
+    fn render_defer_hint(&mut self, frame: &mut Frame, area: Rect) {
         if area.height == 0 {
             return;
         }
@@ -568,6 +606,11 @@ impl App {
             Span::styled(key::DEFER_INPUT.label, t.keybind_key),
             Span::styled(" Undefer pending model input)", t.tool_dim),
         ]);
+        let width = (line.width() as u16).min(area.width);
+        self.hits.push(
+            Rect::new(area.x, area.y, width, area.height),
+            ClickTarget::DeferInput,
+        );
         frame.render_widget(Paragraph::new(line), area);
     }
 

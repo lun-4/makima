@@ -1,3 +1,4 @@
+use crossterm::event::KeyEvent;
 use ratatui::layout::{Position, Rect};
 
 /// One UI surface family that owns a vertical scrollbar.
@@ -34,7 +35,26 @@ pub enum CompletionGrid {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Surface {
+    Picker(PickerId),
+    Help,
+    Btw,
+    Permission,
+    Float(u32),
+    Menu,
+    Plan,
+    Queue,
+    Completion,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClickTarget {
+    Surface(Surface),
+    DismissSurface(Surface),
+    PickerInput(PickerId),
+    DeferInput,
+    KeyHint(KeyEvent),
+    PermissionChip,
     ModeChip,
     ThinkingChip,
     ModelChip,
@@ -51,6 +71,7 @@ pub enum ClickTarget {
     CompletionRow { grid: CompletionGrid, index: usize },
     WindowContent(u32),
     WindowChrome(u32),
+    WindowFooter { id: u32, index: usize },
     Scrollbar(ScrollOwner),
 }
 
@@ -63,13 +84,13 @@ pub struct HitTarget {
 #[derive(Default)]
 pub struct HitRegistry {
     hits: Vec<HitTarget>,
-    modal_rects: Vec<Rect>,
+    modal: Option<(Surface, Rect, usize)>,
 }
 
 impl HitRegistry {
     pub fn clear(&mut self) {
         self.hits.clear();
-        self.modal_rects.clear();
+        self.modal = None;
     }
 
     pub fn push(&mut self, rect: Rect, target: ClickTarget) {
@@ -80,36 +101,46 @@ impl HitRegistry {
     }
 
     pub fn target_at(&self, pos: Position) -> Option<ClickTarget> {
-        self.hits
+        self.hits[self.modal.map_or(0, |(_, _, start)| start)..]
             .iter()
             .rev()
             .find(|hit| hit.rect.contains(pos))
             .map(|hit| hit.target)
     }
 
+    pub fn surface_at(&self, pos: Position) -> Option<Surface> {
+        self.hits[self.modal.map_or(0, |(_, _, start)| start)..]
+            .iter()
+            .rev()
+            .find_map(|hit| match hit.target {
+                ClickTarget::Surface(surface) if hit.rect.contains(pos) => Some(surface),
+                _ => None,
+            })
+    }
+
     pub fn rect_of(&self, target: ClickTarget) -> Option<Rect> {
-        self.hits
+        self.hits[self.modal.map_or(0, |(_, _, start)| start)..]
             .iter()
             .rev()
             .find(|hit| hit.target == target)
             .map(|hit| hit.rect)
     }
 
-    pub fn set_modal_rects(&mut self, rects: impl IntoIterator<Item = Rect>) {
-        self.modal_rects.clear();
-        self.modal_rects
-            .extend(rects.into_iter().filter(|r| r.width > 0 && r.height > 0));
+    pub fn surface(&mut self, surface: Surface, rect: Rect, modal: bool) {
+        if rect.is_empty() {
+            return;
+        }
+        if modal {
+            self.modal = Some((surface, rect, self.hits.len()));
+        }
+        self.push(rect, ClickTarget::Surface(surface));
     }
 
-    pub fn modal_rects(&self) -> &[Rect] {
-        &self.modal_rects
+    pub fn modal(&self) -> Option<(Surface, Rect)> {
+        self.modal.map(|(surface, rect, _)| (surface, rect))
     }
 
     pub fn inside_modal(&self, pos: Position) -> bool {
-        self.modal_rects.iter().any(|rect| rect.contains(pos))
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.hits.is_empty()
+        self.modal.is_some_and(|(_, rect, _)| rect.contains(pos))
     }
 }

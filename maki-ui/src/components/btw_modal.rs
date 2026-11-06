@@ -1,7 +1,7 @@
 use crate::components::ModalScroll;
 use crate::components::Overlay;
 use crate::components::modal::Modal;
-use crate::components::scrollbar::{ScrollbarHit, render_vertical_scrollbar};
+use crate::components::scrollbar::{ScrollbarHit, render_vertical_scrollbar, saturating_u16};
 use crate::components::streaming_content::StreamingContent;
 use crate::theme;
 
@@ -153,15 +153,17 @@ impl BtwModal {
         let md_lines = self.answer.render_lines(padded_width, theme_gen);
         lines.extend_from_slice(md_lines);
 
-        let total = Paragraph::new(lines.clone())
-            .wrap(Wrap { trim: false })
-            .line_count(padded_width) as u16;
+        let total = saturating_u16(
+            Paragraph::new(lines.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(padded_width),
+        );
         let modal = Modal {
             title: TITLE,
             width_percent: WIDTH_PERCENT,
             max_height_percent: MAX_HEIGHT_PERCENT,
         };
-        let (popup, inner) = modal.render(frame, area, total);
+        let (popup, inner) = modal.render(frame, area, total.min(area.height.saturating_sub(2)));
         let padded = Rect {
             x: inner.x + H_PAD,
             width: inner.width.saturating_sub(H_PAD * 2),
