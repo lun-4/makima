@@ -1509,14 +1509,17 @@ impl App {
 
     fn scroll_at(&mut self, column: u16, row: u16, delta: i32) -> Option<SelectionZone> {
         let pos = Position::new(column, row);
-        if let Some(surface) = self.hits.surface_at(pos) {
+        if let Some(surface) = self.hits.scroll_surface_at(pos) {
             self.scroll_surface(surface, delta);
             return None;
         }
-        if self.hits.modal().is_some() || self.has_modal_overlay() {
-            return None;
-        }
-        let zone = self.zone_at(row, column)?.zone;
+        let zone = [SelectionZone::Input, SelectionZone::Messages]
+            .into_iter()
+            .find(|&zone| {
+                self.zones
+                    .find(zone)
+                    .is_some_and(|entry| entry.area.contains(pos))
+            })?;
         self.scroll_zone(zone, delta);
         Some(zone)
     }

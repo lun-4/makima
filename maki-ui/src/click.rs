@@ -118,6 +118,13 @@ impl HitRegistry {
             })
     }
 
+    pub fn scroll_surface_at(&self, pos: Position) -> Option<Surface> {
+        self.hits.iter().rev().find_map(|hit| match hit.target {
+            ClickTarget::Surface(surface) if hit.rect.contains(pos) => Some(surface),
+            _ => None,
+        })
+    }
+
     pub fn rect_of(&self, target: ClickTarget) -> Option<Rect> {
         self.hits[self.modal.map_or(0, |(_, _, start)| start)..]
             .iter()

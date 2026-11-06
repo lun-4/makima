@@ -3159,6 +3159,103 @@ fn rendered_upper_surface_blocks_covered_picker_and_wheel(surface: u8) {
     assert_eq!(app.chats[0].scroll_top(), chat_offset);
 }
 
+#[test_case(0; "help")]
+#[test_case(1; "model_picker")]
+#[test_case(2; "focused_float")]
+fn wheel_scrolls_exposed_transcript_without_changing_modal(surface: u8) {
+    let mut app = middle_scroll_transcript();
+    match surface {
+        0 => app.help_modal.toggle(),
+        1 => {
+            app.run_builtin(BuiltinAction::ModelPicker);
+        }
+        _ => {
+            let buf = Arc::new(maki_agent::SharedBuf::new());
+            let (event_tx, _event_rx) = flume::bounded(8);
+            let (_cmd_tx, cmd_rx) = flume::bounded(8);
+            app.float_mgr.open(
+                buf,
+                maki_lua::FloatConfig {
+                    width: maki_lua::Dimension::Abs(40),
+                    height: maki_lua::Dimension::Abs(10),
+                    ..maki_lua::FloatConfig::default()
+                },
+                true,
+                event_tx,
+                cmd_rx,
+            );
+        }
+    }
+    render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
+    let modal = app.hits.modal();
+    assert!(modal.is_some());
+    let area = app.zones.find(SelectionZone::Messages).unwrap().area;
+    let pos = (area.y..area.bottom())
+        .flat_map(|y| (area.x..area.right()).map(move |x| ratatui::layout::Position::new(x, y)))
+        .find(|&pos| app.hits.scroll_surface_at(pos).is_none())
+        .unwrap();
+    let before = app.chats[0].scroll_top();
+    assert!(before > 0);
+    assert!(
+        app.update(Msg::Scroll {
+            column: pos.x,
+            row: pos.y,
+            delta: 4
+        })
+        .is_empty()
+    );
+    render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
+    assert!(app.chats[0].scroll_top() < before);
+    assert_eq!(app.hits.modal(), modal);
+    assert_eq!(app.active_chat, 0);
+    assert!(app.selection_state.is_none());
+}
+
+#[test_case(ScrollbarFixture::Model; "lower_picker")]
+#[test_case(ScrollbarFixture::Input; "input")]
+#[test_case(ScrollbarFixture::Split; "passive_split")]
+fn wheel_scrolls_exposed_lower_surface_without_click_activation(fixture: ScrollbarFixture) {
+    let (mut app, owner) = scrollbar_fixture(fixture);
+    app.scroll_owner_to(owner, 0);
+    app.help_modal.toggle();
+    render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
+    let help = app.hits.modal().unwrap();
+    assert_eq!(help.0, Surface::Help);
+    let pos = if owner == ScrollOwner::Input {
+        let area = app.zones.find(SelectionZone::Input).unwrap().area;
+        (area.y..area.bottom())
+            .flat_map(|y| (area.x..area.right()).map(move |x| ratatui::layout::Position::new(x, y)))
+            .find(|&pos| app.hits.scroll_surface_at(pos).is_none())
+    } else {
+        let lower = match owner {
+            ScrollOwner::Picker(picker) => Surface::Picker(picker),
+            ScrollOwner::Float(id) => Surface::Float(id),
+            _ => unreachable!(),
+        };
+        (0..RENDER_AREA.height)
+            .flat_map(|y| (0..RENDER_AREA.width).map(move |x| ratatui::layout::Position::new(x, y)))
+            .find(|&pos| app.hits.scroll_surface_at(pos) == Some(lower))
+    }
+    .expect("lower surface remains exposed beside help");
+    let help_offset = app.help_modal.scroll_line();
+    let before = app.scroll_line(owner);
+    let selection = scrollbar_selection(&app);
+    assert!(app.hits.target_at(pos).is_none());
+    assert!(
+        app.update(Msg::Scroll {
+            column: pos.x,
+            row: pos.y,
+            delta: -4
+        })
+        .is_empty()
+    );
+    render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
+    assert!(app.scroll_line(owner) > before);
+    assert_eq!(app.help_modal.scroll_line(), help_offset);
+    assert_eq!(app.hits.modal(), Some(help));
+    assert_eq!(scrollbar_selection(&app), selection);
+}
+
 #[test]
 fn rendered_outside_click_dismisses_only_upper_modal() {
     let mut app = app_with_tall_model_picker();
