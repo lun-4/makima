@@ -1543,6 +1543,89 @@ case("check_write_other_long_line_unaffected", function()
   eq(long_lines.check_write(LONG .. "\n" .. OTHER_LONG, OTHER_LONG .. "\n" .. LONG, LL_MAX), nil)
 end)
 
+case("text_input_click_tracks_display_cells_wrapping_and_utf8_bytes", function()
+  local input = TextInput.new()
+  input:insert_text("a界bc\néd")
+  local rendered = input:render("❯ ", nil, 6)
+  eq(#rendered.lines, 3, "wide characters wrap by cells")
+  input:click(rendered, 1, 5)
+  eq(input.line, 1)
+  eq(input.col, 1, "second cell of wide glyph keeps its byte boundary")
+  input:click(rendered, 2, 3)
+  eq(input.col, #"a界b", "wrapped row starts at the correct byte")
+  input:click(rendered, 3, 4)
+  eq(input.line, 2)
+  eq(input.col, #"é")
+  input:insert_text("!")
+  eq(input:value(), "a界bc\né!d")
+  eq(input:click(rendered, 0, 1), R.IGNORED)
+end)
+
+case("text_input_click_clamps_to_prefix_and_row_end", function()
+  local input = TextInput.new()
+  input:insert_text("界\néx")
+  local rendered = input:render("> ", 2, 20)
+  input:click(rendered, 1, 1)
+  eq(input.col, 0)
+  input:click(rendered, 1, 99)
+  eq(input.col, #"界")
+  input:click(rendered, 2, 4)
+  eq(input.col, #"é", "zero-width combining mark stays with its character")
+end)
+
+case("list_picker_clicks_filter_caret_and_respects_section_rows", function()
+  local ListPicker = require("maki.list_picker")
+  local original_buf, original_win = maki.ui.buf, maki.ui.open_win
+  local lines, closed, step = {}, false, 0
+  maki.ui.buf = function()
+    return {
+      set_lines = function(_, value)
+        lines = value
+      end,
+    }
+  end
+  maki.ui.open_win = function()
+    return {
+      width = 40,
+      height = 10,
+      set_config = function() end,
+      set_cursor = function() end,
+      close = function()
+        closed = true
+      end,
+      recv = function()
+        step = step + 1
+        if step == 1 then
+          return { type = "paste", text = "ab" }
+        end
+        if step == 2 then
+          return { type = "click", row = #lines, col = 3 }
+        end
+        if step == 3 then
+          return { type = "key", key = "x" }
+        end
+        if step == 4 then
+          assert(span_text(lines[#lines]):find("xab", 1, true), "click must move query caret")
+          return { type = "click", row = 1, col = 2 }
+        end
+        if step == 5 then
+          return { type = "click", row = 2, col = 3 }
+        end
+        return { type = "close" }
+      end,
+    }
+  end
+  local ok, result = pcall(ListPicker.open, {
+    { label = "xab", section = "Group" },
+    { label = "other", section = "Group" },
+  })
+  maki.ui.buf, maki.ui.open_win = original_buf, original_win
+  assert(ok, tostring(result))
+  eq(result.type, "choice")
+  eq(result.index, 1)
+  eq(closed, true)
+end)
+
 if #failures > 0 then
   error(#failures .. " case(s) failed:\n\n" .. table.concat(failures, "\n\n"))
 end

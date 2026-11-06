@@ -7180,6 +7180,9 @@ function TextInput:handle_key(key)
 -- Wrap lines to {width} with {prefix} before the first row. Returns
 -- { lines = styled lines, cursor_row = 1-based row holding the cursor }.
 function TextInput:render(prefix, prefix_width, width)
+
+-- Click coordinates are 1-based display cells in the rendered input.
+function TextInput:click(rendered, row, col)
 ```
 
 ### `require("maki.toast")`
