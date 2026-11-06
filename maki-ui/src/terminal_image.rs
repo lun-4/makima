@@ -25,6 +25,9 @@ use ratatui_image::{
 
 use crate::image::{MAX_IMAGE_BYTES, MAX_IMAGE_PIXELS};
 use crate::repaint::Dirty;
+use crate::terminal_da;
+#[cfg(any(unix, test))]
+use crate::terminal_da::Da1Feature;
 
 const MAX_IMAGE_ROWS: u16 = 20;
 const FALLBACK_FONT_SIZE: FontSize = FontSize::new(10, 20);
@@ -62,14 +65,9 @@ const KITTY_PROBE_DIRECT_REPLY: &[u8] = b"Gi=31;";
 const BEL_BYTE: u8 = 0x07;
 #[cfg(any(unix, test))]
 const ST_BYTES: &[u8] = b"\x1b\\";
-#[cfg(any(unix, test))]
-const SIXEL_DA1_FEATURE: &[u8] = b"4";
-#[cfg(any(unix, test))]
-const OSC52_DA1_FEATURE: &[u8] = b"52";
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 static DECODE_JOBS: OnceLock<flume::Sender<DecodeJob>> = OnceLock::new();
 static DETECTED_GRAPHICS: OnceLock<Option<DetectedGraphics>> = OnceLock::new();
-static OSC52_SUPPORTED: OnceLock<bool> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DetectedGraphics {
@@ -153,31 +151,6 @@ fn is_tmux_detected(buffer: &[u8], env_tmux: bool) -> bool {
 }
 
 #[cfg(any(unix, test))]
-fn has_da1_feature(buffer: &[u8], feature: &[u8]) -> (bool, bool) {
-    for (offset, prefix) in buffer.windows(3).enumerate() {
-        if prefix != b"\x1b[?" {
-            continue;
-        }
-        let params = &buffer[offset + prefix.len()..];
-        let Some(end) = params.iter().position(|byte| (0x40..=0x7e).contains(byte)) else {
-            continue;
-        };
-        if params[end] != b'c' {
-            continue;
-        }
-        let parts = params[..end].split(|&byte| byte == b';');
-        if parts
-            .clone()
-            .all(|part| !part.is_empty() && part.iter().all(u8::is_ascii_digit))
-            && parts.skip(1).any(|part| part == feature)
-        {
-            return (true, contains_subslice(&params[end + 1..], DSR_RESPONSE));
-        }
-    }
-    (false, false)
-}
-
-#[cfg(any(unix, test))]
 pub(crate) fn parse_probe_stream(buffer: &[u8], env_tmux: bool) -> ProbeResult {
     let in_tmux = is_tmux_detected(buffer, env_tmux);
 
@@ -208,9 +181,11 @@ pub(crate) fn parse_probe_stream(buffer: &[u8], env_tmux: bool) -> ProbeResult {
         };
     }
 
-    let (is_sixel, sixel_sentinel) = has_da1_feature(buffer, SIXEL_DA1_FEATURE);
+    let sixel_sentinel = Da1Feature::Sixel
+        .response_tail(buffer)
+        .is_some_and(|tail| contains_subslice(tail, DSR_RESPONSE));
     let dsr_count = count_subslice(buffer, DSR_RESPONSE);
-    if is_sixel && sixel_sentinel && (!in_tmux || dsr_count >= 2) {
+    if sixel_sentinel && (!in_tmux || dsr_count >= 2) {
         return ProbeResult::Detected(DetectedGraphics {
             protocol: ProtocolType::Sixel,
             is_tmux: in_tmux,
@@ -315,12 +290,13 @@ pub(crate) fn probe_terminal_graphics(timeout: Duration) -> Option<DetectedGraph
         Instant::now() + PROBE_DRAIN_TIMEOUT,
         &mut buf,
     );
-    let _ = OSC52_SUPPORTED.set(has_da1_feature(&buf, OSC52_DA1_FEATURE).0);
+    terminal_da::cache_features(&buf);
     detected
 }
 
 #[cfg(not(unix))]
 pub(crate) fn probe_terminal_graphics(_timeout: Duration) -> Option<DetectedGraphics> {
+    terminal_da::cache_features(&[]);
     None
 }
 
@@ -350,10 +326,6 @@ pub(crate) fn init_graphics_detection() {
         tracing::warn!("terminal graphics protocol handshake timed out or unsupported");
     }
     let _ = DETECTED_GRAPHICS.set(detected);
-}
-
-pub(crate) fn supports_osc52() -> bool {
-    OSC52_SUPPORTED.get().copied().unwrap_or(false)
 }
 
 pub(crate) fn detected_graphics() -> Option<DetectedGraphics> {
@@ -611,8 +583,8 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        DetectedGraphics, FALLBACK_FONT_SIZE, ImageState, InlineImage, OSC52_DA1_FEATURE,
-        ProbeResult, create_picker, encode, has_da1_feature, parse_probe_stream, protocol_from_env,
+        DetectedGraphics, FALLBACK_FONT_SIZE, ImageState, InlineImage, ProbeResult, create_picker,
+        encode, parse_probe_stream, protocol_from_env,
     };
     use crate::repaint::Dirty;
     use ratatui::buffer::Buffer;
@@ -749,9 +721,8 @@ mod tests {
         use color_eyre::eyre::Result;
         use test_case::test_case;
 
-        use super::super::{
-            OSC52_DA1_FEATURE, PROBE_DRAIN_TIMEOUT, drain_stdin, has_da1_feature, wait_readable,
-        };
+        use super::super::{PROBE_DRAIN_TIMEOUT, drain_stdin, wait_readable};
+        use crate::terminal_da::Da1Feature;
 
         const CONTINUOUS_INPUT_PATH: &str = "/dev/zero";
         const HANG_GUARD: Duration = Duration::from_secs(5);
@@ -779,7 +750,7 @@ mod tests {
             output.write_all(suffix)?;
             let mut buffer = prefix.to_vec();
             drain_stdin(input.as_raw_fd(), Instant::now() + HANG_GUARD, &mut buffer);
-            assert!(has_da1_feature(&buffer, OSC52_DA1_FEATURE).0);
+            assert!(Da1Feature::Osc52.response_tail(&buffer).is_some());
             Ok(())
         }
 
@@ -798,24 +769,6 @@ mod tests {
             assert_eq!(wait_readable(input.as_raw_fd(), Duration::ZERO), expired);
             Ok(())
         }
-    }
-
-    #[test_case(b"\x1b[?62;22;52c", true; "clipboard_without_graphics")]
-    #[test_case(b"\x1b[?62;4;52c\x1b[0n", true; "clipboard_and_sixel")]
-    #[test_case(b"\x1b[?62;52;22c", true; "feature_before_other_features")]
-    #[test_case(b"\x1b[?62;22c", false; "no_advertisement")]
-    #[test_case(b"\x1b[?52;22c", false; "model_is_not_a_feature")]
-    #[test_case(b"\x1b[?62;152c", false; "exact_feature_only")]
-    #[test_case(b"\x1b[?62;52", false; "incomplete_reply")]
-    #[test_case(b"\x1b[?62;52n", false; "wrong_terminator")]
-    #[test_case(b"\x1b[?62;;52c", false; "empty_parameter")]
-    #[test_case(b"\x1b[?62;52;badc", false; "invalid_parameter")]
-    #[test_case(b"\x1b[>62;52c", false; "secondary_attributes")]
-    #[test_case(b"\x1b[?62;22c\x1b[?62;52c", true; "later_reply")]
-    #[test_case(b"\x1b[?62;52\x1b[?62;52c", true; "malformed_then_valid_reply")]
-    #[test_case(DIRECT_PROBE_RESPONSE, false; "graphics_does_not_imply_clipboard")]
-    fn osc52_advertisement(response: &[u8], expected: bool) {
-        assert_eq!(has_da1_feature(response, OSC52_DA1_FEATURE).0, expected);
     }
 
     #[test]

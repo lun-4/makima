@@ -17,6 +17,8 @@ use crossterm::event::{DisableFocusChange, EnableFocusChange};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use maki_config::NotificationMethod;
 
+use crate::terminal_da::Da1Feature;
+
 const FALLBACK_NOTIFICATION_MESSAGE: &str = "Makima needs attention";
 const BELL_SEQUENCE: &str = "\u{7}";
 /// XTPUSHTITLE saves whatever title the shell left on the window, so the
@@ -411,7 +413,7 @@ pub(crate) fn open_in_editor(
 }
 
 pub(crate) fn supports_osc52() -> bool {
-    crate::terminal_image::supports_osc52()
+    Da1Feature::Osc52.is_supported()
 }
 
 fn clipboard_sequence(text: &str, mux: TerminalMux, advertised: bool) -> Result<String, String> {
