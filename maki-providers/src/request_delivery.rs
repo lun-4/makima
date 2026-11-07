@@ -126,6 +126,14 @@ impl RequestDeliveryTracker {
     }
 }
 
+/// An owner dropped mid-attempt (its future cancelled) retires the attempt,
+/// so a handle that outlives it cannot record a delivery nobody reads.
+impl Drop for RequestDeliveryTracker {
+    fn drop(&mut self) {
+        self.shared.lock().open_attempt = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,6 +157,15 @@ mod tests {
         tracker.end_attempt(false);
         assert!(!delivery.mark());
         assert!(!tracker.is_delivered());
+    }
+
+    #[test]
+    fn dropped_tracker_retires_its_open_attempt() {
+        let tracker = RequestDeliveryTracker::new();
+        let delivery = tracker.attempt(0);
+        drop(tracker);
+        assert!(!delivery.mark());
+        assert!(!delivery.is_delivered());
     }
 
     #[test]
