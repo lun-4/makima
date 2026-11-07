@@ -44,6 +44,7 @@ Bundled Lua plugins register these commands at startup. Plugin commands have hig
 |---------|-------------|------|-----------|-----------|
 | `/automode` | Toggle bash auto mode (classifier gates every bash command) | none |  | all |
 | `/build` | Switch to build mode (full tool access) | none |  | all |
+| `/goal` | Set a goal, clear it with /goal off, or inspect it with /goal status. | raw (optional) |  | all |
 | `/memory` | View, edit, and delete memory files | none |  | TUI only |
 | `/options` | Browse and change session options | none |  | TUI only |
 | `/plan` | Switch to plan mode (analyse and write only the plan file) | none |  | all |
@@ -53,6 +54,14 @@ Bundled Lua plugins register these commands at startup. Plugin commands have hig
 | `/splash-fps` | Toggle the splash fps overlay: live fps and per-frame render time. | none |  | TUI only |
 | `/thinking` | Set thinking effort (bare opens a selector) | typed | [effort] | all |
 | `/usage` | Show provider quota and focused-session token usage | none |  | TUI only |
+
+## Goals
+
+The default-enabled `goal` plugin registers `/goal <text>`, `/goal status`, and `/goal off`. A goal belongs to the targeted agent. Setting a goal replaces its previous goal but does not start a turn. After each successful turn, a persistent checker subagent assesses completion and sends a continuation with feedback if the goal remains incomplete. Failed and cancelled turns do not trigger continuations.
+
+The `verdict` profile uses transcript evidence only. The `verify` profile also allows the checker to use the agent's subagent tools. Configure the checker model, profile, evidence bounds, timeout, and continuation limit under [`plugins.goal`](/docs/configuration/#plugins-goal). By default, continuations are unlimited and checker waits have no timeout.
+
+`/goal off` clears the goal and closes its checker. Goals also stop on completion, checker failure, or agent closure. Goals do not persist across restarts. Pause and resume controls are not available.
 
 ## Command arguments
 

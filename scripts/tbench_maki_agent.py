@@ -43,12 +43,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from collect import append_csv, compute_cost, lookup_pricing
-from harbor.agents.installed.base import (  # ty: ignore[unresolved-import]
+from harbor.agents.installed.base import (  # ty: ignore[import-not-found]
     BaseInstalledAgent,
     with_prompt_template,
 )
-from harbor.environments.base import BaseEnvironment  # ty: ignore[unresolved-import]
-from harbor.models.agent.context import AgentContext  # ty: ignore[unresolved-import]
+from harbor.environments.base import BaseEnvironment  # ty: ignore[import-not-found]
+from harbor.models.agent.context import AgentContext  # ty: ignore[import-not-found]
 
 AGENT_LOG_FILE = "makima.txt"
 AGENT_LOG_PATH = f"/logs/agent/{AGENT_LOG_FILE}"

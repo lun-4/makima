@@ -78,6 +78,10 @@ struct BundledPlugin {
 /// `require()` shared modules across boundaries.
 static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
+        name: "goal",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/goal"),
+    },
+    BundledPlugin {
         name: "sessions",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/sessions"),
     },
@@ -2005,18 +2009,19 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn memory_builtin_registers_command() {
+    #[test_case("/memory")]
+    #[test_case("/goal")]
+    fn builtin_registers_command(command: &str) {
         let reg = Arc::new(ToolRegistry::new());
         let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
         let snap = command_snapshot(&host);
         let found = snap
             .commands()
             .iter()
-            .any(|c| c.spec().name.as_ref() == "/memory");
+            .any(|c| c.spec().name.as_ref() == command);
         assert!(
             found,
-            "Expected /memory command, found: {:?}",
+            "Expected {command} command, found: {:?}",
             snap.commands()
                 .iter()
                 .map(|c| c.spec().name.as_ref())
