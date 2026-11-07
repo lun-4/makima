@@ -1518,6 +1518,8 @@ mod tests {
     #[test_case(false, "unknown"; "unknown_command")]
     fn print_turn_uses_initialized_config(nested: bool, outcome: &str) {
         const SYSTEM: &str = "print initialized system";
+        const MODEL_IDENTITY: &str =
+            "# Model identity\n- Model: claude-opus-4-8\n- Provider: anthropic";
         const COMMAND: &str = "/print_initialized";
         const COMMAND_FINISHED: &str = "print command finished";
         let registry = CommandRegistry::new();
@@ -1850,14 +1852,21 @@ mod tests {
             assert!(requests.is_empty());
             return;
         }
-        assert_eq!(requests[0], (PRINT_MODEL.into(), String::new(), true));
-        assert_eq!(requests[1], (PRINT_MODEL.into(), SYSTEM.into(), true));
+        let expected_system = format!("{SYSTEM}\n\n{MODEL_IDENTITY}");
+        assert_eq!(
+            requests[0],
+            (PRINT_MODEL.into(), MODEL_IDENTITY.into(), true)
+        );
+        assert_eq!(
+            requests[1],
+            (PRINT_MODEL.into(), expected_system.clone(), true)
+        );
         if nested {
             assert_eq!(requests.len(), 6);
             assert!(requests.iter().all(|(spec, _, _)| spec == PRINT_MODEL));
             assert!(requests[2].2);
             assert!(requests[3].2);
-            assert_eq!(requests[5], (PRINT_MODEL.into(), SYSTEM.into(), true));
+            assert_eq!(requests[5], (PRINT_MODEL.into(), expected_system, true));
         } else {
             assert_eq!(requests.len(), 2);
         }

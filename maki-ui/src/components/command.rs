@@ -19,6 +19,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
+use crate::click::{ClickTarget, CompletionGrid, HitTarget};
 use crate::components::coherent_completion::{Publication, Published};
 use crate::components::file_completion::{
     CompletionGridItem, CompletionGridState, render_completion_grid,
@@ -78,6 +79,7 @@ pub struct CommandPalette {
     snapshot: RegistrySnapshot,
     nucleo: Nucleo<CommandItem>,
     current_arg_count: usize,
+    last_hits: Vec<HitTarget>,
     argument_items: Vec<ArgumentMatch>,
     argument_range: Option<(usize, usize)>,
     active_argument_start: Option<usize>,
@@ -214,6 +216,7 @@ impl CommandPalette {
             argument_publication: Published::default(),
             latest_argument_context: None,
             command_matching: false,
+            last_hits: Vec::new(),
         }
     }
 
@@ -1464,12 +1467,41 @@ impl CommandPalette {
         }
     }
 
+    pub fn hits(&self) -> Vec<HitTarget> {
+        self.last_hits.clone()
+    }
+
+    pub fn select_command(&mut self, index: usize) -> bool {
+        if index >= self.filtered.len() {
+            return false;
+        }
+        self.command_selected = index;
+        true
+    }
+
+    pub fn select_argument(&mut self, index: usize) -> bool {
+        if index >= self.argument_items.len() {
+            return false;
+        }
+        self.argument_selected = index;
+        true
+    }
+
+    pub fn select_grid(&mut self, index: usize) -> bool {
+        if index >= self.argument_items.len() {
+            return false;
+        }
+        self.argument_grid.set_selected(index);
+        true
+    }
+
     pub fn view(
         &mut self,
         frame: &mut Frame,
         input_area: Rect,
         autocomplete_height: f64,
     ) -> Option<Rect> {
+        self.last_hits.clear();
         if !self.is_active() {
             return None;
         }
@@ -1545,6 +1577,15 @@ impl CommandPalette {
             Paragraph::new(lines).style(Style::new().bg(t.background)),
             popup,
         );
+        self.last_hits = (0..popup_height as usize)
+            .map(|index| HitTarget {
+                rect: Rect::new(popup.x, popup.y + index as u16, popup.width, 1),
+                target: ClickTarget::CompletionRow {
+                    grid: CompletionGrid::PaletteCommands,
+                    index,
+                },
+            })
+            .collect();
 
         Some(popup)
     }
@@ -1618,6 +1659,18 @@ impl CommandPalette {
             Paragraph::new(lines).style(Style::new().bg(t.background)),
             popup,
         );
+        self.last_hits = (0..visible_rows)
+            .map(|row| {
+                let index = self.argument_scroll_offset + row;
+                HitTarget {
+                    rect: Rect::new(popup.x, popup.y + row as u16, popup.width, 1),
+                    target: ClickTarget::CompletionRow {
+                        grid: CompletionGrid::PaletteArguments,
+                        index,
+                    },
+                }
+            })
+            .collect();
         Some(popup)
     }
 
@@ -1636,7 +1689,22 @@ impl CommandPalette {
                 },
             })
             .collect();
-        render_completion_grid(frame, input_area, &items, &mut self.argument_grid)
+        let rendered = render_completion_grid(frame, input_area, &items, &mut self.argument_grid);
+        self.last_hits = rendered
+            .as_ref()
+            .map(|(_, hits)| {
+                hits.iter()
+                    .map(|&(rect, index)| HitTarget {
+                        rect,
+                        target: ClickTarget::CompletionRow {
+                            grid: CompletionGrid::PaletteGrid,
+                            index,
+                        },
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        rendered.map(|(popup, _)| popup)
     }
 
     fn ensure_argument_visible(&mut self, visible_rows: usize) {
@@ -3067,9 +3135,18 @@ mod tests {
             .with_completion(CompletionPolicy::Replace);
         argument.variadic = true;
         registration.spec.arguments = CommandArguments::Positional(Arc::from([argument]));
-        registration.argument_completions = vec![Some(Arc::new(ModelArgSource::new(Arc::new(
-            ArcSwapOption::from(Some(Arc::new(vec!["openai/gpt-5".into()]))),
-        ))))];
+        registration.argument_completions = vec![Some(Arc::new(ModelArgSource::new(
+            Arc::new(ArcSwapOption::from(Some(Arc::new(vec![
+                "openai/gpt-5".into(),
+            ])))),
+            crate::model_capabilities::test_support::seeded(
+                &[(
+                    "openai/gpt-5",
+                    crate::model_capabilities::test_support::ALL_OPTIONS,
+                )],
+                &[],
+            ),
+        )))];
         producer.replace(vec![registration]).unwrap();
         let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
         let mut palette = CommandPalette::new(registry, target);

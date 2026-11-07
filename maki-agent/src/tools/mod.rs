@@ -231,7 +231,10 @@ pub const WRITE_TOOL_NAME: &str = "write";
 
 pub const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
 pub(crate) const DEADLINE_EXCEEDED: &str = "timeout exceeded";
-pub const TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long a timed-out tool's output hook and offload write may still run.
+/// Both cross threads, so a loaded machine needs seconds here; a shorter window
+/// throws away partial output a slow scheduler was about to deliver.
+pub const TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Provider and model id of the placeholder model a context without a model
 /// carries.
 const NO_MODEL: &str = "none";

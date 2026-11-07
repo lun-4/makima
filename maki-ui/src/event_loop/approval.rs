@@ -2,14 +2,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use maki_agent::actor::{
-    ActorIdleGuard, ActorSourceSnapshot, ConfigChange, ConfigCommit, ConfigPatch, HistoryChange,
+    ActorIdleGuard, ActorSourceSnapshot, ConfigChange, ConfigCommit, HistoryChange,
     PreparedOperationTicket, PreparedTransaction, PreparedTurn, TurnTicket,
 };
-use maki_agent::config_change::prepare_patch;
+use maki_agent::config_change::prepare_selection;
 use maki_agent::{
     AgentId, AgentInput, AgentMode, AgentRef, CancelToken, EffectiveAgentConfig, EventSender,
 };
-use maki_providers::Message;
+use maki_providers::{Message, ModelSelection};
 use maki_storage::checkpoint::CheckpointPublication;
 use maki_storage::sessions::{HistorySnapshot, StoredRule};
 
@@ -109,7 +109,7 @@ impl Drop for ApprovalPresentation {
 
 struct PlanApprovalRequest {
     path: PathBuf,
-    model: Option<String>,
+    selection: ModelSelection,
     parallel: bool,
     clear_context: bool,
     run_id: u64,
@@ -131,12 +131,7 @@ impl SessionRuntime {
             return;
         }
         if let Some(pending) = self.pending_approval.take() {
-            let (_, root) = self.handles.manager_and_root();
-            if pending.target == root {
-                self.app.plan_approval_pending = false;
-            } else {
-                self.app.finish_child_plan_approval(pending.target);
-            }
+            self.app.clear_plan_approval_pending(pending.target);
         } else {
             self.app.plan_approval_pending = false;
         }
@@ -167,11 +162,11 @@ impl SessionRuntime {
             || !Arc::ptr_eq(&source.config.identity, &prepared.source.config.identity)
             || source.config.generation != prepared.source.config.generation
             || !Arc::ptr_eq(&source.config.config, &prepared.source.config.config)
-            || (self.app.selected_agent_id() == Some(prepared.target.id())
-                && !self.app.plan_approval_matches(
-                    prepared.request.model.as_deref(),
-                    prepared.request.parallel,
-                ))
+            || !self.app.plan_approval_matches(
+                prepared.target.id(),
+                &prepared.request.selection,
+                prepared.request.parallel,
+            )
             || prepared.request.yolo != self.app.permissions.persisted_yolo()
             || prepared.request.rules
                 != rules_to_stored(&self.app.permissions.session_rules_snapshot())
@@ -415,7 +410,7 @@ impl EventLoop<'_> {
         &mut self,
         idx: usize,
         clear_context: bool,
-        model: Option<String>,
+        selection: ModelSelection,
         parallel: bool,
         path: PathBuf,
     ) {
@@ -457,7 +452,7 @@ impl EventLoop<'_> {
                 .map_err(|error| error.to_string())?;
             let request = PlanApprovalRequest {
                 path,
-                model,
+                selection,
                 parallel,
                 clear_context,
                 run_id: operation.presentation_id(),
@@ -487,6 +482,9 @@ impl EventLoop<'_> {
                 Ok(prepared) => prepared,
                 Err(error) => return self.sessions[idx].abort_plan_approval(error),
             };
+        if request.selection.spec.is_some() || request.selection.fast.is_some() {
+            self.sessions[idx].drop_pending_fast(&target);
+        }
         let absolute = if request.path.is_absolute() {
             request.path.clone()
         } else {
@@ -499,15 +497,9 @@ impl EventLoop<'_> {
             operation
                 .replace_turn_input(AgentInput::new(plan.message.clone(), Vec::new()))
                 .map_err(|error| error.to_string())?;
-            let spec = request.model.as_deref();
-            let patch = prepare_patch(
-                ConfigPatch::default(),
-                spec,
-                &template.model_policy,
-                &prepare,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+            let patch = prepare_selection(&request.selection, &template.model_policy, &prepare)
+                .await
+                .map_err(|error| error.to_string())?;
             let change = ConfigChange::PatchAndMode {
                 patch,
                 mode: AgentMode::Build,

@@ -106,8 +106,19 @@ async fn build_session_provider(
             Arc::clone(&agent_ctx.provider),
         ));
     };
+    let preparer = session_model_preparer(agent_ctx, prepare);
+    let prepared = prepare_model(spec, &agent_ctx.model_policy, &preparer)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok((prepared.model, prepared.provider))
+}
+
+fn session_model_preparer(
+    agent_ctx: &AgentContext,
+    prepare: Option<SessionProviderPreparer>,
+) -> ModelPreparer {
     let providers = Arc::clone(&agent_ctx.providers);
-    let preparer: ModelPreparer = match prepare {
+    match prepare {
         Some(prepare) => Arc::new(move |spec| {
             let prepared = providers
                 .model(&spec)
@@ -120,11 +131,7 @@ async fn build_session_provider(
             Box::pin(async move { prepared })
         }),
         None => default_model_preparer(providers),
-    };
-    let prepared = prepare_model(spec, &agent_ctx.model_policy, &preparer)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok((prepared.model, prepared.provider))
+    }
 }
 
 /// Shared backend state, owned by the adapter and cloned into the actor's
@@ -1100,10 +1107,6 @@ impl SessionParent {
         dispatch_ctx(lua, ctx, "session").cloned()
     }
 
-    fn restricts_writes(&self) -> bool {
-        self.context.restrict_write_to().is_some()
-    }
-
     fn revalidate(&self, lua: &Lua, ctx: &LuaCtx) -> Result<(), String> {
         ctx.validate_origin(lua)?;
         if let Some(current) = &self.managed_turn {
@@ -1189,7 +1192,7 @@ impl SessionOptions {
             .get::<Option<bool>>("inherit_provider")?
             .unwrap_or(false);
         let fast = selection.fast.unwrap_or(parent.context.opts.fast);
-        let mcp = opts.get::<Option<bool>>("mcp")?.unwrap_or(true) && !parent.restricts_writes();
+        let mcp = opts.get::<Option<bool>>("mcp")?.unwrap_or(true);
         let silent = opts.get::<Option<bool>>("silent")?.unwrap_or(false);
         let auto_deliver = opts.get::<Option<bool>>("auto_deliver")?.unwrap_or(true);
         let showable = if silent {

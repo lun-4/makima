@@ -1542,11 +1542,9 @@ impl Writer {
                         .incarnations
                         .get(&id)
                         .is_some_and(|incarnation| Arc::ptr_eq(incarnation, &save.incarnation))
-                    || (request
-                        .checkpoint
-                        .as_ref()
-                        .is_none_or(|checkpoint| checkpoint.kind != SessionCheckpointKind::History)
-                        && state.config_versions.get(&id).copied() != save.config_version)
+                    || (request.checkpoint.as_ref().is_some_and(|checkpoint| {
+                        checkpoint.kind != SessionCheckpointKind::History
+                    }) && state.config_versions.get(&id).copied() != save.config_version)
                     || save.history_version.is_some_and(|incoming| {
                         request.history.as_ref().is_some_and(|(destination, _)| {
                             history_version(&state, id, destination)
@@ -2203,6 +2201,72 @@ mod tests {
             assert_eq!(
                 saved.subagents()[0].model.as_deref(),
                 Some(expected_model.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn child_config_survives_root_config_published_ahead_of_it() {
+        let (_tmp, dir) = state_dir();
+        let (writer, _wake_rx) = manual_writer();
+        let mut session = AppSession::new(MODEL, CWD);
+        session.set_subagents(vec![StoredSubagent {
+            tool_use_id: TOOL_ID.into(),
+            name: TOOL_ID.into(),
+            model: Some(MODEL.into()),
+            thinking: Some(StoredThinking::Adaptive),
+            fast: false,
+        }]);
+        let id = session.id;
+        writer.seed(Arc::new(session.clone()));
+        writer.bind_config_runtime(id, 1);
+        let (lease, checkpoint) = guarded_writer(&writer, &dir, id);
+        let (warn_tx, _warn_rx) = flume::unbounded();
+        let mut disk = Writer {
+            dir: dir.clone(),
+            warn_tx,
+            logs: HashMap::new(),
+            failing: HashSet::new(),
+        };
+        disk.write(&session).unwrap();
+        let root = publish_config(
+            &checkpoint,
+            CheckpointRequest {
+                session_id: id,
+                version: CheckpointVersion {
+                    revision: 1,
+                    epoch: session.history_snapshot().epoch,
+                },
+                snapshot: Arc::new(config_checkpoint(1, 1)),
+            },
+        );
+        let child = enqueue_staged_checkpoint(
+            &writer.pending,
+            &writer.wake,
+            StagedSessionCheckpoint {
+                session_id: id,
+                checkpoint: None,
+                selected_config: Some((
+                    HistoryDestination::Child(TOOL_ID.into()),
+                    config_projection(NEXT_MODEL, CWD, 1, 1).config,
+                )),
+                history: None,
+                publication: CheckpointPublication::default(),
+                claim: publication_claim(),
+                guard: lease.publication_guard(),
+            },
+        )
+        .unwrap();
+        disk.flush(&writer.pending);
+        smol::block_on(root).unwrap();
+        child.recv().unwrap().unwrap();
+        let next_model_id = maki_providers::Model::from_spec(NEXT_MODEL).unwrap().id;
+        let stored = AppSession::load(id, &dir).unwrap();
+        for saved in [&stored, writer.latest_snapshot(id).unwrap().as_ref()] {
+            assert_eq!(saved.model, FAILED_MODEL);
+            assert_eq!(
+                saved.subagents()[0].model.as_deref(),
+                Some(next_model_id.as_str())
             );
         }
     }

@@ -15,7 +15,16 @@ group = "Reference"
 
 const INTRO: &str = "Makima talks to LLM providers over their HTTP APIs. Every provider is registered by a Lua plugin; the built-in ones come from the bundled `providers` plugin. Models are split into three tiers: **weak** (cheap and fast), **medium** (balanced), and **strong** (highest capability, highest cost). There is also a **compaction** tier for choosing a dedicated model to summarize context when the conversation grows long.";
 
-const TIER_PICKER_NOTE: &str = r#"Open the model picker with `/model` and press `!`, `@`, `#`, or `$` on any row to assign it to strong, medium, weak, or compaction. Press the same key again to remove the assignment. Your overrides are saved to `~/.local/state/makima/model-tiers` and apply across sessions."#;
+const TIER_PICKER_NOTE: &str = r#"Press `!`, `@`, `#`, or `$` on any row of the model list to assign it to strong, medium, weak, or compaction. Press the same key again to remove the assignment. Your overrides are saved to `~/.local/state/makima/model-tiers` and apply across sessions."#;
+
+const MODEL_PICKER: &str = r#"## Model picker
+
+`/model` without arguments and Ctrl+M open the model picker. The plan form's `Implementation model` row opens the same picker.
+
+Type to filter the list and use Up and Down to move. Tab moves to the options the highlighted model supports, such as thinking and fast mode. Each option starts at `Use current`, which keeps the agent's value. Type a value, or cycle through the choices with Up and Down for thinking or Space, Left and Right for fast. Enter applies the model and its options together, and Esc cancels everything.
+
+Options the highlighted model does not support are hidden. If you set one and then move to a model without it, it is left out, and it comes back when you move to a model that has it.
+"#;
 
 const AUTH_RELOADING: &str = r#"## Auth Reloading
 
@@ -232,7 +241,7 @@ pub fn generate() -> String {
     let _ = writeln!(out, "{FRONT_MATTER}\n");
     let _ = writeln!(out, "# Providers\n");
     let _ = writeln!(out, "{INTRO}\n");
-    let _ = writeln!(out, "{TIER_PICKER_NOTE}\n");
+    let _ = writeln!(out, "{MODEL_PICKER}\n{TIER_PICKER_NOTE}\n");
     let _ = writeln!(out, "{AUTH_RELOADING}\n");
     let _ = writeln!(out, "{SETTINGS}\n");
     let _ = writeln!(out, "## Built-in Providers\n");

@@ -277,6 +277,38 @@ fn rebuild(panel: &mut MessagesPanel) {
     render(panel, 80, 24);
 }
 
+#[test_case(false ; "plain_post")]
+#[test_case(true ; "linked_post")]
+fn post_agent_target_follows_wrapping_and_scroll(linked: bool) {
+    const AGENT_ID: &str = "reviewer";
+    const POST_TEXT: &str = "reviewer started checking the pending changes";
+    const WIDTH: u16 = 16;
+    const HEIGHT: u16 = 2;
+    const SCROLL_ROW: u16 = 1;
+    let mut panel = panel_with_tools(&[]);
+    let mut post = DisplayMessage::new(
+        DisplayRole::Post(maki_agent::PostLevel::Info),
+        POST_TEXT.into(),
+    );
+    post.post_agent = linked.then(|| AGENT_ID.into());
+    panel.push(post);
+    render(&mut panel, WIDTH, HEIGHT);
+    panel.set_scroll_top(SCROLL_ROW);
+    let terminal = render(&mut panel, WIDTH, HEIGHT);
+    assert_eq!(panel.scroll_top(), SCROLL_ROW);
+    let area = Rect::new(0, 0, WIDTH, HEIGHT);
+    let expected = linked.then_some(AGENT_ID);
+    for row in 0..HEIGHT {
+        assert_eq!(panel.post_agent_at(row, area), expected);
+        let cell = &terminal.backend().buffer()[(0, row)];
+        assert_eq!(
+            cell.modifier.contains(ratatui::style::Modifier::UNDERLINED),
+            linked
+        );
+    }
+    assert_eq!(panel.post_agent_at(HEIGHT, area), None);
+}
+
 #[test]
 fn ctrl_d_to_bottom_re_enables_auto_scroll() {
     let mut panel = MessagesPanel::new(
@@ -498,7 +530,10 @@ fn cancel_in_progress_marks_pending_as_error(cache_built: bool) {
 
 const THINKING_TEXT: &str = "a long chain of reasoning";
 const HIGHLIGHTED_CODE: &str = "fn main() {}";
-const HIGHLIGHT_DEADLINE: Duration = Duration::from_secs(10);
+/// The first job pays for loading the `SyntaxSet` and compiling the syntax's
+/// regexes on the one highlight thread, which a box running 64 test processes
+/// on 3 cores can stretch by orders of magnitude. Only a hang guard.
+const HIGHLIGHT_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Only `view` advances a typewriter, and collapsed thinking is never drawn,
 /// so its reveal can never finish. Believing it would hold the loop at full
@@ -657,14 +692,10 @@ fn tick_drains_the_highlight_worker() {
     });
     rebuild(&mut panel);
 
-    let deadline = Instant::now() + HIGHLIGHT_DEADLINE;
-    while panel.tick() == Dirty::NO {
-        assert!(
-            Instant::now() < deadline,
-            "a highlighted tool stays unstyled until some unrelated repaint"
-        );
-        std::thread::yield_now();
-    }
+    wait_for_highlight(
+        &mut panel,
+        "a highlighted tool stays unstyled until some unrelated repaint",
+    );
 
     assert!(
         seg_text(&panel, "t1").contains(HIGHLIGHTED_CODE),
@@ -2619,15 +2650,18 @@ fn code_span_styles(panel: &MessagesPanel, tool_id: &str) -> Vec<(String, Style)
         .collect()
 }
 
-fn drain_highlight_worker(panel: &mut MessagesPanel) {
+/// Parks on the worker's channel between ticks: a `yield_now` spin here takes
+/// CPU from the very thread it is waiting on.
+fn wait_for_highlight(panel: &mut MessagesPanel, failure: &str) {
     let deadline = Instant::now() + HIGHLIGHT_DEADLINE;
     while panel.tick() == Dirty::NO {
-        assert!(
-            Instant::now() < deadline,
-            "the highlight worker never delivered a result"
-        );
-        std::thread::yield_now();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(panel.hl_worker.wait_for_result(remaining), "{failure}");
     }
+}
+
+fn drain_highlight_worker(panel: &mut MessagesPanel) {
+    wait_for_highlight(panel, "the highlight worker never delivered a result");
     render(panel, 80, 20);
 }
 

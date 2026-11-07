@@ -29,7 +29,7 @@ pub use api::util::command::{
     FloatConfigPatch, HintReader, HintSnapshot, ProviderUsageAck, ProviderUsageInvalidation,
     ProviderUsageLimit, ProviderUsageReply, ProviderUsageSnapshot, ProviderUsageWindow,
     SessionReply, SessionRequest, Split, StatusContent, StatusContentReader, StatusContentSnapshot,
-    TitlePos, UiAction, UiReply, WinCommand, WinEvent, WinView,
+    StatusEntry, TitlePos, UiAction, UiReply, WinCommand, WinEvent, WinView,
 };
 pub use api::util::picker::{PickerConfig, PickerEvent, PickerItemSpec, PickerResult};
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
@@ -232,6 +232,7 @@ pub mod test_support {
         pub fn try_recv(&self) -> Option<(&'static str, Vec<usize>)> {
             use crate::runtime::Request;
             Some(match self.0.try_recv().ok()? {
+                Request::ClickRegion { .. } => ("status_click", Vec::new()),
                 Request::ClickTool { fallback: None, .. } => ("click", Vec::new()),
                 Request::ClickTool {
                     fallback: Some(fb), ..

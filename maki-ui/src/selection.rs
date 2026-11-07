@@ -82,7 +82,7 @@ pub struct SelectableZone {
     pub zone: SelectionZone,
 }
 
-const ZONE_CAP: usize = 12;
+const ZONE_CAP: usize = 20;
 
 const EMPTY_ZONE: SelectableZone = SelectableZone {
     area: Rect::new(0, 0, 0, 0),
@@ -102,13 +102,16 @@ impl ZoneRegistry {
         }
     }
 
-    pub fn push(&mut self, zone: SelectableZone) {
+    /// Returns whether the zone was dropped because the registry is full.
+    pub fn push(&mut self, zone: SelectableZone) -> bool {
         let i = self.len as usize;
         if i >= ZONE_CAP {
-            return;
+            tracing::warn!(cap = ZONE_CAP, "selection zone registry overflowed");
+            return true;
         }
         self.entries[i] = zone;
         self.len += 1;
+        false
     }
 
     pub fn push_overlay(&mut self, area: Rect) {

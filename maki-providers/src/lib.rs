@@ -28,8 +28,9 @@ pub use registry::{
 };
 pub use retry::{RetryKind, RetryPolicy, RetryState};
 pub use selection::{
-    CompleteModelSelection, FAST_VALUES, MODEL_FAST_KEY, MODEL_OPTION_KEYS, MODEL_SPEC_KEY,
-    MODEL_THINKING_KEY, ModelSelection, ModelSelectionError, parse_fast, parse_thinking,
+    CompleteModelSelection, FAST_VALUES, MODEL_FAST_KEY, MODEL_SPEC_KEY, MODEL_THINKING_KEY,
+    ModelCapabilities, ModelOption, ModelSelection, ModelSelectionError, parse_fast,
+    parse_thinking,
 };
 pub use tokens::{ContextGauge, estimate_message_tokens, estimate_prompt_tokens};
 pub use types::{

@@ -24,8 +24,10 @@ use std::time::{Duration, Instant};
 use crate::AppSession;
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
+use crate::click::{ClickTarget, CompletionGrid, HitRegistry, PickerId, ScrollOwner, Surface};
 use crate::clipboard::ClipboardState;
 use crate::command_runtime::{CommandRuntime, PreparedCommandTarget};
+use crate::model_capabilities::ModelCapabilityCache;
 use maki_agent::HistorySnapshot;
 
 use crate::components::btw_modal::BtwModal;
@@ -44,6 +46,7 @@ use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::lua_float::FloatManager;
 use crate::components::lua_picker::{LuaPicker, LuaPickerAction};
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
+use crate::components::menu::{Menu, MenuAction, MenuItem, MenuKind};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
@@ -62,14 +65,17 @@ use crate::text_buffer::is_newline_key;
 use arc_swap::{ArcSwap, ArcSwapOption};
 #[cfg(test)]
 pub(crate) use crossterm::event::KeyEventKind;
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind as CrosstermKeyEventKind, MouseEvent};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind as CrosstermKeyEventKind, KeyModifiers, MouseEvent,
+};
 use maki_agent::actor::{EffectiveAgentConfig, TranscriptRequest};
 use maki_agent::agent::isolated_turn::IsolatedTurnRequest;
 use maki_agent::permissions::PermissionManager;
+use maki_agent::tools::ToolFilter;
 use maki_agent::{
-    ActorWorkKind, AgentEvent, AgentId, AgentInput, AgentMode, AgentRef, Envelope, ImageMediaType,
-    ImageSource, McpConfigErrors, McpPromptRef, McpSnapshotReader, Post, SharedBuf, SharedMessages,
-    SubagentInfo, TurnCompleteEvent,
+    ActorWorkKind, AgentConfig, AgentEvent, AgentId, AgentInput, AgentMode, AgentRef, Envelope,
+    ImageMediaType, ImageSource, McpConfigErrors, McpPromptRef, McpSnapshotReader, Post, SharedBuf,
+    SharedMessages, SubagentInfo, TurnCompleteEvent,
 };
 use maki_commands::{
     AgentTurn, BuiltinOperation, CommandAttachment, CommandContent, CommandError,
@@ -83,7 +89,10 @@ use maki_lua::{
     BuiltinAction, CompletionCtx, EventHandle, FloatConfig, HintReader, HintSnapshot, ItemSpec,
     KeymapReader, Split, StatusContentReader, StatusContentSnapshot, WinCommand, WinEvent, WinView,
 };
-use maki_providers::{ContentBlock, Message, Model, ProviderRegistry, add_cost, format_tokens};
+use maki_providers::{
+    ContentBlock, Message, Model, ModelCapabilities, ModelSelection, ProviderRegistry,
+    ThinkingConfig, add_cost, format_tokens,
+};
 use maki_storage::StateDir;
 use maki_storage::conversation::ConversationState;
 use maki_storage::input_history::InputHistory;
@@ -124,6 +133,7 @@ const FLASH_CANCEL: &str = "Press esc again to stop...";
 const FLASH_REWIND: &str = "Press esc again to rewind...";
 const AUTH_EXPIRED_MSG: &str =
     "Token expired. Run `makima auth login` in another terminal, then press Enter to retry.";
+const FLASH_NO_AGENT_CHAT: &str = "Agent chat is unavailable";
 const FLASH_NO_PLAN: &str = "No plan file";
 const FLASH_NO_PLAN_BODY: &str = "Plan file is empty or unreadable";
 const PLAN_SUBMIT_TOOL: &str = "plan_submit";
@@ -353,7 +363,7 @@ pub(crate) struct InputDemand {
     perm: Option<PermissionPayload>,
 }
 
-#[derive(Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum ModelPickerPurpose {
     #[default]
     Session,
@@ -392,6 +402,7 @@ pub struct App {
     plan_form_target: Option<AgentId>,
     plan_forms: HashMap<Option<AgentId>, (PlanForm, bool)>,
     pub(super) status_bar: StatusBar,
+    pub(super) menu: Menu,
     pub status: Status,
     pub(crate) state: session_state::SessionState,
     /// The config the root was seeded with, shown until the root answers.
@@ -412,6 +423,10 @@ pub struct App {
     pub(crate) run_model: Option<String>,
     pub(crate) run_context_window: Option<u32>,
     pub(super) zones: ZoneRegistry,
+    pub(super) hits: HitRegistry,
+    pub(super) pending_click: Option<(ClickTarget, Position)>,
+    scroll_drag: Option<mouse::ScrollDrag>,
+    pub(super) hover: Option<ClickTarget>,
     pub(super) selection_state: Option<SelectionState>,
     middle_scroll: Option<MiddleScroll>,
     pub(super) clipboard: ClipboardState,
@@ -445,6 +460,7 @@ pub struct App {
     pub(crate) coordinator: Option<maki_agent::session_coordinator::SessionCoordinatorHandle>,
     pub(crate) model_policy: Arc<ModelPolicy>,
     pub(crate) lua_event_handle: EventHandle,
+    tool_filter: ToolFilter,
     pub(super) keymap_reader: KeymapReader,
     pub(super) hint_reader: HintReader,
     hints: Watch<HintSnapshot>,
@@ -521,6 +537,7 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare(
         config: EffectiveAgentConfig,
+        agent_config: &AgentConfig,
         session: AppSession,
         storage: StateDir,
         available_models: Arc<ArcSwapOption<Vec<String>>>,
@@ -538,6 +555,7 @@ impl App {
         providers: Arc<ProviderRegistry>,
         theme_provider: Arc<dyn ThemesProvider>,
         command_runtime: Arc<CommandRuntime>,
+        model_capabilities: Arc<ModelCapabilityCache>,
     ) -> PreparedApp {
         let mut state =
             SessionState::from_session(session, &config.model, &model_policy, &providers);
@@ -580,11 +598,15 @@ impl App {
                 command_palette_defaults(&command_runtime),
                 Arc::from(state.session.cwd.as_str()),
             ),
-            task_picker: ListPicker::new(),
+            task_picker: ListPicker::new().with_picker(PickerId::Task),
             task_picker_original: None,
             lua_picker: LuaPicker::new(lua_event_handle.clone()),
             theme_picker: ThemePicker::new(Arc::clone(&theme_provider)),
-            model_picker: ModelPicker::new(Arc::clone(&model_picker_models), providers),
+            model_picker: ModelPicker::new(
+                Arc::clone(&model_picker_models),
+                providers,
+                model_capabilities,
+            ),
             model_picker_purpose: ModelPickerPurpose::Session,
             model_picker_target: None,
             plan_approval_pending: false,
@@ -602,8 +624,10 @@ impl App {
             plan_form_target: None,
             plan_forms: HashMap::new(),
             status_bar: StatusBar::new(flash, config.context.cwd().to_path_buf()),
+            menu: Menu::default(),
             status: Status::Idle,
             state,
+            tool_filter: ToolFilter::from_config(agent_config, &config.model, &[]),
             seed_config: Arc::new(config),
             exit_request: ExitRequest::None,
             exit_on_done: false,
@@ -617,6 +641,10 @@ impl App {
             run_model: None,
             run_context_window: None,
             zones: ZoneRegistry::new(),
+            hits: HitRegistry::default(),
+            pending_click: None,
+            scroll_drag: None,
+            hover: None,
             selection_state: None,
             middle_scroll: None,
             clipboard: ClipboardState::new(),
@@ -703,6 +731,7 @@ impl App {
         );
         Self::prepare(
             config,
+            &AgentConfig::default(),
             session,
             storage,
             available_models,
@@ -720,6 +749,7 @@ impl App {
             Arc::default(),
             theme_provider,
             command_runtime,
+            ModelCapabilityCache::new(|_| ModelCapabilities::NONE, || {}),
         )
         .activate()
     }
@@ -849,6 +879,9 @@ impl App {
         if target == self.plan_form_target {
             return;
         }
+        if self.model_picker_purpose == ModelPickerPurpose::PlanImplementation {
+            self.close_model_picker();
+        }
         let (form, pending) = self
             .plan_forms
             .remove(&target)
@@ -858,6 +891,77 @@ impl App {
         self.plan_forms
             .insert(self.plan_form_target, (previous, previous_pending));
         self.plan_form_target = target;
+    }
+
+    /// Brings the focused plan form forward, and retires its staging once
+    /// the focused agent's plan is gone or replaced.
+    pub(crate) fn sync_focused_plan_form(&mut self) {
+        self.sync_plan_form_target();
+        let path = if self.is_main_chat() {
+            self.focused_plan_path()
+        } else if let Some(config) = self.focused_config() {
+            config.mode.plan_path().map(Path::to_path_buf)
+        } else {
+            return;
+        };
+        self.sync_plan_form_path(self.plan_form_target, path.as_deref());
+        if path.is_none() && self.plan_picker_edits(self.plan_form_target) {
+            self.close_model_picker();
+            self.pending_dirty |= Dirty::YES;
+        }
+    }
+
+    /// Retires the staging of saved child plan forms whose plans are gone.
+    pub(crate) fn sync_child_plan_paths(
+        &mut self,
+        mut path_for: impl FnMut(AgentId) -> Option<PathBuf>,
+    ) {
+        let targets = self
+            .plan_forms
+            .keys()
+            .copied()
+            .flatten()
+            .chain(self.plan_form_target)
+            .collect::<Vec<_>>();
+        for target in targets {
+            self.sync_plan_form_path(Some(target), path_for(target).as_deref());
+        }
+    }
+
+    /// A form staged for one plan never carries over to the next, and a
+    /// picker editing it closes with it.
+    pub(super) fn sync_plan_form_path(&mut self, key: Option<AgentId>, path: Option<&Path>) {
+        let Some((form, pending)) = self.plan_form_entry(key) else {
+            return;
+        };
+        if !form.sync_plan_path(path) {
+            return;
+        }
+        *pending = false;
+        if self.plan_picker_edits(key) {
+            self.close_model_picker();
+        }
+        self.pending_dirty |= Dirty::YES;
+    }
+
+    /// The plan form for `key` (`None` is the root) and its approval-pending
+    /// flag, whether it is the focused form or a saved one.
+    pub(super) fn plan_form_entry(
+        &mut self,
+        key: Option<AgentId>,
+    ) -> Option<(&mut PlanForm, &mut bool)> {
+        if self.plan_form_target == key {
+            Some((&mut self.plan_form, &mut self.plan_approval_pending))
+        } else {
+            self.plan_forms
+                .get_mut(&key)
+                .map(|(form, pending)| (form, pending))
+        }
+    }
+
+    pub(super) fn plan_picker_edits(&self, key: Option<AgentId>) -> bool {
+        self.model_picker_purpose == ModelPickerPurpose::PlanImplementation
+            && self.plan_form_target == key
     }
 
     fn plan_form_active(&self) -> bool {
@@ -959,7 +1063,7 @@ impl App {
     }
 
     pub(crate) fn sync_focused_queue(&mut self) {
-        self.sync_plan_form_target();
+        self.sync_focused_plan_form();
         let id = self.selected_agent_id();
         let actor = self
             .command_runtime
@@ -999,9 +1103,9 @@ impl App {
                 vec![]
             }
             Msg::Mouse(event) => {
-                let dirty = self.handle_mouse(event);
+                let (dirty, actions) = self.handle_mouse(event);
                 self.pending_dirty |= dirty;
-                vec![]
+                actions
             }
             Msg::Scroll { column, row, delta } => {
                 self.handle_scroll(column, row, delta);
@@ -1014,7 +1118,12 @@ impl App {
         // immediately, rather than waiting for the next 100ms tick.
         let dirty = self.promote_deferred_if_ready();
         self.pending_dirty |= dirty;
+        if self.has_modal_overlay() || self.permission_active() {
+            self.menu.close();
+        }
         let dirty = self.validate_middle_scroll();
+        self.pending_dirty |= dirty;
+        let dirty = self.validate_scroll_drag();
         self.pending_dirty |= dirty;
         actions
     }
@@ -1047,35 +1156,468 @@ impl App {
         }
     }
 
-    fn scroll_at(&mut self, column: u16, row: u16, delta: i32) -> Option<SelectionZone> {
-        if self.btw_modal.is_open() {
-            self.btw_modal.scroll(delta);
-            return None;
+    pub(super) fn scroll_content_len(&self, owner: ScrollOwner) -> Option<u16> {
+        match owner {
+            ScrollOwner::Messages => Some(self.chats[self.resolve_render_chat()].content_len()),
+            ScrollOwner::Input => Some(self.input_box.content_len()),
+            ScrollOwner::Picker(picker) => match picker {
+                PickerId::Model => self.model_picker.content_len(),
+                PickerId::Task => self
+                    .task_picker
+                    .is_open()
+                    .then(|| self.task_picker.content_len())
+                    .flatten(),
+                PickerId::Theme => self.theme_picker.content_len(),
+                PickerId::Rewind => self.rewind_picker.content_len(),
+                PickerId::Login => self.login_picker.content_len(),
+                PickerId::Mcp => self.mcp_picker.content_len(),
+                PickerId::Lua => self.lua_picker.content_len(),
+                PickerId::Search => self
+                    .search_modal
+                    .is_open()
+                    .then(|| self.search_modal.content_len()),
+                PickerId::File => self.file_picker.content_len(),
+            },
+            ScrollOwner::Help => self
+                .help_modal
+                .is_open()
+                .then(|| self.help_modal.content_len()),
+            ScrollOwner::Btw => self
+                .btw_modal
+                .is_open()
+                .then(|| self.btw_modal.content_len()),
+            ScrollOwner::Float(id) => self.float_mgr.content_len(id),
         }
-        if self.help_modal.is_open() {
-            self.help_modal.scroll(delta);
-            return None;
+    }
+
+    pub(super) fn scroll_line(&self, owner: ScrollOwner) -> u16 {
+        match owner {
+            ScrollOwner::Messages => self.chats[self.resolve_render_chat()].scroll_top(),
+            ScrollOwner::Input => self.input_box.scroll_y(),
+            ScrollOwner::Picker(picker) => match picker {
+                PickerId::Model => self.model_picker.scroll_line().unwrap_or(0),
+                PickerId::Task => self.task_picker.scroll_line(),
+                PickerId::Theme => self.theme_picker.scroll_line().unwrap_or(0),
+                PickerId::Rewind => self.rewind_picker.scroll_line().unwrap_or(0),
+                PickerId::Login => self.login_picker.scroll_line().unwrap_or(0),
+                PickerId::Mcp => self.mcp_picker.scroll_line().unwrap_or(0),
+                PickerId::Lua => self.lua_picker.scroll_line().unwrap_or(0),
+                PickerId::Search => self.search_modal.scroll_line(),
+                PickerId::File => self.file_picker.scroll_line(),
+            },
+            ScrollOwner::Help => self.help_modal.scroll_line(),
+            ScrollOwner::Btw => self.btw_modal.scroll_line(),
+            ScrollOwner::Float(id) => self.float_mgr.scroll_line(id).unwrap_or(0),
         }
-        let pos = Position::new(column, row);
-        if self.float_mgr.is_focused() && self.float_mgr.contains(pos) {
-            self.float_mgr.scroll(delta);
-            return None;
+    }
+
+    pub(super) fn scroll_owner_to(&mut self, owner: ScrollOwner, line: u16) {
+        let chat = self.resolve_render_chat();
+        match owner {
+            ScrollOwner::Messages => self.chats[chat].scroll_to_line(line),
+            ScrollOwner::Input => self.input_box.scroll_to_line(line),
+            ScrollOwner::Picker(picker) => match picker {
+                PickerId::Model => self.model_picker.scroll_to_line(line),
+                PickerId::Task => self.task_picker.scroll_to_line(line),
+                PickerId::Theme => self.theme_picker.scroll_to_line(line),
+                PickerId::Rewind => self.rewind_picker.scroll_to_line(line),
+                PickerId::Login => self.login_picker.scroll_to_line(line),
+                PickerId::Mcp => self.mcp_picker.scroll_to_line(line),
+                PickerId::Lua => self.lua_picker.scroll_to_line(line),
+                PickerId::Search => self.search_modal.scroll_to_line(line),
+                PickerId::File => self.file_picker.scroll_to_line(line),
+            },
+            ScrollOwner::Help => self.help_modal.scroll_to_line(line),
+            ScrollOwner::Btw => self.btw_modal.scroll_to_line(line),
+            ScrollOwner::Float(id) => self.float_mgr.scroll_to_line(id, line),
         }
-        macro_rules! try_picker {
-            ($picker:expr) => {
-                if $picker.is_open() {
-                    if $picker.contains(pos) {
-                        $picker.scroll(delta);
-                    }
-                    return None;
+    }
+
+    fn answer_permission(&mut self, answer: maki_agent::permissions::PermissionAnswer) {
+        let agent_id = self.permission_prompt.agent_id();
+        let request_id = self.permission_prompt.request_id().unwrap_or_default();
+        let encoded = maki_agent::permissions::TaggedAnswer::new(request_id, answer).encode();
+        self.permission_prompt.close();
+        self.send_to_agent(agent_id, encoded);
+    }
+
+    pub(super) fn dispatch_click(&mut self, target: ClickTarget, pos: Position) -> Vec<Action> {
+        match target {
+            ClickTarget::DeferInput => {
+                self.toggle_defer_input();
+                vec![]
+            }
+            ClickTarget::KeyHint(key) => match self.hits.surface_at(pos) {
+                Some(Surface::Picker(picker)) => self.handle_picker_key(picker, key),
+                Some(Surface::Plan) => self.handle_key(key),
+                _ => vec![],
+            },
+            ClickTarget::PermissionChip => {
+                self.toggle_permission_menu();
+                vec![]
+            }
+            ClickTarget::PickerInput(picker) => {
+                match picker {
+                    PickerId::Model => self.model_picker.click_input(pos),
+                    PickerId::Task => self.task_picker.click_input(pos),
+                    PickerId::Theme => self.theme_picker.click_input(pos),
+                    PickerId::Rewind => self.rewind_picker.click_input(pos),
+                    PickerId::Login => self.login_picker.click_input(pos),
+                    PickerId::Mcp => self.mcp_picker.click_input(pos),
+                    PickerId::Lua => self.lua_picker.click_input(pos),
+                    PickerId::Search => self.search_modal.click_input(pos),
+                    PickerId::File => self.file_picker.click_input(pos),
+                };
+                vec![]
+            }
+            ClickTarget::ModeChip => {
+                self.toggle_mode_menu();
+                vec![]
+            }
+            ClickTarget::ThinkingChip => {
+                self.toggle_thinking_menu();
+                vec![]
+            }
+            ClickTarget::ModelChip => {
+                if self.plan_approval_pending {
+                    vec![]
+                } else if self.plan_form_active() {
+                    self.handle_plan_form_action(PlanFormAction::OpenModelPicker)
+                } else {
+                    self.run_builtin(BuiltinAction::ModelPicker)
                 }
-            };
+            }
+            ClickTarget::AgentChip | ClickTarget::TasksHint => {
+                self.run_builtin(BuiltinAction::Tasks)
+            }
+            ClickTarget::AutoScrollChip => {
+                self.active_chat().enable_auto_scroll();
+                vec![]
+            }
+            ClickTarget::StatusEntry(id) => {
+                self.lua_event_handle.click_region(id);
+                vec![]
+            }
+            ClickTarget::WindowFooter { id, index } => {
+                self.float_mgr.click_footer(id, index);
+                vec![]
+            }
+            ClickTarget::WindowContent(id) | ClickTarget::WindowChrome(id) => {
+                self.float_mgr.click_at(id, pos);
+                vec![]
+            }
+            ClickTarget::PermissionHint { row, cell } => {
+                if let Some(answer) = self.permission_prompt.click_hint(row, cell) {
+                    self.answer_permission(answer);
+                }
+                vec![]
+            }
+            ClickTarget::PermissionGuidance => {
+                self.permission_prompt.click_guidance(pos);
+                vec![]
+            }
+            ClickTarget::CompletionRow { grid, index } => {
+                let selected = match grid {
+                    CompletionGrid::PaletteCommands => self.command_palette.select_command(index),
+                    CompletionGrid::PaletteArguments => self.command_palette.select_argument(index),
+                    CompletionGrid::PaletteGrid => self.command_palette.select_grid(index),
+                    CompletionGrid::FileCompletion => self.file_completion.select_grid(index),
+                };
+                if selected {
+                    self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                } else {
+                    vec![]
+                }
+            }
+            ClickTarget::PlanRow(row) => {
+                if !self.plan_approval_pending && self.plan_form.select_row(row as usize) {
+                    self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                } else {
+                    vec![]
+                }
+            }
+            ClickTarget::QueueRow(index) => {
+                if self.queue.focus() == Some(index) {
+                    self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                } else {
+                    self.queue.set_focus_at(index);
+                    vec![]
+                }
+            }
+            ClickTarget::PickerRow { picker, index } => {
+                if self.select_picker_row(picker, index) {
+                    self.handle_picker_key(
+                        picker,
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    )
+                } else {
+                    vec![]
+                }
+            }
+            ClickTarget::MenuRow(index) => {
+                let action = self.menu.click_row(index as usize);
+                if let Some(action) = action {
+                    self.menu.close();
+                    self.apply_menu_action(action)
+                } else {
+                    vec![]
+                }
+            }
+            _ => vec![],
         }
-        try_picker!(self.rewind_picker);
-        try_picker!(self.task_picker);
-        try_picker!(self.model_picker);
-        try_picker!(self.file_picker);
-        let zone = self.zone_at(row, column)?.zone;
+    }
+
+    fn handle_picker_key(&mut self, picker: PickerId, key: KeyEvent) -> Vec<Action> {
+        match picker {
+            PickerId::Lua => match self.lua_picker.handle_key(key) {
+                LuaPickerAction::Confirming(msg) => {
+                    self.flash(msg);
+                    vec![]
+                }
+                LuaPickerAction::Consumed
+                | LuaPickerAction::Choice(..)
+                | LuaPickerAction::Delete(..)
+                | LuaPickerAction::Close => vec![],
+            },
+            PickerId::Search => {
+                match self.search_modal.handle_key(key) {
+                    SearchAction::Consumed => self.refresh_search_matches(),
+                    SearchAction::Navigate => {
+                        sync_search_highlight(
+                            &self.search_modal,
+                            &mut self.chats[self.active_chat],
+                        );
+                    }
+                    SearchAction::Select(idx) => {
+                        let chat = &mut self.chats[self.active_chat];
+                        chat.scroll_to_segment(idx);
+                        chat.set_highlight_segment(None);
+                        self.search_modal.close();
+                    }
+                    SearchAction::Close(saved) => {
+                        let chat = &mut self.chats[self.active_chat];
+                        chat.set_highlight_segment(None);
+                        if let Some((top, auto)) = saved {
+                            chat.restore_scroll(top, auto);
+                        }
+                        self.search_modal.close();
+                    }
+                }
+                vec![]
+            }
+            PickerId::File => match self.file_picker.handle_key(key) {
+                FilePickerModalAction::Consumed => vec![],
+                FilePickerModalAction::Select(path) => {
+                    self.file_picker.close();
+                    if let InputAction::PaletteSync(val) =
+                        self.input_box.handle_paste_with_spaces(&path)
+                    {
+                        self.pending_dirty |= self.command_palette.sync(&val);
+                        self.sync_command_arguments(
+                            &val,
+                            self.input_box.buffer.cursor_byte_offset(),
+                        );
+                        self.sync_file_completion();
+                    }
+                    vec![]
+                }
+                FilePickerModalAction::Close => {
+                    self.file_picker.close();
+                    vec![]
+                }
+            },
+            PickerId::Task => {
+                if key::TASKS.matches(key) {
+                    self.task_picker.close();
+                    return vec![];
+                }
+                match self.task_picker.handle_key(key) {
+                    PickerAction::Consumed
+                    | PickerAction::Toggle(..)
+                    | PickerAction::Delete(..) => {
+                        vec![]
+                    }
+                    PickerAction::Select(entry) => {
+                        self.task_picker_original = None;
+                        self.active_chat = entry.chat_index;
+                        vec![]
+                    }
+                    PickerAction::Close => {
+                        self.active_chat = self.task_picker_original.take().unwrap_or(0);
+                        vec![]
+                    }
+                }
+            }
+            PickerId::Rewind => match self.rewind_picker.handle_key(key) {
+                RewindPickerAction::Consumed => vec![],
+                RewindPickerAction::Select(entry) => self.rewind_to(entry),
+                RewindPickerAction::Close => vec![],
+            },
+            PickerId::Theme => match self.theme_picker.handle_key(key) {
+                ThemePickerAction::Consumed => vec![],
+                ThemePickerAction::Closed => vec![],
+            },
+            PickerId::Model => self.handle_model_picker_key(key),
+            PickerId::Login => {
+                let action = self.login_picker.handle_key(key);
+                self.login_picker_actions(action)
+            }
+            PickerId::Mcp => match self.mcp_picker.handle_key(key) {
+                McpPickerAction::Consumed => vec![],
+                McpPickerAction::Toggle {
+                    server_name,
+                    enabled,
+                } => {
+                    vec![Action::ToggleMcp(server_name, enabled)]
+                }
+                McpPickerAction::Close => vec![],
+            },
+        }
+    }
+
+    fn select_picker_row(&mut self, picker: PickerId, index: usize) -> bool {
+        match picker {
+            PickerId::Model => self.model_picker.select(index),
+            PickerId::Task => self.task_picker.select(index),
+            PickerId::Theme => self.theme_picker.select(index),
+            PickerId::Rewind => self.rewind_picker.select(index),
+            PickerId::Login => self.login_picker.click_row(index),
+            PickerId::Mcp => self.mcp_picker.select(index),
+            PickerId::Lua => self.lua_picker.select(index),
+            PickerId::Search => self.search_modal.select(index),
+            PickerId::File => self.file_picker.select(index),
+        }
+    }
+
+    fn apply_menu_action(&mut self, action: MenuAction) -> Vec<Action> {
+        match action {
+            MenuAction::Permission(enabled) => {
+                if self.coordinator.is_none() {
+                    self.permissions.set_yolo(enabled);
+                    self.apply_toggled_option(maki_agent::session_options::YOLO_OPTION_ID, enabled);
+                    vec![]
+                } else {
+                    vec![Action::SetSessionOption {
+                        id: maki_agent::session_options::YOLO_OPTION_ID,
+                        enabled,
+                    }]
+                }
+            }
+            MenuAction::Mode(key) => vec![Action::ChangeMode(key)],
+            MenuAction::Thinking(thinking) => {
+                vec![Action::SelectModel(maki_commands::ModelSelection {
+                    spec: None,
+                    thinking: Some(thinking),
+                    fast: None,
+                })]
+            }
+        }
+    }
+
+    fn toggle_permission_menu(&mut self) {
+        if self.menu.kind() == Some(MenuKind::Permission) {
+            self.menu.close();
+            return;
+        }
+        let Some(anchor) = self.hits.rect_of(ClickTarget::PermissionChip) else {
+            return;
+        };
+        self.menu
+            .open_permission(anchor, self.permissions.is_yolo());
+    }
+
+    fn toggle_mode_menu(&mut self) {
+        if self.menu.kind() == Some(MenuKind::Mode) {
+            self.menu.close();
+            return;
+        }
+        let Some(anchor) = self.hits.rect_of(ClickTarget::ModeChip) else {
+            return;
+        };
+        let registry = self.lua_event_handle.mode_registry();
+        let current = self.focused_mode().def(&registry).id.key().to_owned();
+        let mut defs = registry.list();
+        defs.sort_by(|a, b| {
+            let rank = |id: &maki_agent::ModeId| match id {
+                maki_agent::ModeId::Build => 0,
+                maki_agent::ModeId::Plan => 1,
+                maki_agent::ModeId::Custom(_) => 2,
+            };
+            rank(&a.id)
+                .cmp(&rank(&b.id))
+                .then_with(|| a.label.cmp(&b.label))
+        });
+        let items = defs
+            .into_iter()
+            .map(|def| {
+                let key = def.id.key().to_owned();
+                MenuItem {
+                    current: key == current,
+                    label: def.label.to_string(),
+                    action: MenuAction::Mode(key),
+                }
+            })
+            .collect();
+        self.menu.open(MenuKind::Mode, anchor, items);
+    }
+
+    fn toggle_thinking_menu(&mut self) {
+        if self.menu.kind() == Some(MenuKind::Thinking) {
+            self.menu.close();
+            return;
+        }
+        let Some(anchor) = self.hits.rect_of(ClickTarget::ThinkingChip) else {
+            return;
+        };
+        let current = self.displayed_config(self.active_chat).options().thinking;
+        let items = ThinkingConfig::options()
+            .iter()
+            .filter_map(|option| {
+                option
+                    .parse::<ThinkingConfig>()
+                    .ok()
+                    .map(|thinking| (*option, thinking))
+            })
+            .map(|(label, thinking)| MenuItem {
+                current: thinking == current,
+                label: label.to_string(),
+                action: MenuAction::Thinking(thinking),
+            })
+            .collect();
+        self.menu.open(MenuKind::Thinking, anchor, items);
+    }
+
+    fn scroll_surface(&mut self, surface: Surface, delta: i32) {
+        match surface {
+            Surface::Picker(PickerId::Model) => self.model_picker.scroll(delta),
+            Surface::Picker(PickerId::Task) => self.task_picker.scroll(delta),
+            Surface::Picker(PickerId::Theme) => self.theme_picker.scroll(delta),
+            Surface::Picker(PickerId::Rewind) => self.rewind_picker.scroll(delta),
+            Surface::Picker(PickerId::Login) => self.login_picker.scroll(delta),
+            Surface::Picker(PickerId::Mcp) => self.mcp_picker.scroll(delta),
+            Surface::Picker(PickerId::Lua) => self.lua_picker.scroll(delta),
+            Surface::Picker(PickerId::Search) => self.search_modal.scroll(delta),
+            Surface::Picker(PickerId::File) => self.file_picker.scroll(delta),
+            Surface::Help => self.help_modal.scroll(delta),
+            Surface::Btw => self.btw_modal.scroll(delta),
+            Surface::Float(id) => self.float_mgr.scroll_window(id, delta),
+            _ => {}
+        }
+    }
+
+    fn scroll_at(&mut self, column: u16, row: u16, delta: i32) -> Option<SelectionZone> {
+        let pos = Position::new(column, row);
+        if let Some(surface) = self.hits.scroll_surface_at(pos) {
+            self.scroll_surface(surface, delta);
+            return None;
+        }
+        let zone = [SelectionZone::Input, SelectionZone::Messages]
+            .into_iter()
+            .find(|&zone| {
+                self.zones
+                    .find(zone)
+                    .is_some_and(|entry| entry.area.contains(pos))
+            })?;
         self.scroll_zone(zone, delta);
         Some(zone)
     }
@@ -1254,14 +1796,34 @@ impl App {
 
         if self.permission_active() {
             if let Some(answer) = self.permission_prompt.handle_key(key) {
-                let agent_id = self.permission_prompt.agent_id();
-                let request_id = self.permission_prompt.request_id().unwrap_or_default();
-                let encoded =
-                    maki_agent::permissions::TaggedAnswer::new(request_id, answer).encode();
-                self.permission_prompt.close();
-                self.send_to_agent(agent_id, encoded);
+                self.answer_permission(answer);
             }
             return Some(vec![]);
+        }
+
+        if self.menu.is_open() && !self.has_modal_overlay() {
+            match key.code {
+                KeyCode::Up => {
+                    self.menu.up();
+                    return Some(vec![]);
+                }
+                KeyCode::Down => {
+                    self.menu.down();
+                    return Some(vec![]);
+                }
+                KeyCode::Enter => {
+                    if let Some(action) = self.menu.take_action() {
+                        self.menu.close();
+                        return Some(self.apply_menu_action(action));
+                    }
+                    return Some(vec![]);
+                }
+                KeyCode::Esc => {
+                    self.menu.close();
+                    return Some(vec![]);
+                }
+                _ => self.menu.close(),
+            }
         }
 
         if self.help_modal.is_open() {
@@ -1299,16 +1861,7 @@ impl App {
         }
 
         if self.lua_picker.is_open() {
-            return Some(match self.lua_picker.handle_key(key) {
-                LuaPickerAction::Confirming(msg) => {
-                    self.flash(msg);
-                    vec![]
-                }
-                LuaPickerAction::Consumed
-                | LuaPickerAction::Choice(..)
-                | LuaPickerAction::Delete(..)
-                | LuaPickerAction::Close => vec![],
-            });
+            return Some(self.handle_picker_key(PickerId::Lua, key));
         }
 
         if !self.permission_active() && self.float_mgr.handle_key(key) {
@@ -1316,51 +1869,11 @@ impl App {
         }
 
         if self.search_modal.is_open() {
-            match self.search_modal.handle_key(key) {
-                SearchAction::Consumed => self.refresh_search_matches(),
-                SearchAction::Navigate => {
-                    sync_search_highlight(&self.search_modal, &mut self.chats[self.active_chat]);
-                }
-                SearchAction::Select(idx) => {
-                    let chat = &mut self.chats[self.active_chat];
-                    chat.scroll_to_segment(idx);
-                    chat.set_highlight_segment(None);
-                    self.search_modal.close();
-                }
-                SearchAction::Close(saved) => {
-                    let chat = &mut self.chats[self.active_chat];
-                    chat.set_highlight_segment(None);
-                    if let Some((top, auto)) = saved {
-                        chat.restore_scroll(top, auto);
-                    }
-                    self.search_modal.close();
-                }
-            }
-            return Some(vec![]);
+            return Some(self.handle_picker_key(PickerId::Search, key));
         }
 
         if self.file_picker.is_open() {
-            return Some(match self.file_picker.handle_key(key) {
-                FilePickerModalAction::Consumed => vec![],
-                FilePickerModalAction::Select(path) => {
-                    self.file_picker.close();
-                    if let InputAction::PaletteSync(val) =
-                        self.input_box.handle_paste_with_spaces(&path)
-                    {
-                        self.pending_dirty |= self.command_palette.sync(&val);
-                        self.sync_command_arguments(
-                            &val,
-                            self.input_box.buffer.cursor_byte_offset(),
-                        );
-                        self.sync_file_completion();
-                    }
-                    vec![]
-                }
-                FilePickerModalAction::Close => {
-                    self.file_picker.close();
-                    vec![]
-                }
-            });
+            return Some(self.handle_picker_key(PickerId::File, key));
         }
 
         if self.queue.focus().is_some() {
@@ -1381,61 +1894,27 @@ impl App {
         }
 
         if self.task_picker.is_open() {
-            if key::TASKS.matches(key) {
-                self.task_picker.close();
-                return Some(vec![]);
-            }
-            return Some(match self.task_picker.handle_key(key) {
-                PickerAction::Consumed | PickerAction::Toggle(..) | PickerAction::Delete(..) => {
-                    vec![]
-                }
-                PickerAction::Select(entry) => {
-                    self.task_picker_original = None;
-                    self.active_chat = entry.chat_index;
-                    vec![]
-                }
-                PickerAction::Close => {
-                    self.active_chat = self.task_picker_original.take().unwrap_or(0);
-                    vec![]
-                }
-            });
+            return Some(self.handle_picker_key(PickerId::Task, key));
         }
 
         if self.rewind_picker.is_open() {
-            return Some(match self.rewind_picker.handle_key(key) {
-                RewindPickerAction::Consumed => vec![],
-                RewindPickerAction::Select(entry) => self.rewind_to(entry),
-                RewindPickerAction::Close => vec![],
-            });
+            return Some(self.handle_picker_key(PickerId::Rewind, key));
         }
 
         if self.theme_picker.is_open() {
-            return Some(match self.theme_picker.handle_key(key) {
-                ThemePickerAction::Consumed => vec![],
-                ThemePickerAction::Closed => vec![],
-            });
+            return Some(self.handle_picker_key(PickerId::Theme, key));
         }
 
         if self.model_picker.is_open() {
-            return Some(self.handle_model_picker_key(key));
+            return Some(self.handle_picker_key(PickerId::Model, key));
         }
 
         if self.login_picker.is_open() {
-            let action = self.login_picker.handle_key(key);
-            return Some(self.login_picker_actions(action));
+            return Some(self.handle_picker_key(PickerId::Login, key));
         }
 
         if self.mcp_picker.is_open() {
-            return Some(match self.mcp_picker.handle_key(key) {
-                McpPickerAction::Consumed => vec![],
-                McpPickerAction::Toggle {
-                    server_name,
-                    enabled,
-                } => {
-                    vec![Action::ToggleMcp(server_name, enabled)]
-                }
-                McpPickerAction::Close => vec![],
-            });
+            return Some(self.handle_picker_key(PickerId::Mcp, key));
         }
 
         if key::PLAN_TOGGLE.matches(key) && self.plan_toggle_ready() {
@@ -1464,7 +1943,11 @@ impl App {
             .ok_or(CommandError::StaleTarget)?;
         self.model_picker_purpose = ModelPickerPurpose::Session;
         self.model_picker_target = Some(target);
-        self.model_picker.open(&config.model.spec());
+        self.model_picker.open(
+            config.model_selection(),
+            ModelCapabilities::from(&config.model),
+            &ModelSelection::default(),
+        );
         Ok(())
     }
 
@@ -1485,17 +1968,20 @@ impl App {
             self.flash(CommandError::StaleTarget.to_string());
             return;
         }
-        self.model_picker_target = None;
-        let spec = match purpose {
-            ModelPickerPurpose::PlanImplementation => self
-                .plan_form
-                .implementation_model()
-                .map(str::to_owned)
-                .unwrap_or_else(|| self.focused_model_spec()),
-            ModelPickerPurpose::Session => self.focused_model_spec(),
+        let config = self.focused_config().unwrap_or_else(|| self.root_config());
+        let draft = match purpose {
+            ModelPickerPurpose::PlanImplementation => {
+                self.plan_form.implementation_selection().clone()
+            }
+            ModelPickerPurpose::Session => ModelSelection::default(),
         };
+        self.model_picker_target = None;
         self.model_picker_purpose = purpose;
-        self.model_picker.open(&spec);
+        self.model_picker.open(
+            config.model_selection(),
+            ModelCapabilities::from(&config.model),
+            &draft,
+        );
     }
 
     /// Closes the picker and retires its purpose together, so the open state
@@ -1509,16 +1995,17 @@ impl App {
     fn handle_model_picker_key(&mut self, key: KeyEvent) -> Vec<Action> {
         match self.model_picker.handle_key(key) {
             ModelPickerAction::Consumed => vec![],
-            ModelPickerAction::Select(spec) => {
-                let purpose = std::mem::take(&mut self.model_picker_purpose);
+            ModelPickerAction::Select(selection) => {
+                let purpose = self.model_picker_purpose;
+                let target = self.model_picker_target.clone();
+                self.close_model_picker();
                 if purpose == ModelPickerPurpose::PlanImplementation {
-                    let model = self.focused_model_spec();
-                    self.plan_form.set_implementation_model(spec, &model);
+                    self.plan_form.set_implementation_selection(selection);
                     vec![]
-                } else if let Some(target) = self.model_picker_target.take() {
-                    vec![Action::ChangePinnedModel { target, spec }]
+                } else if let Some(target) = target {
+                    vec![Action::SelectPinnedModel { target, selection }]
                 } else {
-                    vec![Action::ChangeModel(spec)]
+                    vec![Action::SelectModel(selection)]
                 }
             }
             ModelPickerAction::AssignTier(spec, tier) => vec![Action::AssignTier(spec, tier)],
@@ -1538,8 +2025,6 @@ impl App {
         }
     }
 
-    /// True when `plan_submit` is in the active mode's toolset (set by
-    /// `mode_plan_override`), flipping the plan auto-hooks on/off.
     fn plan_submit_active(&self) -> bool {
         if self.focused_plan_path().is_none() {
             return false;
@@ -1553,7 +2038,9 @@ impl App {
             });
         def.tools
             .as_deref()
-            .is_some_and(|tools| tools.iter().any(|t| t.as_str() == PLAN_SUBMIT_TOOL))
+            .is_none_or(|tools| tools.iter().any(|t| t.as_str() == PLAN_SUBMIT_TOOL))
+            && self.tool_filter.matches(PLAN_SUBMIT_TOOL)
+            && self.lua_event_handle.has_native_tool(PLAN_SUBMIT_TOOL)
     }
 
     fn submit_plan(&mut self) -> Vec<Action> {
@@ -1654,11 +2141,15 @@ impl App {
     }
 
     fn dispatch_override(&self, key: KeyEvent) -> Option<u64> {
+        let (code, modifiers) = match key.code {
+            KeyCode::BackTab => (KeyCode::Tab, key.modifiers | KeyModifiers::SHIFT),
+            _ => (key.code, key.modifiers),
+        };
         self.keymap_reader
             .load()
             .entries
             .iter()
-            .find(|entry| entry.key == key.code && entry.modifiers == key.modifiers)
+            .find(|entry| entry.key == code && entry.modifiers == modifiers)
             .filter(|_| !self.lua_event_handle.is_disconnected())
             .map(|entry| entry.id)
     }
@@ -1807,7 +2298,12 @@ impl App {
                         self.active_chat().scroll(-1);
                         vec![]
                     }
-                    KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
+                    KeyCode::BackTab if !self.is_bash_input() => self.toggle_mode(),
+                    KeyCode::Tab
+                        if key.modifiers.contains(KeyModifiers::SHIFT) && !self.is_bash_input() =>
+                    {
+                        self.toggle_mode()
+                    }
                     KeyCode::Esc => {
                         if let Some(t) = self.last_esc.take()
                             && t.elapsed() < self.status_bar.flash_duration
@@ -2193,6 +2689,15 @@ impl App {
                 return vec![];
             }
             if matches!(&envelope.event, AgentEvent::SubagentClosed) {
+                self.finish_child_plan_approval(subagent.agent_id);
+                if self.plan_picker_edits(Some(subagent.agent_id))
+                    || self
+                        .model_picker_target
+                        .as_ref()
+                        .is_some_and(|target| target.id() == subagent.agent_id)
+                {
+                    self.close_model_picker();
+                }
                 self.terminal_subagents.insert(subagent.agent_id);
                 if let Some(channels) = self.subagent_channels.get_mut(&subagent.agent_id) {
                     channels.closed = true;
@@ -2538,7 +3043,7 @@ impl App {
             ),
             None => (0, None),
         };
-        self.chats[chat_idx].push_post(&post.text, post.level);
+        self.chats[chat_idx].push_post(&post);
         let session = &self.state.session;
         let after_message = committed_messages.unwrap_or_else(|| match &chat {
             Some(id) => session
@@ -3510,24 +4015,42 @@ impl App {
         self.plan_approval_pending = true;
         vec![Action::ApprovePlan {
             clear_context,
-            model: self.plan_form.implementation_model().map(str::to_owned),
+            selection: self.plan_form.implementation_selection().clone(),
             parallel: self.plan_form.parallel(),
             path,
         }]
     }
 
-    pub(crate) fn plan_approval_matches(&self, model: Option<&str>, parallel: bool) -> bool {
-        self.plan_approval_pending
-            && self.focused_plan_path().is_some()
-            && self.plan_form.implementation_model() == model
-            && self.plan_form.parallel() == parallel
+    fn plan_form_key(&self, target: AgentId) -> Option<AgentId> {
+        (self.chats.first().and_then(|chat| chat.agent_id) != Some(target)).then_some(target)
     }
 
-    pub(crate) fn finish_child_plan_approval(&mut self, target: maki_agent::AgentId) {
-        if self.plan_form_target == Some(target) {
-            self.plan_approval_pending = false;
-            self.plan_form.reset();
-        } else if let Some((form, pending)) = self.plan_forms.get_mut(&Some(target)) {
+    pub(crate) fn plan_approval_matches(
+        &self,
+        target: AgentId,
+        selection: &ModelSelection,
+        parallel: bool,
+    ) -> bool {
+        let key = self.plan_form_key(target);
+        let (form, pending) = if self.plan_form_target == key {
+            (&self.plan_form, self.plan_approval_pending)
+        } else {
+            match self.plan_forms.get(&key) {
+                Some((form, pending)) => (form, *pending),
+                None => return false,
+            }
+        };
+        pending && form.implementation_selection() == selection && form.parallel() == parallel
+    }
+
+    pub(crate) fn clear_plan_approval_pending(&mut self, target: AgentId) {
+        if let Some((_, pending)) = self.plan_form_entry(self.plan_form_key(target)) {
+            *pending = false;
+        }
+    }
+
+    pub(crate) fn finish_child_plan_approval(&mut self, target: AgentId) {
+        if let Some((form, pending)) = self.plan_form_entry(self.plan_form_key(target)) {
             form.reset();
             *pending = false;
         }
@@ -3540,8 +4063,6 @@ impl App {
         path: String,
         prompt: String,
     ) {
-        self.plan_approval_pending = false;
-        self.plan_form.reset();
         self.state.plan = PlanState::None;
         self.main_chat().push(DisplayMessage::plan(content, path));
         self.main_chat().show_user_message(prompt, vec![]);

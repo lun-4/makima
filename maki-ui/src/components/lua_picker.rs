@@ -12,8 +12,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use flume::Sender;
 use maki_lua::{EventHandle, PickerConfig, PickerEvent, PickerItemSpec, PickerResult};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 
+use crate::click::{HitTarget, PickerId};
 use crate::components::Overlay;
 use crate::components::keybindings::key_display;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
@@ -77,7 +78,7 @@ pub struct LuaPicker {
 impl LuaPicker {
     pub fn new(event_handle: EventHandle) -> Self {
         Self {
-            picker: ListPicker::new(),
+            picker: ListPicker::new().with_picker(PickerId::Lua),
             event_handle,
             id: None,
             reply_tx: None,
@@ -105,6 +106,7 @@ impl LuaPicker {
             })
             .collect();
         let mut picker = ListPicker::new()
+            .with_picker(PickerId::Lua)
             .with_submit_keys(config.submit_keys.clone())
             .with_delete_key(KeyEvent::new(DELETE_KEY, KeyModifiers::CONTROL));
         if let Some(footer) = &config.footer {
@@ -238,6 +240,37 @@ impl LuaPicker {
         if let Some(id) = self.id.take() {
             self.event_handle.picker_event(id, PickerEvent::Done);
         }
+    }
+    pub fn select(&mut self, index: usize) -> bool {
+        self.picker.select(index)
+    }
+
+    pub fn click_input(&mut self, pos: Position) -> bool {
+        self.picker.click_input(pos)
+    }
+
+    pub fn scroll(&mut self, delta: i32) {
+        self.picker.scroll(delta);
+    }
+
+    pub fn hits(&self) -> Vec<HitTarget> {
+        if self.is_open() {
+            self.picker.hits()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn scroll_line(&self) -> Option<u16> {
+        self.is_open().then(|| self.picker.scroll_line())
+    }
+
+    pub fn content_len(&self) -> Option<u16> {
+        self.is_open().then(|| self.picker.content_len()).flatten()
+    }
+
+    pub fn scroll_to_line(&mut self, line: u16) {
+        self.picker.scroll_to_line(line);
     }
 }
 

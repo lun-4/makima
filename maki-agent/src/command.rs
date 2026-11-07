@@ -230,7 +230,7 @@ impl maki_commands::CommandHost for SessionCommandHost {
             }),
             BuiltinOperation::SelectModel(selection) => Box::pin(async move {
                 coordinator
-                    .set_model(selection.spec, selection.fast, selection.thinking)
+                    .set_model(selection)
                     .await
                     .map_err(producer_error)?;
                 Ok(HostResponse::Completed)
@@ -396,7 +396,9 @@ fn parsed_directory_argument(
         .transpose()
 }
 
-fn resolve_model(argument: &str, specs: &[Arc<str>]) -> Result<Arc<str>, CommandError> {
+/// Resolves a `/model` argument: an exact `provider/model`, or a fuzzy match
+/// against `specs`.
+pub fn resolve_model(argument: &str, specs: &[Arc<str>]) -> Result<Arc<str>, CommandError> {
     if argument.contains('/') {
         Model::parse_spec(argument)
             .map_err(|error| CommandError::Producer(Arc::from(error.to_string())))?;

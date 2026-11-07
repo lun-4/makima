@@ -14,6 +14,7 @@ pub(crate) mod login_picker;
 pub(crate) mod lua_float;
 pub(crate) mod lua_picker;
 pub(crate) mod mcp_picker;
+pub(crate) mod menu;
 pub mod messages;
 pub(crate) mod modal;
 pub(crate) mod model_picker;
@@ -154,6 +155,15 @@ impl ModalScroll {
         self.auto_scroll = self.offset >= self.max_offset;
     }
 
+    pub fn scroll_to(&mut self, offset: u16) {
+        self.offset = offset.min(self.max_offset);
+        self.auto_scroll = self.offset >= self.max_offset;
+    }
+
+    pub fn content_len(&self) -> u16 {
+        self.max_offset.saturating_add(self.viewport_h)
+    }
+
     pub fn handle_key(&mut self, key_event: KeyEvent) -> bool {
         use keybindings::key;
         match key_event.code {
@@ -224,15 +234,15 @@ pub enum Action {
         boundary: HistoryBoundary,
     },
     ChangeModel(String),
-    ChangePinnedModel {
+    SelectPinnedModel {
         target: AgentRef,
-        spec: String,
+        selection: maki_commands::ModelSelection,
     },
     SelectModel(maki_commands::ModelSelection),
     ChangeMode(String),
     ApprovePlan {
         clear_context: bool,
-        model: Option<String>,
+        selection: maki_commands::ModelSelection,
         parallel: bool,
         path: PathBuf,
     },
@@ -241,6 +251,10 @@ pub enum Action {
     /// through the coordinator, off the event-loop thread.
     ToggleSessionOption {
         id: &'static str,
+    },
+    SetSessionOption {
+        id: &'static str,
+        enabled: bool,
     },
     /// `/cd`, adopted through the coordinator off the event-loop thread.
     ChangeDirectory(PathBuf),
@@ -334,6 +348,7 @@ pub struct DisplayMessage {
     pub live_output: Option<String>,
     pub annotation: Option<String>,
     pub plan_path: Option<String>,
+    pub post_agent: Option<String>,
     pub timestamp: Option<String>,
     pub turn_usage: Option<String>,
     pub truncated_lines: usize,
@@ -355,6 +370,7 @@ impl DisplayMessage {
             live_output: None,
             annotation: None,
             plan_path: None,
+            post_agent: None,
             timestamp: None,
             turn_usage: None,
             truncated_lines: 0,
@@ -388,6 +404,7 @@ impl DisplayMessage {
             live_output: None,
             annotation: None,
             plan_path: Some(plan_path),
+            post_agent: None,
             timestamp: None,
             turn_usage: None,
             truncated_lines: 0,

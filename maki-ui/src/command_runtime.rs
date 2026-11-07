@@ -383,7 +383,10 @@ mod tests {
                 argument_hint: None,
             }],
             CommandRegistry::new(),
-            Arc::new(ModelArgSource::new(Arc::new(ArcSwapOption::empty()))),
+            Arc::new(ModelArgSource::new(
+                Arc::new(ArcSwapOption::empty()),
+                crate::model_capabilities::test_support::seeded(&[], &[]),
+            )),
             Arc::new(ThemeArgSource::new(Arc::new(
                 crate::theme::InMemoryThemesProvider::bundled(),
             ))),

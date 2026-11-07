@@ -17,6 +17,8 @@ use crossterm::event::{DisableFocusChange, EnableFocusChange};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use maki_config::NotificationMethod;
 
+use crate::terminal_da::Da1Feature;
+
 const FALLBACK_NOTIFICATION_MESSAGE: &str = "Makima needs attention";
 const BELL_SEQUENCE: &str = "\u{7}";
 /// XTPUSHTITLE saves whatever title the shell left on the window, so the
@@ -184,7 +186,7 @@ fn query_tmux_client() -> Option<TmuxClient> {
     }
     let output = child.wait_with_output().ok()?;
     let output = String::from_utf8(output.stdout).ok()?;
-    let (term_type, term_name) = output.trim_end().split_once('\t')?;
+    let (term_type, term_name) = output.trim_end_matches(['\r', '\n']).split_once('\t')?;
     Some(TmuxClient {
         term_type: term_type.into(),
         term_name: term_name.into(),
@@ -410,12 +412,24 @@ pub(crate) fn open_in_editor(
     }
 }
 
-pub(crate) fn copy_to_clipboard(text: &str) -> Result<(), String> {
+pub(crate) fn supports_osc52() -> bool {
+    Da1Feature::Osc52.is_supported()
+}
+
+fn clipboard_sequence(text: &str, mux: TerminalMux, advertised: bool) -> Result<String, String> {
     let mut sequence = String::new();
     CopyToClipboard::to_clipboard_from(text)
         .write_ansi(&mut sequence)
         .map_err(|e| e.to_string())?;
-    let sequence = TerminalMux::detect().wrap_for_mux(sequence);
+    Ok(if advertised {
+        sequence
+    } else {
+        mux.wrap_for_mux(sequence)
+    })
+}
+
+pub(crate) fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    let sequence = clipboard_sequence(text, TerminalMux::detect(), supports_osc52())?;
     let mut stdout = stdout().lock();
     stdout
         .write_all(sequence.as_bytes())
@@ -685,6 +699,22 @@ mod tests {
         let payload = "\u{1b}A\u{1b}B\u{1b}C\u{1b}\\";
         let wrapped = TerminalMux::Tmux.wrap_for_mux(payload.to_string());
         assert_eq!(parse_dcs_passthrough(&wrapped, "\u{1b}Ptmux;"), payload);
+    }
+
+    #[test_case(TerminalMux::None, true; "direct_advertised")]
+    #[test_case(TerminalMux::Tmux, true; "tmux_advertised")]
+    #[test_case(TerminalMux::Screen, true; "screen_advertised")]
+    #[test_case(TerminalMux::Tmux, false; "tmux_fallback")]
+    #[test_case(TerminalMux::Screen, false; "screen_fallback")]
+    fn clipboard_transport(mux: TerminalMux, advertised: bool) {
+        const TEXT: &str = "Hello";
+        let sequence = clipboard_sequence(TEXT, mux, advertised).unwrap();
+        let expected = if advertised {
+            OSC52_WITH_ST.to_string()
+        } else {
+            mux.wrap_for_mux(OSC52_WITH_ST.to_string())
+        };
+        assert_eq!(sequence, expected);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use maki_providers::ThinkingConfigExt;
 use std::sync::atomic::Ordering;
 
+use crate::click::{ClickTarget, HitTarget, PickerId, ScrollOwner, Surface};
 use crate::components::Overlay;
 use crate::components::input::Placeholder;
 #[cfg(test)]
@@ -51,6 +52,8 @@ struct ViewLayout {
 
 impl App {
     pub fn view(&mut self, frame: &mut Frame) {
+        self.hits.clear();
+        self.float_mgr.begin_frame();
         self.sync_focused_queue();
         self.status_bar.set_cwd(self.focused_cwd());
         let form_visible = self.permission_active() || self.plan_form_active();
@@ -62,11 +65,40 @@ impl App {
         self.render_messages(frame, &layout, render_chat);
         self.render_bottom_panel(frame, &layout);
         self.render_splits(frame, &layout);
-        let mut overlay_rect = self.render_picker_overlays(frame, &layout);
         self.render_status_bar(frame, layout.status_area, render_chat);
+        let mut modal_rects = self.render_picker_overlays(frame, &layout);
+        if self.menu.is_open() && !self.has_modal_overlay() && !self.permission_active() {
+            let hits = self.menu.view(frame, frame.area(), self.hover);
+            if let Some(rect) = self.menu.area() {
+                self.hits.surface(Surface::Menu, rect, false);
+            }
+            self.absorb_hits(hits);
+        }
         self.render_defer_hint(frame, layout.defer_hint_area);
-        overlay_rect = self.render_top_modals(frame, overlay_rect);
-        self.register_zones(&layout, overlay_rect);
+        self.render_top_modals(frame, &mut modal_rects);
+        if self.permission_active() {
+            modal_rects.push(layout.bottom_area);
+        } else if self.question_active()
+            && let Some(rect) = layout.splits.rect(Split::Below)
+        {
+            modal_rects.push(selection::inset_border(rect));
+        }
+        let overlay_rect = modal_rects
+            .iter()
+            .copied()
+            .reduce(|a, b| {
+                let x = a.x.min(b.x);
+                let y = a.y.min(b.y);
+                let right = a.right().max(b.right());
+                let bottom = a.bottom().max(b.bottom());
+                Rect::new(x, y, right.saturating_sub(x), bottom.saturating_sub(y))
+            })
+            .unwrap_or_default();
+        let menu_rect = self
+            .menu
+            .area()
+            .filter(|_| !self.has_modal_overlay() && !self.permission_active());
+        self.register_zones(&layout, overlay_rect, menu_rect);
         let dirty = self.validate_middle_scroll();
         self.pending_dirty |= dirty;
         self.apply_selection(frame, render_chat);
@@ -78,6 +110,8 @@ impl App {
                 .set_style(Style::new().fg(theme::current().mode_build));
         }
         self.render_active_input(frame, &layout);
+        let dirty = self.validate_scroll_drag();
+        self.pending_dirty |= dirty;
     }
 
     fn compute_layout(&self, area: Rect, form_visible: bool) -> ViewLayout {
@@ -192,7 +226,7 @@ impl App {
         bg.render(frame.area(), frame.buffer_mut());
     }
 
-    fn render_top_bar(&self, frame: &mut Frame, layout: &ViewLayout) {
+    fn render_top_bar(&mut self, frame: &mut Frame, layout: &ViewLayout) {
         let area = layout.top_bar_area;
         if area.height == 0 {
             return;
@@ -233,11 +267,19 @@ impl App {
             Constraint::Length(right_span.width() as u16),
         ])
         .areas(area);
+        let badge_rect = bar_span_rect(left_area, &left_spans, 0);
+        let task_rect = bar_span_rect(left_area, &left_spans, 1);
         frame.render_widget(Paragraph::new(Line::from(left_spans)), left_area);
         frame.render_widget(
             Paragraph::new(Line::from(right_span)).alignment(Alignment::Right),
             right_area,
         );
+        if let Some(rect) = badge_rect {
+            self.hits.push(rect, ClickTarget::AgentChip);
+        }
+        if let Some(rect) = task_rect {
+            self.hits.push(rect, ClickTarget::TasksHint);
+        }
     }
 
     fn render_messages(&mut self, frame: &mut Frame, layout: &ViewLayout, render_chat: usize) {
@@ -261,6 +303,10 @@ impl App {
             self.selection_state.is_some() || self.middle_scroll.is_some(),
             images_visible,
         );
+        if let Some(hit) = self.chats[render_chat].scrollbar_hit() {
+            self.hits
+                .push(hit.area, ClickTarget::Scrollbar(ScrollOwner::Messages));
+        }
     }
 
     fn render_bottom_panel(&mut self, frame: &mut Frame, layout: &ViewLayout) {
@@ -269,12 +315,19 @@ impl App {
             // (`render_active_input`) so it lands above pickers/modals.
         } else if self.plan_form_active() {
             let model = self.focused_model_spec();
-            self.plan_form.view(frame, layout.bottom_area, &model);
+            self.hits.surface(Surface::Plan, layout.bottom_area, false);
+            let hits = self.plan_form.view(frame, layout.bottom_area, &model);
+            self.absorb_hits(hits);
         } else if layout.bottom_area.height > 0 {
             let queue_entries = self.queue.panel_entries();
-            queue_panel::view(frame, layout.queue_area, &queue_entries, self.queue.focus());
+            self.hits.surface(Surface::Queue, layout.queue_area, false);
+            let hits =
+                queue_panel::view(frame, layout.queue_area, &queue_entries, self.queue.focus());
+            self.absorb_hits(hits);
             for &(idx, rect) in &layout.panel_windows {
                 self.float_mgr.view_panel(frame, idx, rect);
+                let hits = self.float_mgr.take_hits();
+                self.absorb_hits(hits);
             }
             let streaming = self.focused_streaming();
             let placeholder = if streaming {
@@ -302,15 +355,26 @@ impl App {
                 panel_hint,
                 &cwd,
             );
+            if let Some(hit) = self.input_box.scrollbar_hit() {
+                self.hits
+                    .push(hit.area, ClickTarget::Scrollbar(ScrollOwner::Input));
+            }
             if !streaming && !self.command_palette.is_active() && !self.any_overlay_open() {
                 self.file_completion.view(frame, layout.input_area);
+                let hits = self.file_completion.hits();
+                self.absorb_hits(hits);
             }
             if !self.any_overlay_open() {
-                self.command_palette.view(
+                let popup = self.command_palette.view(
                     frame,
                     layout.input_area,
                     self.ui_config.autocomplete_height,
                 );
+                if let Some(rect) = popup {
+                    self.hits.surface(Surface::Completion, rect, false);
+                }
+                let hits = self.command_palette.hits();
+                self.absorb_hits(hits);
             }
         }
     }
@@ -324,6 +388,8 @@ impl App {
             }
             if let Some(rect) = layout.splits.rect(dir) {
                 self.float_mgr.view_split(frame, dir, rect);
+                let hits = self.float_mgr.take_hits();
+                self.absorb_hits(hits);
             }
         }
     }
@@ -339,68 +405,120 @@ impl App {
                 Block::default().style(Style::new().bg(theme::current().background)),
                 layout.bottom_area,
             );
-            self.permission_prompt.view(frame, layout.bottom_area);
+            self.hits
+                .surface(Surface::Permission, layout.bottom_area, false);
+            let hits = self.permission_prompt.view(frame, layout.bottom_area);
+            self.absorb_hits(hits);
         } else if self.question_active()
             && let Some(rect) = layout.splits.rect(Split::Below)
         {
             self.float_mgr.view_split(frame, Split::Below, rect);
+            let hits = self.float_mgr.take_hits();
+            self.absorb_hits(hits);
         }
     }
 
-    fn render_picker_overlays(&mut self, frame: &mut Frame, layout: &ViewLayout) -> Rect {
-        let mut overlay_rect = Rect::default();
+    fn render_picker_overlays(&mut self, frame: &mut Frame, layout: &ViewLayout) -> Vec<Rect> {
+        let mut rects = Vec::new();
         let full = frame.area();
 
         if self.search_modal.is_open() {
-            overlay_rect = self.search_modal.view(frame, layout.msg_area);
+            let rect = self.search_modal.view(frame, layout.msg_area);
+            self.hits
+                .surface(Surface::Picker(PickerId::Search), rect, true);
+            rects.push(rect);
+            let hits = self.search_modal.hits();
+            self.absorb_hits(hits);
         }
 
         if self.task_picker.is_open() {
-            overlay_rect = self.task_picker.view(frame, full);
+            let rect = self.task_picker.view(frame, full);
+            self.hits
+                .surface(Surface::Picker(PickerId::Task), rect, true);
+            rects.push(rect);
+            let hits = self.task_picker.hits();
+            self.absorb_hits(hits);
         }
 
         if self.lua_picker.is_open() {
-            overlay_rect = self.lua_picker.view(frame, full);
+            let rect = self.lua_picker.view(frame, full);
+            self.hits
+                .surface(Surface::Picker(PickerId::Lua), rect, true);
+            rects.push(rect);
+            let hits = self.lua_picker.hits();
+            self.absorb_hits(hits);
         }
 
         if self.file_picker.is_open() {
-            overlay_rect = self.file_picker.view(frame, full);
+            let rect = self.file_picker.view(frame, full);
+            self.hits
+                .surface(Surface::Picker(PickerId::File), rect, true);
+            rects.push(rect);
+            let hits = self.file_picker.hits();
+            self.absorb_hits(hits);
         }
 
         macro_rules! render_if_open {
-            ($overlay:expr) => {
+            ($overlay:expr, $id:ident) => {
                 if $overlay.is_open() {
-                    overlay_rect = $overlay.view(frame, full);
+                    let rect = $overlay.view(frame, full);
+                    self.hits
+                        .surface(Surface::Picker(PickerId::$id), rect, true);
+                    rects.push(rect);
+                    let hits = $overlay.hits();
+                    self.absorb_hits(hits);
                 }
             };
         }
 
-        render_if_open!(self.rewind_picker);
-        render_if_open!(self.theme_picker);
-        render_if_open!(self.model_picker);
-        render_if_open!(self.login_picker);
-        render_if_open!(self.mcp_picker);
+        render_if_open!(self.rewind_picker, Rewind);
+        render_if_open!(self.theme_picker, Theme);
+        render_if_open!(self.model_picker, Model);
+        render_if_open!(self.login_picker, Login);
+        render_if_open!(self.mcp_picker, Mcp);
 
-        overlay_rect
+        rects
     }
 
-    fn render_top_modals(&mut self, frame: &mut Frame, mut overlay_rect: Rect) -> Rect {
+    fn absorb_hits(&mut self, hits: Vec<HitTarget>) {
+        for hit in hits {
+            if let ClickTarget::Surface(surface) = hit.target {
+                let modal = matches!(surface, Surface::Float(id) if self.float_mgr.is_focused_window(id) && !self.question_active());
+                self.hits.surface(surface, hit.rect, modal);
+            } else {
+                self.hits.push(hit.rect, hit.target);
+            }
+        }
+    }
+
+    fn render_top_modals(&mut self, frame: &mut Frame, rects: &mut Vec<Rect>) {
         let full = frame.area();
         let r = self
             .btw_modal
             .view(frame, full, self.theme_provider.generation());
         if r.width > 0 {
-            overlay_rect = r;
+            self.hits.surface(Surface::Btw, r, true);
+            if let Some(hit) = self.btw_modal.scrollbar_hit() {
+                self.hits
+                    .push(hit.area, ClickTarget::Scrollbar(ScrollOwner::Btw));
+            }
+            rects.push(r);
         }
         let r = self.help_modal.view(frame, full);
         if r.width > 0 {
-            overlay_rect = r;
+            self.hits.surface(Surface::Help, r, true);
+            if let Some(hit) = self.help_modal.scrollbar_hit() {
+                self.hits
+                    .push(hit.area, ClickTarget::Scrollbar(ScrollOwner::Help));
+            }
+            rects.push(r);
         }
-        let r = self.float_mgr.view(frame, full);
-        if r.width > 0 {
-            overlay_rect = r;
+        self.float_mgr.view(frame, full);
+        if let Some(rect) = self.float_mgr.focused_rect() {
+            rects.push(rect);
         }
-        overlay_rect
+        let hits = self.float_mgr.take_hits();
+        self.absorb_hits(hits);
     }
 
     fn render_status_bar(&mut self, frame: &mut Frame, status_area: Rect, render_chat: usize) {
@@ -466,13 +584,19 @@ impl App {
             restoring: self.restoring.load(Ordering::Relaxed),
             status_content: self.status_content.get(),
             suppress_status_content: self.suppress_status_content.load(Ordering::Acquire),
+            hover: self.hover,
+            thinking_supported: config.as_ref().map_or_else(
+                || self.root_config().model.supports_thinking(),
+                |config| config.model.supports_thinking(),
+            ),
         };
-        self.status_bar.view(frame, status_area, &ctx);
+        let hits = self.status_bar.view(frame, status_area, &ctx);
+        self.absorb_hits(hits);
     }
 
     /// Left-aligned affordance pinned on the row above the status bar while an
     /// Alt+M-deferred prompt waits: how to bring it back without submitting.
-    fn render_defer_hint(&self, frame: &mut Frame, area: Rect) {
+    fn render_defer_hint(&mut self, frame: &mut Frame, area: Rect) {
         if area.height == 0 {
             return;
         }
@@ -482,10 +606,15 @@ impl App {
             Span::styled(key::DEFER_INPUT.label, t.keybind_key),
             Span::styled(" Undefer pending model input)", t.tool_dim),
         ]);
+        let width = (line.width() as u16).min(area.width);
+        self.hits.push(
+            Rect::new(area.x, area.y, width, area.height),
+            ClickTarget::DeferInput,
+        );
         frame.render_widget(Paragraph::new(line), area);
     }
 
-    fn register_zones(&mut self, layout: &ViewLayout, overlay_rect: Rect) {
+    fn register_zones(&mut self, layout: &ViewLayout, overlay_rect: Rect, menu_rect: Option<Rect>) {
         // Push order = z-order. zone_at() walks in reverse, so later entries win.
         self.zones = ZoneRegistry::new();
 
@@ -493,6 +622,10 @@ impl App {
             area: layout.msg_area,
             zone: SelectionZone::Messages,
         });
+
+        if layout.top_bar_area.height > 0 {
+            self.zones.push_overlay(layout.top_bar_area);
+        }
 
         if layout.input_area.height > 0 && !layout.bottom_takeover {
             let input_inner = Rect::new(
@@ -535,6 +668,10 @@ impl App {
         if overlay_rect.width > 0 {
             self.zones
                 .push_overlay(selection::inset_border(overlay_rect));
+        }
+
+        if let Some(rect) = menu_rect {
+            self.zones.push_overlay(rect);
         }
 
         // The active input surface is the single topmost zone so it wins clicks
@@ -647,6 +784,13 @@ impl App {
         }
         contexts
     }
+}
+
+fn bar_span_rect(area: Rect, spans: &[Span], index: usize) -> Option<Rect> {
+    let span = spans.get(index)?;
+    let x = area.x + spans[..index].iter().map(Span::width).sum::<usize>() as u16;
+    let right = x.saturating_add(span.width() as u16).min(area.right());
+    (right > x && x < area.right()).then(|| Rect::new(x, area.y, right - x, 1))
 }
 
 #[cfg(test)]

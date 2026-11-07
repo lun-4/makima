@@ -1802,8 +1802,9 @@ Requires an active managed turn or a trusted manager-backed parent.
   - `output_schema` (`table`) validated before creation; requires a valid final
     report each turn through the Rust structured-output reporting tool.
   - `silent` (`boolean`) defaults to false; suppresses parent relay and delivery.
-  - `show` (`boolean|string`) post a row for the child in its parent's chat;
-    a string adds a description. Defaults to true for trusted parents and
+  - `show` (`boolean|string`) post a clickable row for the child in its parent's chat;
+    clicking it opens the child's chat once the child starts a turn.
+    A string adds a description. Defaults to true for trusted parents and
     false otherwise. Silent children and children spawned by a tool call,
     which already have a tool row, cannot be shown.
   - `auto_deliver` (`boolean`) defaults to true; children notify their recorded
@@ -6788,8 +6789,10 @@ option.
 - `{text}` (`string`) Row text. Must not be blank.
 - `{opts?}` (`table?`) Optional fields:
   - `level` (`string?`) "info" (default), "warn" or "error".
-  - `agent` (`Agent?`) a child spawned from Lua that the post is about. Keeps
-    that child's transcript when this post survives a rewind.
+  - `agent` (`Agent?`) a child spawned from Lua that the post is about. The row
+    is underlined; clicking it opens the child's chat. If no unique chat is
+    available, a status message explains why it cannot open. Keeps that child's
+    transcript when this post survives a rewind.
 
   Any other option key is an error.
 
@@ -6985,18 +6988,18 @@ local win = maki.ui.open_win(buf, {
 maki.ui.set_status_content({spans})
 ```
 
-Sets styled status content for your plugin. Each span is a {text, style_name} pair. An empty table clears your plugin's content. Only your own content is affected.
+Sets styled status content for your plugin. Each span is {text, style_name} or {text, style_name, on_click}. An empty table clears your plugin's content. Only your own content is affected. Clickable entries run their callback when clicked in the status bar.
 
 **Parameters:**
 
-- `{spans}` (`table`) Sequence of {text, style_name} string pairs.
+- `{spans}` (`table`) Sequence of {text, style_name} or {text, style_name, on_click} entries.
 
 **Example:**
 
 ```lua
 maki.ui.set_status_content({ {"connected", "success"}, {" readonly", "muted"} })
--- later, clear it:
-maki.ui.set_status_content({})
+-- clickable entry:
+maki.ui.set_status_content({ {"refresh", "accent", function() maki.ui.flash("refreshing") end} })
 ```
 
 ---
@@ -7082,6 +7085,7 @@ Event tables by type:
 - `{type="key", key}` -- keypress. Key is a string like "q", "j", or "esc".
 - `{type="resize", width, height}` -- terminal was resized.
 - `{type="paste", text}` -- bracketed paste.
+- `{type="click", row, col}` -- mouse click in the content; row is 1-based, 0 means the border/title/footer.
 - `{type="close"}` -- window was closed externally.
 - `{type="timeout"}` -- no event arrived within {timeout_ms}.
 
@@ -7384,7 +7388,10 @@ Registers an event handler on the buffer.
 
 Supported events:
 - "click": fires when the user clicks a line. The handler receives
-  a click-event table and may yield or mutate the buffer.
+  a click-event table whose `row` is 1-based, with `row = 0` for clicks
+  on chrome or outside the content. Transcript buffers deliver clicks
+  here; float windows deliver them from `win:recv()` as a `click` event
+  that also carries `col`.
 - "change": fires synchronously after every mutation (`line`,
   `lines`, `set_lines`). Must not yield.
 
@@ -7928,6 +7935,9 @@ function TextInput:handle_key(key)
 -- Wrap lines to {width} with {prefix} before the first row. Returns
 -- { lines = styled lines, cursor_row = 1-based row holding the cursor }.
 function TextInput:render(prefix, prefix_width, width)
+
+-- Click coordinates are 1-based display cells in the rendered input.
+function TextInput:click(rendered, row, col)
 ```
 
 ### `require("maki.toast")`

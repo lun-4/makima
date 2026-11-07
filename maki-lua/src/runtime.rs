@@ -34,7 +34,7 @@ use mlua::{
 };
 
 use crate::coalesced_latest::{CoalescedLatest, CoalescedWork};
-use crate::splash::SplashFrame;
+use crate::splash::{SplashFrame, SplashPull};
 use serde_json::Value;
 
 use maki_commands::{
@@ -68,7 +68,7 @@ use crate::api::tool::{
     ToolCallReply, resolve_rules,
 };
 use crate::api::ui::buf::{BufHandle, BufferStore};
-use crate::api::ui::{HintStore, StatusContentStore};
+use crate::api::ui::{ClickRegions, HintStore, StatusContentStore};
 use crate::api::util::command::{
     ArgumentCompletion, CommandCompletionCallbacks, CommandGenerationMap, CommandHandlerMap,
     HintWriter, StatusContentWriter, UiAction,
@@ -156,7 +156,7 @@ static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 /// Generous on purpose: legit restores of heavy items take double-digit
 /// seconds on a loaded debug build, and a wrongly killed restore loses the
 /// tool's rendered output.
-const RESTORE_ITEM_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const RESTORE_ITEM_TIMEOUT: Duration = Duration::from_secs(60);
 const SPAWN_QUEUE_NOT_INIT: &str = "spawn queue not initialized";
 /// Without a cap, a runaway plugin OOM-kills the whole process.
 /// With one, it hits a catchable Lua error instead.
@@ -342,6 +342,9 @@ pub enum Request {
         tool_use_id: String,
         row: usize,
         fallback: Option<Box<ClickFallback>>,
+    },
+    ClickRegion {
+        id: u32,
     },
     RunKeybindCallback {
         id: u64,
@@ -2798,6 +2801,7 @@ impl LuaRuntime {
         lua.set_app_data(HintStore::new());
         lua.set_app_data(hint_writer);
         lua.set_app_data(StatusContentStore::new());
+        lua.set_app_data(ClickRegions::default());
         lua.set_app_data(status_content_writer);
         lua.set_app_data(Arc::clone(&registry));
         lua.set_app_data(Arc::clone(&modes));
@@ -3975,6 +3979,9 @@ impl LuaRuntime {
                 writer.publish(entries);
             }
         }
+        if let Some(mut regions) = self.lua.app_data_mut::<ClickRegions>() {
+            regions.remove_plugin(&self.lua, plugin);
+        }
         if let Some(mut store) = self.lua.app_data_mut::<StatusContentStore>() {
             let changed = store.clear_plugin(plugin);
             let entries = changed.then(|| store.snapshot_entries());
@@ -4852,45 +4859,49 @@ async fn splash_frame(
     height: u16,
     elapsed_secs: f32,
     fade: f32,
-) -> Option<crate::splash::SplashFrame> {
+) -> SplashPull {
     let args = mlua::MultiValue::from_vec(vec![
         LuaValue::Integer(width as i64),
         LuaValue::Integer(height as i64),
         LuaValue::Number(elapsed_secs as f64),
         LuaValue::Number(fade as f64),
     ]);
+    let started = Instant::now();
     let cell = TaskCell::new(
         CancelToken::none(),
-        Some(Instant::now() + SPLASH_RENDER_DEADLINE),
+        Some(started + SPLASH_RENDER_DEADLINE),
         None,
     )
     .with_kill_grace(SPLASH_RENDER_KILL_GRACE);
     let scope = TaskScope::new(lua, cell);
-    let started = Instant::now();
-    let frame: Option<crate::splash::SplashFrame> =
-        match crate::api::slot::invoke_slot_from_host(lua, "splash.render", args).await {
-            Err(e) => {
-                tracing::warn!(error = %e, "splash.render failed");
-                None
-            }
-            Ok(mv) => mv.into_iter().next().and_then(|v| {
-                if matches!(v, LuaValue::Nil) {
-                    return None;
+    let pull = match crate::api::slot::invoke_slot_from_host(lua, "splash.render", args).await {
+        // A starved Lua thread overruns the wall-clock budget as surely as a
+        // slow renderer does, so a deadline kill says nothing about the
+        // renderer. `Missing` would suppress the splash until it is next shown.
+        Err(e) if e.to_string().contains(INTERRUPT_DEADLINE_MSG) => {
+            tracing::debug!(error = %e, elapsed = ?started.elapsed(), "splash.render overran its deadline");
+            SplashPull::Unknown
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "splash.render failed");
+            SplashPull::Missing
+        }
+        Ok(mv) => match mv.into_iter().next() {
+            None | Some(LuaValue::Nil) => SplashPull::Missing,
+            Some(v) => match crate::splash::frame_from_lua(v, width, height) {
+                Ok(f) => SplashPull::Frame(f),
+                Err(e) => {
+                    tracing::warn!(error = %e, "splash.render bad frame");
+                    SplashPull::Missing
                 }
-                match crate::splash::frame_from_lua(v, width, height) {
-                    Ok(f) => Some(f),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "splash.render bad frame");
-                        None
-                    }
-                }
-            }),
-        };
+            },
+        },
+    };
     drop(scope);
     if let Some(mut perf) = lua.app_data_mut::<crate::splash::PerfInfo>() {
         perf.record_render(started.elapsed());
     }
-    frame
+    pull
 }
 
 pub struct SpawnConfig {
@@ -5458,6 +5469,33 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             })
                             .detach();
                         }
+                        Request::ClickRegion { id } => {
+                            let func = rt
+                                .lua
+                                .app_data_ref::<ClickRegions>()
+                                .and_then(|regions| regions.function(&rt.lua, id));
+                            if let Some(func) = func {
+                                let handle = TaskCell::new(CancelToken::none(), None, None)
+                                    .into_handle();
+                                let lua = rt.lua.clone();
+                                let g = Rc::clone(&gate);
+                                ex.spawn(async move {
+                                    let slot = Some(g.acquire().await);
+                                    let call = covered(
+                                        slot,
+                                        ScopedFuture::new(
+                                            lua.clone(),
+                                            handle,
+                                            func.call_async::<()>(()),
+                                        ),
+                                    );
+                                    if let Err(e) = call.await {
+                                        tracing::warn!(id, error = %e, "status click failed");
+                                    }
+                                })
+                                .detach();
+                            }
+                        }
                         Request::ObserveAgents(manager) => {
                             crate::agent_autocmd::observe(&rt.lua, &manager);
                         }
@@ -5474,7 +5512,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                         Request::SplashFrame(work) => {
                             rt.codegen_budgeted();
                             let request = work.value();
-                            let frame = splash_frame(
+                            let pull = splash_frame(
                                 &rt.lua,
                                 request.width,
                                 request.height,
@@ -5482,7 +5520,14 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                 request.fade,
                             )
                             .await;
+                            // Unknown drops the reply unanswered, which the
+                            // puller reads as "retry", like a superseded pull.
                             work.finish(|request| {
+                                let frame = match pull {
+                                    SplashPull::Frame(frame) => Some(frame),
+                                    SplashPull::Missing => None,
+                                    SplashPull::Unknown => return,
+                                };
                                 let _ = request.reply.send(frame);
                             });
                         }
@@ -7318,7 +7363,7 @@ mod tests {
 
         let frame = smol::block_on(splash_frame(&lua, 80, 24, 0.0, 1.0));
         assert!(
-            frame.is_some(),
+            matches!(frame, SplashPull::Frame(_)),
             "watchdog killed the render under the stale handle"
         );
     }
@@ -7368,10 +7413,13 @@ mod tests {
         let (runaway_frame, elapsed, operation, recovered_frame) = rx
             .recv_timeout(COMPLETION_BOUND)
             .expect("runaway splash render monopolized the Lua thread");
-        assert!(runaway_frame.is_none());
+        assert!(
+            matches!(runaway_frame, SplashPull::Unknown),
+            "an overrun must ask for a retry, not report a dead renderer"
+        );
         assert!(elapsed < COMPLETION_BOUND);
         assert_eq!(operation, 42);
-        assert_eq!(recovered_frame.unwrap().rows[0].glyphs, GLYPHS);
+        assert_eq!(recovered_frame.frame().unwrap().rows[0].glyphs, GLYPHS);
     }
 
     #[test]

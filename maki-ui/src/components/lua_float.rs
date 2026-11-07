@@ -1,16 +1,17 @@
-use std::sync::Arc;
+use std::{mem, sync::Arc};
 
 use crossterm::event::KeyEvent;
 use maki_agent::{SharedBuf, SnapshotLine, SpanStyle};
 use maki_lua::{Anchor, Axis, Border, FloatConfig, Split, TitlePos, WinCommand, WinEvent};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use crate::animation::{animation_elapsed_ms, spinner_str};
+use crate::click::{ClickTarget, HitTarget, ScrollOwner, Surface};
 use crate::components::Overlay;
-use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::scrollbar::{ScrollbarHit, render_vertical_scrollbar, saturating_u16};
 use crate::components::split_layout::SplitReq;
 use crate::components::tool_display::{
     SPINNER_STYLE_NAME, SPINNER_STYLE_PREFIX, resolve_span_style,
@@ -19,6 +20,7 @@ use crate::keybindings::key::DEFER_INPUT;
 use crate::keybindings::key_event_to_string;
 use crate::repaint::{Cadence, Dirty};
 use crate::theme;
+use unicode_width::UnicodeWidthStr;
 
 /// Blank rows kept between two windows of the same stack.
 const STACK_GAP: u16 = 1;
@@ -74,6 +76,10 @@ struct FloatWindow {
     /// scroll math stays consistent between frames.
     viewport_h: u16,
     last_content: Rect,
+    scroll_area: Rect,
+    pinned_top: Option<Rect>,
+    pinned_bot: Option<Rect>,
+    scrollbar_hit: Option<ScrollbarHit>,
     cursor: usize,
     visible: bool,
     event_tx: flume::Sender<WinEvent>,
@@ -148,6 +154,7 @@ pub(crate) struct FloatManager {
     focused_id: Option<u32>,
     focused_rect: Option<Rect>,
     next_id: u32,
+    hits: Vec<HitTarget>,
 }
 
 impl FloatManager {
@@ -157,6 +164,7 @@ impl FloatManager {
             focused_id: None,
             focused_rect: None,
             next_id: 0,
+            hits: Vec::new(),
         }
     }
 
@@ -220,6 +228,10 @@ impl FloatManager {
             cached_lines,
             viewport_h: 1,
             last_content: Rect::default(),
+            scroll_area: Rect::default(),
+            pinned_top: None,
+            pinned_bot: None,
+            scrollbar_hit: None,
             cursor: 0,
             visible,
             event_tx,
@@ -420,6 +432,99 @@ impl FloatManager {
         self.render_window(frame, idx, rect);
     }
 
+    pub fn focused_rect(&self) -> Option<Rect> {
+        self.focused_rect
+    }
+
+    pub fn begin_frame(&mut self) {
+        self.hits.clear();
+        self.focused_rect = None;
+    }
+
+    pub fn take_hits(&mut self) -> Vec<HitTarget> {
+        mem::take(&mut self.hits)
+    }
+
+    pub fn is_focused_window(&self, id: u32) -> bool {
+        self.focused_id == Some(id)
+    }
+
+    pub fn scroll_window(&mut self, id: u32, delta: i32) {
+        if let Some(win) = self.windows.iter_mut().find(|win| win.id == id) {
+            win.scroll_by(delta);
+        }
+    }
+
+    /// Delivers a click to the focused float, translating the pointer to a
+    /// 1-based content row. `row = 0` means the click landed on chrome or
+    /// outside the content.
+    pub fn click_at(&mut self, id: u32, pos: Position) {
+        if self.focused_id != Some(id) {
+            return;
+        }
+        let Some(win) = self.windows.iter_mut().find(|w| w.id == id) else {
+            return;
+        };
+        let (row, col) = if !win.last_content.contains(pos) {
+            (0, 1)
+        } else {
+            let top = win.layout().reserved_top;
+            let scrollable = win.layout().scrollable;
+            let row = if win.pinned_top.is_some_and(|rect| rect.contains(pos)) {
+                1 + usize::from(pos.y.saturating_sub(win.pinned_top.unwrap_or_default().y))
+            } else if win.pinned_bot.is_some_and(|rect| rect.contains(pos)) {
+                1 + top
+                    + scrollable
+                    + usize::from(pos.y.saturating_sub(win.pinned_bot.unwrap_or_default().y))
+            } else {
+                1 + top + win.scroll_offset + usize::from(pos.y.saturating_sub(win.scroll_area.y))
+            };
+            let max_row = win.cached_lines.len().max(1).min(usize::from(u16::MAX));
+            let col = 1 + pos.x.saturating_sub(win.last_content.x);
+            (
+                row.clamp(1, max_row) as u16,
+                col.min(win.last_content.width.max(1)),
+            )
+        };
+        let _ = win.event_tx.try_send(WinEvent::Click { row, col });
+    }
+
+    pub fn click_footer(&self, id: u32, index: usize) {
+        let Some(win) = self.windows.iter().find(|win| win.id == id) else {
+            return;
+        };
+        if self.focused_id != Some(id) {
+            return;
+        }
+        if let Some((label, _)) = win.config.footer.get(index)
+            && let Some(key) = footer_key(label)
+        {
+            let _ = win.event_tx.try_send(WinEvent::Key { key });
+        }
+    }
+
+    pub fn scroll_line(&self, id: u32) -> Option<u16> {
+        self.windows
+            .iter()
+            .find(|w| w.id == id)
+            .map(|w| saturating_u16(w.scroll_offset))
+    }
+
+    pub fn content_len(&self, id: u32) -> Option<u16> {
+        self.windows
+            .iter()
+            .find(|w| w.id == id)
+            .map(|w| saturating_u16(w.layout().scrollable))
+    }
+
+    pub fn scroll_to_line(&mut self, id: u32, line: u16) {
+        let Some(win) = self.windows.iter_mut().find(|w| w.id == id) else {
+            return;
+        };
+        let max_offset = win.layout().max_offset(win.viewport_h);
+        win.scroll_offset = (line as usize).min(max_offset);
+    }
+
     pub fn panel_reqs(&self) -> Vec<(usize, u16)> {
         let mut reqs: Vec<(usize, u16)> = self
             .windows
@@ -526,6 +631,9 @@ impl FloatManager {
                 (None, content_area, None)
             };
 
+        win.scroll_area = scroll_area;
+        win.pinned_top = pinned_top_area;
+        win.pinned_bot = pinned_bot_area;
         win.refresh_layout(scroll_area.height);
         let top = layout.reserved_top;
         let scrollable = layout.scrollable;
@@ -564,24 +672,89 @@ impl FloatManager {
             frame.render_widget(Paragraph::new(pinned), pa);
         }
 
-        if scrollable as u16 > win.viewport_h {
+        win.scrollbar_hit = if scrollable > usize::from(win.viewport_h) {
             render_vertical_scrollbar(
                 frame,
                 scroll_area,
-                scrollable as u16,
-                win.scroll_offset as u16,
-            );
-        }
+                saturating_u16(scrollable),
+                saturating_u16(win.scroll_offset),
+            )
+        } else {
+            None
+        };
 
+        self.hits.push(HitTarget {
+            rect: popup,
+            target: ClickTarget::Surface(Surface::Float(win.id)),
+        });
         if Some(win.id) == self.focused_id {
             self.focused_rect = Some(popup);
+            self.hits.push(HitTarget {
+                rect: popup,
+                target: ClickTarget::WindowChrome(win.id),
+            });
+            self.hits.push(HitTarget {
+                rect: content_area,
+                target: ClickTarget::WindowContent(win.id),
+            });
+        }
+        if Some(win.id) == self.focused_id && border_type.is_some() {
+            let row = Rect::new(
+                popup.x + 1,
+                popup.bottom().saturating_sub(1),
+                popup.width.saturating_sub(2),
+                1,
+            );
+            let footer_width = hint_footer(&win.config.footer)
+                .width()
+                .min(usize::from(u16::MAX)) as u16;
+            let mut x = i32::from(row.right()) - i32::from(footer_width) + 1;
+            for (index, (label, desc)) in win.config.footer.iter().enumerate() {
+                let width = (label.width() + 1 + desc.width()).min(usize::from(u16::MAX)) as u16;
+                let left = x.clamp(i32::from(row.x), i32::from(row.right())) as u16;
+                let right =
+                    (x + i32::from(width)).clamp(i32::from(row.x), i32::from(row.right())) as u16;
+                if left < right && footer_key(label).is_some() {
+                    self.hits.push(HitTarget {
+                        rect: Rect::new(left, row.y, right - left, 1),
+                        target: ClickTarget::WindowFooter { id: win.id, index },
+                    });
+                }
+                x += i32::from(width) + 1;
+            }
+        }
+        if Some(win.id) == self.focused_id
+            && win.config.split == Split::Below
+            && win.config.needs_input
+            && border_type.is_some()
+        {
+            let line = hint_footer(&[(DEFER_INPUT.label, "defer")]);
+            let rect = Rect::new(
+                popup.x + 1,
+                popup.bottom().saturating_sub(1),
+                saturating_u16(line.width()).min(popup.width.saturating_sub(2)),
+                1,
+            );
+            frame.render_widget(Paragraph::new(line), rect);
+            self.hits.push(HitTarget {
+                rect,
+                target: ClickTarget::DeferInput,
+            });
+        }
+        if let Some(hit) = win.scrollbar_hit {
+            self.hits.push(HitTarget {
+                rect: hit.area,
+                target: ClickTarget::Scrollbar(ScrollOwner::Float(win.id)),
+            });
         }
     }
 
-    pub fn contains(&self, pos: ratatui::layout::Position) -> bool {
+    #[cfg(test)]
+    pub fn contains(&self, pos: Position) -> bool {
         self.focused_rect.is_some_and(|r| r.contains(pos))
     }
 
+    #[cfg(test)]
     pub fn scroll(&mut self, delta: i32) {
         let Some(fid) = self.focused_id else {
             return;
@@ -599,6 +772,35 @@ impl FloatManager {
     pub fn close_all(&mut self) {
         self.remove_windows(|_| true);
     }
+}
+
+fn footer_key(label: &str) -> Option<String> {
+    let key = label.split('/').next()?.trim().to_lowercase();
+    let base = key.rsplit('+').next()?;
+    let valid_base = base.chars().count() == 1
+        || matches!(
+            base,
+            "enter"
+                | "esc"
+                | "tab"
+                | "space"
+                | "backspace"
+                | "delete"
+                | "left"
+                | "right"
+                | "up"
+                | "down"
+                | "home"
+                | "end"
+                | "pageup"
+                | "pagedown"
+        );
+    let valid_modifiers = key
+        .split('+')
+        .rev()
+        .skip(1)
+        .all(|part| matches!(part, "ctrl" | "alt" | "shift"));
+    (valid_base && valid_modifiers).then_some(key)
 }
 
 pub(crate) fn hint_footer<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Line<'static> {
@@ -745,9 +947,13 @@ impl Overlay for FloatManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repaint::expect::{OWED, QUIET};
+    use crate::{
+        click::HitRegistry,
+        repaint::expect::{OWED, QUIET},
+    };
     use maki_agent::SnapshotSpan;
     use maki_lua::{Dimension, FloatConfigPatch};
+    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
     use test_case::test_case;
 
     const EXPECT_OPEN: &str = "expected manager to have open windows";
@@ -757,6 +963,185 @@ mod tests {
     const EXPECT_PASTE_FALSE: &str = "handle_paste should return false with no focus";
     const PASTE_TEXT: &str = "hello";
     const NO_STACK_OFFSET: u16 = 0;
+    const EXPECT_FOOTER_TEXT: &str = "expected footer text in rendered buffer";
+    const EXPECT_FOOTER_HIT: &str = "expected hit for rendered footer text";
+    const FOOTER_ACCEPT: &str = "Enter accept";
+    const FOOTER_PREVIOUS: &str = "Shift+Tab previous";
+    const FOOTER_CLOSE: &str = "Esc/q close";
+
+    fn render_footer(
+        config: FloatConfig,
+        width: u16,
+        focus: bool,
+    ) -> (FloatManager, Buffer, flume::Receiver<WinEvent>) {
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, event_rx, _cmd_tx) = make_channels();
+        mgr.open(make_buf(&[]), config, focus, event_tx, cmd_rx);
+        let mut terminal = Terminal::new(TestBackend::new(width + 6, 10)).unwrap();
+        terminal
+            .draw(|frame| mgr.render_window(frame, 0, Rect::new(3, 2, width, 5)))
+            .unwrap();
+        (mgr, terminal.backend().buffer().clone(), event_rx)
+    }
+
+    fn footer_config() -> FloatConfig {
+        FloatConfig {
+            border: Border::Single,
+            footer: vec![
+                ("Enter".into(), "accept".into()),
+                ("Shift+Tab".into(), "previous".into()),
+                ("Esc/q".into(), "close".into()),
+            ],
+            ..FloatConfig::default()
+        }
+    }
+
+    fn footer_text_rect(buffer: &Buffer, text: &str) -> Rect {
+        let y = 6;
+        let row: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect();
+        let offset = row.find(text).expect(EXPECT_FOOTER_TEXT);
+        let x = row[..offset].chars().count() as u16;
+        Rect::new(x, y, text.width() as u16, 1)
+    }
+
+    fn footer_registry(mgr: &mut FloatManager) -> HitRegistry {
+        let mut registry = HitRegistry::default();
+        for hit in mgr.take_hits() {
+            registry.push(hit.rect, hit.target);
+        }
+        registry
+    }
+
+    #[test_case(80, " Enter accept Shift+Tab previous Esc/q close ", &[(0, FOOTER_ACCEPT), (1, FOOTER_PREVIOUS), (2, FOOTER_CLOSE)] ; "normal")]
+    #[test_case(28, "+Tab previous Esc/q close ", &[(1, "+Tab previous"), (2, FOOTER_CLOSE)] ; "clipped_label")]
+    #[test_case(20, "vious Esc/q close ", &[(1, "vious"), (2, FOOTER_CLOSE)] ; "clipped_description")]
+    #[test_case(10, "q close ", &[(2, "q close")] ; "only_last_action")]
+    fn footer_hits_match_rendered_text(width: u16, visible: &str, fragments: &[(usize, &str)]) {
+        let (mut mgr, buffer, _event_rx) = render_footer(footer_config(), width, true);
+        footer_text_rect(&buffer, visible);
+        let id = mgr.windows[0].id;
+        let hits = mgr.take_hits();
+        let footer_count = hits
+            .iter()
+            .filter(|hit| matches!(hit.target, ClickTarget::WindowFooter { .. }))
+            .count();
+        assert_eq!(footer_count, fragments.len());
+        let mut registry = HitRegistry::default();
+        for hit in hits {
+            registry.push(hit.rect, hit.target);
+        }
+        for &(index, text) in fragments {
+            let rect = footer_text_rect(&buffer, text);
+            let target = ClickTarget::WindowFooter { id, index };
+            assert_eq!(registry.rect_of(target), Some(rect), "{EXPECT_FOOTER_HIT}");
+            for x in rect.x..rect.right() {
+                assert_eq!(registry.target_at(Position::new(x, rect.y)), Some(target));
+            }
+        }
+    }
+
+    #[test_case("Enter", "enter" ; "enter")]
+    #[test_case("Shift+Tab", "shift+tab" ; "shift_tab")]
+    #[test_case("Esc/q", "esc" ; "first_alias")]
+    #[test_case("Ctrl+X", "ctrl+x" ; "control")]
+    #[test_case("Alt+M", "alt+m" ; "alt")]
+    fn footer_hit_dispatches_key(label: &str, expected: &str) {
+        let config = FloatConfig {
+            footer: vec![(label.into(), "action".into())],
+            ..footer_config()
+        };
+        let (mut mgr, buffer, event_rx) = render_footer(config, 40, true);
+        let rect = footer_text_rect(&buffer, &format!("{label} action"));
+        let registry = footer_registry(&mut mgr);
+        let Some(ClickTarget::WindowFooter { id, index }) =
+            registry.target_at(Position::new(rect.x, rect.y))
+        else {
+            panic!("{EXPECT_FOOTER_HIT}");
+        };
+        mgr.click_footer(id, index);
+        let keys: Vec<_> = event_rx
+            .drain()
+            .filter_map(|event| match event {
+                WinEvent::Key { key } => Some(key),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys, [expected]);
+    }
+
+    #[test]
+    fn informational_footer_has_no_action_hit_or_key_event() {
+        let config = FloatConfig {
+            footer: vec![
+                ("3 items".into(), "loaded".into()),
+                ("Enter".into(), "accept".into()),
+                ("read-only".into(), "buffer".into()),
+            ],
+            ..footer_config()
+        };
+        let (mut mgr, buffer, event_rx) = render_footer(config, 80, true);
+        let id = mgr.windows[0].id;
+        let registry = footer_registry(&mut mgr);
+        for (index, text) in [(0, "3 items loaded"), (2, "read-only buffer")] {
+            let rect = footer_text_rect(&buffer, text);
+            assert_eq!(
+                registry.rect_of(ClickTarget::WindowFooter { id, index }),
+                None
+            );
+            for x in rect.x..rect.right() {
+                assert!(!matches!(
+                    registry.target_at(Position::new(x, rect.y)),
+                    Some(ClickTarget::WindowFooter { .. })
+                ));
+            }
+            mgr.click_footer(id, index);
+        }
+        let rect = footer_text_rect(&buffer, FOOTER_ACCEPT);
+        assert_eq!(
+            registry.rect_of(ClickTarget::WindowFooter { id, index: 1 }),
+            Some(rect)
+        );
+        assert!(
+            !event_rx
+                .drain()
+                .any(|event| matches!(event, WinEvent::Key { .. }))
+        );
+    }
+
+    #[test_case(80 ; "separate_hints")]
+    #[test_case(28 ; "overlapping_hints")]
+    fn question_defer_takes_priority_over_footer(width: u16) {
+        let config = FloatConfig {
+            split: Split::Below,
+            needs_input: true,
+            ..footer_config()
+        };
+        let (mut mgr, buffer, _event_rx) = render_footer(config, width, true);
+        let defer = footer_text_rect(&buffer, &format!("{} defer", DEFER_INPUT.label));
+        let registry = footer_registry(&mut mgr);
+        for x in defer.x..defer.right() {
+            assert_eq!(
+                registry.target_at(Position::new(x, defer.y)),
+                Some(ClickTarget::DeferInput)
+            );
+        }
+        let close = footer_text_rect(&buffer, FOOTER_CLOSE);
+        let id = mgr.windows[0].id;
+        for x in close.x..close.right() {
+            assert_eq!(
+                registry.target_at(Position::new(x, close.y)),
+                Some(ClickTarget::WindowFooter { id, index: 2 })
+            );
+        }
+        if width == 28 {
+            let previous = registry
+                .rect_of(ClickTarget::WindowFooter { id, index: 1 })
+                .expect(EXPECT_FOOTER_HIT);
+            assert!(!previous.intersection(defer).is_empty());
+        }
+    }
 
     fn make_line(text: &str) -> SnapshotLine {
         SnapshotLine {
@@ -1865,6 +2250,10 @@ mod tests {
             cached_lines,
             viewport_h: 1,
             last_content: Rect::default(),
+            scroll_area: Rect::default(),
+            pinned_top: None,
+            pinned_bot: None,
+            scrollbar_hit: None,
             cursor: 0,
             visible: true,
             event_tx,

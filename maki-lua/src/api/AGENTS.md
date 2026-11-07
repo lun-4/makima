@@ -25,6 +25,15 @@ All `maki.fs` I/O dispatches through the `FsBackend` trait (`api/fs/mod.rs`), as
 
 The backend is resolved per Lua state via app_data (`FsBackendHandle`); a state that carries none falls back to a static `RealFs`, so bare `Lua::new()` unit tests still hit the disk. Test hosts boot disk-free: `test_support::spawn_host_for_tests` runs on `InMemoryFs` with the synthetic `TEST_STATE_DIR` (never created on the real disk), and `PluginHostGuard::backend()` exposes the backend for assertions (see `tests/in_memory_host.rs`).
 
+## Click contract
+
+Two click channels share one event name and one 1-based `row` convention:
+
+- Float windows deliver `{type = "click", row, col}` from `win:recv()`. `row = 0` means the click landed on chrome or outside the content; `col` is the 1-based content column. Rows in the pinned top and bottom bands carry their real content row.
+- Transcript tool buffers deliver `{row}` through `buf:on("click")`; `row = 0` is the same chrome/outside sentinel.
+
+`maki.ui.set_status_content` entries accept an optional third element, a click callback. The runtime keeps one registry key per (plugin, entry index), replaces it on re-register, and frees it on plugin unload, so click callbacks do not leak.
+
 ## Callback seams
 
 Autocmd callbacks (and the `Agent:on_*` aliases, which are autocmds filtered to one agent) each run as their own deadline-free task, so they may suspend. Agent events come from the graph (`agent_autocmd::observe`) for every agent, children included, and from frontend envelopes for tool and compaction events; their callbacks get the agent's handle in `ev.agent` and a trusted ctx pinned to it.

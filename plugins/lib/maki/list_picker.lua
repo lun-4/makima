@@ -186,7 +186,7 @@ end
 -- makes the header taller than a picker would guess, and a reserved_top guessed
 -- elsewhere then mis-scrolls the list.
 function ListPicker.render_header(win, lines, input, prefix, inner)
-  for _, ln in ipairs(input:render(prefix, utf8.len(prefix) or #prefix, inner).lines) do
+  for _, ln in ipairs(input:render(prefix, maki.ui.display_width(prefix), inner).lines) do
     lines[#lines + 1] = ln
   end
   lines[#lines + 1] = {}
@@ -222,6 +222,8 @@ function ListPicker.open(items, opts)
 
   local cursor = math.max(math.min(opts.cursor or 1, #filtered), 1)
   local item_lines = {}
+  local input_render, input_start
+  local win
 
   local function build_lines()
     local content
@@ -231,10 +233,12 @@ function ListPicker.open(items, opts)
     else
       content, item_lines = render_lines(filtered, cursor, width, input:value())
     end
-    local r = input:render("\xe2\x9d\xaf ")
-    for _, ln in ipairs(r.lines) do
+    input_start = #content
+    input_render = input:render("\xe2\x9d\xaf ", nil, width)
+    for _, ln in ipairs(input_render.lines) do
       content[#content + 1] = ln
     end
+    win:set_config({ reserved_bottom = #content - input_start })
     return content
   end
 
@@ -244,7 +248,7 @@ function ListPicker.open(items, opts)
   local content_h = #items + section_rows(items) + 1
   local total_h = content_h + border_chrome
 
-  local win = maki.ui.open_win(buf, {
+  win = maki.ui.open_win(buf, {
     title = opts.title,
     footer = opts.footer,
     height = total_h,
@@ -285,6 +289,28 @@ function ListPicker.open(items, opts)
       width = ev.width
       height = ev.height
       move_cursor(cursor)
+    elseif ev.type == "click" then
+      if ev.row > input_start and ev.row <= input_start + #input_render.lines then
+        input:click(input_render, ev.row - input_start, ev.col)
+        move_cursor(cursor)
+      end
+      local selected
+      for i, line in pairs(item_lines) do
+        if line == ev.row then
+          selected = i
+        end
+      end
+      if selected then
+        move_cursor(selected)
+        if #filtered > 0 then
+          win:close()
+          return { type = "choice", index = original_indices[cursor] }
+        end
+      end
+    elseif ev.type == "paste" then
+      input:insert_text(ev.text)
+      filtered, original_indices = filter_items(items, input:value())
+      move_cursor(1)
     elseif ev.type == "key" then
       if ev.key == "up" then
         move_cursor((cursor - 2) % math.max(#filtered, 1) + 1)

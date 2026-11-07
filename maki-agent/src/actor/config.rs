@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use maki_domain::ModelSelection;
 use maki_providers::{
     Model, PreparedProvider, ProviderRegistry, RequestOptions, ThinkingConfig, ThinkingConfigExt,
 };
@@ -63,6 +64,16 @@ pub struct ConfigPatch {
     pub toggle_thinking: bool,
     pub fast: Option<bool>,
     pub workflow: Option<bool>,
+}
+
+impl ConfigPatch {
+    pub fn from_model_selection(selection: &ModelSelection) -> Self {
+        Self {
+            thinking: selection.thinking,
+            fast: selection.fast,
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Clone)]

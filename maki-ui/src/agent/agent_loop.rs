@@ -1938,21 +1938,19 @@ mod tests {
         }
     }
 
-    #[test_case(true, false; "enabled")]
-    #[test_case(false, false; "disabled")]
-    #[test_case(true, true; "restricted_parent")]
-    fn command_spawn_uses_production_mcp_template(enabled: bool, restricted: bool) {
+    #[test_case(true, false, false; "enabled")]
+    #[test_case(false, false, false; "disabled")]
+    #[test_case(true, true, false; "restricted_parent")]
+    #[test_case(true, true, true; "plan_parent")]
+    #[test_case(false, true, true; "plan_parent_mcp_disabled")]
+    fn command_spawn_uses_production_mcp_template(enabled: bool, restricted: bool, plan: bool) {
         use maki_lua::orchestration::TrustedTarget;
 
         smol::block_on(async {
             const COMMAND: &str = "/ui-mcp-spawn";
             const MCP_EXECUTED: &str = "fake MCP executed";
             const MCP_DENIED: &str = "MCP denied";
-            let expected = if enabled && !restricted {
-                MCP_EXECUTED
-            } else {
-                MCP_DENIED
-            };
+            let expected = if enabled { MCP_EXECUTED } else { MCP_DENIED };
             let (mut backend, _, _) = failing_backend();
             let host = maki_lua::PluginHost::new(Arc::clone(ToolRegistry::global_arc())).unwrap();
             backend.lua_handle = host.event_handle();
@@ -1980,6 +1978,12 @@ mod tests {
                     .unwrap();
                 mode.restrict_write_to = Some(PathBuf::from("/tmp/ui-mcp-plan.md"));
                 config = config.with_mode_def(Some(mode));
+            }
+            if plan {
+                config.mode = AgentMode::Plan(PathBuf::from("/tmp/ui-mcp-plan.md"));
+                config = config.with_mode_def(
+                    maki_agent::ModeRegistry::builtin().get(&maki_agent::ModeId::Plan),
+                );
             }
             let manager = maki_agent::AgentManagerHandle::new(Default::default()).unwrap();
             let root = manager

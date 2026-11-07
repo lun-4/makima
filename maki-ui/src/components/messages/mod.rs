@@ -33,7 +33,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::scrollbar::render_vertical_scrollbar;
+use super::scrollbar::{ScrollbarHit, render_vertical_scrollbar};
 use super::streaming_content::StreamingContent;
 use maki_agent::{
     BufferSnapshot, EventSender, ImageSource, InstructionBlock, NO_FILES_FOUND, SharedBuf,
@@ -45,7 +45,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 
 use crate::repaint::{Cadence, Dirty};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use tracing::warn;
 
@@ -77,6 +77,7 @@ pub struct MessagesPanel {
     viewport_width: u16,
     cache: SegmentCache,
     last_total_lines: u16,
+    scrollbar_hit: Option<ScrollbarHit>,
     hl_worker: RenderWorker,
     image_picker: Option<Picker>,
     inline_images: bool,
@@ -157,6 +158,7 @@ impl MessagesPanel {
             viewport_width: crossterm::terminal::size().map_or(80, |(w, _)| w.saturating_sub(1)),
             cache: SegmentCache::new(),
             last_total_lines: 0,
+            scrollbar_hit: None,
             hl_worker: RenderWorker::new(),
             image_picker: terminal_image::picker(ui_config.inline_images),
             inline_images: ui_config.inline_images,
@@ -662,6 +664,15 @@ impl MessagesPanel {
         self.accent.set(color);
     }
 
+    pub fn post_agent_at(&self, row: u16, area: Rect) -> Option<&str> {
+        if row < area.y || row >= area.bottom() {
+            return None;
+        }
+        let doc_row = u32::from(row - area.y) + u32::from(self.scroll_top);
+        let (_, segment, _) = self.cache.segment_at_row(doc_row, self.viewport_width)?;
+        self.messages.get(segment.msg_index?)?.post_agent.as_deref()
+    }
+
     pub fn handle_click(&mut self, row: u16, area: Rect) -> bool {
         if area.height == 0 {
             return false;
@@ -1115,9 +1126,11 @@ impl MessagesPanel {
             );
         }
 
-        if total_lines > area.height {
-            render_vertical_scrollbar(frame, area, total_lines, self.scroll_top);
-        }
+        self.scrollbar_hit = if total_lines > area.height {
+            render_vertical_scrollbar(frame, area, total_lines, self.scroll_top)
+        } else {
+            None
+        };
     }
 
     fn max_scroll(&self) -> u16 {
@@ -1126,6 +1139,18 @@ impl MessagesPanel {
 
     pub fn scroll_top(&self) -> u16 {
         self.scroll_top
+    }
+
+    pub fn scroll_to_line(&mut self, line: u16) {
+        self.set_scroll_top(line);
+    }
+
+    pub fn scrollbar_hit(&self) -> Option<ScrollbarHit> {
+        self.scrollbar_hit
+    }
+
+    pub fn content_len(&self) -> u16 {
+        self.last_total_lines
     }
 
     /// Backs `maki.fn.winsaveview`. The clamp matters: a pinned or restored
@@ -1777,6 +1802,11 @@ fn build_message_lines(msg: &DisplayMessage, width: u16) -> Vec<Line<'static>> {
     } else {
         plain_lines(text, prefix, style.text_style, style.prefix_style)
     };
+    if msg.post_agent.is_some() {
+        for line in &mut lines {
+            line.style = line.style.add_modifier(Modifier::UNDERLINED);
+        }
+    }
     if let Some(annotation) = &msg.annotation
         && msg.role == DisplayRole::User
     {

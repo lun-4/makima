@@ -1,11 +1,59 @@
-use crate::{Model, RequestOptions, ThinkingConfig};
+use crate::{Model, RequestOptions, ThinkingConfig, ThinkingSupport};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 pub use maki_domain::{
-    FAST_VALUES, MODEL_FAST_KEY, MODEL_OPTION_KEYS, MODEL_SPEC_KEY, MODEL_THINKING_KEY,
-    ModelSelection, ModelSelectionError, parse_fast, parse_thinking,
+    FAST_VALUES, MODEL_FAST_KEY, MODEL_SPEC_KEY, MODEL_THINKING_KEY, ModelOption, ModelSelection,
+    ModelSelectionError, parse_fast, parse_thinking,
 };
+
+const THINKING_REQUIRED_NOTE: &str = "off uses minimal effort";
+
+/// The [`ModelOption`]s a provider-adjusted model accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelCapabilities {
+    pub thinking: ThinkingSupport,
+    pub fast: bool,
+}
+
+impl ModelCapabilities {
+    pub const NONE: Self = Self {
+        thinking: ThinkingSupport::No,
+        fast: false,
+    };
+
+    pub fn supports(self, option: ModelOption) -> bool {
+        match option {
+            ModelOption::Thinking => self.thinking != ThinkingSupport::No,
+            ModelOption::Fast => self.fast,
+        }
+    }
+
+    /// A caveat worth showing beside a supported option.
+    pub fn note(self, option: ModelOption) -> Option<&'static str> {
+        match option {
+            ModelOption::Thinking => {
+                (self.thinking == ThinkingSupport::Required).then_some(THINKING_REQUIRED_NOTE)
+            }
+            ModelOption::Fast => None,
+        }
+    }
+}
+
+impl From<&Model> for ModelCapabilities {
+    fn from(model: &Model) -> Self {
+        Self {
+            thinking: if model.requires_thinking() {
+                ThinkingSupport::Required
+            } else if model.supports_thinking() {
+                ThinkingSupport::Yes
+            } else {
+                ThinkingSupport::No
+            },
+            fast: model.supports_fast(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,8 +87,9 @@ impl From<CompleteModelSelection> for ModelSelection {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompleteModelSelection, ModelSelection};
-    use crate::{Effort, ThinkingConfig};
+    use super::{CompleteModelSelection, ModelCapabilities, ModelOption, ModelSelection};
+    use crate::model::FastSupport;
+    use crate::{Effort, Model, ThinkingConfig, ThinkingSupport};
     use serde_json::json;
     use std::sync::Arc;
     use test_case::test_case;
@@ -71,5 +120,26 @@ mod tests {
             serde_json::from_value::<ModelSelection>(value).unwrap(),
             ModelSelection::from(selection)
         );
+    }
+
+    #[test_case(ThinkingSupport::No, FastSupport::Supported, false, true, None; "fast_only")]
+    #[test_case(ThinkingSupport::Required, FastSupport::Pending, true, false, Some("off uses minimal effort"); "required_thinking_pending_fast")]
+    fn capabilities_follow_provider_adjusted_model(
+        thinking: ThinkingSupport,
+        fast: FastSupport,
+        supports_thinking: bool,
+        supports_fast: bool,
+        thinking_note: Option<&str>,
+    ) {
+        let mut model = Model::from_spec("anthropic/claude-opus-4-6").unwrap();
+        model.thinking_support = Some(thinking);
+        model.fast_support = Some(fast);
+        let capabilities = ModelCapabilities::from(&model);
+        assert_eq!(
+            capabilities.supports(ModelOption::Thinking),
+            supports_thinking
+        );
+        assert_eq!(capabilities.supports(ModelOption::Fast), supports_fast);
+        assert_eq!(capabilities.note(ModelOption::Thinking), thinking_note);
     }
 }

@@ -5,11 +5,12 @@ use std::sync::Arc;
 use crossterm::event::{KeyCode, KeyEvent};
 use flume::{Receiver, Sender};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Wrap;
 use smol::Task;
+use unicode_width::UnicodeWidthStr;
 
 use maki_config::ModelPolicy;
 use maki_providers::login::{
@@ -19,8 +20,9 @@ use maki_providers::provider::BoxFuture;
 use maki_providers::{AgentError, ProviderRegistry};
 use maki_storage::StateDir;
 
+use crate::click::{ClickTarget, HitTarget, PickerId};
 use crate::components::Overlay;
-use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
+use crate::components::list_picker::{ListPicker, PickerAction, PickerItem, click_search_buffer};
 use crate::components::modal::Modal;
 use crate::repaint::Dirty;
 use crate::text_buffer::TextBuffer;
@@ -117,6 +119,8 @@ pub struct LoginPicker {
     notes: Vec<String>,
     /// Opens a URL in the user's browser; tests swap in one that records it.
     browser: Browser,
+    /// Where the last frame drew the text input, for caret clicks.
+    input_area: Rect,
 }
 
 fn open_in_browser(url: &str) -> io::Result<()> {
@@ -143,6 +147,7 @@ impl LoginPicker {
             login: None,
             notes: Vec::new(),
             browser: Box::new(open_in_browser),
+            input_area: Rect::default(),
         }
     }
 
@@ -195,7 +200,7 @@ impl LoginPicker {
                         return None;
                     }
                     InteractionRequest::Choice { prompt, options } => {
-                        let mut picker = ListPicker::new();
+                        let mut picker = ListPicker::new().with_picker(PickerId::Login);
                         if !self.notes.is_empty() {
                             picker = picker.with_footer_line(Line::from(self.notes.join(" · ")));
                         }
@@ -314,7 +319,69 @@ impl LoginPicker {
         }
     }
 
+    fn choice_picker(&self) -> Option<&ListPicker<ChoiceItem>> {
+        match &self.step {
+            Step::Choice { picker, .. } => Some(picker),
+            _ => None,
+        }
+    }
+
+    fn choice_picker_mut(&mut self) -> Option<&mut ListPicker<ChoiceItem>> {
+        match &mut self.step {
+            Step::Choice { picker, .. } => Some(picker),
+            _ => None,
+        }
+    }
+
+    pub fn scroll(&mut self, delta: i32) {
+        if let Some(picker) = self.choice_picker_mut() {
+            picker.scroll(delta);
+        }
+    }
+
+    pub fn click_input(&mut self, pos: Position) -> bool {
+        let area = self.input_area;
+        match &mut self.step {
+            Step::Choice { picker, .. } => picker.click_input(pos),
+            Step::Input { input, .. } => {
+                click_search_buffer(input, area, pos, super::CHEVRON.width() as u16)
+            }
+            _ => false,
+        }
+    }
+
+    pub fn click_row(&mut self, index: usize) -> bool {
+        self.choice_picker_mut()
+            .is_some_and(|picker| picker.select(index))
+    }
+
+    pub fn hits(&self) -> Vec<HitTarget> {
+        match &self.step {
+            Step::Choice { picker, .. } => picker.hits(),
+            Step::Input { .. } => vec![HitTarget {
+                rect: self.input_area,
+                target: ClickTarget::PickerInput(PickerId::Login),
+            }],
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn scroll_line(&self) -> Option<u16> {
+        self.choice_picker().map(ListPicker::scroll_line)
+    }
+
+    pub fn content_len(&self) -> Option<u16> {
+        self.choice_picker().and_then(ListPicker::content_len)
+    }
+
+    pub fn scroll_to_line(&mut self, line: u16) {
+        if let Some(picker) = self.choice_picker_mut() {
+            picker.scroll_to_line(line);
+        }
+    }
+
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        self.input_area = Rect::default();
         match &mut self.step {
             Step::Closed => Rect::default(),
             Step::Choice { picker, .. } => picker.view(frame, area),
@@ -322,7 +389,7 @@ impl LoginPicker {
                 let lines = note_lines(&self.notes)
                     .chain(iter::once(placeholder_line(WAITING_MESSAGE)))
                     .collect();
-                notes_modal(frame, area, lines)
+                notes_modal(frame, area, lines).0
             }
             Step::Input {
                 input,
@@ -330,19 +397,26 @@ impl LoginPicker {
                 secret,
                 ..
             } => {
-                let lines = note_lines(&self.notes)
-                    .chain([
-                        placeholder_line(prompt),
-                        input_line_with_cursor(input, *secret),
-                    ])
+                let above: Vec<_> = note_lines(&self.notes)
+                    .chain(iter::once(placeholder_line(prompt)))
                     .collect();
-                notes_modal(frame, area, lines)
+                let lines = above
+                    .iter()
+                    .cloned()
+                    .chain(iter::once(input_line_with_cursor(input, *secret)))
+                    .collect();
+                let (popup, inner) = notes_modal(frame, area, lines);
+                let row = crate::wrap::total_rows(&above, inner.width);
+                if row < inner.height {
+                    self.input_area = Rect::new(inner.x, inner.y + row, inner.width, 1);
+                }
+                popup
             }
             Step::Done { message } => {
                 let lines = iter::once(Line::from(message.clone()))
                     .chain(note_lines(&self.notes))
                     .collect();
-                notes_modal(frame, area, lines)
+                notes_modal(frame, area, lines).0
             }
         }
     }
@@ -370,7 +444,8 @@ fn placeholder_line(text: &str) -> Line<'static> {
     ))
 }
 
-fn notes_modal(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) -> Rect {
+/// Returns the popup and the area its lines are drawn in.
+fn notes_modal(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) -> (Rect, Rect) {
     let modal = Modal {
         title: TITLE,
         width_percent: 65,
@@ -384,7 +459,7 @@ fn notes_modal(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) -> Rect
             .wrap(Wrap { trim: true }),
         inner,
     );
-    popup
+    (popup, inner)
 }
 
 fn input_line_with_cursor(input: &TextBuffer, secret: bool) -> Line<'static> {
@@ -427,6 +502,7 @@ mod tests {
     use maki_storage::model::read_model;
     use serde_json::json;
     use tempfile::TempDir;
+    use test_case::test_case;
 
     use super::*;
     use crate::components::key;
@@ -545,6 +621,46 @@ mod tests {
                 _ => panic!("expected an input step"),
             }
         }
+    }
+
+    #[test_case(0, 0; "prefix")]
+    #[test_case(3, 1; "wide_character")]
+    #[test_case(20, 3; "past_end")]
+    fn text_entry_click_moves_caret(column: u16, expected: usize) {
+        let state = TempDir::new().unwrap();
+        let mut picker = LoginPicker::new(
+            Arc::new(ProviderRegistry::default()),
+            StateDir::from_path(state.path().to_path_buf()),
+            Arc::new(ModelPolicy::default()),
+        );
+        picker.step = Step::Input {
+            input: TextBuffer::new("a界z".into()),
+            prompt: KEY_PROMPT.into(),
+            secret: false,
+            reply: flume::unbounded().0,
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+        let rect = picker
+            .hits()
+            .into_iter()
+            .find(|hit| hit.target == ClickTarget::PickerInput(PickerId::Login))
+            .unwrap()
+            .rect;
+        assert!(picker.click_input(Position::new(rect.x + column, rect.y)));
+        assert!(!picker.click_input(Position::new(rect.x, rect.y - 1)));
+        let Step::Input { input, .. } = &picker.step else {
+            unreachable!()
+        };
+        assert_eq!(input.x(), expected);
+        picker.close();
+        assert!(!picker.click_input(Position::new(rect.x, rect.y)));
+        assert!(picker.hits().is_empty());
     }
 
     fn ctrl(c: char) -> KeyEvent {

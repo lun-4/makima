@@ -799,6 +799,7 @@ impl PluginHost {
             shutdown: Arc::clone(&self.inner.shutdown),
             prio_tx: self.inner.prio_tx.clone(),
             modes: Arc::clone(&self.inner.modes),
+            tools: Arc::clone(&self.registry),
             session_options: self.inner.session_options.clone(),
             completion: None,
             command_generations: Some(Arc::clone(&self.inner.command_generations)),
@@ -846,6 +847,7 @@ pub struct EventHandle {
     /// Shared mode registry; `None`-less so plugins and the Rust agent see
     /// the same definitions. Test handles use an empty builtin set.
     modes: Arc<maki_agent::ModeRegistry>,
+    tools: Arc<ToolRegistry>,
     session_options: SessionOptionCatalog,
     /// In-memory stand-in for the Lua completion/expander stores, used only by
     /// tests that build an `App` without a running plugin host. `None` in
@@ -932,6 +934,7 @@ impl EventHandle {
             shutdown: Arc::default(),
             prio_tx: flume::unbounded().0,
             modes: Arc::new(maki_agent::ModeRegistry::builtin()),
+            tools: Arc::new(ToolRegistry::new()),
             session_options: SessionOptionCatalog::default(),
             completion: None,
             command_generations: None,
@@ -954,6 +957,10 @@ impl EventHandle {
 
     pub fn mode_registry(&self) -> Arc<maki_agent::ModeRegistry> {
         Arc::clone(&self.modes)
+    }
+
+    pub fn has_native_tool(&self, name: &str) -> bool {
+        self.tools.has(name)
     }
 
     pub fn session_option_catalog(&self) -> SessionOptionCatalog {
@@ -1046,6 +1053,7 @@ impl EventHandle {
             shutdown: Arc::default(),
             prio_tx: flume::unbounded().0,
             modes,
+            tools: Arc::new(ToolRegistry::new()),
             session_options: SessionOptionCatalog::default(),
             completion: None,
             command_generations: None,
@@ -1064,6 +1072,7 @@ impl EventHandle {
             tx: flume::unbounded().0,
             prio_tx: flume::unbounded().0,
             modes: Arc::new(maki_agent::ModeRegistry::builtin()),
+            tools: Arc::new(ToolRegistry::new()),
             session_options: SessionOptionCatalog::default(),
             completion: Some(backend),
             command_generations: None,
@@ -1093,6 +1102,7 @@ impl EventHandle {
             tx: shared.clone(),
             prio_tx: shared.clone(),
             modes: Arc::new(maki_agent::ModeRegistry::builtin()),
+            tools: Arc::new(ToolRegistry::new()),
             session_options: SessionOptionCatalog::default(),
             completion: None,
             command_generations: None,
@@ -1245,6 +1255,12 @@ impl EventHandle {
         let _ = self.tx.send(Request::RestoreToolAsync { item, event_tx });
     }
 
+    /// Runs the callback registered for a clickable `set_status_content`
+    /// entry.
+    pub fn click_region(&self, id: u32) {
+        let _ = self.tx.send(Request::ClickRegion { id });
+    }
+
     /// `row` is the 1-based line in the tool's live buffer, 0 for clicks
     /// outside it (header line etc.).
     pub fn request_click(&self, tool_use_id: String, row: usize) {
@@ -1282,7 +1298,7 @@ impl EventHandle {
     /// the whole batch has landed, making it the batch barrier.
     #[doc(hidden)]
     pub fn wait_restore_complete_for_test(&self) {
-        const DEADLINE: Duration = Duration::from_secs(30);
+        const DEADLINE: Duration = runtime::RESTORE_ITEM_TIMEOUT.saturating_mul(2);
         let flag = Arc::new(AtomicBool::new(true));
         self.send_restore_complete(Arc::clone(&flag));
         let start = std::time::Instant::now();

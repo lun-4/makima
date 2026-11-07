@@ -408,9 +408,11 @@ struct LuaInvocationBackend {
     sibling: Option<SiblingInvocation>,
 }
 
-/// Receives the tool context of the managed turn, so a test can run a
-/// sibling invocation of the fixture tool under that same turn.
-type SiblingInvocation = flume::Sender<ToolContext>;
+/// Receives the result of a sibling invocation of the fixture tool, run
+/// concurrently with the managed one under the same turn context. The turn
+/// settles only after both finish, since the Lua runtime may start either
+/// call first.
+type SiblingInvocation = flume::Sender<Result<(), String>>;
 
 impl ActorBackend for LuaInvocationBackend {
     fn run_turn<'a>(
@@ -465,17 +467,19 @@ impl ActorBackend for LuaInvocationBackend {
                 .clone()
                 .unwrap_or_else(|| context.cancel.clone());
             self.context.managed_turn = context.managed_turn;
-            let invocation = self
-                .registry
-                .get(self.tool)
-                .unwrap()
-                .tool
-                .parse(&json!({}))
-                .unwrap();
-            if let Some(sibling) = &self.sibling {
-                sibling.send(self.context.clone()).unwrap();
-            }
-            let result = invocation.execute(&self.context).await.output.map(|_| ());
+            let tool = &self.registry.get(self.tool).unwrap().tool;
+            let execution = tool.parse(&json!({})).unwrap().execute(&self.context);
+            let output = match &self.sibling {
+                Some(sibling) => {
+                    let sibling_execution = tool.parse(&json!({})).unwrap().execute(&self.context);
+                    let (output, sibling_output) =
+                        futures_lite::future::zip(execution, sibling_execution).await;
+                    sibling.send(sibling_output.output.map(|_| ())).unwrap();
+                    output
+                }
+                None => execution.await,
+            };
+            let result = output.output.map(|_| ());
             let _ = self.completed.send(result.clone());
             if let Some(inbox) = &context.inbox {
                 loop {
@@ -1169,6 +1173,11 @@ fn trusted_config_callback_survives_subscription_gc_and_revocation(shutdown: boo
                     local root = assert(ctx:agent())
                     local selection = assert(root:set_model(ctx, {{ spec = "{FAST_MODEL}", thinking = "low", fast = true }}))
                     assert(selection.spec == "{FAST_MODEL}" and selection.thinking == "low" and selection.fast == true)
+                    local disabled, selection_err = root:set_model(ctx, {{ fast = false }})
+                    assert(disabled and selection_err == nil, selection_err)
+                    assert(disabled.spec == selection.spec and disabled.thinking == selection.thinking and disabled.fast == false)
+                    local restored = assert(root:set_model(ctx, selection))
+                    for _, key in ipairs({{ "spec", "thinking", "fast" }}) do assert(restored[key] == selection[key]) end
                     local roundtrip = assert(root:config(ctx)).model
                     for _, key in ipairs({{ "spec", "thinking", "fast" }}) do assert(selection[key] == roundtrip[key]) end
                     assert(assert(root:config(ctx)).mode == "build")
@@ -1380,6 +1389,8 @@ fn public_child_mode_changes_provider_system_after_queued_turns(custom: Option<&
     const NEW_MODE: &str = "pr160_new_mode";
     const OLD_PROMPT: &str = "old mode directive";
     const NEW_PROMPT: &str = "new mode directive";
+    const MODEL_IDENTITY: &str =
+        "# Model identity\n- Model: claude-sonnet-4-20250514\n- Provider: anthropic";
     smol::block_on(async {
         let fixture = Fixture::start_with_options(
             OWNER,
@@ -1441,7 +1452,7 @@ fn public_child_mode_changes_provider_system_after_queued_turns(custom: Option<&
                 || prompt.to_owned(),
                 |system| format!("{prompt}\n\n{system}"),
             );
-            assert_eq!(request.system, expected);
+            assert_eq!(request.system, format!("{expected}\n\n{MODEL_IDENTITY}"));
             request.reply.send(common::canned_reply(reply)).unwrap();
         }
         assert_eq!(
@@ -2323,8 +2334,11 @@ fn trusted_mode_changes_preserve_registered_target_model_policy() {
                     assert(target:set_mode(ctx, "build") == "build")
                     local changed, model_err = target:set_model(ctx, {UPDATED_MODEL:?})
                     assert(changed == nil and model_err == {not_allowed:?}, model_err)
-                    assert(target:set_model(ctx, {{ thinking = "low" }}))
-                    assert(assert(target:config(ctx)).model.thinking == "low")
+                    local before = assert(target:config(ctx)).model
+                    local selection, selection_err = target:set_model(ctx, {{ thinking = "low" }})
+                    assert(selection and selection_err == nil, selection_err)
+                    assert(selection.spec == before.spec and selection.fast == before.fast and selection.thinking == "low")
+                    assert(assert(target:config(ctx)).model.thinking == selection.thinking)
                 end,
             }})
         "#
@@ -3693,32 +3707,13 @@ fn public_output_schema_retries_invalid_reports_and_resets_each_turn() {
 #[test]
 fn managed_sibling_tool_call_cannot_use_another_calls_ctx() {
     const TOOL: &str = "pr5_managed_sibling";
-    const READY: &str = "/pr5_managed_sibling_ready";
-    const RELEASE: &str = "/pr5_managed_sibling_release";
     const FOREIGN_CONTEXT: &str = "context belongs to another invocation";
     smol::block_on(async {
-        let (sibling, sibling_context) = flume::bounded(1);
+        let (sibling, sibling_result) = flume::bounded(1);
         let fixture = Fixture::start_with_options(
             TOOL,
             FixtureOptions {
-                plugin_source: format!(
-                    r#"
-                    local gate, held, shared = maki.async.semaphore(1)
-                    local entered, on_entered
-                    maki.api.register_command({{
-                        name = "{READY}", tui_only = false,
-                        handler = function()
-                            if not entered then
-                                maki.async.await(1, function(done) on_entered = done end)
-                            end
-                        end,
-                    }})
-                    maki.api.register_command({{
-                        name = "{RELEASE}", tui_only = false,
-                        handler = function() held:release() end,
-                    }})
-                "#
-                ),
+                plugin_source: "local gate, held, shared = maki.async.semaphore(1)".into(),
                 sibling: Some(sibling),
                 ..Default::default()
             },
@@ -3727,43 +3722,18 @@ fn managed_sibling_tool_call_cannot_use_another_calls_ctx() {
                 if shared == nil then
                     shared = ctx
                     held = gate:acquire()
-                    entered = true
-                    if on_entered then on_entered() end
                     gate:acquire():release()
                 else
                     local listed, err = maki.agent.list(shared)
                     assert(listed == nil and err == "{FOREIGN_CONTEXT}", err)
                     assert(maki.agent.list(ctx))
+                    held:release()
                 end
             "#
             ),
         );
-        let context = bounded(sibling_context.recv_async(), "managed tool context")
-            .await
-            .unwrap();
-        let ready = run_command(&fixture._host.command_registry(), READY, 0, None);
         assert_eq!(
-            bounded(ready.recv_async(), "first invocation entry")
-                .await
-                .unwrap(),
-            Ok(())
-        );
-        let sibling = ToolRegistry::global()
-            .get(TOOL)
-            .unwrap()
-            .tool
-            .parse(&json!({}))
-            .unwrap();
-        assert_eq!(
-            bounded(sibling.execute(&context), "sibling invocation")
-                .await
-                .output
-                .map(|_| ()),
-            Ok(())
-        );
-        let release = run_command(&fixture._host.command_registry(), RELEASE, 0, None);
-        assert_eq!(
-            bounded(release.recv_async(), "first invocation release")
+            bounded(sibling_result.recv_async(), "sibling invocation")
                 .await
                 .unwrap(),
             Ok(())

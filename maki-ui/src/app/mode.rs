@@ -7,7 +7,7 @@ use crate::theme;
 use maki_agent::{AgentInput, AgentMode, ModeDef, ModeId, ModeRegistry};
 use ratatui::style::{Color, Modifier, Style};
 
-use super::{App, ModelPickerPurpose};
+use super::App;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -146,7 +146,7 @@ impl App {
     }
 
     /// Cycles to the next registered mode; the default two-mode case keeps
-    /// Tab toggling build<->plan.
+    /// Shift+Tab toggling build<->plan.
     pub(super) fn toggle_mode(&mut self) -> Vec<super::Action> {
         let registry = self.lua_event_handle.mode_registry();
         let modes = registry.list();
@@ -171,13 +171,16 @@ impl App {
         match mode.plan_path() {
             Some(path) if self.state.plan.path() != Some(path) => {
                 self.state.plan = PlanState::Drafting(path.to_path_buf());
+                self.sync_plan_form_path(None, Some(path));
             }
             Some(_) => {}
             None if matches!(previous, AgentMode::Plan(_)) => {
                 self.state.plan = PlanState::None;
-                self.plan_form.reset();
-                self.plan_approval_pending = false;
-                if self.model_picker_purpose == ModelPickerPurpose::PlanImplementation {
+                if let Some((form, pending)) = self.plan_form_entry(None) {
+                    form.reset();
+                    *pending = false;
+                }
+                if self.plan_picker_edits(None) {
                     self.close_model_picker();
                 }
             }
