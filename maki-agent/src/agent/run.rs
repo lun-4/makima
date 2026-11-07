@@ -8,14 +8,14 @@ use tracing::{error, info, warn};
 
 use maki_providers::provider::Provider;
 use maki_providers::{
-    ContentBlock, IMAGE_PLACEHOLDER, Message, Model, RequestOptions, Role, StopReason,
-    StreamResponse, ThinkingConfig, TokenUsage,
+    ContentBlock, ConversationEnd, IMAGE_PLACEHOLDER, InvocationPurpose, Message, Model,
+    ProviderRegistry, RequestOptions, Role, StopReason, StreamResponse, ThinkingConfig, TokenUsage,
 };
 
 use super::compaction;
 use super::history::{History, sanitize_cancelled_history};
 use super::instructions::LoadedInstructions;
-use super::streaming::{StreamError, stream_with_retry};
+use super::streaming::{Conversation, StreamError, end_conversation_detached, stream_with_retry};
 use super::tool_dispatch::{self, RecentCalls};
 use crate::actor::{TurnContext, TurnInbox};
 use crate::cancel::{CancelMap, CancelToken, ReasonedCancelToken};
@@ -59,19 +59,18 @@ const CANCELLED_TEXT_NOTE: &str = "[Response cut off by user cancel]";
 const INTERRUPT_NOTE: &str =
     "The user sent a new message while you were working. Address it and continue.";
 
-pub fn resolve_compaction_model(
+pub async fn resolve_compaction_model(
     provider: &Arc<dyn Provider>,
     model: &Model,
-    timeouts: maki_providers::Timeouts,
+    providers: &ProviderRegistry,
     model_policy: &ModelPolicy,
 ) -> (Arc<dyn Provider>, Model) {
-    if let Some(spec) =
-        maki_providers::model_registry::spec_for_tier_any(maki_providers::ModelTier::Compaction)
+    if let Some(spec) = providers.spec_for_tier_any(maki_providers::ModelTier::Compaction)
         && model_policy.allows(&spec)
-        && let Ok(mut m) = Model::from_spec(&spec)
-        && let Ok(p) = maki_providers::provider::from_model(&mut m, timeouts)
+        && let Ok(model) = providers.model(&spec)
+        && let Ok(prepared) = providers.prepare(model).await
     {
-        return (Arc::from(p), m);
+        return (prepared.provider, prepared.model);
     }
     (Arc::clone(provider), model.clone())
 }
@@ -180,6 +179,7 @@ pub struct AgentParams {
     pub audience: ToolAudience,
     pub question_mode: crate::tools::QuestionMode,
     pub model_policy: Arc<ModelPolicy>,
+    pub providers: Arc<ProviderRegistry>,
     /// Same-process per-path mutation locks, cloned from the parent context
     /// for subagents so concurrent same-path mutations stay serialized.
     pub file_write_locks: Arc<crate::tools::FileWriteLocks>,
@@ -241,6 +241,7 @@ pub struct Agent<'h> {
     local_tool_capture: Option<Arc<Mutex<Option<Value>>>>,
     turn_bindings: Arc<TurnToolBindings>,
     model_policy: Arc<ModelPolicy>,
+    providers: Arc<ProviderRegistry>,
     file_write_locks: Arc<crate::tools::FileWriteLocks>,
     offload: Option<Arc<OffloadStore>>,
     managed_turn: Option<crate::CurrentManagedTurn>,
@@ -333,6 +334,7 @@ impl<'h> Agent<'h> {
             local_tool_capture: None,
             turn_bindings: Arc::new(TurnToolBindings::default()),
             model_policy: params.model_policy,
+            providers: params.providers,
             file_write_locks: params.file_write_locks,
             offload: params.offload,
             managed_turn: params.managed_turn,
@@ -531,6 +533,11 @@ impl<'h> Agent<'h> {
             },
             Err(AgentError::Cancelled) => {
                 sanitize_cancelled_history(self.history, self.rollback_len);
+                end_conversation_detached(
+                    &self.provider,
+                    self.history.continue_conversation(),
+                    ConversationEnd::Cancelled,
+                );
                 let reason = match &self.cancel_reason_source {
                     Some(source) => source
                         .reason()
@@ -665,7 +672,7 @@ impl<'h> Agent<'h> {
         }
     }
 
-    fn request_tools(&self) -> Result<Cow<'_, Value>, AgentError> {
+    fn request_tools(&self) -> Result<Value, AgentError> {
         let def = self.mode_def.as_ref().ok_or_else(|| AgentError::Config {
             message: format!("mode '{}' is not defined", self.mode.id().key()),
         })?;
@@ -689,7 +696,7 @@ impl<'h> Agent<'h> {
                     .is_some_and(|name| tool_dispatch::authorize_advertised(&ctx, name))
             });
         }
-        Ok(tools)
+        Ok(tools.into_owned())
     }
 
     async fn turn(&mut self) -> Result<TurnProgress, AgentError> {
@@ -699,15 +706,22 @@ impl<'h> Agent<'h> {
         self.consume_turn_inbox()?;
         self.pending_instruction_request = false;
         let tools = self.request_tools()?;
+        self.history.mark_sent();
         if let Some(inbox) = &self.turn_inbox {
             inbox.instructions_submitted();
         }
         let response = match stream_with_retry(
             &*self.provider,
+            Conversation {
+                id: Arc::clone(self.history.conversation_id()),
+                purpose: InvocationPurpose::Agent,
+                agent_id: Some(self.agent_id.to_string().into()),
+                previous: self.history.conversation().previous.clone(),
+            },
             &self.model,
             self.history.as_slice(),
             &self.system,
-            tools.as_ref(),
+            &tools,
             &self.event_tx,
             &self.cancel,
             self.opts,
@@ -951,6 +965,7 @@ impl<'h> Agent<'h> {
             turn_bindings: Arc::clone(&self.turn_bindings),
             live_sink: None,
             model_policy: Arc::clone(&self.model_policy),
+            providers: Arc::clone(&self.providers),
             file_write_locks: Arc::clone(&self.file_write_locks),
             offload: self.offload.clone(),
             pending_output_limits: None,
@@ -986,11 +1001,13 @@ impl<'h> Agent<'h> {
         let (compact_provider, compact_model) = resolve_compaction_model(
             &self.provider,
             &self.model,
-            self.timeouts,
+            &self.providers,
             &self.model_policy,
-        );
+        )
+        .await;
         let compaction_usage = compaction::compact_history(
-            &*compact_provider,
+            &compact_provider,
+            &self.provider,
             &compact_model,
             self.history,
             &self.event_tx,
@@ -1171,8 +1188,8 @@ mod tests {
 
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
-        StreamResponse, TokenUsage,
+        ContentBlock, ConversationLink, ConversationRelation, Invocation, Message, Model,
+        ProviderEvent, RequestOptions, RetryKind, Role, StopReason, StreamResponse, TokenUsage,
     };
     use serde_json::Value;
     use test_case::test_case;
@@ -1233,6 +1250,7 @@ mod tests {
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
                 self.captured_messages
@@ -1248,10 +1266,6 @@ mod tests {
                 assert!(!responses.is_empty(), "MockProvider: no more responses");
                 Ok(responses.remove(0))
             })
-        }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
-            Box::pin(async { unimplemented!() })
         }
     }
 
@@ -1270,6 +1284,7 @@ mod tests {
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 let mut advertised = self.advertised.lock().unwrap();
@@ -1289,10 +1304,6 @@ mod tests {
                 }
             })
         }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
-            Box::pin(async { unimplemented!() })
-        }
     }
 
     struct ScriptedProvider {
@@ -1309,6 +1320,7 @@ mod tests {
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
                 self.results
@@ -1318,19 +1330,15 @@ mod tests {
                     .expect("ScriptedProvider: no more results")
             })
         }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
-            Box::pin(async { unimplemented!() })
-        }
     }
 
     /// Streams `delta` (if any), fires `cancel_after_delta` (if any),
-    /// then fails with `fail_status` or hangs until cancelled.
+    /// then fails with `fail` (status and retry class) or hangs until cancelled.
     #[derive(Default)]
     struct StubStreamProvider {
         delta: Option<&'static str>,
         cancel_after_delta: Mutex<Option<crate::cancel::CancelTrigger>>,
-        fail_status: Option<u16>,
+        fail: Option<(u16, Option<RetryKind>)>,
     }
 
     impl Provider for StubStreamProvider {
@@ -1343,6 +1351,7 @@ mod tests {
             ptx: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 if let Some(text) = self.delta {
@@ -1352,15 +1361,70 @@ mod tests {
                 if let Some(trigger) = self.cancel_after_delta.lock().unwrap().take() {
                     trigger.cancel();
                 }
-                match self.fail_status {
-                    Some(status) => Err(AgentError::api(status, "stub")),
+                match self.fail {
+                    Some((status, retry)) => Err(api_error(status, retry)),
                     None => futures_lite::future::pending().await,
                 }
             })
         }
+    }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
-            Box::pin(async { unimplemented!() })
+    type Ended = (Arc<str>, ConversationEnd);
+
+    fn api_error(status: u16, retry: Option<RetryKind>) -> AgentError {
+        AgentError::Api {
+            status,
+            message: "stub".into(),
+            retry_after: None,
+            overflow: false,
+            retry,
+        }
+    }
+
+    /// Cancels its first request if armed. `end_conversation` never resolves,
+    /// so a caller that waited on it would hang.
+    struct ConversationProbe {
+        cancel_first: Mutex<Option<crate::cancel::CancelTrigger>>,
+        /// Each request's invocation and message count.
+        conversations: Arc<Mutex<Vec<(Invocation, usize)>>>,
+        ended: flume::Sender<Ended>,
+    }
+
+    impl Provider for ConversationProbe {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            messages: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+            invocation: &'a Invocation,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            self.conversations
+                .lock()
+                .unwrap()
+                .push((invocation.clone(), messages.len()));
+            let cancel = self.cancel_first.lock().unwrap().take();
+            Box::pin(async move {
+                match cancel {
+                    Some(trigger) => {
+                        trigger.cancel();
+                        futures_lite::future::pending().await
+                    }
+                    None => Ok(text_response(StopReason::EndTurn)),
+                }
+            })
+        }
+
+        fn end_conversation(
+            &self,
+            conversation_id: &str,
+            reason: ConversationEnd,
+        ) -> BoxFuture<'_, ()> {
+            let _ = self.ended.send((conversation_id.into(), reason));
+            Box::pin(futures_lite::future::pending())
         }
     }
 
@@ -2263,6 +2327,7 @@ mod tests {
             audience: ToolAudience::MAIN,
             question_mode: crate::tools::QuestionMode::Tui,
             model_policy: Arc::new(ModelPolicy::default()),
+            providers: Arc::default(),
             file_write_locks: Arc::new(crate::tools::FileWriteLocks::new()),
             offload: None,
             managed_turn: None,
@@ -2490,7 +2555,7 @@ mod tests {
         smol::block_on(async {
             let mut history = History::new(Vec::new());
             let provider = StubStreamProvider {
-                fail_status: Some(400),
+                fail: Some((400, None)),
                 ..Default::default()
             };
             let (mut agent, event_rx) = make_agent(provider, &mut history);
@@ -2624,7 +2689,7 @@ mod tests {
             const TEXT: &str = "response";
             let mut results = VecDeque::new();
             if retry {
-                results.push_back(Err(AgentError::api(429, "retry fixture")));
+                results.push_back(Err(api_error(429, Some(RetryKind::RateLimit))));
             }
             if tools {
                 results.push_back(Ok(tool_use_response(TOOL, serde_json::json!({"ok":true}))));
@@ -2908,6 +2973,56 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_turn_ends_its_conversation_and_the_next_turn_starts_another() {
+        smol::block_on(async {
+            let conversations = Arc::new(Mutex::new(Vec::new()));
+            let (ended_tx, ended_rx) = flume::unbounded();
+            let mut history = History::new(Vec::new());
+            let original = Arc::clone(history.conversation_id());
+            let (trigger, cancel) = CancelToken::new();
+            let probe = ConversationProbe {
+                cancel_first: Mutex::new(Some(trigger)),
+                conversations: Arc::clone(&conversations),
+                ended: ended_tx.clone(),
+            };
+            let (agent, _events) = make_agent(probe, &mut history);
+            let mut agent = agent.with_cancel(cancel);
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            assert!(matches!(outcome, TurnOutcome::Cancelled { .. }));
+            drop(agent);
+            assert_eq!(
+                ended_rx.recv_async().await.unwrap(),
+                (Arc::clone(&original), ConversationEnd::Cancelled)
+            );
+
+            let probe = ConversationProbe {
+                cancel_first: Mutex::new(None),
+                conversations: Arc::clone(&conversations),
+                ended: ended_tx,
+            };
+            let (mut agent, _events) = make_agent(probe, &mut history);
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+            drop(agent);
+            let conversations = conversations.lock().unwrap();
+            let [(cancelled, sent), (next, _)] = &conversations[..] else {
+                panic!("expected two requests, got {}", conversations.len());
+            };
+            assert_eq!(cancelled.conversation_id, original);
+            assert_eq!(cancelled.previous, None);
+            assert_eq!(&next.conversation_id, history.conversation_id());
+            assert_eq!(
+                next.previous,
+                Some(ConversationLink {
+                    id: original,
+                    relation: ConversationRelation::Continues,
+                    shared: *sent,
+                })
+            );
+        });
+    }
+
+    #[test]
     fn cancel_mid_stream_keeps_partial_text_in_history() {
         const PARTIAL: &str = "partial answer";
         smol::block_on(async {
@@ -2945,7 +3060,7 @@ mod tests {
             let (trigger, cancel) = CancelToken::new();
             let provider = StubStreamProvider {
                 delta: Some(PARTIAL),
-                fail_status: Some(529),
+                fail: Some((529, Some(RetryKind::Transient))),
                 ..Default::default()
             };
             let mut history = History::new(Vec::new());
@@ -3203,6 +3318,10 @@ mod tests {
         ));
         assert!(matches!(outcome, TurnOutcome::Failed { num_turns: 0, .. }));
         assert!(agent.mode_def.is_none());
+        assert_eq!(agent.history.conversation().sent, None);
+        let unsent = Arc::clone(agent.history.conversation_id());
+        assert_eq!(agent.history.continue_conversation(), unsent);
+        assert_eq!(agent.history.conversation().previous, None);
     }
 
     #[test]
@@ -3303,7 +3422,6 @@ mod tests {
             .unwrap();
         let tools = agent.request_tools().unwrap();
         let names: Vec<&str> = tools
-            .as_ref()
             .as_array()
             .unwrap()
             .iter()
@@ -3329,7 +3447,7 @@ mod tests {
         ));
         admit(&mut agent);
         let tools = agent.request_tools().unwrap();
-        let names = tool_names(tools.as_ref());
+        let names = tool_names(&tools);
         assert!(names.contains(&crate::mcp::TOOL_SEARCH_TOOL_NAME));
         assert!(!names.contains(&"srv__probe"));
         agent
@@ -3339,7 +3457,7 @@ mod tests {
             .search_tools("probe", crate::tools::CallOrigin::Model)
             .unwrap();
         let tools = agent.request_tools().unwrap();
-        let names = tool_names(tools.as_ref());
+        let names = tool_names(&tools);
         assert!(names.contains(&"srv__probe"));
     }
 

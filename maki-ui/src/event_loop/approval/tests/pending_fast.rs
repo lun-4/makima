@@ -20,7 +20,7 @@ fn set_fast_support(
 ) -> ConfigCommit {
     let provider = Arc::clone(&actor.effective_config().unwrap().provider);
     let mut model = capable_model(&actor.effective_config().unwrap().model.spec());
-    model.supports_fast_override = Some(support);
+    model.fast_support = Some(support);
     let commit = apply_patch(
         actor,
         ConfigPatch {
@@ -87,10 +87,13 @@ fn explicit_root_approval_supersedes_saved_fast(fast_only: bool, pending: bool) 
                 ..Default::default()
             });
         let prepare = Arc::clone(&event_loop.ctx.prepare_provider);
-        event_loop.ctx.prepare_provider = Arc::new(move |model, timeouts| {
-            let mut prepared = prepare(model, timeouts)?;
-            prepared.model.supports_fast_override = Some(support);
-            Ok(prepared)
+        event_loop.ctx.prepare_provider = Arc::new(move |spec| {
+            let prepared = prepare(spec);
+            Box::pin(async move {
+                let mut prepared = prepared.await?;
+                prepared.model.fast_support = Some(support);
+                Ok(prepared)
+            })
         });
         approve(event_loop, index, false);
         assert!(!event_loop.sessions[index].app.state.fast_pending);

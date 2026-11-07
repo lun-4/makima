@@ -21,7 +21,7 @@ use maki_lua::{
     test_support::run_command,
 };
 use maki_providers::{
-    AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
+    AgentError, ContentBlock, Invocation, Message, Model, ProviderEvent, RequestOptions, Role,
     StreamResponse, TokenUsage,
     provider::{BoxFuture, Provider},
 };
@@ -220,6 +220,7 @@ impl Provider for GatedProvider {
         _: &'a flume::Sender<ProviderEvent>,
         _: RequestOptions,
         _: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let (reply, response) = flume::bounded(1);
@@ -233,10 +234,6 @@ impl Provider for GatedProvider {
                 .unwrap();
             common::bounded(response.recv_async()).await.unwrap()
         })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
     }
 }
 

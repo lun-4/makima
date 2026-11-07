@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use maki_agent::agent::isolated_turn::{IsolatedTurnEvent, IsolatedTurnRequest, run_isolated_turn};
 use maki_providers::provider::Provider;
-use maki_providers::{ImageSource, Model};
+use maki_providers::{ConversationRelation, ImageSource, Model};
 use maki_storage::id::SessionRef;
 
 use crate::components::btw_modal::BtwEvent;
@@ -20,10 +20,18 @@ impl App {
         provider: Arc<dyn Provider>,
         model: Model,
     ) {
-        let history = self
+        let snapshot = self
             .shared_history
             .as_ref()
-            .map(|history| Vec::clone(&history.load().messages))
+            .map(|history| history.load_full());
+        let previous = snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .conversation
+                .as_ref()?
+                .link(ConversationRelation::Branches, snapshot.messages.len())
+        });
+        let history = snapshot
+            .map(|snapshot| Vec::clone(&snapshot.messages))
             .unwrap_or_default();
         let system = self
             .btw_system
@@ -35,6 +43,7 @@ impl App {
             provider,
             model,
             history,
+            previous,
             system,
             question,
             images,

@@ -43,7 +43,7 @@ Pass a prompt with `-p` / `--prompt`, or pipe it on stdin. With both, stdin foll
 | `--print` | Non-interactive run. See [Headless Mode](/docs/headless/) |
 | `-p`, `--prompt <TEXT>` | Initial prompt. Piped stdin is appended after a blank line. Use `--prompt=<TEXT>` when the text starts with `-` |
 | `--image <PATH>` | Attach an image in `--print` mode (repeatable). Paths must be png, jpeg, gif, or webp |
-| `-m`, `--model <SPEC>` | Model as `provider/model-id`. Fallback: last used → `provider.default_model` in config → auto-detect from available providers |
+| `-m`, `--model <SPEC>` | Model as `provider/model-id`. Fallback: last used → `provider.default_model` in config → the strong default (else medium) of the first provider in `makima auth status` order that has credentials |
 | `--verbose` | Full turn-by-turn messages in `--print` output |
 | `-c`, `--continue [ID]` | Continue a specific session by ID (TUI / SDK). With no ID (TUI only), opens the session picker with this directory's sessions. A following positional is taken as the ID, so run `--continue` alone to open the picker. Resuming a session stored under another directory, or one open in another terminal, is an error. In `--print` mode an ID is ignored (print mode always starts a new session) and a bare flag is an error |
 | `-l`, `--last` | Continue the most recent session in this directory (TUI / SDK only). Errors the same way if it is open in another terminal |
@@ -94,9 +94,15 @@ makima auth logout <provider>
 makima auth status
 ```
 
-`login` stores credentials under the state directory and can write plan / base URL choices into `providers.toml` (see [Configuration](/docs/configuration/#directory-layout) for the platform path). OpenAI and Copilot have dedicated flows; other providers prompt for a key (and a plan when the provider has more than one). Custom providers can be created from the interactive picker.
+`login` and the TUI's `/login` run the same flow. You name a provider or pick one from the list, answer the settings it asks for (a plan, a base URL), and choose a login method. Each provider brings its own methods, such as pasting an API key, a device code in the browser for a ChatGPT login, or importing an existing Copilot token. A login alias like `openai-codex` skips the method question. Settings are written to `providers.toml` only after the login works, so a cancelled login leaves nothing behind. Credentials go to `auth/<provider>.json` in the state directory, readable only by you (paths in [Configuration](/docs/configuration/#directory-layout)). The provider's strong default becomes your model.
 
-`status` shows each provider as configured (key on disk), env-only, or missing.
+Pick **Custom provider...** to add an endpoint of your own. An [executable provider](/docs/providers/#executable-providers) with its own login runs that login on your terminal, so it works from `makima auth login` but not from the TUI.
+
+`logout` deletes the saved credentials and the provider's `providers.toml` section.
+
+`status` lists each provider as saved (credentials on disk), env (key from an environment variable), configured (key in `providers.toml`), error (the check failed, with the reason), or missing.
+
+The list is in the order Makima picks a default model when you have not chosen one: Anthropic, OpenAI, Copilot, Z.AI, Synthetic, DeepSeek, Regolo, then the other built-in providers, Ollama, llama.cpp and OpenCode, your own providers, and the models.dev catalog providers last. So with both `ANTHROPIC_API_KEY` and `GEMINI_API_KEY` set, a fresh start uses Anthropic.
 
 ### `makima models`
 
@@ -105,7 +111,7 @@ makima models
 makima models --refresh    # refetch the models.dev catalog
 ```
 
-One spec per line, warnings on stderr. Built-in and script providers are listed live, catalog-backed providers from the models.dev cache, which expires after 24 hours and supplies model pricing and context windows. `--refresh` refetches it. When the refetch fails, the cached catalog stays in place, the list still prints, and the command exits non-zero.
+One spec per line, warnings on stderr. Built-in and script providers are listed live, catalog-backed providers from the models.dev cache, which expires after 24 hours and supplies model pricing and context windows. `--refresh` refetches it and asks every provider to skip its caches. Startup reads only the cache and never waits on the network, so a provider new to the catalog shows up from the next start. When the refetch fails, the cached catalog stays in place, the list still prints, and the command exits non-zero.
 
 ### `makima sessions`
 

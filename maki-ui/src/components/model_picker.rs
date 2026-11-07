@@ -6,11 +6,10 @@ use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 
-use maki_providers::dynamic;
 use maki_providers::model_registry;
-use maki_providers::provider::ProviderKind;
 use maki_providers::{
     CompleteModelSelection, ModelCapabilities, ModelOption, ModelSelection, ModelTier,
+    ProviderRegistry,
 };
 
 use crate::click::{ClickTarget, HitTarget, PickerId};
@@ -112,6 +111,7 @@ pub struct ModelPicker {
     models: Arc<ArcSwapOption<Vec<String>>>,
     available: Watch<Vec<String>>,
     recents: Vec<String>,
+    providers: Arc<ProviderRegistry>,
     capabilities: Arc<ModelCapabilityCache>,
     draft: Option<Draft>,
     needs_rebuild: bool,
@@ -149,6 +149,7 @@ impl Draft {
 impl ModelPicker {
     pub fn new(
         models: Arc<ArcSwapOption<Vec<String>>>,
+        providers: Arc<ProviderRegistry>,
         capabilities: Arc<ModelCapabilityCache>,
     ) -> Self {
         Self {
@@ -156,6 +157,7 @@ impl ModelPicker {
             models,
             available: Watch::default(),
             recents: Vec::new(),
+            providers,
             capabilities,
             draft: None,
             needs_rebuild: false,
@@ -232,7 +234,7 @@ impl ModelPicker {
         let mut entries = Vec::new();
         for spec in &self.recents {
             if specs.is_none_or(|specs| specs.contains(spec))
-                && let Some(mut entry) = parse_model_entry(spec)
+                && let Some(mut entry) = parse_model_entry(spec, &self.providers)
             {
                 entry.suffix = Some(std::mem::take(&mut entry.provider_display));
                 entry.provider_display = RECENT_SECTION.to_string();
@@ -243,7 +245,7 @@ impl ModelPicker {
             .map(|specs| {
                 specs
                     .iter()
-                    .filter_map(|spec| parse_model_entry(spec))
+                    .filter_map(|spec| parse_model_entry(spec, &self.providers))
                     .collect()
             })
             .unwrap_or_default();
@@ -690,26 +692,13 @@ fn format_tier_label(tier: &str, override_tiers: &[ModelTier], free: bool) -> St
     }
 }
 
-fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
+fn parse_model_entry(spec: &str, providers: &ProviderRegistry) -> Option<ModelEntry> {
     let (provider_str, model_id) = spec.split_once('/')?;
-
-    let provider_display = if let Ok(kind) = provider_str.parse::<ProviderKind>() {
-        kind.display_name().to_string()
-    } else if let Some(name) = dynamic::display_name(provider_str) {
-        name.to_string()
-    } else if let Some(info) = maki_providers::catalog_provider_if_available(provider_str) {
-        info.display_name.clone()
-    } else if let Some(builtin) = maki_config::providers::builtin_provider(provider_str) {
-        builtin.display_name.to_string()
-    } else {
-        let config = maki_config::providers::ProvidersConfig::load();
-        config.get(provider_str)?;
-        maki_config::providers::resolve_display_name(provider_str, config.get(provider_str))
-    };
+    let provider_display = providers.display_name(provider_str)?.to_string();
 
     let override_tiers = model_registry::override_tiers(spec);
-    let (tier, free) = match maki_providers::Model::from_spec(spec) {
-        Ok(m) => (m.tier.to_string(), m.is_free()),
+    let (tier, free) = match providers.model(spec) {
+        Ok(m) => (m.tier.to_string(), m.free),
         Err(_) => (String::new(), false),
     };
     let tier = format_tier_label(&tier, &override_tiers, free);
@@ -738,9 +727,10 @@ mod tests {
     use crate::repaint::Dirty;
     use arc_swap::ArcSwapOption;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use maki_providers::test_util::offline_ids;
     use maki_providers::{
         CompleteModelSelection, Effort, ModelCapabilities, ModelOption, ModelSelection, ModelTier,
-        ThinkingConfig, ThinkingSupport, model_registry,
+        ProviderRegistry, ThinkingConfig, ThinkingSupport, model_registry,
     };
     use maki_storage::StateDir;
     use ratatui::{Terminal, backend::TestBackend, layout::Position};
@@ -748,6 +738,8 @@ mod tests {
     use tempfile::TempDir;
     use test_case::test_case;
 
+    const ANTHROPIC: &str = "anthropic";
+    const ZAI: &str = "zai";
     const CURRENT: &str = "anthropic/claude-sonnet-4-20250514";
     const OTHER: &str = "anthropic/claude-opus-4-6-20260101";
     const THIRD: &str = "zai/glm-5";
@@ -908,8 +900,12 @@ mod tests {
         )
     }
 
+    fn test_providers() -> Arc<ProviderRegistry> {
+        Arc::new(offline_ids(&[ANTHROPIC, ZAI, "openai", "llama-cpp"]))
+    }
+
     fn picker(models: Arc<ArcSwapOption<Vec<String>>>) -> ModelPicker {
-        ModelPicker::new(models, cache())
+        ModelPicker::new(models, test_providers(), cache())
     }
 
     static MODEL_REGISTRY_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -926,10 +922,7 @@ mod tests {
             let lock = MODEL_REGISTRY_TEST_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let previous_strong =
-                model_registry::spec_for_tier_any(ModelTier::Strong).filter(|previous| {
-                    model_registry::override_tiers(previous).contains(&ModelTier::Strong)
-                });
+            let previous_strong = model_registry::tier_override(ModelTier::Strong);
             let temp_dir = tempfile::tempdir().unwrap();
             let state_dir = StateDir::from_path(temp_dir.path().to_path_buf());
             Self {
@@ -1346,7 +1339,7 @@ mod tests {
         let _ = picker.refresh();
         assert_eq!(
             picker.picker.selected_item().unwrap().provider_display,
-            "Anthropic"
+            ANTHROPIC
         );
     }
 
@@ -1358,20 +1351,17 @@ mod tests {
         picker.picker.select(0);
         assert_eq!(confirm(&mut picker).spec.as_deref(), Some(THIRD));
         open(&mut picker, THIRD);
-        assert_eq!(
-            picker.picker.selected_item().unwrap().provider_display,
-            "Z.AI"
-        );
+        assert_eq!(picker.picker.selected_item().unwrap().provider_display, ZAI);
     }
 
     #[test]
     fn parse_model_entry_preserves_provider_tier_and_price() {
-        let entry = parse_model_entry(CURRENT).unwrap();
+        let entry = parse_model_entry(CURRENT, &test_providers()).unwrap();
         assert_eq!(entry.id, "claude-sonnet-4-20250514");
-        assert_eq!(entry.provider_display, "Anthropic");
+        assert_eq!(entry.provider_display, ANTHROPIC);
         assert!(!entry.tier.is_empty());
         assert!(!entry.tier.starts_with(FREE_PREFIX));
-        assert!(parse_model_entry("no-slash").is_none());
+        assert!(parse_model_entry("no-slash", &ProviderRegistry::default()).is_none());
     }
 
     #[test_case(120, 24; "wide")]

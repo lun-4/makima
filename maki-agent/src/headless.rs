@@ -11,8 +11,8 @@ use futures_lite::future;
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_providers::Message;
 use maki_providers::model::Model;
-use maki_providers::provider::{self, BoxFuture, Provider};
-use maki_providers::{RequestOptions, Timeouts};
+use maki_providers::provider::BoxFuture;
+use maki_providers::{ConversationEnd, ProviderRegistry, RequestOptions, Timeouts};
 use maki_storage::id::{MakiId, SessionRef};
 use serde_json::Value;
 use tracing::warn;
@@ -24,6 +24,8 @@ use crate::actor::{
 use crate::agent::isolated_turn::IsolatedTurnEvent;
 use crate::agent::{self, History, PromptSlotSource, TurnSetup};
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
+use crate::config_change::{ConfigChangeError, unresolved_model};
+use crate::end_conversation_detached;
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
 use crate::session_coordinator::{ModelPreparer, SessionCoordinatorHandle};
@@ -101,6 +103,7 @@ pub struct InteractiveParams {
     pub append_system_prompt: Option<String>,
     pub defaults: SessionDefaults,
     pub model_policy: Arc<ModelPolicy>,
+    pub providers: Arc<ProviderRegistry>,
     pub modes: Arc<crate::ModeRegistry>,
     pub question_mode: crate::tools::QuestionMode,
     pub plugin_rules: Arc<PluginRuleStore>,
@@ -419,34 +422,23 @@ impl InteractiveHandle {
     }
 }
 
-pub type ProviderPreparation = Box<
-    dyn FnOnce(
-            Model,
-            Timeouts,
-        ) -> BoxFuture<'static, Result<(Model, Arc<dyn Provider>), crate::AgentError>>
-        + Send,
->;
+pub type ProviderPreparation =
+    Box<dyn FnOnce(Model) -> BoxFuture<'static, Result<PreparedModel, crate::AgentError>> + Send>;
 
-pub fn default_preparation() -> ProviderPreparation {
-    Box::new(|mut model, timeouts| {
-        Box::pin(async move {
-            let provider = provider::from_model_async(&mut model, timeouts).await?;
-            Ok((model, Arc::from(provider)))
-        })
-    })
+pub fn default_preparation(providers: Arc<ProviderRegistry>) -> ProviderPreparation {
+    Box::new(|model| Box::pin(async move { providers.prepare(model).await }))
 }
 
-/// Prepares the provider for a model a session coordinator commits.
-pub fn default_model_preparer(timeouts: Timeouts) -> ModelPreparer {
-    Arc::new(move |mut model| {
+/// Resolves and prepares the model a session coordinator commits.
+pub fn default_model_preparer(providers: Arc<ProviderRegistry>) -> ModelPreparer {
+    Arc::new(move |spec| {
+        let providers = Arc::clone(&providers);
         Box::pin(async move {
-            let provider = provider::from_model_async(&mut model, timeouts)
+            let model = providers.model(&spec).map_err(unresolved_model)?;
+            providers
+                .prepare(model)
                 .await
-                .map_err(|error| Arc::from(error.user_message()))?;
-            Ok(PreparedModel {
-                model,
-                provider: Arc::from(provider),
-            })
+                .map_err(|error| ConfigChangeError::ModelPreparation(error.user_message().into()))
         })
     })
 }
@@ -565,6 +557,7 @@ impl HeadlessBackend {
             )),
             live_sink: None,
             model_policy: Arc::clone(&self.params.model_policy),
+            providers: Arc::clone(&self.params.providers),
             file_write_locks: Arc::clone(&self.params.file_write_locks),
             offload: self.params.offload.clone(),
             pending_output_limits: None,
@@ -586,7 +579,8 @@ impl HeadlessBackend {
         };
         let previous = history.snapshot().clone();
         let result = agent::compact(
-            &*config.provider,
+            &config.provider,
+            &config.provider,
             &config.model,
             history,
             &self.event_sender(context),
@@ -754,13 +748,24 @@ impl ActorBackend for HeadlessBackend {
                 Some(InteractiveControl::Reset(reply)) => {
                     let previous = history.snapshot().clone();
                     history.replace(Vec::new());
+                    // Rotated before the write, so the reset log never stores the ended id.
+                    let ended = history.restart_conversation();
                     let result = persist_history(
                         self.params.session_id.as_ref().unwrap().id(),
                         history.snapshot().clone(),
                     )
                     .await;
-                    if result.is_err() {
-                        history.replace_snapshot(previous);
+                    match &result {
+                        Ok(()) => {
+                            if let Some(config) = &context.policy {
+                                end_conversation_detached(
+                                    &config.settings.provider,
+                                    ended,
+                                    ConversationEnd::Closed,
+                                );
+                            }
+                        }
+                        Err(_) => history.restore_snapshot(previous),
                     }
                     let _ = reply.send(result);
                 }
@@ -794,6 +799,7 @@ impl ActorBackend for HeadlessBackend {
                             provider: Arc::clone(&config.provider),
                             model: config.model.clone(),
                             history: history.as_slice().to_vec(),
+                            previous: history.branch(history.len()),
                             system: self.system(&config, &instructions, &slots),
                             question,
                             images,
@@ -1003,7 +1009,7 @@ pub fn spawn_interactive_with_binding(
         async move {
             let _lifetime = lifetime;
             let initialized = async {
-                let (model, provider) = prepare(params.model.clone(), params.timeouts)
+                let PreparedModel { model, provider } = prepare(params.model.clone())
                     .await
                     .map_err(|error| error.user_message())?;
                 model_source.install(Arc::clone(&provider), model.clone());
@@ -1038,6 +1044,7 @@ pub fn spawn_interactive_with_binding(
                         audience: ToolAudience::MAIN,
                         question_mode: params.question_mode,
                         model_policy: params.model_policy,
+                        providers: params.providers,
                         file_write_locks: Arc::new(crate::tools::FileWriteLocks::new()),
                         offload,
                         managed_turn: None,
@@ -1152,7 +1159,8 @@ pub(crate) mod tests {
     use crate::session_coordinator::{SessionCoordinatorParams, builtin_option_definitions};
     use crate::tools::offload::{OffloadBackend, OffloadError};
     use crate::{ModeRegistry, TurnOutcome};
-    use maki_providers::{ContentBlock, Role, StopReason, StreamResponse, TokenUsage};
+    use maki_providers::provider::Provider;
+    use maki_providers::{ContentBlock, Invocation, Role, StopReason, StreamResponse, TokenUsage};
     use maki_storage::checkpoint::{
         CheckpointAck, CheckpointError, CheckpointFuture, CheckpointRequest, CheckpointWriter,
         accept_all,
@@ -1206,6 +1214,7 @@ pub(crate) mod tests {
             _: &'a flume::Sender<maki_providers::ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
             Box::pin(async move {
                 self.entered.send_async(()).await.unwrap();
@@ -1216,17 +1225,42 @@ pub(crate) mod tests {
                 }
             })
         }
-
-        fn list_models(
-            &self,
-        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, crate::AgentError>> {
-            Box::pin(async { Ok(Vec::new()) })
-        }
     }
 
     struct RecordingProvider {
         name: &'static str,
         requests: flume::Sender<(&'static str, String, String, bool)>,
+    }
+
+    struct EndRecordingProvider {
+        requests: flume::Sender<Arc<str>>,
+        ended: flume::Sender<(String, ConversationEnd)>,
+    }
+
+    impl Provider for EndRecordingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<maki_providers::ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+            invocation: &'a Invocation,
+        ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
+            let _ = self.requests.send(Arc::clone(&invocation.conversation_id));
+            Box::pin(async { Ok(response(SAVED_OUTPUT)) })
+        }
+
+        fn end_conversation(
+            &self,
+            conversation_id: &str,
+            reason: ConversationEnd,
+        ) -> BoxFuture<'_, ()> {
+            let _ = self.ended.send((conversation_id.to_owned(), reason));
+            Box::pin(async {})
+        }
     }
 
     impl Provider for RecordingProvider {
@@ -1239,6 +1273,7 @@ pub(crate) mod tests {
             _: &'a flume::Sender<maki_providers::ProviderEvent>,
             options: RequestOptions,
             _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
             Box::pin(async move {
                 let _ = self
@@ -1246,12 +1281,6 @@ pub(crate) mod tests {
                     .send((self.name, model.spec(), system.into(), options.fast));
                 Ok(response(self.name))
             })
-        }
-
-        fn list_models(
-            &self,
-        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, crate::AgentError>> {
-            Box::pin(async { Ok(Vec::new()) })
         }
     }
 
@@ -1266,8 +1295,8 @@ pub(crate) mod tests {
     ) -> InteractiveHandle {
         let handle = spawn_interactive_with_binding(
             params,
-            Box::new(move |model, _| {
-                Box::pin(async move { provider.map(|provider| (model, provider)) })
+            Box::new(move |model| {
+                Box::pin(async move { provider.map(|provider| PreparedModel { model, provider }) })
             }),
             None,
             None,
@@ -1279,6 +1308,7 @@ pub(crate) mod tests {
     fn interactive_params(session_id: MakiId, history: Vec<Message>) -> InteractiveParams {
         InteractiveParams {
             model: Model::from_spec(TEST_MODEL).unwrap(),
+            providers: Arc::default(),
             config: AgentConfig::default(),
             permissions_config: PermissionsConfig::default(),
             timeouts: Timeouts::default(),
@@ -1313,7 +1343,7 @@ pub(crate) mod tests {
         let binding = coordinator_binding(coordinator, Arc::clone(&provider));
         spawn_interactive_with_binding(
             params,
-            Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) })),
+            Box::new(move |model| Box::pin(async move { Ok(PreparedModel { model, provider }) })),
             None,
             Some(binding),
         )
@@ -1328,8 +1358,9 @@ pub(crate) mod tests {
                 coordinator
                     .bind_actor(
                         root,
-                        Arc::new(move |model| {
+                        Arc::new(move |spec| {
                             let provider = Arc::clone(&provider);
+                            let model = Model::from_spec(&spec).unwrap();
                             Box::pin(async move { Ok(PreparedModel { provider, model }) })
                         }),
                         Arc::new(|_| {}),
@@ -1373,7 +1404,7 @@ pub(crate) mod tests {
         let binding = coordinator_binding(coordinator.clone(), Arc::clone(&provider));
         let handle = spawn_interactive_with_binding(
             interactive_params(session_id, history),
-            Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) })),
+            Box::new(move |model| Box::pin(async move { Ok(PreparedModel { model, provider }) })),
             None,
             Some(binding),
         );
@@ -1476,7 +1507,9 @@ pub(crate) mod tests {
             }
             let handle = spawn_interactive_with_binding(
                 params,
-                Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) })),
+                Box::new(move |model| {
+                    Box::pin(async move { Ok(PreparedModel { model, provider }) })
+                }),
                 None,
                 Some(binding),
             );
@@ -1737,6 +1770,93 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn failed_reset_restores_history_and_does_not_close_conversation() {
+        smol::block_on(async {
+            let (attempted_tx, attempted_rx) = flume::bounded(1);
+            let checkpoint: Checkpoint = Arc::new(
+                move |request: CheckpointRequest<crate::session_coordinator::SessionCheckpoint>| {
+                    let attempted_tx = attempted_tx.clone();
+                    Box::pin(async move {
+                        attempted_tx
+                            .send_async(request.snapshot.history.clone().unwrap())
+                            .await
+                            .unwrap();
+                        Err(CheckpointError::Save {
+                            session_id: request.session_id,
+                            message: Arc::from(SAVE_ERROR),
+                        })
+                    }) as CheckpointFuture
+                },
+            );
+            let (requests_tx, requests_rx) = flume::unbounded();
+            let (ended_tx, ended_rx) = flume::unbounded();
+            let history = vec![Message::user("kept".into())];
+            let (handle, coordinator) = fixture(
+                history.clone(),
+                checkpoint,
+                Arc::new(EndRecordingProvider {
+                    requests: requests_tx,
+                    ended: ended_tx,
+                }),
+            );
+            let root = handle.initialized_root().await.unwrap();
+            let (reply, response) = flume::bounded(1);
+
+            handle
+                .control_tx
+                .send(InteractiveControl::Reset(reply))
+                .await
+                .unwrap();
+
+            assert!(bounded(response.recv_async()).await.unwrap().is_err());
+            let attempted = bounded(attempted_rx.recv_async()).await.unwrap();
+            assert!(attempted.messages.is_empty());
+            assert_eq!(root.actor().unwrap().committed_history().as_ref(), &history);
+            assert!(requests_rx.is_empty());
+            assert!(ended_rx.is_empty());
+            handle.task.cancel().await;
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn successful_reset_closes_the_sent_conversation() {
+        smol::block_on(async {
+            let (requests_tx, requests_rx) = flume::unbounded();
+            let (ended_tx, ended_rx) = flume::unbounded();
+            let (handle, coordinator) = fixture(
+                Vec::new(),
+                checkpoint(),
+                Arc::new(EndRecordingProvider {
+                    requests: requests_tx,
+                    ended: ended_tx,
+                }),
+            );
+            let root = handle.initialized_root().await.unwrap();
+            let turn = handle.input_tx.admit(first_input()).await.unwrap();
+            bounded(turn.wait()).await;
+            let sent = bounded(requests_rx.recv_async()).await.unwrap();
+            let (reply, response) = flume::bounded(1);
+
+            handle
+                .control_tx
+                .send(InteractiveControl::Reset(reply))
+                .await
+                .unwrap();
+
+            bounded(response.recv_async()).await.unwrap().unwrap();
+            assert_eq!(root.actor().unwrap().committed_message_count(), 0);
+            assert_eq!(
+                bounded(ended_rx.recv_async()).await.unwrap(),
+                (sent.to_string(), ConversationEnd::Closed)
+            );
+            assert!(ended_rx.is_empty());
+            handle.task.cancel().await;
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
     fn reset_is_ordered_after_active_turn() {
         smol::block_on(async {
             let (entered, received) = flume::bounded(1);
@@ -1821,7 +1941,9 @@ pub(crate) mod tests {
             params.config.max_concurrent_agent_turns = 1;
             let handle = spawn_interactive_with_binding(
                 params,
-                Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) })),
+                Box::new(move |model| {
+                    Box::pin(async move { Ok(PreparedModel { model, provider }) })
+                }),
                 None,
                 Some(Box::new(move |manager, root, template| {
                     Box::pin(async move {

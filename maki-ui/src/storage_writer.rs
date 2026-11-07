@@ -151,6 +151,7 @@ impl RequiredHistory {
                 let saved = session.history_snapshot();
                 saved.epoch == history.epoch
                     && saved.compacted == history.compacted
+                    && saved.conversation == history.conversation
                     && Arc::ptr_eq(&history.messages, &saved.messages)
             }
             Self::Child { key, history } => {
@@ -1711,7 +1712,7 @@ mod tests {
     use maki_domain::{Post, PostLevel};
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        AgentError, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
+        AgentError, Invocation, Model, ProviderEvent, RequestOptions, StreamResponse,
     };
     use maki_providers::{Effort, Message};
     use maki_storage::id::SessionRef;
@@ -1754,12 +1755,9 @@ mod tests {
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(std::future::pending())
-        }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-            Box::pin(async { Ok(Vec::new()) })
         }
     }
 

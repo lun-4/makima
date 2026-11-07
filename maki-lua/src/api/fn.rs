@@ -617,11 +617,11 @@ pub(crate) fn deliver_job_event(lua: &Lua, job_id: u32, event: &JobEvent) -> Lua
     Ok(())
 }
 
-/// Check whether {name} can be found on `$PATH` or is an absolute path
-/// to a file. Returns 1 when found, 0 otherwise (matches Neovim's
-/// `vim.fn.executable`).
+/// Check whether {name} can be found on `$PATH` or is a path to a file,
+/// and on Unix whether that file may be executed. Returns 1 when found, 0
+/// otherwise (matches Neovim's `vim.fn.executable`).
 ///
-/// @param name string Program name (e.g. `"git"`) or absolute path.
+/// @param name string Program name (e.g. `"git"`) or path.
 /// @return (integer) `1` if found, `0` otherwise.
 /// @example
 /// if maki.fn.executable("rg") == 1 then
@@ -630,10 +630,23 @@ pub(crate) fn deliver_job_event(lua: &Lua, job_id: u32, event: &JobEvent) -> Lua
 #[lua_fn(guard = Env)]
 fn executable(_lua: &Lua, name: String) -> LuaResult<i32> {
     let found = env::var_os("PATH")
-        .map(|paths| env::split_paths(&paths).any(|dir| dir.join(&name).is_file()))
+        .map(|paths| env::split_paths(&paths).any(|dir| is_executable(&dir.join(&name))))
         .unwrap_or(false)
-        || Path::new(&name).is_file();
+        || is_executable(Path::new(&name));
     Ok(if found { 1 } else { 0 })
+}
+
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
 }
 
 /// Read the viewport of the focused chat transcript, like Neovim's

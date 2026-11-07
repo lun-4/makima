@@ -28,7 +28,7 @@ use maki_agent::{
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
-use maki_providers::{AgentError, Message, Model};
+use maki_providers::{AgentError, Message, Model, ProviderRegistry};
 use maki_storage::id::SessionRef;
 use tracing::{info, warn};
 
@@ -53,6 +53,7 @@ pub(crate) struct TuiActorBackend {
     lua_handle: EventHandle,
     subagent_cancels: Arc<CancelMap<String>>,
     model_policy: Arc<ModelPolicy>,
+    providers: Arc<ProviderRegistry>,
     system_prompt: SystemPromptOverride,
     file_write_locks: Arc<maki_agent::tools::FileWriteLocks>,
     offload: Option<Arc<OffloadStore>>,
@@ -85,6 +86,7 @@ pub(super) fn new_backend(
     lua_handle: EventHandle,
     subagent_cancels: Arc<CancelMap<String>>,
     model_policy: Arc<ModelPolicy>,
+    providers: Arc<ProviderRegistry>,
     system_prompt: SystemPromptOverride,
     file_write_locks: Arc<maki_agent::tools::FileWriteLocks>,
     offload: Option<Arc<OffloadStore>>,
@@ -109,6 +111,7 @@ pub(super) fn new_backend(
         lua_handle,
         subagent_cancels,
         model_policy,
+        providers,
         system_prompt,
         file_write_locks,
         offload,
@@ -146,6 +149,7 @@ impl TuiActorBackend {
                 audience: ToolAudience::MAIN,
                 question_mode: QuestionMode::Tui,
                 model_policy: Arc::clone(&self.model_policy),
+                providers: Arc::clone(&self.providers),
                 file_write_locks: Arc::clone(&self.file_write_locks),
                 offload: self.offload.clone(),
                 managed_turn: None,
@@ -369,6 +373,7 @@ impl TuiActorBackend {
                 audience: ToolAudience::MAIN,
                 question_mode: QuestionMode::Tui,
                 model_policy: Arc::clone(&self.model_policy),
+                providers: Arc::clone(&self.providers),
                 file_write_locks: Arc::clone(&self.file_write_locks),
                 offload: self.offload.clone(),
                 managed_turn: context.managed_turn.clone(),
@@ -481,6 +486,7 @@ impl ActorBackend for TuiActorBackend {
                 EventSender::with_identity(self.agent_tx.clone(), Some(work_identity)).try_send(
                     AgentEvent::ModelSwitched {
                         spec: policy.settings.model.spec(),
+                        context_window: policy.settings.model.context_window,
                     },
                 );
             }
@@ -570,13 +576,18 @@ impl ActorBackend for TuiActorBackend {
             let (provider, model) = maki_agent::agent::resolve_compaction_model(
                 &base_provider,
                 &base_model,
-                self.timeouts,
+                &self.providers,
                 &self.model_policy,
-            );
-            event_tx.try_send(AgentEvent::ModelSwitched { spec: model.spec() });
+            )
+            .await;
+            event_tx.try_send(AgentEvent::ModelSwitched {
+                spec: model.spec(),
+                context_window: model.context_window,
+            });
             let previous = history.snapshot().clone();
             let mut result = maki_agent::agent::compact(
-                &*provider,
+                &provider,
+                &base_provider,
                 &model,
                 history,
                 &event_tx,
@@ -670,7 +681,7 @@ mod tests {
     };
     use maki_config::PermissionsConfig;
     use maki_lua::test_support::run_command;
-    use maki_providers::ContentBlock;
+    use maki_providers::{ContentBlock, Invocation};
     use test_case::test_case;
 
     use super::*;
@@ -1560,6 +1571,7 @@ mod tests {
                 _: &'a flume::Sender<maki_providers::ProviderEvent>,
                 _: maki_providers::RequestOptions,
                 _: Option<&'a SessionRef>,
+                _invocation: &'a Invocation,
             ) -> maki_providers::provider::BoxFuture<
                 'a,
                 Result<maki_providers::StreamResponse, AgentError>,
@@ -1584,14 +1596,6 @@ mod tests {
                         stop_reason: Some(maki_providers::StopReason::EndTurn),
                     })
                 })
-            }
-            fn list_models(
-                &self,
-            ) -> maki_providers::provider::BoxFuture<
-                '_,
-                Result<Vec<maki_providers::ModelInfo>, AgentError>,
-            > {
-                Box::pin(async { Ok(Vec::new()) })
             }
         }
     }
@@ -1702,6 +1706,7 @@ mod tests {
             _: &'a flume::Sender<maki_providers::ProviderEvent>,
             _: maki_providers::RequestOptions,
             _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, AgentError>,
@@ -1721,15 +1726,6 @@ mod tests {
                     stop_reason: Some(maki_providers::StopReason::EndTurn),
                 })
             })
-        }
-
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, AgentError>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
         }
     }
 
@@ -2110,6 +2106,7 @@ mod tests {
             events: &'a flume::Sender<maki_providers::ProviderEvent>,
             _: maki_providers::RequestOptions,
             _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, AgentError>,
@@ -2150,14 +2147,6 @@ mod tests {
                     }),
                 })
             })
-        }
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, AgentError>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
         }
     }
 
@@ -2387,6 +2376,7 @@ mod tests {
             _: &'a flume::Sender<maki_providers::ProviderEvent>,
             _: maki_providers::RequestOptions,
             _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, AgentError>,
@@ -2429,15 +2419,6 @@ mod tests {
                 })
             })
         }
-
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, AgentError>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
-        }
     }
 
     struct CompletionProvider {
@@ -2455,22 +2436,15 @@ mod tests {
             events: &'a flume::Sender<maki_providers::ProviderEvent>,
             options: maki_providers::RequestOptions,
             session: Option<&'a SessionRef>,
+            invocation: &'a Invocation,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, AgentError>,
         > {
             self.requests.send(messages.to_vec()).unwrap();
-            self.inner
-                .stream_message(model, messages, system, tools, events, options, session)
-        }
-
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, AgentError>,
-        > {
-            self.inner.list_models()
+            self.inner.stream_message(
+                model, messages, system, tools, events, options, session, invocation,
+            )
         }
     }
 
@@ -2490,6 +2464,7 @@ mod tests {
             events: &'a flume::Sender<maki_providers::ProviderEvent>,
             _: maki_providers::RequestOptions,
             _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, AgentError>,
@@ -2513,14 +2488,6 @@ mod tests {
                     stop_reason: Some(maki_providers::StopReason::EndTurn),
                 })
             })
-        }
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, AgentError>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
         }
     }
 
@@ -2658,6 +2625,7 @@ mod tests {
             EventHandle::disconnected_for_test(),
             Arc::new(CancelMap::new()),
             Arc::new(ModelPolicy::default()),
+            Arc::default(),
             SystemPromptOverride::default(),
             Arc::new(maki_agent::tools::FileWriteLocks::new()),
             None,
@@ -2817,6 +2785,7 @@ mod tests {
             EventHandle::disconnected_for_test(),
             Arc::new(CancelMap::new()),
             Arc::new(ModelPolicy::default()),
+            Arc::default(),
             SystemPromptOverride::default(),
             Arc::new(maki_agent::tools::FileWriteLocks::new()),
             None,
@@ -3018,20 +2987,12 @@ mod tests {
             _event_tx: &'a flume::Sender<maki_providers::ProviderEvent>,
             _opts: maki_providers::RequestOptions,
             _session_id: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, AgentError>,
         > {
             Box::pin(std::future::pending())
-        }
-
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, AgentError>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
         }
     }
 }

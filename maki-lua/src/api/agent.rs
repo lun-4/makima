@@ -27,7 +27,7 @@ use maki_agent::actor::{
 };
 use maki_agent::agent::{PromptSlotSource, TurnSetup, build_mode_system_prompt, tool_dispatch};
 use maki_agent::cancel::CancelMap;
-use maki_agent::config_change::prepare_model;
+use maki_agent::config_change::{ConfigChangeError, prepare_model, unresolved_model};
 use maki_agent::headless::default_model_preparer;
 use maki_agent::session_coordinator::ModelPreparer;
 use maki_agent::template::env_vars_for;
@@ -117,14 +117,20 @@ fn session_model_preparer(
     agent_ctx: &AgentContext,
     prepare: Option<SessionProviderPreparer>,
 ) -> ModelPreparer {
+    let providers = Arc::clone(&agent_ctx.providers);
     match prepare {
-        Some(prepare) => Arc::new(move |model| {
-            let prepared = prepare(model)
-                .map(|(model, provider)| PreparedModel { model, provider })
-                .map_err(Arc::from);
+        Some(prepare) => Arc::new(move |spec| {
+            let prepared = providers
+                .model(&spec)
+                .map_err(unresolved_model)
+                .and_then(|model| {
+                    prepare(model)
+                        .map(|(model, provider)| PreparedModel { model, provider })
+                        .map_err(|error| ConfigChangeError::ModelPreparation(error.into()))
+                });
             Box::pin(async move { prepared })
         }),
-        None => default_model_preparer(agent_ctx.timeouts),
+        None => default_model_preparer(providers),
     }
 }
 
@@ -223,6 +229,10 @@ impl LuaActorState {
         let event = AgentEvent::SubagentHistory {
             tool_use_id: self.ui_id.clone(),
             history_epoch: snapshot.epoch,
+            conversation_id: snapshot
+                .conversation
+                .as_ref()
+                .map(|conversation| Arc::clone(&conversation.id)),
             messages: snapshot.messages.as_ref().clone(),
         };
         let _ = match self.subagent_info.get() {
@@ -539,11 +549,13 @@ impl ActorBackend for LuaActorBackend {
             let (provider, model) = maki_agent::agent::resolve_compaction_model(
                 &settings.provider,
                 &settings.model,
-                params.timeouts,
+                &params.providers,
                 &params.model_policy,
-            );
+            )
+            .await;
             match maki_agent::agent::compact(
-                &*provider,
+                &provider,
+                &settings.provider,
                 &model,
                 history,
                 &event_tx,
@@ -580,15 +592,24 @@ fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Mode
         return Ok(Model::clone(&ctx.model));
     }
     let slug = &ctx.model.provider;
-    maki_providers::model_registry::spec_for_tier(slug, effective)
-        .or_else(|| maki_providers::model_registry::spec_for_tier_any(effective))
+    ctx.providers
+        .spec_for_tier(slug, effective)
+        .or_else(|| ctx.providers.spec_for_tier_any(effective))
         .filter(|spec| ctx.model_policy.allows(spec))
-        .and_then(|s| Model::from_spec(&s).ok())
+        .and_then(|s| ctx.providers.model(&s).ok())
         .map(Ok)
         .unwrap_or_else(|| {
-            Model::from_tier_with_policy(slug, effective, &ctx.model_policy)
+            ctx.providers
+                .model_for_tier(slug, effective, &ctx.model_policy)
                 .map_err(|e| e.to_string())
         })
+}
+
+fn allowed_model(ctx: &AgentContext, spec: &str) -> Result<Model, ModelError> {
+    if !ctx.model_policy.allows(spec) {
+        return Err(ModelError::NotAllowed(spec.to_string()));
+    }
+    ctx.providers.model(spec)
 }
 
 fn dispatch_ctx<'a>(lua: &Lua, ctx: &'a LuaCtx, method: &str) -> Result<&'a AgentContext, String> {
@@ -670,7 +691,7 @@ async fn resolve_model(
         .and_then(|t| t.get::<Option<String>>("spec").ok().flatten());
 
     let model = match spec_str {
-        Some(ref spec) => try_pair!(Model::from_spec_with_policy(spec, &agent.model_policy)),
+        Some(ref spec) => try_pair!(allowed_model(agent, spec)),
         None => try_pair!(resolve_model_from_ctx(agent, tier_str.as_deref())),
     };
     Ok((Some(crate::api::model::model_table(&lua, &model)?), None))
@@ -769,7 +790,7 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
 
     let parsed = spec_str
         .as_deref()
-        .and_then(|spec| Model::from_spec_with_policy(spec, &agent.model_policy).ok());
+        .and_then(|spec| allowed_model(agent, spec).ok());
     let model = parsed.as_ref().unwrap_or(&agent.model);
 
     let base = match (only, except) {
@@ -1568,6 +1589,7 @@ fn agent_params(
         audience: options.audience,
         question_mode: context.question_mode,
         model_policy: Arc::clone(&context.model_policy),
+        providers: Arc::clone(&context.providers),
         file_write_locks: Arc::clone(&context.file_write_locks),
         offload: context.offload.clone(),
         managed_turn: None,
@@ -2091,7 +2113,7 @@ mod tests {
     };
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
+        AgentError, ContentBlock, Invocation, Message, Model, ProviderEvent, RequestOptions, Role,
         StopReason, StreamResponse, ThinkingConfig, TokenUsage,
     };
     use maki_storage::id::SessionRef;
@@ -2314,15 +2336,12 @@ mod tests {
             _event_tx: &'a flume::Sender<ProviderEvent>,
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 std::future::pending::<()>().await;
                 unreachable!()
             })
-        }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-            Box::pin(async { unimplemented!() })
         }
     }
 
@@ -2377,16 +2396,13 @@ mod tests {
             _event_tx: &'a flume::Sender<ProviderEvent>,
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 let mut replies = self.replies.lock().unwrap();
                 assert!(!replies.is_empty(), "no more canned replies");
                 Ok(replies.remove(0))
             })
-        }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-            Box::pin(async { unimplemented!() })
         }
     }
 
@@ -2470,6 +2486,7 @@ mod tests {
             audience: ToolAudience::GENERAL_SUB,
             question_mode: ctx.question_mode,
             model_policy: Arc::clone(&ctx.model_policy),
+            providers: Arc::clone(&ctx.providers),
             file_write_locks: Arc::clone(&ctx.file_write_locks),
             offload: ctx.offload.clone(),
             managed_turn: None,
@@ -2798,15 +2815,12 @@ mod tests {
                 _event_tx: &'a flume::Sender<ProviderEvent>,
                 _opts: RequestOptions,
                 _session_id: Option<&'a SessionRef>,
+                _invocation: &'a Invocation,
             ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
                 Box::pin(async move {
                     self.0.send(()).unwrap();
                     std::future::pending().await
                 })
-            }
-
-            fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-                Box::pin(async { Ok(Vec::new()) })
             }
         }
         let (started_tx, started_rx) = flume::bounded(1);
@@ -3321,6 +3335,7 @@ mod tests {
             _event_tx: &'a flume::Sender<ProviderEvent>,
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -3331,10 +3346,6 @@ mod tests {
                     Ok(canned_reply("recovered on the same session"))
                 }
             })
-        }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-            Box::pin(async { unimplemented!() })
         }
     }
 
@@ -3444,6 +3455,7 @@ mod tests {
                 event: AgentEvent::SubagentHistory {
                     tool_use_id: "grandchild".into(),
                     history_epoch: 0,
+                    conversation_id: None,
                     messages: Vec::new(),
                 },
                 subagent: Some(grandchild_info),

@@ -1,7 +1,13 @@
 use std::sync::Arc;
 
-use maki_providers::{Model, ModelInfo, model_registry};
+use maki_providers::login::{AuthSpec, AuthStatus, InteractionService};
+use maki_providers::provider::{self, BoxFuture};
+use maki_providers::{
+    AgentError, Model, ModelInfo, PreparedProvider, ProviderBackend, ProviderRegistry,
+    RegisteredProvider,
+};
 use maki_storage::checkpoint::CheckpointPublication;
+use serde_json::Value;
 use test_case::test_case;
 
 use super::{ScriptedBackend, input, policy, spawn, until};
@@ -12,10 +18,9 @@ use crate::actor::{
 use crate::types::TurnCancellationReason;
 use crate::{AgentMode, CancelToken, EventSender, Instructions, TurnOutcome};
 
-const DISCOVERY_PROVIDER: &str = "synthetic";
+const DISCOVERY_PROVIDER: &str = "rediscovery-test";
 const DISCOVERED_MODEL_ID: &str = "rediscovered-config-known";
 const UNDISCOVERED_MODEL_ID: &str = "rediscovered-config-unknown";
-const COLD_PATCH_MODEL_ID: &str = "rediscovered-config-cold-patch";
 const DISCOVERED_WINDOW: u32 = 524_000;
 
 #[test]
@@ -1565,44 +1570,101 @@ fn cancelled_preparation_does_not_block_successors() {
     });
 }
 
+struct EchoBackend;
+
+impl ProviderBackend for EchoBackend {
+    fn prepare(
+        &self,
+        model: Model,
+        _info: ModelInfo,
+    ) -> BoxFuture<'static, Result<PreparedProvider, AgentError>> {
+        Box::pin(async move {
+            Ok(PreparedProvider {
+                model,
+                provider: provider::unconfigured(),
+            })
+        })
+    }
+
+    fn discover(
+        &self,
+        _refresh: bool,
+    ) -> Option<BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>> {
+        None
+    }
+
+    fn login(
+        &self,
+        _method: String,
+        _config: Value,
+        _ui: Arc<dyn InteractionService>,
+    ) -> BoxFuture<'static, Result<Option<String>, AgentError>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn auth_status(
+        &self,
+        _config: Value,
+    ) -> Option<BoxFuture<'static, Result<AuthStatus, AgentError>>> {
+        None
+    }
+
+    fn logout(&self) -> Option<BoxFuture<'static, Result<(), AgentError>>> {
+        None
+    }
+}
+
+/// A registry whose provider lists only {DISCOVERED_MODEL_ID}, with a
+/// window no model built from a bare id has.
+fn discovery_registry() -> ProviderRegistry {
+    ProviderRegistry::new(vec![RegisteredProvider {
+        id: DISCOVERY_PROVIDER.into(),
+        display_name: DISCOVERY_PROVIDER.into(),
+        models: vec![ModelInfo {
+            context_window: Some(DISCOVERED_WINDOW),
+            ..ModelInfo::id_only(DISCOVERED_MODEL_ID.into())
+        }],
+        backend: Arc::new(EchoBackend),
+        auth: AuthSpec::default(),
+        docs: None,
+    }])
+}
+
+fn cold_model(model_id: &str) -> Model {
+    let model = Model::from_info(DISCOVERY_PROVIDER, &ModelInfo::id_only(model_id.into()));
+    assert_ne!(model.context_window, DISCOVERED_WINDOW);
+    model
+}
+
 #[test]
-fn patched_model_takes_discovery_that_lands_after_it_materialized() {
+fn refresh_queued_behind_a_patch_refreshes_the_patched_model() {
     smol::block_on(async {
+        let providers = discovery_registry();
         let (actor, task) = spawn(ScriptedBackend::new());
         let config = EffectiveAgentConfig::new(policy(false), AgentMode::Build);
         let provider = Arc::clone(&config.provider);
         actor.initialize_config(config).unwrap();
-        let cold =
-            Model::from_spec(&format!("{DISCOVERY_PROVIDER}/{COLD_PATCH_MODEL_ID}")).unwrap();
-        assert_ne!(cold.context_window, DISCOVERED_WINDOW);
-        let change = actor.reserve_prepared_operation(None).unwrap();
-        change
+        let patch = actor.reserve_prepared_operation(None).unwrap();
+        patch
             .resolve(Some(ConfigChange::Patch(ConfigPatch {
                 model: Some(crate::PreparedModel {
                     provider,
-                    model: cold,
+                    model: cold_model(DISCOVERED_MODEL_ID),
                 }),
                 ..Default::default()
             })))
             .unwrap();
-        change.wait_ready().await.unwrap();
-        assert_ne!(
-            change.ready_config().unwrap().model.context_window,
-            DISCOVERED_WINDOW
-        );
-        model_registry::set_known_models(
-            DISCOVERY_PROVIDER,
-            vec![ModelInfo {
-                context_window: Some(DISCOVERED_WINDOW),
-                ..ModelInfo::id_only(COLD_PATCH_MODEL_ID.into())
-            }],
-        );
-        let committed = change.commit().unwrap().config;
+        patch.wait_ready().await.unwrap();
+        let refresh = actor.reserve_prepared_operation(None).unwrap();
+        let refreshed = async {
+            let predecessor = refresh.wait_predecessor().await.unwrap();
+            let change = ConfigChange::rediscovered(&predecessor, &providers).await;
+            refresh.commit_when_ready(change).await.unwrap()
+        };
+        let (refreshed, _) =
+            futures_lite::future::zip(refreshed, async { patch.commit().unwrap() }).await;
+        let committed = refreshed.config;
         assert_eq!(committed.config.model.context_window, DISCOVERED_WINDOW);
-        assert_eq!(
-            actor.effective_config().unwrap().model.context_window,
-            DISCOVERED_WINDOW
-        );
         actor.close();
         task.await;
     });
@@ -1612,18 +1674,10 @@ fn patched_model_takes_discovery_that_lands_after_it_materialized() {
 #[test_case(UNDISCOVERED_MODEL_ID, None ; "undiscovered_model_is_unchanged")]
 fn rediscovered_refreshes_only_changed_models(model_id: &str, expected: Option<u32>) {
     let mut settings = policy(false);
-    settings.model = Model::from_spec(&format!("{DISCOVERY_PROVIDER}/{model_id}")).unwrap();
-    assert_ne!(settings.model.context_window, DISCOVERED_WINDOW);
-    model_registry::set_known_models(
-        DISCOVERY_PROVIDER,
-        vec![ModelInfo {
-            context_window: Some(DISCOVERED_WINDOW),
-            ..ModelInfo::id_only(DISCOVERED_MODEL_ID.into())
-        }],
-    );
+    settings.model = cold_model(model_id);
     let config = EffectiveAgentConfig::new(settings, AgentMode::Build);
 
-    let change = ConfigChange::rediscovered(&config);
+    let change = smol::block_on(ConfigChange::rediscovered(&config, &discovery_registry()));
 
     let window = change.map(|change| {
         let ConfigChange::Refresh {

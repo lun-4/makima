@@ -26,6 +26,7 @@ use maki_agent::tools::{
 use maki_agent::{
     BufferSnapshot, CurrentManagedTurn, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle,
 };
+use maki_providers::{ProviderRegistry, Timeouts};
 use maki_storage::checkpoint::CheckpointPublication;
 use mlua::{
     Chunk, ChunkMode, Compiler, Function, Lua, MultiValue, RegistryKey, Table, Value as LuaValue,
@@ -53,6 +54,7 @@ use crate::api::fs::FsBackend;
 use crate::api::keymap::KeymapReader;
 use crate::api::keymap::{KeymapStore, KeymapWriter, PendingKeymaps};
 use crate::api::options::{PluginOptionSpecs, PluginOpts, collect_plugin_options};
+use crate::api::provider::{PendingProviders, ProviderStore};
 use crate::api::session_option::{
     PendingSessionOptions, SessionOptionStore, SessionOptionValidation, SessionOptionValidators,
     activate_pending as activate_session_options, commit_catalog as commit_session_option_catalog,
@@ -80,6 +82,7 @@ use crate::docs_render;
 use crate::error::PluginError;
 use crate::orchestration::TrustedTarget;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
+use crate::provider::ProviderJob;
 
 const INTERRUPT_SHUTDOWN_MSG: &str = "plugin interrupted: host shutting down";
 const INTERRUPT_CANCELLED_MSG: &str = "plugin interrupted: task cancelled";
@@ -302,6 +305,15 @@ pub enum Request {
     },
     CollectPluginOptions {
         reply: flume::Sender<PluginOptionSpecs>,
+    },
+    BuildProviderRegistry {
+        timeouts: Timeouts,
+        reply: flume::Sender<Arc<ProviderRegistry>>,
+    },
+    /// One call into a Lua provider, ended by `cancel`.
+    Provider {
+        job: ProviderJob,
+        cancel: CancelToken,
     },
     Shutdown,
     RestoreToolAsync {
@@ -1307,7 +1319,7 @@ async fn run_command_completion_scoped<F: Future>(
     result
 }
 
-async fn run_scoped<F: Future>(lua: &Lua, scope: TaskScope, fut: F) -> F::Output {
+pub(crate) async fn run_scoped<F: Future>(lua: &Lua, scope: TaskScope, fut: F) -> F::Output {
     let handle = Arc::clone(scope.handle());
     let pump = async {
         let mut event_buf = Vec::new();
@@ -2774,6 +2786,8 @@ impl LuaRuntime {
         lua.set_app_data(maki_config::ClockFormat::default());
         lua.set_app_data(TimerStore::new());
         lua.set_app_data(Store::default());
+        lua.set_app_data(ProviderStore::default());
+        lua.set_app_data(crate::credentials::RefreshFlights::default());
         let layered: Arc<LayeredTools> = Arc::default();
         lua.set_app_data(SlotStore::new(Arc::clone(&layered)));
         registry.set_hook(crate::hook::SlotHook {
@@ -2936,6 +2950,9 @@ impl LuaRuntime {
         });
         if let Some(mut store) = self.lua.app_data_mut::<PluginOptionSpecs>() {
             store.remove(name);
+        }
+        if let Some(mut store) = self.lua.app_data_mut::<ProviderStore>() {
+            store.clear_plugin(name);
         }
         if let Some(mut store) = self.lua.app_data_mut::<AutocmdStore>() {
             store.clear_plugin(name);
@@ -3540,6 +3557,7 @@ impl LuaRuntime {
             .app_data_ref::<SessionOptionStore>()
             .map_or(1, |store| store.next_generation(&name));
         let pending_session_options = PendingSessionOptions::new(Arc::clone(&name), generation);
+        let pending_providers = PendingProviders::default();
         let context = PluginLoadContext {
             pending: Arc::clone(&self.pending),
             pending_rules: Arc::clone(&pending_rules),
@@ -3555,6 +3573,7 @@ impl LuaRuntime {
             pending_slots: Arc::clone(&pending_slots),
             pending_prompts: Arc::clone(&pending_prompts),
             pending_hint: Arc::clone(&pending_hint),
+            pending_providers: Arc::clone(&pending_providers),
         };
         let maki = create_maki_global(
             &self.lua,
@@ -3866,6 +3885,7 @@ impl LuaRuntime {
             }
         }
         self.commit_pending_store(&name, pending_store);
+        crate::api::provider::commit_pending(&self.lua, &name, &pending_providers);
         self.commit_pending_options(&name, pending_options);
         self.commit_pending_completion(&name, pending_sources, pending_expanders);
         with_jobs(&self.lua, |store| {
@@ -5372,6 +5392,22 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                         Request::CollectPluginOptions { reply } => {
                             let _ = reply.send(collect_plugin_options(&rt.lua));
                         }
+                        Request::BuildProviderRegistry { timeouts, reply } => {
+                            let registry = Arc::new(crate::provider::build_registry(
+                                &rt.lua, &rt.tx, timeouts,
+                            ));
+                            rt.lua.set_app_data(Arc::clone(&registry));
+                            let _ = reply.send(registry);
+                        }
+                        Request::Provider { job, cancel } => {
+                            let lua = rt.lua.clone();
+                            ex.spawn(async move {
+                                let scope =
+                                    TaskScope::new(&lua, TaskCell::new(cancel.clone(), None, None));
+                                let _ = run_scoped(&lua, scope, cancel.race(job(lua.clone()))).await;
+                            })
+                            .detach();
+                        }
                         Request::RestoreToolAsync { item, event_tx } => {
                             spawn_restore(&ex, &gate, &restores, &rt, item, event_tx);
                         }
@@ -5698,17 +5734,22 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                 .map_or(Ok(()), |option| {
                                     validate_option_value(&rt.lua, option, &value)
                                 });
-                            let result = match validation {
-                                Ok(()) => coordinator
-                                    .set_option_if_version(id, value, Some(snapshot.version))
-                                    .await
-                                    .map_err(Into::into),
-                                Err(error) => Err(
-                                    maki_agent::config_change::ConfigChangeError::from(error)
-                                        .into(),
-                                ),
-                            };
-                            let _ = reply.send(result);
+                            // Detached: a model change prepares its provider,
+                            // and a Lua provider's prepare runs on this loop.
+                            ex.spawn(async move {
+                                let result = match validation {
+                                    Ok(()) => coordinator
+                                        .set_option_if_version(id, value, Some(snapshot.version))
+                                        .await
+                                        .map_err(Into::into),
+                                    Err(error) => Err(
+                                        maki_agent::config_change::ConfigChangeError::from(error)
+                                            .into(),
+                                    ),
+                                };
+                                let _ = reply.send(result);
+                            })
+                            .detach();
                         }
                     }
                 }

@@ -1,3 +1,5 @@
+pub(crate) mod send;
+
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, LazyLock};
@@ -12,8 +14,8 @@ use mlua::{Lua, Result as LuaResult, Table};
 use smol::{Timer, unblock};
 use url::Url;
 
+use crate::api::net::send::{send__doc, send__register};
 use crate::api::util::pair::{Pair, try_pair};
-
 use crate::plugin_permissions::PluginPermissions;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -31,6 +33,7 @@ const HTTP_PORT: u16 = 80;
 const HTTPS_PORT: u16 = 443;
 const DNS_ATTEMPTS: u32 = 3;
 const DNS_RETRY_DELAY: Duration = Duration::from_millis(150);
+pub(crate) const NON_HTTP_URL_ERR: &str = "URL must be http or https";
 const ALLOWLIST_HINT: &str = "add it to `net.allowed_private_hosts` in your init.lua to allow it";
 /// Reserved IPv4 ranges the standard library has no predicate for. Carrier
 /// grade NAT is the one that bites: Alibaba Cloud parks its instance metadata
@@ -241,19 +244,31 @@ async fn request(lua: Lua, url: String, opts: Option<Table>) -> LuaResult<Pair<T
 }
 
 lua_table! {
-    /// HTTP client for fetching web content. All traffic goes over HTTPS
-    /// (plain HTTP is upgraded). Private and metadata IP addresses are
-    /// blocked to prevent SSRF, including after a redirect. Hosts listed in
-    /// the `net.allowed_private_hosts` config option are exempt.
-    /// Failed requests (5xx) are retried automatically.
+    /// HTTP clients: a guarded `request` for web content and a raw, streaming
+    /// `send` for trusted plugin code.
+    ///
+    /// With `request`, all traffic goes over HTTPS (plain HTTP is upgraded),
+    /// private and metadata IP addresses are blocked to prevent SSRF,
+    /// including after a redirect, and failed requests (5xx) are retried.
+    /// Hosts listed in the `net.allowed_private_hosts` config option are
+    /// exempt from the block. `send` has none of these guards.
     ///
     /// ```lua
     /// local res, err = maki.net.request("https://example.com")
     /// if res then print(res.body) end
     /// ```
     "maki.net" => pub(crate) fn create_net_table(perms: &PluginPermissions), DOCS [
-        request(perms),
+        request(perms), send(perms),
     ]
+}
+
+/// Parses {url}, accepting only `http` and `https`.
+pub(crate) fn parse_http_url(url: &str) -> Result<Url, String> {
+    let parsed = Url::parse(url).map_err(|e| format!("invalid URL {url}: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => Ok(parsed),
+        scheme => Err(format!("{NON_HTTP_URL_ERR}, got {scheme}: {url}")),
+    }
 }
 
 async fn extract_request_params(url: &str, opts: Option<&Table>) -> Result<RequestParams, String> {

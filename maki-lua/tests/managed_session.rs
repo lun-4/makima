@@ -20,7 +20,7 @@ use maki_lua::agent_errors::{INVOCATION_EXPIRED, TURN_WAIT_TIMEOUT};
 use maki_lua::test_support::InMemoryFs;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    AgentError, ContentBlock, Message, Model, ModelInfo, ObservationSource, ProviderEvent,
+    AgentError, ContentBlock, Invocation, Message, Model, ObservationSource, ProviderEvent,
     RequestOptions, Role, StreamResponse,
 };
 use maki_storage::id::SessionRef;
@@ -789,6 +789,7 @@ impl Provider for NestedRecordingProvider {
         _: &'a flume::Sender<ProviderEvent>,
         opts: RequestOptions,
         _: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             self.requests.send((model.spec(), opts)).unwrap();
@@ -798,10 +799,6 @@ impl Provider for NestedRecordingProvider {
                 Ok(common::canned_reply(NESTED_RESULT))
             }
         })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
     }
 }
 
@@ -815,15 +812,12 @@ impl Provider for RecordingProvider {
         _: &'a flume::Sender<ProviderEvent>,
         opts: RequestOptions,
         _: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             self.requests.send((model.spec(), opts)).unwrap();
             Ok(common::canned_reply(SILENT_REPLY))
         })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
     }
 }
 
@@ -1022,16 +1016,13 @@ impl Provider for PendingProvider {
         _: &'a flume::Sender<ProviderEvent>,
         _: RequestOptions,
         _: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let _signal = DropSignal(self.dropped.clone());
             std::future::pending::<()>().await;
             unreachable!()
         })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
     }
 }
 
@@ -1164,6 +1155,7 @@ impl Provider for AutoDeliveryProvider {
         _: &'a flume::Sender<ProviderEvent>,
         _: RequestOptions,
         _: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             if !messages
@@ -1199,10 +1191,6 @@ impl Provider for AutoDeliveryProvider {
                 }),
             }
         })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
     }
 }
 
@@ -1459,6 +1447,7 @@ impl Provider for ScriptedTaskProvider {
         _: &'a flume::Sender<ProviderEvent>,
         _: RequestOptions,
         _: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             if !messages
@@ -1501,10 +1490,6 @@ impl Provider for ScriptedTaskProvider {
                 }),
             }
         })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
     }
 }
 

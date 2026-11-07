@@ -1,8 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use maki_providers::provider::adjust_model;
-use maki_providers::{Model, ModelCapabilities, Timeouts};
+use maki_providers::{ModelCapabilities, ProviderRegistry};
 use tracing::debug;
 
 type Resolve = Box<dyn Fn(&str) -> ModelCapabilities + Send + Sync>;
@@ -39,10 +38,10 @@ impl ModelCapabilityCache {
     }
 
     pub(crate) fn provider_adjusted(
-        timeouts: Timeouts,
+        providers: Arc<ProviderRegistry>,
         notify: impl Fn() + Send + Sync + 'static,
     ) -> Arc<Self> {
-        Self::new(move |spec| provider_adjusted(spec, timeouts), notify)
+        Self::new(move |spec| provider_adjusted(spec, &providers), notify)
     }
 
     /// Returns the cached capabilities of `spec`, or starts resolving them.
@@ -112,14 +111,17 @@ impl ModelCapabilityCache {
 /// Falls back to the static capabilities when the provider cannot be built,
 /// so a broken provider shows what the model table knows instead of loading
 /// forever. Applying the selection still validates against the real provider.
-fn provider_adjusted(spec: &str, timeouts: Timeouts) -> ModelCapabilities {
-    let Ok(mut model) = Model::from_spec(spec) else {
+fn provider_adjusted(spec: &str, providers: &ProviderRegistry) -> ModelCapabilities {
+    let Ok(model) = providers.model(spec) else {
         return ModelCapabilities::NONE;
     };
-    if let Err(error) = adjust_model(&mut model, timeouts) {
-        debug!(spec, %error, "model capabilities fall back to static metadata");
+    match smol::block_on(providers.prepare(model.clone())) {
+        Ok(prepared) => ModelCapabilities::from(&prepared.model),
+        Err(error) => {
+            debug!(spec, %error, "model capabilities fall back to static metadata");
+            ModelCapabilities::from(&model)
+        }
     }
-    ModelCapabilities::from(&model)
 }
 
 #[cfg(test)]

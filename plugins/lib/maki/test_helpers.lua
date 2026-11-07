@@ -45,6 +45,103 @@ function M.rmtree(dir)
   maki.fs.rm(dir, { recursive = true })
 end
 
+-- A scripted `maki.net.send` response that yields {chunks} in order. A
+-- `read_error` is returned once the chunks run out instead of the end.
+function M.response(chunks, opts)
+  opts = opts or {}
+  local index = 0
+  local response = { status = opts.status or 200, headers = opts.headers or {}, closed = false }
+  function response:read()
+    index += 1
+    if chunks[index] then
+      return chunks[index]
+    end
+    return nil, opts.read_error
+  end
+  function response:close()
+    self.closed = true
+  end
+  return response
+end
+
+-- A provider `ctx` whose `send` records each request and returns the next of
+-- {responses}, and whose credentials live in memory. `refresh` and `lock`
+-- run their function at once, without a lock.
+function M.provider_ctx(responses, saved)
+  local ctx = { id = "test", requests = {}, saved = saved }
+  ctx.send = function(request)
+    ctx.requests[#ctx.requests + 1] = request
+    return table.remove(responses, 1)
+  end
+  ctx.credentials = {
+    read = function()
+      return ctx.saved
+    end,
+    write = function(_, value)
+      ctx.saved = value
+      return true
+    end,
+    delete = function()
+      local existed = ctx.saved ~= nil
+      ctx.saved = nil
+      return existed
+    end,
+    refresh = function(_, fn)
+      local value, err = fn(ctx.saved)
+      if value == nil and err ~= nil then
+        return nil, err
+      end
+      if value ~= nil then
+        ctx.saved = value
+      end
+      return ctx.saved
+    end,
+    lock = function(_, fn)
+      return fn()
+    end,
+  }
+  return ctx
+end
+
+-- An `emit` for provider streams, plus the list it records into.
+function M.recorder()
+  local events = {}
+  return function(event)
+    events[#events + 1] = event
+    return true
+  end, events
+end
+
+-- Runs {fn} with `maki.uv.os_getenv` reading from {env} instead.
+function M.with_env(env, fn)
+  local getenv = maki.uv.os_getenv
+  maki.uv.os_getenv = function(name)
+    return env[name]
+  end
+  local ok, err = pcall(fn)
+  maki.uv.os_getenv = getenv
+  if not ok then
+    error(err, 0)
+  end
+end
+
+-- Compares JSON-like values structurally.
+function M.same(actual, expected, path)
+  path = path or "value"
+  if type(expected) ~= "table" or type(actual) ~= "table" then
+    M.eq(actual, expected, path)
+    return
+  end
+  for key, value in pairs(expected) do
+    M.same(actual[key], value, path .. "." .. tostring(key))
+  end
+  for key in pairs(actual) do
+    if expected[key] == nil then
+      error(path .. ": unexpected key " .. tostring(key))
+    end
+  end
+end
+
 function M.report()
   if #failures > 0 then
     error(#failures .. " case(s) failed:\n\n" .. table.concat(failures, "\n\n"))

@@ -14,7 +14,7 @@ Rules come from four layers, combined for resolution:
 1. **Session rules**, set during the current session (in-memory only)
 2. **Config rules**, loaded from TOML permission files
 3. **Builtin rules**, the hardcoded defaults
-4. **Plugin rules**, declared by plugins via [`maki.api.register_permission_rule`](/lua-api/#maki-api-register_permission_rule)
+4. **Plugin rules**, declared by plugins via [`maki.api.register_permission_rule`](/docs/lua-api/#maki-api-register_permission_rule)
 
 Any matching deny blocks the tool. No exceptions, so a config deny always beats a plugin allow.
 
@@ -251,13 +251,15 @@ The permission prompt's actions are clickable, including the confirm and deny-ed
 
 ## Plugin Permissions
 
-Lua plugins have a separate, unrelated gate. A `plugin.toml` manifest next to the Lua file controls which gated `maki.*` APIs it may call. No manifest means every gated call is denied, including for your own `init.lua`. The [Lua API reference](/lua-api/#plugin-permissions) documents the manifest and lists every permission.
+Lua plugins have a separate, unrelated gate. A `plugin.toml` manifest next to the Lua file controls which gated `maki.*` APIs it may call. No manifest means every gated call is denied, including for your own `init.lua`. The [Lua API reference](/docs/lua-api/#plugin-permissions) documents the manifest and lists every permission.
 
 ## Network Addresses
 
-`webfetch`, `websearch` and every plugin that calls `maki.net` go through one guard. A request to a private, loopback or link-local address is refused, and so is a redirect that lands on one. The model picks these URLs, so a page it reads could otherwise talk it into fetching `http://169.254.169.254/` or an admin panel on your LAN.
+`webfetch`, `websearch` and every plugin that calls `maki.net.request` go through one guard. A request to a private, loopback or link-local address is refused, and so is a redirect that lands on one. The model picks these URLs, so a page it reads could otherwise talk it into fetching `http://169.254.169.254/` or an admin panel on your LAN.
 
 To reach a service on your own machine or network, list it in [`net.allowed_private_hosts`](/docs/configuration/#net). An allowed host also keeps plain `http://` instead of being upgraded to `https://`, since a service on your LAN rarely has a certificate.
+
+Providers do not go through this guard. They use `maki.net.send`, which reaches any address, because their URLs come from provider code and your config, not from the model: Ollama on `localhost`, a llama.cpp box on your LAN, or the cloud metadata server that Vertex and Bedrock read credentials from. `send` needs the `net` plugin permission like `request` does. A plugin should never hand it a URL the model chose. The [Lua API reference](/docs/lua-api/#maki-net) compares the two.
 
 ## Session Persistence
 

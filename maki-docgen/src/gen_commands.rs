@@ -252,7 +252,7 @@ pub fn generate() -> color_eyre::Result<String> {
     .unwrap();
     writeln!(
         out,
-        "- **`/fast`**: faster responses on Anthropic Opus, and on eligible Codex models when you sign in with a ChatGPT subscription. OpenAI API keys and every other model ignore it. Config: `always_fast = true`."
+        "- **`/fast`**: toggle fast mode when the selected model reports support for it. Availability can depend on the provider, model, and signed-in account. Config: `always_fast = true`."
     )
     .unwrap();
     writeln!(

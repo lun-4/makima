@@ -44,9 +44,9 @@ use crate::{
     AgentConfig, AgentId, AgentMode, CurrentManagedTurn, EventSender, RunLedger, SharedBuf,
 };
 use maki_config::{ModelPolicy, ToolOutputLines};
-use maki_providers::Model;
 use maki_providers::RequestOptions;
 use maki_providers::provider::Provider;
+use maki_providers::{Invocation, Model, ModelInfo, ProviderRegistry};
 use maki_storage::id::SessionRef;
 
 pub struct DescriptionContext<'a> {
@@ -235,6 +235,9 @@ pub(crate) const DEADLINE_EXCEEDED: &str = "timeout exceeded";
 /// Both cross threads, so a loaded machine needs seconds here; a shorter window
 /// throws away partial output a slow scheduler was about to deliver.
 pub const TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(5);
+/// Provider and model id of the placeholder model a context without a model
+/// carries.
+const NO_MODEL: &str = "none";
 
 #[derive(Clone, Copy, Debug, Default)]
 pub enum Deadline {
@@ -498,6 +501,7 @@ pub struct ToolContext {
     /// it for its own call only.
     pub live_sink: Option<flume::Sender<ToolLive>>,
     pub model_policy: Arc<ModelPolicy>,
+    pub providers: Arc<ProviderRegistry>,
     /// Shared same-process per-path mutation locks for every context cloned
     /// from this one (batch siblings, subagents, recursive `call_tool`). See
     /// [`FileWriteLocks`].
@@ -836,13 +840,8 @@ impl Provider for NullProvider {
         _: &'a flume::Sender<ProviderEvent>,
         _: RequestOptions,
         _: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
-        Box::pin(async { unimplemented!() })
-    }
-
-    fn list_models(
-        &self,
-    ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, crate::AgentError>> {
         Box::pin(async { unimplemented!() })
     }
 }
@@ -857,8 +856,12 @@ pub fn interpreter_ctx(
     cwd: PathBuf,
 ) -> ToolContext {
     static PROVIDER: LazyLock<Arc<dyn Provider>> = LazyLock::new(|| Arc::new(NullProvider));
-    static MODEL: LazyLock<Arc<Model>> =
-        LazyLock::new(|| Arc::new(Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap()));
+    static MODEL: LazyLock<Arc<Model>> = LazyLock::new(|| {
+        Arc::new(Model::from_info(
+            NO_MODEL,
+            &ModelInfo::id_only(NO_MODEL.into()),
+        ))
+    });
     let modes = Arc::new(crate::ModeRegistry::builtin());
     ToolContext {
         execution_agent_id: None,
@@ -903,6 +906,7 @@ pub fn interpreter_ctx(
         local_tool_capture: None,
         live_sink: None,
         model_policy: Arc::new(ModelPolicy::default()),
+        providers: Arc::default(),
         file_write_locks: Arc::new(FileWriteLocks::new()),
         offload: None,
         pending_output_limits: None,
@@ -1183,7 +1187,7 @@ mod tests {
     #[test_case(false ; "text_only_model_loses_view_image")]
     fn from_config_gates_view_image_on_vision(vision: bool) {
         let mut model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
-        model.supports_vision_override = Some(vision);
+        model.vision = Some(vision);
         let filter = ToolFilter::from_config(&AgentConfig::default(), &model, &[]);
         assert_eq!(filter.matches(VIEW_IMAGE_TOOL_NAME), vision);
         assert!(

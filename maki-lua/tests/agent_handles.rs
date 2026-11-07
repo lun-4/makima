@@ -34,7 +34,7 @@ use maki_lua::{
     test_support::{InMemoryFs, run_command},
 };
 use maki_providers::{
-    AgentError, ContentBlock, Effort, Message, Model, ModelInfo, ObservationSource, ProviderEvent,
+    AgentError, ContentBlock, Effort, Invocation, Message, Model, ObservationSource, ProviderEvent,
     RequestOptions, Role, StreamResponse, ThinkingConfig,
     provider::{BoxFuture, Provider},
 };
@@ -220,8 +220,9 @@ fn gated_config_mutations(
             *committed.lock().unwrap() = Some(Arc::clone(&config));
             handle.bind_actor(
                 target.clone(),
-                Arc::new(move |model| {
+                Arc::new(move |spec| {
                     let provider = Arc::clone(&provider);
+                    let model = Model::from_spec(&spec).unwrap();
                     Box::pin(
                         async move { Ok(maki_agent::actor::PreparedModel { model, provider }) },
                     )
@@ -374,6 +375,7 @@ impl Provider for ScriptedProvider {
         _: &'a flume::Sender<ProviderEvent>,
         options: RequestOptions,
         _: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let (reply, response) = flume::bounded(1);
@@ -393,10 +395,6 @@ impl Provider for ScriptedProvider {
                 message: "scripted response gate closed".into(),
             })
         })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
     }
 }
 

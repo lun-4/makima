@@ -2,10 +2,14 @@
 //! changing an agent's model goes through its `Agent` handle.
 
 use maki_lua_macro::{lua_fn, lua_table};
-use maki_providers::{Model, ThinkingConfig};
+use std::sync::Arc;
+
+use maki_providers::{Model, ProviderRegistry, ThinkingConfig};
 use mlua::{Lua, Result as LuaResult, Table};
 
 use crate::api::util::pair::{Pair, err_pair};
+
+const REGISTRY_UNAVAILABLE: &str = "provider registry unavailable";
 
 /// Describes a model by spec without addressing any agent. Unknown specs
 /// return an error.
@@ -19,7 +23,10 @@ use crate::api::util::pair::{Pair, err_pair};
 /// local info = assert(maki.model.info("anthropic/claude-sonnet-4-20250514"))
 #[lua_fn]
 fn info(lua: &Lua, spec: String) -> LuaResult<Pair<Table>> {
-    let model = match Model::from_spec(&spec) {
+    let Some(providers) = lua.app_data_ref::<Arc<ProviderRegistry>>() else {
+        return Ok(err_pair(REGISTRY_UNAVAILABLE));
+    };
+    let model = match providers.model(&spec) {
         Ok(model) => model,
         Err(error) => return Ok(err_pair(error.to_string())),
     };
@@ -69,17 +76,52 @@ lua_table! {
 mod tests {
     use super::*;
     use crate::api::util::convert::lua_to_json;
+    use maki_providers::test_util::offline_registry;
+    use maki_providers::{FastSupport, ModelInfo, ModelPricing};
     use mlua::Value;
 
-    const SPEC: &str = "anthropic/claude-opus-4-6";
+    const SPEC: &str = "priced/model";
+    const CONTEXT_WINDOW: u32 = 42_000;
+    const INPUT_RATE: f64 = 5.0;
+    const CACHE_READ_RATE: f64 = 0.5;
 
     #[test]
-    fn info_describes_the_model_registry_entry() {
+    fn info_without_registry_reports_it_unavailable() {
         let lua = Lua::new();
         lua.globals()
             .set("model", create_model_table(&lua).unwrap())
             .unwrap();
-        let model = Model::from_spec(SPEC).unwrap();
+        let (info, err): (Value, Option<String>) = smol::block_on(
+            lua.load(format!("return model.info({SPEC:?})"))
+                .eval_async(),
+        )
+        .unwrap();
+        assert!(info.is_nil());
+        assert_eq!(err.as_deref(), Some(REGISTRY_UNAVAILABLE));
+    }
+
+    #[test]
+    fn info_describes_the_model_registry_entry() {
+        let lua = Lua::new();
+        let (provider, id) = Model::parse_spec(SPEC).unwrap();
+        let registry = offline_registry(vec![(
+            provider,
+            vec![ModelInfo {
+                context_window: Some(CONTEXT_WINDOW),
+                supports_fast: Some(FastSupport::Supported),
+                pricing: Some(ModelPricing {
+                    input: INPUT_RATE,
+                    cache_read: CACHE_READ_RATE,
+                    ..ModelPricing::ZERO
+                }),
+                ..ModelInfo::id_only(id.into())
+            }],
+        )]);
+        let model = registry.model(SPEC).unwrap();
+        lua.set_app_data(Arc::new(registry));
+        lua.globals()
+            .set("model", create_model_table(&lua).unwrap())
+            .unwrap();
         let (info, err): (Value, Option<String>) = smol::block_on(
             lua.load(format!("return model.info({SPEC:?})"))
                 .eval_async(),

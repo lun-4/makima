@@ -124,7 +124,7 @@ pub struct RetryState {
     /// Keys left to try, which is not a budget: a fresh key cures a different
     /// problem than waiting does, so a rotation costs no time and no retry.
     ///
-    /// Counted per request because `KeyPool`'s index is shared. Two turns
+    /// Counted per request because a provider's key index is shared. Two turns
     /// rotating at once shove that index around, and neither could tell it had
     /// been all the way around the pool. A local count bounds the walk
     /// regardless: the worst a jumping index costs is a skipped key, never a

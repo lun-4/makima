@@ -11,7 +11,7 @@ use maki_agent::{ActorBackend, AgentLimits, AgentManagerHandle};
 use maki_lua::PluginHost;
 use maki_lua::orchestration::TrustedTarget;
 use maki_lua::test_support::run_command;
-use maki_providers::{Effort, Model, ThinkingConfig};
+use maki_providers::{Effort, Model, ThinkingConfig, ThinkingSupport};
 use serde_json::{Value, json};
 
 mod common;
@@ -99,7 +99,10 @@ fn thinking_clamped_to_off_for_non_supporting_model() {
     let provider = Arc::new(CannedProvider::new(vec![canned_reply("ok")]));
     let (mut ctx, _rx, _trigger) = ctx_with_provider(Arc::clone(&provider));
     ctx.opts.thinking = ThinkingConfig::Effort(Effort::High);
-    let non_thinking = Arc::new(Model::from_spec("copilot/gpt-5-mini").unwrap());
+    let non_thinking = Arc::new(Model {
+        thinking_support: Some(ThinkingSupport::No),
+        ..Model::from_spec("ollama/qwen3").unwrap()
+    });
     assert!(
         !non_thinking.supports_thinking(),
         "fixture model must not support thinking"
