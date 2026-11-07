@@ -2113,8 +2113,8 @@ mod tests {
     };
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        AgentError, ContentBlock, Invocation, Message, Model, ProviderEvent, RequestOptions, Role,
-        StopReason, StreamResponse, ThinkingConfig, TokenUsage,
+        AgentError, ContentBlock, Invocation, Message, Model, ProviderEvent, RequestDelivery,
+        RequestOptions, Role, StopReason, StreamResponse, ThinkingConfig, TokenUsage,
     };
     use maki_storage::id::SessionRef;
     use serde_json::{Value, json};
@@ -2337,6 +2337,7 @@ mod tests {
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
             _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 std::future::pending::<()>().await;
@@ -2397,6 +2398,7 @@ mod tests {
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
             _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 let mut replies = self.replies.lock().unwrap();
@@ -2816,6 +2818,7 @@ mod tests {
                 _opts: RequestOptions,
                 _session_id: Option<&'a SessionRef>,
                 _invocation: &'a Invocation,
+                _delivery: RequestDelivery,
             ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
                 Box::pin(async move {
                     self.0.send(()).unwrap();
@@ -3336,6 +3339,7 @@ mod tests {
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
             _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {

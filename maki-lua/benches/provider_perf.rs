@@ -15,8 +15,8 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use maki_agent::tools::ToolRegistry;
 use maki_lua::PluginHost;
 use maki_providers::{
-    ContentBlock, Invocation, InvocationPurpose, Message, PreparedProvider, RequestOptions, Role,
-    Timeouts,
+    ContentBlock, Invocation, InvocationPurpose, Message, PreparedProvider, RequestDelivery,
+    RequestOptions, Role, Timeouts,
 };
 use serde_json::{Value, json};
 
@@ -138,6 +138,7 @@ fn provider_request(c: &mut Criterion) {
                         RequestOptions::default(),
                         None,
                         &invocation,
+                        RequestDelivery::untracked(),
                     ))
                     .unwrap()
                 });

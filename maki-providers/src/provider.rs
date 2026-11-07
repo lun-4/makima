@@ -12,8 +12,8 @@ use maki_storage::id::SessionRef;
 use crate::model::Model;
 use crate::retry::RetryPolicy;
 use crate::{
-    AgentError, ConversationEnd, Invocation, Message, ProviderEvent, ProviderUsage, RequestOptions,
-    StreamResponse,
+    AgentError, ConversationEnd, Invocation, Message, ProviderEvent, ProviderUsage,
+    RequestDelivery, RequestOptions, StreamResponse,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -60,6 +60,7 @@ pub trait Provider: Send + Sync {
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
         invocation: &'a Invocation,
+        delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>>;
 
     /// Fetch provider-side usage quota (remaining percentage / reset times).
@@ -118,6 +119,7 @@ impl Provider for UnconfiguredProvider {
         _opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
         _invocation: &'a Invocation,
+        _delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async {
             Err(AgentError::Config {

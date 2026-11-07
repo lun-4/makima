@@ -6,6 +6,7 @@ pub mod model_registry;
 pub mod pricing;
 pub mod provider;
 pub mod registry;
+pub(crate) mod request_delivery;
 pub mod retry;
 pub mod selection;
 #[cfg(any(test, feature = "test-util"))]
@@ -26,6 +27,7 @@ pub use registry::{
     PreparedProvider, ProviderBackend, ProviderDocs, ProviderListing, ProviderRegistry,
     RegisteredProvider,
 };
+pub use request_delivery::{RequestDelivery, RequestDeliveryMarker, RequestDeliveryTracker};
 pub use retry::{RetryKind, RetryPolicy, RetryState};
 pub use selection::{
     CompleteModelSelection, FAST_VALUES, MODEL_FAST_KEY, MODEL_SPEC_KEY, MODEL_THINKING_KEY,

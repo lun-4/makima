@@ -35,7 +35,7 @@ use maki_lua::{
 };
 use maki_providers::{
     AgentError, ContentBlock, Effort, Invocation, Message, Model, ObservationSource, ProviderEvent,
-    RequestOptions, Role, StreamResponse, ThinkingConfig,
+    RequestDelivery, RequestOptions, Role, StreamResponse, ThinkingConfig,
     provider::{BoxFuture, Provider},
 };
 use maki_storage::StateDir;
@@ -376,6 +376,7 @@ impl Provider for ScriptedProvider {
         options: RequestOptions,
         _: Option<&'a SessionRef>,
         _invocation: &'a Invocation,
+        _delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let (reply, response) = flume::bounded(1);

@@ -2446,7 +2446,8 @@ mod tests {
     use maki_commands::TargetCapabilities;
     use maki_lua::orchestration::{OrchestrationServices, TurnCompletion};
     use maki_providers::{
-        ContentBlock as MsgBlock, FastSupport, Invocation, ModelInfo, Role, TokenUsage,
+        ContentBlock as MsgBlock, FastSupport, Invocation, ModelInfo, RequestDelivery, Role,
+        TokenUsage,
     };
     use maki_storage::StateDir;
     use maki_storage::checkpoint::{ClaimingWriter, accept_all};
@@ -2530,6 +2531,7 @@ mod tests {
             options: maki_providers::RequestOptions,
             session: Option<&'a SessionRef>,
             invocation: &'a Invocation,
+            delivery: RequestDelivery,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, maki_agent::AgentError>,
@@ -2657,6 +2659,7 @@ mod tests {
                 options,
                 session,
                 invocation,
+                delivery,
             )
         }
     }
@@ -2935,6 +2938,7 @@ mod tests {
             _: maki_providers::RequestOptions,
             _: Option<&'a SessionRef>,
             _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, maki_agent::AgentError>,
@@ -2973,6 +2977,7 @@ mod tests {
             _: maki_providers::RequestOptions,
             _: Option<&'a SessionRef>,
             _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, maki_agent::AgentError>,

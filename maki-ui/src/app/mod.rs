@@ -158,6 +158,7 @@ impl maki_providers::provider::Provider for DetachedProvider {
         _opts: maki_providers::RequestOptions,
         _session_id: Option<&'a maki_storage::id::SessionRef>,
         _invocation: &'a maki_providers::Invocation,
+        _delivery: maki_providers::RequestDelivery,
     ) -> maki_providers::provider::BoxFuture<
         'a,
         Result<maki_providers::StreamResponse, maki_agent::AgentError>,

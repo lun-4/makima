@@ -100,6 +100,15 @@ function M.provider_ctx(responses, saved)
       return fn()
     end,
   }
+  -- `delivered_after` is how many requests went out before the first
+  -- `ctx.mark_request_delivery()`; set `retired` to make it return false.
+  ctx.mark_request_delivery = function()
+    if ctx.retired then
+      return false
+    end
+    ctx.delivered_after = ctx.delivered_after or #ctx.requests
+    return true
+  end
   return ctx
 end
 

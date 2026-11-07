@@ -12,7 +12,9 @@ use std::sync::Arc;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use maki_agent::tools::ToolRegistry;
 use maki_lua::PluginHost;
-use maki_providers::{Invocation, InvocationPurpose, PreparedProvider, RequestOptions, Timeouts};
+use maki_providers::{
+    Invocation, InvocationPurpose, PreparedProvider, RequestDelivery, RequestOptions, Timeouts,
+};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -60,6 +62,7 @@ fn provider_wire(c: &mut Criterion) {
                         RequestOptions::default(),
                         None,
                         &invocation,
+                        RequestDelivery::untracked(),
                     ))
                     .unwrap()
                 });
