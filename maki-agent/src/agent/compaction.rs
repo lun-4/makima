@@ -422,6 +422,8 @@ mod tests {
         }
     }
 
+    const SUMMARY_FAILED: &str = "summary failed";
+
     fn default_model() -> Model {
         Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap()
     }
@@ -603,6 +605,37 @@ mod tests {
             );
             assert_ne!(history.conversation_id(), &original);
             assert_eq!(history.conversation().previous, None);
+        });
+    }
+
+    #[test]
+    fn undelivered_summary_is_not_ended() {
+        smol::block_on(async {
+            let summarizer = MockProvider::new(vec![Err(AgentError::Config {
+                message: SUMMARY_FAILED.into(),
+            })]);
+            let ended = summarizer.ended.1.clone();
+            let mut history = History::new(vec![Message::user("work".into())]);
+            let (raw_tx, _rx) = flume::unbounded();
+
+            let result = compact(
+                &dyn_provider(&summarizer),
+                &dyn_provider(&summarizer),
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx),
+                &CancelToken::none(),
+                &AgentConfig::default(),
+                None,
+                None,
+            )
+            .await;
+
+            assert!(result.is_err());
+            drop(summarizer);
+            // Only a detached end call could still hold the provider, and
+            // with it the sender.
+            assert_eq!(ended.recv_async().await.ok(), None);
         });
     }
 

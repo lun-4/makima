@@ -447,6 +447,19 @@ mod tests {
     }
 
     #[test]
+    fn rotating_an_undelivered_conversation_ends_nothing() {
+        let mut history = History::new(vec![Message::user(FIRST.into())]);
+        assert_eq!(history.restart_conversation(), None);
+        assert_eq!(
+            history.replace_compacted(vec![Message::user(SECOND.into())]),
+            None
+        );
+        history.mark_sent();
+        let delivered = Arc::clone(history.conversation_id());
+        assert_eq!(history.restart_conversation(), Some(delivered));
+    }
+
+    #[test]
     fn restart_drops_the_link() {
         let mut history = sent_history(2, 2);
         history.continue_conversation();
