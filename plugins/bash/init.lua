@@ -19,6 +19,8 @@ local RTK_UNSUPPORTED_FLAGS = {
   " -fprintf ",
 }
 local SEPARATOR = "──────"
+-- Windows can be configured to run cmd or powershell (agent.shell).
+local IS_BASH = makima.env.shell() == "bash"
 
 local rtk_available
 
@@ -103,7 +105,7 @@ end
 
 local function rtk_rewrite(command, ctx)
   local config = ctx:config()
-  if config and not config.rtk then
+  if not IS_BASH or (config and not config.rtk) then
     return nil
   end
 
@@ -255,8 +257,14 @@ local function collect_commands(node, source)
   return out
 end
 
-local description = [[Execute a bash command.
-Commands run in ]] .. cwd .. [[ by default.
+local SHELL = makima.env.shell()
+
+local description = [[Execute a ]]
+  .. SHELL
+  .. [[ command.
+Commands run in ]]
+  .. cwd
+  .. [[ by default.
 
 - Use `workdir` param instead of `cd <dir> && <cmd>` patterns.
 - Do NOT use to communicate text to the user.
@@ -360,12 +368,14 @@ makima.api.register_command({
   end,
 })
 
+-- The bash grammar cannot split cmd or powershell commands, so under those the
+-- whole command stays one scope and prompts.
 local function command_scopes(command)
   if not command or command:match("^%s*$") then
     return nil
   end
 
-  local parser = makima.treesitter.get_parser(command, "bash")
+  local parser = IS_BASH and makima.treesitter.get_parser(command, "bash")
   if not parser then
     return { scopes = { command }, force_prompt = true }
   end

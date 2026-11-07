@@ -1396,6 +1396,10 @@ impl EventHandle {
         let _ = self.prio_tx.try_send(Request::SetClockFormat(format));
     }
 
+    pub fn set_shell(&self, shell: makima_config::Shell) {
+        let _ = self.prio_tx.try_send(Request::SetShell(shell));
+    }
+
     pub fn provider_usage_changed(
         &self,
         snapshot: crate::ProviderUsageSnapshot,

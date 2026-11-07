@@ -241,6 +241,11 @@ debug = false
 # multiline paste submits at the first newline (#336). Pinned to the head of
 # crossterm-rs/crossterm#1030, which lives in refs/pull/1030/head on the upstream repo.
 # Remove once the PR ships in a crossterm release.
+# The earlier 3ca5429 pin turned VT input on for the whole session without asking the
+# terminal for SGR mouse tracking, so on ConPTY the wheel never arrived as a mouse
+# event (it scrolled alternate-screen arrows instead). 94ed715 scopes VT input to
+# bracketed paste and emits ?1003;1006h with mouse capture. It stops short of the
+# later non-exhaustive KeyEvent/MouseEvent break in #1149.
 #
 # syntect 5.3.0 spins forever on a JavaScript line like `x /*`: two rules match
 # empty at the same byte and `set` each other back, which is neither the push nor

@@ -603,6 +603,18 @@ pub enum NotificationMethod {
     Off,
 }
 
+/// Which shell runs `bash` tool commands on Windows. Unix always uses bash.
+/// The tool is named after bash and its prompts assume it, so `auto` picks
+/// Git Bash when Git for Windows is installed and cmd.exe otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Shell {
+    #[default]
+    Auto,
+    Cmd,
+    Powershell,
+}
+
 #[derive(Deserialize, Default, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct ToolOutputLinesFile {
@@ -734,6 +746,7 @@ pub struct AgentFileConfig {
     pub post_compaction_instructions: Option<String>,
     pub stale_read_check: Option<bool>,
     pub rtk: Option<bool>,
+    pub shell: Option<Shell>,
 }
 
 impl AgentFileConfig {
@@ -754,7 +767,8 @@ impl AgentFileConfig {
             compaction_instructions,
             post_compaction_instructions,
             stale_read_check,
-            rtk
+            rtk,
+            shell
         );
     }
 }
@@ -1598,6 +1612,14 @@ pub struct AgentConfig {
     )]
     pub rtk: bool,
 
+    #[config(
+        default = Shell::Auto,
+        ty = "string",
+        default_doc = "auto",
+        desc = "Windows shell for the bash tool: auto (Git Bash from GIT_INSTALL_ROOT, else cmd), cmd, or powershell; Unix ignores it"
+    )]
+    pub shell: Shell,
+
     #[config(skip, default = "None")]
     pub max_turns: Option<u32>,
 
@@ -1633,6 +1655,7 @@ impl AgentConfig {
             post_compaction_instructions: file.post_compaction_instructions,
             stale_read_check: file.stale_read_check.unwrap_or(true),
             rtk: file.rtk.unwrap_or(true),
+            shell: file.shell.unwrap_or_default(),
             max_turns: None,
             allowed_tools: Vec::new(),
             disabled_tools: Vec::new(),
@@ -2445,6 +2468,14 @@ mod tests {
         let raw: RawConfig =
             toml::from_str(&format!("[ui]\nnotifications = \"{value}\"\n")).unwrap();
         assert_eq!(raw.into_config().unwrap().ui.notifications, expected);
+    }
+
+    #[test_case("auto", Shell::Auto ; "auto")]
+    #[test_case("cmd", Shell::Cmd ; "cmd")]
+    #[test_case("powershell", Shell::Powershell ; "powershell")]
+    fn shell_deserialize(value: &str, expected: Shell) {
+        let raw: RawConfig = toml::from_str(&format!("[agent]\nshell = \"{value}\"\n")).unwrap();
+        assert_eq!(raw.into_config().unwrap().agent.shell, expected);
     }
 
     #[test]
