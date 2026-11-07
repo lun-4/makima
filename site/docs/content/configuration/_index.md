@@ -272,6 +272,19 @@ maki.setup({
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 | `search_result_limit` | integer | `100` | 10 | Max files returned per search. |
 
+### `plugins.goal`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `checker_fast` | boolean | `false` | - | Enable fast mode for the checker. |
+| `checker_model` | string | `""` | - | Checker model spec; empty selects the weak model tier. |
+| `checker_thinking` | string | `""` | - | Checker thinking level; empty uses the model default. |
+| `last_messages` | integer | `4` | 1 | Maximum recent transcript messages supplied as evidence. |
+| `max_bytes` | integer | `65536` | 1 | Maximum transcript bytes supplied as evidence. |
+| `max_continuations` | integer | `0` | 0 | Maximum automatic continuations; 0 is unlimited. |
+| `profile` | string | `"verdict"` | - | Checker profile: verdict uses transcript evidence; verify also allows tools. |
+| `timeout_secs` | integer | `0` | 0 | Checker timeout in seconds; 0 waits without a timeout. |
+
 ### `plugins.grep`
 
 | Field | Type | Default | Min | Description |
