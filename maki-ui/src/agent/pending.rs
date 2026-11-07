@@ -7,7 +7,7 @@ use async_lock::OnceCell;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
     AgentError, ConversationEnd, Invocation, Message, Model, ProviderEvent, ProviderUsage,
-    RequestOptions, StreamResponse,
+    RequestDelivery, RequestOptions, StreamResponse,
 };
 use maki_storage::id::SessionRef;
 use serde_json::Value;
@@ -46,12 +46,14 @@ impl Provider for PendingProvider {
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
         invocation: &'a Invocation,
+        delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             self.provider()
                 .await?
                 .stream_message(
                     model, messages, system, tools, event_tx, opts, session_id, invocation,
+                    delivery,
                 )
                 .await
         })

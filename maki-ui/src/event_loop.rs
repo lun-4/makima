@@ -5007,7 +5007,7 @@ fn ring_bell() {
 mod tests {
     use super::*;
     use maki_domain::ThinkingConfig as DomainThinkingConfig;
-    use maki_providers::Invocation;
+    use maki_providers::{Invocation, RequestDelivery};
     use maki_storage::checkpoint::ClaimingWriter;
 
     /// A preparer for tests, from a blocking one over the resolved model,
@@ -5995,6 +5995,7 @@ mod tests {
             _opts: maki_providers::RequestOptions,
             _session_id: Option<&'a SessionRef>,
             _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, maki_providers::AgentError>,
@@ -6019,6 +6020,7 @@ mod tests {
             _opts: maki_providers::RequestOptions,
             _session_id: Option<&'a SessionRef>,
             _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, maki_providers::AgentError>,
@@ -6628,6 +6630,7 @@ mod tests {
                 _opts: maki_providers::RequestOptions,
                 _session_id: Option<&'a SessionRef>,
                 _invocation: &'a Invocation,
+                _delivery: RequestDelivery,
             ) -> maki_providers::provider::BoxFuture<
                 'a,
                 Result<maki_providers::StreamResponse, maki_providers::AgentError>,
@@ -6932,6 +6935,7 @@ mod tests {
                 opts: RequestOptions,
                 _session_id: Option<&'a SessionRef>,
                 _invocation: &'a Invocation,
+                _delivery: RequestDelivery,
             ) -> maki_providers::provider::BoxFuture<
                 'a,
                 Result<StreamResponse, maki_providers::AgentError>,
@@ -7151,6 +7155,7 @@ mod tests {
             _opts: maki_providers::RequestOptions,
             _session_id: Option<&'a SessionRef>,
             _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, maki_providers::AgentError>,
@@ -10293,6 +10298,7 @@ mod tests {
                 options: RequestOptions,
                 _session_id: Option<&'a SessionRef>,
                 _invocation: &'a maki_providers::Invocation,
+                _delivery: maki_providers::RequestDelivery,
             ) -> maki_providers::provider::BoxFuture<
                 'a,
                 Result<maki_providers::StreamResponse, maki_providers::AgentError>,

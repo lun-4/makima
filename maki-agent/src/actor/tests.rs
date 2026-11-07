@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
     ContentBlock, ImageMediaType, ImageSource, Invocation, Message, Model, ProviderEvent,
-    RequestOptions, Role, StreamResponse, TokenUsage,
+    RequestDelivery, RequestOptions, Role, StreamResponse, TokenUsage,
 };
 use maki_storage::id::SessionRef;
 use serde_json::Value;
@@ -62,6 +62,7 @@ impl Provider for PolicyTestProvider {
         _: RequestOptions,
         _: Option<&'a SessionRef>,
         _invocation: &'a Invocation,
+        _delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, maki_providers::AgentError>> {
         Box::pin(async { unreachable!() })
     }

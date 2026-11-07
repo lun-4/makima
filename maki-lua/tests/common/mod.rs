@@ -33,8 +33,8 @@ use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::test_util::offline_registry;
 use maki_providers::{
     AgentError, ContentBlock, FastSupport, Invocation, Message, Model, ModelInfo, ModelTier,
-    ProviderEvent, ProviderRegistry, RequestOptions, Role, StopReason, StreamResponse,
-    ThinkingConfig, TokenUsage,
+    ProviderEvent, ProviderRegistry, RequestDelivery, RequestOptions, Role, StopReason,
+    StreamResponse, ThinkingConfig, TokenUsage,
 };
 use maki_storage::id::SessionRef;
 use serde_json::Value;
@@ -96,6 +96,7 @@ impl Provider for CannedProvider {
         opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
         _invocation: &'a Invocation,
+        _delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             self.captured_opts.lock().unwrap().push(opts);

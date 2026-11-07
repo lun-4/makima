@@ -52,8 +52,8 @@ mod tests {
         WorkKind,
     };
     use maki_providers::{
-        AgentError, Invocation, Message, Model, ProviderEvent, RequestOptions, StreamResponse,
-        TokenUsage,
+        AgentError, Invocation, Message, Model, ProviderEvent, RequestDelivery, RequestOptions,
+        StreamResponse, TokenUsage,
         provider::{BoxFuture, Provider},
     };
     use maki_storage::id::SessionRef;
@@ -190,6 +190,7 @@ mod tests {
             _: RequestOptions,
             _: Option<&'a SessionRef>,
             _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(std::future::pending())
         }

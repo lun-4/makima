@@ -3,7 +3,7 @@ use std::sync::Arc;
 use maki_providers::provider::Provider;
 use maki_providers::{
     ConversationEnd, ConversationLink, ImageSource, Invocation, InvocationPurpose, Message, Model,
-    ProviderEvent, RequestOptions,
+    ProviderEvent, RequestDeliveryTracker, RequestOptions,
 };
 use maki_storage::id::SessionRef;
 use serde_json::Value;
@@ -90,6 +90,7 @@ pub async fn run_isolated_turn(
         agent_id: None,
         previous,
     };
+    let delivery = RequestDeliveryTracker::new();
     let result = futures_lite::future::race(
         provider.stream_message(
             &model,
@@ -100,6 +101,7 @@ pub async fn run_isolated_turn(
             RequestOptions::default(),
             session_id.as_ref(),
             &invocation,
+            delivery.attempt(invocation.attempt),
         ),
         async {
             cancel.cancelled().await;
@@ -107,13 +109,16 @@ pub async fn run_isolated_turn(
         },
     )
     .await;
+    delivery.end_attempt(result.is_ok());
     drop(provider_tx);
     forwarder.await;
-    end_conversation_detached(
-        &provider,
-        invocation.conversation_id,
-        ConversationEnd::Closed,
-    );
+    if delivery.is_delivered() {
+        end_conversation_detached(
+            &provider,
+            invocation.conversation_id,
+            ConversationEnd::Closed,
+        );
+    }
     let terminal = match result {
         Ok(_) => IsolatedTurnEvent::Done,
         Err(crate::AgentError::Cancelled) => IsolatedTurnEvent::Cancelled,
@@ -128,8 +133,8 @@ mod tests {
 
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        ContentBlock, ConversationRelation, ProviderEvent, Role, StopReason, StreamResponse,
-        TokenUsage,
+        ContentBlock, ConversationRelation, ProviderEvent, RequestDelivery, Role, StopReason,
+        StreamResponse, TokenUsage,
     };
     use test_case::test_case;
 
@@ -150,6 +155,7 @@ mod tests {
         Success,
         Failure,
         Pending,
+        DeliveredThenPending,
     }
 
     struct CapturingProvider {
@@ -169,6 +175,7 @@ mod tests {
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
             invocation: &'a Invocation,
+            delivery: RequestDelivery,
         ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
             let mut captured = self.captured.lock().unwrap();
             captured.invocation = Some(invocation.clone());
@@ -201,6 +208,10 @@ mod tests {
                     })
                 }),
                 ProviderOutcome::Pending => Box::pin(std::future::pending()),
+                ProviderOutcome::DeliveredThenPending => {
+                    assert!(delivery.mark());
+                    Box::pin(std::future::pending())
+                }
             }
         }
 
@@ -257,9 +268,15 @@ mod tests {
         }
     }
 
-    #[test_case(ProviderOutcome::Success, false ; "finished")]
-    #[test_case(ProviderOutcome::Pending, true ; "cancelled")]
-    fn isolated_turn_ends_its_own_conversation(outcome: ProviderOutcome, cancelled: bool) {
+    #[test_case(ProviderOutcome::Success, false, true ; "finished")]
+    #[test_case(ProviderOutcome::DeliveredThenPending, true, true ; "cancelled_after_delivery")]
+    #[test_case(ProviderOutcome::Pending, true, false ; "cancelled_before_delivery")]
+    #[test_case(ProviderOutcome::Failure, false, false ; "failed_before_delivery")]
+    fn isolated_turn_ends_only_a_delivered_conversation(
+        outcome: ProviderOutcome,
+        cancelled: bool,
+        ends: bool,
+    ) {
         smol::block_on(async {
             let (trigger, cancel) = CancelToken::new();
             if cancelled {
@@ -293,9 +310,11 @@ mod tests {
             assert_eq!(invocation.purpose, InvocationPurpose::Isolated);
             assert_eq!(invocation.attempt, 0);
             assert_eq!(invocation.previous, Some(link()));
+            // The provider, and with it the sender, outlives the turn only
+            // inside a detached end call.
             assert_eq!(
-                ended_rx.recv_async().await.unwrap(),
-                (invocation.conversation_id, ConversationEnd::Closed)
+                ended_rx.recv_async().await.ok(),
+                ends.then_some((invocation.conversation_id, ConversationEnd::Closed))
             );
         });
     }

@@ -2085,7 +2085,8 @@ mod tests {
     use maki_lua::orchestration::{OrchestrationServices, TrustedTarget};
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        ContentBlock, Invocation, ProviderEvent, RequestOptions, Role, StreamResponse,
+        ContentBlock, Invocation, ProviderEvent, RequestDelivery, RequestOptions, Role,
+        StreamResponse,
     };
     use maki_storage::checkpoint::{CheckpointWriter, ClaimingWriter};
     use maki_storage::sessions::Prefs;
@@ -2281,6 +2282,7 @@ mod tests {
             _: RequestOptions,
             _: Option<&'a SessionRef>,
             _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 self.entered.send_async(()).await.unwrap();
@@ -2931,6 +2933,7 @@ mod tests {
             options: RequestOptions,
             _: Option<&'a SessionRef>,
             _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 self.requests.send((model.spec(), options)).unwrap();

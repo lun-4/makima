@@ -104,7 +104,9 @@ The shape must provide these properties:
 - no delivery after the attempt has been retired. The retire check and the mark share one lock with the emitter's close (`CloseOnDrop`), so a mark is accepted only while the emitter is open, and `ctx.mark_request_delivery()` returns `false` after it closes;
 - no cost on the text-delta path beyond one flag check for the first emit in auto mode.
 
-`LuaProvider` reads `request_delivery_marker` at preparation. In auto mode the emitter marks delivery on its first accepted event. In both modes the adapter marks delivery before it returns a successful result. `ctx.mark_request_delivery()` maps to `RequestDelivery::mark`.
+`LuaProvider` reads `request_delivery_marker` at preparation. In auto mode the emitter marks delivery on its first accepted event. `ctx.mark_request_delivery()` maps to `RequestDelivery::mark`. The successful-return fallback lives on the host side, in `RequestDeliveryTracker::end_attempt(succeeded)`, so it covers every provider; the Lua adapter only logs the `warn` when a manual provider succeeds without a mark.
+
+The owner side is `RequestDeliveryTracker`: it opens an attempt (`attempt(n)` returns the handle), ends it (`end_attempt(succeeded)` retires the handle and applies the success fallback), reports `is_delivered()`, and resolves `delivered()` once on the first delivery.
 
 Every real provider is Lua (`src/architecture_tests.rs`). Rust `Provider` implementations are test providers. They can mark through the handle to cover either mode.
 
@@ -116,7 +118,7 @@ Every real provider is Lua (`src/architecture_tests.rs`). Rust `Provider` implem
 
 1. It creates one shared delivery state for the logical request.
 2. Every attempt receives a `RequestDelivery` connected to that state and retired when the attempt ends.
-3. The first delivery signal is reported to the caller while the stream is still running (see below). The result of `stream_with_retry()` also says whether the request was delivered, for callers without a `History` (compaction summaries, isolated turns).
+3. The caller owns the `RequestDeliveryTracker` and passes it in, so it learns of the first delivery while the stream is still running (see below). Callers without a `History` (compaction summaries, isolated turns) read `is_delivered()` after the call.
 4. Delivery stays true for all later retries and terminal outcomes.
 5. A terminal failure or cancellation before delivery leaves `conversation.sent` unchanged. For the first request of a conversation that means `None`. For a later request it keeps the previous request's length.
 

@@ -21,8 +21,8 @@ use maki_lua::{
     test_support::run_command,
 };
 use maki_providers::{
-    AgentError, ContentBlock, Invocation, Message, Model, ProviderEvent, RequestOptions, Role,
-    StreamResponse, TokenUsage,
+    AgentError, ContentBlock, Invocation, Message, Model, ProviderEvent, RequestDelivery,
+    RequestOptions, Role, StreamResponse, TokenUsage,
     provider::{BoxFuture, Provider},
 };
 use maki_storage::id::{MakiId, SessionRef};
@@ -221,6 +221,7 @@ impl Provider for GatedProvider {
         _: RequestOptions,
         _: Option<&'a SessionRef>,
         _invocation: &'a Invocation,
+        _delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let (reply, response) = flume::bounded(1);
