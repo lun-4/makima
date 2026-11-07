@@ -1,0 +1,27 @@
+{
+  "name": "maki-claude-agent-bridge",
+  "private": true,
+  "type": "module",
+  "description": "Serves Maki's claude-agent provider through the Claude Agent SDK",
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": {
+    "maki-claude-agent-bridge": "src/main.ts"
+  },
+  "scripts": {
+    "start": "node src/main.ts",
+    "check": "tsc && prettier --check src test",
+    "fmt": "prettier --write src test",
+    "test": "node --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.318",
+    "@modelcontextprotocol/sdk": "1.32.2"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "prettier": "3.6.2",
+    "typescript": "5.9.3"
+  }
+}

@@ -44,6 +44,10 @@ gen-docs-check:
 machete:
     cargo-machete
 
+# The Claude Agent bridge (TypeScript, Node 24+); not part of `ci`.
+bridge-check:
+    cd claude-agent-bridge && npm install --omit=optional && npm run check && npm test
+
 # Criterion benches (maki-lua: luau_perf, splash_perf, provider_perf). Pass a filter to pick
 # one, e.g. `just bench -- pull_roundtrip`; slow meters are sample_size 10.
 bench *ARGS:
