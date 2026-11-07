@@ -46,7 +46,7 @@ use crate::{
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_providers::RequestOptions;
 use maki_providers::provider::Provider;
-use maki_providers::{Invocation, Model, ModelInfo, ProviderRegistry};
+use maki_providers::{Invocation, Model, ModelInfo, ProviderRegistry, RequestDelivery};
 use maki_storage::id::SessionRef;
 
 pub struct DescriptionContext<'a> {
@@ -841,6 +841,7 @@ impl Provider for NullProvider {
         _: RequestOptions,
         _: Option<&'a SessionRef>,
         _invocation: &'a Invocation,
+        _delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
         Box::pin(async { unimplemented!() })
     }

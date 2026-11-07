@@ -681,7 +681,7 @@ mod tests {
     };
     use maki_config::PermissionsConfig;
     use maki_lua::test_support::run_command;
-    use maki_providers::{ContentBlock, Invocation};
+    use maki_providers::{ContentBlock, Invocation, RequestDelivery};
     use test_case::test_case;
 
     use super::*;
@@ -1572,6 +1572,7 @@ mod tests {
                 _: maki_providers::RequestOptions,
                 _: Option<&'a SessionRef>,
                 _invocation: &'a Invocation,
+                _delivery: RequestDelivery,
             ) -> maki_providers::provider::BoxFuture<
                 'a,
                 Result<maki_providers::StreamResponse, AgentError>,
@@ -1707,6 +1708,7 @@ mod tests {
             _: maki_providers::RequestOptions,
             _: Option<&'a SessionRef>,
             _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, AgentError>,
@@ -2107,6 +2109,7 @@ mod tests {
             _: maki_providers::RequestOptions,
             _: Option<&'a SessionRef>,
             _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, AgentError>,
@@ -2377,6 +2380,7 @@ mod tests {
             _: maki_providers::RequestOptions,
             _: Option<&'a SessionRef>,
             _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, AgentError>,
@@ -2437,13 +2441,14 @@ mod tests {
             options: maki_providers::RequestOptions,
             session: Option<&'a SessionRef>,
             invocation: &'a Invocation,
+            delivery: RequestDelivery,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, AgentError>,
         > {
             self.requests.send(messages.to_vec()).unwrap();
             self.inner.stream_message(
-                model, messages, system, tools, events, options, session, invocation,
+                model, messages, system, tools, events, options, session, invocation, delivery,
             )
         }
     }
@@ -2465,6 +2470,7 @@ mod tests {
             _: maki_providers::RequestOptions,
             _: Option<&'a SessionRef>,
             _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, AgentError>,
@@ -2988,6 +2994,7 @@ mod tests {
             _opts: maki_providers::RequestOptions,
             _session_id: Option<&'a SessionRef>,
             _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, AgentError>,

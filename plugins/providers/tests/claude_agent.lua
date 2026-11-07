@@ -90,6 +90,7 @@ t.case("a_step_posts_the_request_and_streams_its_events", function()
   t.same(body.request, REQUEST)
   t.same(events, { { type = "text_delta", text = "hel" }, { type = "text_delta", text = "lo" } })
   t.same(result, DONE)
+  t.eq(ctx.delivered_after, 0)
 end)
 
 t.case("the_bridge_error_table_is_returned_as_is", function()
@@ -101,8 +102,20 @@ end)
 
 t.case("a_refused_step_returns_the_bridge_table", function()
   local conflict = { message = "step o1/0 was already started", retry = "none" }
-  local _, _, err = stream({ json(conflict, 409) })
+  local ctx, _, err = stream({ json(conflict, 409) })
   t.same(err, conflict)
+  t.eq(ctx.delivered_after, 0)
+end)
+
+t.case("a_retired_call_sends_no_step", function()
+  local ctx = t.provider_ctx({})
+  ctx.retired = true
+  local instance = assert(spec.prepare(ctx, { id = "sonnet" }, CONFIG))
+  t.eq(instance.request_delivery_marker, "manual")
+  local result, err = instance.stream(ctx, REQUEST, t.recorder())
+  t.eq(result, nil)
+  t.eq(err.retry, "none")
+  t.eq(#ctx.requests, 0)
 end)
 
 t.case("a_stream_without_a_result_is_not_retried", function()

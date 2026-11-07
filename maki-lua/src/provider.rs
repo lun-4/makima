@@ -4,7 +4,7 @@
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use flume::Sender;
@@ -16,7 +16,8 @@ use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
     AgentError, ConversationEnd, Invocation, Message, Model, ModelInfo, PreparedProvider,
     ProviderBackend, ProviderEvent, ProviderRegistry, ProviderUsage, RegisteredProvider,
-    RequestOptions, RetryKind, StopReason, StreamResponse, Timeouts, TokenUsage,
+    RequestDelivery, RequestDeliveryMarker, RequestOptions, RetryKind, StopReason, StreamResponse,
+    Timeouts, TokenUsage,
 };
 use maki_storage::id::SessionRef;
 use mlua::{
@@ -35,6 +36,10 @@ use crate::runtime::{Request, strip_traceback};
 
 pub(crate) const HOST_STOPPED: &str = "plugin host stopped";
 const NO_STREAM: &str = "provider instance has no stream function";
+const DELIVERY_MARKER_FIELD: &str = "request_delivery_marker";
+const DELIVERY_MARKER_AUTO: &str = "auto";
+const DELIVERY_MARKER_MANUAL: &str = "manual";
+const MARK_REQUEST_DELIVERY: &str = "mark_request_delivery";
 const DEFAULT_KEY_COUNT: usize = 1;
 const LOGIN_INCOMPLETE: &str = "login did not complete";
 const CONFIG_KIND: &str = "config";
@@ -252,11 +257,11 @@ fn first(values: MultiValue) -> LuaValue {
     values.into_iter().next().unwrap_or(LuaValue::Nil)
 }
 
-/// Calls {function} with ctx and {args}. {decode} gets the result, or `None`
-/// when there is no function to call.
+/// Calls {function} with {ctx} and {args}. {decode} gets the result, or
+/// `None` when there is no function to call.
 async fn call_with_ctx<T>(
     lua: &Lua,
-    callbacks: &Callbacks,
+    ctx: Table,
     function: Option<Function>,
     args: impl FnOnce(&Lua) -> mlua::Result<MultiValue>,
     decode: impl FnOnce(&Lua, Option<LuaValue>) -> JobResult<T>,
@@ -265,7 +270,7 @@ async fn call_with_ctx<T>(
         return decode(lua, None);
     };
     let mut call_args = args(lua)?;
-    call_args.push_front(LuaValue::Table(callbacks.ctx(lua)?));
+    call_args.push_front(LuaValue::Table(ctx));
     let values = function.call_async::<MultiValue>(call_args).await?;
     match returned(values) {
         Ok(values) => decode(lua, Some(first(values))),
@@ -330,7 +335,7 @@ impl LuaBackend {
                     let function = key(&callbacks)
                         .map(|key| lua.registry_value::<Function>(key))
                         .transpose()?;
-                    call_with_ctx(&lua, &callbacks, function, args, decode).await
+                    call_with_ctx(&lua, callbacks.ctx(&lua)?, function, args, decode).await
                 })
             })
             .await
@@ -349,7 +354,12 @@ impl ProviderBackend for LuaBackend {
         Box::pin(async move {
             let job_callbacks = Arc::clone(&callbacks);
             let config = callbacks.config();
-            let (instance, adjusted, key_count) = invoke(&requests, move |lua| {
+            let PreparedInstance {
+                instance,
+                adjusted,
+                key_count,
+                delivery_marker,
+            } = invoke(&requests, move |lua| {
                 Box::pin(
                     async move { prepare_instance(&lua, &job_callbacks, &info, &config).await },
                 )
@@ -372,6 +382,7 @@ impl ProviderBackend for LuaBackend {
                     callbacks,
                     instance: Arc::new(instance),
                     key_count: AtomicUsize::new(key_count),
+                    delivery_marker,
                 }),
             })
         })
@@ -501,7 +512,7 @@ async fn prepare_instance(
     callbacks: &Callbacks,
     info: &ModelInfo,
     config: &Value,
-) -> JobResult<(RegistryKey, Option<ModelInfo>, usize)> {
+) -> JobResult<PreparedInstance> {
     let prepare: Function = lua.registry_value(&callbacks.prepare)?;
     let values = prepare
         .call_async::<MultiValue>((
@@ -524,12 +535,31 @@ async fn prepare_instance(
         None | Some(LuaValue::Nil) => None,
         Some(model) => Some(lua.from_value(model)?),
     };
+    let delivery_marker = match instance.get::<LuaValue>(DELIVERY_MARKER_FIELD)? {
+        LuaValue::Nil => RequestDeliveryMarker::Auto,
+        LuaValue::String(value) if value == DELIVERY_MARKER_AUTO => RequestDeliveryMarker::Auto,
+        LuaValue::String(value) if value == DELIVERY_MARKER_MANUAL => RequestDeliveryMarker::Manual,
+        other => {
+            return Ok(Err(config_error(format!(
+                "{DELIVERY_MARKER_FIELD} must be \"{DELIVERY_MARKER_AUTO}\" or \"{DELIVERY_MARKER_MANUAL}\", got {}",
+                other.to_string()?
+            ))));
+        }
+    };
     let key_count = instance_key_count(lua, callbacks, &instance).await?;
-    Ok(Ok((
-        lua.create_registry_value(instance)?,
+    Ok(Ok(PreparedInstance {
+        instance: lua.create_registry_value(instance)?,
         adjusted,
         key_count,
-    )))
+        delivery_marker,
+    }))
+}
+
+struct PreparedInstance {
+    instance: RegistryKey,
+    adjusted: Option<ModelInfo>,
+    key_count: usize,
+    delivery_marker: RequestDeliveryMarker,
 }
 
 async fn instance_key_count(
@@ -572,18 +602,42 @@ struct StreamResult {
     stop_reason: Option<StopReason>,
 }
 
-/// The `emit` a Lua stream holds. The Rust side closes it when the call
-/// ends, so a closure Lua keeps around cannot hold the event channel open.
+struct EmitTarget {
+    events: Sender<ProviderEvent>,
+    delivery: RequestDelivery,
+    mark_on_event: bool,
+}
+
+/// The `emit` and `ctx.mark_request_delivery` a Lua stream holds. The Rust
+/// side closes it when the call ends, so a closure Lua keeps around can
+/// neither hold the event channel open nor mark a retired request.
 #[derive(Clone)]
-struct Emitter(Arc<Mutex<Option<Sender<ProviderEvent>>>>);
+struct Emitter(Arc<Mutex<Option<EmitTarget>>>);
 
 impl Emitter {
+    fn lock(&self) -> MutexGuard<'_, Option<EmitTarget>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn send(&self, event: ProviderEvent) -> bool {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        let mut target = self.lock();
+        let Some(target) = target.as_mut() else {
+            return false;
+        };
+        if target.events.send(event).is_err() {
+            return false;
+        }
+        if target.mark_on_event {
+            target.mark_on_event = false;
+            target.delivery.mark();
+        }
+        true
+    }
+
+    fn mark_delivery(&self) -> bool {
+        self.lock()
             .as_ref()
-            .is_some_and(|tx| tx.send(event).is_ok())
+            .is_some_and(|target| target.delivery.mark())
     }
 }
 
@@ -591,11 +645,7 @@ struct CloseOnDrop(Emitter);
 
 impl Drop for CloseOnDrop {
     fn drop(&mut self) {
-        self.0
-            .0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        self.0.lock().take();
     }
 }
 
@@ -606,6 +656,7 @@ struct LuaProvider {
     /// Read at prepare and again after each auth reload or refresh, which
     /// may change the key pool.
     key_count: AtomicUsize,
+    delivery_marker: RequestDeliveryMarker,
 }
 
 impl LuaProvider {
@@ -617,6 +668,17 @@ impl LuaProvider {
         args: impl FnOnce(&Lua) -> mlua::Result<MultiValue> + Send + 'static,
         decode: impl FnOnce(&Lua, Option<LuaValue>) -> JobResult<T> + Send + 'static,
     ) -> impl Future<Output = Result<T, AgentError>> + Send + 'static {
+        self.call_extending_ctx(name, |_, _| Ok(()), args, decode)
+    }
+
+    /// `call`, with {extend} adding what only this call's ctx offers.
+    fn call_extending_ctx<T: Send + 'static>(
+        &self,
+        name: &'static str,
+        extend: impl FnOnce(&Lua, &Table) -> mlua::Result<()> + Send + 'static,
+        args: impl FnOnce(&Lua) -> mlua::Result<MultiValue> + Send + 'static,
+        decode: impl FnOnce(&Lua, Option<LuaValue>) -> JobResult<T> + Send + 'static,
+    ) -> impl Future<Output = Result<T, AgentError>> + Send + 'static {
         let requests = self.requests.clone();
         let callbacks = Arc::clone(&self.callbacks);
         let instance = Arc::clone(&self.instance);
@@ -625,7 +687,9 @@ impl LuaProvider {
                 Box::pin(async move {
                     let instance: Table = lua.registry_value(&instance)?;
                     let function = instance.get::<Option<Function>>(name)?;
-                    call_with_ctx(&lua, &callbacks, function, args, decode).await
+                    let ctx = callbacks.ctx(&lua)?;
+                    extend(&lua, &ctx)?;
+                    call_with_ctx(&lua, ctx, function, args, decode).await
                 })
             })
             .await
@@ -667,6 +731,7 @@ impl Provider for LuaProvider {
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
         invocation: &'a Invocation,
+        delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         let request = StreamRequest {
             model: RequestModel {
@@ -681,10 +746,23 @@ impl Provider for LuaProvider {
             session_id: session_id.cloned(),
             invocation: invocation.clone(),
         };
-        let emitter = Emitter(Arc::new(Mutex::new(Some(event_tx.clone()))));
+        let manual = self.delivery_marker == RequestDeliveryMarker::Manual;
+        let emitter = Emitter(Arc::new(Mutex::new(Some(EmitTarget {
+            events: event_tx.clone(),
+            delivery: delivery.clone(),
+            mark_on_event: !manual,
+        }))));
         let close = CloseOnDrop(emitter.clone());
-        let call = self.call(
+        let marker = emitter.clone();
+        let provider_id = Arc::clone(&self.callbacks.id);
+        let conversation_id = Arc::clone(&invocation.conversation_id);
+        let operation_id = Arc::clone(&invocation.operation_id);
+        let call = self.call_extending_ctx(
             "stream",
+            move |lua, ctx| {
+                let mark = lua.create_function(move |_, ()| Ok(marker.mark_delivery()))?;
+                ctx.set(MARK_REQUEST_DELIVERY, mark)
+            },
             move |lua| {
                 let emit = lua.create_function(move |lua, event: LuaValue| {
                     Ok(emitter.send(lua.from_value(event)?))
@@ -692,11 +770,19 @@ impl Provider for LuaProvider {
                 let request = unlimited(lua, || lua.to_value_with(&request, serialize_options()))?;
                 (request, emit).into_lua_multi(lua)
             },
-            |lua, result| {
+            move |lua, result| {
                 let Some(result) = result else {
                     return Ok(Err(config_error(NO_STREAM)));
                 };
                 let result: StreamResult = lua.from_value(result)?;
+                if manual && !delivery.is_delivered() {
+                    warn!(
+                        provider = %provider_id,
+                        %conversation_id,
+                        %operation_id,
+                        "manual request delivery never marked, delivered by its successful return"
+                    );
+                }
                 Ok(Ok(StreamResponse {
                     message: result.message,
                     usage: result.usage,

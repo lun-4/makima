@@ -21,8 +21,8 @@ use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::test_util::offline_ids;
 use maki_providers::{
     AgentError, CompleteModelSelection, ContentBlock, Invocation, Message, Model,
-    ModelCapabilities, ProviderEvent, RequestOptions, Role, StopReason, StreamResponse,
-    ThinkingSupport, TokenUsage,
+    ModelCapabilities, ProviderEvent, RequestDelivery, RequestOptions, Role, StopReason,
+    StreamResponse, ThinkingSupport, TokenUsage,
 };
 use maki_storage::checkpoint::{CheckpointRequest, CheckpointVersion, CheckpointWriter};
 use maki_storage::id::{MakiId, SessionRef};
@@ -213,6 +213,7 @@ impl Provider for RecordingProvider {
         options: RequestOptions,
         _session: Option<&'a SessionRef>,
         _invocation: &'a Invocation,
+        _delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             self.requests
@@ -253,6 +254,7 @@ impl Provider for ChildProvider {
         _options: RequestOptions,
         _session: Option<&'a SessionRef>,
         _invocation: &'a Invocation,
+        _delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let child = system == "child"

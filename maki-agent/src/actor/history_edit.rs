@@ -239,7 +239,9 @@ impl HistoryEditWork {
                     } else {
                         (history.continue_conversation(), ConversationEnd::Rewound)
                     };
-                    if let Some(policy) = &state.policy {
+                    if let Some(policy) = &state.policy
+                        && let Some(ended) = ended
+                    {
                         end_conversation_detached(&policy.settings.provider, ended, reason);
                     }
                     HistoryChange {
@@ -345,13 +347,15 @@ mod tests {
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
 
+    use arc_swap::ArcSwap;
     use futures_lite::future;
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
         AgentError, ContentBlock, ConversationEnd, Invocation, Message, Model, ProviderEvent,
-        RequestOptions, Role, StreamResponse, TokenUsage,
+        RequestDelivery, RequestOptions, Role, StreamResponse, TokenUsage,
     };
     use maki_storage::checkpoint::CheckpointPublication;
+    use maki_storage::conversation::ConversationState;
     use maki_storage::id::SessionRef;
     use maki_storage::sessions::HistorySnapshot;
     use serde_json::Value;
@@ -1338,6 +1342,7 @@ mod tests {
             _: RequestOptions,
             _: Option<&'a SessionRef>,
             _: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async { unreachable!() })
         }
@@ -1352,18 +1357,25 @@ mod tests {
         }
     }
 
-    #[test_case(1, ConversationEnd::Rewound ; "keeping_messages_rewinds")]
-    #[test_case(0, ConversationEnd::Closed ; "keeping_nothing_closes")]
+    #[test_case(1, Some(ConversationEnd::Rewound) ; "keeping_messages_rewinds")]
+    #[test_case(0, Some(ConversationEnd::Closed) ; "keeping_nothing_closes")]
+    #[test_case(1, None ; "undelivered_is_not_ended")]
     fn rewind_ends_the_outgoing_conversation_and_close_keeps_the_new_one(
         boundary: usize,
-        expected: ConversationEnd,
+        expected: Option<ConversationEnd>,
     ) {
         smol::block_on(async {
             let (ended_tx, ended_rx) = flume::unbounded();
+            let messages = vec![Message::user("first".into()), Message::user("draft".into())];
+            let mut seed = HistorySnapshot::new(messages.clone());
+            seed.conversation = Some(ConversationState {
+                sent: expected.map(|_| messages.len()),
+                ..ConversationState::fresh(None)
+            });
             let (actor, runner) = AgentActorHandle::spawn(
                 AgentId::generate(),
-                vec![Message::user("first".into()), Message::user("draft".into())],
-                None,
+                messages,
+                Some(Arc::new(ArcSwap::from_pointee(seed))),
                 Box::new(IdleBackend),
             );
             let settings = crate::RunSettings {
@@ -1375,12 +1387,16 @@ mod tests {
                 .unwrap();
             let boundary = actor.history_boundaries().unwrap().remove(boundary);
             rewind(&actor, &boundary, published()).await.unwrap();
-            let (rewound, reason) = ended_rx.recv_async().await.unwrap();
-            assert_eq!(reason, expected);
-            assert!(!rewound.is_empty());
             actor.close();
             runner.await;
-            assert!(ended_rx.try_recv().is_err());
+            drop(actor);
+            // Once the actor is gone only a detached end call still holds the
+            // provider, and with it the sender.
+            let mut reasons = Vec::new();
+            while let Ok((_, reason)) = ended_rx.recv_async().await {
+                reasons.push(reason);
+            }
+            assert_eq!(reasons, Vec::from_iter(expected));
         });
     }
 

@@ -19,7 +19,8 @@ use maki_providers::login::{
 };
 use maki_providers::provider::BoxFuture;
 use maki_providers::{
-    AgentError, Invocation, InvocationPurpose, Message, ProviderRegistry, RequestOptions, RetryKind,
+    AgentError, Invocation, InvocationPurpose, Message, ProviderRegistry, RequestDelivery,
+    RequestOptions, RetryKind,
 };
 use maki_storage::StateDir;
 use maki_storage::auth::{load_credentials, save_credentials};
@@ -400,6 +401,7 @@ fn bundled_stream_errors_carry_a_retry_class() {
         RequestOptions::default(),
         None,
         &invocation,
+        RequestDelivery::untracked(),
     )))
     .unwrap_err();
     assert_eq!(error.retry_kind(), Some(RetryKind::Connect), "{error:?}");

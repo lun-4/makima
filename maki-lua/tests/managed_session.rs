@@ -21,7 +21,7 @@ use maki_lua::test_support::InMemoryFs;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
     AgentError, ContentBlock, Invocation, Message, Model, ObservationSource, ProviderEvent,
-    RequestOptions, Role, StreamResponse,
+    RequestDelivery, RequestOptions, Role, StreamResponse,
 };
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
@@ -790,6 +790,7 @@ impl Provider for NestedRecordingProvider {
         opts: RequestOptions,
         _: Option<&'a SessionRef>,
         _invocation: &'a Invocation,
+        _delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             self.requests.send((model.spec(), opts)).unwrap();
@@ -813,6 +814,7 @@ impl Provider for RecordingProvider {
         opts: RequestOptions,
         _: Option<&'a SessionRef>,
         _invocation: &'a Invocation,
+        _delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             self.requests.send((model.spec(), opts)).unwrap();
@@ -1017,6 +1019,7 @@ impl Provider for PendingProvider {
         _: RequestOptions,
         _: Option<&'a SessionRef>,
         _invocation: &'a Invocation,
+        _delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let _signal = DropSignal(self.dropped.clone());
@@ -1156,6 +1159,7 @@ impl Provider for AutoDeliveryProvider {
         _: RequestOptions,
         _: Option<&'a SessionRef>,
         _invocation: &'a Invocation,
+        _delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             if !messages
@@ -1448,6 +1452,7 @@ impl Provider for ScriptedTaskProvider {
         _: RequestOptions,
         _: Option<&'a SessionRef>,
         _invocation: &'a Invocation,
+        _delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             if !messages

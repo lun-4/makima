@@ -7,8 +7,8 @@ use maki_config::SessionDefaults;
 use maki_providers::model::Model;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    Effort, Invocation, Message, ProviderEvent, RequestOptions, StopReason, StreamResponse,
-    TokenUsage,
+    Effort, Invocation, Message, ProviderEvent, RequestDelivery, RequestOptions, StopReason,
+    StreamResponse, TokenUsage,
 };
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::{Effort as StoredEffort, StoredThinking};
@@ -583,6 +583,7 @@ impl Provider for RecordingProvider {
         options: RequestOptions,
         _: Option<&'a SessionRef>,
         _invocation: &'a Invocation,
+        _delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         let _ = self.0.send((system.to_owned(), options));
         Box::pin(async {
