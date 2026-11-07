@@ -457,6 +457,12 @@ mod tests {
         history.mark_sent();
         let delivered = Arc::clone(history.conversation_id());
         assert_eq!(history.restart_conversation(), Some(delivered));
+        history.mark_sent();
+        let compacted = Arc::clone(history.conversation_id());
+        assert_eq!(
+            history.replace_compacted(vec![Message::user(SECOND.into())]),
+            Some(compacted)
+        );
     }
 
     #[test]
