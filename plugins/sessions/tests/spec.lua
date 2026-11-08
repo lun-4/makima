@@ -352,6 +352,7 @@ local function picker(events, query, opts)
   local clock = { secs = NOW, nanosecs = 0 }
   local async_queue = {}
   local snapshots, snapshot_counts, timeouts = {}, {}, {}
+  local autocmds = opts.autocmds or {}
   local live_calls, list_calls, match_calls = 0, 0, 0
   local function advance_clock(ms)
     clock.nanosecs = clock.nanosecs + ms * NANOS_PER_MS
@@ -372,7 +373,9 @@ local function picker(events, query, opts)
       command = spec.handler
     end
   end
-  maki.api.create_autocmd = function() end
+  maki.api.create_autocmd = function(name, spec)
+    autocmds[name] = spec.callback
+  end
   maki.keymap.set = function() end
   maki.async.run = function(fn)
     if opts.defer_async then
@@ -620,7 +623,7 @@ case("age_renders_on_first_second_boundary", function()
     { type = "close" },
   })
   eq(#probe.snapshots, 3, "999ms does not redraw; the next 1ms crosses the boundary")
-  eq(probe.timeouts[1], 1000, "the receive timeout waits for the next second")
+  eq(probe.timeouts[1], 100, "the receive timeout stays within the status poll bound")
   assert(all_text(probe.snapshots[2]):find("0s", 1, true))
   assert(all_text(probe.snapshots[3]):find("1s", 1, true))
 end)
@@ -634,6 +637,18 @@ case("continuous_events_do_not_starve_age_render", function()
   local _, _, _, _, probe = picker(events)
   eq(#probe.snapshots, 3, "harmless events still allow the second-boundary redraw")
   assert(all_text(probe.snapshots[3]):find("1s", 1, true))
+end)
+
+case("status_changes_refresh_after_non_timeout_events", function()
+  local autocmds = {}
+  local _, _, _, _, probe = picker({
+    function()
+      autocmds.SessionStatusChanged({ data = { session_id = "x", status = "working", focused = true } })
+      return { type = "click", row = 0, col = 0 }
+    end,
+    { type = "close" },
+  }, nil, { autocmds = autocmds })
+  eq(#probe.snapshots, 3, "a status change arriving with input still refreshes the list")
 end)
 
 case("age_only_render_does_not_scan_or_filter_sessions", function()

@@ -17,7 +17,7 @@ local EMPTY_HINT = "  No sessions yet. Press Ctrl+N to start one."
 local NO_MATCHES_HINT = "  No matches"
 local LOADING_HINT = "  Loading sessions…"
 local OPEN_ELSEWHERE_MSG = "session is open in another terminal"
-local TICK_MS = 1000
+local STATUS_POLL_MS = 100
 local NANOS_PER_MS = 1000000
 local NANOS_PER_SEC = 1000000000
 -- Placeholder only: the host swaps "spinner:*"-styled spans for the live
@@ -138,7 +138,7 @@ end
 local function age_timeout_ms()
   local now = maki.time.now()
   local remaining = NANOS_PER_SEC - now.nanosecs
-  return math.max(1, math.min(math.ceil(remaining / NANOS_PER_MS), TICK_MS))
+  return math.max(1, math.min(math.ceil(remaining / NANOS_PER_MS), STATUS_POLL_MS))
 end
 
 local function render()
@@ -526,16 +526,9 @@ local function open(query)
     refresh()
   end)
   while board do
-    local ev = board.win:recv(board.age_visible and age_timeout_ms() or TICK_MS)
+    local ev = board.win:recv(board.age_visible and age_timeout_ms() or STATUS_POLL_MS)
     if not ev or ev.type == "close" then
       board = nil
-    elseif ev.type == "timeout" then
-      if board.dirty then
-        board.dirty = false
-        refresh()
-      elseif board.age_visible and age_bucket_changed() then
-        render()
-      end
     elseif ev.type == "click" then
       if ev.row > 0 and ev.row <= #board.input_render.lines then
         local input = board.rename and board.rename.input or board.input
@@ -569,7 +562,10 @@ local function open(query)
       board.height = ev.height
       render()
     end
-    if board and board.age_visible and age_bucket_changed() then
+    if board and board.dirty then
+      board.dirty = false
+      refresh()
+    elseif board and board.age_visible and age_bucket_changed() then
       render()
     end
   end
