@@ -15,6 +15,7 @@ local TITLE_MIN_WIDTH = 4
 local ROW_PREFIX_WIDTH = 2
 local ICON_WIDTH = 2
 local RIGHT_SEPARATOR_WIDTH = 1
+local ROW_TITLE_FLOOR = 1
 local HEADER_STYLE = "path"
 local AGE_HEADER = "age"
 local COUNT_HEADER = "messages"
@@ -88,7 +89,13 @@ end
 -- Widest everything left of the separator (prefix, icon, title) may render
 -- and still leave the right columns on screen.
 function M.title_width_budget(confirm_width, inner_width, layout)
-  return math.max(inner_width - confirm_width - layout.right_width - RIGHT_SEPARATOR_WIDTH, 1)
+  return math.max(inner_width - confirm_width - layout.right_width - RIGHT_SEPARATOR_WIDTH, ROW_TITLE_FLOOR)
+end
+
+-- Widest delete confirmation that still leaves the title floor and the
+-- separator before the right columns.
+function M.confirm_width_budget(inner_width, layout)
+  return math.max(inner_width - layout.right_width - RIGHT_SEPARATOR_WIDTH - ROW_TITLE_FLOOR, 0)
 end
 
 function M.row_right_columns(left_width, inner_width, count, layout)

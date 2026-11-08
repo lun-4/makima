@@ -256,6 +256,22 @@ case("picker_row_clips_long_titles_before_the_columns", function()
   eq(utf8.len(clipped[3][1]), budget - 4, "only the title tail is cut")
 end)
 
+case("picker_row_with_clipped_confirmation_fills_the_width_exactly", function()
+  local inner = 40
+  local columns = sh.layout(inner, { "1d 0s" }, { "7" })
+  local room = sh.confirm_width_budget(inner, columns)
+  local confirm = sh.clip_spans({ { string.rep("x", 100), "error" } }, room)
+  local confirm_width = sh.spans_width(confirm)
+  local budget = sh.title_width_budget(confirm_width, inner, columns)
+  local title = sh.clip_spans({ { "  ", "item" }, { "● ", "accent" }, { "title", "item" } }, budget)
+  for _, span in ipairs(confirm) do
+    title[#title + 1] = span
+  end
+  local count_text, padding = sh.row_right_columns(sh.spans_width(title), inner, 7, columns)
+  local row = sh.row_spans(title, count_text, "dim", padding, "1d 0s", "dim", columns)
+  eq(sh.spans_width(row), inner, "a confirmation clipped to its budget keeps the columns on their header cells")
+end)
+
 case("picker_header_shares_row_columns_and_theme_style", function()
   local inner = 80
   local columns = sh.layout(inner, { "1d 0s" }, { "5" })

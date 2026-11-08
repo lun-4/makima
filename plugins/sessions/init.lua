@@ -187,7 +187,7 @@ local function render()
     end
     local confirm_spans, confirm_width = {}, 0
     if board.confirm == s.id then
-      local room = math.max(inner - columns.right_width - 1, 0)
+      local room = Helpers.confirm_width_budget(inner, columns)
       confirm_spans = Helpers.clip_spans({ { CONFIRM_HINT, selected and "match_selected" or "error" } }, room)
       confirm_width = Helpers.spans_width(confirm_spans)
     end
