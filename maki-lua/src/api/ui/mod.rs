@@ -533,7 +533,13 @@ async fn open_editor(lua: Lua, #[ctx] tx: flume::Sender<UiAction>, path: String)
 /// highlighted, exactly like the built-in pickers. Filter edits keep the
 /// current row instead of jumping to the best match.
 ///
-/// @param items table List of items: plain strings, or `{ label, detail?, section?, section_detail? }` tables.
+/// An item's optional `age` field is a timestamp from `maki.time.now` or
+/// `maki.time.at`, not an elapsed duration. The host renders it as a live
+/// delta (for example `9s` or `4d 7h 23m 9s`) and refreshes it about once
+/// per second while the dialog is open. `detail` and `age` can coexist;
+/// age follows the detail.
+///
+/// @param items table List of items: plain strings, or `{ label, detail?, section?, section_detail?, age? }` tables.
 /// @param opts table? Options:
 ///   - title (string): dialog title.
 ///   - footer (table): key-hint pairs for the footer border. Each entry is `{key, label}`.

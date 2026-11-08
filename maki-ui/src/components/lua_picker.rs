@@ -17,7 +17,7 @@ use ratatui::layout::{Position, Rect};
 use crate::click::{HitTarget, PickerId};
 use crate::components::Overlay;
 use crate::components::keybindings::key_display;
-use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
+use crate::components::list_picker::{ClockSample, ListPicker, PickerAction, PickerItem};
 use crate::components::lua_float::hint_footer;
 use crate::repaint::{Cadence, Dirty};
 
@@ -33,6 +33,8 @@ pub struct PickerEntry {
     detail: Option<String>,
     section: Option<String>,
     section_detail: Option<String>,
+    /// Unix-epoch instant supplied by Lua; formatted at draw time.
+    age: Option<Duration>,
 }
 
 impl PickerItem for PickerEntry {
@@ -47,6 +49,9 @@ impl PickerItem for PickerEntry {
     }
     fn section_detail(&self) -> Option<&str> {
         self.section_detail.as_deref()
+    }
+    fn age(&self, now: &ClockSample) -> Option<Duration> {
+        self.age.map(|at| now.unix.saturating_sub(at))
     }
 }
 
@@ -103,6 +108,7 @@ impl LuaPicker {
                 detail: s.detail.clone(),
                 section: s.section.clone(),
                 section_detail: s.section_detail.clone(),
+                age: s.age,
             })
             .collect();
         let mut picker = ListPicker::new()
@@ -145,6 +151,11 @@ impl LuaPicker {
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
         self.picker.view(frame, area)
+    }
+
+    #[cfg(test)]
+    pub fn view_at(&mut self, frame: &mut Frame, area: Rect, now: &ClockSample) -> Rect {
+        self.picker.view_at(frame, area, now)
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
@@ -286,10 +297,11 @@ impl Overlay for LuaPicker {
     }
 
     fn cadence(&self) -> Cadence {
-        match self.next_timeout {
+        let timeout = match self.next_timeout {
             Some(next) => Cadence::after(next.saturating_duration_since(Instant::now())),
             None => Cadence::IDLE,
-        }
+        };
+        Cadence::any([self.picker.cadence(), timeout])
     }
 }
 
@@ -297,6 +309,8 @@ impl Overlay for LuaPicker {
 mod tests {
     use super::*;
     use maki_lua::test_support;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     const EXPECT_CONFIRM_FLASH: &str = "Press Ctrl+D again to delete";
 
@@ -306,6 +320,22 @@ mod tests {
             detail: None,
             section: None,
             section_detail: None,
+            age: None,
+        }
+    }
+
+    fn spoke_at(unix_secs: u64) -> ClockSample {
+        ClockSample {
+            monotonic: Instant::now(),
+            unix: Duration::from_secs(unix_secs),
+        }
+    }
+
+    fn aged_spec(label: &str, age_secs: u64) -> PickerItemSpec {
+        PickerItemSpec {
+            label: label.into(),
+            age: Some(Duration::from_secs(age_secs)),
+            ..Default::default()
         }
     }
 
@@ -430,6 +460,114 @@ mod tests {
         );
         assert_eq!(lp.tick(), Dirty::NO);
         assert!(probe.try_recv_picker_event().is_none());
+    }
+
+    #[test]
+    fn lua_picker_live_age_reaches_visible_buffer() {
+        let (handle, _probe) = test_support::probed_event_handle();
+        let mut lp = LuaPicker::new(handle);
+        let (tx, rx) = flume::bounded(1);
+        lp.open(
+            1,
+            vec![aged_spec("alpha", 991), aged_spec("beta", 997)],
+            PickerConfig::default(),
+            tx,
+        );
+        let area = Rect::new(0, 0, 60, 12);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        let mut render = |lp: &mut LuaPicker, now: ClockSample| {
+            terminal
+                .draw(|frame| {
+                    lp.view_at(frame, area, &now);
+                })
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| {
+                            buf.cell(Position::new(x, y))
+                                .map(|c| c.symbol())
+                                .unwrap_or(" ")
+                        })
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let rows = render(&mut lp, spoke_at(1000));
+        assert!(rows.iter().any(|row| row.contains("9s")));
+        assert!(rows.iter().any(|row| row.contains("3s")));
+
+        let rows = render(&mut lp, spoke_at(1001));
+        assert!(rows.iter().any(|row| row.contains("10s")));
+        assert!(rows.iter().any(|row| row.contains("4s")));
+
+        assert_eq!(
+            lp.handle_key(key_event(KeyCode::Down)),
+            LuaPickerAction::Consumed
+        );
+        assert_eq!(
+            lp.handle_key(key_event(KeyCode::Enter)),
+            LuaPickerAction::Choice(1),
+            "age rendering preserves original callback indices"
+        );
+        assert_eq!(rx.try_recv().unwrap(), PickerResult::Choice(1));
+    }
+
+    #[test]
+    fn lua_picker_age_is_independent_of_idle_timeout() {
+        let (handle, probe) = test_support::probed_event_handle();
+        let mut lp = LuaPicker::new(handle);
+        let config = PickerConfig {
+            timeout: Some(Duration::from_secs(5)),
+            ..Default::default()
+        };
+        let (tx, _rx) = flume::bounded(1);
+        lp.open(2, vec![aged_spec("alpha", 990)], config, tx);
+
+        let cadence = lp.cadence();
+        assert_eq!(cadence.frame(), Some(crate::repaint::AGE_FRAME));
+        assert!(cadence.moves(), "ages owe frames even with an idle timeout");
+        assert_eq!(lp.tick(), Dirty::NO);
+        assert!(
+            probe.try_recv_picker_event().is_none(),
+            "looking at a live age must not fire on_timeout"
+        );
+    }
+
+    #[test]
+    fn lua_picker_age_close_and_replacement() {
+        let (handle, probe) = test_support::probed_event_handle();
+        let mut lp = LuaPicker::new(handle);
+        let (tx, _rx) = flume::bounded(1);
+        lp.open(
+            3,
+            vec![aged_spec("alpha", 991)],
+            PickerConfig::default(),
+            tx,
+        );
+        assert!(lp.cadence().moves());
+
+        lp.close();
+        assert_eq!(lp.cadence(), Cadence::IDLE);
+        assert_eq!(probe.try_recv_picker_event(), Some((3, PickerEvent::Done)));
+
+        let (tx, _rx) = flume::bounded(1);
+        lp.open(
+            4,
+            vec![aged_spec("alpha", 991)],
+            PickerConfig::default(),
+            tx,
+        );
+        let (tx, _rx) = flume::bounded(1);
+        lp.open(5, vec![spec("static")], PickerConfig::default(), tx);
+        assert_eq!(probe.try_recv_picker_event(), Some((4, PickerEvent::Done)));
+        assert_eq!(
+            lp.cadence(),
+            Cadence::IDLE,
+            "a static replacement drops the age animation"
+        );
     }
 
     #[test]

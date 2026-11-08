@@ -5509,7 +5509,7 @@ fn job_callbacks_fire_while_command_handler_parked() {
 /// dialog replies; `on_change`/`on_timeout` fire from picker events sent by
 /// id, and the reply carries the 1-based original index.
 #[test]
-fn host_list_picker_roundtrip() {
+fn host_list_picker_roundtrip_with_age() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use maki_lua::{PickerEvent, PickerResult, UiAction};
 
@@ -5524,7 +5524,7 @@ fn host_list_picker_roundtrip() {
             tui_only = false,
             handler = function()
                 local result = maki.ui.open_list_picker(
-                    { "alpha", { label = "beta", detail = "b-d", section = "s" } },
+                    { "alpha", { label = "beta", detail = "b-d", section = "s", age = maki.time.at(1700000000) } },
                     {
                         title = "Pick",
                         cursor = 2,
@@ -5563,6 +5563,11 @@ fn host_list_picker_roundtrip() {
     assert_eq!(items[1].label, "beta");
     assert_eq!(items[1].detail.as_deref(), Some("b-d"));
     assert_eq!(items[1].section.as_deref(), Some("s"));
+    assert_eq!(
+        items[1].age,
+        Some(Duration::from_secs(1_700_000_000)),
+        "picker age metadata crosses the bridge as a Unix-epoch instant"
+    );
     assert_eq!(config.title.as_deref(), Some("Pick"));
     assert_eq!(
         config.cursor,

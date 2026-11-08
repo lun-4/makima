@@ -39,6 +39,9 @@ pub const IDLE_POLL: Duration = Duration::from_millis(100);
 /// Fast enough that per-character reveals and colour fades look continuous.
 const SMOOTH_FRAME: Duration = Duration::from_millis(16);
 
+/// How often a visible second-precision age changes.
+pub const AGE_FRAME: Duration = Duration::from_secs(1);
+
 /// What every poller in the crate is tested against, so the two invariants
 /// read the same wherever they are checked.
 #[cfg(test)]
@@ -161,6 +164,11 @@ impl Cadence {
     /// Typewriter reveals and colour fades, which change every frame.
     pub const SMOOTH: Self = Self {
         frame: Some(SMOOTH_FRAME),
+        moves: true,
+    };
+    /// Second-precision elapsed ages, which redraw once per displayed second.
+    pub const AGE: Self = Self {
+        frame: Some(AGE_FRAME),
         moves: true,
     };
     /// A worker mid-answer, looked at again on the smooth frame so a result
