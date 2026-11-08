@@ -541,6 +541,37 @@ fn send_and_store_refresh_work_during_load() {
     );
 }
 
+#[test]
+fn concurrent_refreshes_during_load_share_one_call() {
+    let state = TempDir::new().unwrap();
+    let source = format!(
+        r#"
+        {constants}
+        local store = maki.credentials.open(root, STORE_KEY)
+        local calls = 0
+        local function refresh()
+            local tokens = store:refresh(function()
+                calls = calls + 1
+                return {{ access = REFRESHED .. calls, refresh = REFRESH, expires = EXPIRES }}
+            end)
+            return tokens.access
+        end
+        local results = maki.async.gather({{ refresh, refresh }})
+        local seen = calls .. "," .. results[1].value .. "," .. results[2].value
+        assert(seen == "1," .. REFRESHED .. "1," .. REFRESHED .. "1", seen)
+        "#,
+        constants = constants(""),
+    );
+
+    load_bounded(state.path(), source).unwrap();
+
+    let dir = StateDir::from_path(state.path().to_path_buf());
+    assert_eq!(
+        load_credentials(&dir, &format!("plugins/{PLUGIN}/{STORE_KEY}")).unwrap()["access"],
+        format!("{REFRESHED}1")
+    );
+}
+
 #[test_case(r#"root:with_name("")"#, BAD_NAME_ERR ; "empty_name")]
 #[test_case(r#"root:with_name(".hidden")"#, BAD_NAME_ERR ; "dot_name")]
 #[test_case(r#"root:with_name("a/b")"#, BAD_NAME_ERR ; "slash_name")]

@@ -16,6 +16,7 @@ use mlua::{
     Function, Lua, LuaSerdeExt, MultiValue, Result as LuaResult, UserDataRef, Value as LuaValue,
 };
 use serde_json::Value;
+use smol::future::yield_now;
 use smol::unblock;
 use tracing::warn;
 
@@ -101,7 +102,7 @@ async fn delete(lua: Lua, this: UserDataRef<Store>) -> LuaResult<Pair<bool>> {
 /// Concurrent refreshes of one store share a single call of {fn}. The call
 /// runs on its own and is not cancelled with the caller, so a rotated token
 /// that the server already issued is always written. During plugin load,
-/// which nothing cancels, {fn} runs in the caller instead.
+/// which nothing cancels, {fn} runs in the first caller instead.
 ///
 /// @param fn function `fn(current)` returning the table to store.
 /// @return (table?, any?) The stored table after the refresh, or nil plus the error {fn} returned, unchanged.
@@ -118,22 +119,18 @@ async fn refresh(
 ) -> LuaResult<(LuaValue, LuaValue)> {
     let name = Arc::clone(&this.name);
     drop(this);
-    // A load holds the request loop that runs refresh jobs, so a job queued
-    // now would wait for the load that waits for it.
-    let result = if lua.app_data_ref::<LoadingPlugin>().is_some() {
-        run_refresh(&lua, &name, r#fn).await
-    } else {
-        let existing = lua
-            .app_data_ref::<RefreshFlights>()
-            .and_then(|flights| flights.0.get(&name).cloned());
-        let flight = match existing {
-            Some(flight) => Ok(flight),
-            None => start_refresh(&lua, name, r#fn),
-        };
-        match flight {
+    let existing = lua
+        .app_data_ref::<RefreshFlights>()
+        .and_then(|flights| flights.0.get(&name).cloned());
+    let result = match existing {
+        Some(flight) => flight.await.unwrap_or_else(|_| Err(HOST_STOPPED.into())),
+        None if lua.app_data_ref::<LoadingPlugin>().is_some() => {
+            refresh_in_load(&lua, name, r#fn).await
+        }
+        None => match start_refresh(&lua, name, r#fn) {
             Ok(flight) => flight.await.unwrap_or_else(|_| Err(HOST_STOPPED.into())),
             Err(error) => Err(error.into()),
-        }
+        },
     };
     let to_lua = |value: &Value| lua.to_value_with(value, serialize_options());
     match result {
@@ -166,6 +163,28 @@ async fn lock(lua: Lua, this: UserDataRef<Store>, r#fn: Function) -> LuaResult<M
     let values = r#fn.call_async::<MultiValue>(()).await;
     drop(lock);
     values
+}
+
+/// A load holds the request loop that runs refresh jobs, so a job queued now
+/// would wait for the load that waits for it. The first caller runs
+/// {refresh} itself instead, and concurrent callers wait on its flight as
+/// they would on a job's. Nothing cancels a load midway, so the rotated
+/// token is still always written.
+async fn refresh_in_load(lua: &Lua, name: Arc<str>, refresh: Function) -> RefreshResult {
+    let (reply, flight) = oneshot::channel();
+    if let Some(mut flights) = lua.app_data_mut::<RefreshFlights>() {
+        flights.0.insert(Arc::clone(&name), flight.shared());
+    }
+    // The refresh can finish within one poll when its file work is quick, so
+    // yield once: callers started alongside this one, such as by
+    // `maki.async.gather`, then find the flight instead of running {refresh}.
+    yield_now().await;
+    let result = run_refresh(lua, &name, refresh).await;
+    if let Some(mut flights) = lua.app_data_mut::<RefreshFlights>() {
+        flights.0.remove(&name);
+    }
+    let _ = reply.send(result.clone());
+    result
 }
 
 /// Runs the refresh as its own uncancellable job, so dropping the caller

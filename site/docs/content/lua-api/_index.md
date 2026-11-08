@@ -4853,7 +4853,7 @@ lock was taken. It returns a new table to store, nil to keep `current`
 Concurrent refreshes of one store share a single call of {fn}. The call
 runs on its own and is not cancelled with the caller, so a rotated token
 that the server already issued is always written. During plugin load,
-which nothing cancels, {fn} runs in the caller instead.
+which nothing cancels, {fn} runs in the first caller instead.
 
 **Parameters:**
 
