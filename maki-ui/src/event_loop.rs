@@ -3378,22 +3378,15 @@ impl<'t> EventLoop<'t> {
         provider: Option<PreparedProvider>,
     ) -> Result<(), String> {
         let (runtime, kind) = match target {
-            RuntimeTarget::Open { .. } => {
-                if let Some(idx) = self.position(session.id) {
-                    self.set_focused(idx);
-                    return Ok(());
-                }
-                let runtime = self
-                    .ctx
-                    .spawn_runtime_with_provider(session, provider)
-                    .map_err(|error| error.to_string())?;
-                let idx = self.push_runtime(runtime);
-                self.set_focused(idx);
-                return Ok(());
-            }
+            RuntimeTarget::Open { .. } => return self.open_runtime(session, provider),
             RuntimeTarget::Replace { runtime, kind, .. } => (runtime, kind),
         };
         let idx = self.runtime_position(runtime).ok_or(RUNTIME_GONE_ERR)?;
+        // Taking a blank tab was decided before the model was prepared; the
+        // user may have typed or started work there since, so look again.
+        if kind.is_none() && !self.blank_and_idle(idx) {
+            return self.open_runtime(session, provider);
+        }
         if self.sessions[idx].lock_lost {
             return Err(LOCK_LOST_REPLACEMENT_ERR.into());
         }
@@ -3414,6 +3407,41 @@ impl<'t> EventLoop<'t> {
             None => {}
         }
         Ok(())
+    }
+
+    fn open_runtime(
+        &mut self,
+        session: AppSession,
+        provider: Option<PreparedProvider>,
+    ) -> Result<(), String> {
+        if let Some(idx) = self.position(session.id) {
+            self.set_focused(idx);
+            return Ok(());
+        }
+        let runtime = self
+            .ctx
+            .spawn_runtime_with_provider(session, provider)
+            .map_err(|error| error.to_string())?;
+        let idx = self.push_runtime(runtime);
+        self.set_focused(idx);
+        Ok(())
+    }
+
+    /// Whether the session at {idx} holds nothing worth keeping, so a stored
+    /// session may take its tab: idle, nothing queued, no messages or draft.
+    /// The input box is read too, as a draft typed since the last frame has
+    /// not reached the session yet.
+    fn blank_and_idle(&self, idx: usize) -> bool {
+        let session = &self.sessions[idx];
+        let (manager, root) = session.handles.manager_and_root();
+        let actor_idle = manager.actor(root).is_ok_and(|actor| {
+            let snapshot = actor.snapshot();
+            snapshot.status == maki_agent::actor::ActorStatus::Idle && snapshot.queued == 0
+        });
+        session.quiescent()
+            && actor_idle
+            && !session.app.has_content()
+            && session.app.input_box.buffer.value().is_empty()
     }
 
     fn report_placement(&mut self, target: RuntimeTarget, result: Result<(), String>) {
@@ -3574,13 +3602,8 @@ impl<'t> EventLoop<'t> {
         if let Some(block) = session_lock::resume_block(&session.cwd, &cwd, open_elsewhere) {
             return Err(block.to_string());
         }
-        let current = &self.sessions[self.focused];
-        let (manager, root) = current.handles.manager_and_root();
-        let actor_idle = manager.actor(root).is_ok_and(|actor| {
-            let snapshot = actor.snapshot();
-            snapshot.status == maki_agent::actor::ActorStatus::Idle && snapshot.queued == 0
-        });
-        let target = if current.quiescent() && actor_idle && !current.app.has_content() {
+        let target = if self.blank_and_idle(self.focused) {
+            let current = &self.sessions[self.focused];
             if current.lock_lost {
                 return Err(LOCK_LOST_REPLACEMENT_ERR.into());
             }
@@ -7640,6 +7663,37 @@ mod tests {
                 event_loop.ctx.model_slot.load().provider.identity(),
                 current_provider
             );
+        });
+    }
+
+    #[test]
+    fn deferred_blank_tab_replacement_keeps_a_tab_that_gained_a_draft() {
+        const MODEL: &str = "ollama/hf:test-model";
+        const DRAFT: &str = "typed while the model was prepared";
+
+        with_event_loop(|event_loop| {
+            let current_id = event_loop.sessions[0].id();
+            let session = AppSession::new(MODEL, &event_loop.session_cwd);
+            let loaded_id = session.id;
+            let (reply_tx, reply_rx) = flume::bounded(1);
+            let target = RuntimeTarget::Replace {
+                runtime: event_loop.sessions[0].handles.identity(),
+                kind: None,
+                reply: Some(reply_tx),
+            };
+            event_loop.sessions[0].app.input_box.set_input(DRAFT.into());
+            let provider = PreparedProvider {
+                model: Model::from_spec(MODEL).unwrap(),
+                provider: Arc::new(StubProvider),
+            };
+
+            event_loop.complete_bring_up(target, session, Ok(provider));
+
+            assert!(reply_rx.try_recv().unwrap().is_ok());
+            assert_eq!(event_loop.sessions.len(), 2);
+            assert_eq!(event_loop.sessions[0].id(), current_id);
+            assert_eq!(event_loop.sessions[0].app.input_box.buffer.value(), DRAFT);
+            assert_eq!(event_loop.sessions[event_loop.focused].id(), loaded_id);
         });
     }
 
