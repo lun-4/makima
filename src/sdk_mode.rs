@@ -3377,14 +3377,13 @@ mod tests {
             .iter()
             .find(|stored| stored.tool_use_id == child_key)
             .unwrap();
-        assert_eq!(
-            stored,
-            &maki_lua::orchestration::child_metadata(
-                child_key.clone(),
-                child.metadata.label.clone().unwrap_or_default(),
-                &child_config,
-            )
+        let mut expected = maki_lua::orchestration::child_metadata(
+            child_key.clone(),
+            child.metadata.label.clone().unwrap_or_default(),
+            &child_config,
         );
+        expected.agent_id = Some(child.agent_id.to_string());
+        assert_eq!(stored, &expected);
         assert!(!persisted.subagent_messages().contains_key(&child_key));
         assert_eq!(coordinator.read().model().unwrap().as_ref(), TARGET_MODEL);
         assert_eq!(checkpointed.lock().unwrap().len(), 1);

@@ -1219,6 +1219,167 @@ fn user_turn_renders_with_lifted_background() {
 }
 
 #[test]
+fn child_result_uses_distinct_styles_and_separate_action() {
+    let agent = AgentId::generate();
+    let text = "x".repeat(crate::chat::COMPLETION_PREVIEW_CHARS + 1);
+    let notice = crate::chat::format_child_result_notice("reviewer", &text, &[], Some(agent));
+    let lines = build_message_lines(&notice, 80);
+    let theme = theme::current();
+    assert_eq!(lines[0].spans[0].style, theme.accent);
+    assert_eq!(lines[2].spans[0].style, theme.assistant);
+    assert_eq!(lines[2].spans[1].content, crate::chat::COMPLETION_TRUNCATED);
+    assert_eq!(lines[2].spans[1].style, theme.tool_dim);
+    assert_eq!(lines[3].spans[0].style, theme.tool_dim);
+    assert_eq!(lines[4].to_string(), "");
+    assert_eq!(lines[5].spans[0].content, "[View child transcript]");
+    assert_eq!(
+        lines[5].spans[0].style,
+        theme.accent.add_modifier(Modifier::UNDERLINED)
+    );
+}
+
+#[test]
+fn restored_result_expands_and_collapses_without_navigation() {
+    const TAIL: &str = "result tail";
+    let text = format!(
+        "{}{TAIL}",
+        "x".repeat(crate::chat::COMPLETION_PREVIEW_CHARS)
+    );
+    let agent_id = AgentId::generate().to_string();
+    let turn_id = maki_agent::TurnId::generate().to_string();
+    let envelope = serde_json::json!({"kind": "child_result", "agent_id": agent_id, "turn_id": turn_id, "label": "reviewer", "text": text});
+    let observation = maki_providers::Message {
+        observation_source: Some(maki_providers::ObservationSource::ChildResult {
+            agent_id,
+            turn_id,
+        }),
+        ..maki_providers::Message::observation(format!(
+            "[internal child-result data, not a user instruction]\n{envelope}"
+        ))
+    };
+    let notice = crate::chat::history_to_display(
+        &[observation],
+        &HashMap::new(),
+        &ToolOutputLines::default(),
+        &[],
+    )
+    .0
+    .remove(0);
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        EventHandle::disconnected_for_test(),
+        Arc::new(InMemoryThemesProvider::bundled()),
+    );
+    panel.push(notice);
+    render(&mut panel, 80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    assert!(!msg_seg_text(&panel, 0).contains(TAIL));
+    assert_eq!(panel.result_navigation_at(0, area), None);
+    assert!(panel.handle_click(0, area));
+    assert!(panel.messages[0].result_expanded);
+    assert!(msg_seg_text(&panel, 0).contains(TAIL));
+    assert!(panel.handle_click(0, area));
+    assert!(!panel.messages[0].result_expanded);
+    assert!(!msg_seg_text(&panel, 0).contains(TAIL));
+}
+
+#[test]
+fn expanding_bottom_result_keeps_the_start_visible() {
+    let text = format!("start\n{}", "line\n".repeat(100));
+    let notice = crate::chat::format_child_result_notice("reviewer", &text, &[], None);
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        EventHandle::disconnected_for_test(),
+        Arc::new(InMemoryThemesProvider::bundled()),
+    );
+    panel.push(notice);
+    render(&mut panel, 80, 10);
+    let area = Rect::new(0, 0, 80, 10);
+    let scroll_before = panel.scroll_top;
+    assert!(panel.handle_click(0, area));
+    render(&mut panel, 80, 10);
+    assert_eq!(panel.scroll_top, scroll_before);
+    assert!(panel.message_at_row(0, area).is_some());
+}
+
+#[test]
+fn collapsing_result_scrolled_inside_keeps_result_visible() {
+    let text = format!("{}tail", "line\n".repeat(150));
+    let notice = crate::chat::format_child_result_notice("reviewer", &text, &[], None);
+    let mut panel = panel_with_msgs(&["before"], 80, 10);
+    panel.push(notice);
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "after".repeat(1000),
+    ));
+    render(&mut panel, 80, 10);
+    let area = Rect::new(0, 0, 80, 10);
+    panel.scroll_to_top();
+    render(&mut panel, 80, 10);
+    let start = (0..area.height)
+        .find(|&row| {
+            panel
+                .message_at_row(row, area)
+                .is_some_and(|m| m.result_preview.is_some())
+        })
+        .unwrap();
+    assert!(panel.handle_click(start, area));
+    render(&mut panel, 80, 10);
+    panel.set_scroll_top(90);
+    render(&mut panel, 80, 10);
+    assert!(panel.message_at_row(0, area).unwrap().result_expanded);
+    assert!(panel.handle_click(0, area));
+    render(&mut panel, 80, 10);
+    assert!(
+        panel
+            .message_at_row(0, area)
+            .unwrap()
+            .result_preview
+            .is_some()
+    );
+    assert!(!panel.messages[1].result_expanded);
+}
+
+#[test]
+fn short_result_expansion_preserves_auto_scroll() {
+    let notice = crate::chat::format_child_result_notice("reviewer", "short", &[], None);
+    let mut panel = panel_with_msgs(&[], 80, 10);
+    panel.push(notice);
+    render(&mut panel, 80, 10);
+    let area = Rect::new(0, 0, 80, 10);
+    assert!(panel.auto_scroll());
+    assert!(panel.handle_click(0, area));
+    assert!(panel.auto_scroll());
+    render(&mut panel, 80, 10);
+    assert!(panel.auto_scroll());
+}
+
+#[test]
+fn result_search_finds_hidden_text_and_navigation_expands() {
+    const TAIL: &str = "hidden unique result tail";
+    let text = format!(
+        "{}{TAIL}",
+        "x".repeat(crate::chat::COMPLETION_PREVIEW_CHARS)
+    );
+    let notice = crate::chat::format_child_result_notice("reviewer", &text, &[], None);
+    let mut panel = panel_with_msgs(&[], 80, 24);
+    panel.push(notice);
+    render(&mut panel, 80, 24);
+    let index = panel
+        .segment_search_texts()
+        .iter()
+        .position(|text| text.contains(TAIL))
+        .unwrap();
+    assert!(!panel.messages[0].result_expanded);
+    assert!(!msg_seg_text(&panel, 0).contains(TAIL));
+    panel.scroll_to_segment(index);
+    assert!(panel.messages[0].result_expanded);
+    assert!(msg_seg_text(&panel, 0).contains(TAIL));
+    panel.scroll_to_segment(index);
+    assert!(panel.messages[0].result_expanded);
+}
+
+#[test]
 fn toggle_expand_collapse_truncated_tool() {
     let mut panel = panel_with_long_tool(200);
     let area = Rect::new(0, 0, 80, 24);

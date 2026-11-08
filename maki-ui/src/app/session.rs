@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
-use crate::chat::{Chat, DONE_TEXT, history_to_display};
+use crate::chat::{Chat, DONE_TEXT, history_to_display_with_lookup};
 use crate::components::DisplayRole;
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::{Action, SessionReplacementKind, SessionReplacementRequest};
@@ -181,8 +181,34 @@ impl App {
             .into_iter()
             .map(|(tool_id, &chat_index)| {
                 let chat = &self.chats[chat_index];
+                let previous = self
+                    .state
+                    .session
+                    .subagents()
+                    .iter()
+                    .find(|sa| sa.tool_use_id == *tool_id);
+                let current_id = chat.agent_id.map(|id| id.to_string());
+                let ambiguous = previous.is_some_and(|sa| {
+                    sa.ambiguous
+                        || (current_id.is_some()
+                            && sa.agent_id != current_id
+                            && (sa.agent_id.is_some()
+                                || self.state.session.subagent_messages().contains_key(tool_id)))
+                }) || self
+                    .chats
+                    .iter()
+                    .filter(|chat| chat.subagent_id.as_deref() == Some(tool_id))
+                    .count()
+                    != 1;
+                let agent_id = if ambiguous {
+                    None
+                } else {
+                    current_id.or_else(|| previous.and_then(|sa| sa.agent_id.clone()))
+                };
                 StoredSubagent {
                     tool_use_id: tool_id.clone(),
+                    agent_id,
+                    ambiguous,
                     name: chat.name.clone(),
                     model: chat.model_id.clone(),
                     thinking: chat.opts.map(|o| o.thinking.into()),
@@ -237,13 +263,6 @@ impl App {
         let restoring = Arc::new(AtomicBool::new(true));
         self.restoring = restoring.clone();
 
-        let (display_msgs, restore_items) = history_to_display(
-            self.state.session.messages(),
-            self.state.session.tool_outputs(),
-            &self.ui_config.tool_output_lines,
-            &posts_in(self.state.session.posts(), None),
-        );
-        self.main_chat().load_messages(display_msgs);
         let cost = self.state.cost;
         let context_size = self.state.context_size;
         let main = self.main_chat();
@@ -254,8 +273,6 @@ impl App {
             self.input_box.set_input(draft);
             self.input_box.buffer.move_to_end();
         }
-
-        self.fire_restore_items(restore_items);
 
         // Read, not taken: the live chats below are the source `sync_subagents`
         // mirrors back, so emptying the session here would only make the next
@@ -276,21 +293,38 @@ impl App {
                 thinking: thinking.into(),
                 fast: sa.fast,
             });
-            if let Some(messages) = self.state.session.subagent_messages().get(&sa.tool_use_id) {
-                let (display, items) = history_to_display(
-                    messages,
-                    self.state.session.tool_outputs(),
-                    &self.ui_config.tool_output_lines,
-                    &posts_in(self.state.session.posts(), Some(&sa.tool_use_id)),
-                );
-                chat.load_messages(display);
-                chat.mark_finished(DisplayRole::Done, DONE_TEXT);
-                self.fire_restore_items(items);
-            }
             self.chats.push(chat);
         }
 
         self.sync_subagents();
+
+        let (display, items) = history_to_display_with_lookup(
+            self.state.session.messages(),
+            self.state.session.tool_outputs(),
+            &self.ui_config.tool_output_lines,
+            &posts_in(self.state.session.posts(), None),
+            &|id| self.historical_chat_index(id).is_some(),
+        );
+        self.main_chat().load_messages(display);
+        self.fire_restore_items(items);
+
+        for index in 1..self.chats.len() {
+            let Some(key) = self.chats[index].subagent_id.as_deref() else {
+                continue;
+            };
+            if let Some(messages) = self.state.session.subagent_messages().get(key) {
+                let (display, items) = history_to_display_with_lookup(
+                    messages,
+                    self.state.session.tool_outputs(),
+                    &self.ui_config.tool_output_lines,
+                    &posts_in(self.state.session.posts(), Some(key)),
+                    &|id| self.historical_chat_index(id).is_some(),
+                );
+                self.chats[index].load_messages(display);
+                self.chats[index].mark_finished(DisplayRole::Done, DONE_TEXT);
+                self.fire_restore_items(items);
+            }
+        }
 
         let eh = &self.lua_event_handle;
         if eh.is_disconnected() {
@@ -428,12 +462,23 @@ impl App {
                 &live_children,
             );
         }
-        let (display, items) = history_to_display(
+        let (mut display, items) = history_to_display_with_lookup(
             &change.messages,
             self.state.session.tool_outputs(),
             &self.ui_config.tool_output_lines,
             &posts_in(self.state.session.posts(), chat.as_deref()),
+            &|id| {
+                self.live_chat_index.contains_key(&id) || self.historical_chat_index(id).is_some()
+            },
         );
+        for message in &mut display {
+            if message
+                .result_agent
+                .is_some_and(|id| self.live_chat_index.contains_key(&id))
+            {
+                message.result_historical = false;
+            }
+        }
         self.chats[index].load_messages(display);
         self.chats[index].context_size = context_size;
         self.fire_restore_items(items);

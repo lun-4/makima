@@ -221,7 +221,7 @@ impl SessionLogCheckpoint {
         dir: &StateDir,
         session: &Mutex<RetainedSession>,
         session_id: MakiId,
-        child: StoredSubagent,
+        mut child: StoredSubagent,
         history: &HistorySnapshot<Message>,
         guard: Option<&SessionPublicationGuard>,
     ) -> Result<(), CheckpointError> {
@@ -231,6 +231,8 @@ impl SessionLogCheckpoint {
         };
         let mut candidate = lock(session).session.clone();
         let key = child.tool_use_id.clone();
+        mark_duplicate_agent_ids(&mut candidate, &mut child);
+        mark_unidentified_history(&candidate, &mut child);
         if candidate
             .subagent_history_snapshot(&key)
             .is_some_and(|selected| {
@@ -243,11 +245,15 @@ impl SessionLogCheckpoint {
             return Err(failure(Arc::from(HISTORY_SUPERSEDED)));
         }
         candidate.prune_posts(Some(&key), history.messages.len());
-        if !candidate
+        if let Some(current) = candidate
             .subagents()
             .iter()
-            .any(|current| current.tool_use_id == key)
+            .find(|current| current.tool_use_id == key)
         {
+            let mut metadata = current.clone();
+            merge_child_identity(&mut metadata, &child);
+            upsert_child(&mut candidate, metadata);
+        } else {
             upsert_child(&mut candidate, child);
         }
         let directory = dir
@@ -270,12 +276,14 @@ impl SessionLogCheckpoint {
     fn save_child_config(
         dir: &StateDir,
         session: &Mutex<RetainedSession>,
-        child: StoredSubagent,
+        mut child: StoredSubagent,
         guard: Option<&SessionPublicationGuard>,
         publication: &CheckpointPublication,
         claim: &CheckpointClaim,
     ) -> Result<(), CheckpointError> {
         let mut candidate = lock(session).session.clone();
+        mark_duplicate_agent_ids(&mut candidate, &mut child);
+        mark_unidentified_history(&candidate, &mut child);
         upsert_child(&mut candidate, child);
         Self::publish_candidate(dir, &candidate, guard, publication, claim)?;
         lock(session).session = candidate;
@@ -373,14 +381,72 @@ impl CheckpointWriter<SessionCheckpoint> for SessionLogCheckpoint {
     }
 }
 
-fn upsert_child(candidate: &mut StoredSession, child: StoredSubagent) {
-    let mut children = candidate.subagents().to_vec();
-    if let Some(current) = children
-        .iter_mut()
-        .find(|current| current.tool_use_id == child.tool_use_id)
+fn mark_unidentified_history(candidate: &StoredSession, child: &mut StoredSubagent) {
+    if child.agent_id.is_some()
+        && candidate
+            .subagent_messages()
+            .contains_key(&child.tool_use_id)
+        && !candidate
+            .subagents()
+            .iter()
+            .any(|current| current.tool_use_id == child.tool_use_id && current.agent_id.is_some())
     {
+        child.agent_id = None;
+        child.ambiguous = true;
+    }
+}
+
+fn mark_duplicate_agent_ids(candidate: &mut StoredSession, child: &mut StoredSubagent) {
+    let Some(agent_id) = &child.agent_id else {
+        return;
+    };
+    let mut children = candidate.subagents().to_vec();
+    let mut collision = false;
+    for current in &mut children {
+        if current.tool_use_id != child.tool_use_id && current.agent_id.as_ref() == Some(agent_id) {
+            current.agent_id = None;
+            current.ambiguous = true;
+            collision = true;
+        }
+    }
+    if collision {
+        child.agent_id = None;
+        child.ambiguous = true;
+        candidate.set_subagents(children);
+    }
+}
+
+fn merge_child_identity(current: &mut StoredSubagent, incoming: &StoredSubagent) {
+    current.ambiguous |= incoming.ambiguous
+        || matches!((&current.agent_id, &incoming.agent_id), (Some(a), Some(b)) if a != b);
+    if current.ambiguous {
+        current.agent_id = None;
+    } else if incoming.agent_id.is_some() {
+        current.agent_id.clone_from(&incoming.agent_id);
+    }
+}
+
+fn upsert_child(candidate: &mut StoredSession, mut child: StoredSubagent) {
+    let mut children = candidate.subagents().to_vec();
+    let key = child.tool_use_id.clone();
+    let mut matching = children
+        .iter_mut()
+        .filter(|current| current.tool_use_id == key);
+    if let Some(current) = matching.next() {
+        merge_child_identity(current, &child);
+        child.agent_id.clone_from(&current.agent_id);
+        child.ambiguous = current.ambiguous;
         *current = child;
+        for duplicate in matching {
+            duplicate.agent_id = None;
+            duplicate.ambiguous = true;
+            current.agent_id = None;
+            current.ambiguous = true;
+        }
     } else {
+        if child.ambiguous {
+            child.agent_id = None;
+        }
         children.push(child);
     }
     candidate.set_subagents(children);
@@ -496,6 +562,8 @@ mod tests {
     fn child(key: &str) -> StoredSubagent {
         StoredSubagent {
             tool_use_id: key.into(),
+            agent_id: None,
+            ambiguous: false,
             name: CHILD_NAME.into(),
             model: Some(MODEL.into()),
             thinking: Some(ThinkingConfig::Off.into()),
@@ -520,6 +588,224 @@ mod tests {
             "created_at": session.created_at,
             "updated_at": session.updated_at,
         })
+    }
+
+    #[test_case::test_case(false; "collision_in_history")]
+    #[test_case::test_case(true; "collision_in_config")]
+    fn child_identity_collision_is_persistent(config_collision: bool) {
+        smol::block_on(async {
+            let tmp = TempDir::new().unwrap();
+            let dir = StateDir::from_path(tmp.path().to_path_buf());
+            let id = MakiId::generate();
+            let mut first = child(CHILD_KEY);
+            first.agent_id = Some(MakiId::generate().to_string());
+            let mut session = child_session(id);
+            session.set_subagents(vec![first.clone(), child(SIBLING_KEY)]);
+            session.save(&dir).unwrap();
+            let writer = SessionLogCheckpoint::open(dir.clone(), id, MODEL, CWD, None).unwrap();
+            let history = HistorySnapshot::new(vec![Message::user(TERMINAL.into())]);
+            writer
+                .checkpoint_child(first.clone(), history.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                StoredSession::load(id, &dir).unwrap().subagents()[0].agent_id,
+                first.agent_id
+            );
+
+            let mut second = first.clone();
+            second.agent_id = Some(MakiId::generate().to_string());
+            if config_collision {
+                writer
+                    .checkpoint_child_config(
+                        second,
+                        CheckpointPublication::default(),
+                        Arc::new(|publication| {
+                            assert!(publication.try_publish());
+                            Ok(())
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                writer
+                    .checkpoint_child(second, history.clone())
+                    .await
+                    .unwrap();
+            }
+            drop(writer);
+            let writer = SessionLogCheckpoint::open(dir.clone(), id, MODEL, CWD, None).unwrap();
+            writer.checkpoint_child(first, history).await.unwrap();
+            let loaded = StoredSession::load(id, &dir).unwrap();
+            assert!(loaded.subagents()[0].ambiguous);
+            assert_eq!(loaded.subagents()[0].agent_id, None);
+        });
+    }
+
+    #[test_case::test_case(false; "history")]
+    #[test_case::test_case(true; "config")]
+    fn duplicate_tool_keys_stay_ambiguous(config: bool) {
+        smol::block_on(async {
+            let tmp = TempDir::new().unwrap();
+            let dir = StateDir::from_path(tmp.path().to_path_buf());
+            let id = MakiId::generate();
+            let mut first = child(CHILD_KEY);
+            first.agent_id = Some(MakiId::generate().to_string());
+            let mut session = child_session(id);
+            session.set_subagents(vec![first.clone(), first.clone(), child(SIBLING_KEY)]);
+            session.save(&dir).unwrap();
+            let writer = SessionLogCheckpoint::open(dir.clone(), id, MODEL, CWD, None).unwrap();
+            if config {
+                writer
+                    .checkpoint_child_config(
+                        first.clone(),
+                        CheckpointPublication::default(),
+                        Arc::new(|publication| {
+                            assert!(publication.try_publish());
+                            Ok(())
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                writer
+                    .checkpoint_child(
+                        first,
+                        HistorySnapshot::new(vec![Message::user(TERMINAL.into())]),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let loaded = StoredSession::load(id, &dir).unwrap();
+            for saved in loaded
+                .subagents()
+                .iter()
+                .filter(|saved| saved.tool_use_id == CHILD_KEY)
+            {
+                assert!(saved.ambiguous);
+                assert_eq!(saved.agent_id, None);
+            }
+        });
+    }
+
+    #[test_case::test_case(false, false; "history_conflicting_identity")]
+    #[test_case::test_case(false, true; "history_unidentified")]
+    #[test_case::test_case(true, false; "config_conflicting_identity")]
+    #[test_case::test_case(true, true; "config_unidentified")]
+    fn cross_key_identity_collision_is_persistent(config: bool, unidentified: bool) {
+        smol::block_on(async {
+            let tmp = TempDir::new().unwrap();
+            let dir = StateDir::from_path(tmp.path().to_path_buf());
+            let id = MakiId::generate();
+            let mut session = child_session(id);
+            let mut first = child(CHILD_KEY);
+            if !unidentified {
+                first.agent_id = Some(MakiId::generate().to_string());
+            }
+            let mut sibling = child(SIBLING_KEY);
+            sibling.agent_id = Some(MakiId::generate().to_string());
+            session.set_subagents(vec![first.clone(), sibling.clone()]);
+            session.save(&dir).unwrap();
+            let writer = SessionLogCheckpoint::open(dir.clone(), id, MODEL, CWD, None).unwrap();
+            first.agent_id.clone_from(&sibling.agent_id);
+            if config {
+                writer
+                    .checkpoint_child_config(
+                        first.clone(),
+                        CheckpointPublication::default(),
+                        Arc::new(|publication| {
+                            assert!(publication.try_publish());
+                            Ok(())
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                writer
+                    .checkpoint_child(
+                        first.clone(),
+                        HistorySnapshot::new(vec![Message::user(TERMINAL.into())]),
+                    )
+                    .await
+                    .unwrap();
+            }
+            drop(writer);
+            let writer = SessionLogCheckpoint::open(dir.clone(), id, MODEL, CWD, None).unwrap();
+            writer
+                .checkpoint_child_config(
+                    first,
+                    CheckpointPublication::default(),
+                    Arc::new(|publication| {
+                        assert!(publication.try_publish());
+                        Ok(())
+                    }),
+                )
+                .await
+                .unwrap();
+            let loaded = StoredSession::load(id, &dir).unwrap();
+            for saved in loaded.subagents() {
+                assert!(saved.ambiguous);
+                assert_eq!(saved.agent_id, None);
+            }
+        });
+    }
+
+    #[test_case::test_case(false, false; "history_with_metadata")]
+    #[test_case::test_case(false, true; "history_without_metadata")]
+    #[test_case::test_case(true, false; "config_with_metadata")]
+    #[test_case::test_case(true, true; "config_without_metadata")]
+    fn unidentified_history_does_not_acquire_identity(config: bool, missing_metadata: bool) {
+        smol::block_on(async {
+            let tmp = TempDir::new().unwrap();
+            let dir = StateDir::from_path(tmp.path().to_path_buf());
+            let id = MakiId::generate();
+            let mut session = child_session(id);
+            if missing_metadata {
+                session.set_subagents(vec![child(SIBLING_KEY)]);
+            }
+            session.save(&dir).unwrap();
+            let writer = SessionLogCheckpoint::open(dir.clone(), id, MODEL, CWD, None).unwrap();
+            let mut incoming = child(CHILD_KEY);
+            incoming.agent_id = Some(MakiId::generate().to_string());
+            if config {
+                writer
+                    .checkpoint_child_config(
+                        incoming.clone(),
+                        CheckpointPublication::default(),
+                        Arc::new(|publication| {
+                            assert!(publication.try_publish());
+                            Ok(())
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                writer
+                    .checkpoint_child(
+                        incoming.clone(),
+                        HistorySnapshot::new(vec![Message::user(TERMINAL.into())]),
+                    )
+                    .await
+                    .unwrap();
+            }
+            drop(writer);
+            let writer = SessionLogCheckpoint::open(dir.clone(), id, MODEL, CWD, None).unwrap();
+            writer
+                .checkpoint_child(
+                    incoming,
+                    HistorySnapshot::new(vec![Message::user(TERMINAL.into())]),
+                )
+                .await
+                .unwrap();
+            let loaded = StoredSession::load(id, &dir).unwrap();
+            let saved = loaded
+                .subagents()
+                .iter()
+                .find(|child| child.tool_use_id == CHILD_KEY)
+                .unwrap();
+            assert!(saved.ambiguous);
+            assert_eq!(saved.agent_id, None);
+        });
     }
 
     fn child_session(id: MakiId) -> StoredSession {

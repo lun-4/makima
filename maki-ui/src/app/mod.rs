@@ -106,9 +106,8 @@ const COMMAND_TRANSCRIPT_MESSAGES: usize = 1000;
 const COMMAND_TRANSCRIPT_BYTES: usize = 1024 * 1024;
 const SUBAGENT_STREAMING_STATUS: Status = Status::Streaming;
 const SUBAGENT_IDLE_STATUS: Status = Status::Idle;
-const COMPLETION_LABEL_CHARS: usize = 80;
-const COMPLETION_PREVIEW_CHARS: usize = 512;
-const COMPLETION_TRUNCATED: &str = "... [truncated]";
+#[cfg(test)]
+use crate::chat::{COMPLETION_PREVIEW_CHARS, COMPLETION_TRUNCATED};
 
 #[cfg(test)]
 pub(crate) use crate::agent::QueuedMessage;
@@ -534,29 +533,12 @@ impl App {
             || delivery.result.outcome.agent_id().to_string(),
             str::to_owned,
         );
-        let source: String = source.chars().take(COMPLETION_LABEL_CHARS).collect();
-        let mut chars = delivery.result.text.chars();
-        let text: String = chars.by_ref().take(COMPLETION_PREVIEW_CHARS).collect();
-        let reference = delivery
-            .result
-            .output
-            .iter()
-            .find(|value| value["truncated"] == true && value["full_result"].is_object());
-        let truncated = chars.next().is_some() || reference.is_some();
-        let marker = if truncated { COMPLETION_TRUNCATED } else { "" };
-        let mut notice = DisplayMessage::new(
-            DisplayRole::Done,
-            format!(
-                "[Result from {source}] {text}{marker}\n[click to view child transcript; {} for Tasks]",
-                key::TASKS.label
-            ),
+        let notice = crate::chat::format_child_result_notice(
+            &source,
+            &delivery.result.text,
+            &delivery.result.output,
+            Some(delivery.result.outcome.agent_id()),
         );
-        if let Some(reference) = reference {
-            notice
-                .text
-                .push_str(&format!("\n[Full result lookup: {reference}]"));
-        }
-        notice.result_agent = Some(delivery.result.outcome.agent_id());
         self.chats[0].push(notice);
     }
 
@@ -3100,6 +3082,38 @@ impl App {
             after_message,
             post,
         });
+    }
+
+    fn historical_chat_index(&self, agent_id: maki_agent::AgentId) -> Option<usize> {
+        let session = &self.state.session;
+        let id = agent_id.to_string();
+        let mut matching = session
+            .subagents()
+            .iter()
+            .filter(|entry| entry.agent_id.as_deref() == Some(&id));
+        let entry = matching.next()?;
+        if entry.ambiguous
+            || matching.next().is_some()
+            || session
+                .subagents()
+                .iter()
+                .filter(|other| other.tool_use_id == entry.tool_use_id)
+                .count()
+                != 1
+            || !session.subagent_messages().contains_key(&entry.tool_use_id)
+        {
+            return None;
+        }
+        let mut chats = self
+            .chats
+            .iter()
+            .enumerate()
+            .filter(|(_, chat)| chat.subagent_id.as_deref() == Some(&entry.tool_use_id));
+        let (index, chat) = chats.next()?;
+        if chat.agent_id.is_some() || chats.next().is_some() {
+            return None;
+        }
+        Some(index)
     }
 
     fn resolve_or_create_chat(&mut self, subagent: &SubagentInfo) -> usize {
