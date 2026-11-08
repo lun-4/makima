@@ -30,6 +30,8 @@ const BAD_NAME_ERR: &str =
     "must be non-empty ASCII letters, digits, '-', '_' or '.', and not start with '.'";
 const BAD_ARGS_ERR: &str = "takes (ctx, spec) or (spec)";
 const NOT_A_CTX: &str = "userdata";
+const NET_TIMEOUT_ENV: &str = "MAKIMA_NET_TIMEOUT_SECS";
+const NET_TIMEOUT_SECS: &str = "1";
 const SPEC: &str = "fake/fake-1";
 const BOUND: Duration = Duration::from_secs(10);
 const API_KEY: &str = "sk-written-by-lua";
@@ -570,6 +572,25 @@ fn concurrent_refreshes_during_load_share_one_call() {
         load_credentials(&dir, &format!("plugins/{PLUGIN}/{STORE_KEY}")).unwrap()["access"],
         format!("{REFRESHED}1")
     );
+}
+
+#[test]
+fn plugin_ctx_send_gives_up_after_the_net_timeout() {
+    // SAFETY: nextest runs each test in its own process, and the variable is
+    // set before the host starts.
+    unsafe { std::env::set_var(NET_TIMEOUT_ENV, NET_TIMEOUT_SECS) };
+    let silent = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", silent.local_addr().unwrap());
+    let state = TempDir::new().unwrap();
+    let source = format!(
+        r#"
+        local root = ...
+        local response, err = root.send({{ url = "{url}" }})
+        assert(response == nil and err ~= nil, "send to a silent server returned a response")
+        "#
+    );
+
+    load_bounded(state.path(), source).unwrap();
 }
 
 #[test_case(r#"root:with_name("")"#, BAD_NAME_ERR ; "empty_name")]
