@@ -506,6 +506,21 @@ fn named_children_of_the_root_ctx_open_separate_stores() {
 }
 
 #[test]
+fn child_ctx_cannot_read_a_parent_only_store() {
+    let state = TempDir::new().unwrap();
+    let source = format!(
+        r#"
+        local root = ...
+        assert(maki.credentials.open(root, "{STORE_KEY}"):write({{ at = "root" }}))
+        local seen = maki.credentials.open(root:with_name("{NAMESPACE}"), "{STORE_KEY}"):read()
+        assert(seen == nil, "a child ctx read its parent's store")
+        "#
+    );
+
+    load_bounded(state.path(), source).unwrap();
+}
+
+#[test]
 fn send_and_store_refresh_work_during_load() {
     let server = serve();
     let rotated = json!({ "access": ROTATED, "refresh": REFRESH, "expires": EXPIRES });
