@@ -6,6 +6,7 @@ ListPicker.__index = ListPicker
 local DETAIL_RIGHT_PAD = 2
 local NO_MATCHES_LABEL = "  (no matches)"
 local TITLE_MIN_WIDTH = 4
+local COLUMN_SEPARATOR_WIDTH = 1
 local AGE_ELLIPSIS_MIN_WIDTH = 6
 local NANOS_PER_MS = 1000000
 local NANOS_PER_SEC = 1000000000
@@ -207,7 +208,7 @@ local function render_lines(items, selected, width, query, reference)
     local age = type(item) == "table" and item.age and maki.time.ago(item.age, reference) or nil
     if age then
       local title_min = math.min(TITLE_MIN_WIDTH, math.max(width - 2 - DETAIL_RIGHT_PAD, 0))
-      local right_room = math.max(width - 2 - title_min - DETAIL_RIGHT_PAD, 0)
+      local right_room = math.max(width - 2 - title_min - DETAIL_RIGHT_PAD - COLUMN_SEPARATOR_WIDTH, 0)
       local right = detail and (detail .. " " .. age) or age
       if dispw(right) > right_room then
         right = age
@@ -215,7 +216,8 @@ local function render_lines(items, selected, width, query, reference)
       if dispw(right) > right_room then
         right = elide_left(right, right_room)
       end
-      local label_budget = math.max(width - 2 - dispw(right) - DETAIL_RIGHT_PAD, 0)
+      local separator = right ~= "" and COLUMN_SEPARATOR_WIDTH or 0
+      local label_budget = math.max(width - 2 - dispw(right) - DETAIL_RIGHT_PAD - separator, 0)
       label = truncate_label(label, label_budget)
       local spans = highlight_spans(label, words, style, match_style)
       if spans[1][2] == style then
