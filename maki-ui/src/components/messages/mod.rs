@@ -36,7 +36,7 @@ use std::time::Instant;
 use super::scrollbar::{ScrollbarHit, render_vertical_scrollbar};
 use super::streaming_content::StreamingContent;
 use maki_agent::{
-    BufferSnapshot, EventSender, ImageSource, InstructionBlock, NO_FILES_FOUND, SharedBuf,
+    AgentId, BufferSnapshot, EventSender, ImageSource, InstructionBlock, NO_FILES_FOUND, SharedBuf,
     ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
 use maki_lua::{EventHandle, WARM_TOOL_CAP, WinView};
@@ -636,6 +636,17 @@ impl MessagesPanel {
 
     pub fn scroll_to_segment(&mut self, segment_index: usize) {
         let width = self.viewport_width;
+        if let Some(msg_idx) = self.cache.get(segment_index).and_then(|seg| seg.msg_index)
+            && let Some(msg) = self.messages.get_mut(msg_idx)
+            && msg.result_preview.is_some()
+            && !msg.result_expanded
+        {
+            msg.result_expanded = true;
+            let lines = build_message_lines(msg, width);
+            if let Some(seg) = self.cache.get_mut(segment_index) {
+                seg.set_lines(lines);
+            }
+        }
         let offset = self
             .cache
             .segments()
@@ -664,13 +675,30 @@ impl MessagesPanel {
         self.accent.set(color);
     }
 
-    pub fn post_agent_at(&self, row: u16, area: Rect) -> Option<&str> {
+    pub fn message_at_row(&self, row: u16, area: Rect) -> Option<&DisplayMessage> {
         if row < area.y || row >= area.bottom() {
             return None;
         }
         let doc_row = u32::from(row - area.y) + u32::from(self.scroll_top);
         let (_, segment, _) = self.cache.segment_at_row(doc_row, self.viewport_width)?;
-        self.messages.get(segment.msg_index?)?.post_agent.as_deref()
+        self.messages.get(segment.msg_index?)
+    }
+
+    pub fn result_navigation_at(&self, row: u16, area: Rect) -> Option<AgentId> {
+        if row < area.y || row >= area.bottom() {
+            return None;
+        }
+        let doc_row = u32::from(row - area.y) + u32::from(self.scroll_top);
+        let (_, segment, start) = self.cache.segment_at_row(doc_row, self.viewport_width)?;
+        let message = self.messages.get(segment.msg_index?)?;
+        let agent = message.result_agent?;
+        let rel = u16::try_from(doc_row - start).ok()?;
+        let line = segment.source_line_at(rel, self.viewport_width)?;
+        (line + 1 == segment.lines().len()).then_some(agent)
+    }
+
+    pub fn post_agent_at(&self, row: u16, area: Rect) -> Option<&str> {
+        self.message_at_row(row, area)?.post_agent.as_deref()
     }
 
     pub fn handle_click(&mut self, row: u16, area: Rect) -> bool {
@@ -682,7 +710,7 @@ impl MessagesPanel {
         // Both fallbacks toggle thinking: a row past the cached segments
         // belongs to the still-streaming indicator, and a segment without a
         // tool_id is a finished message's text.
-        let Some((_, seg, seg_start)) = self.cache.segment_at_row(doc_row, width) else {
+        let Some((seg_idx, seg, seg_start)) = self.cache.segment_at_row(doc_row, width) else {
             return self.try_toggle_collapsed_thinking(doc_row, width);
         };
         let rel = u16::try_from(doc_row - seg_start).unwrap_or(u16::MAX);
@@ -691,6 +719,38 @@ impl MessagesPanel {
         }
         let Some(tool_id) = seg.tool_id.as_deref() else {
             let msg_idx = seg.msg_index;
+            if let Some(idx) = msg_idx
+                && let Some(msg) = self.messages.get_mut(idx)
+                && msg.result_preview.is_some()
+            {
+                let old_height = seg.height(width);
+                let expanding = !msg.result_expanded;
+                msg.result_expanded = expanding;
+                let lines = build_message_lines(msg, width);
+                let anchor = self.cache.anchor_at(u32::from(self.scroll_top), width);
+                let Some(seg) = self.cache.get_mut(seg_idx) else {
+                    return false;
+                };
+                seg.set_lines(lines);
+                let new_height = seg.height(width);
+                if let Some((anchor_idx, rel)) = anchor
+                    && anchor_idx == seg_idx
+                    && !expanding
+                    && rel > 0
+                {
+                    self.scroll_top = seg_start.min(u32::from(u16::MAX)) as u16;
+                }
+                let total = u32::from(self.last_total_lines)
+                    .saturating_sub(u32::from(old_height))
+                    .saturating_add(u32::from(new_height));
+                let max_scroll = total.saturating_sub(u32::from(self.viewport_height));
+                if u32::from(self.scroll_top) < max_scroll
+                    && (new_height > old_height || !expanding)
+                {
+                    self.auto_scroll = false;
+                }
+                return true;
+            }
             return self.try_toggle_cached_thinking(msg_idx, width);
         };
 
@@ -1770,6 +1830,60 @@ fn message_search_text(msg: &DisplayMessage) -> String {
     format!("{}{}", message_prefix(msg, &style), msg.text)
 }
 
+fn visible_message_text(msg: &DisplayMessage) -> &str {
+    if !msg.result_expanded {
+        msg.result_preview.as_deref().unwrap_or(&msg.text)
+    } else {
+        &msg.text
+    }
+}
+
+fn child_result_lines(text: &str) -> Vec<Line<'static>> {
+    let theme = theme::current();
+    let Some((content, action)) = text.rsplit_once('\n') else {
+        return plain_lines(text, "", theme.tool, theme.tool_dim);
+    };
+    let Some((content, hint)) = content.rsplit_once('\n') else {
+        return plain_lines(text, "", theme.tool, theme.tool_dim);
+    };
+    let Some((label, body)) = content.split_once("] ") else {
+        return plain_lines(text, "", theme.tool, theme.tool_dim);
+    };
+    let (body, lookup) = body
+        .split_once("\n[Full result lookup: ")
+        .map_or((body, None), |(body, lookup)| (body, Some(lookup)));
+    let (body, truncated) = body
+        .strip_suffix(crate::chat::COMPLETION_TRUNCATED)
+        .map_or((body, false), |body| (body, true));
+    let mut lines = vec![Line::from(Span::styled(format!("{label}]"), theme.accent))];
+    lines.push(Line::from(""));
+    lines.extend(
+        body.split('\n')
+            .map(|line| Line::from(Span::styled(line.to_owned(), theme.assistant))),
+    );
+    if truncated && let Some(line) = lines.last_mut() {
+        line.spans.push(Span::styled(
+            crate::chat::COMPLETION_TRUNCATED,
+            theme.tool_dim,
+        ));
+    }
+    if let Some(lookup) = lookup {
+        lines.push(Line::from(Span::styled(
+            format!("[Full result lookup: {lookup}"),
+            theme.tool_dim,
+        )));
+    }
+    lines.push(Line::from(Span::styled(hint.to_owned(), theme.tool_dim)));
+    lines.push(Line::from(""));
+    let action_style = if action == "[View child transcript]" {
+        theme.accent.add_modifier(Modifier::UNDERLINED)
+    } else {
+        theme.tool_dim
+    };
+    lines.push(Line::from(Span::styled(action.to_owned(), action_style)));
+    lines
+}
+
 fn logical_line_count(text: &str) -> usize {
     if text.is_empty() {
         0
@@ -1788,9 +1902,11 @@ fn build_message_lines(msg: &DisplayMessage, width: u16) -> Vec<Line<'static>> {
     let text = if !msg.images.is_empty() && msg.text == IMAGE_PLACEHOLDER {
         ""
     } else {
-        &msg.text
+        visible_message_text(msg)
     };
-    let mut lines = if style.use_markdown {
+    let mut lines = if msg.result_preview.is_some() {
+        child_result_lines(text)
+    } else if style.use_markdown {
         text_to_lines(
             text,
             prefix,

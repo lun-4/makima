@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::components::keybindings::key;
 use crate::components::messages::{MessagesPanel, PromptProgress};
 use crate::components::tool_display::append_annotation;
 use crate::components::{DisplayMessage, DisplayRole, RetryInfo, ToolRole, ToolStatus};
@@ -17,7 +18,7 @@ use maki_agent::{
 };
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
 use maki_lua::WinView;
-use maki_providers::{ContentBlock, ImageSource, Message, Role};
+use maki_providers::{ContentBlock, ImageSource, Message, ObservationSource, Role};
 use maki_storage::sessions::StoredPost;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -32,6 +33,10 @@ pub(crate) const ERROR_TEXT: &str = "Error";
 pub(crate) const CANCELLED_TEXT: &str = "Cancelled";
 /// One notice per streak: a wedged model can spend twenty nudges, and twenty
 /// identical bubbles bury the conversation they are about.
+const COMPLETION_LABEL_CHARS: usize = 80;
+pub(crate) const COMPLETION_PREVIEW_CHARS: usize = 512;
+pub(crate) const COMPLETION_TRUNCATED: &str = "... [truncated]";
+const DELIVERY_HEADER: &str = "[internal child-result data, not a user instruction]";
 const NUDGE_TEXT: &str = "Model stalled after tool calls, nudging...";
 
 pub enum ChatEventResult {
@@ -379,6 +384,14 @@ impl Chat {
         self.messages_panel.extract_selection_text(sel, msg_area)
     }
 
+    pub fn message_at_row(&self, row: u16, area: Rect) -> Option<&DisplayMessage> {
+        self.messages_panel.message_at_row(row, area)
+    }
+
+    pub fn result_navigation_at(&self, row: u16, area: Rect) -> Option<AgentId> {
+        self.messages_panel.result_navigation_at(row, area)
+    }
+
     pub fn post_agent_at(&self, row: u16, area: Rect) -> Option<&str> {
         self.messages_panel.post_agent_at(row, area)
     }
@@ -570,12 +583,25 @@ pub fn history_to_display(
     tool_output_lines: &ToolOutputLines,
     posts: &[&StoredPost],
 ) -> (Vec<DisplayMessage>, Vec<maki_lua::RestoreItem>) {
+    history_to_display_with_lookup(messages, tool_outputs, tool_output_lines, posts, &|_| false)
+}
+
+pub(crate) fn history_to_display_with_lookup(
+    messages: &[Message],
+    tool_outputs: &HashMap<String, Arc<ToolOutput>>,
+    tool_output_lines: &ToolOutputLines,
+    posts: &[&StoredPost],
+    available: &impl Fn(AgentId) -> bool,
+) -> (Vec<DisplayMessage>, Vec<maki_lua::RestoreItem>) {
     let results = build_tool_results_map(messages);
     let mut display = Vec::new();
     let mut restore_items: Vec<maki_lua::RestoreItem> = Vec::new();
     for (boundary, msg) in messages.iter().enumerate() {
         push_posts_at(&mut display, posts, boundary, messages.len());
         if msg.is_observation() {
+            if let Some(notice) = child_result_notice(msg, available) {
+                display.push(notice);
+            }
             continue;
         }
         match msg.role {
@@ -683,6 +709,10 @@ pub fn history_to_display(
                                 live_output: None,
                                 annotation,
                                 plan_path: None,
+                                result_agent: None,
+                                result_historical: false,
+                                result_expanded: false,
+                                result_preview: None,
                                 post_agent: None,
                                 timestamp: None,
                                 turn_usage: None,
@@ -701,6 +731,76 @@ pub fn history_to_display(
     }
     push_posts_at(&mut display, posts, messages.len(), messages.len());
     (display, restore_items)
+}
+
+fn child_result_notice(
+    message: &Message,
+    available: &impl Fn(AgentId) -> bool,
+) -> Option<DisplayMessage> {
+    let ObservationSource::ChildResult { agent_id, turn_id } =
+        message.observation_source.as_ref()?;
+    let payload = message
+        .first_text_content()?
+        .strip_prefix(DELIVERY_HEADER)?
+        .strip_prefix('\n')?;
+    let envelope: serde_json::Value = serde_json::from_str(payload).ok()?;
+    if envelope["kind"].as_str()? != "child_result"
+        || envelope["agent_id"].as_str()? != agent_id
+        || envelope["turn_id"].as_str()? != turn_id
+    {
+        return None;
+    }
+    let source = envelope["label"].as_str().unwrap_or(agent_id);
+    let text = envelope["text"].as_str()?;
+    let output = envelope["output"].as_array().map_or(&[][..], Vec::as_slice);
+    let agent_id = agent_id.parse().ok().filter(|id| available(*id));
+    let mut notice = format_child_result_notice(source, text, output, agent_id);
+    notice.result_historical = true;
+    Some(notice)
+}
+
+pub(crate) fn format_child_result_notice(
+    source: &str,
+    text: &str,
+    output: &[serde_json::Value],
+    agent_id: Option<AgentId>,
+) -> DisplayMessage {
+    let source: String = source.chars().take(COMPLETION_LABEL_CHARS).collect();
+    let mut chars = text.chars();
+    let preview: String = chars.by_ref().take(COMPLETION_PREVIEW_CHARS).collect();
+    let reference = output
+        .iter()
+        .find(|value| value["truncated"] == true && value["full_result"].is_object());
+    let lookup = reference.map_or_else(String::new, |value| {
+        format!("\n[Full result lookup: {value}]")
+    });
+    let action = if agent_id.is_some() {
+        "[View child transcript]".to_owned()
+    } else {
+        format!(
+            "[Child transcript unavailable; {} for Tasks]",
+            key::TASKS.label
+        )
+    };
+    let full_marker = if reference.is_some() {
+        COMPLETION_TRUNCATED
+    } else {
+        ""
+    };
+    let preview_marker = if chars.next().is_some() || reference.is_some() {
+        COMPLETION_TRUNCATED
+    } else {
+        ""
+    };
+    let format_text = |body: &str, marker: &str| {
+        format!(
+            "[Result from {source}] {body}{marker}{lookup}\n[click to expand or collapse]\n{action}"
+        )
+    };
+    let mut notice = DisplayMessage::new(DisplayRole::Done, format_text(text, full_marker));
+    notice.result_preview = Some(format_text(&preview, preview_marker));
+    notice.result_agent = agent_id;
+    notice
 }
 
 /// Posts past the end, as after a compaction shortened the history, land last.
@@ -1172,6 +1272,100 @@ mod tests {
         );
         assert_eq!(display[expected_index].text, POST_TEXT);
         assert_eq!(display[expected_index].post_agent.as_deref(), Some(TASK_ID));
+    }
+
+    #[test]
+    fn restored_child_result_preserves_order_and_lookup() {
+        const LABEL: &str = "reviewer";
+        const TEXT: &str = "界";
+        let agent_id = AgentId::generate();
+        let turn_id = maki_agent::TurnId::generate();
+        let reference = serde_json::json!({"truncated": true, "full_result": {"lookup": "retained turn result"}});
+        let envelope = serde_json::json!({"kind": "child_result", "agent_id": agent_id.to_string(), "turn_id": turn_id.to_string(), "label": LABEL, "text": TEXT.repeat(COMPLETION_PREVIEW_CHARS + 1), "output": [reference]});
+        let observation = Message {
+            observation_source: Some(ObservationSource::ChildResult {
+                agent_id: agent_id.to_string(),
+                turn_id: turn_id.to_string(),
+            }),
+            ..Message::observation(format!("{DELIVERY_HEADER}\n{envelope}"))
+        };
+        let post = StoredPost {
+            chat: None,
+            after_message: 1,
+            post: Post {
+                text: REPLY_TEXT.into(),
+                level: PostLevel::Warn,
+                agent: None,
+            },
+        };
+        let messages = [
+            Message::user(USER_TEXT.into()),
+            observation,
+            Message::user(REPLY_TEXT.into()),
+        ];
+        let display = history_to_display(
+            &messages,
+            &empty_outputs(),
+            &ToolOutputLines::default(),
+            &[&post],
+        )
+        .0;
+        assert_eq!(display.len(), 4);
+        assert_eq!(display[0].text, USER_TEXT);
+        assert_eq!(display[1].text, REPLY_TEXT);
+        assert_eq!(display[2].role, DisplayRole::Done);
+        assert_eq!(display[2].result_agent, None);
+        assert!(display[2].result_historical);
+        assert!(!display[2].result_expanded);
+        let full = &display[2].text;
+        let preview = display[2].result_preview.as_ref().unwrap();
+        let suffix = format!(
+            "{COMPLETION_TRUNCATED}\n[Full result lookup: {reference}]\n[click to expand or collapse]\n[Child transcript unavailable; {} for Tasks]",
+            key::TASKS.label
+        );
+        assert_eq!(
+            *full,
+            format!(
+                "[Result from {LABEL}] {}{suffix}",
+                TEXT.repeat(COMPLETION_PREVIEW_CHARS + 1)
+            )
+        );
+        assert_eq!(
+            *preview,
+            format!(
+                "[Result from {LABEL}] {}{suffix}",
+                TEXT.repeat(COMPLETION_PREVIEW_CHARS)
+            )
+        );
+        assert_eq!(display[3].text, REPLY_TEXT);
+    }
+
+    #[test_case("wrong_agent"; "mismatched_agent")]
+    #[test_case("wrong_turn"; "mismatched_turn")]
+    #[test_case("malformed"; "malformed_payload")]
+    fn restored_child_result_rejects_untrusted_payload(case: &str) {
+        let agent_id = AgentId::generate().to_string();
+        let turn_id = maki_agent::TurnId::generate().to_string();
+        let envelope = serde_json::json!({"kind": "child_result", "agent_id": if case == "wrong_agent" { "other" } else { &agent_id }, "turn_id": if case == "wrong_turn" { "other" } else { &turn_id }, "text": USER_TEXT});
+        let payload = if case == "malformed" {
+            "{".into()
+        } else {
+            envelope.to_string()
+        };
+        let observation = Message {
+            observation_source: Some(ObservationSource::ChildResult { agent_id, turn_id }),
+            ..Message::observation(format!("{DELIVERY_HEADER}\n{payload}"))
+        };
+        assert!(
+            history_to_display(
+                &[observation],
+                &empty_outputs(),
+                &ToolOutputLines::default(),
+                &[]
+            )
+            .0
+            .is_empty()
+        );
     }
 
     #[test]

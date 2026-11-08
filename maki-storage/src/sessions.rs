@@ -320,6 +320,10 @@ pub fn write_prefs(state_dir: &StateDir, prefs: &Prefs) -> Result<(), StorageErr
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredSubagent {
     pub tool_use_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ambiguous: bool,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -329,6 +333,26 @@ pub struct StoredSubagent {
     pub thinking: Option<StoredThinking>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fast: bool,
+}
+
+fn mark_duplicate_subagent_identities(subagents: &mut [StoredSubagent]) {
+    let mut keys = HashMap::new();
+    let mut ids = HashMap::new();
+    for child in subagents.iter() {
+        *keys.entry(child.tool_use_id.clone()).or_insert(0usize) += 1;
+        if let Some(id) = &child.agent_id {
+            *ids.entry(id.clone()).or_insert(0usize) += 1;
+        }
+    }
+    for child in subagents {
+        if child.ambiguous
+            || keys[&child.tool_use_id] > 1
+            || child.agent_id.as_ref().is_some_and(|id| ids[id] > 1)
+        {
+            child.ambiguous = true;
+            child.agent_id = None;
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -994,6 +1018,7 @@ where
         path: display_path.to_string(),
     })?;
 
+    mark_duplicate_subagent_identities(&mut subagents);
     Ok(Session {
         id,
         title,
@@ -1528,7 +1553,8 @@ where
         &self.subagents
     }
 
-    pub fn set_subagents(&mut self, subagents: Vec<StoredSubagent>) {
+    pub fn set_subagents(&mut self, mut subagents: Vec<StoredSubagent>) {
+        mark_duplicate_subagent_identities(&mut subagents);
         if self.subagents == subagents {
             return;
         }
@@ -1953,6 +1979,8 @@ mod tests {
         fn subagent(id: &str) -> StoredSubagent {
             StoredSubagent {
                 tool_use_id: id.into(),
+                agent_id: None,
+                ambiguous: false,
                 name: "sub".into(),
                 model: None,
                 thinking: None,
@@ -2009,6 +2037,58 @@ mod tests {
         assert_eq!(loaded.cwd, "/home/test/project");
         assert_eq!(loaded.messages().len(), 1);
         assert_eq!(loaded.subagent_messages["tool-1"].len(), 2);
+    }
+
+    #[test]
+    fn subagent_identity_roundtrip_and_legacy_defaults() {
+        let legacy: StoredSubagent =
+            serde_json::from_str(r#"{"tool_use_id":"tool","name":"child"}"#).unwrap();
+        assert_eq!(legacy.agent_id, None);
+        assert!(!legacy.ambiguous);
+
+        let tmp = TempDir::new().unwrap();
+        let mut session: TestSession = Session::new("model", "/project");
+        let mut child = legacy;
+        child.agent_id = Some("agent".into());
+        session.set_subagents(vec![child.clone()]);
+        session.save_to(tmp.path()).unwrap();
+        let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert_eq!(loaded.subagents(), &[child]);
+    }
+
+    #[test_case(true; "duplicate_key")]
+    #[test_case(false; "duplicate_agent_id")]
+    fn duplicate_subagent_identities_remain_ambiguous_after_removal(duplicate_key: bool) {
+        let child = StoredSubagent {
+            tool_use_id: "first".into(),
+            agent_id: Some("agent".into()),
+            ambiguous: false,
+            name: "child".into(),
+            model: None,
+            thinking: None,
+            fast: false,
+        };
+        let mut other = child.clone();
+        if !duplicate_key {
+            other.tool_use_id = "second".into();
+        }
+        let mut session: TestSession = Session::new("model", "/project");
+        session.subagents = vec![child, other];
+        let raw = TempDir::new().unwrap();
+        session.save_to(raw.path()).unwrap();
+        let mut session = TestSession::load_from(session.id, raw.path()).unwrap();
+        assert!(
+            session
+                .subagents()
+                .iter()
+                .all(|child| child.ambiguous && child.agent_id.is_none())
+        );
+        session.set_subagents(vec![session.subagents()[0].clone()]);
+        let tmp = TempDir::new().unwrap();
+        session.save_to(tmp.path()).unwrap();
+        let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert!(loaded.subagents()[0].ambiguous);
+        assert!(loaded.subagents()[0].agent_id.is_none());
     }
 
     #[test]
