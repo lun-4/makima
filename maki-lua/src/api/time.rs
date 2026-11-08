@@ -18,6 +18,7 @@ const MILLIS_PER_SEC: u128 = 1_000;
 const SECS_PER_MIN: u64 = 60;
 const SECS_PER_HOUR: u64 = 60 * SECS_PER_MIN;
 const SECS_PER_DAY: u64 = 24 * SECS_PER_HOUR;
+const U64_RANGE_END: f64 = 18_446_744_073_709_551_616.0;
 const TIMESTAMP_FIELD_ERR: &str =
     "timestamp requires non-negative integer secs and nanosecs 0..1e9";
 
@@ -51,7 +52,11 @@ fn ts_to_table(lua: &Lua, ts: Timestamp) -> LuaResult<Table> {
 fn timestamp_field(t: &Table, field: &str) -> LuaResult<u64> {
     match t.get::<Value>(field)? {
         Value::Integer(value) if value >= 0 => Ok(value as u64),
-        Value::Number(value) if value.is_finite() && value >= 0.0 && value.fract() == 0.0 => {
+        Value::Number(value)
+            if value.is_finite()
+                && (0.0..U64_RANGE_END).contains(&value)
+                && value.fract() == 0.0 =>
+        {
             Ok(value as u64)
         }
         _ => Err(mlua::Error::runtime(TIMESTAMP_FIELD_ERR)),
@@ -266,6 +271,11 @@ mod tests {
         fractional.set("secs", 1.5).unwrap();
         fractional.set("nanosecs", 0).unwrap();
         assert!(into_duration(&fractional).is_err());
+
+        let oversized = lua.create_table().unwrap();
+        oversized.set("secs", 1e20).unwrap();
+        oversized.set("nanosecs", 0).unwrap();
+        assert!(into_duration(&oversized).is_err());
 
         let err = create_time_table(&lua)
             .unwrap()
