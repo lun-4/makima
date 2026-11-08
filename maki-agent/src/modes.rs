@@ -55,7 +55,7 @@ pub struct ModeDef {
     /// System-prompt snippet appended verbatim (like `PLAN_PROMPT`). Vars are
     /// applied at prompt-build time.
     pub system_prompt: Option<String>,
-    /// When set, all non-matching writes are blocked (plan-file-style lock).
+    /// Restricts bundled native mutation tools to this target path.
     pub restrict_write_to: Option<PathBuf>,
     /// When `Some`, the mode swaps in exactly this toolset. `None` inherits
     /// the default (build) set.

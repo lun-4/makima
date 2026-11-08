@@ -87,7 +87,9 @@ Some pickers add extra bindings on top of the defaults:
 |---------|-----|--------|
 | Queue | `Enter` | Remove item |
 | Commands | `Tab` | Complete command |
-| Model Picker | `!/@/#/$` | Set tier (strong/medium/weak/compaction) |
+| Model Picker | `Tab/Shift+Tab` | Move between the model list and its options |
+| Model Picker | `↑/↓ or Space/←/→` | Cycle the focused option through its values |
+| Model Picker | `!/@/#/$` | Set tier (strong/medium/weak/compaction) from the model list |
 | Session Picker | `Ctrl+N` | New session |
 | Session Picker | `Ctrl+R` | Rename session |
 | Session Picker | `Ctrl+D` | Delete session (press twice) |

@@ -286,7 +286,8 @@ impl<'h> Agent<'h> {
         agent
     }
 
-    pub fn new(params: AgentParams, run: AgentRunParams<'h>) -> Self {
+    pub fn new(params: AgentParams, mut run: AgentRunParams<'h>) -> Self {
+        crate::prompt::append_model_identity(&mut run.system, &params.model);
         Self {
             agent_id: params.agent_id,
             provider: params.provider,
@@ -1208,6 +1209,7 @@ mod tests {
         responses: Mutex<Vec<StreamResponse>>,
         captured_tools: Arc<Mutex<Vec<Value>>>,
         captured_messages: Arc<Mutex<Vec<Vec<Message>>>>,
+        captured_systems: Arc<Mutex<Vec<String>>>,
     }
 
     impl MockProvider {
@@ -1216,6 +1218,7 @@ mod tests {
                 responses: Mutex::new(responses),
                 captured_tools: Arc::default(),
                 captured_messages: Arc::default(),
+                captured_systems: Arc::default(),
             }
         }
     }
@@ -1225,7 +1228,7 @@ mod tests {
             &'a self,
             _: &'a Model,
             messages: &'a [Message],
-            _: &'a str,
+            system: &'a str,
             tools: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
@@ -1237,6 +1240,10 @@ mod tests {
                     .unwrap()
                     .push(messages.to_vec());
                 self.captured_tools.lock().unwrap().push(tools.clone());
+                self.captured_systems
+                    .lock()
+                    .unwrap()
+                    .push(system.to_owned());
                 let mut responses = self.responses.lock().unwrap();
                 assert!(!responses.is_empty(), "MockProvider: no more responses");
                 Ok(responses.remove(0))
@@ -2155,15 +2162,20 @@ mod tests {
         });
     }
 
-    #[test]
-    fn actor_turn_runs_under_committed_policy() {
+    #[test_case(""; "empty_system")]
+    #[test_case("Custom system prompt"; "custom_system")]
+    fn actor_turn_runs_under_committed_policy(system: &str) {
+        const MODEL_SPEC: &str = "openai/gpt-4o";
+        const MODEL_IDENTITY: &str = "# Model identity\n- Model: gpt-4o\n- Provider: openai";
         let mut history = History::new(Vec::new());
-        let params = test_params(MockProvider::new(vec![text_response(StopReason::EndTurn)]));
+        let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+        let captured_systems = Arc::clone(&provider.captured_systems);
+        let params = test_params(provider);
         let plan = AgentMode::Plan(PathBuf::from(TEST_PLAN_PATH));
         let policy = EffectiveAgentConfig::new(
             RunSettings {
                 provider: Arc::clone(&params.provider),
-                model: params.model.clone(),
+                model: Model::from_spec(MODEL_SPEC).unwrap(),
                 fast: true,
                 workflow: true,
                 thinking: ThinkingConfig::Budget(TEST_THINKING_BUDGET),
@@ -2197,7 +2209,7 @@ mod tests {
             params,
             AgentRunParams {
                 history: &mut history,
-                system: String::new(),
+                system: system.into(),
                 event_tx: EventSender::new(raw_tx),
                 tools: RequestTools::default(),
             },
@@ -2209,6 +2221,12 @@ mod tests {
             TurnId::generate(),
             default_input(),
         ));
+        let expected_system = if system.is_empty() {
+            MODEL_IDENTITY.to_owned()
+        } else {
+            format!("{system}\n\n{MODEL_IDENTITY}")
+        };
+        assert_eq!(*captured_systems.lock().unwrap(), [expected_system]);
         assert_eq!(agent.mode, plan);
         assert!(agent.workflow && agent.opts.fast);
         assert_eq!(
@@ -3295,7 +3313,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_hides_mcp_tools() {
+    fn plan_mode_advertises_mcp_search_and_loaded_tools() {
         let mut history = History::new(Vec::new());
         let (mut agent, _rx) = make_agent(MockProvider::new(vec![]), &mut history);
         agent.mode = AgentMode::Plan(PathBuf::from("/tmp/plan"));
@@ -3304,18 +3322,25 @@ mod tests {
             "srv.probe",
             "probe",
         )]));
+        agent.turn_bindings = Arc::new(TurnToolBindings::capture(
+            &agent.registry,
+            &agent.local_tools,
+            agent.mcp.as_ref(),
+        ));
         admit(&mut agent);
-        let names: Vec<String> = agent
-            .request_tools()
-            .unwrap()
+        let tools = agent.request_tools().unwrap();
+        let names = tool_names(tools.as_ref());
+        assert!(names.contains(&crate::mcp::TOOL_SEARCH_TOOL_NAME));
+        assert!(!names.contains(&"srv__probe"));
+        agent
+            .mcp
             .as_ref()
-            .as_array()
             .unwrap()
-            .iter()
-            .filter_map(|definition| definition.get("name").and_then(Value::as_str))
-            .map(str::to_owned)
-            .collect();
-        assert!(!names.contains(&"srv__probe".to_owned()));
+            .search_tools("probe", crate::tools::CallOrigin::Model)
+            .unwrap();
+        let tools = agent.request_tools().unwrap();
+        let names = tool_names(tools.as_ref());
+        assert!(names.contains(&"srv__probe"));
     }
 
     #[test]

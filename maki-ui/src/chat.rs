@@ -13,7 +13,7 @@ use crate::markdown::truncate_output;
 use crate::selection::Selection;
 use maki_agent::tools::{ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use maki_agent::{
-    AgentEvent, AgentId, BufferSnapshot, PostLevel, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    AgentEvent, AgentId, BufferSnapshot, Post, ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
 use maki_lua::WinView;
@@ -379,6 +379,10 @@ impl Chat {
         self.messages_panel.extract_selection_text(sel, msg_area)
     }
 
+    pub fn post_agent_at(&self, row: u16, area: Rect) -> Option<&str> {
+        self.messages_panel.post_agent_at(row, area)
+    }
+
     pub fn handle_click(&mut self, row: u16, area: Rect) {
         self.messages_panel.handle_click(row, area);
     }
@@ -470,9 +474,9 @@ impl Chat {
         self.messages_panel.load_messages(msgs);
     }
 
-    pub fn push_post(&mut self, text: &str, level: PostLevel) {
+    pub fn push_post(&mut self, post: &Post) {
         self.flush();
-        self.messages_panel.push(post_message(text, level));
+        self.messages_panel.push(post_message(post));
     }
 
     pub fn push_user_message(&mut self, text: impl Into<String>) {
@@ -679,6 +683,7 @@ pub fn history_to_display(
                                 live_output: None,
                                 annotation,
                                 plan_path: None,
+                                post_agent: None,
                                 timestamp: None,
                                 turn_usage: None,
                                 truncated_lines,
@@ -709,12 +714,15 @@ fn push_posts_at(
         posts
             .iter()
             .filter(|stored| stored.after_message.min(message_count) == boundary)
-            .map(|stored| post_message(&stored.post.text, stored.post.level)),
+            .map(|stored| post_message(&stored.post)),
     );
 }
 
-fn post_message(text: &str, level: PostLevel) -> DisplayMessage {
-    DisplayMessage::new(DisplayRole::Post(level), text.to_owned())
+fn post_message(post: &Post) -> DisplayMessage {
+    DisplayMessage {
+        post_agent: post.agent.clone(),
+        ..DisplayMessage::new(DisplayRole::Post(post.level), post.text.clone())
+    }
 }
 
 /// `ToolResult` is gone after session load, so we rebuild from
@@ -828,7 +836,7 @@ mod tests {
     use crate::components::IMAGE_PLACEHOLDER;
     use crate::theme::InMemoryThemesProvider;
     use maki_agent::{
-        AgentEvent, Post, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
+        AgentEvent, Post, PostLevel, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
     };
     use maki_config::UiConfig;
     use maki_providers::ImageMediaType;
@@ -1147,7 +1155,7 @@ mod tests {
             post: Post {
                 text: POST_TEXT.into(),
                 level: PostLevel::Warn,
-                agent: None,
+                agent: Some(TASK_ID.into()),
             },
         };
         let display = history_to_display(
@@ -1163,6 +1171,7 @@ mod tests {
             DisplayRole::Post(PostLevel::Warn)
         );
         assert_eq!(display[expected_index].text, POST_TEXT);
+        assert_eq!(display[expected_index].post_agent.as_deref(), Some(TASK_ID));
     }
 
     #[test]

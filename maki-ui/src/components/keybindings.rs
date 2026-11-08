@@ -569,8 +569,20 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Single("Tab/Shift+Tab"),
+        description: "Move between the model list and its options",
+        context: KeybindContext::ModelPicker,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("↑/↓ or Space/←/→"),
+        description: "Cycle the focused option through its values",
+        context: KeybindContext::ModelPicker,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Single("!/@/#/$"),
-        description: "Set tier (strong/medium/weak/compaction)",
+        description: "Set tier (strong/medium/weak/compaction) from the model list",
         context: KeybindContext::ModelPicker,
         platform: Platform::All,
     },

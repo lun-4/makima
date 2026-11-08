@@ -219,7 +219,7 @@ pub fn generate() -> color_eyre::Result<String> {
     .unwrap();
     writeln!(
         out,
-        "- **`/model [spec] [thinking=value] [fast=true|false]`**: options change the thinking level and fast mode together with the spec, as one change to the selected agent. Options without a spec keep the current model, so `/model thinking=high` only changes thinking. The same options also fit in braces after the spec, as in `/model openai/gpt-5{{thinking=high,fast=true}}`; braces are understood by `/model` only. Each option may appear once, and unknown options are rejected. Asking for fast mode or thinking on a model without them is rejected; values carried over from the previous model are adjusted to what the new model supports."
+        "- **`/model [spec] [thinking=value] [fast=true|false]`**: options change the thinking level and fast mode together with the spec, as one change to the selected agent. Options without a spec keep the current model, so `/model thinking=high` only changes thinking. The same options also fit in braces after the spec, as in `/model openai/gpt-5{{thinking=high,fast=true}}`; braces are understood by `/model` only. Each option may appear once, and unknown options are rejected. Asking for fast mode or thinking on a model without them is rejected; values carried over from the previous model are adjusted to what the new model supports. Completion only suggests the options the named model, or the current one, supports."
     )
     .unwrap();
     writeln!(

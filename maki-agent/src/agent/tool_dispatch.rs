@@ -491,7 +491,6 @@ fn resolve<'a>(ctx: &'a ToolContext, name: &'a str) -> Resolved<'a> {
     Resolved { name, route }
 }
 
-const MODE_DENIED: &str = "tool not allowed in restricted mode";
 #[cfg(test)]
 const STRUCTURED_OUTPUT_TOOL_NAME: &str = "structured_output";
 
@@ -533,13 +532,6 @@ fn binding_matches(resolved: &Resolved<'_>, ctx: &ToolContext) -> bool {
         )
 }
 
-fn mode_offers(ctx: &ToolContext, resolved: &Resolved<'_>) -> bool {
-    if ctx.restrict_write_to().is_none() {
-        return true;
-    }
-    !matches!(&resolved.route, Route::Mcp(..) | Route::ToolSearch(_))
-}
-
 pub(crate) fn authorize_advertised(ctx: &ToolContext, name: &str) -> bool {
     let resolved = resolve(ctx, name);
     let Some(mode) = ctx.mode_def.as_ref() else {
@@ -560,21 +552,14 @@ pub(crate) fn authorize_advertised(ctx: &ToolContext, name: &str) -> bool {
         Route::Mcp(..) | Route::ToolSearch(_) => true,
         Route::Unknown => false,
     };
-    available && binding_matches(&resolved, ctx) && mode_offers(ctx, &resolved)
+    available && binding_matches(&resolved, ctx)
 }
 
 fn authorize_mode(resolved: &Resolved<'_>, ctx: &ToolContext) -> Result<(), String> {
     if authorize_advertised(ctx, resolved.name) {
         Ok(())
     } else {
-        let name = resolved.name;
-        Err(
-            if ctx.restrict_write_to().is_some() && !mode_offers(ctx, resolved) {
-                format!("{MODE_DENIED}: {name}")
-            } else {
-                format!("{UNAVAILABLE_TOOL_PREFIX}: {name}")
-            },
-        )
+        Err(format!("{UNAVAILABLE_TOOL_PREFIX}: {}", resolved.name))
     }
 }
 
@@ -1196,7 +1181,9 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use maki_config::{Effect, Permission, PermissionRule, PermissionsConfig, ToolKey};
+    use maki_config::{
+        DefaultEffect, Effect, Permission, PermissionRule, PermissionsConfig, ToolKey,
+    };
     use test_case::test_case;
 
     use super::*;
@@ -1204,7 +1191,9 @@ mod tests {
     use crate::cancel::CancelToken;
     use crate::mcp::test_support::{stub_session, stub_session_with_result};
     use crate::mcp::tool_names;
-    use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionManager};
+    use crate::permissions::{
+        PERMISSION_DENIED_PREFIX, PermissionAnswer, PermissionManager, TaggedAnswer,
+    };
     use crate::template::Vars;
     use crate::tools::offload::{OFFLOAD_FOOTER_PREFIX, OffloadBackend, OffloadStore};
     use crate::tools::registry::{ToolRegistry, ToolSource};
@@ -2218,7 +2207,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_denies_tool_search_before_hooks_and_loading() {
+    fn plan_mode_tool_search_loads_matches() {
         smol::block_on(async {
             let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
             let mcp = stub_mcp(&[PROBE_QUALIFIED]);
@@ -2230,15 +2219,12 @@ mod tests {
                 &serde_json::json!({"query": "probe"}),
             )
             .await;
-            assert!(done.is_error);
-            assert_eq!(
-                done.output.as_text(),
-                format!("{MODE_DENIED}: {TOOL_SEARCH_TOOL_NAME}")
-            );
-            assert!(hook.seen.lock().unwrap().is_empty());
+            assert!(!done.is_error);
+            assert!(done.output.as_text().contains(PROBE_WIRE));
+            assert_eq!(hook.stages(), both_stages(Authority::Unbounded));
             let mut tools = serde_json::json!([]);
             mcp.extend_tools(&mut tools);
-            assert!(!tool_names(&tools).contains(&PROBE_WIRE));
+            assert!(tool_names(&tools).contains(&PROBE_WIRE));
         });
     }
 
@@ -2723,7 +2709,16 @@ mod tests {
                 .iter()
                 .map(|tool| tool.name.clone())
                 .collect();
-            assert_eq!(names, [CLIENT_NAME, "read"]);
+            assert_eq!(
+                names,
+                [
+                    CLIENT_NAME,
+                    "read",
+                    "srv__get-docs",
+                    PROBE_WIRE,
+                    TOOL_SEARCH_TOOL_NAME
+                ]
+            );
             for name in ["read", CLIENT_NAME] {
                 assert!(authorize_advertised(&restricted, name));
                 let allowed = dispatch(&restricted, name, &json!({})).await;
@@ -2798,12 +2793,16 @@ mod tests {
     }
 
     #[test]
-    fn plan_callable_excludes_unknown_effect_and_shell() {
+    fn plan_callable_includes_shell_mcp_and_search() {
         let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
         let mut ctx = with_mcp(stub_ctx(&plan), &stub_mcp(&[PROBE_QUALIFIED]));
         ctx.registry = registered(Arc::new(HookMock(Some(Permission::Run))));
-        assert!(callable_names(&ctx).is_empty());
-        assert!(!authorize_advertised(&ctx, TOOL_SEARCH_TOOL_NAME));
+        pin(&mut ctx);
+        assert_eq!(
+            callable_names(&ctx),
+            [HOOK_TOOL_NAME, PROBE_WIRE, TOOL_SEARCH_TOOL_NAME]
+        );
+        assert!(authorize_advertised(&ctx, TOOL_SEARCH_TOOL_NAME));
     }
 
     struct SpoofedReadInvocation(Arc<AtomicBool>);
@@ -3238,8 +3237,28 @@ mod tests {
         });
     }
 
+    #[test_case(Effect::Allow ; "allowed")]
+    #[test_case(Effect::Deny ; "denied")]
+    fn plan_mode_shell_uses_normal_permission_rules(effect: Effect) {
+        smol::block_on(async {
+            let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
+            let ctx = ruled_ctx(&plan, ToolKey::native(HOOK_TOOL_NAME), effect);
+            let (ctx, hook) = hooked_with(ctx, Some(Permission::Run), RecordingHook::default());
+            assert!(authorize_advertised(&ctx, HOOK_TOOL_NAME));
+            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
+            let allowed = effect == Effect::Allow;
+            assert_eq!(done.is_error, !allowed);
+            if allowed {
+                assert_eq!(done.output.as_text(), ran(HOOK_PLAIN));
+            } else {
+                assert!(done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX));
+            }
+            assert!(hook.at(HookStage::Input).is_some());
+        });
+    }
+
     #[test]
-    fn plan_mode_blocks_shell_before_hooks_even_with_allow_rule() {
+    fn plan_mode_empty_tool_selection_blocks_shell_before_hooks_even_with_allow_rule() {
         smol::block_on(async {
             let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
             let (tx, rx) = flume::unbounded::<crate::Envelope>();
@@ -3260,76 +3279,133 @@ mod tests {
         });
     }
 
-    #[test]
-    fn mcp_tool_denied_even_with_allow_rule_in_plan_mode() {
+    #[test_case(Effect::Allow, false ; "allow_rule")]
+    #[test_case(Effect::Deny, false ; "deny_rule")]
+    #[test_case(Effect::Deny, true ; "deny_rule_overrides_yolo")]
+    fn mcp_tool_uses_normal_rules_in_plan_mode(effect: Effect, yolo: bool) {
         smol::block_on(async {
             let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
             let (tx, rx) = flume::unbounded::<crate::Envelope>();
-            let event_tx = crate::EventSender::new(tx);
-            let permissions = ruled_ctx(
-                &plan,
-                ToolKey::parse(PROBE_QUALIFIED).unwrap(),
-                Effect::Allow,
-            )
-            .permissions;
-            let mut ctx = crate::tools::test_support::stub_ctx_with(&plan, Some(&event_tx), None);
-            ctx.permissions = permissions;
-            let ctx = with_mcp(ctx, &stub_mcp(&[PROBE_QUALIFIED]));
-            let done = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
-            assert!(done.is_error);
-            assert_eq!(
-                done.output.as_text(),
-                format!("{MODE_DENIED}: {PROBE_WIRE}")
-            );
-            let mut tools = serde_json::json!([]);
-            ctx.mcp.as_ref().unwrap().extend_tools(&mut tools);
-            assert!(
-                !tool_names(&tools).contains(&&PROBE_WIRE.to_owned()[..]),
-                "a restricted call must not load the definition"
-            );
+            let mut ctx = ruled_ctx(&plan, ToolKey::parse(PROBE_QUALIFIED).unwrap(), effect);
+            ctx.event_tx = crate::EventSender::new(tx);
+            ctx.permissions.set_yolo(yolo);
+            let mcp = stub_session_with_result(&[(PROBE_QUALIFIED, "")], HOOK_OUTPUT_TEXT);
+            let ctx = with_mcp(ctx, &mcp);
+            let done = dispatch(&ctx, PROBE_WIRE, &json!({})).await;
+            let allowed = effect == Effect::Allow;
+            assert_eq!(done.is_error, !allowed);
+            if allowed {
+                assert_eq!(done.output.as_text(), HOOK_OUTPUT_TEXT);
+            } else {
+                assert!(done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX));
+            }
+            let mut tools = json!([]);
+            mcp.extend_tools(&mut tools);
+            assert_eq!(tool_names(&tools).contains(&PROBE_WIRE), allowed);
             assert_no_permission_request(&rx);
         });
     }
 
-    /// An MCP server can write without announcing it, so a restricted mode
-    /// rejects it even if ordinary permissions would allow it.
-    #[test]
-    fn mcp_tool_in_plan_mode_is_never_auto_approved() {
+    #[test_case(false ; "default_allow")]
+    #[test_case(true ; "yolo")]
+    fn mcp_tool_can_be_auto_approved_in_plan_mode(yolo: bool) {
         smol::block_on(async {
             let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
-            let ctx = with_mcp(stub_ctx(&plan), &stub_mcp(&[PROBE_QUALIFIED]));
-            let done = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
-            assert!(done.is_error);
-            let text = done.output.as_text();
-            assert_eq!(text, format!("{MODE_DENIED}: {PROBE_WIRE}"));
-            let mut tools = serde_json::json!([]);
-            ctx.mcp.as_ref().unwrap().extend_tools(&mut tools);
-            assert!(
-                !tool_names(&tools).contains(&&PROBE_WIRE.to_owned()[..]),
-                "an unapproved call must not load the definition"
-            );
+            let permissions = Arc::new(PermissionManager::new(
+                PermissionsConfig {
+                    yolo,
+                    default: if yolo {
+                        DefaultEffect::Prompt
+                    } else {
+                        DefaultEffect::Allow
+                    },
+                    ..Default::default()
+                },
+                PathBuf::from(TEST_ROOT),
+                maki_config::ProjectConfig::for_project(Path::new(TEST_ROOT)),
+                Arc::default(),
+            ));
+            let mcp = stub_session_with_result(&[(PROBE_QUALIFIED, "")], HOOK_OUTPUT_TEXT);
+            let ctx = with_mcp(stub_ctx_with_permissions(&plan, permissions), &mcp);
+            let done = dispatch(&ctx, PROBE_WIRE, &json!({})).await;
+            assert!(!done.is_error);
+            assert_eq!(done.output.as_text(), HOOK_OUTPUT_TEXT);
+            let mut tools = json!([]);
+            mcp.extend_tools(&mut tools);
+            assert!(tool_names(&tools).contains(&PROBE_WIRE));
         });
     }
 
-    #[test]
-    fn mcp_tool_denied_by_rule_in_plan_mode() {
+    #[test_case(PermissionAnswer::AllowOnce ; "allow_once")]
+    #[test_case(PermissionAnswer::Deny ; "deny")]
+    fn mcp_tool_prompts_normally_in_plan_mode(answer: PermissionAnswer) {
         smol::block_on(async {
             let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
-            let ctx = with_mcp(
-                ruled_ctx(
-                    &plan,
+            let permissions = Arc::new(PermissionManager::new(
+                PermissionsConfig::default(),
+                PathBuf::from(TEST_ROOT),
+                maki_config::ProjectConfig::for_project(Path::new(TEST_ROOT)),
+                Arc::default(),
+            ));
+            let (tx, rx) = flume::unbounded::<crate::Envelope>();
+            let (response_tx, response_rx) = flume::unbounded();
+            let allowed = answer.is_allow();
+            response_tx
+                .send(TaggedAnswer::new(TEST_ID, answer).encode())
+                .unwrap();
+            let mut ctx = stub_ctx_with_permissions(&plan, permissions);
+            ctx.event_tx = crate::EventSender::new(tx);
+            ctx.user_response_rx = Some(Arc::new(async_lock::Mutex::new(response_rx)));
+            let mcp = stub_session_with_result(&[(PROBE_QUALIFIED, "")], HOOK_OUTPUT_TEXT);
+            let ctx = with_mcp(ctx, &mcp);
+            let done = dispatch(&ctx, PROBE_WIRE, &json!({})).await;
+            assert_eq!(done.is_error, !allowed);
+            if allowed {
+                assert_eq!(done.output.as_text(), HOOK_OUTPUT_TEXT);
+            } else {
+                assert!(done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX));
+            }
+            let requests: Vec<_> = rx
+                .try_iter()
+                .filter_map(|envelope| match envelope.event {
+                    AgentEvent::PermissionRequest { id, tool, scopes } => Some((id, tool, scopes)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                requests,
+                [(
+                    TEST_ID.into(),
                     ToolKey::parse(PROBE_QUALIFIED).unwrap(),
-                    Effect::Deny,
-                ),
-                &stub_mcp(&[PROBE_QUALIFIED]),
+                    vec![json!({}).to_string()]
+                )]
             );
-            let done = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
-            assert!(done.is_error, "plan mode must not bypass deny rules");
-            assert!(
-                done.output.as_text() == format!("{MODE_DENIED}: {PROBE_WIRE}"),
-                "got: {}",
-                done.output.as_text()
+            let mut tools = json!([]);
+            mcp.extend_tools(&mut tools);
+            assert_eq!(tool_names(&tools).contains(&PROBE_WIRE), allowed);
+        });
+    }
+
+    #[test_case(PROBE_WIRE ; "mcp_tool")]
+    #[test_case(TOOL_SEARCH_TOOL_NAME ; "tool_search")]
+    fn explicit_tool_selection_blocks_mcp_even_with_yolo(name: &str) {
+        smol::block_on(async {
+            let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
+            let ctx = ruled_ctx(&plan, ToolKey::Wildcard, Effect::Allow);
+            ctx.permissions.set_yolo(true);
+            let mcp = stub_session_with_result(&[(PROBE_QUALIFIED, "")], HOOK_OUTPUT_TEXT);
+            let mut ctx = with_mcp(ctx, &mcp);
+            Arc::make_mut(ctx.mode_def.as_mut().unwrap()).tools = Some(Vec::new());
+            assert!(callable_names(&ctx).is_empty());
+            let done = dispatch(&ctx, name, &json!({"query": "probe"})).await;
+            assert!(done.is_error);
+            assert_eq!(
+                done.output.as_text(),
+                format!("{UNAVAILABLE_TOOL_PREFIX}: {name}")
             );
+            let mut tools = json!([]);
+            mcp.extend_tools(&mut tools);
+            assert!(!tool_names(&tools).contains(&PROBE_WIRE));
         });
     }
 

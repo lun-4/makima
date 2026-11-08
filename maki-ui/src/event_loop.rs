@@ -27,7 +27,7 @@ use maki_agent::actor::{
 };
 use maki_agent::command::CustomCommand;
 use maki_agent::config_change::{
-    ConfigChangeError, ConfigChangeTicket, prepare_model, prepare_patch,
+    ConfigChangeError, ConfigChangeTicket, prepare_model, prepare_selection,
 };
 #[cfg(test)]
 use maki_agent::permissions::PermissionAnswer;
@@ -96,6 +96,7 @@ use crate::components::{
     Action, ExitRequest, SessionReplacementKind, SessionReplacementRequest, Status,
 };
 use crate::input::InputReader;
+use crate::model_capabilities::ModelCapabilityCache;
 use crate::plan_approval::PrepareProvider;
 use crate::provider_usage::{
     ProviderIdentity, ProviderUsageCoordinator, ProviderUsageFetch, ProviderUsageFetchId,
@@ -1112,7 +1113,7 @@ impl SessionRuntime {
 
     /// An explicit choice of model or fast for the root replaces a restored
     /// `/fast` wish. Returns whether one was pending.
-    fn drop_pending_fast(&mut self, target: &AgentRef) -> bool {
+    pub(super) fn drop_pending_fast(&mut self, target: &AgentRef) -> bool {
         let (_, root) = self.handles.manager_and_root();
         target.id() == root && std::mem::take(&mut self.app.state.fast_pending)
     }
@@ -1216,6 +1217,7 @@ struct SpawnCtx {
     session_defaults: SessionDefaults,
     system_prompt: SystemPromptOverride,
     command_runtime: Arc<CommandRuntime>,
+    model_capabilities: Arc<ModelCapabilityCache>,
     trust_question: Option<TrustQuestion>,
 }
 
@@ -1399,6 +1401,7 @@ impl SpawnCtx {
         let coordinator_config = config.clone();
         let mut app = App::prepare(
             config.clone(),
+            &self.config,
             session.clone(),
             self.storage.clone(),
             self.catalog.specs(),
@@ -1418,6 +1421,7 @@ impl SpawnCtx {
             Arc::clone(&self.model_policy),
             crate::theme::default_provider().clone(),
             Arc::clone(&self.command_runtime),
+            Arc::clone(&self.model_capabilities),
         );
         let handles = AgentHandles::prepare(
             &model_slot,
@@ -1488,6 +1492,7 @@ impl SpawnCtx {
 
 enum InternalEvent {
     ModelsDiscovered,
+    ModelCapabilitiesResolved,
     ProviderUsageFetched {
         fetch_id: ProviderUsageFetchId,
         provider: ProviderIdentity,
@@ -1740,7 +1745,16 @@ impl<'t> EventLoop<'t> {
         let sessions_dir = storage.ensure_subdir(SESSIONS_DIR)?;
 
         let notifier = terminal::TerminalNotifier::new(ui_config.notifications);
-        let model_completion = Arc::new(ModelArgSource::new(catalog.specs()));
+        let model_capabilities = ModelCapabilityCache::provider_adjusted(timeouts, {
+            let internal_tx = internal_tx.clone();
+            move || {
+                let _ = internal_tx.send(InternalEvent::ModelCapabilitiesResolved);
+            }
+        });
+        let model_completion = Arc::new(ModelArgSource::new(
+            catalog.specs(),
+            Arc::clone(&model_capabilities),
+        ));
         let theme_completion = Arc::new(ThemeArgSource::new(
             crate::theme::default_provider().clone(),
         ));
@@ -1778,6 +1792,7 @@ impl<'t> EventLoop<'t> {
                 append_text: append_system_prompt,
             },
             command_runtime,
+            model_capabilities,
             trust_question,
         };
 
@@ -1880,6 +1895,7 @@ impl<'t> EventLoop<'t> {
                 .zip(&self.orchestration_revisions)
                 .all(|(runtime, previous)| orchestration_revision(runtime).matches(previous))
         {
+            self.sync_plan_forms();
             return;
         }
         self.orchestration_focus = Some(self.focused);
@@ -1931,6 +1947,7 @@ impl<'t> EventLoop<'t> {
         self.ctx.command_runtime.sync_admissions(admissions);
         self.orchestration.select(focused);
         self.sync_model_discovery();
+        self.sync_plan_forms();
     }
 
     fn sync_model_discovery(&mut self) {
@@ -1950,6 +1967,25 @@ impl<'t> EventLoop<'t> {
                 })
                 .unwrap_or_default();
             runtime.app.project_model_discovery(specs);
+        }
+    }
+
+    /// Retires plan-form staging, and a picker editing it, once the plan it
+    /// was staged for is gone.
+    fn sync_plan_forms(&mut self) {
+        for runtime in &mut self.sessions {
+            let (manager, _) = runtime.handles.manager_and_root();
+            runtime.app.sync_child_plan_paths(|target| {
+                manager
+                    .actor(target)
+                    .ok()?
+                    .config_snapshot()?
+                    .config
+                    .mode
+                    .plan_path()
+                    .map(Path::to_path_buf)
+            });
+            runtime.app.sync_focused_plan_form();
         }
     }
 
@@ -2104,7 +2140,17 @@ impl<'t> EventLoop<'t> {
                     self.complete_plan_approval(idx, result);
                 }
             }
-            InternalEvent::ModelsDiscovered => self.refresh_discovered_models(),
+            InternalEvent::ModelsDiscovered => {
+                self.ctx.model_capabilities.clear();
+                self.refresh_discovered_models();
+            }
+            InternalEvent::ModelCapabilitiesResolved => {
+                for runtime in &mut self.sessions {
+                    if runtime.app.model_picker.is_open() {
+                        runtime.app.pending_dirty |= Dirty::YES;
+                    }
+                }
+            }
             InternalEvent::SessionOp {
                 session,
                 runtime,
@@ -2151,6 +2197,7 @@ impl<'t> EventLoop<'t> {
     }
 
     fn handle_provider_change(&mut self, _change: ProviderChange) {
+        self.ctx.model_capabilities.clear();
         let provider = self.focused_model_slot().load().provider.identity();
         for runtime in &self.sessions {
             runtime
@@ -3505,15 +3552,9 @@ impl<'t> EventLoop<'t> {
                 },
                 None,
             ),
-            Action::ChangePinnedModel { target, spec } => self.dispatch_model_selection(
-                idx,
-                Some(target),
-                maki_commands::ModelSelection {
-                    spec: Some(Arc::from(spec)),
-                    ..Default::default()
-                },
-                None,
-            ),
+            Action::SelectPinnedModel { target, selection } => {
+                self.dispatch_model_selection(idx, Some(target), selection, None);
+            }
             Action::RunKeybind(id) => self.run_keybind(idx, id),
             Action::SelectModel(selection) => {
                 self.note_if_deferred(idx, "model");
@@ -3531,11 +3572,11 @@ impl<'t> EventLoop<'t> {
             ),
             Action::ApprovePlan {
                 clear_context,
-                model,
+                selection,
                 parallel,
                 path,
             } => {
-                self.prepare_plan_approval(idx, clear_context, model, parallel, path);
+                self.prepare_plan_approval(idx, clear_context, selection, parallel, path);
             }
             Action::CancelPlanApproval => self.sessions[idx].end_plan_approval(),
             Action::RefreshProvider { slug } => self.refresh_provider(slug),
@@ -4066,14 +4107,8 @@ impl<'t> EventLoop<'t> {
         let session = self.sessions[idx].id();
         let runtime = self.sessions[idx].handles.identity();
         smol::spawn(async move {
-            let patch = ConfigPatch {
-                thinking: selection.thinking,
-                fast: selection.fast,
-                ..Default::default()
-            };
-            let spec = selection.spec.as_deref();
             let result = match reservation {
-                Ok(ticket) => commit_model_patch(ticket, patch, spec, &policy, &prepare)
+                Ok(ticket) => commit_model_selection(ticket, &selection, &policy, &prepare)
                     .await
                     .map(|_| ()),
                 Err(error) => Err(error),
@@ -4515,18 +4550,15 @@ fn reserve_config_change(
     )
 }
 
-/// Commits {patch} with {spec}'s model prepared, unless preparation outlives
-/// the session op timeout.
-async fn commit_model_patch(
+async fn commit_model_selection(
     ticket: ConfigChangeTicket<'_>,
-    patch: ConfigPatch,
-    spec: Option<&str>,
+    selection: &maki_commands::ModelSelection,
     policy: &ModelPolicy,
     prepare: &ModelPreparer,
 ) -> Result<ConfigCommit, ConfigChangeError> {
     let change = async {
         Ok(ConfigChange::Patch(
-            prepare_patch(patch, spec, policy, prepare).await?,
+            prepare_selection(selection, policy, prepare).await?,
         ))
     };
     prepare_config_change(ticket, change, async {
@@ -4699,7 +4731,7 @@ mod tests {
     use maki_config::PermissionsConfig;
     use maki_lua::BuiltinAction;
     use maki_providers::model::FastSupport;
-    use maki_providers::{Effort, TokenUsage};
+    use maki_providers::{Effort, ModelCapabilities, TokenUsage};
     use ratatui::{Terminal, backend::TestBackend};
     use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
@@ -5866,7 +5898,10 @@ mod tests {
             let command_runtime = Arc::new(CommandRuntime::new_for_test(
                 &[],
                 command_registry,
-                Arc::new(ModelArgSource::new(catalog.specs())),
+                Arc::new(ModelArgSource::new(
+                    catalog.specs(),
+                    crate::model_capabilities::test_support::seeded(&[], &[]),
+                )),
                 Arc::new(ThemeArgSource::new(
                     crate::theme::default_provider().clone(),
                 )),
@@ -5904,6 +5939,7 @@ mod tests {
                 session_defaults: SessionDefaults::default(),
                 system_prompt: SystemPromptOverride::default(),
                 command_runtime,
+                model_capabilities: ModelCapabilityCache::new(|_| ModelCapabilities::NONE, || {}),
                 trust_question: None,
             };
             Self {
@@ -6700,7 +6736,10 @@ mod tests {
         smol::block_on(
             runtime
                 .coordinator
-                .set_model(Some(Arc::from(STORED_MODEL)), None, None),
+                .set_model(maki_commands::ModelSelection {
+                    spec: Some(Arc::from(STORED_MODEL)),
+                    ..Default::default()
+                }),
         )
         .unwrap();
         assert_eq!(runtime.model_slot.load().model.spec(), STORED_MODEL);
@@ -7799,25 +7838,52 @@ mod tests {
             let items = complete(&original);
             assert!(items.iter().any(|spec| spec == ALLOWED));
             assert!(!items.iter().any(|spec| spec == EXCLUDED));
-            assert!(items.iter().any(|spec| spec == "thinking=high"));
-            assert!(items.iter().any(|spec| spec == "fast=true"));
+            let config = target.actor().unwrap().effective_config().unwrap();
+            assert_eq!(
+                items.iter().any(|spec| spec == "thinking=high"),
+                config.model.supports_thinking()
+            );
+            assert_eq!(
+                items.iter().any(|spec| spec == "fast=true"),
+                config.model.supports_fast()
+            );
+            let current = |spec: &str| {
+                let mut selection = config.model_selection();
+                selection.spec = Arc::from(spec);
+                selection
+            };
             let picker = &mut event_loop.sessions[0].app.model_picker;
             picker.set_recents(vec![EXCLUDED.into()]);
-            picker.open(EXCLUDED);
+            picker.open(
+                current(EXCLUDED),
+                ModelCapabilities::NONE,
+                &maki_commands::ModelSelection::default(),
+            );
+            assert_eq!(picker.highlighted_spec(), Some(EXCLUDED));
             assert!(matches!(
                 picker.handle_key(crate::components::key(KeyCode::Enter)),
-                crate::components::model_picker::ModelPickerAction::Select(spec) if spec == ALLOWED
+                crate::components::model_picker::ModelPickerAction::Select(selection)
+                    if selection == maki_commands::ModelSelection::default()
             ));
 
-            picker.open(ALLOWED);
+            picker.open(
+                current(ALLOWED),
+                ModelCapabilities::NONE,
+                &maki_commands::ModelSelection::default(),
+            );
             event_loop.sessions[0]
                 .handles
                 .orchestration_template
                 .model_policy = Arc::new(ModelPolicy::new(&[], &[ALLOWED.into()]).unwrap());
             event_loop.sync_orchestration();
+            assert_eq!(
+                event_loop.sessions[0].app.model_picker.highlighted_spec(),
+                Some(ALLOWED)
+            );
             assert!(matches!(
                 event_loop.sessions[0].app.model_picker.handle_key(crate::components::key(KeyCode::Enter)),
-                crate::components::model_picker::ModelPickerAction::Select(spec) if spec == EXCLUDED
+                crate::components::model_picker::ModelPickerAction::Select(selection)
+                    if selection == maki_commands::ModelSelection::default()
             ));
 
             let mut second = test_runtime(model_named("other-model"));
@@ -8122,7 +8188,7 @@ mod tests {
                 assert!(!actions.iter().any(|action| matches!(
                     action,
                     Action::ChangeModel(_)
-                        | Action::ChangePinnedModel { .. }
+                        | Action::SelectPinnedModel { .. }
                         | Action::SelectModel(_)
                 )));
                 assert_eq!(
@@ -8145,8 +8211,8 @@ mod tests {
             let app = &mut event_loop.sessions[0].app;
             let actions = app.update(crate::app::Msg::Key(crate::components::key(KeyCode::Enter)));
             assert!(
-                matches!(actions.as_slice(), [Action::ChangePinnedModel { target, spec }]
-                if target.id() == child && spec == CHILD_MODEL)
+                matches!(actions.as_slice(), [Action::SelectPinnedModel { target, selection }]
+                if target.id() == child && selection.is_empty())
             );
             assert_eq!(app.root_config().model.spec(), root_model);
             assert_eq!(actor.effective_config().unwrap().model.spec(), CHILD_MODEL);
@@ -8166,8 +8232,9 @@ mod tests {
             ));
             let actions = app.update(crate::app::Msg::Key(crate::components::key(KeyCode::Enter)));
             assert!(
-                matches!(actions.as_slice(), [Action::ChangePinnedModel { target, spec }]
-                if target.id() == child && spec == NEXT_MODEL)
+                matches!(actions.as_slice(), [Action::SelectPinnedModel { target, selection }]
+                if target.id() == child && selection.spec.as_deref() == Some(NEXT_MODEL)
+                    && !selection.has_option_overrides())
             );
             event_loop.dispatch(0, actions);
             let completion = std::iter::repeat_with(|| {
@@ -9554,5 +9621,153 @@ mod tests {
 
         let text = preamble.iter().map(Message::user_text).collect::<Vec<_>>();
         assert_eq!(text, [Some(SHELL_RESULT), Some(OBSERVATION)]);
+    }
+
+    #[test_case("high", true ; "enabled_options")]
+    #[test_case("off", false ; "explicit_disabled_options")]
+    fn session_model_picker_commits_provider_and_options_together(thinking: &str, fast: bool) {
+        use crate::components::model_picker::ModelPicker;
+        use crate::model_capabilities::test_support::seeded;
+        use maki_providers::{RequestOptions, ThinkingSupport};
+
+        const MODEL: &str = "anthropic/picker-committed-model";
+        const PROMPT: &str = "record picker selection";
+
+        struct RecordingProvider(flume::Sender<(String, RequestOptions)>);
+
+        impl Provider for RecordingProvider {
+            fn stream_message<'a>(
+                &'a self,
+                model: &'a Model,
+                _messages: &'a [Message],
+                _system: &'a str,
+                _tools: &'a serde_json::Value,
+                _event_tx: &'a flume::Sender<maki_providers::ProviderEvent>,
+                options: RequestOptions,
+                _session_id: Option<&'a SessionRef>,
+            ) -> maki_providers::provider::BoxFuture<
+                'a,
+                Result<maki_providers::StreamResponse, maki_providers::AgentError>,
+            > {
+                Box::pin(async move {
+                    self.0.send((model.spec(), options)).unwrap();
+                    std::future::pending().await
+                })
+            }
+
+            fn list_models(
+                &self,
+            ) -> maki_providers::provider::BoxFuture<
+                '_,
+                Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>,
+            > {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+        }
+
+        fn adjusted(mut model: Model) -> Model {
+            model.thinking_override = Some(ThinkingSupport::Yes);
+            model.supports_fast_override = Some(FastSupport::Supported);
+            model
+        }
+
+        fn finish_selection(event_loop: &mut EventLoop<'_>) {
+            loop {
+                let event = event_loop
+                    .internal_rx
+                    .recv_timeout(SESSION_OP_TIMEOUT)
+                    .unwrap();
+                let done = match &event {
+                    InternalEvent::SessionOp {
+                        result: Err(error), ..
+                    } => panic!("picker selection failed: {error}"),
+                    InternalEvent::SessionOp {
+                        kind: SessionOpKind::ProviderRefreshed,
+                        ..
+                    } => true,
+                    _ => false,
+                };
+                event_loop.handle_internal(event);
+                if done {
+                    return;
+                }
+            }
+        }
+
+        with_event_loop(|event_loop| {
+            let (requests, received) = flume::unbounded();
+            let provider: Arc<dyn Provider> = Arc::new(RecordingProvider(requests));
+            let committed_provider = Arc::clone(&provider);
+            event_loop.ctx.prepare_provider = Arc::new(move |model, _| {
+                Ok(PreparedModel {
+                    model: adjusted(model),
+                    provider: Arc::clone(&provider),
+                })
+            });
+            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let before = actor.config_snapshot().unwrap();
+            event_loop
+                .ctx
+                .catalog
+                .specs()
+                .store(Some(Arc::new(vec![MODEL.into()])));
+            event_loop.sync_orchestration();
+            event_loop.sync_model_discovery();
+            let app = &mut event_loop.sessions[0].app;
+            app.model_picker = ModelPicker::new(
+                Arc::clone(&app.available_models),
+                seeded(
+                    &[(
+                        MODEL,
+                        ModelCapabilities::from(&adjusted(Model::from_spec(MODEL).unwrap())),
+                    )],
+                    &[],
+                ),
+            );
+            app.run_builtin(BuiltinAction::ModelPicker);
+            app.update(Msg::Paste(MODEL.split_once('/').unwrap().1.into()));
+            assert_eq!(app.model_picker.highlighted_spec(), Some(MODEL));
+            app.update(Msg::Key(crate::components::key(KeyCode::Tab)));
+            app.update(Msg::Paste(thinking.into()));
+            app.update(Msg::Key(crate::components::key(KeyCode::Tab)));
+            app.update(Msg::Key(crate::components::key(KeyCode::Right)));
+            if !fast {
+                app.update(Msg::Key(crate::components::key(KeyCode::Right)));
+            }
+            event_loop.sync_orchestration();
+            let unchanged = actor.config_snapshot().unwrap();
+            assert_eq!(unchanged.generation, before.generation);
+
+            let actions = event_loop.sessions[0]
+                .app
+                .update(Msg::Key(crate::components::key(KeyCode::Enter)));
+            let expected_thinking = thinking.parse::<DomainThinkingConfig>().unwrap();
+            assert!(
+                matches!(actions.as_slice(), [Action::SelectPinnedModel { target, selection }]
+                if target.id() == root && selection.spec.as_deref() == Some(MODEL)
+                    && selection.thinking == Some(expected_thinking) && selection.fast == Some(fast))
+            );
+            event_loop.dispatch(0, actions);
+            finish_selection(event_loop);
+            drain_config_commits(&mut event_loop.sessions[0]);
+            let after = actor.config_snapshot().unwrap();
+            assert_eq!(after.generation, before.generation + 1);
+            assert!(Arc::ptr_eq(&after.config.provider, &committed_provider));
+            assert_eq!(after.config.model.spec(), MODEL);
+            let expected = RequestOptions {
+                thinking: expected_thinking,
+                fast,
+            }
+            .clamped(&after.config.model);
+            assert_eq!(after.config.thinking, expected.thinking);
+            assert_eq!(after.config.fast, expected.fast);
+
+            event_loop.submit_text(0, PROMPT.into()).unwrap();
+            assert_eq!(
+                received.recv_timeout(SESSION_OP_TIMEOUT).unwrap(),
+                (MODEL.into(), expected)
+            );
+        });
     }
 }
