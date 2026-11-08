@@ -63,8 +63,10 @@ const BACKGROUND_COMMAND: &str = "/parity_background";
 const BACKGROUND_PROMPT: &str = "background job";
 const FOLLOW_UP: &str = "and one more thing";
 const FOLLOW_UP_ID: u64 = PROMPT_ID + 1;
-/// The toolset the bundled plan mode swaps in.
-const PLAN_TOOLS: [&str; 11] = [
+const PLAN_TOOLS: [&str; 14] = [
+    "bash",
+    "batch",
+    "code_execution",
     "edit",
     "glob",
     "grep",
@@ -239,7 +241,16 @@ impl Scenario {
                     panic!("expected one request: {bodies:?}")
                 };
                 assert_eq!(last_user_text(body), PROMPT);
-                assert_eq!(tool_names(body), PLAN_TOOLS);
+                let names = tool_names(body);
+                for tool in PLAN_TOOLS {
+                    assert!(
+                        names.contains(&tool),
+                        "plan mode is missing {tool}: {names:?}"
+                    );
+                }
+                let prompt = system_text(body);
+                assert!(prompt.contains("allowed for read-only investigation"));
+                assert!(prompt.contains("normal permission flow"));
                 let plans = home
                     .join(".local/state")
                     .join(APP_DIR)

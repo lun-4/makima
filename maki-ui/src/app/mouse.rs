@@ -8,7 +8,7 @@ use ratatui::layout::{Position, Rect};
 
 use crate::repaint::Dirty;
 
-use super::{Action, App};
+use super::{Action, App, FLASH_NO_AGENT_CHAT};
 
 pub(super) const EDGE_SCROLL_LINES: i32 = 1;
 pub(super) const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -316,7 +316,21 @@ impl App {
                         }
                         return (Dirty::YES, vec![]);
                     }
-                    self.chats[self.active_chat].handle_click(row, area);
+                    if let Some(id) = self.chats[self.active_chat].post_agent_at(row, area) {
+                        let mut matches = self
+                            .chats
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, chat)| chat.subagent_id.as_deref() == Some(id));
+                        let target = matches.next().map(|(index, _)| index);
+                        if let Some(index) = target.filter(|_| matches.next().is_none()) {
+                            self.active_chat = index;
+                        } else {
+                            self.flash(FLASH_NO_AGENT_CHAT.into());
+                        }
+                    } else {
+                        self.chats[self.active_chat].handle_click(row, area);
+                    }
                 }
             }
         }

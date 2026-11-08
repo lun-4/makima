@@ -798,8 +798,10 @@ fn focused_agent(lua: &Lua) -> LuaResult<Pair<LuaAgentRef>> {
 /// @param text string Row text. Must not be blank.
 /// @param opts table? Optional fields:
 ///   `level` (string?) - "info" (default), "warn" or "error".
-///   `agent` (Agent?) - a child spawned from Lua that the post is about. Keeps
-///     that child's transcript when this post survives a rewind.
+///   `agent` (Agent?) - a child spawned from Lua that the post is about. The row
+///     is underlined; clicking it opens the child's chat. If no unique chat is
+///     available, a status message explains why it cannot open. Keeps that child's
+///     transcript when this post survives a rewind.
 /// Any other option key is an error.
 /// @return (boolean?, string?) True once sent, or nil and an error.
 /// @example

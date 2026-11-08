@@ -3135,9 +3135,18 @@ mod tests {
             .with_completion(CompletionPolicy::Replace);
         argument.variadic = true;
         registration.spec.arguments = CommandArguments::Positional(Arc::from([argument]));
-        registration.argument_completions = vec![Some(Arc::new(ModelArgSource::new(Arc::new(
-            ArcSwapOption::from(Some(Arc::new(vec!["openai/gpt-5".into()]))),
-        ))))];
+        registration.argument_completions = vec![Some(Arc::new(ModelArgSource::new(
+            Arc::new(ArcSwapOption::from(Some(Arc::new(vec![
+                "openai/gpt-5".into(),
+            ])))),
+            crate::model_capabilities::test_support::seeded(
+                &[(
+                    "openai/gpt-5",
+                    crate::model_capabilities::test_support::ALL_OPTIONS,
+                )],
+                &[],
+            ),
+        )))];
         producer.replace(vec![registration]).unwrap();
         let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
         let mut palette = CommandPalette::new(registry, target);

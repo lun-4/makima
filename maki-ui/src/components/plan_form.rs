@@ -7,8 +7,10 @@ use crate::wrap::Measure;
 
 use std::borrow::Cow;
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use maki_providers::{ModelOption, ModelSelection};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -61,7 +63,7 @@ const MODEL_LABEL: &str = "Implementation model";
 const MODEL_STAGED_TAG: &str = "  selected";
 const MODEL_CURRENT_TAG: &str = "  current";
 const USE_CURRENT_LABEL: &str = "Use current model";
-const USE_CURRENT_DESC: &str = "  Clear implementation model choice";
+const USE_CURRENT_DESC: &str = "  Clear implementation model and option choices";
 const PARALLEL_TAG: &str = " (parallel)";
 
 #[derive(Debug, PartialEq)]
@@ -87,7 +89,8 @@ pub struct PlanForm {
     visibility: Visibility,
     selected: usize,
     parallel: bool,
-    implementation_model: Option<String>,
+    implementation_selection: ModelSelection,
+    plan_path: Option<PathBuf>,
 }
 
 impl PlanForm {
@@ -96,7 +99,8 @@ impl PlanForm {
             visibility: Visibility::Hidden,
             selected: 0,
             parallel: false,
-            implementation_model: None,
+            implementation_selection: ModelSelection::default(),
+            plan_path: None,
         }
     }
 
@@ -137,36 +141,45 @@ impl PlanForm {
     pub fn reset(&mut self) {
         self.visibility = Visibility::Hidden;
         self.selected = 0;
-        self.implementation_model = None;
+        self.implementation_selection = ModelSelection::default();
+        self.plan_path = None;
     }
 
-    pub fn implementation_model(&self) -> Option<&str> {
-        self.implementation_model.as_deref()
-    }
-
-    pub fn set_implementation_model(&mut self, spec: String, current_model: &str) {
-        if spec == current_model {
-            self.use_current_model();
-        } else {
-            self.implementation_model = Some(spec);
+    pub(crate) fn sync_plan_path(&mut self, path: Option<&Path>) -> bool {
+        let changed = self
+            .plan_path
+            .as_deref()
+            .is_some_and(|previous| Some(previous) != path);
+        if changed {
+            self.reset();
         }
+        self.plan_path = path.map(Path::to_path_buf);
+        changed
+    }
+
+    pub fn implementation_selection(&self) -> &ModelSelection {
+        &self.implementation_selection
+    }
+
+    pub fn set_implementation_selection(&mut self, selection: ModelSelection) {
+        self.implementation_selection = selection;
+        self.selected = self
+            .selected
+            .min(Self::menu_len(!self.implementation_selection.is_empty()) - 1);
     }
 
     pub fn use_current_model(&mut self) {
-        self.implementation_model = None;
+        self.implementation_selection = ModelSelection::default();
         self.selected = MODEL_ROW;
     }
 
     pub fn clear_model_if_current(&mut self, current_model: &str) {
-        if self.implementation_model() == Some(current_model) {
-            self.implementation_model = None;
-            self.selected = self.selected.min(MODEL_ROW);
+        if self.implementation_selection.spec.as_deref() == Some(current_model) {
+            self.implementation_selection.spec = None;
+            self.selected = self
+                .selected
+                .min(Self::menu_len(!self.implementation_selection.is_empty()) - 1);
         }
-    }
-
-    fn staged_model(&self, current_model: &str) -> Option<&str> {
-        self.implementation_model()
-            .filter(|spec| *spec != current_model)
     }
 
     fn menu_len(staged: bool) -> usize {
@@ -213,7 +226,7 @@ impl PlanForm {
             }
             KeyCode::Down => {
                 self.selected = (self.selected + 1)
-                    .min(Self::menu_len(self.implementation_model.is_some()) - 1);
+                    .min(Self::menu_len(!self.implementation_selection.is_empty()) - 1);
                 PlanFormAction::Consumed
             }
             KeyCode::Char(' ') => {
@@ -238,17 +251,23 @@ impl PlanForm {
         let width = area.width.saturating_sub(2);
         let mut measure = Measure::new(width);
         let mut row = 0u16;
-        let menu_len = Self::menu_len(self.staged_model(current_model).is_some());
         let inner = Rect::new(area.x + 1, area.y + 1, width, area.height.saturating_sub(2));
         let mut hits = Vec::new();
         for (index, line) in lines.iter().enumerate() {
             let rows = measure.rows(line).max(1);
             let line_area =
                 Rect::new(inner.x, inner.y.saturating_add(row), width, rows).intersection(inner);
-            if index < menu_len {
+            let menu_row = match index {
+                0..=MODEL_ROW => Some(index),
+                _ if !self.implementation_selection.is_empty() && index == lines.len() - 3 => {
+                    Some(USE_CURRENT_ROW)
+                }
+                _ => None,
+            };
+            if let Some(menu_row) = menu_row {
                 hits.push(HitTarget {
                     rect: line_area,
-                    target: ClickTarget::PlanRow(index as u16),
+                    target: ClickTarget::PlanRow(menu_row as u16),
                 });
                 if index < MENU.len() && self.parallel {
                     let end = line
@@ -293,7 +312,7 @@ impl PlanForm {
     }
 
     pub fn select_row(&mut self, row: usize) -> bool {
-        if row >= Self::menu_len(self.implementation_model.is_some()) {
+        if row >= Self::menu_len(!self.implementation_selection.is_empty()) {
             return false;
         }
         self.selected = row;
@@ -302,9 +321,9 @@ impl PlanForm {
 
     fn lines(&self, current_model: &str) -> Vec<Line<'static>> {
         let t = theme::current();
-        let staged = self.staged_model(current_model);
-        let menu_len = Self::menu_len(staged.is_some());
-        let mut lines: Vec<Line<'static>> = Vec::with_capacity(menu_len + 2);
+        let staged = &self.implementation_selection;
+        let menu_len = Self::menu_len(!staged.is_empty());
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(menu_len + 3);
 
         for (row, item) in MENU.iter().enumerate() {
             let mut spans = self.row_spans(&t, row, item.label, item.desc);
@@ -313,7 +332,7 @@ impl PlanForm {
             }
             lines.push(Line::from(spans));
         }
-        let (spec, tag) = match staged {
+        let (spec, tag) = match staged.spec.as_deref() {
             Some(spec) => (spec, MODEL_STAGED_TAG),
             None => (current_model, MODEL_CURRENT_TAG),
         };
@@ -323,7 +342,17 @@ impl PlanForm {
             format!("{MODEL_LABEL}: {spec}"),
             tag,
         )));
-        if staged.is_some() {
+        let overrides: Vec<String> = ModelOption::ALL
+            .into_iter()
+            .filter_map(|option| Some(format!("{}={}", option.key(), option.get(staged)?)))
+            .collect();
+        if !overrides.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled(format!("    {}", overrides.join(" ")), t.tool_dim),
+                Span::styled(MODEL_STAGED_TAG, t.tool_dim),
+            ]));
+        }
+        if !staged.is_empty() {
             lines.push(Line::from(self.row_spans(
                 &t,
                 USE_CURRENT_ROW,
@@ -403,10 +432,18 @@ pub(super) fn wrapped_key_hits(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        MODEL_ROW, ModelSelection, PlanForm, PlanFormAction, USE_CURRENT_LABEL, USE_CURRENT_ROW,
+    };
+    use crate::click::ClickTarget;
+    use crate::components::keybindings::key;
     use crate::components::{buffer_text, key};
+    use crate::wrap::Measure;
+    use crossterm::event::{KeyCode, KeyEvent};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+    use std::path::Path;
     use test_case::test_case;
 
     const CURRENT_MODEL: &str = "provider/current";
@@ -414,6 +451,19 @@ mod tests {
     const LONG_MODEL: &str = "openrouter/vendor/a-very-long-implementation-model-name-that-wraps";
     const WIDE: u16 = 200;
     const HINT_TAIL: &str = "dismiss";
+    const PLAN_PATH: &str = "plan.md";
+    const REPLACEMENT_PLAN_PATH: &str = "replacement-plan.md";
+
+    fn selection(spec: Option<&str>, options: &[(&str, &str)]) -> ModelSelection {
+        let mut selection = ModelSelection {
+            spec: spec.map(Into::into),
+            ..ModelSelection::default()
+        };
+        for (key, value) in options {
+            selection.set_option(key, value).unwrap();
+        }
+        selection
+    }
 
     #[test_case(30; "narrow")]
     #[test_case(80; "normal")]
@@ -457,12 +507,76 @@ mod tests {
         );
     }
 
-    fn render(form: &PlanForm, width: u16, current_model: &str) -> String {
-        let height = form.height(width, current_model);
+    #[test_case(30, None, true; "narrow_options_only")]
+    #[test_case(80, None, true; "normal_options_only")]
+    #[test_case(WIDE, None, true; "wide_options_only")]
+    #[test_case(30, Some(LONG_MODEL), true; "narrow_model_and_options")]
+    #[test_case(80, Some(LONG_MODEL), true; "normal_model_and_options")]
+    #[test_case(WIDE, Some(LONG_MODEL), true; "wide_model_and_options")]
+    #[test_case(30, Some(LONG_MODEL), false; "narrow_model_only")]
+    #[test_case(80, Some(LONG_MODEL), false; "normal_model_only")]
+    #[test_case(WIDE, Some(LONG_MODEL), false; "wide_model_only")]
+    fn staged_rows_keep_logical_mouse_targets(width: u16, spec: Option<&str>, has_options: bool) {
+        let mut form = PlanForm::new();
+        form.on_plan_ready();
+        let options = if has_options {
+            &[("thinking", "off"), ("fast", "false")][..]
+        } else {
+            &[]
+        };
+        form.set_implementation_selection(selection(spec, options));
+        let height = form.height(width, CURRENT_MODEL);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut hits = Vec::new();
+        terminal
+            .draw(|frame| {
+                hits = form.view(frame, frame.area(), CURRENT_MODEL);
+            })
+            .unwrap();
+        let row_targets: Vec<_> = hits
+            .iter()
+            .filter_map(|hit| match hit.target {
+                ClickTarget::PlanRow(row) => Some(row),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            row_targets,
+            (0..=USE_CURRENT_ROW as u16).collect::<Vec<_>>()
+        );
+
+        let lines = form.lines(CURRENT_MODEL);
+        let inner_width = width - 2;
+        let mut measure = Measure::new(inner_width);
+        let mut y = 1;
+        for line in lines.iter().take(MODEL_ROW + 1) {
+            y += measure.rows(line).max(1);
+        }
+        if has_options {
+            let summary_height = measure.rows(&lines[MODEL_ROW + 1]).max(1);
+            let summary_area = Rect::new(1, y, inner_width, summary_height);
+            assert!(hits.iter().all(|hit| !hit.rect.intersects(summary_area)));
+            y += summary_height;
+        }
+        assert!(hits.iter().any(|hit| {
+            hit.target == ClickTarget::PlanRow(USE_CURRENT_ROW as u16) && hit.rect.y == y
+        }));
+        assert!(form.select_row(USE_CURRENT_ROW));
+        assert_eq!(
+            form.handle_key(key(KeyCode::Enter)),
+            PlanFormAction::UseCurrentModel
+        );
+        assert!(!form.select_row(USE_CURRENT_ROW + 1));
+        form.use_current_model();
+        assert!(!form.select_row(USE_CURRENT_ROW));
+    }
+
+    fn render(form: &PlanForm, width: u16) -> String {
+        let height = form.height(width, CURRENT_MODEL);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| {
-                form.view(frame, frame.area(), current_model);
+                form.view(frame, frame.area(), CURRENT_MODEL);
             })
             .unwrap();
         buffer_text(terminal.backend().buffer())
@@ -510,6 +624,37 @@ mod tests {
         assert!(form.is_visible());
     }
 
+    #[test_case(Some(PLAN_PATH), false ; "unchanged")]
+    #[test_case(Some(REPLACEMENT_PLAN_PATH), true ; "replacement")]
+    #[test_case(None, true ; "retired")]
+    fn plan_path_sync_discards_only_retired_stage(next: Option<&str>, retired: bool) {
+        let mut form = PlanForm::new();
+        assert!(!form.sync_plan_path(Some(Path::new(PLAN_PATH))));
+        form.on_plan_ready();
+        let staged = selection(Some(OTHER_MODEL), &[("thinking", "off"), ("fast", "false")]);
+        form.set_implementation_selection(staged.clone());
+        assert_eq!(
+            form.handle_key(key(KeyCode::Char(' '))),
+            PlanFormAction::Consumed
+        );
+        form.selected = USE_CURRENT_ROW;
+        assert_eq!(form.sync_plan_path(next.map(Path::new)), retired);
+        assert!(form.parallel());
+        if retired {
+            assert!(!form.is_visible());
+            assert!(form.implementation_selection().is_empty());
+            assert_eq!(form.selected, 0);
+            form.on_plan_ready();
+            assert!(form.is_visible());
+            assert!(form.implementation_selection().is_empty());
+        } else {
+            assert!(form.is_visible());
+            assert_eq!(form.implementation_selection(), &staged);
+            assert_eq!(form.selected, USE_CURRENT_ROW);
+        }
+        assert!(!form.sync_plan_path(next.map(Path::new)));
+    }
+
     #[test]
     fn reset_clears_state() {
         let mut form = PlanForm::new();
@@ -553,10 +698,13 @@ mod tests {
         form.on_plan_ready();
         form.parallel = parallel;
         if let Some(spec) = staged {
-            form.set_implementation_model(spec.into(), CURRENT_MODEL);
+            form.set_implementation_selection(selection(
+                Some(spec),
+                &[("thinking", "off"), ("fast", "false")],
+            ));
         }
         form.selected = selected;
-        let text = render(&form, width, CURRENT_MODEL);
+        let text = render(&form, width);
         assert!(text.contains(HINT_TAIL));
         assert!(text.contains(&format!("▸ {row_label}")));
     }
@@ -585,52 +733,88 @@ mod tests {
         assert_eq!(form.handle_key(key(KeyCode::Enter)), expected);
     }
 
-    #[test_case(false ; "current_to_current")]
-    #[test_case(true ; "override_to_current")]
-    fn choosing_current_model_clears_override(staged: bool) {
+    #[test]
+    fn staged_identity_becoming_current_keeps_options() {
         let mut form = PlanForm::new();
-        form.on_plan_ready();
-        let height = form.height(WIDE, CURRENT_MODEL);
-        if staged {
-            form.set_implementation_model(OTHER_MODEL.into(), CURRENT_MODEL);
-            assert_eq!(form.height(WIDE, CURRENT_MODEL), height + 1);
-        }
-        form.set_implementation_model(CURRENT_MODEL.into(), CURRENT_MODEL);
-        assert_eq!(form.implementation_model(), None);
-        assert_eq!(form.height(WIDE, CURRENT_MODEL), height);
+        let options = [("thinking", "off"), ("fast", "false")];
+        form.set_implementation_selection(selection(Some(OTHER_MODEL), &options));
+        form.selected = USE_CURRENT_ROW;
+        form.clear_model_if_current(OTHER_MODEL);
+        assert_eq!(form.implementation_selection(), &selection(None, &options));
+        assert_eq!(form.selected, USE_CURRENT_ROW);
+    }
+
+    #[test_case(None ; "options_only")]
+    #[test_case(Some(OTHER_MODEL) ; "identity_and_options")]
+    fn plan_form_use_current_clears_all_overrides(spec: Option<&str>) {
+        let mut form = PlanForm::new();
+        form.parallel = true;
+        form.set_implementation_selection(selection(
+            spec,
+            &[("thinking", "off"), ("fast", "false")],
+        ));
+        form.use_current_model();
+        assert!(form.implementation_selection().is_empty());
+        assert!(form.parallel());
         assert_eq!(form.selected, MODEL_ROW);
         form.handle_key(key(KeyCode::Down));
         assert_eq!(form.selected, MODEL_ROW);
     }
 
     #[test]
-    fn staged_model_survives_planning_lifecycle_until_reset() {
+    fn staged_selection_survives_planning_lifecycle_until_reset() {
         let mut form = PlanForm::new();
-        form.set_implementation_model(OTHER_MODEL.into(), CURRENT_MODEL);
+        let selection = selection(Some(OTHER_MODEL), &[("thinking", "high"), ("fast", "true")]);
+        form.set_implementation_selection(selection.clone());
+        form.parallel = true;
         form.on_plan_ready();
         form.hide();
         form.toggle();
         form.on_plan_drafting();
         form.on_plan_ready();
-        assert_eq!(form.implementation_model(), Some(OTHER_MODEL));
+        assert_eq!(form.implementation_selection(), &selection);
         form.reset();
-        assert_eq!(form.implementation_model(), None);
+        assert!(form.implementation_selection().is_empty());
+        assert!(form.parallel());
     }
 
     #[test]
-    fn staged_model_matching_session_model_is_no_override() {
+    fn matching_identity_cleanup_clamps_reset_row() {
+        let mut form = PlanForm::new();
+        form.set_implementation_selection(selection(Some(OTHER_MODEL), &[]));
+        form.selected = USE_CURRENT_ROW;
+        form.clear_model_if_current(OTHER_MODEL);
+        assert!(form.implementation_selection().is_empty());
+        assert_eq!(form.selected, MODEL_ROW);
+    }
+
+    #[test_case(None ; "options_only")]
+    #[test_case(Some(OTHER_MODEL) ; "identity_and_options")]
+    fn renders_staged_selection(spec: Option<&str>) {
         let mut form = PlanForm::new();
         form.on_plan_ready();
-        let unstaged_height = form.height(WIDE, OTHER_MODEL);
-        form.set_implementation_model(OTHER_MODEL.into(), CURRENT_MODEL);
-        form.selected = USE_CURRENT_ROW;
-        let text = render(&form, WIDE, OTHER_MODEL);
-        assert!(text.contains(&format!("Implementation model: {OTHER_MODEL}  current")));
-        assert!(!text.contains("Use current model"));
-        assert_eq!(form.height(WIDE, OTHER_MODEL), unstaged_height);
-        form.clear_model_if_current(OTHER_MODEL);
-        assert_eq!(form.implementation_model(), None);
-        assert_eq!(form.selected, MODEL_ROW);
+        form.set_implementation_selection(selection(
+            spec,
+            &[("thinking", "off"), ("fast", "false")],
+        ));
+        let text = render(&form, WIDE);
+        assert!(text.contains(&format!(
+            "Implementation model: {}",
+            spec.unwrap_or(CURRENT_MODEL)
+        )));
+        assert!(text.contains("thinking=off fast=false  selected"));
+        assert!(text.contains(USE_CURRENT_LABEL));
+        assert!(text.contains(HINT_TAIL));
+    }
+
+    #[test]
+    fn unstaged_form_shows_current_model_only() {
+        let mut form = PlanForm::new();
+        form.on_plan_ready();
+        let text = render(&form, WIDE);
+        assert!(text.contains(&format!("Implementation model: {CURRENT_MODEL}  current")));
+        assert!(!text.contains("thinking="));
+        assert!(!text.contains(USE_CURRENT_LABEL));
     }
 
     #[test]

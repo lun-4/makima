@@ -27,6 +27,7 @@ use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::click::{ClickTarget, CompletionGrid, HitRegistry, PickerId, ScrollOwner, Surface};
 use crate::clipboard::ClipboardState;
 use crate::command_runtime::{CommandRuntime, PreparedCommandTarget};
+use crate::model_capabilities::ModelCapabilityCache;
 use maki_agent::HistorySnapshot;
 
 use crate::components::btw_modal::BtwModal;
@@ -70,10 +71,11 @@ use crossterm::event::{
 use maki_agent::actor::{EffectiveAgentConfig, TranscriptRequest};
 use maki_agent::agent::isolated_turn::IsolatedTurnRequest;
 use maki_agent::permissions::PermissionManager;
+use maki_agent::tools::ToolFilter;
 use maki_agent::{
-    ActorWorkKind, AgentEvent, AgentId, AgentInput, AgentMode, AgentRef, Envelope, ImageMediaType,
-    ImageSource, McpConfigErrors, McpPromptRef, McpSnapshotReader, Post, SharedBuf, SharedMessages,
-    SubagentInfo, TurnCompleteEvent,
+    ActorWorkKind, AgentConfig, AgentEvent, AgentId, AgentInput, AgentMode, AgentRef, Envelope,
+    ImageMediaType, ImageSource, McpConfigErrors, McpPromptRef, McpSnapshotReader, Post, SharedBuf,
+    SharedMessages, SubagentInfo, TurnCompleteEvent,
 };
 use maki_commands::{
     AgentTurn, BuiltinOperation, CommandAttachment, CommandContent, CommandError,
@@ -87,8 +89,10 @@ use maki_lua::{
     BuiltinAction, CompletionCtx, EventHandle, FloatConfig, HintReader, HintSnapshot, ItemSpec,
     KeymapReader, Split, StatusContentReader, StatusContentSnapshot, WinCommand, WinEvent, WinView,
 };
-use maki_providers::ThinkingConfig;
-use maki_providers::{ContentBlock, Message, Model, add_cost, format_tokens};
+use maki_providers::{
+    ContentBlock, Message, Model, ModelCapabilities, ModelSelection, ThinkingConfig, add_cost,
+    format_tokens,
+};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
@@ -129,6 +133,7 @@ const FLASH_CANCEL: &str = "Press esc again to stop...";
 const FLASH_REWIND: &str = "Press esc again to rewind...";
 const AUTH_EXPIRED_MSG: &str =
     "Token expired. Run `makima auth login` in another terminal, then press Enter to retry.";
+const FLASH_NO_AGENT_CHAT: &str = "Agent chat is unavailable";
 const FLASH_NO_PLAN: &str = "No plan file";
 const FLASH_NO_PLAN_BODY: &str = "Plan file is empty or unreadable";
 const PLAN_SUBMIT_TOOL: &str = "plan_submit";
@@ -270,6 +275,8 @@ pub(super) struct TaskEntry {
     finished: Option<bool>,
     chat_index: usize,
     identity: TaskIdentity,
+    parent_chat_index: Option<usize>,
+    depth: usize,
     /// First `SNIPPET_CHARS` of the subagent chat's last message, shown dimly.
     snippet: String,
     context: String,
@@ -279,6 +286,9 @@ pub(super) struct TaskEntry {
 impl PickerItem for TaskEntry {
     fn label(&self) -> &str {
         &self.name
+    }
+    fn depth(&self) -> usize {
+        self.depth
     }
     fn detail(&self) -> Option<&str> {
         matches!(self.finished, Some(true)).then_some(TASK_DONE_DETAIL)
@@ -366,7 +376,7 @@ pub(crate) struct InputDemand {
     perm: Option<PermissionPayload>,
 }
 
-#[derive(Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum ModelPickerPurpose {
     #[default]
     Session,
@@ -463,6 +473,7 @@ pub struct App {
     pub(crate) coordinator: Option<maki_agent::session_coordinator::SessionCoordinatorHandle>,
     pub(crate) model_policy: Arc<ModelPolicy>,
     pub(crate) lua_event_handle: EventHandle,
+    tool_filter: ToolFilter,
     pub(super) keymap_reader: KeymapReader,
     pub(super) hint_reader: HintReader,
     hints: Watch<HintSnapshot>,
@@ -552,6 +563,7 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare(
         config: EffectiveAgentConfig,
+        agent_config: &AgentConfig,
         session: AppSession,
         storage: StateDir,
         available_models: Arc<ArcSwapOption<Vec<String>>>,
@@ -568,6 +580,7 @@ impl App {
         model_policy: Arc<ModelPolicy>,
         theme_provider: Arc<dyn ThemesProvider>,
         command_runtime: Arc<CommandRuntime>,
+        model_capabilities: Arc<ModelCapabilityCache>,
     ) -> PreparedApp {
         let mut state = SessionState::from_session(session, &config.model, &model_policy);
         state.adopt(&config);
@@ -608,7 +621,7 @@ impl App {
             task_picker_original: None,
             lua_picker: LuaPicker::new(lua_event_handle.clone()),
             theme_picker: ThemePicker::new(Arc::clone(&theme_provider)),
-            model_picker: ModelPicker::new(Arc::clone(&model_picker_models)),
+            model_picker: ModelPicker::new(Arc::clone(&model_picker_models), model_capabilities),
             model_picker_purpose: ModelPickerPurpose::Session,
             model_picker_target: None,
             plan_approval_pending: false,
@@ -629,6 +642,7 @@ impl App {
             menu: Menu::default(),
             status: Status::Idle,
             state,
+            tool_filter: ToolFilter::from_config(agent_config, &config.model, &[]),
             seed_config: Arc::new(config),
             exit_request: ExitRequest::None,
             exit_on_done: false,
@@ -728,6 +742,7 @@ impl App {
                 );
         Self::prepare(
             config,
+            &AgentConfig::default(),
             session,
             storage,
             available_models,
@@ -744,6 +759,7 @@ impl App {
             model_policy,
             theme_provider,
             command_runtime,
+            ModelCapabilityCache::new(|_| ModelCapabilities::NONE, || {}),
         )
         .activate()
     }
@@ -873,6 +889,9 @@ impl App {
         if target == self.plan_form_target {
             return;
         }
+        if self.model_picker_purpose == ModelPickerPurpose::PlanImplementation {
+            self.close_model_picker();
+        }
         let (form, pending) = self
             .plan_forms
             .remove(&target)
@@ -882,6 +901,77 @@ impl App {
         self.plan_forms
             .insert(self.plan_form_target, (previous, previous_pending));
         self.plan_form_target = target;
+    }
+
+    /// Brings the focused plan form forward, and retires its staging once
+    /// the focused agent's plan is gone or replaced.
+    pub(crate) fn sync_focused_plan_form(&mut self) {
+        self.sync_plan_form_target();
+        let path = if self.is_main_chat() {
+            self.focused_plan_path()
+        } else if let Some(config) = self.focused_config() {
+            config.mode.plan_path().map(Path::to_path_buf)
+        } else {
+            return;
+        };
+        self.sync_plan_form_path(self.plan_form_target, path.as_deref());
+        if path.is_none() && self.plan_picker_edits(self.plan_form_target) {
+            self.close_model_picker();
+            self.pending_dirty |= Dirty::YES;
+        }
+    }
+
+    /// Retires the staging of saved child plan forms whose plans are gone.
+    pub(crate) fn sync_child_plan_paths(
+        &mut self,
+        mut path_for: impl FnMut(AgentId) -> Option<PathBuf>,
+    ) {
+        let targets = self
+            .plan_forms
+            .keys()
+            .copied()
+            .flatten()
+            .chain(self.plan_form_target)
+            .collect::<Vec<_>>();
+        for target in targets {
+            self.sync_plan_form_path(Some(target), path_for(target).as_deref());
+        }
+    }
+
+    /// A form staged for one plan never carries over to the next, and a
+    /// picker editing it closes with it.
+    pub(super) fn sync_plan_form_path(&mut self, key: Option<AgentId>, path: Option<&Path>) {
+        let Some((form, pending)) = self.plan_form_entry(key) else {
+            return;
+        };
+        if !form.sync_plan_path(path) {
+            return;
+        }
+        *pending = false;
+        if self.plan_picker_edits(key) {
+            self.close_model_picker();
+        }
+        self.pending_dirty |= Dirty::YES;
+    }
+
+    /// The plan form for `key` (`None` is the root) and its approval-pending
+    /// flag, whether it is the focused form or a saved one.
+    pub(super) fn plan_form_entry(
+        &mut self,
+        key: Option<AgentId>,
+    ) -> Option<(&mut PlanForm, &mut bool)> {
+        if self.plan_form_target == key {
+            Some((&mut self.plan_form, &mut self.plan_approval_pending))
+        } else {
+            self.plan_forms
+                .get_mut(&key)
+                .map(|(form, pending)| (form, pending))
+        }
+    }
+
+    pub(super) fn plan_picker_edits(&self, key: Option<AgentId>) -> bool {
+        self.model_picker_purpose == ModelPickerPurpose::PlanImplementation
+            && self.plan_form_target == key
     }
 
     fn plan_form_active(&self) -> bool {
@@ -984,7 +1074,7 @@ impl App {
     }
 
     pub(crate) fn sync_focused_queue(&mut self) {
-        self.sync_plan_form_target();
+        self.sync_focused_plan_form();
         let id = self.selected_agent_id();
         let actor = self
             .command_runtime
@@ -1170,10 +1260,7 @@ impl App {
             }
             ClickTarget::KeyHint(key) => match self.hits.surface_at(pos) {
                 Some(Surface::Picker(picker)) => self.handle_picker_key(picker, key),
-                Some(Surface::Plan) => {
-                    let action = self.plan_form.handle_key(key);
-                    self.handle_plan_form_action(action)
-                }
+                Some(Surface::Plan) => self.handle_key(key),
                 _ => vec![],
             },
             ClickTarget::PermissionChip => {
@@ -1202,7 +1289,15 @@ impl App {
                 self.toggle_thinking_menu();
                 vec![]
             }
-            ClickTarget::ModelChip => self.run_builtin(BuiltinAction::ModelPicker),
+            ClickTarget::ModelChip => {
+                if self.plan_approval_pending {
+                    vec![]
+                } else if self.plan_form_active() {
+                    self.handle_plan_form_action(PlanFormAction::OpenModelPicker)
+                } else {
+                    self.run_builtin(BuiltinAction::ModelPicker)
+                }
+            }
             ClickTarget::AgentChip | ClickTarget::TasksHint => {
                 self.run_builtin(BuiltinAction::Tasks)
             }
@@ -1246,7 +1341,7 @@ impl App {
                 }
             }
             ClickTarget::PlanRow(row) => {
-                if self.plan_form.select_row(row as usize) {
+                if !self.plan_approval_pending && self.plan_form.select_row(row as usize) {
                     self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
                 } else {
                     vec![]
@@ -1556,6 +1651,12 @@ impl App {
                 } else {
                     TaskIdentity::Unidentified(chat_index)
                 },
+                parent_chat_index: chat.parent_agent_id.and_then(|parent_id| {
+                    self.chats
+                        .iter()
+                        .position(|parent| parent.agent_id == Some(parent_id))
+                }),
+                depth: 0,
                 snippet: if chat_index == 0 {
                     String::new()
                 } else {
@@ -1574,7 +1675,38 @@ impl App {
                 .cmp(&b.is_finished())
                 .then_with(|| b.started_at.cmp(&a.started_at))
         });
-        entries
+        Self::order_task_hierarchy(entries)
+    }
+
+    fn order_task_hierarchy(mut entries: Vec<TaskEntry>) -> Vec<TaskEntry> {
+        fn append_subtree(
+            mut entry: TaskEntry,
+            depth: usize,
+            remaining: &mut Vec<TaskEntry>,
+            ordered: &mut Vec<TaskEntry>,
+        ) {
+            entry.depth = depth;
+            let parent = entry.chat_index;
+            ordered.push(entry);
+            while let Some(index) = remaining
+                .iter()
+                .position(|entry| entry.parent_chat_index == Some(parent))
+            {
+                let child = remaining.remove(index);
+                append_subtree(child, depth + 1, remaining, ordered);
+            }
+        }
+
+        let mut ordered = Vec::with_capacity(entries.len());
+        while !entries.is_empty() {
+            let index = entries
+                .iter()
+                .position(|entry| entry.parent_chat_index.is_none())
+                .unwrap_or(0);
+            let root = entries.remove(index);
+            append_subtree(root, 0, &mut entries, &mut ordered);
+        }
+        ordered
     }
 
     fn open_tasks(&mut self) {
@@ -1620,7 +1752,7 @@ impl App {
             }
         }
         ordered.extend(current);
-        ordered
+        Self::order_task_hierarchy(ordered)
     }
 
     fn sync_command_arguments(&mut self, input: &str, cursor: usize) {
@@ -1859,7 +1991,11 @@ impl App {
             .ok_or(CommandError::StaleTarget)?;
         self.model_picker_purpose = ModelPickerPurpose::Session;
         self.model_picker_target = Some(target);
-        self.model_picker.open(&config.model.spec());
+        self.model_picker.open(
+            config.model_selection(),
+            ModelCapabilities::from(&config.model),
+            &ModelSelection::default(),
+        );
         Ok(())
     }
 
@@ -1880,17 +2016,20 @@ impl App {
             self.flash(CommandError::StaleTarget.to_string());
             return;
         }
-        self.model_picker_target = None;
-        let spec = match purpose {
-            ModelPickerPurpose::PlanImplementation => self
-                .plan_form
-                .implementation_model()
-                .map(str::to_owned)
-                .unwrap_or_else(|| self.focused_model_spec()),
-            ModelPickerPurpose::Session => self.focused_model_spec(),
+        let config = self.focused_config().unwrap_or_else(|| self.root_config());
+        let draft = match purpose {
+            ModelPickerPurpose::PlanImplementation => {
+                self.plan_form.implementation_selection().clone()
+            }
+            ModelPickerPurpose::Session => ModelSelection::default(),
         };
+        self.model_picker_target = None;
         self.model_picker_purpose = purpose;
-        self.model_picker.open(&spec);
+        self.model_picker.open(
+            config.model_selection(),
+            ModelCapabilities::from(&config.model),
+            &draft,
+        );
     }
 
     /// Closes the picker and retires its purpose together, so the open state
@@ -1904,16 +2043,17 @@ impl App {
     fn handle_model_picker_key(&mut self, key: KeyEvent) -> Vec<Action> {
         match self.model_picker.handle_key(key) {
             ModelPickerAction::Consumed => vec![],
-            ModelPickerAction::Select(spec) => {
-                let purpose = std::mem::take(&mut self.model_picker_purpose);
+            ModelPickerAction::Select(selection) => {
+                let purpose = self.model_picker_purpose;
+                let target = self.model_picker_target.clone();
+                self.close_model_picker();
                 if purpose == ModelPickerPurpose::PlanImplementation {
-                    let model = self.focused_model_spec();
-                    self.plan_form.set_implementation_model(spec, &model);
+                    self.plan_form.set_implementation_selection(selection);
                     vec![]
-                } else if let Some(target) = self.model_picker_target.take() {
-                    vec![Action::ChangePinnedModel { target, spec }]
+                } else if let Some(target) = target {
+                    vec![Action::SelectPinnedModel { target, selection }]
                 } else {
-                    vec![Action::ChangeModel(spec)]
+                    vec![Action::SelectModel(selection)]
                 }
             }
             ModelPickerAction::AssignTier(spec, tier) => vec![Action::AssignTier(spec, tier)],
@@ -1933,8 +2073,6 @@ impl App {
         }
     }
 
-    /// True when `plan_submit` is in the active mode's toolset (set by
-    /// `mode_plan_override`), flipping the plan auto-hooks on/off.
     fn plan_submit_active(&self) -> bool {
         if self.focused_plan_path().is_none() {
             return false;
@@ -1948,7 +2086,9 @@ impl App {
             });
         def.tools
             .as_deref()
-            .is_some_and(|tools| tools.iter().any(|t| t.as_str() == PLAN_SUBMIT_TOOL))
+            .is_none_or(|tools| tools.iter().any(|t| t.as_str() == PLAN_SUBMIT_TOOL))
+            && self.tool_filter.matches(PLAN_SUBMIT_TOOL)
+            && self.lua_event_handle.has_native_tool(PLAN_SUBMIT_TOOL)
     }
 
     fn submit_plan(&mut self) -> Vec<Action> {
@@ -2594,6 +2734,15 @@ impl App {
                 return vec![];
             }
             if matches!(&envelope.event, AgentEvent::SubagentClosed) {
+                self.finish_child_plan_approval(subagent.agent_id);
+                if self.plan_picker_edits(Some(subagent.agent_id))
+                    || self
+                        .model_picker_target
+                        .as_ref()
+                        .is_some_and(|target| target.id() == subagent.agent_id)
+                {
+                    self.close_model_picker();
+                }
                 self.terminal_subagents.insert(subagent.agent_id);
                 if let Some(channels) = self.subagent_channels.get_mut(&subagent.agent_id) {
                     channels.closed = true;
@@ -2937,7 +3086,7 @@ impl App {
             ),
             None => (0, None),
         };
-        self.chats[chat_idx].push_post(&post.text, post.level);
+        self.chats[chat_idx].push_post(&post);
         let session = &self.state.session;
         let after_message = committed_messages.unwrap_or_else(|| match &chat {
             Some(id) => session
@@ -2983,6 +3132,7 @@ impl App {
         chat.opts = subagent.opts;
         chat.subagent_id = Some(id.clone());
         chat.agent_id = Some(subagent.agent_id);
+        chat.parent_agent_id = subagent.parent_agent_id;
         chat.set_started_at_now();
         if let Some(ref prompt) = subagent.prompt {
             chat.push_user_message(prompt);
@@ -3908,24 +4058,42 @@ impl App {
         self.plan_approval_pending = true;
         vec![Action::ApprovePlan {
             clear_context,
-            model: self.plan_form.implementation_model().map(str::to_owned),
+            selection: self.plan_form.implementation_selection().clone(),
             parallel: self.plan_form.parallel(),
             path,
         }]
     }
 
-    pub(crate) fn plan_approval_matches(&self, model: Option<&str>, parallel: bool) -> bool {
-        self.plan_approval_pending
-            && self.focused_plan_path().is_some()
-            && self.plan_form.implementation_model() == model
-            && self.plan_form.parallel() == parallel
+    fn plan_form_key(&self, target: AgentId) -> Option<AgentId> {
+        (self.chats.first().and_then(|chat| chat.agent_id) != Some(target)).then_some(target)
     }
 
-    pub(crate) fn finish_child_plan_approval(&mut self, target: maki_agent::AgentId) {
-        if self.plan_form_target == Some(target) {
-            self.plan_approval_pending = false;
-            self.plan_form.reset();
-        } else if let Some((form, pending)) = self.plan_forms.get_mut(&Some(target)) {
+    pub(crate) fn plan_approval_matches(
+        &self,
+        target: AgentId,
+        selection: &ModelSelection,
+        parallel: bool,
+    ) -> bool {
+        let key = self.plan_form_key(target);
+        let (form, pending) = if self.plan_form_target == key {
+            (&self.plan_form, self.plan_approval_pending)
+        } else {
+            match self.plan_forms.get(&key) {
+                Some((form, pending)) => (form, *pending),
+                None => return false,
+            }
+        };
+        pending && form.implementation_selection() == selection && form.parallel() == parallel
+    }
+
+    pub(crate) fn clear_plan_approval_pending(&mut self, target: AgentId) {
+        if let Some((_, pending)) = self.plan_form_entry(self.plan_form_key(target)) {
+            *pending = false;
+        }
+    }
+
+    pub(crate) fn finish_child_plan_approval(&mut self, target: AgentId) {
+        if let Some((form, pending)) = self.plan_form_entry(self.plan_form_key(target)) {
             form.reset();
             *pending = false;
         }
@@ -3938,8 +4106,6 @@ impl App {
         path: String,
         prompt: String,
     ) {
-        self.plan_approval_pending = false;
-        self.plan_form.reset();
         self.state.plan = PlanState::None;
         self.main_chat().push(DisplayMessage::plan(content, path));
         self.main_chat().show_user_message(prompt, vec![]);

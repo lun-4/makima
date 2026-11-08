@@ -1,11 +1,6 @@
-//! Verifies the plan-mode directive and plan-reviewer prompt are verbatim
-//! clones of pi-luna's polytoken ports, differing only where makima's tool names
-//! or mechanics require a substitution (AC.1, AC.2, AC.3).
-//!
-//! These run on the real plugin sources so a byte-level edit to any of the
-//! three files is caught here, not just at runtime.
-
-use maki_lua::test_support::run_command;
+use maki_agent::{ModeId, tools::ToolRegistry};
+use maki_lua::{PluginHost, test_support::run_command};
+use std::{path::Path, sync::Arc};
 use test_case::test_case;
 
 const MODE_OVERRIDE_SRC: &str = include_str!("../../plugins/mode_plan_override/init.lua");
@@ -53,7 +48,7 @@ fn must_absent(src: &str, needle: &str, what: &str) {
 }
 
 #[test]
-fn directive_is_verbatim_clone() {
+fn directive_preserves_planning_workflow() {
     for s in PI_TOOL_STRINGS {
         must_absent(MODE_OVERRIDE_SRC, s, "plan-mode directive");
     }
@@ -80,29 +75,29 @@ fn directive_is_verbatim_clone() {
 }
 
 #[test]
-fn plan_toolset_includes_webfetch() {
-    for tool in [
-        "read",
-        "grep",
-        "glob",
-        "webfetch",
-        "write",
-        "edit",
-        "plan_submit",
-        "task_spawn",
-        "task_wait",
-        "task_send",
-        "task_despawn",
-    ] {
-        must_contain(MODE_OVERRIDE_SRC, &format!("\"{tool}\""), "plan toolset");
-    }
-    // A phrase unique to the directive sentence (the header comment also
-    // mentions webfetch, so the backticked name alone would not pin it).
-    must_contain(
-        MODE_OVERRIDE_SRC,
-        "fetching a page is a read",
-        "plan-mode directive",
+fn plan_mode_inherits_tools_and_keeps_write_restriction() {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source(MODE_OVERRIDE_PLUGIN, MODE_OVERRIDE_SRC)
+        .unwrap();
+    let mode = host.mode_registry().get(&ModeId::Plan).unwrap();
+    assert!(mode.tools.is_none());
+    assert_eq!(
+        mode.restrict_write_to.as_deref(),
+        Some(Path::new("plan.md"))
     );
+    let prompt = mode.system_prompt.unwrap();
+    for required in [
+        "Command execution through `bash`, `code_execution`",
+        "allowed for read-only investigation",
+        "MCP tools may also be used for read-only investigation",
+        "normal permission flow",
+        "Tool availability or permission approval does not authorize side effects",
+        "ask the user for confirmation with `question`",
+        "Everything above applies to delegated work too",
+    ] {
+        assert!(prompt.contains(required), "missing instruction: {required}");
+    }
+    assert!(!prompt.contains("There is no shell in plan mode"));
 }
 
 #[test]
@@ -166,9 +161,7 @@ fn plan_spec_is_single_shared_source() {
 #[test_case("/plan" ; "plan")]
 #[test_case("/build" ; "build")]
 fn mode_command_failure_reaches_the_caller(command: &str) {
-    let host =
-        maki_lua::PluginHost::new(std::sync::Arc::new(maki_agent::tools::ToolRegistry::new()))
-            .unwrap();
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
     host.load_source(MODE_OVERRIDE_PLUGIN, MODE_OVERRIDE_SRC)
         .unwrap();
     let result = run_command(&host.command_registry(), command, 0, None)

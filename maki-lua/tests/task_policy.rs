@@ -7,12 +7,19 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use maki_agent::tools::test_support::stub_ctx;
+use maki_agent::cancel::CancelToken;
+use maki_agent::tools::test_support::{stub_ctx, stub_ctx_with};
 use maki_agent::tools::{
     DescriptionContext, ToolAudience, ToolContext, ToolFilter, ToolRegistry, TurnToolBindings,
 };
-use maki_agent::{AgentLimits, AgentMode, ModeDef, ModeId, ToolOutput};
-use maki_lua::{PluginHost, agent_errors::OUTPUT_SCHEMA_NOT_OBJECT};
+use maki_agent::{
+    AgentEvent, AgentLimits, AgentMode, BufferSnapshot, Envelope, EventSender, ModeDef, ModeId,
+    SpanStyle, ToolOutput,
+};
+use maki_lua::{
+    PluginHost, RestoreItem,
+    agent_errors::{INVOCATION_EXPIRED, OUTPUT_SCHEMA_NOT_OBJECT},
+};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
     AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
@@ -60,6 +67,20 @@ const TURN_UNAVAILABLE_ERR: &str = "turn_result_unavailable";
 const TICKET_LIMIT_BUSY_ERR: &str = "stub admission busy";
 const SCENARIO_UNRESOLVED: &str = "unresolved";
 const JOIN_PENDING_MESSAGE: &str = "join pending";
+const WAIT_TOOL_USE_ID: &str = "task_wait_presentation";
+const UNKNOWN_TASK_ID: &str = "missing-task-id";
+const UNAVAILABLE_TURN_ID: &str = "missing-turn";
+const WAIT_PENDING: &str = "Waiting for the subagent…";
+const WAIT_COMPLETED: &str = "Completed";
+const WAIT_CANCELLED: &str = "Subagent cancelled: cancelled";
+const WAIT_RUNNING: &str =
+    "Still running when checked. The wait timed out; the task was not cancelled.";
+const WAIT_UNAVAILABLE: &str =
+    "Cannot retrieve this turn: its result is no longer retained. (turn_result_unavailable)";
+const WAIT_UNKNOWN: &str =
+    "Cannot retrieve this task: it is no longer available. (unknown task_id)";
+const WAIT_CANCELLED_PENDING: &str = "Wait failed: cancelled";
+const WAIT_DETAILS: &str = "Details (click to expand)";
 
 const NESTED_CHILD_PROMPT: &str = "child prompt";
 const NESTED_CHILD_REPLY: &str = "child finished";
@@ -75,6 +96,18 @@ const SCENARIO_RAISE: &str = "raise";
 /// `maki.async` stays real; structured-output validation uses the real-driver tests.
 const STUB_PRELUDE: &str = r#"
 recorder = { prompts = {}, closed = 0, sessions = 0 }
+local register_tool = maki.api.register_tool
+maki.api.register_tool = function(spec)
+  if spec.name == "task_wait" then
+    local handler = spec.handler
+    spec.handler = function(input, ctx)
+      local reply = handler(input, ctx)
+      recorder.wait_state = reply.state
+      return reply
+    end
+  end
+  return register_tool(spec)
+end
 
 maki.agent.resolve_model = function(ctx, opts)
   recorder.resolve_opts = opts
@@ -265,6 +298,7 @@ maki.api.register_tool({
       prompt_count = #recorder.prompts,
       has_local_tools = recorder.has_local_tools,
       output_schema = recorder.output_schema,
+      wait_state = recorder.wait_state,
     }
     if recorder.resolve_opts then
       snap.resolve_opts = recorder.resolve_opts
@@ -582,6 +616,138 @@ fn managed_general_child_can_access_all_nested_lifecycle_tools() {
             "general child cannot invoke {name}"
         );
     }
+}
+
+fn wait_snapshots(rx: &flume::Receiver<Envelope>) -> (BufferSnapshot, BufferSnapshot) {
+    let mut body = None;
+    let mut header = None;
+    for env in rx.drain() {
+        match env.event {
+            AgentEvent::ToolSnapshot { id, snapshot, .. } => {
+                assert_eq!(id, WAIT_TOOL_USE_ID);
+                body = Some(snapshot);
+            }
+            AgentEvent::ToolHeaderSnapshot { id, snapshot, .. } => {
+                assert_eq!(id, WAIT_TOOL_USE_ID);
+                header = Some(snapshot);
+            }
+            _ => {}
+        }
+    }
+    (body.expect("wait body"), header.expect("wait header"))
+}
+
+#[test_case::test_case(SCENARIO_PLAIN, None, WAIT_COMPLETED, Some(PLAIN_TEXT) ; "plain")]
+#[test_case::test_case(SCENARIO_PARTIAL_ERROR, None, WAIT_CANCELLED, Some(PARTIAL_TEXT) ; "cancelled")]
+#[test_case::test_case(SCENARIO_UNRESOLVED, None, WAIT_RUNNING, None ; "timeout")]
+#[test_case::test_case(SCENARIO_PLAIN, Some(TURN_UNAVAILABLE_ERR), WAIT_UNAVAILABLE, None ; "unavailable_turn")]
+#[test_case::test_case(UNKNOWN_TASK_ID, Some(UNKNOWN_TASK_ERR), WAIT_UNKNOWN, None ; "unknown_task")]
+fn task_wait_presentation_matches_standalone_restore(
+    scenario: &str,
+    error: Option<&str>,
+    status: &str,
+    report: Option<&str>,
+) {
+    let (reg, host) = load_task_host();
+    let mut input = if scenario == UNKNOWN_TASK_ID {
+        json!({ "task_id": UNKNOWN_TASK_ID })
+    } else {
+        let spawned = exec_tool_json(&reg, TASK_SPAWN_TOOL, task_input(scenario, None));
+        json!({ "task_id": spawned["task_id"], "turn_id": spawned["turn_id"] })
+    };
+    if error == Some(TURN_UNAVAILABLE_ERR) {
+        input["turn_id"] = json!(UNAVAILABLE_TURN_ID);
+    }
+    if scenario == SCENARIO_UNRESOLVED {
+        input["timeout"] = json!(0);
+    }
+    let (tx, rx) = flume::unbounded();
+    let event_tx = EventSender::new(tx);
+    let ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(WAIT_TOOL_USE_ID));
+    let invocation = reg.get(TASK_WAIT_TOOL).unwrap().tool.parse(&input).unwrap();
+    let start_header = smol::block_on(invocation.start_header()).text();
+    let result = smol::block_on(invocation.execute(&ctx));
+    host.load_source("barrier", "").unwrap();
+    let live = wait_snapshots(&rx);
+    let state = probe(&reg).get("wait_state").cloned();
+    let expected_state = (scenario != UNKNOWN_TASK_ID).then(|| json!({ "description": scenario }));
+    assert_eq!(state, expected_state);
+    let output = match error {
+        Some(error) => {
+            assert_eq!(result.output.unwrap_err(), error);
+            error.to_owned()
+        }
+        None => {
+            let ToolOutput::Plain(output) = result.output.unwrap() else {
+                panic!("expected plain task_wait output");
+            };
+            assert_eq!(output.state, expected_state);
+            let expected = if scenario == SCENARIO_UNRESOLVED {
+                json!({ "status": "running" })
+            } else {
+                let mut result = json!({
+                    "text": report.unwrap(),
+                    "turn_id": input["turn_id"],
+                    "status": "completed",
+                    "error": false,
+                });
+                let mut expected = json!({ "status": "done", "error": false });
+                if scenario == SCENARIO_PARTIAL_ERROR {
+                    result["status"] = json!("cancelled");
+                    result["error"] = json!(CANCELLED_ERR);
+                    expected["error"] = json!(CANCELLED_ERR);
+                }
+                expected["result"] = result;
+                expected
+            };
+            assert_eq!(
+                serde_json::from_str::<Value>(&output.text).unwrap(),
+                expected
+            );
+            output.text
+        }
+    };
+    let expected_body = match report {
+        Some(report) => format!("{status}\n\n{report}\n{WAIT_DETAILS}"),
+        None => format!("{status}\n{WAIT_DETAILS}"),
+    };
+    assert_eq!(live.0.text(), expected_body);
+    assert_eq!(
+        live.0.lines[0].spans[0].style,
+        SpanStyle::Named(if error.is_some() || scenario == SCENARIO_PARTIAL_ERROR {
+            "error".to_owned()
+        } else {
+            "dim".to_owned()
+        })
+    );
+    let expected_header = if scenario == UNKNOWN_TASK_ID {
+        &UNKNOWN_TASK_ID[UNKNOWN_TASK_ID.len() - 8..]
+    } else {
+        scenario
+    };
+    assert_eq!(start_header, expected_header);
+    assert_eq!(live.1.text(), expected_header);
+
+    let (_restore_reg, restore_host) = load_task_host();
+    let handle = restore_host.event_handle();
+    let (tx, rx) = flume::unbounded();
+    handle.request_restore(
+        RestoreItem {
+            tool: Arc::from(TASK_WAIT_TOOL),
+            tool_use_id: WAIT_TOOL_USE_ID.to_owned(),
+            input,
+            output,
+            is_error: error.is_some(),
+            tool_output_lines: ctx.tool_output_lines,
+            theme_gen: None,
+            clicks: Vec::new(),
+            state,
+        },
+        EventSender::new(tx),
+    );
+    handle.wait_restore_complete_for_test();
+    restore_host.load_source("barrier", "").unwrap();
+    assert_eq!(wait_snapshots(&rx), live);
 }
 
 #[test]
@@ -1352,9 +1518,10 @@ fn timed_out_task_wait_reports_running_and_preserves_child(timeout: u64) {
     });
 }
 
-#[test_case::test_case(false ; "snapshots_latest_once")]
-#[test_case::test_case(true ; "explicit_exact_ticket")]
-fn task_wait_same_turn_includes_later_send(explicit_turn: bool) {
+#[test_case::test_case(false, false ; "snapshots_latest_once")]
+#[test_case::test_case(true, false ; "explicit_exact_ticket")]
+#[test_case::test_case(true, true ; "cancelled_wait_preserves_child")]
+fn task_wait_same_turn_includes_later_send(explicit_turn: bool, cancel_wait: bool) {
     smol::block_on(async {
         let (started_tx, started_rx) = flume::unbounded();
         let (release_tx, release_rx) = flume::unbounded();
@@ -1363,7 +1530,7 @@ fn task_wait_same_turn_includes_later_send(explicit_turn: bool) {
             release_rx,
         });
         let (ctx, _rx, _trigger) = common::ctx_with_provider(provider);
-        let (reg, _host, ctx) = load_real_driver_host(&ctx);
+        let (reg, host, ctx) = load_real_driver_host(&ctx);
         let first = exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("first", None));
         let task_id = first["task_id"].as_str().unwrap();
         assert!(first["turn_id"].is_string());
@@ -1383,7 +1550,16 @@ fn task_wait_same_turn_includes_later_send(explicit_turn: bool) {
             .tool
             .parse(&wait_input)
             .unwrap();
-        let wait_ctx = common::with_request_tools(&reg, &ctx);
+        assert_eq!(
+            invocation.start_header().await.text(),
+            &task_id[task_id.len() - 8..]
+        );
+        let mut wait_ctx = common::with_request_tools(&reg, &ctx);
+        let (wait_trigger, wait_cancel) = CancelToken::new();
+        wait_ctx.cancel = wait_cancel;
+        let (wait_tx, wait_rx) = flume::unbounded();
+        wait_ctx.event_tx = EventSender::new(wait_tx);
+        wait_ctx.tool_use_id = Some(WAIT_TOOL_USE_ID.to_owned());
         let wait = invocation.execute(&wait_ctx);
         futures_lite::pin!(wait);
         assert!(futures_lite::future::poll_once(&mut wait).await.is_none());
@@ -1393,6 +1569,53 @@ fn task_wait_same_turn_includes_later_send(explicit_turn: bool) {
             }
         })
         .await;
+        let pending = common::bounded(async {
+            loop {
+                if let AgentEvent::LiveToolBuf { id, body } =
+                    wait_rx.recv_async().await.unwrap().event
+                {
+                    assert_eq!(id, WAIT_TOOL_USE_ID);
+                    break body;
+                }
+            }
+        })
+        .await;
+        let snapshot = pending.take();
+        assert_eq!(snapshot.text(), format!("first\n{WAIT_PENDING}"));
+        assert_eq!(snapshot.lines.len(), 2);
+        for line in snapshot.lines.iter() {
+            assert_eq!(line.spans.len(), 1);
+            assert_eq!(line.spans[0].style, SpanStyle::Named("dim".to_owned()));
+        }
+        assert!(futures_lite::future::poll_once(&mut wait).await.is_none());
+        if cancel_wait {
+            wait_trigger.cancel();
+            common::bounded(async {
+                while pending.take().text() != WAIT_CANCELLED_PENDING {
+                    smol::future::yield_now().await;
+                }
+            })
+            .await;
+            let snapshot = pending.take();
+            assert_eq!(snapshot.text(), WAIT_CANCELLED_PENDING);
+            assert_eq!(snapshot.lines.len(), 1);
+            assert_eq!(snapshot.lines[0].spans.len(), 1);
+            assert_eq!(
+                snapshot.lines[0].spans[0].style,
+                SpanStyle::Named("error".to_owned())
+            );
+            release_tx.send(()).unwrap();
+            assert_eq!(
+                common::bounded(wait).await.output.unwrap_err(),
+                INVOCATION_EXPIRED
+            );
+            host.load_source("barrier", "").unwrap();
+            let completed = exec_tool_json_with_ctx(&reg, &ctx, TASK_WAIT_TOOL, wait_input);
+            assert_eq!(completed["result"]["status"], "completed");
+            assert_eq!(completed["result"]["turn_id"], first["turn_id"]);
+            exec_tool_json_with_ctx(&reg, &ctx, TASK_DESPAWN_TOOL, json!({ "task_id": task_id }));
+            return;
+        }
 
         let second = exec_tool_json_with_ctx(
             &reg,

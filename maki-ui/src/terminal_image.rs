@@ -25,6 +25,9 @@ use ratatui_image::{
 
 use crate::image::{MAX_IMAGE_BYTES, MAX_IMAGE_PIXELS};
 use crate::repaint::Dirty;
+use crate::terminal_da;
+#[cfg(any(unix, test))]
+use crate::terminal_da::Da1Feature;
 
 const MAX_IMAGE_ROWS: u16 = 20;
 const FALLBACK_FONT_SIZE: FontSize = FontSize::new(10, 20);
@@ -38,6 +41,8 @@ const PROBE_POLL_SLICE: Duration = Duration::from_millis(50);
 const PROBE_QUIET: Duration = Duration::from_millis(20);
 #[cfg(unix)]
 const PROBE_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
+#[cfg(unix)]
+const MAX_PROBE_BYTES: usize = 64 * 1024;
 #[cfg(unix)]
 const PROBE_KITTY_DIRECT: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
 #[cfg(unix)]
@@ -146,25 +151,6 @@ fn is_tmux_detected(buffer: &[u8], env_tmux: bool) -> bool {
 }
 
 #[cfg(any(unix, test))]
-fn has_sixel_da1(buffer: &[u8]) -> (bool, bool) {
-    let mut i = 0;
-    while i < buffer.len() {
-        if buffer[i..].starts_with(b"\x1b[?") {
-            let start = i + 3;
-            if let Some(end_rel) = buffer[start..].iter().position(|&b| b == b'c') {
-                let params = &buffer[start..start + end_rel];
-                let is_sixel = params.split(|&b| b == b';').any(|part| part == b"4");
-                let rest = &buffer[start + end_rel + 1..];
-                let has_sentinel = contains_subslice(rest, DSR_RESPONSE);
-                return (is_sixel, has_sentinel);
-            }
-        }
-        i += 1;
-    }
-    (false, false)
-}
-
-#[cfg(any(unix, test))]
 pub(crate) fn parse_probe_stream(buffer: &[u8], env_tmux: bool) -> ProbeResult {
     let in_tmux = is_tmux_detected(buffer, env_tmux);
 
@@ -195,9 +181,11 @@ pub(crate) fn parse_probe_stream(buffer: &[u8], env_tmux: bool) -> ProbeResult {
         };
     }
 
-    let (is_sixel, sixel_sentinel) = has_sixel_da1(buffer);
+    let sixel_sentinel = Da1Feature::Sixel
+        .response_tail(buffer)
+        .is_some_and(|tail| contains_subslice(tail, DSR_RESPONSE));
     let dsr_count = count_subslice(buffer, DSR_RESPONSE);
-    if is_sixel && sixel_sentinel && (!in_tmux || dsr_count >= 2) {
+    if sixel_sentinel && (!in_tmux || dsr_count >= 2) {
         return ProbeResult::Detected(DetectedGraphics {
             protocol: ProtocolType::Sixel,
             is_tmux: in_tmux,
@@ -232,7 +220,7 @@ fn write_probe(bytes: &[u8]) -> Option<()> {
 }
 
 #[cfg(unix)]
-fn drain_stdin(fd: RawFd, deadline: Instant) {
+fn drain_stdin(fd: RawFd, deadline: Instant, buffer: &mut Vec<u8>) {
     while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
         if !wait_readable(fd, remaining.min(PROBE_QUIET)) {
             break;
@@ -242,6 +230,8 @@ fn drain_stdin(fd: RawFd, deadline: Instant) {
         if n <= 0 {
             break;
         }
+        let retained = (n as usize).min(MAX_PROBE_BYTES.saturating_sub(buffer.len()));
+        buffer.extend_from_slice(&discard[..retained]);
     }
 }
 
@@ -271,7 +261,11 @@ pub(crate) fn probe_terminal_graphics(timeout: Duration) -> Option<DetectedGraph
             let n =
                 unsafe { libc::read(libc::STDIN_FILENO, chunk.as_mut_ptr().cast(), chunk.len()) };
             if n > 0 {
-                buf.extend_from_slice(&chunk[..n as usize]);
+                let retained = (n as usize).min(MAX_PROBE_BYTES.saturating_sub(buf.len()));
+                buf.extend_from_slice(&chunk[..retained]);
+                if buf.len() == MAX_PROBE_BYTES {
+                    break;
+                }
                 if !tmux_query_sent && is_tmux_detected(&buf, env_tmux) {
                     tmux_query_sent = write_probe(PROBE_KITTY_TMUX).is_some();
                 }
@@ -291,12 +285,18 @@ pub(crate) fn probe_terminal_graphics(timeout: Duration) -> Option<DetectedGraph
         }
     }
 
-    drain_stdin(libc::STDIN_FILENO, Instant::now() + PROBE_DRAIN_TIMEOUT);
+    drain_stdin(
+        libc::STDIN_FILENO,
+        Instant::now() + PROBE_DRAIN_TIMEOUT,
+        &mut buf,
+    );
+    terminal_da::cache_features(&buf);
     detected
 }
 
 #[cfg(not(unix))]
 pub(crate) fn probe_terminal_graphics(_timeout: Duration) -> Option<DetectedGraphics> {
+    terminal_da::cache_features(&[]);
     None
 }
 
@@ -722,6 +722,7 @@ mod tests {
         use test_case::test_case;
 
         use super::super::{PROBE_DRAIN_TIMEOUT, drain_stdin, wait_readable};
+        use crate::terminal_da::Da1Feature;
 
         const CONTINUOUS_INPUT_PATH: &str = "/dev/zero";
         const HANG_GUARD: Duration = Duration::from_secs(5);
@@ -733,12 +734,23 @@ mod tests {
             let input = File::open(CONTINUOUS_INPUT_PATH)?;
             let (done_tx, done_rx) = mpsc::channel();
             let worker = thread::spawn(move || {
-                drain_stdin(input.as_raw_fd(), Instant::now() + budget);
+                drain_stdin(input.as_raw_fd(), Instant::now() + budget, &mut Vec::new());
                 done_tx.send(()).unwrap();
             });
 
             done_rx.recv_timeout(HANG_GUARD)?;
             worker.join().unwrap();
+            Ok(())
+        }
+
+        #[test_case(b"", b"\x1b[?62;52c"; "late_complete_reply")]
+        #[test_case(b"\x1b[?62;", b"52c"; "split_reply")]
+        fn clipboard_reply_survives_drain(prefix: &[u8], suffix: &[u8]) -> Result<()> {
+            let (input, mut output) = UnixStream::pair()?;
+            output.write_all(suffix)?;
+            let mut buffer = prefix.to_vec();
+            drain_stdin(input.as_raw_fd(), Instant::now() + HANG_GUARD, &mut buffer);
+            assert!(Da1Feature::Osc52.response_tail(&buffer).is_some());
             Ok(())
         }
 
@@ -750,7 +762,9 @@ mod tests {
             assert!(wait_readable(input.as_raw_fd(), HANG_GUARD));
             let deadline = Instant::now() + if expired { Duration::ZERO } else { HANG_GUARD };
 
-            drain_stdin(input.as_raw_fd(), deadline);
+            let mut buffer = Vec::new();
+            drain_stdin(input.as_raw_fd(), deadline, &mut buffer);
+            assert_eq!(buffer, if expired { b"" } else { PENDING_REPLY });
 
             assert_eq!(wait_readable(input.as_raw_fd(), Duration::ZERO), expired);
             Ok(())
