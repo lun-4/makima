@@ -86,6 +86,18 @@ function M.layout(inner_width, statuses, counts)
   }
 end
 
+-- The row asking for delete confirmation lends its message count cell to the
+-- confirmation so the destructive hint stays readable next to a wide age; the
+-- age keeps its column.
+function M.confirm_layout(layout)
+  return {
+    status_width = layout.status_width,
+    count_width = 0,
+    show_count = false,
+    right_width = layout.status_width,
+  }
+end
+
 -- Widest everything left of the separator (prefix, icon, title) may render
 -- and still leave the right columns on screen.
 function M.title_width_budget(confirm_width, inner_width, layout)

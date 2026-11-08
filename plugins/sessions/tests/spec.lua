@@ -272,6 +272,15 @@ case("picker_row_with_clipped_confirmation_fills_the_width_exactly", function()
   eq(sh.spans_width(row), inner, "a confirmation clipped to its budget keeps the columns on their header cells")
 end)
 
+case("confirm_layout_keeps_the_full_hint_beside_a_wide_age", function()
+  local inner, label, hint = 38, "4d 7h 23m 9s", "  Ctrl+D again to delete"
+  local columns = sh.layout(inner, { label }, { "123" })
+  assert(sh.confirm_width_budget(inner, columns) < utf8.len(hint), "the shared layout would clip the hint")
+  local confirming = sh.confirm_layout(columns)
+  eq(confirming.status_width, columns.status_width, "the age keeps its column")
+  assert(sh.confirm_width_budget(inner, confirming) >= utf8.len(hint), "the confirmation lends the count cell")
+end)
+
 case("picker_header_shares_row_columns_and_theme_style", function()
   local inner = 80
   local columns = sh.layout(inner, { "1d 0s" }, { "5" })

@@ -186,8 +186,10 @@ local function render()
       icon_style = "spinner:" .. icon_style
     end
     local confirm_spans, confirm_width = {}, 0
+    local row_columns = columns
     if board.confirm == s.id then
-      local room = Helpers.confirm_width_budget(inner, columns)
+      row_columns = Helpers.confirm_layout(columns)
+      local room = Helpers.confirm_width_budget(inner, row_columns)
       confirm_spans = Helpers.clip_spans({ { CONFIRM_HINT, selected and "match_selected" or "error" } }, room)
       confirm_width = Helpers.spans_width(confirm_spans)
     end
@@ -199,7 +201,7 @@ local function render()
     do
       title_spans[#title_spans + 1] = sp
     end
-    title_spans = Helpers.clip_spans(title_spans, Helpers.title_width_budget(confirm_width, inner, columns))
+    title_spans = Helpers.clip_spans(title_spans, Helpers.title_width_budget(confirm_width, inner, row_columns))
     if #confirm_spans > 0 then
       local first = 1
       for _, span in ipairs(title_spans) do
@@ -210,9 +212,10 @@ local function render()
         title_spans[#title_spans + 1] = span
       end
     end
-    local count_text, pad = Helpers.row_right_columns(Helpers.spans_width(title_spans), inner, s.message_count, columns)
+    local count_text, pad =
+      Helpers.row_right_columns(Helpers.spans_width(title_spans), inner, s.message_count, row_columns)
     local count_style = selected and "selected" or "dim"
-    local line = Helpers.row_spans(title_spans, count_text, count_style, pad, right, right_style, columns)
+    local line = Helpers.row_spans(title_spans, count_text, count_style, pad, right, right_style, row_columns)
     lines[#lines + 1] = line
     if selected then
       cursor_line = #lines
