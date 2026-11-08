@@ -1325,6 +1325,7 @@ fn render_list<T: PickerItem>(
             item.detail().map(String::from)
         };
         let mut head_parts: Vec<String> = Vec::new();
+        let status_parts = usize::from(status.is_some());
         if let Some(s) = status {
             head_parts.push(s);
         }
@@ -1361,15 +1362,23 @@ fn render_list<T: PickerItem>(
                     let room = available(0);
                     let title_min = (prefix_width + AGE_TITLE_MIN_WIDTH).min(room);
                     let budget = room.saturating_sub(title_min);
-                    while !head_parts.is_empty() && join_right(&head_parts, &age).width() > budget {
+                    while head_parts.len() > status_parts
+                        && join_right(&head_parts, &age).width() > budget
+                    {
                         head_parts.pop();
                     }
-                    let age = if age.width() > budget {
-                        elide_left(&age, budget)
+                    if join_right(&head_parts, &age).width() <= budget {
+                        join_right(&head_parts, &age)
                     } else {
-                        age
-                    };
-                    join_right(&head_parts, &age)
+                        let head = head_parts.join(" ");
+                        let head_width = if head.is_empty() { 0 } else { head.width() + 1 };
+                        let age_budget = budget.saturating_sub(head_width);
+                        if age_budget == 0 {
+                            head
+                        } else {
+                            join_right(&head_parts, &elide_left(&age, age_budget))
+                        }
+                    }
                 }
             }
         } else {
@@ -1619,6 +1628,7 @@ mod tests {
     struct Entry {
         label: String,
         detail: Option<String>,
+        context: Option<String>,
         spinning: bool,
         age: Option<Duration>,
     }
@@ -1628,6 +1638,7 @@ mod tests {
             Self {
                 label: label.into(),
                 detail: None,
+                context: None,
                 spinning: false,
                 age: None,
             }
@@ -1640,6 +1651,9 @@ mod tests {
         }
         fn detail(&self) -> Option<&str> {
             self.detail.as_deref()
+        }
+        fn context_str(&self) -> Option<&str> {
+            self.context.as_deref()
         }
         fn is_spinning(&self) -> bool {
             self.spinning
@@ -1678,7 +1692,7 @@ mod tests {
     fn picker_compound_age_layout() {
         let mut p = ListPicker::new();
         let mut aged = Entry::new("task");
-        aged.detail = Some("12k".into());
+        aged.context = Some("12k".into());
         aged.age = Some(Duration::from_secs(4 * 86400 + 7 * 3600 + 23 * 60 + 9));
         p.open(vec![aged], " Age ");
         let now = fixed_clock();
@@ -1711,6 +1725,29 @@ mod tests {
         assert!(elided_row.contains('…'), "higher units elide first");
         assert!(!elided_row.contains("4d 7h 23m 9s"));
         assert!(elided_row.chars().count() <= 28);
+    }
+
+    #[test]
+    fn narrow_aged_row_keeps_status_marker() {
+        let mut p = ListPicker::new();
+        let mut running = Entry::new("task");
+        running.spinning = true;
+        running.age = Some(Duration::from_secs(4 * 86400 + 7 * 3600 + 23 * 60 + 9));
+        p.open(vec![running], " Age ");
+        let now = fixed_clock();
+        let area = Rect::new(0, 0, 24, 8);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                p.view_at(frame, area, &now);
+            })
+            .unwrap();
+        let lines = buffer_lines(&terminal, area);
+        let row = lines.iter().find(|line| line.contains("9s")).unwrap();
+        assert!(
+            row.chars().any(|c| ('\u{2800}'..='\u{28ff}').contains(&c)),
+            "the spinner survives age shortening: {row:?}"
+        );
     }
 
     #[test]
