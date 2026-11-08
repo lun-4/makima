@@ -175,19 +175,27 @@ mod tests {
 
     struct Gate {
         cache: Arc<ModelCapabilityCache>,
-        started: flume::Receiver<()>,
-        answer: flume::Sender<ModelCapabilities>,
+        started: flume::Receiver<flume::Sender<ModelCapabilities>>,
         notified: flume::Receiver<()>,
     }
 
-    /// Each resolution announces itself, then waits for an answer.
+    impl Gate {
+        /// The answer channel of the next resolution once it starts. Each
+        /// resolution has its own, so a stale one can never take the answer
+        /// meant for a fresh one.
+        fn next_resolution(&self) -> flume::Sender<ModelCapabilities> {
+            self.started.recv_timeout(RESOLVE_TIMEOUT).unwrap()
+        }
+    }
+
+    /// Each resolution announces itself with its answer channel, then waits.
     fn gate() -> Gate {
         let (started_tx, started) = flume::unbounded();
-        let (answer, answer_rx) = flume::unbounded::<ModelCapabilities>();
         let (notified_tx, notified) = flume::unbounded();
         let cache = ModelCapabilityCache::new(
             move |_| {
-                started_tx.send(()).unwrap();
+                let (answer, answer_rx) = flume::bounded(1);
+                started_tx.send(answer).unwrap();
                 answer_rx.recv().unwrap()
             },
             move || notified_tx.send(()).unwrap(),
@@ -195,7 +203,6 @@ mod tests {
         Gate {
             cache,
             started,
-            answer,
             notified,
         }
     }
@@ -205,8 +212,7 @@ mod tests {
         let gate = gate();
         assert_eq!(gate.cache.get(SPEC), None);
         assert_eq!(gate.cache.get(SPEC), None);
-        gate.started.recv_timeout(RESOLVE_TIMEOUT).unwrap();
-        gate.answer.send(THINKING_ONLY).unwrap();
+        gate.next_resolution().send(THINKING_ONLY).unwrap();
         gate.notified.recv_timeout(RESOLVE_TIMEOUT).unwrap();
         assert_eq!(gate.cache.get(SPEC), Some(THINKING_ONLY));
         assert!(gate.started.try_recv().is_err());
@@ -216,16 +222,15 @@ mod tests {
     fn clear_discards_resolution_in_flight() {
         let gate = gate();
         assert_eq!(gate.cache.get(SPEC), None);
-        gate.started.recv_timeout(RESOLVE_TIMEOUT).unwrap();
+        let stale = gate.next_resolution();
         gate.cache.clear();
-        gate.answer.send(ModelCapabilities::NONE).unwrap();
+        stale.send(ModelCapabilities::NONE).unwrap();
         assert_eq!(gate.cache.get(SPEC), None);
-        gate.started.recv_timeout(RESOLVE_TIMEOUT).unwrap();
         let fresh = ModelCapabilities {
             thinking: ThinkingSupport::Required,
             fast: true,
         };
-        gate.answer.send(fresh).unwrap();
+        gate.next_resolution().send(fresh).unwrap();
         gate.notified.recv_timeout(RESOLVE_TIMEOUT).unwrap();
         assert_eq!(gate.cache.get(SPEC), Some(fresh));
     }
