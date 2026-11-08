@@ -39,6 +39,7 @@ mod common;
 const BASH_SRC: &str = include_str!("../../plugins/bash/init.lua");
 const GREP_SRC: &str = include_str!("../../plugins/grep/init.lua");
 const BATCH_SRC: &str = include_str!("../../plugins/batch/init.lua");
+const TASK_SRC: &str = include_str!("../../plugins/task/init.lua");
 const MANAGED_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const MANAGED_BASH_TIMEOUT: Duration = Duration::from_secs(5);
 const CLASSIFIER_TOOL_NAME: &str = "classifier_verdict";
@@ -54,12 +55,53 @@ const INDEX_VIEW_CAP: usize = 2;
 const READ_VIEW_CAP: usize = 5;
 const GREP_NO_MATCHES: &str = "No files found";
 const GREP_ERROR_OUTPUT: &str = "error: pattern is required";
+const TASK_WAIT_TOOL: &str = "task_wait";
+const TASK_ID: &str = "task-0123456789abcdef";
+const TASK_SHORT_ID: &str = "89abcdef";
+const TASK_TURN_ID: &str = "turn-restored-result";
+const TASK_INPUT_TURN_ID: &str = "turn-requested";
+const TASK_DESCRIPTION: &str = "Review restored task reports";
+const TASK_RUNNING: &str =
+    "Still running when checked. The wait timed out; the task was not cancelled.";
+const TASK_COMPLETED: &str = "Completed";
+const TASK_DETAILS_HINT: &str = "Details (click to expand)";
+const TASK_REPORT: &str = "**Restored report**";
+const TASK_REPORT_TEXT: &str = "Restored report";
+const TASK_PARTIAL_REPORT: &str = "Partial findings survive";
+const TASK_CHILD_ERROR: &str = "provider unavailable";
+const TASK_CHILD_USER_MESSAGE: &str = "Please retry the provider";
+const TASK_FAILED: &str = "Subagent failed: provider unavailable";
+const TASK_FAILED_USER_MESSAGE: &str = "Subagent failed: Please retry the provider";
+const TASK_CANCEL_REASON: &str = "stopped by parent";
+const TASK_CANCELLED: &str = "Subagent cancelled: stopped by parent";
+const TASK_UNKNOWN_ERROR: &str = "unknown task_id";
+const TASK_UNKNOWN_MESSAGE: &str =
+    "Cannot retrieve this task: it is no longer available. (unknown task_id)";
+const TASK_EVICTED_ERROR: &str = "turn_result_unavailable";
+const TASK_EVICTED_MESSAGE: &str =
+    "Cannot retrieve this turn: its result is no longer retained. (turn_result_unavailable)";
+const TASK_ACCESS_ERROR: &str = "task is owned by another agent branch";
+const TASK_ACCESS_MESSAGE: &str = "Cannot retrieve this task: it belongs to another agent branch. (task is owned by another agent branch)";
+const TASK_LEGACY_OUTPUT: &str = "Legacy report without JSON";
+const TASK_MALFORMED_OUTPUT: &str = "{\"status\":";
+const TASK_LEGACY_STATUS: &str = "Wait result";
+const TASK_STRUCTURED_MESSAGE: &str = "Structured result available in details.";
+const TASK_EMPTY_MESSAGE: &str = "No report returned.";
+const TASK_TOKEN_DETAILS: &str = "Tokens: 17 input, 9 output";
+const TASK_CAPTURED_DETAILS: &str = "Captured: {\"verified\":true}";
+const TASK_REPORT_PREFIX: &str = "Report line";
+const TASK_REPORT_EXTRA_LINES: usize = 3;
+const TASK_DURATION_MS: u64 = 2000;
+const TASK_COMPLETED_WITH_DURATION: &str = "Completed · 2s";
+const TASK_INPUT_TOKENS: u64 = 17;
+const TASK_OUTPUT_TOKENS: u64 = 9;
 
 fn view_lines() -> ToolOutputLines {
     ToolOutputLines {
         other: VIEW_CAP,
         index: INDEX_VIEW_CAP,
         read: READ_VIEW_CAP,
+        task_spawn: VIEW_CAP,
         ..ToolOutputLines::DEFAULT
     }
 }
@@ -78,6 +120,7 @@ fn load_host() -> PluginHost {
     host.load_source("bash", BASH_SRC).unwrap();
     host.load_source("grep", GREP_SRC).unwrap();
     host.load_source("batch", BATCH_SRC).unwrap();
+    host.load_source("task", TASK_SRC).unwrap();
     host
 }
 
@@ -150,6 +193,308 @@ fn restore_as(
         }
     }
     out
+}
+
+#[test_case::test_case(Some(TASK_DESCRIPTION); "persisted_description")]
+#[test_case::test_case(None; "short_id_fallback")]
+fn task_wait_restore_running_is_historical(description: Option<&str>) {
+    let host = load_host();
+    let restored = restore(
+        &host,
+        TASK_WAIT_TOOL,
+        json!({ "task_id": TASK_ID }),
+        &json!({ "status": "running" }).to_string(),
+        description.map(|description| json!({ "description": description })),
+        Vec::new(),
+    );
+
+    assert_eq!(restored.header.trim(), description.unwrap_or(TASK_SHORT_ID));
+    assert_eq!(
+        restored.body.lines().collect::<Vec<_>>(),
+        [TASK_RUNNING, TASK_DETAILS_HINT]
+    );
+}
+
+#[test_case::test_case(false; "without_duration")]
+#[test_case::test_case(true; "with_duration")]
+fn task_wait_restore_done_renders_markdown(with_duration: bool) {
+    let host = load_host();
+    let mut result = json!({ "text": TASK_REPORT });
+    if with_duration {
+        result["duration_ms"] = json!(TASK_DURATION_MS);
+    }
+    let restored = restore(
+        &host,
+        TASK_WAIT_TOOL,
+        json!({ "task_id": TASK_ID }),
+        &json!({ "status": "done", "result": result }).to_string(),
+        None,
+        Vec::new(),
+    );
+
+    let status = if with_duration {
+        TASK_COMPLETED_WITH_DURATION
+    } else {
+        TASK_COMPLETED
+    };
+    assert_eq!(restored.body.lines().next(), Some(status));
+    assert!(
+        restored.body.contains(TASK_REPORT_TEXT),
+        "{}",
+        restored.body
+    );
+    assert!(!restored.body.contains(TASK_REPORT), "{}", restored.body);
+    assert!(
+        restored
+            .spans
+            .iter()
+            .flat_map(|line| &line.spans)
+            .any(|span| {
+                span.text.contains(TASK_REPORT_TEXT)
+                    && matches!(&span.style, SpanStyle::Named(style) if style == "bold")
+            })
+    );
+}
+
+#[test_case::test_case(
+    json!({ "status": "failed", "error": TASK_CHILD_ERROR }), TASK_FAILED;
+    "failed"
+)]
+#[test_case::test_case(
+    json!({ "status": "failed", "error": TASK_CHILD_ERROR, "user_message": TASK_CHILD_USER_MESSAGE }),
+    TASK_FAILED_USER_MESSAGE;
+    "failed_user_message"
+)]
+#[test_case::test_case(
+    json!({ "status": "cancelled", "error": TASK_CANCEL_REASON }), TASK_CANCELLED;
+    "cancelled_error"
+)]
+#[test_case::test_case(
+    json!({ "status": "cancelled", "cancellation_reason": TASK_CANCEL_REASON }), TASK_CANCELLED;
+    "cancelled_reason"
+)]
+fn task_wait_restore_child_failure_keeps_partial_report(mut result: Value, status: &str) {
+    let host = load_host();
+    result["text"] = json!(TASK_PARTIAL_REPORT);
+    let restored = restore(
+        &host,
+        TASK_WAIT_TOOL,
+        json!({ "task_id": TASK_ID }),
+        &json!({ "status": "done", "result": result }).to_string(),
+        None,
+        Vec::new(),
+    );
+
+    assert_eq!(restored.body.lines().next(), Some(status));
+    assert!(
+        restored.body.contains(TASK_PARTIAL_REPORT),
+        "{}",
+        restored.body
+    );
+    assert!(matches!(
+        &restored.spans[0].spans[0].style,
+        SpanStyle::Named(style) if style == "error"
+    ));
+}
+
+#[test_case::test_case(TASK_UNKNOWN_ERROR, TASK_UNKNOWN_MESSAGE; "unknown_task")]
+#[test_case::test_case(TASK_EVICTED_ERROR, TASK_EVICTED_MESSAGE; "evicted_turn")]
+#[test_case::test_case(TASK_ACCESS_ERROR, TASK_ACCESS_MESSAGE; "access_denied")]
+fn task_wait_restore_wait_errors_are_not_child_failures(output: &str, status: &str) {
+    let host = load_host();
+    let restored = restore_as(
+        &host,
+        TASK_WAIT_TOOL,
+        json!({ "task_id": TASK_ID }),
+        output,
+        true,
+        None,
+        Vec::new(),
+    );
+
+    assert_eq!(
+        restored.body.lines().collect::<Vec<_>>(),
+        [status, TASK_DETAILS_HINT]
+    );
+    assert!(matches!(
+        &restored.spans[0].spans[0].style,
+        SpanStyle::Named(style) if style == "error"
+    ));
+}
+
+#[test_case::test_case(TASK_LEGACY_OUTPUT; "legacy_text")]
+#[test_case::test_case(TASK_MALFORMED_OUTPUT; "malformed_json")]
+fn task_wait_restore_legacy_output_uses_text_fallback(output: &str) {
+    let host = load_host();
+    let restored = restore(
+        &host,
+        TASK_WAIT_TOOL,
+        json!({ "task_id": TASK_ID }),
+        output,
+        None,
+        Vec::new(),
+    );
+
+    assert_eq!(restored.body.lines().next(), Some(TASK_LEGACY_STATUS));
+    assert!(restored.body.contains(output), "{}", restored.body);
+    assert!(
+        restored.body.contains(TASK_DETAILS_HINT),
+        "{}",
+        restored.body
+    );
+}
+
+#[test_case::test_case(false, TASK_EMPTY_MESSAGE; "no_report")]
+#[test_case::test_case(true, TASK_STRUCTURED_MESSAGE; "structured_result")]
+fn task_wait_restore_empty_report_and_expanded_details(captured: bool, message: &str) {
+    let host = load_host();
+    let mut result = json!({
+        "input_tokens": TASK_INPUT_TOKENS, "output_tokens": TASK_OUTPUT_TOKENS,
+    });
+    if captured {
+        result["turn_id"] = json!(TASK_TURN_ID);
+        result["captured"] = json!({ "verified": true });
+    }
+    let input = json!({ "task_id": TASK_ID, "turn_id": TASK_INPUT_TURN_ID });
+    let output = json!({ "status": "done", "result": result }).to_string();
+    let collapsed = restore(
+        &host,
+        TASK_WAIT_TOOL,
+        input.clone(),
+        &output,
+        None,
+        Vec::new(),
+    );
+    assert!(collapsed.body.contains(message), "{}", collapsed.body);
+    assert!(!collapsed.body.contains(TASK_ID), "{}", collapsed.body);
+    assert!(
+        !collapsed.body.contains(TASK_TOKEN_DETAILS),
+        "{}",
+        collapsed.body
+    );
+    assert!(
+        !collapsed.body.contains(TASK_CAPTURED_DETAILS),
+        "{}",
+        collapsed.body
+    );
+
+    let expanded = restore(&host, TASK_WAIT_TOOL, input.clone(), &output, None, vec![0]);
+    assert!(expanded.body.contains(message), "{}", expanded.body);
+    assert!(
+        expanded.body.contains(&format!("Task: {TASK_ID}")),
+        "{}",
+        expanded.body
+    );
+    let turn_id = if captured {
+        TASK_TURN_ID
+    } else {
+        TASK_INPUT_TURN_ID
+    };
+    assert!(
+        expanded.body.contains(&format!("Turn: {turn_id}")),
+        "{}",
+        expanded.body
+    );
+    assert!(
+        expanded.body.contains(TASK_TOKEN_DETAILS),
+        "{}",
+        expanded.body
+    );
+    assert_eq!(expanded.body.contains(TASK_CAPTURED_DETAILS), captured);
+    assert!(!expanded.body.contains(EXPAND_HINT), "{}", expanded.body);
+
+    let recollapsed = restore(&host, TASK_WAIT_TOOL, input, &output, None, vec![0, 0]);
+    assert_eq!(recollapsed.body, collapsed.body);
+}
+
+#[test_case::test_case(false; "standalone")]
+#[test_case::test_case(true; "batch_child")]
+fn task_wait_restore_report_truncation_click_roundtrip(in_batch: bool) {
+    let host = load_host();
+    let report = (1..=VIEW_CAP + TASK_REPORT_EXTRA_LINES)
+        .map(|line| format!("{TASK_REPORT_PREFIX} {line}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let output = json!({ "status": "done", "result": {
+        "text": report, "turn_id": TASK_TURN_ID,
+    }})
+    .to_string();
+    let input = json!({ "task_id": TASK_ID });
+    let state = json!({ "description": TASK_DESCRIPTION });
+    let (tool, input, state) = if in_batch {
+        (
+            "batch",
+            json!({ "tool_calls": [{ "tool": TASK_WAIT_TOOL, "parameters": input }] }),
+            json!({ "children": [{
+                "tool": TASK_WAIT_TOOL, "status": "success", "output": output, "state": state,
+            }] }),
+        )
+    } else {
+        (TASK_WAIT_TOOL, input, state)
+    };
+    let collapsed = restore(
+        &host,
+        tool,
+        input.clone(),
+        &output,
+        Some(state.clone()),
+        Vec::new(),
+    );
+    let tail = format!(
+        "{TASK_REPORT_PREFIX} {}",
+        VIEW_CAP + TASK_REPORT_EXTRA_LINES
+    );
+    assert!(
+        collapsed.body.contains(TASK_COMPLETED),
+        "{}",
+        collapsed.body
+    );
+    assert!(
+        collapsed.body.contains(&format!("{TASK_REPORT_PREFIX} 1")),
+        "{}",
+        collapsed.body
+    );
+    assert!(!collapsed.body.contains(&tail), "{}", collapsed.body);
+    assert!(
+        !collapsed.body.contains(TASK_DETAILS_HINT),
+        "{}",
+        collapsed.body
+    );
+    let notice_row = 1 + collapsed
+        .body
+        .lines()
+        .position(|line| line.contains(EXPAND_HINT))
+        .unwrap();
+    let expanded = restore(
+        &host,
+        tool,
+        input.clone(),
+        &output,
+        Some(state.clone()),
+        vec![notice_row],
+    );
+    assert!(expanded.body.contains(&tail), "{}", expanded.body);
+    assert!(
+        expanded.body.contains(&format!("Task: {TASK_ID}")),
+        "{}",
+        expanded.body
+    );
+    assert!(
+        expanded.body.contains(&format!("Turn: {TASK_TURN_ID}")),
+        "{}",
+        expanded.body
+    );
+    assert!(!expanded.body.contains(EXPAND_HINT), "{}", expanded.body);
+    let recollapsed = restore(
+        &host,
+        tool,
+        input,
+        &output,
+        Some(state),
+        vec![notice_row, notice_row],
+    );
+    assert_eq!(recollapsed.body, collapsed.body);
+    assert_eq!(recollapsed.header, collapsed.header);
 }
 
 #[test]
