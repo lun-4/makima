@@ -1335,6 +1335,11 @@ fn render_list<T: PickerItem>(
         let trailing_gap = suffix.map_or(0, |s| s.width() + suffix_gap);
         let checkbox_w = checkbox.as_ref().map_or(0, Span::width);
         let width = area.width as usize;
+        let prefix_width = item
+            .depth()
+            .saturating_mul(DEPTH_INDENT_WIDTH)
+            .saturating_add(LABEL_PREFIX_WIDTH)
+            .min((area.width as usize).saturating_sub(checkbox_w));
         let right = if let Some(elapsed) = item.age(now) {
             let age = maki_lua::format_ago(elapsed);
             let full = join_right(&head_parts, &age);
@@ -1343,7 +1348,7 @@ fn render_list<T: PickerItem>(
             };
             let fits = |right: &str, trailing: usize| {
                 let room = available(trailing);
-                let title_min = AGE_TITLE_MIN_WIDTH.min(room);
+                let title_min = (prefix_width + AGE_TITLE_MIN_WIDTH).min(room);
                 right.width() <= room.saturating_sub(title_min)
             };
             if fits(&full, trailing_gap) {
@@ -1354,7 +1359,7 @@ fn render_list<T: PickerItem>(
                     full
                 } else {
                     let room = available(0);
-                    let title_min = AGE_TITLE_MIN_WIDTH.min(room);
+                    let title_min = (prefix_width + AGE_TITLE_MIN_WIDTH).min(room);
                     let budget = room.saturating_sub(title_min);
                     while !head_parts.is_empty() && join_right(&head_parts, &age).width() > budget {
                         head_parts.pop();
@@ -1377,11 +1382,6 @@ fn render_list<T: PickerItem>(
         } else {
             t.item_match
         };
-        let prefix_width = item
-            .depth()
-            .saturating_mul(DEPTH_INDENT_WIDTH)
-            .saturating_add(LABEL_PREFIX_WIDTH)
-            .min((area.width as usize).saturating_sub(checkbox_w));
         let line = if !right.is_empty() {
             let right_budget = (area.width as usize)
                 .saturating_sub(trailing_gap + 1 + DETAIL_RIGHT_PAD as usize + checkbox_w);
@@ -1698,7 +1698,7 @@ mod tests {
         assert!(wide_row.contains("12k 4d 7h 23m 9s"));
         assert!(wide_row.chars().count() <= 80);
 
-        let narrow = render(&mut p, 32);
+        let narrow = render(&mut p, 34);
         let narrow_row = narrow.iter().find(|line| line.contains("9s")).unwrap();
         assert!(
             !narrow_row.contains("12k"),
