@@ -3722,6 +3722,27 @@ fn restored_subagents_have_no_ago_and_are_finished() {
     let sub = entries.iter().find(|e| e.chat_index == 1).unwrap();
     assert!(sub.is_finished());
     assert_eq!(sub.ago(), None);
+    assert_eq!(sub.depth(), 0);
+    assert_eq!(sub.parent_chat_index, None);
+
+    let root = AgentId::generate();
+    let child = AgentId::generate();
+    app.chats[0].agent_id = Some(root);
+    add_picker_agent(&mut app, child, root, "child");
+    add_picker_agent(&mut app, AgentId::generate(), child, "grandchild");
+    let entries = app.task_entries();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.depth()))
+            .collect::<Vec<_>>(),
+        [
+            ("Main", 0),
+            ("child", 1),
+            ("grandchild", 2),
+            ("old task", 0)
+        ]
+    );
 }
 
 fn streaming_app() -> App {
@@ -3743,6 +3764,147 @@ fn with_subagent(mut app: App, id: &str) -> App {
 
 fn app_with_subagent() -> App {
     app_with_subagent_id(TASK_ID)
+}
+
+fn add_picker_agent(app: &mut App, agent_id: AgentId, parent_id: AgentId, name: &str) {
+    let mut info = subagent_info_for_agent(agent_id, name, name, None, None);
+    info.parent_agent_id = Some(parent_id);
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta { text: "x".into() },
+        subagent: Some(info),
+        identity: Some(work_identity(1)),
+    })));
+}
+
+#[test_case(false, false; "parent_first")]
+#[test_case(true, false; "parent_arrives_late")]
+#[test_case(true, true; "parent_arrives_late_filtered")]
+fn task_entries_preserve_hierarchy_with_unknown_ancestry(
+    parent_arrives_late: bool,
+    filtered: bool,
+) {
+    let mut app = app_with_subagent_id("unknown");
+    let root = app.chats[0].agent_id.unwrap();
+    let child = AgentId::generate();
+    let grandchild = AgentId::generate();
+    if parent_arrives_late {
+        add_picker_agent(&mut app, grandchild, child, "grandchild");
+        let entries = app.task_entries();
+        let orphan = entries
+            .iter()
+            .find(|entry| entry.name == "grandchild")
+            .unwrap();
+        assert_eq!(orphan.depth(), 0);
+        app.open_tasks();
+        if filtered {
+            app.task_picker.handle_paste("grandchild");
+        }
+        app.task_picker
+            .select_item_by(|entry| entry.name == "grandchild");
+    }
+    add_picker_agent(&mut app, child, root, "child");
+    if !parent_arrives_late {
+        add_picker_agent(&mut app, grandchild, child, "grandchild");
+    }
+    let child_index = app.live_chat_index[&child];
+    app.chats[child_index].mark_finished(DisplayRole::Assistant, DONE_TEXT);
+    add_picker_agent(&mut app, AgentId::generate(), root, "sibling");
+
+    let entries = app.task_entries();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.depth()))
+            .collect::<Vec<_>>(),
+        [
+            ("Main", 0),
+            ("sibling", 1),
+            ("child", 1),
+            ("grandchild", 2),
+            ("research", 0)
+        ]
+    );
+    assert_eq!(app.chats[child_index].parent_agent_id, Some(root));
+    if parent_arrives_late {
+        let selected = app.task_picker.selected_item().unwrap();
+        assert_eq!(selected.name, "grandchild");
+        assert_eq!(selected.depth(), 2);
+    }
+}
+
+#[test_case(false; "unfiltered")]
+#[test_case(true; "filtered")]
+fn task_picker_inserts_descendants_in_subtree_preserving_selection(filtered: bool) {
+    let mut app = streaming_app();
+    let root = app.chats[0].agent_id.unwrap();
+    let child = AgentId::generate();
+    let grandchild = AgentId::generate();
+    add_picker_agent(&mut app, child, root, "branch");
+    add_picker_agent(&mut app, AgentId::generate(), root, "branch sibling");
+    app.open_tasks();
+    if filtered {
+        app.update(Msg::Key(key(KeyCode::Char('b'))));
+    }
+    app.task_picker
+        .select_item_by(|entry| entry.name == "branch");
+    add_picker_agent(&mut app, grandchild, child, "branch leaf");
+
+    assert_eq!(app.task_picker.selected_item().unwrap().name, "branch");
+    app.update(Msg::Key(key(KeyCode::Down)));
+    assert_eq!(app.task_picker.selected_item().unwrap().name, "branch leaf");
+    assert_eq!(app.task_picker.selected_item().unwrap().depth(), 2);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.active_chat, app.live_chat_index[&grandchild]);
+}
+
+#[test]
+fn task_picker_nested_siblings_sort_on_open_and_stay_stable_during_refresh() {
+    let mut app = streaming_app();
+    let root = app.chats[0].agent_id.unwrap();
+    let parent = AgentId::generate();
+    let older = AgentId::generate();
+    let newer = AgentId::generate();
+    add_picker_agent(&mut app, parent, root, "parent");
+    add_picker_agent(&mut app, older, parent, "older");
+    add_picker_agent(&mut app, newer, parent, "newer");
+    app.chats[app.live_chat_index[&newer]].mark_finished(DisplayRole::Assistant, DONE_TEXT);
+    app.open_tasks();
+    assert_eq!(app.task_picker.item(2).unwrap().name, "older");
+    app.task_picker
+        .select_item_by(|entry| entry.name == "newer");
+    add_picker_agent(&mut app, AgentId::generate(), older, "new leaf");
+    assert_eq!(app.task_picker.selected_item().unwrap().name, "newer");
+    assert_eq!(app.task_picker.item(3).unwrap().name, "new leaf");
+
+    app.chats[app.live_chat_index[&older]].mark_finished(DisplayRole::Assistant, DONE_TEXT);
+    app.sync_task_picker();
+    assert_eq!(app.task_picker.item(2).unwrap().name, "older");
+    app.task_picker.close();
+    app.open_tasks();
+    assert_eq!(app.task_picker.item(2).unwrap().name, "newer");
+    assert_eq!(app.task_picker.item(3).unwrap().name, "older");
+}
+
+#[test]
+fn filtered_task_picker_keeps_ancestors_in_tree_order() {
+    let mut app = streaming_app();
+    let root = app.chats[0].agent_id.unwrap();
+    let child = AgentId::generate();
+    add_picker_agent(&mut app, child, root, "branch");
+    add_picker_agent(&mut app, AgentId::generate(), child, "leaf");
+    add_picker_agent(&mut app, AgentId::generate(), root, "leaf sibling");
+    app.open_tasks();
+    app.task_picker.handle_paste("leaf");
+    assert_eq!(
+        app.task_picker.selected_item().unwrap().name,
+        "leaf sibling"
+    );
+    app.task_picker.select_item_by(|entry| entry.name == "Main");
+
+    for name in ["Main", "leaf sibling", "branch", "leaf"] {
+        assert_eq!(app.task_picker.selected_item().unwrap().name, name);
+        app.update(Msg::Key(key(KeyCode::Down)));
+    }
 }
 
 #[test]

@@ -274,6 +274,8 @@ pub(super) struct TaskEntry {
     finished: Option<bool>,
     chat_index: usize,
     identity: TaskIdentity,
+    parent_chat_index: Option<usize>,
+    depth: usize,
     /// First `SNIPPET_CHARS` of the subagent chat's last message, shown dimly.
     snippet: String,
     context: String,
@@ -283,6 +285,9 @@ pub(super) struct TaskEntry {
 impl PickerItem for TaskEntry {
     fn label(&self) -> &str {
         &self.name
+    }
+    fn depth(&self) -> usize {
+        self.depth
     }
     fn detail(&self) -> Option<&str> {
         matches!(self.finished, Some(true)).then_some(TASK_DONE_DETAIL)
@@ -1632,6 +1637,12 @@ impl App {
                 } else {
                     TaskIdentity::Unidentified(chat_index)
                 },
+                parent_chat_index: chat.parent_agent_id.and_then(|parent_id| {
+                    self.chats
+                        .iter()
+                        .position(|parent| parent.agent_id == Some(parent_id))
+                }),
+                depth: 0,
                 snippet: if chat_index == 0 {
                     String::new()
                 } else {
@@ -1650,7 +1661,38 @@ impl App {
                 .cmp(&b.is_finished())
                 .then_with(|| b.started_at.cmp(&a.started_at))
         });
-        entries
+        Self::order_task_hierarchy(entries)
+    }
+
+    fn order_task_hierarchy(mut entries: Vec<TaskEntry>) -> Vec<TaskEntry> {
+        fn append_subtree(
+            mut entry: TaskEntry,
+            depth: usize,
+            remaining: &mut Vec<TaskEntry>,
+            ordered: &mut Vec<TaskEntry>,
+        ) {
+            entry.depth = depth;
+            let parent = entry.chat_index;
+            ordered.push(entry);
+            while let Some(index) = remaining
+                .iter()
+                .position(|entry| entry.parent_chat_index == Some(parent))
+            {
+                let child = remaining.remove(index);
+                append_subtree(child, depth + 1, remaining, ordered);
+            }
+        }
+
+        let mut ordered = Vec::with_capacity(entries.len());
+        while !entries.is_empty() {
+            let index = entries
+                .iter()
+                .position(|entry| entry.parent_chat_index.is_none())
+                .unwrap_or(0);
+            let root = entries.remove(index);
+            append_subtree(root, 0, &mut entries, &mut ordered);
+        }
+        ordered
     }
 
     fn open_tasks(&mut self) {
@@ -1696,7 +1738,7 @@ impl App {
             }
         }
         ordered.extend(current);
-        ordered
+        Self::order_task_hierarchy(ordered)
     }
 
     fn sync_command_arguments(&mut self, input: &str, cursor: usize) {
@@ -3076,6 +3118,7 @@ impl App {
         chat.opts = subagent.opts;
         chat.subagent_id = Some(id.clone());
         chat.agent_id = Some(subagent.agent_id);
+        chat.parent_agent_id = subagent.parent_agent_id;
         chat.set_started_at_now();
         if let Some(ref prompt) = subagent.prompt {
             chat.push_user_message(prompt);
