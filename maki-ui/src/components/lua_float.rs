@@ -2355,6 +2355,61 @@ mod tests {
     }
 
     #[test]
+    fn sessions_age_snapshots_reach_terminal_buffer() {
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, _event_rx, _cmd_tx) = make_channels();
+        let buf = make_buf(&["Sessions", "first 1s", "second 2s", "third 3s"]);
+        let mut config = make_config();
+        config.reserved_top = 1;
+        mgr.open(buf.clone(), config, true, event_tx, cmd_rx);
+        mgr.windows[0].refresh_layout(2);
+        mgr.windows[0].set_cursor(2);
+        mgr.windows[0].scroll_by(-1);
+
+        let area = Rect::new(0, 0, 40, 10);
+        let render = |mgr: &mut FloatManager| {
+            let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            terminal
+                .draw(|frame| mgr.render_window(frame, 0, area))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| {
+                            buffer
+                                .cell(Position::new(x, y))
+                                .map(|c| c.symbol())
+                                .unwrap_or(" ")
+                        })
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let rows = render(&mut mgr);
+        assert!(rows.iter().any(|row| row.contains("1s")));
+        assert!(rows.iter().any(|row| row.contains("2s")));
+        let scrolled = mgr.windows[0].scroll_offset;
+
+        buf.set_lines(vec![
+            make_line("Sessions"),
+            make_line("first 2s"),
+            make_line("second 3s"),
+            make_line("third 4s"),
+        ]);
+        let mut dirty = mgr.tick();
+        assert!(dirty.take(), "the buffer update must dirty the float");
+        let rows = render(&mut mgr);
+        assert!(rows.iter().any(|row| row.contains("2s")));
+        assert!(rows.iter().any(|row| row.contains("3s")));
+        assert_eq!(
+            mgr.windows[0].scroll_offset, scrolled,
+            "age snapshots keep the wheel scroll stable"
+        );
+    }
+
+    #[test]
     fn tick_preserves_wheel_scroll_across_periodic_rereder() {
         let mut mgr = FloatManager::new();
         let (event_tx, cmd_rx, _event_rx, cmd_tx) = make_channels();

@@ -1,4 +1,5 @@
 use std::mem;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use maki_match::{
     CompletionMatch, CompletionMatchOptions, CompletionRanking, compare_completion_matches,
@@ -34,6 +35,26 @@ pub(super) const SEARCH_PREFIX_WIDTH: u16 = 2;
 const DETAIL_RIGHT_PAD: u16 = 1;
 const LABEL_PREFIX_WIDTH: usize = 2;
 const DEPTH_INDENT_WIDTH: usize = 2;
+const AGE_TITLE_MIN_WIDTH: usize = 4;
+const AGE_ELLIPSIS_MIN_WIDTH: usize = 6;
+
+/// One sampling of both clocks used by a picker draw. Monotonic time measures
+/// task ages; Unix time measures timestamps supplied by Lua.
+pub struct ClockSample {
+    pub monotonic: Instant,
+    pub unix: Duration,
+}
+
+impl ClockSample {
+    pub fn now() -> Self {
+        Self {
+            monotonic: Instant::now(),
+            unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default(),
+        }
+    }
+}
 
 pub trait PickerItem {
     fn label(&self) -> &str;
@@ -61,7 +82,7 @@ pub trait PickerItem {
     fn context_str(&self) -> Option<&str> {
         None
     }
-    fn ago(&self) -> Option<String> {
+    fn age(&self, _now: &ClockSample) -> Option<Duration> {
         None
     }
     fn is_finished(&self) -> bool {
@@ -574,12 +595,19 @@ impl<T: PickerItem> ListPicker<T> {
     }
 
     pub fn cadence(&self) -> Cadence {
-        Cadence::when(
-            self.state
-                .as_ref()
-                .is_some_and(|s| s.items.iter().any(PickerItem::is_spinning)),
-            Cadence::SPINNER,
-        )
+        let Some(s) = self.state.as_ref() else {
+            return Cadence::IDLE;
+        };
+        let now = ClockSample::now();
+        let any_spinning = s.items.iter().any(PickerItem::is_spinning);
+        let any_aged = s
+            .filtered()
+            .iter()
+            .any(|&idx| s.items[idx].age(&now).is_some());
+        Cadence::any([
+            Cadence::when(any_spinning, Cadence::SPINNER),
+            Cadence::when(any_aged, Cadence::AGE),
+        ])
     }
 
     pub fn close(&mut self) {
@@ -794,11 +822,27 @@ impl<T: PickerItem> ListPicker<T> {
         self.view_with_footer_lines(frame, area, footer)
     }
 
+    #[cfg(test)]
+    pub fn view_at(&mut self, frame: &mut Frame, area: Rect, now: &ClockSample) -> Rect {
+        let footer = self.footer.clone().into_iter().collect();
+        self.view_with_footer_lines_at(frame, area, footer, now)
+    }
+
     pub fn view_with_footer_lines(
         &mut self,
         frame: &mut Frame,
         area: Rect,
         footer: Vec<Line<'static>>,
+    ) -> Rect {
+        self.view_with_footer_lines_at(frame, area, footer, &ClockSample::now())
+    }
+
+    pub fn view_with_footer_lines_at(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        footer: Vec<Line<'static>>,
+        now: &ClockSample,
     ) -> Rect {
         let rendered = match self.state.as_mut() {
             None => (Rect::default(), None, Vec::new()),
@@ -810,6 +854,7 @@ impl<T: PickerItem> ListPicker<T> {
                 self.max_visible,
                 footer,
                 self.error_text.as_deref(),
+                now,
             ),
         };
         self.scrollbar_hit = rendered.1;
@@ -910,6 +955,7 @@ fn key_matches(key: KeyEvent, other: &KeyEvent) -> bool {
     key.code == other.code && key.modifiers == other.modifiers
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_ready<T: PickerItem>(
     frame: &mut Frame,
     area: Rect,
@@ -918,6 +964,7 @@ fn render_ready<T: PickerItem>(
     max_visible: Option<u16>,
     footer: Vec<Line<'static>>,
     error_text: Option<&str>,
+    now: &ClockSample,
 ) -> (Rect, Option<ScrollbarHit>, Vec<(Rect, usize)>) {
     let footer_rows = u16::try_from(footer.len()).unwrap_or(u16::MAX);
     let content_rows = if s.filtered().is_empty() {
@@ -1001,6 +1048,7 @@ fn render_ready<T: PickerItem>(
         s.scroll_offset,
         s.viewport_height,
         s.enabled.as_deref(),
+        now,
     );
     s.input_area = search_area;
     render_search(frame, search_area, &s.search);
@@ -1091,6 +1139,43 @@ fn find_scroll_offset_for_bottom<T: PickerItem>(
     find_scroll_offset_for(filtered, items, len - 1, viewport_height)
 }
 
+/// Keep the rightmost `max_width` display cells. Ages are ASCII, but the
+/// helper stays display-width aware so it can be reused safely.
+fn tail_by_width(text: &str, max_width: usize) -> String {
+    let mut width = 0;
+    let mut start = text.len();
+    for (idx, ch) in text.char_indices().rev() {
+        let cw = ch.width().unwrap_or(0);
+        if width + cw > max_width {
+            break;
+        }
+        width += cw;
+        start = idx;
+    }
+    text[start..].to_string()
+}
+
+fn join_right(head: &[String], age: &str) -> String {
+    if head.is_empty() {
+        age.to_string()
+    } else {
+        format!("{} {age}", head.join(" "))
+    }
+}
+
+fn elide_left(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if text.width() <= max_width {
+        return text.to_string();
+    }
+    if max_width < AGE_ELLIPSIS_MIN_WIDTH {
+        return tail_by_width(text, max_width);
+    }
+    format!("\u{2026}{}", tail_by_width(text, max_width - 1))
+}
+
 fn truncate_label(label: &str, max_width: usize) -> String {
     if max_width == 0 {
         return String::new();
@@ -1160,6 +1245,7 @@ fn render_list<T: PickerItem>(
     scroll_offset: usize,
     viewport_height: usize,
     enabled: Option<&[bool]>,
+    now: &ClockSample,
 ) -> Vec<(Rect, usize)> {
     if filtered.is_empty() {
         let line = Line::from(Span::styled(
@@ -1232,38 +1318,79 @@ fn render_list<T: PickerItem>(
             };
             Span::styled(sym, sty)
         });
-        let suffix = item.suffix();
+        let mut suffix = item.suffix();
         let status: Option<String> = if item.is_spinning() {
             Some(spinner_str(animation_elapsed_ms()).to_string())
         } else {
             item.detail().map(String::from)
         };
-        let mut right_parts: Vec<String> = Vec::new();
+        let mut head_parts: Vec<String> = Vec::new();
+        let status_parts = usize::from(status.is_some());
         if let Some(s) = status {
-            right_parts.push(s);
+            head_parts.push(s);
         }
         if let Some(ctx) = item.context_str() {
-            right_parts.push(ctx.to_string());
+            head_parts.push(ctx.to_string());
         }
-        if let Some(ago_s) = item.ago() {
-            right_parts.push(ago_s);
-        }
-        let right = right_parts.join(" ");
         let suffix_gap = 2usize;
-        let suffix_w = suffix.map(|s| s.width()).unwrap_or(0);
-        let trailing_gap = suffix_w + if suffix_w > 0 { suffix_gap } else { 0 };
+        let trailing_gap = suffix.map_or(0, |s| s.width() + suffix_gap);
+        let checkbox_w = checkbox.as_ref().map_or(0, Span::width);
+        let width = area.width as usize;
+        let prefix_width = item
+            .depth()
+            .saturating_mul(DEPTH_INDENT_WIDTH)
+            .saturating_add(LABEL_PREFIX_WIDTH)
+            .min((area.width as usize).saturating_sub(checkbox_w));
+        let right = if let Some(elapsed) = item.age(now) {
+            let age = maki_lua::format_ago(elapsed);
+            let full = join_right(&head_parts, &age);
+            let available = |trailing: usize| {
+                width.saturating_sub(trailing + 1 + DETAIL_RIGHT_PAD as usize + checkbox_w)
+            };
+            let fits = |right: &str, trailing: usize| {
+                let room = available(trailing);
+                let title_min = (prefix_width + AGE_TITLE_MIN_WIDTH).min(room);
+                right.width() <= room.saturating_sub(title_min)
+            };
+            if fits(&full, trailing_gap) {
+                full
+            } else {
+                suffix = None;
+                if fits(&full, 0) {
+                    full
+                } else {
+                    let room = available(0);
+                    let title_min = (prefix_width + AGE_TITLE_MIN_WIDTH).min(room);
+                    let budget = room.saturating_sub(title_min);
+                    while head_parts.len() > status_parts
+                        && join_right(&head_parts, &age).width() > budget
+                    {
+                        head_parts.pop();
+                    }
+                    if join_right(&head_parts, &age).width() <= budget {
+                        join_right(&head_parts, &age)
+                    } else {
+                        let head = head_parts.join(" ");
+                        let head_width = if head.is_empty() { 0 } else { head.width() + 1 };
+                        let age_budget = budget.saturating_sub(head_width);
+                        if age_budget == 0 {
+                            head
+                        } else {
+                            join_right(&head_parts, &elide_left(&age, age_budget))
+                        }
+                    }
+                }
+            }
+        } else {
+            head_parts.join(" ")
+        };
+        let trailing_gap = suffix.map_or(0, |s| s.width() + suffix_gap);
         let label_indices = match_indices.get(i).and_then(|v| v.as_deref());
         let match_style = if i == selected {
             t.item_match_selected
         } else {
             t.item_match
         };
-        let checkbox_w = checkbox.as_ref().map_or(0, Span::width);
-        let prefix_width = item
-            .depth()
-            .saturating_mul(DEPTH_INDENT_WIDTH)
-            .saturating_add(LABEL_PREFIX_WIDTH)
-            .min((area.width as usize).saturating_sub(checkbox_w));
         let line = if !right.is_empty() {
             let right_budget = (area.width as usize)
                 .saturating_sub(trailing_gap + 1 + DETAIL_RIGHT_PAD as usize + checkbox_w);
@@ -1374,6 +1501,13 @@ fn render_search(frame: &mut Frame, area: Rect, search: &TextBuffer) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixed_clock() -> ClockSample {
+        ClockSample {
+            monotonic: Instant::now(),
+            unix: Duration::ZERO,
+        }
+    }
     use crate::components::key;
     use crate::components::keybindings::key as kb;
     use crossterm::event::{KeyCode, KeyModifiers};
@@ -1494,7 +1628,9 @@ mod tests {
     struct Entry {
         label: String,
         detail: Option<String>,
+        context: Option<String>,
         spinning: bool,
+        age: Option<Duration>,
     }
 
     impl Entry {
@@ -1502,7 +1638,9 @@ mod tests {
             Self {
                 label: label.into(),
                 detail: None,
+                context: None,
                 spinning: false,
+                age: None,
             }
         }
     }
@@ -1514,13 +1652,104 @@ mod tests {
         fn detail(&self) -> Option<&str> {
             self.detail.as_deref()
         }
+        fn context_str(&self) -> Option<&str> {
+            self.context.as_deref()
+        }
         fn is_spinning(&self) -> bool {
             self.spinning
+        }
+        fn age(&self, _now: &ClockSample) -> Option<Duration> {
+            self.age
         }
     }
 
     /// The running-task spinner is drawn here and nowhere else, so this is the
     /// only place that can tell the loop to keep painting it.
+
+    #[test]
+    fn picker_age_cadence_tracks_filtered_rows() {
+        let mut p = ListPicker::new();
+        let mut aged = Entry::new("alpha");
+        aged.age = Some(Duration::from_secs(9));
+        p.open(vec![aged, Entry::new("beta")], " Test ");
+
+        let cadence = p.cadence();
+        assert_eq!(cadence.frame(), Some(crate::repaint::AGE_FRAME));
+        assert!(cadence.moves(), "a live age owes a frame");
+
+        p.handle_key(key(KeyCode::Char('z')));
+        assert_eq!(
+            p.cadence(),
+            Cadence::IDLE,
+            "a filtered-out age must not keep animating"
+        );
+
+        p.close();
+        assert_eq!(p.cadence(), Cadence::IDLE, "a closed picker draws nothing");
+    }
+
+    #[test]
+    fn picker_compound_age_layout() {
+        let mut p = ListPicker::new();
+        let mut aged = Entry::new("task");
+        aged.context = Some("12k".into());
+        aged.age = Some(Duration::from_secs(4 * 86400 + 7 * 3600 + 23 * 60 + 9));
+        p.open(vec![aged], " Age ");
+        let now = fixed_clock();
+        let render = |p: &mut ListPicker<Entry>, width: u16| {
+            let area = Rect::new(0, 0, width, 8);
+            let mut terminal = Terminal::new(TestBackend::new(width, 8)).unwrap();
+            terminal
+                .draw(|frame| {
+                    p.view_at(frame, area, &now);
+                })
+                .unwrap();
+            buffer_lines(&terminal, area)
+        };
+
+        let wide = render(&mut p, 80);
+        let wide_row = wide.iter().find(|line| line.contains("task")).unwrap();
+        assert!(wide_row.contains("12k 4d 7h 23m 9s"));
+        assert!(wide_row.chars().count() <= 80);
+
+        let narrow = render(&mut p, 34);
+        let narrow_row = narrow.iter().find(|line| line.contains("9s")).unwrap();
+        assert!(
+            !narrow_row.contains("12k"),
+            "the snippet/context yields first"
+        );
+        assert!(narrow_row.contains("4d 7h 23m 9s"));
+
+        let elided = render(&mut p, 28);
+        let elided_row = elided.iter().find(|line| line.contains("9s")).unwrap();
+        assert!(elided_row.contains('…'), "higher units elide first");
+        assert!(!elided_row.contains("4d 7h 23m 9s"));
+        assert!(elided_row.chars().count() <= 28);
+    }
+
+    #[test]
+    fn narrow_aged_row_keeps_status_marker() {
+        let mut p = ListPicker::new();
+        let mut running = Entry::new("task");
+        running.spinning = true;
+        running.age = Some(Duration::from_secs(4 * 86400 + 7 * 3600 + 23 * 60 + 9));
+        p.open(vec![running], " Age ");
+        let now = fixed_clock();
+        let area = Rect::new(0, 0, 24, 8);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                p.view_at(frame, area, &now);
+            })
+            .unwrap();
+        let lines = buffer_lines(&terminal, area);
+        let row = lines.iter().find(|line| line.contains("9s")).unwrap();
+        assert!(
+            row.chars().any(|c| ('\u{2800}'..='\u{28ff}').contains(&c)),
+            "the spinner survives age shortening: {row:?}"
+        );
+    }
+
     #[test]
     fn a_spinning_item_animates_the_picker() {
         let mut p = ListPicker::new();
@@ -1995,6 +2224,7 @@ mod tests {
                     0,
                     1,
                     None,
+                    &fixed_clock(),
                 );
             })
             .unwrap();
@@ -2040,7 +2270,18 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
         terminal
             .draw(|frame| {
-                render_list(frame, area, &[0], &items, &[Some(vec![0])], 0, 0, 1, None);
+                render_list(
+                    frame,
+                    area,
+                    &[0],
+                    &items,
+                    &[Some(vec![0])],
+                    0,
+                    0,
+                    1,
+                    None,
+                    &fixed_clock(),
+                );
             })
             .unwrap();
         assert_eq!(buffer_lines(&terminal, area), vec![expected]);
@@ -2118,7 +2359,7 @@ mod tests {
             label: String,
             finished: bool,
             ctx: Option<String>,
-            ago: Option<String>,
+            age: Option<Duration>,
         }
         impl PickerItem for Task {
             fn label(&self) -> &str {
@@ -2130,8 +2371,8 @@ mod tests {
             fn context_str(&self) -> Option<&str> {
                 self.ctx.as_deref()
             }
-            fn ago(&self) -> Option<String> {
-                self.ago.clone()
+            fn age(&self, _now: &ClockSample) -> Option<Duration> {
+                self.age
             }
         }
 
@@ -2140,13 +2381,13 @@ mod tests {
                 label: "running".into(),
                 finished: false,
                 ctx: Some("12k".into()),
-                ago: Some("2min ago".into()),
+                age: Some(Duration::from_secs(120)),
             },
             Task {
                 label: "done".into(),
                 finished: true,
                 ctx: Some("3k".into()),
-                ago: Some("5min ago".into()),
+                age: Some(Duration::from_secs(300)),
             },
         ];
         let area = Rect::new(0, 0, 80, 12);
@@ -2166,9 +2407,9 @@ mod tests {
         let running_row = lines.iter().position(|l| l.contains("running")).unwrap() as u16;
         let done_row = lines.iter().position(|l| l.contains("done")).unwrap() as u16;
         assert!(lines[running_row as usize].contains("12k"));
-        assert!(lines[running_row as usize].contains("2min ago"));
+        assert!(lines[running_row as usize].contains("2m 0s"));
         assert!(lines[done_row as usize].contains("3k"));
-        assert!(lines[done_row as usize].contains("5min ago"));
+        assert!(lines[done_row as usize].contains("5m 0s"));
 
         let done_line = &lines[done_row as usize];
         let done_col = done_line

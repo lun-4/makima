@@ -32,12 +32,16 @@ use std::time::Duration;
 
 use crate::animation::SPINNER_FRAME;
 
-/// How long the loop may sleep when nothing is animating. Real events wake it
-/// immediately, so this only bounds how stale a polled result can get.
+/// How long the loop may sleep, whatever is animating. Real events wake it
+/// immediately, so this only bounds how stale a polled result can get; a slower
+/// animation such as [`AGE_FRAME`] still owes frames only at its own deadline.
 pub const IDLE_POLL: Duration = Duration::from_millis(100);
 
 /// Fast enough that per-character reveals and colour fades look continuous.
 const SMOOTH_FRAME: Duration = Duration::from_millis(16);
+
+/// How often a visible second-precision age changes.
+pub const AGE_FRAME: Duration = Duration::from_secs(1);
 
 /// What every poller in the crate is tested against, so the two invariants
 /// read the same wherever they are checked.
@@ -143,31 +147,36 @@ impl<T> Default for Watch<T> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cadence {
     frame: Option<Duration>,
-    moves: bool,
+    paint: Option<Duration>,
 }
 
 impl Cadence {
     /// Nothing to come back for. The loop sleeps until something happens.
     pub const IDLE: Self = Self {
         frame: None,
-        moves: false,
+        paint: None,
     };
     /// Spinner glyphs, which advance once per [`SPINNER_FRAME`]. Painting any
     /// faster redraws the same glyph.
     pub const SPINNER: Self = Self {
         frame: Some(SPINNER_FRAME),
-        moves: true,
+        paint: Some(SPINNER_FRAME),
     };
     /// Typewriter reveals and colour fades, which change every frame.
     pub const SMOOTH: Self = Self {
         frame: Some(SMOOTH_FRAME),
-        moves: true,
+        paint: Some(SMOOTH_FRAME),
+    };
+    /// Second-precision elapsed ages, which redraw once per displayed second.
+    pub const AGE: Self = Self {
+        frame: Some(AGE_FRAME),
+        paint: Some(AGE_FRAME),
     };
     /// A worker mid-answer, looked at again on the smooth frame so a result
     /// landing between two frames is on screen in the next one.
     pub const PENDING: Self = Self {
         frame: Some(SMOOTH_FRAME),
-        moves: false,
+        paint: None,
     };
 
     /// A wake deadline owed to no pixel motion: the loop must come back in
@@ -177,7 +186,7 @@ impl Cadence {
     pub fn after(frame: Duration) -> Self {
         Self {
             frame: Some(frame),
-            moves: false,
+            paint: None,
         }
     }
 
@@ -187,15 +196,17 @@ impl Cadence {
     }
 
     /// Combines both axes: the soonest anyone has to be looked at again, and
-    /// motion if anyone moves. A single scale would let a pending poll outrank
-    /// a typewriter and freeze it.
+    /// the soonest anyone's motion owes a frame. Kept apart so a fast poll
+    /// never drags a slow animation up to its own frame rate, while a single
+    /// scale would let a pending poll outrank a typewriter and freeze it.
     pub fn any(cadences: impl IntoIterator<Item = Self>) -> Self {
+        let soonest = |a: Option<Duration>, b: Option<Duration>| match (a, b) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         cadences.into_iter().fold(Self::IDLE, |a, b| Self {
-            frame: match (a.frame, b.frame) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            },
-            moves: a.moves | b.moves,
+            frame: soonest(a.frame, b.frame),
+            paint: soonest(a.paint, b.paint),
         })
     }
 
@@ -207,7 +218,12 @@ impl Cadence {
 
     /// Whether the next frame differs from this one on the clock alone.
     pub fn moves(self) -> bool {
-        self.moves
+        self.paint.is_some()
+    }
+
+    /// How long until motion on the clock alone owes a frame, if any does.
+    pub fn paint(self) -> Option<Duration> {
+        self.paint
     }
 }
 
@@ -221,6 +237,8 @@ mod tests {
     const EXPECT_SETTLED: &str = "nothing to combine must leave the loop asleep";
     const EXPECT_SOONEST: &str = "the soonest source must win over the whole list";
     const EXPECT_MOTION_KEPT: &str = "a pending poll must not swallow another source's motion";
+    const EXPECT_SLOW_PAINT: &str =
+        "a faster poll must not shorten another source's paint deadline";
     const EXPECT_UNSEEN: &str = "an unpolled watch has nothing to render";
 
     #[test]
@@ -268,6 +286,14 @@ mod tests {
         let folded = Cadence::any([Cadence::IDLE, wake, Cadence::PENDING]);
         assert_eq!(folded.frame(), wake.frame(), "the earliest wake must win");
         assert!(!folded.moves(), "a deadline must not imply motion");
+    }
+
+    #[test]
+    fn a_fast_wake_does_not_hasten_a_slow_paint() {
+        let poll = Duration::from_millis(10);
+        let mixed = Cadence::any([Cadence::after(poll), Cadence::AGE]);
+        assert_eq!(mixed.frame(), Some(poll), "{EXPECT_SOONEST}");
+        assert_eq!(mixed.paint(), Cadence::AGE.paint(), "{EXPECT_SLOW_PAINT}");
     }
 
     /// A generation counter answers this too, as long as every publisher

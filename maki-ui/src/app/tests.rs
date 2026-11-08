@@ -2732,12 +2732,139 @@ fn task_picker_preview_tracks_selected_chat_across_concurrent_reorder() {
 }
 
 #[test]
-fn ago_formats_relative_start_time() {
+fn task_age_uses_monotonic_start() {
     let now = Instant::now();
-    assert_eq!(ago(now), "just now");
-    assert_eq!(ago(now - Duration::from_secs(5 * 60)), "5min ago");
-    assert_eq!(ago(now - Duration::from_secs(2 * 60 * 60)), "2h ago");
-    assert_eq!(ago(now - Duration::from_secs(3 * 24 * 60 * 60)), "3d ago");
+    let clock = ClockSample {
+        monotonic: now,
+        unix: Duration::ZERO,
+    };
+    let entry = |started_at| TaskEntry {
+        name: "task".into(),
+        finished: Some(true),
+        chat_index: 1,
+        identity: TaskIdentity::Unidentified(1),
+        parent_chat_index: None,
+        depth: 0,
+        snippet: String::new(),
+        context: String::new(),
+        started_at,
+    };
+
+    assert_eq!(
+        entry(Some(now)).age(&clock).map(maki_lua::format_ago),
+        Some("0s".into())
+    );
+    assert_eq!(
+        entry(Some(now - Duration::from_secs(5 * 60)))
+            .age(&clock)
+            .map(maki_lua::format_ago),
+        Some("5m 0s".into())
+    );
+    assert_eq!(
+        entry(Some(now - Duration::from_secs(2 * 60 * 60)))
+            .age(&clock)
+            .map(maki_lua::format_ago),
+        Some("2h 0s".into())
+    );
+    assert_eq!(
+        entry(Some(now - Duration::from_secs(3 * 24 * 60 * 60)))
+            .age(&clock)
+            .map(maki_lua::format_ago),
+        Some("3d 0s".into())
+    );
+    assert_eq!(entry(None).age(&clock), None);
+}
+
+fn picker_rows(picker: &mut ListPicker<TaskEntry>, now: &ClockSample) -> Vec<String> {
+    let area = Rect::new(0, 0, 80, 24);
+    let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            picker.view_at(frame, area, now);
+        })
+        .unwrap();
+    let buf = terminal.backend().buffer();
+    (0..area.height)
+        .map(|y| {
+            (0..area.width)
+                .map(|x| {
+                    buf.cell(ratatui::layout::Position::new(x, y))
+                        .map(|c| c.symbol())
+                        .unwrap_or(" ")
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn task_picker_finished_ages_advance_without_row_refresh() {
+    let mut app = app_with_subagent();
+    finish_subagent_task(&mut app, false);
+    app.open_tasks();
+    let started = app.chats[1].started_at().unwrap();
+    let first = ClockSample {
+        monotonic: started + Duration::from_secs(5),
+        unix: Duration::ZERO,
+    };
+    let second = ClockSample {
+        monotonic: first.monotonic + crate::repaint::AGE_FRAME,
+        unix: Duration::ZERO,
+    };
+
+    let rows = picker_rows(&mut app.task_picker, &first);
+    assert!(rows.iter().any(|row| row.contains("5s")));
+    let selected = app.task_picker.selected_index();
+    let count = app.task_picker.items().unwrap().len();
+    let selected_chat = app
+        .task_picker
+        .selected_item()
+        .map(|entry| entry.chat_index);
+
+    let rows = picker_rows(&mut app.task_picker, &second);
+    assert!(rows.iter().any(|row| row.contains("6s")));
+    assert_eq!(app.task_picker.selected_index(), selected);
+    assert_eq!(app.task_picker.items().unwrap().len(), count);
+    assert_eq!(
+        app.task_picker
+            .selected_item()
+            .map(|entry| entry.chat_index),
+        selected_chat
+    );
+
+    let cadence = app.task_picker.cadence();
+    assert_eq!(cadence.frame(), Some(crate::repaint::AGE_FRAME));
+    assert!(
+        cadence.moves(),
+        "a finished-only task list still owes age frames"
+    );
+    app.task_picker.close();
+    assert_eq!(app.task_picker.cadence(), Cadence::IDLE);
+}
+
+#[test]
+fn task_picker_preserves_missing_and_completed_age_semantics() {
+    let mut app = app_with_subagent();
+    finish_subagent_task(&mut app, false);
+    let started = app.chats[1].started_at().unwrap();
+    let clock = ClockSample {
+        monotonic: started + Duration::from_secs(5),
+        unix: Duration::ZERO,
+    };
+    let entries = app.task_entries();
+    let sub = entries.iter().find(|entry| entry.chat_index == 1).unwrap();
+    assert_eq!(sub.age(&clock), Some(Duration::from_secs(5)));
+    assert!(entries[0].age(&clock).is_none(), "the main chat has no age");
+    let later = ClockSample {
+        monotonic: clock.monotonic + Duration::from_secs(1),
+        unix: Duration::ZERO,
+    };
+    assert_eq!(
+        sub.age(&later),
+        Some(Duration::from_secs(6)),
+        "completed tasks keep aging instead of freezing their runtime"
+    );
 }
 
 #[test]
@@ -2787,18 +2914,22 @@ fn task_entries_sort_alive_then_most_recent() {
 }
 
 #[test]
-fn task_entry_shows_context_and_ago() {
+fn task_entry_shows_context_and_age() {
     let mut app = app_with_subagent();
     app.chats[1].context_size = 5000;
     let entries = app.task_entries();
 
+    let clock = ClockSample {
+        monotonic: Instant::now(),
+        unix: Duration::ZERO,
+    };
     let sub = entries.iter().find(|e| e.chat_index == 1).unwrap();
     assert_eq!(sub.context_str(), Some("5.0k"));
-    assert!(sub.ago().is_some_and(|s| !s.is_empty()));
+    assert!(sub.age(&clock).is_some());
 
     let main = &entries[0];
     assert_eq!(main.context_str(), None);
-    assert_eq!(main.ago(), None);
+    assert_eq!(main.age(&clock), None);
 }
 
 #[test]
@@ -3721,7 +3852,13 @@ fn restored_subagents_have_no_ago_and_are_finished() {
     let entries = app.task_entries();
     let sub = entries.iter().find(|e| e.chat_index == 1).unwrap();
     assert!(sub.is_finished());
-    assert_eq!(sub.ago(), None);
+    assert_eq!(
+        sub.age(&ClockSample {
+            monotonic: Instant::now(),
+            unix: Duration::ZERO,
+        }),
+        None
+    );
     assert_eq!(sub.depth(), 0);
     assert_eq!(sub.parent_chat_index, None);
 

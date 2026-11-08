@@ -11,19 +11,15 @@ end
 local CURRENT_LABEL = "current"
 local OPEN_LABEL = "open"
 local COUNT_WIDTH = 15
-local STATUS_WIDTH = 10
+local TITLE_MIN_WIDTH = 4
 local ROW_PREFIX_WIDTH = 2
 local ICON_WIDTH = 2
-local RIGHT_COLUMNS_WIDTH = COUNT_WIDTH + 1 + STATUS_WIDTH
+local RIGHT_SEPARATOR_WIDTH = 1
+local ROW_TITLE_FLOOR = 1
 local HEADER_STYLE = "path"
-local AGE_UNITS = {
-  { 31536000, "y" },
-  { 2592000, "mo" },
-  { 604800, "w" },
-  { 86400, "d" },
-  { 3600, "h" },
-  { 60, "m" },
-}
+local AGE_HEADER = "age"
+local COUNT_HEADER = "messages"
+local AGE_ELLIPSIS_MIN_WIDTH = 6
 
 -- Live rows win over their stored copies and keep `live = true` (read by the
 -- icon). Stored-only rows become idle and unfocused; `open_elsewhere` rides
@@ -60,15 +56,63 @@ function M.format_count(count)
   return tostring(count or 0)
 end
 
--- Widest everything left of the separator (prefix, icon, title) may render
--- and still leave the fixed right columns on screen.
-function M.title_width_budget(confirm_width, inner_width)
-  return math.max(inner_width - confirm_width - 1 - RIGHT_COLUMNS_WIDTH, 1)
+local function max_width(values, minimum)
+  local width = minimum
+  for _, value in ipairs(values) do
+    width = math.max(width, dispw(value))
+  end
+  return width
 end
 
-function M.row_right_columns(left_width, inner_width, count)
-  local count_text = M.format_count(count)
-  local padding = math.max(inner_width - left_width - RIGHT_COLUMNS_WIDTH, 1)
+-- One column budget per render. Ages keep priority over the message count:
+-- status gets what it needs, the count shrinks from its preferred 15 cells,
+-- and disappears before an age is elided.
+function M.layout(inner_width, statuses, counts)
+  local left_min = math.min(inner_width, ROW_PREFIX_WIDTH + ICON_WIDTH + TITLE_MIN_WIDTH)
+  local available = math.max(inner_width - left_min, 0)
+  local status_width = math.min(max_width(statuses, dispw(AGE_HEADER)), available)
+  local count_min = max_width(counts, dispw(COUNT_HEADER))
+  local show_count = available >= status_width + RIGHT_SEPARATOR_WIDTH + count_min
+  local count_width = 0
+  if show_count then
+    count_width = math.min(COUNT_WIDTH, available - status_width - RIGHT_SEPARATOR_WIDTH)
+  end
+  local right_width = status_width + (show_count and RIGHT_SEPARATOR_WIDTH + count_width or 0)
+  return {
+    status_width = status_width,
+    count_width = count_width,
+    show_count = show_count,
+    right_width = right_width,
+  }
+end
+
+-- The row asking for delete confirmation lends its message count cell to the
+-- confirmation so the destructive hint stays readable next to a wide age; the
+-- age keeps its column.
+function M.confirm_layout(layout)
+  return {
+    status_width = layout.status_width,
+    count_width = 0,
+    show_count = false,
+    right_width = layout.status_width,
+  }
+end
+
+-- Widest everything left of the separator (prefix, icon, title) may render
+-- and still leave the right columns on screen.
+function M.title_width_budget(confirm_width, inner_width, layout)
+  return math.max(inner_width - confirm_width - layout.right_width - RIGHT_SEPARATOR_WIDTH, ROW_TITLE_FLOOR)
+end
+
+-- Widest delete confirmation that still leaves the title floor and the
+-- separator before the right columns.
+function M.confirm_width_budget(inner_width, layout)
+  return math.max(inner_width - layout.right_width - RIGHT_SEPARATOR_WIDTH - ROW_TITLE_FLOOR, 0)
+end
+
+function M.row_right_columns(left_width, inner_width, count, layout)
+  local count_text = layout.show_count and M.format_count(count) or ""
+  local padding = math.max(inner_width - left_width - layout.right_width, 1)
   return count_text, padding
 end
 
@@ -92,54 +136,97 @@ function M.clip_spans(spans, max_width)
       used = used + width
     else
       local text = span[1]
-      clipped[#clipped + 1] = { text:sub(1, utf8.offset(text, max_width - used + 1) - 1), span[2] }
+      local offset = utf8.offset(text, max_width - used + 1)
+      if offset then
+        clipped[#clipped + 1] = { text:sub(1, offset - 1), span[2] }
+      end
       used = max_width
     end
   end
   return clipped
 end
 
-function M.row_spans(title_spans, count_text, count_style, padding, status, status_style)
+local function elide_left(text, max_width)
+  if max_width <= 0 then
+    return ""
+  end
+  if dispw(text) <= max_width then
+    return text
+  end
+  local chars = {}
+  for _, cp in utf8.codes(text) do
+    chars[#chars + 1] = utf8.char(cp)
+  end
+  local keep = max_width
+  local ellipsis = ""
+  if max_width >= AGE_ELLIPSIS_MIN_WIDTH then
+    keep = max_width - 1
+    ellipsis = "…"
+  end
+  return ellipsis .. table.concat(chars, "", math.max(#chars - keep + 1, 1))
+end
+
+M.elide_left = elide_left
+
+function M.row_spans(title_spans, count_text, count_style, padding, status, status_style, layout)
   local spans = {}
   for _, span in ipairs(title_spans) do
     spans[#spans + 1] = span
   end
   spans[#spans + 1] = { string.rep(" ", padding), count_style }
-  spans[#spans + 1] = { string.rep(" ", math.max(COUNT_WIDTH - dispw(count_text), 0)), count_style }
-  spans[#spans + 1] = { count_text, count_style }
-  spans[#spans + 1] = { " ", count_style }
-  spans[#spans + 1] = { string.rep(" ", math.max(STATUS_WIDTH - dispw(status), 0)), status_style }
+  if layout.show_count then
+    spans[#spans + 1] = {
+      string.rep(" ", math.max(layout.count_width - dispw(count_text), 0)),
+      count_style,
+    }
+    spans[#spans + 1] = { count_text, count_style }
+    spans[#spans + 1] = { string.rep(" ", RIGHT_SEPARATOR_WIDTH), count_style }
+  end
+  status = elide_left(status, layout.status_width)
+  spans[#spans + 1] = {
+    string.rep(" ", math.max(layout.status_width - dispw(status), 0)),
+    status_style,
+  }
   spans[#spans + 1] = { status, status_style }
   return spans
 end
 
-function M.header_spans(inner_width)
-  local title = "title"
-  local count = "messages"
-  local status = "age"
-  local used = ROW_PREFIX_WIDTH + ICON_WIDTH + dispw(title)
-  local padding = math.max(inner_width - used - RIGHT_COLUMNS_WIDTH, 1)
-  return {
-    { string.rep(" ", ROW_PREFIX_WIDTH + ICON_WIDTH) .. title, HEADER_STYLE },
+function M.header_spans(inner_width, layout)
+  local budget = math.max(inner_width - layout.right_width - RIGHT_SEPARATOR_WIDTH, 1)
+  local title = M.clip_spans({ { string.rep(" ", ROW_PREFIX_WIDTH + ICON_WIDTH) .. "title", HEADER_STYLE } }, budget)
+  local used = M.spans_width(title)
+  local padding = math.max(inner_width - used - layout.right_width, 1)
+  local spans = {
+    { title[1][1], HEADER_STYLE },
     { string.rep(" ", padding), HEADER_STYLE },
-    { string.rep(" ", math.max(COUNT_WIDTH - dispw(count), 0)), HEADER_STYLE },
-    { count, HEADER_STYLE },
-    { " ", HEADER_STYLE },
-    { string.rep(" ", math.max(STATUS_WIDTH - dispw(status), 0)), HEADER_STYLE },
-    { status, HEADER_STYLE },
   }
+  if layout.show_count then
+    spans[#spans + 1] = {
+      string.rep(" ", math.max(layout.count_width - dispw(COUNT_HEADER), 0)),
+      HEADER_STYLE,
+    }
+    spans[#spans + 1] = { COUNT_HEADER, HEADER_STYLE }
+    spans[#spans + 1] = { string.rep(" ", RIGHT_SEPARATOR_WIDTH), HEADER_STYLE }
+  end
+  local status = elide_left(AGE_HEADER, layout.status_width)
+  spans[#spans + 1] = {
+    string.rep(" ", math.max(layout.status_width - dispw(status), 0)),
+    HEADER_STYLE,
+  }
+  spans[#spans + 1] = { status, HEADER_STYLE }
+  return spans
 end
 
 -- Right side labels: focused says "current", open-elsewhere says "open",
 -- everything else shows its age; selection restyles whatever label.
-function M.right(s, selected)
+function M.right(s, selected, reference)
   local text, style
   if s.focused then
     text, style = CURRENT_LABEL, "accent"
   elseif s.open_elsewhere then
     text, style = OPEN_LABEL, "dim"
   else
-    text, style = M.age(s.updated_at), "dim"
+    text, style = M.age(s.updated_at, reference), "dim"
   end
   if selected then
     style = "selected"
@@ -189,14 +276,8 @@ function M.reconcile_selection(previous_id, previous_position, rows)
   return rows[position].id
 end
 
-function M.age(updated_at)
-  local secs = math.max(os.time() - (updated_at or 0), 0)
-  for _, u in ipairs(AGE_UNITS) do
-    if secs >= u[1] then
-      return math.floor(secs / u[1]) .. u[2] .. " ago"
-    end
-  end
-  return "just now"
+function M.age(updated_at, reference)
+  return maki.time.ago(maki.time.at(updated_at or 0), reference or maki.time.now())
 end
 
 return M
