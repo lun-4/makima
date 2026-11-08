@@ -303,6 +303,7 @@ pub fn child_persistence(
 
     let reserver: ConfigMutationReserver = Arc::new(move |target, publication| {
         let (key, name) = config_destination(target)?;
+        let agent_id = target.id().to_string();
         let checkpoint = Arc::clone(&config_checkpoint);
         Ok(Box::new(move |_, claim| {
             Ok(PreparedTransaction {
@@ -311,7 +312,10 @@ pub fn child_persistence(
                     Box::pin(async move {
                         checkpoint
                             .checkpoint_child_config(
-                                child_metadata(key, name, &ready.config),
+                                StoredSubagent {
+                                    agent_id: Some(agent_id),
+                                    ..child_metadata(key, name, &ready.config)
+                                },
                                 publication,
                                 claim,
                             )
@@ -331,7 +335,10 @@ pub fn child_persistence(
                 .effective_config()
                 .map_err(|error| error.to_string())?
                 .ok_or("child agent configuration is unavailable")?;
-            Ok::<_, String>(child_metadata(key, name, &config))
+            Ok::<_, String>(StoredSubagent {
+                agent_id: Some(target.id().to_string()),
+                ..child_metadata(key, name, &config)
+            })
         })();
         let checkpoint = Arc::clone(&checkpoint);
         Box::pin(async move {
@@ -347,6 +354,8 @@ pub fn child_persistence(
 
 pub fn child_metadata(key: String, name: String, config: &EffectiveAgentConfig) -> StoredSubagent {
     StoredSubagent {
+        agent_id: None,
+        ambiguous: false,
         tool_use_id: key,
         name,
         model: Some(config.model.spec()),

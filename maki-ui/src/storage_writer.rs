@@ -1128,6 +1128,47 @@ fn project_selected_config(
 
 fn preserve_child_config(incoming: &mut Arc<AppSession>, latest: &AppSession) {
     let mut subagents = incoming.subagents().to_vec();
+    let mut incoming_ids = HashSet::new();
+    let incoming_duplicates: HashSet<_> = subagents
+        .iter()
+        .filter_map(|child| {
+            (!incoming_ids.insert(&child.tool_use_id)).then_some(&child.tool_use_id)
+        })
+        .cloned()
+        .collect();
+    let mut latest_ids = HashSet::new();
+    let latest_duplicates: HashSet<_> = latest
+        .subagents()
+        .iter()
+        .filter_map(|child| (!latest_ids.insert(&child.tool_use_id)).then_some(&child.tool_use_id))
+        .cloned()
+        .collect();
+    let mut agent_keys: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for child in incoming.subagents().iter().chain(latest.subagents()) {
+        if let Some(agent_id) = child.agent_id.as_deref() {
+            agent_keys
+                .entry(agent_id)
+                .or_default()
+                .insert(&child.tool_use_id);
+        }
+    }
+    let colliding_keys: HashSet<_> = agent_keys
+        .values()
+        .filter(|keys| keys.len() > 1)
+        .flat_map(|keys| keys.iter().copied())
+        .collect();
+    for child in &mut subagents {
+        if incoming_duplicates.contains(&child.tool_use_id)
+            || latest_duplicates.contains(&child.tool_use_id)
+            || colliding_keys.contains(child.tool_use_id.as_str())
+            || (child.agent_id.is_some()
+                && latest.subagent_messages().contains_key(&child.tool_use_id)
+                && !latest_ids.contains(&child.tool_use_id))
+        {
+            child.ambiguous = true;
+            child.agent_id = None;
+        }
+    }
     for current in latest.subagents() {
         if let Some(child) = subagents
             .iter_mut()
@@ -1136,11 +1177,43 @@ fn preserve_child_config(incoming: &mut Arc<AppSession>, latest: &AppSession) {
             child.model.clone_from(&current.model);
             child.thinking = current.thinking;
             child.fast = current.fast;
+            child.ambiguous |= current.ambiguous
+                || matches!((&child.agent_id, &current.agent_id), (Some(a), Some(b)) if a != b)
+                || (child.agent_id.is_none()
+                    && current.agent_id.is_some()
+                    && incoming
+                        .subagent_messages()
+                        .contains_key(&child.tool_use_id))
+                || (current.agent_id.is_none()
+                    && child.agent_id.is_some()
+                    && latest.subagent_messages().contains_key(&child.tool_use_id));
+            if child.ambiguous {
+                child.agent_id = None;
+            } else if child.agent_id.is_none() {
+                child.agent_id.clone_from(&current.agent_id);
+            }
         } else if incoming
             .subagent_messages()
             .contains_key(&current.tool_use_id)
+            || latest
+                .subagent_messages()
+                .contains_key(&current.tool_use_id)
+            || current.ambiguous
+            || latest_duplicates.contains(&current.tool_use_id)
+            || colliding_keys.contains(current.tool_use_id.as_str())
         {
-            subagents.push(current.clone());
+            let mut child = current.clone();
+            if (child.agent_id.is_some()
+                && incoming
+                    .subagent_messages()
+                    .contains_key(&current.tool_use_id))
+                || latest_duplicates.contains(&child.tool_use_id)
+                || colliding_keys.contains(child.tool_use_id.as_str())
+            {
+                child.ambiguous = true;
+                child.agent_id = None;
+            }
+            subagents.push(child);
         }
     }
     if subagents != incoming.subagents() {
@@ -1183,8 +1256,8 @@ fn merge_tui_snapshot(
     live_ids: Option<&[String]>,
 ) -> Arc<AppSession> {
     let mut session = Arc::clone(incoming);
-    preserve_newer_child_histories(&mut session, latest);
     preserve_child_config(&mut session, latest);
+    preserve_newer_child_histories(&mut session, latest);
     if (preserve_history || session.history_snapshot().epoch < latest.history_snapshot().epoch)
         && session.history_identity() != latest.history_identity()
     {
@@ -2025,6 +2098,8 @@ mod tests {
                 .into_iter()
                 .map(|key| StoredSubagent {
                     tool_use_id: key.into(),
+                    agent_id: None,
+                    ambiguous: false,
                     name: key.into(),
                     model: Some(MODEL.into()),
                     thinking: Some(StoredThinking::Adaptive),
@@ -2116,6 +2191,8 @@ mod tests {
         session.set_subagent_messages(TOOL_ID.into(), vec![Message::user(BASE_MSG.into())]);
         session.set_subagents(vec![StoredSubagent {
             tool_use_id: TOOL_ID.into(),
+            agent_id: None,
+            ambiguous: false,
             name: TOOL_ID.into(),
             model: Some(MODEL.into()),
             thinking: Some(StoredThinking::Adaptive),
@@ -2205,6 +2282,152 @@ mod tests {
         }
     }
 
+    #[test_case(false; "no_incoming_history")]
+    #[test_case(true; "unidentified_incoming_history")]
+    fn missing_child_metadata_is_ambiguous_only_with_incoming_history(has_history: bool) {
+        let mut latest = AppSession::new(MODEL, CWD);
+        latest.set_subagents(vec![StoredSubagent {
+            tool_use_id: TOOL_ID.into(),
+            agent_id: Some(SIBLING_AGENT_ID.into()),
+            ambiguous: false,
+            name: TOOL_ID.into(),
+            model: None,
+            thinking: None,
+            fast: false,
+        }]);
+        let mut incoming = AppSession::new(MODEL, CWD);
+        if has_history {
+            incoming.set_subagent_messages(TOOL_ID.into(), vec![Message::user(BASE_MSG.into())]);
+        }
+        let merged = merge_tui_snapshot(&Arc::new(incoming), &latest, false, None);
+        if has_history {
+            assert!(merged.subagents()[0].ambiguous);
+            assert_eq!(merged.subagents()[0].agent_id, None);
+        } else {
+            assert!(merged.subagents().is_empty());
+        }
+    }
+
+    #[test_case(false; "no_latest_history")]
+    #[test_case(true; "unidentified_latest_history")]
+    fn missing_latest_metadata_is_ambiguous_only_with_history(has_history: bool) {
+        let mut latest = AppSession::new(MODEL, CWD);
+        if has_history {
+            latest.set_subagent_messages(TOOL_ID.into(), vec![Message::user(BASE_MSG.into())]);
+        }
+        let mut incoming = AppSession::new(MODEL, CWD);
+        incoming.set_subagents(vec![StoredSubagent {
+            tool_use_id: TOOL_ID.into(),
+            agent_id: Some(SIBLING_AGENT_ID.into()),
+            ambiguous: false,
+            name: TOOL_ID.into(),
+            model: None,
+            thinking: None,
+            fast: false,
+        }]);
+        let merged = merge_tui_snapshot(&Arc::new(incoming), &latest, false, None);
+        let child = &merged.subagents()[0];
+        assert_eq!(child.ambiguous, has_history);
+        assert_eq!(
+            child.agent_id.as_deref(),
+            (!has_history).then_some(SIBLING_AGENT_ID)
+        );
+        if has_history {
+            assert_eq!(
+                merged.subagent_messages()[TOOL_ID][0].user_text(),
+                Some(BASE_MSG)
+            );
+            let merged_again = merge_tui_snapshot(&merged, &latest, false, None);
+            assert!(merged_again.subagents()[0].ambiguous);
+            assert!(merged_again.subagents()[0].agent_id.is_none());
+        }
+    }
+
+    #[test]
+    fn legacy_child_without_history_adopts_known_identity() {
+        let mut latest = AppSession::new(MODEL, CWD);
+        let mut child = StoredSubagent {
+            tool_use_id: TOOL_ID.into(),
+            agent_id: Some(SIBLING_AGENT_ID.into()),
+            ambiguous: false,
+            name: TOOL_ID.into(),
+            model: None,
+            thinking: None,
+            fast: false,
+        };
+        latest.set_subagents(vec![child.clone()]);
+        latest.set_subagent_messages(TOOL_ID.into(), vec![Message::user(BASE_MSG.into())]);
+        child.agent_id = None;
+        let mut incoming = AppSession::new(MODEL, CWD);
+        incoming.set_subagents(vec![child]);
+        let merged = merge_tui_snapshot(&Arc::new(incoming), &latest, false, None);
+        assert!(!merged.subagents()[0].ambiguous);
+        assert_eq!(
+            merged.subagents()[0].agent_id.as_deref(),
+            Some(SIBLING_AGENT_ID)
+        );
+    }
+
+    #[test]
+    fn agent_id_collision_across_snapshots_is_sticky() {
+        let child = StoredSubagent {
+            tool_use_id: TOOL_ID.into(),
+            agent_id: Some(SIBLING_AGENT_ID.into()),
+            ambiguous: false,
+            name: TOOL_ID.into(),
+            model: None,
+            thinking: None,
+            fast: false,
+        };
+        let mut latest = AppSession::new(MODEL, CWD);
+        latest.set_subagents(vec![child.clone()]);
+        let mut incoming = AppSession::new(MODEL, CWD);
+        let mut other = child;
+        other.tool_use_id = LIVE_CHILD.into();
+        incoming.set_subagents(vec![other]);
+        let merged = merge_tui_snapshot(&Arc::new(incoming), &latest, false, None);
+        assert_eq!(merged.subagents().len(), 2);
+        assert!(
+            merged
+                .subagents()
+                .iter()
+                .all(|child| child.ambiguous && child.agent_id.is_none())
+        );
+        let merged_again = merge_tui_snapshot(&merged, &latest, false, None);
+        assert!(
+            merged_again
+                .subagents()
+                .iter()
+                .all(|child| child.ambiguous && child.agent_id.is_none())
+        );
+    }
+
+    #[test]
+    fn child_identity_collision_survives_snapshot_merge() {
+        let mut latest = AppSession::new(MODEL, CWD);
+        let child = StoredSubagent {
+            tool_use_id: TOOL_ID.into(),
+            agent_id: Some("first".into()),
+            ambiguous: false,
+            name: TOOL_ID.into(),
+            model: None,
+            thinking: None,
+            fast: false,
+        };
+        latest.set_subagents(vec![child.clone()]);
+        let mut incoming = latest.clone();
+        let mut other = child;
+        other.agent_id = Some("second".into());
+        incoming.set_subagents(vec![other]);
+        let mut incoming = Arc::new(incoming);
+        preserve_child_config(&mut incoming, &latest);
+        assert!(incoming.subagents()[0].ambiguous);
+        assert_eq!(incoming.subagents()[0].agent_id, None);
+        preserve_child_config(&mut incoming, &latest);
+        assert!(incoming.subagents()[0].ambiguous);
+        assert_eq!(incoming.subagents()[0].agent_id, None);
+    }
+
     #[test]
     fn child_config_survives_root_config_published_ahead_of_it() {
         let (_tmp, dir) = state_dir();
@@ -2212,6 +2435,8 @@ mod tests {
         let mut session = AppSession::new(MODEL, CWD);
         session.set_subagents(vec![StoredSubagent {
             tool_use_id: TOOL_ID.into(),
+            agent_id: None,
+            ambiguous: false,
             name: TOOL_ID.into(),
             model: Some(MODEL.into()),
             thinking: Some(StoredThinking::Adaptive),

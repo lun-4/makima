@@ -1242,11 +1242,18 @@ fn submit_during_streaming_queues_message() {
     assert_eq!(app.queue.len(), 1);
 }
 
-#[test]
-fn typed_completion_notices_render_once_and_skip_withdrawn() {
+#[test_case(COMPLETION_PREVIEW_CHARS - 1, false, false; "short")]
+#[test_case(COMPLETION_PREVIEW_CHARS, false, false; "at_limit")]
+#[test_case(COMPLETION_PREVIEW_CHARS + 1, false, true; "ui_truncated")]
+#[test_case(10, true, true; "delivery_truncated")]
+fn typed_completion_notices_render_once_and_skip_withdrawn(
+    chars: usize,
+    delivery_truncated: bool,
+    truncated: bool,
+) {
     use maki_agent::actor::{ActorEvent, ChildDelivery, DeliveryEvent, DeliveryStatus, TurnResult};
     const LABEL: &str = "research child";
-    const TEXT: &str = "bounded child result";
+    const TEXT: &str = "界";
     let mut app = test_app();
     let delivery = Arc::new(ChildDelivery {
         label: Some(LABEL.into()),
@@ -1258,8 +1265,15 @@ fn typed_completion_notices_render_once_and_skip_withdrawn() {
                 1,
                 DoneReason::EndTurn,
             ),
-            text: TEXT.repeat(COMPLETION_PREVIEW_CHARS),
-            output: Vec::new(),
+            text: TEXT.repeat(chars),
+            output: if delivery_truncated {
+                vec![serde_json::json!({
+                    "truncated": true,
+                    "full_result": {"lookup": "retained turn result"},
+                })]
+            } else {
+                Vec::new()
+            },
             provenance: Default::default(),
             duration_ms: 0,
         },
@@ -1269,6 +1283,7 @@ fn typed_completion_notices_render_once_and_skip_withdrawn() {
         status: DeliveryStatus::Discarded(maki_agent::TurnCancellationReason::User),
     }));
     assert_eq!(app.main_chat().message_count(), 0);
+    let agent_id = delivery.result.outcome.agent_id();
     app.handle_actor_event(ActorEvent::Delivery(DeliveryEvent {
         delivery,
         status: DeliveryStatus::Executed {
@@ -1280,7 +1295,419 @@ fn typed_completion_notices_render_once_and_skip_withdrawn() {
     let notice = chat.message_at(0).unwrap();
     assert_eq!(notice.role, DisplayRole::Done);
     assert!(notice.text.contains(LABEL));
-    assert!(notice.text.chars().count() <= COMPLETION_LABEL_CHARS + COMPLETION_PREVIEW_CHARS + 20);
+    let marker = if truncated { COMPLETION_TRUNCATED } else { "" };
+    let preview = TEXT.repeat(chars.min(COMPLETION_PREVIEW_CHARS));
+    assert_eq!(notice.result_agent, Some(agent_id));
+    assert!(
+        notice
+            .result_preview
+            .as_ref()
+            .unwrap()
+            .starts_with(&format!("[Result from {LABEL}] {preview}{marker}"))
+    );
+    assert_eq!(
+        notice.text.contains("Full result lookup:"),
+        delivery_truncated
+    );
+}
+
+#[test_case(0, false, false, false; "first_child")]
+#[test_case(1, false, false, false; "second_child_same_label")]
+#[test_case(0, true, false, false; "drag_selects_without_navigation")]
+#[test_case(0, false, true, false; "child_unavailable_after_delivery")]
+#[test_case(0, false, false, true; "delivery_preview_opens_full_transcript")]
+fn completion_notice_navigates_to_child(
+    target: usize,
+    drag: bool,
+    unavailable: bool,
+    delivery_preview: bool,
+) {
+    use maki_agent::actor::{ActorEvent, ChildDelivery, DeliveryEvent, DeliveryStatus, TurnResult};
+    const LABEL: &str = "research child";
+    const TAIL: &str = "full result tail";
+    let mut app = app_without_splash();
+    let mut children = Vec::new();
+    for _ in 0..2 {
+        let agent_id = AgentId::generate();
+        let info = subagent_info_for_agent(agent_id, TASK_ID, LABEL, None, None);
+        let index = app.resolve_or_create_chat(&info);
+        let text = format!("{}{TAIL}", "界".repeat(COMPLETION_PREVIEW_CHARS + 1));
+        app.chats[index].push(DisplayMessage::new(DisplayRole::Assistant, text.clone()));
+        app.handle_actor_event(ActorEvent::Delivery(DeliveryEvent {
+            delivery: Arc::new(ChildDelivery {
+                label: Some(LABEL.into()),
+                result: TurnResult {
+                    outcome: TurnOutcome::completed(
+                        agent_id,
+                        TurnId::generate(),
+                        Default::default(),
+                        1,
+                        DoneReason::EndTurn,
+                    ),
+                    text: if delivery_preview { LABEL.into() } else { text },
+                    output: if delivery_preview {
+                        vec![serde_json::json!({
+                            "truncated": true,
+                            "full_result": {"agent_id": agent_id},
+                            "offload": {"path": IMAGE_PATH_PASTE, "complete": true},
+                        })]
+                    } else {
+                        Vec::new()
+                    },
+                    provenance: Default::default(),
+                    duration_ms: 0,
+                },
+            }),
+            status: DeliveryStatus::Executed {
+                parent_turn_id: TurnId::generate(),
+            },
+        }));
+        children.push((agent_id, index));
+    }
+    render_app(&mut app, 80, 60);
+    let (agent_id, index) = children[target];
+    let notice = (0..app.chats[0].message_count())
+        .filter_map(|index| app.chats[0].message_at(index))
+        .find(|message| message.result_agent == Some(agent_id))
+        .unwrap();
+    assert!(
+        notice
+            .result_preview
+            .as_ref()
+            .unwrap()
+            .contains(COMPLETION_TRUNCATED)
+    );
+    assert!(notice.text.contains("[View child transcript]"));
+    if delivery_preview {
+        assert!(notice.text.contains(IMAGE_PATH_PASTE));
+    }
+    let area = app.msg_area();
+    let row = (area.y..area.bottom())
+        .find(|&row| {
+            app.chats[0]
+                .message_at_row(row, area)
+                .is_some_and(|message| message.result_agent == Some(agent_id))
+        })
+        .unwrap();
+    if !drag {
+        for expanded in [true, false] {
+            app.update(mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                area.x,
+                row,
+            ));
+            app.update(mouse_event(
+                MouseEventKind::Up(MouseButton::Left),
+                area.x,
+                row,
+            ));
+            let notice = (0..app.chats[0].message_count())
+                .filter_map(|index| app.chats[0].message_at(index))
+                .find(|message| message.result_agent == Some(agent_id))
+                .unwrap();
+            assert_eq!(notice.result_expanded, expanded);
+            assert_eq!(app.active_chat, 0);
+            render_app(&mut app, 80, 60);
+        }
+    }
+    if unavailable {
+        app.live_chat_index.remove(&agent_id);
+    }
+    if !drag {
+        let action_row = (area.y..area.bottom())
+            .find(|&row| app.chats[0].result_navigation_at(row, area) == Some(agent_id))
+            .unwrap();
+        app.update(mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            area.x,
+            action_row,
+        ));
+        app.update(mouse_event(
+            MouseEventKind::Up(MouseButton::Left),
+            area.x,
+            action_row,
+        ));
+    } else {
+        app.update(mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            area.x,
+            row,
+        ));
+        if drag {
+            app.update(mouse_event(
+                MouseEventKind::Drag(MouseButton::Left),
+                area.x + 3,
+                row,
+            ));
+        }
+        app.update(mouse_event(
+            MouseEventKind::Up(MouseButton::Left),
+            area.x + if drag { 3 } else { 0 },
+            row,
+        ));
+    }
+    if drag || unavailable {
+        assert_eq!(app.active_chat, 0);
+    } else {
+        assert_eq!(app.active_chat, index);
+        assert!(app.chats[index].last_message_text().ends_with(TAIL));
+    }
+    if drag {
+        assert!(matches!(
+            app.selection_state,
+            Some(SelectionState::PendingCopy { .. })
+        ));
+    }
+    if unavailable {
+        assert_eq!(
+            app.status_bar.flash_text(),
+            Some(format!("Child transcript unavailable for {agent_id}").as_str())
+        );
+    }
+}
+
+#[test_case("valid", true; "unique_mapping")]
+#[test_case("ambiguous", false; "marked_ambiguous")]
+#[test_case("duplicate_id", false; "duplicate_agent_id")]
+#[test_case("duplicate_key", false; "duplicate_transcript_key")]
+#[test_case("missing_transcript", false; "missing_transcript")]
+#[test_case("duplicate_chat", false; "duplicate_chat")]
+#[test_case("live_chat", false; "live_chat")]
+fn historical_result_lookup_fails_closed(case: &str, expected: bool) {
+    const KEY: &str = "historical-task";
+    const OTHER: &str = "other-task";
+    let mut app = test_app();
+    let agent_id = AgentId::generate();
+    let entry = StoredSubagent {
+        tool_use_id: KEY.into(),
+        agent_id: Some(agent_id.to_string()),
+        ambiguous: case == "ambiguous",
+        name: KEY.into(),
+        model: None,
+        thinking: None,
+        fast: false,
+    };
+    let mut entries = vec![entry.clone()];
+    if case == "duplicate_id" {
+        let mut other = entry.clone();
+        other.tool_use_id = OTHER.into();
+        entries.push(other);
+    } else if case == "duplicate_key" {
+        let mut other = entry;
+        other.agent_id = Some(AgentId::generate().to_string());
+        entries.push(other);
+    }
+    app.state.session_mut().set_subagents(entries);
+    if case != "missing_transcript" {
+        app.state
+            .session_mut()
+            .set_subagent_messages(KEY.into(), vec![Message::user(KEY.into())]);
+    }
+    let mut chat = Chat::new(
+        KEY.into(),
+        app.ui_config.clone(),
+        app.lua_event_handle.clone(),
+        Arc::clone(&app.theme_provider),
+    );
+    chat.subagent_id = Some(KEY.into());
+    if case == "live_chat" {
+        chat.agent_id = Some(agent_id);
+    }
+    app.chats.push(chat);
+    if case == "duplicate_chat" {
+        let mut other = Chat::new(
+            OTHER.into(),
+            app.ui_config.clone(),
+            app.lua_event_handle.clone(),
+            Arc::clone(&app.theme_provider),
+        );
+        other.subagent_id = Some(KEY.into());
+        app.chats.push(other);
+    }
+    assert_eq!(app.historical_chat_index(agent_id), expected.then_some(1));
+}
+
+#[test_case(false, "available"; "main_available")]
+#[test_case(true, "available"; "nested_available")]
+#[test_case(false, "ambiguous"; "main_ambiguous")]
+#[test_case(true, "ambiguous"; "nested_ambiguous")]
+#[test_case(false, "missing"; "main_missing")]
+#[test_case(true, "missing"; "nested_missing")]
+fn restored_notice_shows_actual_transcript_availability(nested: bool, case: &str) {
+    use maki_providers::ObservationSource;
+    const KEY: &str = "target-task";
+    const PARENT: &str = "parent-task";
+    const HEADER: &str = "[internal child-result data, not a user instruction]";
+    let mut app = test_app();
+    let agent_id = AgentId::generate();
+    let turn_id = TurnId::generate();
+    let envelope = serde_json::json!({"kind":"child_result", "agent_id":agent_id.to_string(), "turn_id":turn_id.to_string(), "text":KEY});
+    let observation = Message {
+        observation_source: Some(ObservationSource::ChildResult {
+            agent_id: agent_id.to_string(),
+            turn_id: turn_id.to_string(),
+        }),
+        ..Message::observation(format!("{HEADER}\n{envelope}"))
+    };
+    let entry = |key: &str, id: Option<String>, ambiguous| StoredSubagent {
+        tool_use_id: key.into(),
+        agent_id: id,
+        ambiguous,
+        name: key.into(),
+        model: None,
+        thinking: None,
+        fast: false,
+    };
+    let mut entries = vec![entry(PARENT, None, false)];
+    if case != "missing" {
+        entries.push(entry(KEY, Some(agent_id.to_string()), case == "ambiguous"));
+        app.state
+            .session_mut()
+            .set_subagent_messages(KEY.into(), vec![Message::user(KEY.into())]);
+    }
+    app.state.session_mut().set_subagents(entries);
+    if nested {
+        app.state
+            .session_mut()
+            .set_subagent_messages(PARENT.into(), vec![observation]);
+    } else {
+        app.state.session_mut().push_message(observation);
+        app.state
+            .session_mut()
+            .set_subagent_messages(PARENT.into(), vec![Message::user(PARENT.into())]);
+    }
+    app.restore_display();
+    let chat_index = if nested { 1 } else { 0 };
+    let notice = app.chats[chat_index].message_at(0).unwrap();
+    let available = case == "available";
+    assert_eq!(notice.result_agent, available.then_some(agent_id));
+    assert_eq!(notice.text.contains("[View child transcript]"), available);
+    assert_eq!(
+        notice.text.contains("[Child transcript unavailable;"),
+        !available
+    );
+    assert_eq!(
+        notice
+            .result_preview
+            .as_ref()
+            .unwrap()
+            .contains("[View child transcript]"),
+        available
+    );
+}
+
+#[test_case(false; "duplicate_key")]
+#[test_case(true; "duplicate_agent_id")]
+fn restore_preserves_duplicate_identity_ambiguity(duplicate_id: bool) {
+    const KEY: &str = "duplicate-task";
+    const OTHER: &str = "other-task";
+    let mut app = test_app();
+    let agent_id = AgentId::generate();
+    let entry = StoredSubagent {
+        tool_use_id: KEY.into(),
+        agent_id: Some(agent_id.to_string()),
+        ambiguous: false,
+        name: KEY.into(),
+        model: None,
+        thinking: None,
+        fast: false,
+    };
+    let mut other = entry.clone();
+    if duplicate_id {
+        other.tool_use_id = OTHER.into();
+    } else {
+        other.agent_id = Some(AgentId::generate().to_string());
+    }
+    app.state.session_mut().set_subagents(vec![entry, other]);
+    app.state
+        .session_mut()
+        .set_subagent_messages(KEY.into(), vec![Message::user(KEY.into())]);
+    app.restore_display();
+    assert!(app.historical_chat_index(agent_id).is_none());
+    assert!(
+        app.state
+            .session
+            .subagents()
+            .iter()
+            .all(|entry| entry.ambiguous)
+    );
+}
+
+#[test_case(false; "legacy_without_history")]
+#[test_case(true; "legacy_with_unidentified_history")]
+fn sync_subagents_legacy_identity_depends_on_history(has_history: bool) {
+    const KEY: &str = "legacy-task";
+    let mut app = test_app();
+    let agent_id = AgentId::generate();
+    app.state.session_mut().set_subagents(vec![StoredSubagent {
+        tool_use_id: KEY.into(),
+        agent_id: None,
+        ambiguous: false,
+        name: KEY.into(),
+        model: None,
+        thinking: None,
+        fast: false,
+    }]);
+    if has_history {
+        app.state
+            .session_mut()
+            .set_subagent_messages(KEY.into(), vec![Message::user(KEY.into())]);
+    }
+    app.resolve_or_create_chat(&subagent_info_for_agent(agent_id, KEY, KEY, None, None));
+    let entry = &app.state.session.subagents()[0];
+    assert_eq!(entry.ambiguous, has_history);
+    assert_eq!(entry.agent_id, (!has_history).then(|| agent_id.to_string()));
+}
+
+#[test_case(false; "historical_transcript")]
+#[test_case(true; "historical_id_does_not_select_live_actor")]
+fn historical_result_click_resolves_only_restored_chat(live_only: bool) {
+    const KEY: &str = "historical-task";
+    let mut app = app_without_splash();
+    let agent_id = AgentId::generate();
+    let mut notice = crate::chat::format_child_result_notice(KEY, KEY, &[], Some(agent_id));
+    notice.result_historical = true;
+    app.chats[0].push(notice);
+    let index =
+        app.resolve_or_create_chat(&subagent_info_for_agent(agent_id, KEY, KEY, None, None));
+    if !live_only {
+        app.live_chat_index.remove(&agent_id);
+        app.chats[index].agent_id = None;
+        app.state.session_mut().set_subagents(vec![StoredSubagent {
+            tool_use_id: KEY.into(),
+            agent_id: Some(agent_id.to_string()),
+            ambiguous: false,
+            name: KEY.into(),
+            model: None,
+            thinking: None,
+            fast: false,
+        }]);
+        app.state
+            .session_mut()
+            .set_subagent_messages(KEY.into(), vec![Message::user(KEY.into())]);
+    }
+    render_app(&mut app, 80, 60);
+    let area = app.msg_area();
+    let row = (area.y..area.bottom())
+        .find(|&row| app.chats[0].result_navigation_at(row, area) == Some(agent_id))
+        .unwrap();
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        area.x,
+        row,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        area.x,
+        row,
+    ));
+    assert_eq!(app.active_chat, if live_only { 0 } else { index });
+    if live_only {
+        assert_eq!(
+            app.status_bar.flash_text(),
+            Some(format!("Child transcript unavailable for {agent_id}").as_str())
+        );
+    }
 }
 
 #[test_case(false; "deferred_input_drawn_on_consumption")]
@@ -3666,6 +4093,8 @@ fn restored_task_keyboard_submission_never_reaches_main(missing_identity: bool) 
     let mut app = test_app();
     app.state.session_mut().set_subagents(vec![StoredSubagent {
         tool_use_id: TASK.into(),
+        agent_id: None,
+        ambiguous: false,
         name: "old task".into(),
         model: None,
         thinking: None,
@@ -3713,6 +4142,8 @@ fn restored_subagents_have_no_ago_and_are_finished() {
     let id = "restored-sub".to_string();
     app.state.session_mut().set_subagents(vec![StoredSubagent {
         tool_use_id: id.clone(),
+        agent_id: None,
+        ambiguous: false,
         name: "old task".into(),
         model: None,
         thinking: None,
@@ -6775,6 +7206,53 @@ fn build_rewind_app() -> App {
     bind_history_actor(&mut app, messages);
     app.open_rewind_picker();
     app
+}
+
+#[test]
+fn history_replacement_preserves_live_child_navigation() {
+    use maki_providers::ObservationSource;
+    const KEY: &str = "live-task";
+    const HEADER: &str = "[internal child-result data, not a user instruction]";
+    let mut app = app_without_splash();
+    let root = bind_history_actor(&mut app, Vec::new());
+    let agent_id = AgentId::generate();
+    let index =
+        app.resolve_or_create_chat(&subagent_info_for_agent(agent_id, KEY, KEY, None, None));
+    let turn_id = TurnId::generate();
+    let envelope = serde_json::json!({"kind":"child_result", "agent_id":agent_id.to_string(), "turn_id":turn_id.to_string(), "text":KEY});
+    let observation = Message {
+        observation_source: Some(ObservationSource::ChildResult {
+            agent_id: agent_id.to_string(),
+            turn_id: turn_id.to_string(),
+        }),
+        ..Message::observation(format!("{HEADER}\n{envelope}"))
+    };
+    let snapshot = HistorySnapshot::new(vec![observation]);
+    app.apply_history_change(HistoryChange {
+        agent_id: root.id(),
+        epoch: snapshot.epoch,
+        messages: snapshot.messages,
+        draft: Message::user(String::new()),
+    });
+    let notice = app.chats[0].message_at(0).unwrap();
+    assert_eq!(notice.result_agent, Some(agent_id));
+    assert!(!notice.result_historical);
+    render_app(&mut app, 80, 60);
+    let area = app.msg_area();
+    let row = (area.y..area.bottom())
+        .find(|&row| app.chats[0].result_navigation_at(row, area) == Some(agent_id))
+        .unwrap();
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        area.x,
+        row,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        area.x,
+        row,
+    ));
+    assert_eq!(app.active_chat, index);
 }
 
 #[test_case(false; "main")]

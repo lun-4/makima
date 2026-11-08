@@ -21,6 +21,11 @@ const MIDDLE_SCROLL_MAX_RATE: f64 = 120.0;
 const MIDDLE_SCROLL_MAX_ELAPSED: Duration = Duration::from_millis(100);
 pub(super) const MIDDLE_SCROLL_ANCHOR: &str = "+";
 
+fn result_action_hit(action: &str, width: u16, row: u16, col: u16) -> bool {
+    let line = ratatui::text::Line::raw(action);
+    crate::wrap::index_at(&line, width, row, col) < action.len()
+}
+
 pub(super) struct MiddleScroll {
     pub(super) origin: Position,
     chat: usize,
@@ -305,6 +310,25 @@ impl App {
                 self.selection_state = None;
                 if zone == SelectionZone::Messages {
                     let area = self.msg_area();
+                    if let Some(id) = self.chats[self.active_chat].result_navigation_at(row, area) {
+                        if !self.result_action_contains(row, col, area, id) {
+                            return (Dirty::NO, vec![]);
+                        }
+                        let historical = self.chats[self.active_chat]
+                            .message_at_row(row, area)
+                            .is_some_and(|message| message.result_historical);
+                        let target = if historical {
+                            self.historical_chat_index(id)
+                        } else {
+                            self.live_chat_index.get(&id).copied()
+                        };
+                        if let Some(index) = target {
+                            self.active_chat = index;
+                        } else {
+                            self.flash(format!("Child transcript unavailable for {id}"));
+                        }
+                        return (Dirty::YES, vec![]);
+                    }
                     if let Some(id) = self.chats[self.active_chat].post_agent_at(row, area) {
                         let mut matches = self
                             .chats
@@ -324,6 +348,49 @@ impl App {
             }
         }
         (Dirty::NO, vec![])
+    }
+
+    fn result_action_contains(
+        &self,
+        row: u16,
+        col: u16,
+        area: Rect,
+        id: maki_agent::AgentId,
+    ) -> bool {
+        let width = area.width;
+        if col < area.x || col >= area.x.saturating_add(width) {
+            return false;
+        }
+        let chat = &self.chats[self.active_chat];
+        let Some(message) = chat.message_at_row(row, area) else {
+            return false;
+        };
+        let text = if message.result_expanded {
+            &message.text
+        } else {
+            message.result_preview.as_ref().unwrap_or(&message.text)
+        };
+        let Some(action) = text.lines().last() else {
+            return false;
+        };
+        let mut first_row = row;
+        while first_row > area.y && chat.result_navigation_at(first_row - 1, area) == Some(id) {
+            first_row -= 1;
+        }
+        let mut last_row = row;
+        while last_row + 1 < area.bottom()
+            && chat.result_navigation_at(last_row + 1, area) == Some(id)
+        {
+            last_row += 1;
+        }
+        let line = ratatui::text::Line::raw(action);
+        let height = crate::wrap::total_rows(std::slice::from_ref(&line), width);
+        let wrapped_row = if last_row + 1 < area.bottom() {
+            height.saturating_sub(1 + last_row - row)
+        } else {
+            row - first_row
+        };
+        result_action_hit(action, width, wrapped_row, col - area.x)
     }
 
     fn hover_update(&mut self, pos: Position) -> Dirty {
@@ -612,5 +679,22 @@ impl App {
                 Rect::new(a.x, a.y, a.width.saturating_sub(1), a.height)
             })
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod result_action_tests {
+    use super::result_action_hit;
+    use test_case::test_case;
+
+    #[test_case(80, 0, 0, true; "first_column")]
+    #[test_case(80, 0, 22, true; "last_column")]
+    #[test_case(80, 0, 23, false; "blank_after_action")]
+    #[test_case(10, 2, 9, true; "wrapped_text")]
+    fn action_bounds(width: u16, row: u16, col: u16, expected: bool) {
+        assert_eq!(
+            result_action_hit("[View child transcript]", width, row, col),
+            expected
+        );
     }
 }
