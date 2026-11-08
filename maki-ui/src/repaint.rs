@@ -32,8 +32,9 @@ use std::time::Duration;
 
 use crate::animation::SPINNER_FRAME;
 
-/// How long the loop may sleep when nothing is animating. Real events wake it
-/// immediately, so this only bounds how stale a polled result can get.
+/// How long the loop may sleep, whatever is animating. Real events wake it
+/// immediately, so this only bounds how stale a polled result can get; a slower
+/// animation such as [`AGE_FRAME`] still owes frames only at its own deadline.
 pub const IDLE_POLL: Duration = Duration::from_millis(100);
 
 /// Fast enough that per-character reveals and colour fades look continuous.

@@ -2054,7 +2054,9 @@ impl<'t> EventLoop<'t> {
                 (Some(pending), Some(soonest)) => Some(pending.min(soonest)),
                 (pending, soonest) => pending.or(soonest),
             };
-            let timeout = cadence.frame().unwrap_or(IDLE_POLL);
+            let timeout = cadence
+                .frame()
+                .map_or(IDLE_POLL, |frame| frame.min(IDLE_POLL));
             let timeout = paint_due.map_or(timeout, |due| {
                 timeout.min(due.saturating_duration_since(now))
             });
