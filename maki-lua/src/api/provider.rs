@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde::de::{Deserializer, Error, Visitor};
 
 use crate::api::util::pair::{Pair, try_pair};
+use crate::ctx::{Ctx, PluginCtx};
 use crate::plugin_permissions::PluginPermissions;
 use crate::provider::serialize_options;
 use crate::runtime::require_plugin_load;
@@ -18,6 +19,7 @@ const ID_PUNCTUATION: &str = "-_.";
 const BAD_ID_ERR: &str =
     "must be non-empty ASCII letters, digits, '-', '_' or '.', and not start with '.'";
 const BAD_ALIAS_ERR: &str = "must be a valid provider id other than the provider's own";
+const BAD_ARGS_ERR: &str = "takes (ctx, spec) or (spec)";
 
 pub(crate) struct ProviderSpec {
     pub(crate) plugin: Arc<str>,
@@ -32,8 +34,8 @@ pub(crate) struct ProviderSpec {
     pub(crate) auth_status: Option<Function>,
     pub(crate) logout: Option<Function>,
     pub(crate) docs: Option<ProviderDocs>,
-    /// The registering plugin's `maki.net.send`, carrying its permissions.
-    pub(crate) send: Function,
+    /// The ctx it was registered under; its callbacks' ctxs derive from it.
+    pub(crate) ctx: PluginCtx,
 }
 
 pub(crate) type PendingProviders = Arc<Mutex<Vec<ProviderSpec>>>;
@@ -127,7 +129,7 @@ struct SpecFields {
 }
 
 /// The id names the provider's credentials file, so it must be a plain file name.
-fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && !id.starts_with('.')
         && id
@@ -161,9 +163,10 @@ fn spec_error(message: impl fmt::Display) -> mlua::Error {
     mlua::Error::runtime(format!("register_provider: {message}"))
 }
 
-/// Registers a model provider. Call it at the top level during plugin load.
-/// A provider id belongs to one plugin; registering an id another plugin
-/// already owns fails and names both plugins.
+/// Registers a model provider under {ctx}, or under the plugin's root ctx
+/// without one. Call it while the plugin loads, such as from a `setup(ctx)`
+/// that `init.lua` calls. A provider id belongs to one plugin; registering
+/// an id another plugin already owns fails and names both plugins.
 ///
 /// {spec} fields:
 ///   `id` (string) Required. The provider part of `provider/model` specs,
@@ -214,11 +217,12 @@ fn spec_error(message: impl fmt::Display) -> mlua::Error {
 /// Config is saved and the default model chosen only after `login`
 /// succeeds and `auth_status` no longer reports `missing`.
 ///
-/// `ctx` is `{ id, send, credentials }`, where `send` is `maki.net.send`
-/// with the `[provider]` connect, low-speed and stream timeouts as defaults, and
-/// `credentials` is the provider's `maki.provider.Credentials`. Only the
-/// registering plugin's callbacks receive `ctx`, so a provider id's
-/// credentials belong to the plugin that registered it. An instance has
+/// Callbacks receive a provider `maki.Ctx` derived from {ctx}: `id`, `send`
+/// (`maki.net.send` with the `[provider]` connect, low-speed and stream
+/// timeouts as defaults) and `credentials` (the provider's
+/// `maki.credentials.Store`); `maki.credentials.open` reaches {ctx}'s plugin
+/// stores through it. Only the registering plugin's callbacks receive it, so
+/// a provider id's credentials belong to the plugin that registered it. An instance has
 /// `stream(ctx, request, emit)` and optionally `fetch_usage(ctx)`,
 /// `refresh_auth(ctx)`, `reload_auth(ctx)`, `rotate_key(ctx)`,
 /// `end_conversation(ctx, conversation_id, reason)` and `key_count` (a
@@ -249,7 +253,8 @@ fn spec_error(message: impl fmt::Display) -> mlua::Error {
 /// retried. Every callback that returns nil plus an error follows these
 /// rules.
 ///
-/// @param spec table Provider definition (see above).
+/// @param ctx maki.Ctx? The ctx to register under; omit it for the plugin's root ctx.
+/// @param spec table Required. Provider definition (see above).
 /// @return
 /// @example
 /// maki.api.register_provider({
@@ -280,10 +285,16 @@ fn register_provider(
     lua: &Lua,
     #[ctx] pending: PendingProviders,
     #[ctx] plugin: Arc<str>,
-    #[ctx] send: Function,
-    spec: Table,
+    #[ctx] root: PluginCtx,
+    ctx: Option<Value>,
+    spec: Option<Table>,
 ) -> LuaResult<()> {
     require_plugin_load(lua, &plugin, "register_provider")?;
+    let (ctx, spec) = match (ctx, spec) {
+        (Some(Value::Table(spec)), None) => (root, spec),
+        (Some(Value::UserData(ctx)), Some(spec)) => (ctx.borrow::<Ctx>()?.plugin().clone(), spec),
+        _ => return Err(spec_error(BAD_ARGS_ERR)),
+    };
     let fields: SpecFields = lua
         .from_value_with(
             Value::Table(spec.clone()),
@@ -380,7 +391,7 @@ fn register_provider(
         auth_status: spec.get("auth_status")?,
         logout: spec.get("logout")?,
         docs: fields.docs,
-        send,
+        ctx,
     });
     Ok(())
 }
@@ -445,10 +456,10 @@ lua_table! {
     extend "maki.api" => pub(crate) fn add_provider_fn(
         pending: PendingProviders,
         plugin: Arc<str>,
-        send: Function,
+        root: PluginCtx,
         perms: &PluginPermissions
     ), DOCS [
-        register_provider(pending, plugin, send),
+        register_provider(pending, plugin, root),
         provider_config(perms),
         startup_provider_config(perms, plugin),
         save_provider_config(perms),

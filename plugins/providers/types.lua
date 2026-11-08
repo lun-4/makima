@@ -134,18 +134,23 @@ export type HttpRequest = {
   unix_socket: string?,
 }
 
-export type Credentials = {
-  read: (self: Credentials) -> (Json?, string?),
-  write: (self: Credentials, value: Json) -> (boolean?, string?),
-  delete: (self: Credentials) -> (boolean?, string?),
-  refresh: (self: Credentials, fn: (current: Json?) -> (Json?, string?)) -> (Json?, string?),
-  lock: <T...>(self: Credentials, fn: () -> T...) -> T...,
+-- `maki.credentials.Store`: a provider ctx's `credentials`, or
+-- `maki.credentials.open(ctx, key)` for a plugin store.
+export type Store = {
+  read: (self: Store) -> (Json?, string?),
+  write: (self: Store, value: Json) -> (boolean?, string?),
+  delete: (self: Store) -> (boolean?, string?),
+  refresh: (self: Store, fn: (current: Json?) -> (Json?, string?)) -> (Json?, string?),
+  lock: <T...>(self: Store, fn: () -> T...) -> T...,
 }
 
+-- `maki.Ctx` as a provider's callbacks receive it. Its fields cannot be
+-- assigned; `with_name` narrows it to a plugin ctx.
 export type Context = {
   id: string,
   send: (request: HttpRequest) -> (Response?, string?),
-  credentials: Credentials,
+  credentials: Store,
+  with_name: (self: Context, name: string) -> any,
 }
 
 export type UsageLimit = { kind: Json, percentage: number?, reset_at: number?, detail: string? }

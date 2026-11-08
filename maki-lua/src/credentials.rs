@@ -1,4 +1,5 @@
-//! `ctx.credentials`: a Lua provider's stored credentials and the shared,
+//! `maki.credentials.Store`: credentials stored for a provider (its ctx's
+//! `credentials`) or for a plugin (`maki.credentials.open`), and the shared,
 //! cross-process refresh transaction.
 
 use std::collections::HashMap;
@@ -8,7 +9,7 @@ use futures::FutureExt;
 use futures::channel::oneshot;
 use futures::future::Shared;
 use maki_agent::cancel::CancelToken;
-use maki_lua_macro::{lua_class, lua_fn};
+use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_storage::StateDir;
 use maki_storage::auth::{delete_credentials, load_credentials, lock_tokens, save_credentials};
 use mlua::{
@@ -20,8 +21,9 @@ use tracing::warn;
 
 use crate::api::env::host_state_dir;
 use crate::api::util::pair::{Pair, pair, try_pair};
+use crate::ctx::Ctx;
 use crate::provider::{HOST_STOPPED, ProviderJob, serialize_options};
-use crate::runtime::{Request, RequestTx, strip_traceback};
+use crate::runtime::{LoadingPlugin, Request, RequestTx, strip_traceback};
 
 const EMPTY_REFRESH: &str = "refresh returned nil with no stored credentials";
 
@@ -30,17 +32,24 @@ const EMPTY_REFRESH: &str = "refresh returned nil with no stored credentials";
 type RefreshResult = Result<Option<Value>, Value>;
 type Flight = Shared<oneshot::Receiver<RefreshResult>>;
 
-/// In-flight refreshes by provider id. Only the Lua thread touches it.
+/// In-flight refreshes by store name. Only the Lua thread touches it.
 #[derive(Default)]
 pub(crate) struct RefreshFlights(HashMap<Arc<str>, Flight>);
 
-/// Always addresses the credentials of the provider whose callback received it.
-pub(crate) struct Credentials {
-    pub(crate) id: Arc<str>,
+/// One credentials file, named relative to the auth dir: a provider id, or a
+/// plugin store under `plugins/`.
+pub(crate) struct Store {
+    name: Arc<str>,
 }
 
-fn location(lua: &Lua, this: &Credentials) -> Result<(StateDir, Arc<str>), String> {
-    Ok((host_state_dir(lua)?, Arc::clone(&this.id)))
+impl Store {
+    pub(crate) fn new(name: Arc<str>) -> Self {
+        Self { name }
+    }
+}
+
+fn location(lua: &Lua, this: &Store) -> Result<(StateDir, Arc<str>), String> {
+    Ok((host_state_dir(lua)?, Arc::clone(&this.name)))
 }
 
 /// Read the stored credentials.
@@ -49,9 +58,9 @@ fn location(lua: &Lua, this: &Credentials) -> Result<(StateDir, Arc<str>), Strin
 /// @example
 /// local saved = ctx.credentials:read()
 #[lua_fn]
-async fn read(lua: Lua, this: UserDataRef<Credentials>) -> LuaResult<Pair<LuaValue>> {
-    let (dir, id) = try_pair!(location(&lua, &this));
-    match unblock(move || load_credentials(&dir, &id)).await {
+async fn read(lua: Lua, this: UserDataRef<Store>) -> LuaResult<Pair<LuaValue>> {
+    let (dir, name) = try_pair!(location(&lua, &this));
+    match unblock(move || load_credentials(&dir, &name)).await {
         Some(value) => Ok((Some(lua.to_value_with(&value, serialize_options())?), None)),
         None => Ok((None, None)),
     }
@@ -65,11 +74,11 @@ async fn read(lua: Lua, this: UserDataRef<Credentials>) -> LuaResult<Pair<LuaVal
 /// @example
 /// local ok, err = ctx.credentials:write({ api_key = key })
 #[lua_fn]
-async fn write(lua: Lua, this: UserDataRef<Credentials>, value: LuaValue) -> LuaResult<Pair<bool>> {
+async fn write(lua: Lua, this: UserDataRef<Store>, value: LuaValue) -> LuaResult<Pair<bool>> {
     let value: Value = lua.from_value(value)?;
-    let (dir, id) = try_pair!(location(&lua, &this));
+    let (dir, name) = try_pair!(location(&lua, &this));
     Ok(pair(
-        unblock(move || save_credentials(&dir, &id, &value).map(|()| true)).await,
+        unblock(move || save_credentials(&dir, &name, &value).map(|()| true)).await,
     ))
 }
 
@@ -79,9 +88,9 @@ async fn write(lua: Lua, this: UserDataRef<Credentials>, value: LuaValue) -> Lua
 /// @example
 /// ctx.credentials:delete()
 #[lua_fn]
-async fn delete(lua: Lua, this: UserDataRef<Credentials>) -> LuaResult<Pair<bool>> {
-    let (dir, id) = try_pair!(location(&lua, &this));
-    Ok(pair(unblock(move || delete_credentials(&dir, &id)).await))
+async fn delete(lua: Lua, this: UserDataRef<Store>) -> LuaResult<Pair<bool>> {
+    let (dir, name) = try_pair!(location(&lua, &this));
+    Ok(pair(unblock(move || delete_credentials(&dir, &name)).await))
 }
 
 /// Refresh the stored credentials as one transaction. {fn}`(current)` runs
@@ -89,9 +98,10 @@ async fn delete(lua: Lua, this: UserDataRef<Credentials>) -> LuaResult<Pair<bool
 /// lock was taken. It returns a new table to store, nil to keep `current`
 /// (another process already refreshed), or nil plus an error.
 ///
-/// Concurrent refreshes of one provider share a single call of {fn}. The
-/// call runs on its own and is not cancelled with the caller, so a rotated
-/// token that the server already issued is always written.
+/// Concurrent refreshes of one store share a single call of {fn}. The call
+/// runs on its own and is not cancelled with the caller, so a rotated token
+/// that the server already issued is always written. During plugin load,
+/// which nothing cancels, {fn} runs in the caller instead.
 ///
 /// @param fn function `fn(current)` returning the table to store.
 /// @return (table?, any?) The stored table after the refresh, or nil plus the error {fn} returned, unchanged.
@@ -103,21 +113,27 @@ async fn delete(lua: Lua, this: UserDataRef<Credentials>) -> LuaResult<Pair<bool
 #[lua_fn]
 async fn refresh(
     lua: Lua,
-    this: UserDataRef<Credentials>,
+    this: UserDataRef<Store>,
     r#fn: Function,
 ) -> LuaResult<(LuaValue, LuaValue)> {
-    let id = Arc::clone(&this.id);
+    let name = Arc::clone(&this.name);
     drop(this);
-    let existing = lua
-        .app_data_ref::<RefreshFlights>()
-        .and_then(|flights| flights.0.get(&id).cloned());
-    let flight = match existing {
-        Some(flight) => Ok(flight),
-        None => start_refresh(&lua, id, r#fn),
-    };
-    let result = match flight {
-        Ok(flight) => flight.await.unwrap_or_else(|_| Err(HOST_STOPPED.into())),
-        Err(error) => Err(error.into()),
+    // A load holds the request loop that runs refresh jobs, so a job queued
+    // now would wait for the load that waits for it.
+    let result = if lua.app_data_ref::<LoadingPlugin>().is_some() {
+        run_refresh(&lua, &name, r#fn).await
+    } else {
+        let existing = lua
+            .app_data_ref::<RefreshFlights>()
+            .and_then(|flights| flights.0.get(&name).cloned());
+        let flight = match existing {
+            Some(flight) => Ok(flight),
+            None => start_refresh(&lua, name, r#fn),
+        };
+        match flight {
+            Ok(flight) => flight.await.unwrap_or_else(|_| Err(HOST_STOPPED.into())),
+            Err(error) => Err(error.into()),
+        }
     };
     let to_lua = |value: &Value| lua.to_value_with(value, serialize_options());
     match result {
@@ -127,7 +143,7 @@ async fn refresh(
     }
 }
 
-/// Run {fn} with the provider's cross-process credential lock held, the same
+/// Run {fn} with the store's cross-process lock held, the same
 /// lock `refresh` takes, for work that must not overlap another process
 /// changing these credentials. Unlike `refresh`, every call runs its own
 /// {fn}, nothing is reread or written, and dropping the caller ends {fn}.
@@ -139,13 +155,13 @@ async fn refresh(
 ///   return run_login_script()
 /// end)
 #[lua_fn]
-async fn lock(lua: Lua, this: UserDataRef<Credentials>, r#fn: Function) -> LuaResult<MultiValue> {
-    let (dir, id) = location(&lua, &this).map_err(mlua::Error::runtime)?;
+async fn lock(lua: Lua, this: UserDataRef<Store>, r#fn: Function) -> LuaResult<MultiValue> {
+    let (dir, name) = location(&lua, &this).map_err(mlua::Error::runtime)?;
     drop(this);
-    let lock_id = Arc::clone(&id);
-    let lock = unblock(move || lock_tokens(&dir, &lock_id)).await;
+    let lock_name = Arc::clone(&name);
+    let lock = unblock(move || lock_tokens(&dir, &lock_name)).await;
     if lock.is_none() {
-        warn!(provider = %id, "credential lock not acquired, running unlocked");
+        warn!(store = %name, "credential lock not acquired, running unlocked");
     }
     let values = r#fn.call_async::<MultiValue>(()).await;
     drop(lock);
@@ -156,19 +172,19 @@ async fn lock(lua: Lua, this: UserDataRef<Credentials>, r#fn: Function) -> LuaRe
 /// cannot lose a token the server already rotated. Nothing bounds the whole
 /// run for the same reason: the token request is bounded by `ctx.send`'s
 /// timeouts instead.
-fn start_refresh(lua: &Lua, id: Arc<str>, refresh: Function) -> Result<Flight, String> {
+fn start_refresh(lua: &Lua, name: Arc<str>, refresh: Function) -> Result<Flight, String> {
     let requests = lua
         .app_data_ref::<RequestTx>()
         .map(|tx| tx.0.clone())
         .ok_or(HOST_STOPPED)?;
     let (reply, flight) = oneshot::channel();
     let flight = flight.shared();
-    let job_id = Arc::clone(&id);
+    let job_name = Arc::clone(&name);
     let job: ProviderJob = Box::new(move |lua| {
         Box::pin(async move {
-            let result = run_refresh(&lua, &job_id, refresh).await;
+            let result = run_refresh(&lua, &job_name, refresh).await;
             if let Some(mut flights) = lua.app_data_mut::<RefreshFlights>() {
-                flights.0.remove(&job_id);
+                flights.0.remove(&job_name);
             }
             let _ = reply.send(result);
         })
@@ -180,20 +196,20 @@ fn start_refresh(lua: &Lua, id: Arc<str>, refresh: Function) -> Result<Flight, S
         })
         .map_err(|_| HOST_STOPPED)?;
     if let Some(mut flights) = lua.app_data_mut::<RefreshFlights>() {
-        flights.0.insert(id, flight.clone());
+        flights.0.insert(name, flight.clone());
     }
     Ok(flight)
 }
 
-async fn run_refresh(lua: &Lua, id: &Arc<str>, refresh: Function) -> RefreshResult {
+async fn run_refresh(lua: &Lua, name: &Arc<str>, refresh: Function) -> RefreshResult {
     let dir = host_state_dir(lua)?;
-    let (lock_dir, lock_id) = (dir.clone(), Arc::clone(id));
-    let lock = unblock(move || lock_tokens(&lock_dir, &lock_id)).await;
+    let (lock_dir, lock_name) = (dir.clone(), Arc::clone(name));
+    let lock = unblock(move || lock_tokens(&lock_dir, &lock_name)).await;
     if lock.is_none() {
-        warn!(provider = %id, "credential lock not acquired, refreshing unlocked");
+        warn!(store = %name, "credential lock not acquired, refreshing unlocked");
     }
-    let (read_dir, read_id) = (dir.clone(), Arc::clone(id));
-    let current = unblock(move || load_credentials(&read_dir, &read_id)).await;
+    let (read_dir, read_name) = (dir.clone(), Arc::clone(name));
+    let current = unblock(move || load_credentials(&read_dir, &read_name)).await;
     let current_lua = match &current {
         Some(value) => lua.to_value_with(value, serialize_options()),
         None => Ok(LuaValue::Nil),
@@ -216,21 +232,44 @@ async fn run_refresh(lua: &Lua, id: &Arc<str>, refresh: Function) -> RefreshResu
             .from_value(value.clone())
             .map_err(|error| error.to_string())?,
     };
-    let (save_id, saved) = (Arc::clone(id), refreshed.clone());
+    let (save_name, saved) = (Arc::clone(name), refreshed.clone());
     // The server may already have revoked the old token, so a failed save
     // still hands the fresh one to the caller.
-    if let Err(error) = unblock(move || save_credentials(&dir, &save_id, &saved)).await {
-        warn!(provider = %id, %error, "refreshed credentials not saved");
+    if let Err(error) = unblock(move || save_credentials(&dir, &save_name, &saved)).await {
+        warn!(store = %name, %error, "refreshed credentials not saved");
     }
     drop(lock);
     Ok(Some(refreshed))
 }
 
+/// Open plugin store {key} of {ctx}: a credentials file only that ctx and
+/// the ctxs it was narrowed from reach. A provider ctx opens its plugin
+/// ctx's stores.
+///
+/// @param ctx maki.Ctx The plugin's ctx, or a provider ctx.
+/// @param key string ASCII letters, digits, `-`, `_` or `.`, not starting with `.`.
+/// @return (maki.credentials.Store) The store.
+/// @example
+/// local account = maki.credentials.open(ctx, "account")
+/// local saved = account:read()
+#[lua_fn]
+fn open(_lua: &Lua, ctx: UserDataRef<Ctx>, key: String) -> LuaResult<Store> {
+    ctx.plugin()
+        .store_name(&key)
+        .map(Store::new)
+        .map_err(mlua::Error::runtime)
+}
+
 lua_class! {
-    /// The calling provider's stored credentials, `ctx.credentials`.
-    ///
-    /// It always addresses that provider's own credentials file. The value is
-    /// whatever JSON table the provider stores, such as `{ api_key }` or
-    /// `{ access, refresh, expires }`.
-    "maki.provider.Credentials" => Credentials, CREDENTIALS_DOCS [read, write, delete, refresh, lock]
+    /// A credentials file: a provider's (its ctx's `credentials`) or a
+    /// plugin's (`maki.credentials.open`). The value is whatever JSON table
+    /// is stored, such as `{ api_key }` or `{ access, refresh, expires }`.
+    "maki.credentials.Store" => Store, STORE_DOCS [read, write, delete, refresh, lock]
+}
+
+lua_table! {
+    /// Credential stores for plugins. A provider's own credentials are its
+    /// ctx's `credentials`; state a plugin shares across its providers, such
+    /// as one sign-in, goes in a plugin store.
+    "maki.credentials" => pub(crate) fn create_credentials_table(), DOCS [open]
 }

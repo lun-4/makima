@@ -121,7 +121,9 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
         &api::session::DOCS,
         &api::session_option::DOCS,
         &api::provider::DOCS,
-        &crate::credentials::CREDENTIALS_DOCS,
+        &crate::credentials::DOCS,
+        &crate::credentials::STORE_DOCS,
+        &crate::ctx::CTX_DOCS,
         &crate::login_ui::LOGIN_UI_DOCS,
         &api::usage::DOCS,
         &api::text::DOCS,
@@ -212,11 +214,13 @@ mod tests {
                 pending_providers: Arc::default(),
             },
             Arc::from("docs-test"),
+            Arc::from("docs-test"),
             Some(ui_tx),
             &PluginPermissions::trusted(),
             Arc::default(),
         )
-        .unwrap();
+        .unwrap()
+        .0;
 
         let mut documented: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
         for module in api_docs() {

@@ -135,6 +135,31 @@ settings in a local table, or export a `setup(opts)` function `init.lua` calls.
 
 {PERMISSIONS}
 
+## The plugin ctx
+
+`init.lua` receives a ctx as `...`: a handle that stands for your config's
+authority. Give each plugin its own part of it with `with_name`, and pass it
+in through a `setup` function:
+
+```lua
+-- ~/.config/makima/init.lua
+local ctx = ...
+require("acme").setup(ctx:with_name("acme"))
+```
+
+APIs that act for a plugin take its ctx:
+
+- `maki.credentials.open(ctx, key)` opens a credential store only that ctx
+  reaches. Stores under `ctx:with_name("acme")` never meet another name's.
+- `maki.api.register_provider(ctx, spec)` registers a provider whose
+  callbacks get a ctx made from yours, with `id`, `send` and `credentials`.
+- `ctx.send` is `maki.net.send` with default timeouts, usable while
+  `init.lua` runs. They come from `MAKIMA_NET_TIMEOUT_SECS` (default 30
+  seconds), because `[provider]` config does not exist yet at that point.
+
+Do not pass a ctx through `require`: a module runs once, so only the first
+caller's ctx would count.
+
 ## Development loop
 
 `/reload` rebuilds plugins and config in place, no restart needed. Until it

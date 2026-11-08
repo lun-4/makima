@@ -3,6 +3,7 @@ pub mod agent_errors;
 mod api;
 mod coalesced_latest;
 mod credentials;
+mod ctx;
 pub mod docs;
 pub mod docs_render;
 mod error;

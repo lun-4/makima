@@ -48,6 +48,8 @@ use crate::api::session_option::PendingSessionOptions;
 use crate::api::store::PendingStore;
 use crate::api::tool::{PendingRules, PendingTools};
 use crate::api::util::command::{PendingCommandMap, UiAction};
+use crate::credentials::create_credentials_table;
+use crate::ctx::PluginCtx;
 use crate::plugin_permissions::PluginPermissions;
 
 #[derive(Clone)]
@@ -69,14 +71,17 @@ pub(crate) struct PluginLoadContext {
     pub(crate) pending_providers: PendingProviders,
 }
 
+/// The plugin's `maki` table and its root ctx, whose stores live under
+/// {root_name}.
 pub(crate) fn create_maki_global(
     lua: &Lua,
     context: PluginLoadContext,
     plugin: Arc<str>,
+    root_name: Arc<str>,
     ui_action_tx: Option<flume::Sender<UiAction>>,
     permissions: &PluginPermissions,
     opts: PluginOpts,
-) -> LuaResult<Table> {
+) -> LuaResult<(Table, PluginCtx)> {
     let maki = lua.create_table()?;
     lua.set_app_data(context.pending_prompts.clone());
     lua.set_app_data(context.pending_hint.clone());
@@ -102,15 +107,17 @@ pub(crate) fn create_maki_global(
     maki.set("json", json::create_json_table(lua)?)?;
     maki.set("yaml", yaml::create_yaml_table(lua)?)?;
     let net = net::create_net_table(lua, permissions)?;
+    let root = PluginCtx::root(lua, root_name, net.get("send")?)?;
     provider::add_provider_fn(
         &api,
         lua,
         context.pending_providers.clone(),
         Arc::clone(&plugin),
-        net.get("send")?,
+        root.clone(),
         permissions,
     )?;
     maki.set("net", net)?;
+    maki.set("credentials", create_credentials_table(lua)?)?;
     maki.set("crypto", crypto::create_crypto_table(lua)?)?;
     maki.set("host", host::create_host_table(lua, permissions)?)?;
     maki.set("text", text::create_text_table(lua)?)?;
@@ -179,5 +186,5 @@ pub(crate) fn create_maki_global(
     meta.set("__newindex", notify_router)?;
     maki.set_metatable(Some(meta))?;
 
-    Ok(maki)
+    Ok((maki, root))
 }

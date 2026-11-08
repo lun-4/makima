@@ -11,6 +11,8 @@ use tracing::debug;
 use crate::{StateDir, StorageError, atomic_write_permissions};
 
 const AUTH_DIR: &str = "auth";
+/// The dir under `auth/` that holds plugin stores, apart from provider files.
+pub const PLUGIN_STORES_DIR: &str = "plugins";
 const AUTH_FILE_MODE: u32 = 0o600;
 const REFRESH_BUFFER_SECS: u64 = 60;
 const LOCK_SUFFIX: &str = ".lock";
@@ -79,8 +81,8 @@ pub fn lock_exclusive(path: &Path) -> Option<File> {
 
 /// Every write replaces the token file, so the lock sits beside it under a name
 /// no loader reads.
-pub fn lock_tokens(dir: &StateDir, provider: &str) -> Option<File> {
-    lock_exclusive(&auth_path(dir, &format!("{provider}{LOCK_SUFFIX}")))
+pub fn lock_tokens(dir: &StateDir, name: &str) -> Option<File> {
+    lock_exclusive(&auth_path(dir, &format!("{name}{LOCK_SUFFIX}")))
 }
 
 pub fn now_millis() -> u64 {
@@ -143,17 +145,18 @@ pub fn delete_mcp_auth(dir: &StateDir, server_name: &str) -> Result<bool, Storag
     delete_auth(&auth_path(dir, &format!("mcp-{server_name}")))
 }
 
-/// The credentials file of {provider} as stored, whatever its shape.
-pub fn load_credentials(dir: &StateDir, provider: &str) -> Option<Value> {
-    load_auth(&auth_path(dir, provider))
+/// The credentials file {name} as stored, whatever its shape. {name} is a
+/// provider id or a plugin store path under [`PLUGIN_STORES_DIR`].
+pub fn load_credentials(dir: &StateDir, name: &str) -> Option<Value> {
+    load_auth(&auth_path(dir, name))
 }
 
-pub fn save_credentials(dir: &StateDir, provider: &str, value: &Value) -> Result<(), StorageError> {
-    save_auth(&auth_path(dir, provider), value)
+pub fn save_credentials(dir: &StateDir, name: &str, value: &Value) -> Result<(), StorageError> {
+    save_auth(&auth_path(dir, name), value)
 }
 
-pub fn delete_credentials(dir: &StateDir, provider: &str) -> Result<bool, StorageError> {
-    delete_auth(&auth_path(dir, provider))
+pub fn delete_credentials(dir: &StateDir, name: &str) -> Result<bool, StorageError> {
+    delete_auth(&auth_path(dir, name))
 }
 
 #[cfg(test)]

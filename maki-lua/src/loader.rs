@@ -35,7 +35,7 @@ use maki_agent::agent::PromptSlotSource;
 use maki_agent::prompt::ResolvedSlots;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
-const GLOBAL_INIT_OWNER: &str = "maki_init.global";
+pub(crate) const GLOBAL_INIT_OWNER: &str = "maki_init.global";
 const PROJECT_INIT_OWNER: &str = "maki_init.project";
 #[allow(dead_code)]
 pub const SKIPPED_PLUGIN_WARNING: &str = "skipping plugin lua";

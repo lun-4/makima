@@ -117,7 +117,9 @@ The rules:
 | [`maki.net`](#maki-net) | HTTP clients: a guarded `request` for web content and a raw, streaming |
 | [`maki.net.Response`](#maki-net-Response) | A streaming HTTP response from `maki.net.send`. |
 | [`maki.session`](#maki-session) | Host session primitives. |
-| [`maki.provider.Credentials`](#maki-provider-Credentials) | The calling provider's stored credentials, `ctx.credentials`. |
+| [`maki.credentials`](#maki-credentials) | Credential stores for plugins. |
+| [`maki.credentials.Store`](#maki-credentials-Store) | A credentials file: a provider's (its ctx's `credentials`) or a |
+| [`maki.Ctx`](#maki-Ctx) | A plugin's authority. |
 | [`maki.provider.LoginUi`](#maki-provider-LoginUi) | The `ui` a provider's `login(ctx, ui, config)` receives. |
 | [`maki.usage`](#maki-usage) | Provider-side quota snapshots. |
 | [`maki.text`](#maki-text) | Text transformation utilities. |
@@ -1181,12 +1183,13 @@ end
 ### `maki.api.register_provider()` {#maki-api-register_provider}
 
 ```lua
-maki.api.register_provider({spec})
+maki.api.register_provider({ctx?}, {spec?})
 ```
 
-Registers a model provider. Call it at the top level during plugin load.
-A provider id belongs to one plugin; registering an id another plugin
-already owns fails and names both plugins.
+Registers a model provider under {ctx}, or under the plugin's root ctx
+without one. Call it while the plugin loads, such as from a `setup(ctx)`
+that `init.lua` calls. A provider id belongs to one plugin; registering
+an id another plugin already owns fails and names both plugins.
 
 {spec} fields:
   `id` (string) Required. The provider part of `provider/model` specs,
@@ -1237,11 +1240,12 @@ already owns fails and names both plugins.
 Config is saved and the default model chosen only after `login`
 succeeds and `auth_status` no longer reports `missing`.
 
-`ctx` is `{ id, send, credentials }`, where `send` is `maki.net.send`
-with the `[provider]` connect, low-speed and stream timeouts as defaults, and
-`credentials` is the provider's `maki.provider.Credentials`. Only the
-registering plugin's callbacks receive `ctx`, so a provider id's
-credentials belong to the plugin that registered it. An instance has
+Callbacks receive a provider `maki.Ctx` derived from {ctx}: `id`, `send`
+(`maki.net.send` with the `[provider]` connect, low-speed and stream
+timeouts as defaults) and `credentials` (the provider's
+`maki.credentials.Store`); `maki.credentials.open` reaches {ctx}'s plugin
+stores through it. Only the registering plugin's callbacks receive it, so
+a provider id's credentials belong to the plugin that registered it. An instance has
 `stream(ctx, request, emit)` and optionally `fetch_usage(ctx)`,
 `refresh_auth(ctx)`, `reload_auth(ctx)`, `rotate_key(ctx)`,
 `end_conversation(ctx, conversation_id, reason)` and `key_count` (a
@@ -1274,7 +1278,8 @@ rules.
 
 **Parameters:**
 
-- `{spec}` (`table`) Provider definition (see above).
+- `{ctx?}` ([`maki.Ctx?`](#maki-Ctx)) The ctx to register under; omit it for the plugin's root ctx.
+- `{spec?}` (`table`) Required. Provider definition (see above).
 
 **Example:**
 
@@ -4734,20 +4739,51 @@ maki.session.set_default_thinking("medium")
 ```
 
 
-## maki.provider.Credentials {#maki-provider-Credentials}
+## maki.credentials {#maki-credentials}
 
-The calling provider's stored credentials, `ctx.credentials`.
-
-It always addresses that provider's own credentials file. The value is
-whatever JSON table the provider stores, such as `{ api_key }` or
-`{ access, refresh, expires }`.
+Credential stores for plugins. A provider's own credentials are its
+ctx's `credentials`; state a plugin shares across its providers, such
+as one sign-in, goes in a plugin store.
 
 ---
 
-### `Credentials:read()` {#Credentials-read}
+### `maki.credentials.open()` {#maki-credentials-open}
 
 ```lua
-Credentials:read()
+maki.credentials.open({ctx}, {key})
+```
+
+Open plugin store {key} of {ctx}: a credentials file only that ctx and
+the ctxs it was narrowed from reach. A provider ctx opens its plugin
+ctx's stores.
+
+**Parameters:**
+
+- `{ctx}` ([`maki.Ctx`](#maki-Ctx)) The plugin's ctx, or a provider ctx.
+- `{key}` (`string`) ASCII letters, digits, `-`, `_` or `.`, not starting with `.`.
+
+**Returns:** ([`maki.credentials.Store`](#maki-credentials-Store)) The store.
+
+**Example:**
+
+```lua
+local account = maki.credentials.open(ctx, "account")
+local saved = account:read()
+```
+
+
+## maki.credentials.Store {#maki-credentials-Store}
+
+A credentials file: a provider's (its ctx's `credentials`) or a
+plugin's (`maki.credentials.open`). The value is whatever JSON table
+is stored, such as `{ api_key }` or `{ access, refresh, expires }`.
+
+---
+
+### `Store:read()` {#Store-read}
+
+```lua
+Store:read()
 ```
 
 Read the stored credentials.
@@ -4762,10 +4798,10 @@ local saved = ctx.credentials:read()
 
 ---
 
-### `Credentials:write()` {#Credentials-write}
+### `Store:write()` {#Store-write}
 
 ```lua
-Credentials:write({value})
+Store:write({value})
 ```
 
 Replace the stored credentials with {value}. The write is atomic and the
@@ -4785,10 +4821,10 @@ local ok, err = ctx.credentials:write({ api_key = key })
 
 ---
 
-### `Credentials:delete()` {#Credentials-delete}
+### `Store:delete()` {#Store-delete}
 
 ```lua
-Credentials:delete()
+Store:delete()
 ```
 
 Delete the stored credentials.
@@ -4803,10 +4839,10 @@ ctx.credentials:delete()
 
 ---
 
-### `Credentials:refresh()` {#Credentials-refresh}
+### `Store:refresh()` {#Store-refresh}
 
 ```lua
-Credentials:refresh({fn})
+Store:refresh({fn})
 ```
 
 Refresh the stored credentials as one transaction. {fn}`(current)` runs
@@ -4814,9 +4850,10 @@ with a cross-process lock held and `current` reread from disk after the
 lock was taken. It returns a new table to store, nil to keep `current`
 (another process already refreshed), or nil plus an error.
 
-Concurrent refreshes of one provider share a single call of {fn}. The
-call runs on its own and is not cancelled with the caller, so a rotated
-token that the server already issued is always written.
+Concurrent refreshes of one store share a single call of {fn}. The call
+runs on its own and is not cancelled with the caller, so a rotated token
+that the server already issued is always written. During plugin load,
+which nothing cancels, {fn} runs in the caller instead.
 
 **Parameters:**
 
@@ -4835,13 +4872,13 @@ end)
 
 ---
 
-### `Credentials:lock()` {#Credentials-lock}
+### `Store:lock()` {#Store-lock}
 
 ```lua
-Credentials:lock({fn})
+Store:lock({fn})
 ```
 
-Run {fn} with the provider's cross-process credential lock held, the same
+Run {fn} with the store's cross-process lock held, the same
 lock `refresh` takes, for work that must not overlap another process
 changing these credentials. Unlike `refresh`, every call runs its own
 {fn}, nothing is reread or written, and dropping the caller ends {fn}.
@@ -4858,6 +4895,46 @@ changing these credentials. Unlike `refresh`, every call runs its own
 local result, err = ctx.credentials:lock(function()
   return run_login_script()
 end)
+```
+
+
+## maki.Ctx {#maki-Ctx}
+
+A plugin's authority. An entry chunk (a bundled plugin, or `init.lua`)
+receives its root ctx as `...`; pass it on by reference, such as to
+a module's `setup(ctx)`, and narrow it with `with_name`. APIs that
+act for the plugin take it, such as `maki.credentials.open` and
+`maki.api.register_provider`. Its fields cannot be assigned.
+
+`send` is `maki.net.send` with default timeouts: from
+`MAKIMA_NET_TIMEOUT_SECS` (default 30 seconds) on a plugin ctx, from
+`[provider]` on a provider ctx. A provider ctx, which a provider's
+callbacks receive, also has `id` (the provider id) and `credentials`
+(the provider's `maki.credentials.Store`).
+
+---
+
+### `Ctx:with_name()` {#Ctx-with_name}
+
+```lua
+Ctx:with_name({name})
+```
+
+A child ctx whose plugin stores live under {name}, inside this ctx's.
+It reaches neither this ctx's stores nor a sibling's. A provider ctx's
+child is a plain plugin ctx.
+
+**Parameters:**
+
+- `{name}` (`string`) ASCII letters, digits, `-`, `_` or `.`, not starting with `.`.
+
+**Returns:** ([`maki.Ctx`](#maki-Ctx)) The child ctx.
+
+**Example:**
+
+```lua
+local ctx = ...
+require("fountain.provider").setup(ctx:with_name("fountain"))
 ```
 
 

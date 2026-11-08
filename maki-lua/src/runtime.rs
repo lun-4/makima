@@ -78,8 +78,10 @@ use crate::api::util::ctx::LuaCtx;
 use crate::api::util::picker::{PickerCallbacks, PickerEvent};
 use crate::api::util::setup::ConfigStore;
 use crate::api::{PluginLoadContext, create_maki_global};
+use crate::ctx::Ctx;
 use crate::docs_render;
 use crate::error::PluginError;
+use crate::loader::GLOBAL_INIT_OWNER;
 use crate::orchestration::TrustedTarget;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
 use crate::provider::ProviderJob;
@@ -3575,10 +3577,18 @@ impl LuaRuntime {
             pending_hint: Arc::clone(&pending_hint),
             pending_providers: Arc::clone(&pending_providers),
         };
-        let maki = create_maki_global(
+        // Global and project config share one root, so a plugin sees the
+        // same stores from either.
+        let root_name = if config_store.is_some() {
+            Arc::from(GLOBAL_INIT_OWNER)
+        } else {
+            Arc::clone(&name)
+        };
+        let (maki, root) = create_maki_global(
             &self.lua,
             context,
             Arc::clone(&name),
+            root_name,
             self.ui_action_tx.clone(),
             permissions,
             Arc::clone(&opts),
@@ -3605,7 +3615,7 @@ impl LuaRuntime {
         let exec_result = match main_fn {
             Ok(func) => {
                 queue_codegen(&self.codegen_queue, &func);
-                func.call_async::<()>(()).await
+                func.call_async::<()>(Ctx::Plugin(root)).await
             }
             Err(e) => Err(e),
         };

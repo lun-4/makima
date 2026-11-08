@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
+use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -21,6 +22,14 @@ use test_case::test_case;
 
 const PROVIDER: &str = "fake";
 const PLUGIN: &str = "fake_plugin";
+const NAMESPACE: &str = "fountain";
+const STORE_KEY: &str = "account";
+const NAMESPACED_STORE: &str = "plugins/fake_plugin/fountain/account";
+const INIT_ROOT: &str = "plugins/maki_init.global";
+const BAD_NAME_ERR: &str =
+    "must be non-empty ASCII letters, digits, '-', '_' or '.', and not start with '.'";
+const BAD_ARGS_ERR: &str = "takes (ctx, spec) or (spec)";
+const NOT_A_CTX: &str = "userdata";
 const SPEC: &str = "fake/fake-1";
 const BOUND: Duration = Duration::from_secs(10);
 const API_KEY: &str = "sk-written-by-lua";
@@ -116,6 +125,21 @@ const SCRIPTS: &str = r#"
                 return ctx.credentials:read().access
             end)
         end,
+        plugin_store = function(ctx)
+            local store = maki.credentials.open(ctx, STORE_KEY)
+            store:write({ api_key = API_KEY })
+            return store:read().api_key
+        end,
+        not_a_ctx = function()
+            local _, err = pcall(maki.credentials.open, {}, STORE_KEY)
+            return tostring(err)
+        end,
+        assign = function(ctx)
+            return tostring(pcall(function() ctx.send = nil end))
+        end,
+        id = function(ctx)
+            return ctx.id
+        end,
         fail_table = function(ctx)
             local _, err = ctx.credentials:refresh(function()
                 return nil, { status = REFRESH_STATUS, message = REFRESH_ERR, retry_after = RETRY_AFTER }
@@ -134,16 +158,7 @@ struct Fixture {
 impl Fixture {
     fn new(server: &str) -> Self {
         let state = TempDir::new().unwrap();
-        let host = PluginHost::with_session_provider_preparer(
-            Arc::new(ToolRegistry::new()),
-            Default::default(),
-            true,
-            Arc::new(InMemoryFs::new()),
-            Some(state.path().to_path_buf()),
-            None,
-            HostUi::Frontend,
-        )
-        .unwrap();
+        let host = new_host(state.path());
         host.load_source(PLUGIN, &source(server)).unwrap();
         let providers = host
             .provider_registry(maki_providers::Timeouts::default())
@@ -166,20 +181,50 @@ impl Fixture {
     }
 }
 
-fn source(server: &str) -> String {
-    let constants = format!(
+fn new_host(state: &Path) -> PluginHost {
+    PluginHost::with_session_provider_preparer(
+        Arc::new(ToolRegistry::new()),
+        Default::default(),
+        true,
+        Arc::new(InMemoryFs::new()),
+        Some(state.to_path_buf()),
+        None,
+        HostUi::Frontend,
+    )
+    .unwrap()
+}
+
+/// Loads {source} as plugin {PLUGIN} into a fresh host on its own thread,
+/// so a load that never finishes fails the test instead of hanging it.
+fn load_bounded(state: &Path, source: String) -> Result<(), String> {
+    let (done_tx, done) = flume::bounded(1);
+    let state = state.to_path_buf();
+    thread::spawn(move || {
+        let host = new_host(&state);
+        let _ = done_tx.send(host.load_source(PLUGIN, &source).map_err(|e| e.to_string()));
+    });
+    done.recv_timeout(BOUND).expect("plugin load timed out")
+}
+
+fn constants(server: &str) -> String {
+    format!(
         r#"
+        local root = ...
         local API_KEY, HOST, ACCESS, REFRESH = "{API_KEY}", "{HOST}", "{ACCESS}", "{REFRESH}"
         local EXPIRES, FRESH, REFRESHED, REFRESH_ERR = {EXPIRES}, "{FRESH}", "{REFRESHED}", "{REFRESH_ERR}"
         local REFRESH_STATUS, RETRY_AFTER = {REFRESH_STATUS}, {RETRY_AFTER_SECS}
+        local STALE, ROTATED, STORE_KEY = "{STALE}", "{ROTATED}", "{STORE_KEY}"
         local SERVER = "{server}"
         "#
-    );
+    )
+}
+
+fn source(server: &str) -> String {
     format!(
         r#"
         {constants}
         {SCRIPTS}
-        maki.api.register_provider({{
+        maki.api.register_provider(root:with_name("{NAMESPACE}"), {{
             id = "{PROVIDER}",
             display_name = "Fake",
             models = {{ {{ id = "fake-1", tier = "strong" }} }},
@@ -195,7 +240,8 @@ fn source(server: &str) -> String {
                 }}
             end,
         }})
-        "#
+        "#,
+        constants = constants(server),
     )
 }
 
@@ -406,4 +452,129 @@ fn refresh_error_table_reaches_the_caller_intact() {
         fixture.run("fail_table"),
         format!("{REFRESH_STATUS},{REFRESH_ERR},{RETRY_AFTER_SECS}")
     );
+}
+
+#[test]
+fn provider_ctx_opens_the_plugin_stores_of_the_ctx_it_was_registered_under() {
+    let fixture = Fixture::new("");
+    assert_eq!(fixture.run("plugin_store"), API_KEY);
+    assert_eq!(
+        load_credentials(&fixture.dir(), NAMESPACED_STORE),
+        Some(json!({ "api_key": API_KEY }))
+    );
+    assert!(load_credentials(&fixture.dir(), PROVIDER).is_none());
+}
+
+#[test]
+fn provider_ctx_names_its_provider_and_cannot_be_assigned() {
+    let fixture = Fixture::new("");
+    assert_eq!(fixture.run("id"), PROVIDER);
+    assert_eq!(fixture.run("assign"), "false");
+}
+
+#[test]
+fn credentials_open_refuses_a_value_that_is_not_a_ctx() {
+    let fixture = Fixture::new("");
+    assert!(fixture.run("not_a_ctx").contains(NOT_A_CTX));
+}
+
+#[test]
+fn named_children_of_the_root_ctx_open_separate_stores() {
+    let state = TempDir::new().unwrap();
+    let source = format!(
+        r#"
+        local root = ...
+        local child = root:with_name("{NAMESPACE}")
+        assert(maki.credentials.open(root, "{STORE_KEY}"):write({{ at = "root" }}))
+        assert(maki.credentials.open(child, "{STORE_KEY}"):write({{ at = "child" }}))
+        assert(maki.credentials.open(child:with_name("deeper"), "{STORE_KEY}"):write({{ at = "deeper" }}))
+        "#
+    );
+
+    load_bounded(state.path(), source).unwrap();
+
+    let dir = StateDir::from_path(state.path().to_path_buf());
+    let at = |name: &str| load_credentials(&dir, name).unwrap()["at"].clone();
+    assert_eq!(at(&format!("plugins/{PLUGIN}/{STORE_KEY}")), "root");
+    assert_eq!(at(NAMESPACED_STORE), "child");
+    assert_eq!(
+        at(&format!("plugins/{PLUGIN}/{NAMESPACE}/deeper/{STORE_KEY}")),
+        "deeper"
+    );
+}
+
+#[test]
+fn send_and_store_refresh_work_during_load() {
+    let server = serve();
+    let rotated = json!({ "access": ROTATED, "refresh": REFRESH, "expires": EXPIRES });
+    server.replies.send(rotated.to_string()).unwrap();
+    let state = TempDir::new().unwrap();
+    let source = format!(
+        r#"
+        {constants}
+        local ctx = root:with_name("{NAMESPACE}")
+        local account = maki.credentials.open(ctx, STORE_KEY)
+        assert(account:write({{ access = STALE, refresh = REFRESH, expires = EXPIRES }}))
+        local refreshed, err = account:refresh(function(current)
+            assert(current.access == STALE)
+            local response = assert(ctx.send({{ url = SERVER }}))
+            local parts = {{}}
+            while true do
+                local chunk = response:read()
+                if not chunk then break end
+                table.insert(parts, chunk)
+            end
+            response:close()
+            return maki.json.decode(table.concat(parts))
+        end)
+        assert(refreshed and refreshed.access == ROTATED, tostring(err))
+        "#,
+        constants = constants(&server.url),
+    );
+
+    load_bounded(state.path(), source).unwrap();
+
+    let dir = StateDir::from_path(state.path().to_path_buf());
+    assert_eq!(
+        load_credentials(&dir, NAMESPACED_STORE).unwrap()["access"],
+        ROTATED
+    );
+}
+
+#[test_case(r#"root:with_name("")"#, BAD_NAME_ERR ; "empty_name")]
+#[test_case(r#"root:with_name(".hidden")"#, BAD_NAME_ERR ; "dot_name")]
+#[test_case(r#"root:with_name("a/b")"#, BAD_NAME_ERR ; "slash_name")]
+#[test_case(r#"maki.credentials.open(root, "../up")"#, BAD_NAME_ERR ; "parent_key")]
+#[test_case(r#"maki.api.register_provider(root)"#, BAD_ARGS_ERR ; "ctx_without_spec")]
+fn invalid_ctx_use_fails_the_load(call: &str, expected: &str) {
+    let state = TempDir::new().unwrap();
+
+    let error = load_bounded(state.path(), format!("local root = ...\n{call}")).unwrap_err();
+
+    assert!(error.contains(expected), "{error}");
+}
+
+#[test]
+fn global_and_project_init_share_one_root() {
+    let state = TempDir::new().unwrap();
+    let host = new_host(state.path());
+    for (name, init) in [
+        ("global", "global/init.lua"),
+        ("project", "project/init.lua"),
+    ] {
+        let source = format!(
+            r#"assert(maki.credentials.open((...), "{name}"):write({{ from = "{init}" }}))"#
+        );
+        host.send_run_init_lua(source, init.to_owned(), None)
+            .unwrap();
+    }
+
+    let dir = StateDir::from_path(state.path().to_path_buf());
+    for (name, init) in [
+        ("global", "global/init.lua"),
+        ("project", "project/init.lua"),
+    ] {
+        let stored = load_credentials(&dir, &format!("{INIT_ROOT}/{name}")).unwrap();
+        assert_eq!(stored["from"], init);
+    }
 }

@@ -20,8 +20,8 @@ use maki_providers::{
 };
 use maki_storage::id::SessionRef;
 use mlua::{
-    Function, IntoLuaMulti, Lua, LuaSerdeExt, MultiValue, RegistryKey, SerializeOptions, Table,
-    Value as LuaValue,
+    AnyUserData, Function, IntoLuaMulti, Lua, LuaSerdeExt, MultiValue, RegistryKey,
+    SerializeOptions, Table, Value as LuaValue,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,7 +29,7 @@ use tracing::warn;
 
 use crate::api::provider::{ProviderSpec, ProviderStore};
 use crate::api::util::memory::unlimited;
-use crate::credentials::Credentials;
+use crate::ctx::{Ctx, PluginCtx};
 use crate::login_ui::LoginUi;
 use crate::runtime::{Request, strip_traceback};
 
@@ -43,19 +43,6 @@ const RETRY_TRANSIENT: &str = "transient";
 const RETRY_CONNECT: &str = "connect";
 const RETRY_TIMEOUT: &str = "timeout";
 const RETRY_NONE: &str = "none";
-const SEND_WITH_DEFAULTS: &str = r#"
-    local send, defaults = ...
-    return function(request)
-        local filled = table.clone(request)
-        for field, value in defaults do
-            if filled[field] == nil then
-                filled[field] = value
-            end
-        end
-        return send(filled)
-    end
-"#;
-
 pub(crate) type ProviderJob = Box<dyn FnOnce(Lua) -> LocalBoxFuture<'static, ()> + Send>;
 /// The outer error is raised Lua; the inner one is what the provider returned.
 type JobResult<T> = mlua::Result<Result<T, AgentError>>;
@@ -108,7 +95,8 @@ fn registered(
             .collect::<mlua::Result<_>>()?,
         auth_status: optional_key(lua, &spec.auth_status)?,
         logout: optional_key(lua, &spec.logout)?,
-        send: lua.create_registry_value(send_with_defaults(lua, &spec.send, timeouts)?)?,
+        send: lua.create_registry_value(spec.ctx.provider_send(lua, &timeouts)?)?,
+        plugin: spec.ctx.clone(),
     };
     Ok(RegisteredProvider {
         id: Arc::clone(&spec.id),
@@ -121,18 +109,6 @@ fn registered(
             callbacks: Arc::new(callbacks),
         }),
     })
-}
-
-/// {send} with the `[provider]` timeouts filled in where a request leaves
-/// them out.
-fn send_with_defaults(lua: &Lua, send: &Function, timeouts: Timeouts) -> mlua::Result<Function> {
-    let defaults = lua.create_table()?;
-    defaults.set("connect_timeout", timeouts.connect.as_secs_f64())?;
-    defaults.set("low_speed_timeout", timeouts.low_speed.as_secs_f64())?;
-    defaults.set("idle_timeout", timeouts.stream.as_secs_f64())?;
-    lua.load(SEND_WITH_DEFAULTS)
-        .set_name("=provider send")
-        .call((send.clone(), defaults))
 }
 
 fn optional_key(lua: &Lua, function: &Option<Function>) -> mlua::Result<Option<RegistryKey>> {
@@ -265,7 +241,7 @@ async fn call_with_ctx<T>(
         return decode(lua, None);
     };
     let mut call_args = args(lua)?;
-    call_args.push_front(LuaValue::Table(callbacks.ctx(lua)?));
+    call_args.push_front(LuaValue::UserData(callbacks.ctx(lua)?));
     let values = function.call_async::<MultiValue>(call_args).await?;
     match returned(values) {
         Ok(values) => decode(lua, Some(first(values))),
@@ -286,6 +262,7 @@ struct Callbacks {
     auth_status: Option<RegistryKey>,
     logout: Option<RegistryKey>,
     send: RegistryKey,
+    plugin: PluginCtx,
 }
 
 impl Callbacks {
@@ -293,17 +270,12 @@ impl Callbacks {
         self.configs.section(&self.id)
     }
 
-    fn ctx(&self, lua: &Lua) -> mlua::Result<Table> {
-        let ctx = lua.create_table()?;
-        ctx.set("id", &*self.id)?;
-        ctx.set("send", lua.registry_value::<Function>(&self.send)?)?;
-        ctx.set(
-            "credentials",
-            Credentials {
-                id: Arc::clone(&self.id),
-            },
-        )?;
-        Ok(ctx)
+    fn ctx(&self, lua: &Lua) -> mlua::Result<AnyUserData> {
+        lua.create_userdata(Ctx::Provider {
+            plugin: self.plugin.clone(),
+            id: Arc::clone(&self.id),
+            send: lua.registry_value(&self.send)?,
+        })
     }
 }
 
