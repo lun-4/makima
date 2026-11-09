@@ -2,8 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use maki_domain::ModelSelection;
-use maki_providers::provider::Provider;
-use maki_providers::{Model, RequestOptions, ThinkingConfig, ThinkingConfigExt, model_registry};
+use maki_providers::{
+    Model, PreparedProvider, ProviderRegistry, RequestOptions, ThinkingConfig, ThinkingConfigExt,
+};
 
 use crate::{AgentMode, ModeDef};
 
@@ -54,11 +55,7 @@ impl ModeCeiling {
     }
 }
 
-#[derive(Clone)]
-pub struct PreparedModel {
-    pub provider: Arc<dyn Provider>,
-    pub model: Model,
-}
+pub type PreparedModel = PreparedProvider;
 
 #[derive(Clone, Default)]
 pub struct ConfigPatch {
@@ -108,42 +105,22 @@ pub struct ConfigCommit {
     pub config: Arc<EffectiveAgentConfig>,
 }
 
-/// Re-resolves `model` against what discovery knows now. `None` when that
-/// changes nothing, so an already-correct agent is left alone.
-pub fn rediscovered_model(provider: &dyn Provider, model: &Model) -> Option<Model> {
-    let mut refined = Model::from_spec(&model.spec()).ok()?;
-    provider.adjust_model(&mut refined);
+/// Re-prepares `model` against what discovery knows now. `None` when that
+/// changes nothing or fails, so an already-correct agent is left alone.
+pub async fn rediscovered_model(providers: &ProviderRegistry, model: &Model) -> Option<Model> {
+    let resolved = providers.model(&model.spec()).ok()?;
+    let refined = providers.prepare(resolved).await.ok()?.model;
     (!same_model(&refined, model)).then_some(refined)
-}
-
-/// {candidate} as it commits over {current}: a model it switched to takes
-/// what discovery knows by now, so discovery that lands after the change
-/// materialized is not lost.
-pub(super) fn with_discovery(
-    current: Option<&EffectiveAgentConfig>,
-    candidate: &Arc<EffectiveAgentConfig>,
-) -> Arc<EffectiveAgentConfig> {
-    let switched = current.is_none_or(|current| {
-        !Arc::ptr_eq(&current.provider, &candidate.provider)
-            || current.model.spec() != candidate.model.spec()
-    });
-    let Some(model) = switched
-        .then(|| model_registry::discovered(&candidate.model.provider, &candidate.model.id))
-        .flatten()
-        .and_then(|_| rediscovered_model(&*candidate.provider, &candidate.model))
-    else {
-        return Arc::clone(candidate);
-    };
-    let mut config = (**candidate).clone();
-    config.settings.model = model;
-    Arc::new(config)
 }
 
 impl ConfigChange {
     /// A metadata-only refresh: the provider stays, so a concurrent model
     /// switch makes the compare-and-swap a no-op.
-    pub fn rediscovered(config: &EffectiveAgentConfig) -> Option<Self> {
-        let model = rediscovered_model(&*config.provider, &config.model)?;
+    pub async fn rediscovered(
+        config: &EffectiveAgentConfig,
+        providers: &ProviderRegistry,
+    ) -> Option<Self> {
+        let model = rediscovered_model(providers, &config.model).await?;
         Some(Self::Refresh {
             expected: PreparedModel {
                 provider: Arc::clone(&config.provider),
@@ -262,15 +239,12 @@ fn same_model(left: &Model, right: &Model) -> bool {
     left.id == right.id
         && left.provider == right.provider
         && left.tier == right.tier
-        && left.family == right.family
-        && left.supports_tool_examples_override == right.supports_tool_examples_override
-        && left.thinking_override == right.thinking_override
-        && left.supports_vision_override == right.supports_vision_override
-        && left.supports_fast_override == right.supports_fast_override
+        && left.tool_examples == right.tool_examples
+        && left.thinking_support == right.thinking_support
+        && left.vision == right.vision
+        && left.fast_support == right.fast_support
         && left.max_output_tokens == right.max_output_tokens
-        && left.turn_output_tokens == right.turn_output_tokens
         && left.context_window == right.context_window
-        && left.thinking_fields == right.thinking_fields
         && left.pricing.input == right.pricing.input
         && left.pricing.output == right.pricing.output
         && left.pricing.cache_write == right.pricing.cache_write

@@ -242,6 +242,7 @@ fn exec_output_in(
         .unwrap_or_else(|| panic!("tool {name} not registered"));
     let inv = entry.tool.parse(&input).expect("parse failed");
     let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.providers = common::test_providers();
     if let Some(r) = registry_override {
         ctx.registry = r;
     }

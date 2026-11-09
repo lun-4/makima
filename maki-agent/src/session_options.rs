@@ -93,6 +93,8 @@ pub enum SessionOptionError {
     UnknownId(Arc<str>),
     #[error("invalid value {value:?} for session option {id}")]
     InvalidValue { id: Arc<str>, value: Arc<str> },
+    #[error("{0}")]
+    UnresolvedModel(Arc<str>),
     #[error("session option owner is unavailable: {0}")]
     UnavailableOwner(Arc<str>),
     #[error("session option was replaced by a newer plugin generation: {0}")]

@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use color_eyre::Result;
-use color_eyre::eyre::{Context, eyre};
+use color_eyre::eyre::eyre;
 
 use crossterm::event::{
     Event, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
@@ -29,6 +29,8 @@ use maki_agent::command::CustomCommand;
 use maki_agent::config_change::{
     ConfigChangeError, ConfigChangeTicket, prepare_model, prepare_selection,
 };
+use maki_agent::end_conversation_detached;
+use maki_agent::headless::default_model_preparer;
 #[cfg(test)]
 use maki_agent::permissions::PermissionAnswer;
 use maki_agent::permissions::PermissionManager;
@@ -62,8 +64,10 @@ use maki_lua::{
     SessionRequest, StatusContentReader, UiAction, UiReply,
 };
 use maki_providers::Timeouts;
-use maki_providers::provider::{Provider, from_model};
-use maki_providers::{Message, Model};
+use maki_providers::provider::Provider;
+use maki_providers::{
+    ConversationEnd, Message, Model, ModelTier, PreparedProvider, ProviderRegistry,
+};
 use maki_storage::StateDir;
 use maki_storage::StorageError;
 use maki_storage::checkpoint::CheckpointPublication;
@@ -78,6 +82,7 @@ fn claim_lock(dir: &Path, id: &MakiId) -> Result<ClaimedSessionLock> {
 }
 
 use crate::AppSession;
+use crate::agent::pending::PendingProvider;
 use crate::agent::{
     AgentCommand, AgentHandles, PreparedAgentHandles, ProviderChange, ProviderSlot,
     SystemPromptOverride, shared_queue::QueueItem,
@@ -97,7 +102,6 @@ use crate::components::{
 };
 use crate::input::InputReader;
 use crate::model_capabilities::ModelCapabilityCache;
-use crate::plan_approval::PrepareProvider;
 use crate::provider_usage::{
     ProviderIdentity, ProviderUsageCoordinator, ProviderUsageFetch, ProviderUsageFetchId,
     ProviderUsageFetchResult, ProviderUsageInput, ProviderUsageOutput, ProviderUsageRequestKind,
@@ -130,6 +134,8 @@ const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
 const PROVIDER_USAGE_CHANGED_ERR: &str = "provider changed while fetching usage";
 const PROVIDER_USAGE_SHUTDOWN_ERR: &str = "UI shut down while fetching usage";
 const NOT_LIVE_ERR: &str = "session not live";
+const UNKNOWN_PROVIDER: &str = "Unknown";
+const RUNTIME_GONE_ERR: &str = "session closed while its model was preparing";
 const CHILD_HISTORY_IDENTITY_ERR: &str = "child history storage identity is unavailable";
 const LOCK_LOST_MSG: &str = "Session lock lost to another process; stopping without saving";
 const LOCK_UNAVAILABLE_REPLACEMENT_ERR: &str =
@@ -170,6 +176,7 @@ pub struct EventLoopParams {
     pub ui_action_rx: flume::Receiver<UiAction>,
     pub lua_event_handle: EventHandle,
     pub model_policy: Arc<ModelPolicy>,
+    pub providers: Arc<ProviderRegistry>,
     pub session_defaults: SessionDefaults,
     pub project_config: ProjectConfig,
     pub trust_question: Option<TrustQuestion>,
@@ -374,8 +381,7 @@ fn prepare_terminal_handoff<'a>(
 }
 
 fn tick_session(app: &mut App, focused: bool, now: Instant) -> (Dirty, Vec<Action>) {
-    let actions = app.poll_login_picker();
-    let mut dirty = Dirty::NO;
+    let (mut dirty, actions) = app.poll_login_picker();
     if focused {
         dirty |= app.tick_at(now);
     } else {
@@ -645,21 +651,20 @@ fn observe_config_commits(
     handles: &AgentHandles,
     model_slot: Arc<ProviderSlot>,
     coordinator: SessionCoordinatorHandle,
-    prepare: PrepareProvider,
+    prepare: ModelPreparer,
 ) -> Result<flume::Receiver<ConfigCommit>, ConfigChangeError> {
     let (manager, root) = handles.manager_and_root();
     let (ui_tx, ui_rx) = flume::unbounded();
     let actor = manager.actor(root)?;
     {
         let target = manager.lookup(root);
-        let timeouts = handles.orchestration_template.timeouts;
         let cwd = handles.cwd_slot();
         let permissions = Arc::clone(&handles.orchestration_template.permissions);
         project_yolo(&coordinator, Arc::clone(&permissions));
         let binding = target.map_err(ConfigChangeError::from).and_then(|target| {
             coordinator.bind_actor(
                 target,
-                model_preparer(prepare, timeouts),
+                prepare,
                 Arc::new(move |commit| {
                     model_slot.project(
                         commit.config.model.clone(),
@@ -761,15 +766,16 @@ struct SessionRuntime {
     pending_approval: Option<PendingPlanApproval>,
 }
 
-struct PendingReplacement {
-    prepared: PreparedSessionRuntime,
-    kind: SessionReplacementKind,
-}
-
-#[derive(Clone)]
-struct PreparedProvider {
-    model: Model,
-    provider: Arc<dyn Provider>,
+/// Where a session goes once the model it needs is prepared.
+enum RuntimeTarget {
+    /// A new focused tab, answering the `maki.session.focus` that asked.
+    Open { reply: flume::Sender<UiReply> },
+    /// In place of the runtime `runtime` identifies.
+    Replace {
+        runtime: Arc<()>,
+        kind: Option<SessionReplacementKind>,
+        reply: Option<flume::Sender<UiReply>>,
+    },
 }
 
 struct PreparedSessionRuntime {
@@ -779,7 +785,7 @@ struct PreparedSessionRuntime {
     model_slot: Arc<ProviderSlot>,
     coordinator: PreparedSessionCoordinator,
     checkpoint: Arc<CoordinatorCheckpointWriter>,
-    prepare_provider: PrepareProvider,
+    prepare_provider: ModelPreparer,
     provider: Option<PreparedProvider>,
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
@@ -1194,7 +1200,8 @@ impl SessionRuntime {
 
 /// Everything needed to bring up a new session runtime after startup.
 struct SpawnCtx {
-    prepare_provider: PrepareProvider,
+    prepare_provider: ModelPreparer,
+    providers: Arc<ProviderRegistry>,
     storage: StateDir,
     sessions_dir: PathBuf,
     config: AgentConfig,
@@ -1277,12 +1284,12 @@ impl SpawnCtx {
     fn prepare_replacement_runtime(
         &self,
         mut session: AppSession,
+        provider: Option<PreparedProvider>,
         current_id: MakiId,
         permissions: &PermissionManager,
         current_offload: Option<&Arc<OffloadStore>>,
     ) -> Result<PreparedSessionRuntime, String> {
         session.meta.yolo = permissions.persisted_yolo();
-        let provider = self.prepare_replacement_provider(&session)?;
         let seed_snapshot = session.id != current_id;
         let offload = if seed_snapshot {
             None
@@ -1300,23 +1307,12 @@ impl SpawnCtx {
         .map_err(|error| error.to_string())
     }
 
-    fn prepare_replacement_provider(
-        &self,
-        session: &AppSession,
-    ) -> Result<Option<PreparedProvider>, String> {
+    /// The model {session} needs prepared before its runtime can start, or
+    /// `None` when it runs on the startup provider.
+    fn replacement_spec(&self, session: &AppSession) -> Option<Arc<str>> {
         let model_spec = &session.model;
-        if model_spec == &self.model_slot.load().model.spec()
-            || !self.model_policy.allows(model_spec)
-        {
-            return Ok(None);
-        }
-        let model = Model::from_spec(model_spec).map_err(|error| error.to_string())?;
-        let prepared =
-            (self.prepare_provider)(model, self.timeouts).map_err(|error| error.to_string())?;
-        Ok(Some(PreparedProvider {
-            model: prepared.model,
-            provider: prepared.provider,
-        }))
+        (model_spec != &self.model_slot.load().model.spec() && self.model_policy.allows(model_spec))
+            .then(|| Arc::from(model_spec.as_str()))
     }
 
     fn prepare_runtime_with_provider(
@@ -1387,7 +1383,12 @@ impl SpawnCtx {
         // seeded with. `effective_config` only carries a caller's explicit
         // override; everything else comes from the session being resumed.
         let config = effective_config.unwrap_or_else(|| {
-            let state = SessionState::from_session(session.clone(), &model, &self.model_policy);
+            let state = SessionState::from_session(
+                session.clone(),
+                &model,
+                &self.model_policy,
+                &self.providers,
+            );
             let provider = Arc::clone(&model_slot.load().provider) as Arc<dyn Provider>;
             state.starting_config(
                 provider,
@@ -1419,6 +1420,7 @@ impl SpawnCtx {
             Arc::clone(&permissions),
             self.lua_event_handle.clone(),
             Arc::clone(&self.model_policy),
+            Arc::clone(&self.providers),
             crate::theme::default_provider().clone(),
             Arc::clone(&self.command_runtime),
             Arc::clone(&self.model_capabilities),
@@ -1437,6 +1439,7 @@ impl SpawnCtx {
             self.lua_event_handle.clone(),
             self.mcp_handle.clone(),
             Arc::clone(&self.model_policy),
+            Arc::clone(&self.providers),
             self.system_prompt.clone(),
         );
         let deps = self.coordinator_deps();
@@ -1492,6 +1495,12 @@ impl SpawnCtx {
 
 enum InternalEvent {
     ModelsDiscovered,
+    /// The UI slot's model prepared differently once discovery landed.
+    ModelRediscovered {
+        spec: String,
+        provider: ProviderIdentity,
+        model: Model,
+    },
     ModelCapabilitiesResolved,
     ProviderUsageFetched {
         fetch_id: ProviderUsageFetchId,
@@ -1511,6 +1520,20 @@ enum InternalEvent {
         runtime: Arc<()>,
         request: Arc<()>,
         result: Result<ApprovalStep, String>,
+    },
+    /// A startup prepare finished; see [`StartupPrepare`].
+    StartupPrepared {
+        spec: Arc<str>,
+        root: bool,
+        targets: Vec<(MakiId, PreparedModel)>,
+        result: Result<PreparedModel, String>,
+    },
+    /// A session's model finished preparing off the loop; see
+    /// [`EventLoop::bring_up`].
+    RuntimePrepared {
+        target: RuntimeTarget,
+        session: Box<AppSession>,
+        result: Result<PreparedProvider, String>,
     },
     SessionHeartbeat(u64),
 }
@@ -1637,6 +1660,48 @@ enum Wake {
     Internal(InternalEvent),
 }
 
+/// A model startup seeded with a [`PendingProvider`] instead of waiting for
+/// its prepare. `targets` are the runtimes seeded on it, with the model and
+/// provider each started on, so a model switched since is left alone.
+struct StartupPrepare {
+    spec: Arc<str>,
+    pending: Arc<PendingProvider>,
+    root: bool,
+    targets: Vec<(MakiId, PreparedModel)>,
+}
+
+impl StartupPrepare {
+    fn spawn(self, prepare: ModelPreparer, internal_tx: flume::Sender<InternalEvent>) {
+        smol::spawn(async move {
+            let result = prepare(Arc::clone(&self.spec))
+                .await
+                .map_err(|error| error.to_string());
+            self.pending
+                .fill(
+                    result
+                        .as_ref()
+                        .map(|prepared| Arc::clone(&prepared.provider))
+                        .map_err(|error| Arc::from(error.as_str())),
+                )
+                .await;
+            let _ = internal_tx.send(InternalEvent::StartupPrepared {
+                spec: self.spec,
+                root: self.root,
+                targets: self.targets,
+                result,
+            });
+        })
+        .detach();
+    }
+}
+
+fn restore_warning(spec: &str, error: &str, fallback: &Model) -> String {
+    format!(
+        "failed to restore model {spec}: {error}; using {}",
+        fallback.spec()
+    )
+}
+
 fn new_session_from_slot(slot: &ProviderSlot, cwd: &str) -> (AppSession, PreparedProvider) {
     let current = slot.load();
     (
@@ -1672,7 +1737,7 @@ impl<'t> EventLoop<'t> {
     ) -> Result<Self> {
         let EventLoopParams {
             cwd,
-            mut model,
+            model,
             needs_login,
             explicit_model,
             commands,
@@ -1694,6 +1759,7 @@ impl<'t> EventLoop<'t> {
             ui_action_rx,
             lua_event_handle,
             model_policy,
+            providers,
             session_defaults,
             project_config,
             trust_question,
@@ -1729,23 +1795,21 @@ impl<'t> EventLoop<'t> {
             crate::update::spawn_check();
         });
 
-        let provider: Arc<dyn Provider> = if needs_login {
-            Arc::from(maki_providers::provider::from_model_fallback(
-                &mut model, timeouts,
-            ))
-        } else {
-            Arc::from(from_model(&mut model, timeouts).context("create provider")?)
+        let startup_pending = (!needs_login).then(|| Arc::new(PendingProvider::default()));
+        let provider = match &startup_pending {
+            Some(pending) => Arc::clone(pending) as Arc<dyn Provider>,
+            None => maki_providers::provider::unconfigured(),
         };
         let (model_slot, provider_change_rx) = ProviderSlot::new(model.clone(), provider);
         let initial_provider = model_slot.load().provider.identity();
         let (internal_tx, internal_rx) = flume::unbounded();
         let (warn_tx, warn_rx) = flume::unbounded::<String>();
-        let catalog = ModelCatalog::offline(&model_policy);
+        let catalog = ModelCatalog::offline(Arc::clone(&providers), &model_policy);
         let storage_writer = Arc::new(StorageWriter::new(storage.clone(), warn_tx.clone()));
         let sessions_dir = storage.ensure_subdir(SESSIONS_DIR)?;
 
         let notifier = terminal::TerminalNotifier::new(ui_config.notifications);
-        let model_capabilities = ModelCapabilityCache::provider_adjusted(timeouts, {
+        let model_capabilities = ModelCapabilityCache::provider_adjusted(Arc::clone(&providers), {
             let internal_tx = internal_tx.clone();
             move || {
                 let _ = internal_tx.send(InternalEvent::ModelCapabilitiesResolved);
@@ -1768,7 +1832,8 @@ impl<'t> EventLoop<'t> {
         let (mcp_handle, mcp_config_errors) =
             smol::block_on(mcp::start(&cwd, project_config.clone()));
         let ctx = SpawnCtx {
-            prepare_provider: Arc::new(prepare_provider),
+            prepare_provider: default_model_preparer(Arc::clone(&providers)),
+            providers,
             storage,
             sessions_dir: sessions_dir.clone(),
             config,
@@ -1797,29 +1862,69 @@ impl<'t> EventLoop<'t> {
         };
 
         let mut runtimes = Vec::with_capacity(sessions.len());
+        let mut prepares = Vec::new();
+        let mut on_startup_provider = Vec::new();
         for session in sessions {
-            let provider = if explicit_model {
+            let restore = if explicit_model {
                 None
             } else {
-                match ctx.prepare_replacement_provider(&session) {
-                    Ok(provider) => provider,
-                    Err(error) => {
-                        startup_warnings.push(format!(
-                            "failed to restore model {}: {error}; using {}",
-                            session.model,
-                            ctx.model_slot.load().model.spec()
-                        ));
-                        None
-                    }
-                }
+                ctx.replacement_spec(&session)
+                    .and_then(|spec| match ctx.providers.model(&spec) {
+                        Ok(model) => Some((spec, model, Arc::new(PendingProvider::default()))),
+                        Err(error) => {
+                            startup_warnings.push(restore_warning(
+                                &spec,
+                                &error.to_string(),
+                                &ctx.model_slot.load().model,
+                            ));
+                            None
+                        }
+                    })
             };
-            match ctx.spawn_runtime_with_provider(session, provider) {
-                Ok(runtime) => runtimes.push(runtime),
+            let provider = restore
+                .as_ref()
+                .map(|(_, model, pending)| PreparedProvider {
+                    model: model.clone(),
+                    provider: Arc::clone(pending) as Arc<dyn Provider>,
+                });
+            let runtime = match ctx.spawn_runtime_with_provider(session, provider) {
+                Ok(runtime) => runtime,
                 Err(error) => {
                     rollback_startup_runtimes(runtimes);
                     return Err(error);
                 }
+            };
+            let seeded = {
+                let current = runtime.model_slot.load();
+                (
+                    runtime.id(),
+                    PreparedModel {
+                        model: current.model.clone(),
+                        provider: Arc::clone(&current.provider) as Arc<dyn Provider>,
+                    },
+                )
+            };
+            match restore {
+                Some((spec, _, pending)) => prepares.push(StartupPrepare {
+                    spec,
+                    pending,
+                    root: false,
+                    targets: vec![seeded],
+                }),
+                None => on_startup_provider.push(seeded),
             }
+            runtimes.push(runtime);
+        }
+        if let Some(pending) = startup_pending {
+            prepares.push(StartupPrepare {
+                spec: Arc::from(model.spec()),
+                pending,
+                root: true,
+                targets: on_startup_provider,
+            });
+        }
+        for prepare in prepares {
+            prepare.spawn(Arc::clone(&ctx.prepare_provider), internal_tx.clone());
         }
         for runtime in &mut runtimes {
             runtime.activate_deferred();
@@ -1831,7 +1936,7 @@ impl<'t> EventLoop<'t> {
         let app = &mut runtimes[focused].app;
         app.exit_on_done = exit_on_done;
         if needs_login {
-            app.login_picker.open(app.storage.clone());
+            app.login_picker.open();
         }
         if !ctx.mcp_config_errors.is_empty() {
             let msg = format!("MCP config error: {}", ctx.mcp_config_errors);
@@ -2166,6 +2271,22 @@ impl<'t> EventLoop<'t> {
                     }
                 }
             }
+            InternalEvent::ModelRediscovered {
+                spec,
+                provider,
+                model,
+            } => self.apply_rediscovered_model(&spec, provider, model),
+            InternalEvent::StartupPrepared {
+                spec,
+                root,
+                targets,
+                result,
+            } => self.complete_startup_prepare(spec, root, targets, result),
+            InternalEvent::RuntimePrepared {
+                target,
+                session,
+                result,
+            } => self.complete_bring_up(target, *session, result),
             InternalEvent::SessionOp {
                 session,
                 runtime,
@@ -2245,7 +2366,7 @@ impl<'t> EventLoop<'t> {
             "ProviderChanged",
             serde_json::json!({
                 "provider_id": format!("{}:{}:{}", current.model.provider, provider.instance.0, provider.auth.0),
-                "provider": current.model.provider_display_name(),
+                "provider": self.provider_display_name(&current.model.provider),
                 "model": current.model.id,
             }),
         );
@@ -2751,6 +2872,13 @@ impl<'t> EventLoop<'t> {
         .detach();
     }
 
+    fn provider_display_name(&self, provider: &str) -> String {
+        self.ctx
+            .providers
+            .display_name(provider)
+            .map_or_else(|| UNKNOWN_PROVIDER.into(), |name| name.to_string())
+    }
+
     fn provider_usage_loading_snapshot(&self) -> ProviderUsageSnapshot {
         let current = self.focused_model_slot().load();
         ProviderUsageSnapshot {
@@ -2760,7 +2888,7 @@ impl<'t> EventLoop<'t> {
                 current.provider.identity().instance.0,
                 current.provider.identity().auth.0
             ),
-            provider: current.model.provider_display_name().to_owned(),
+            provider: self.provider_display_name(&current.model.provider),
             model: current.model.id.clone(),
             status: "loading".into(),
             limits: Vec::new(),
@@ -2797,7 +2925,7 @@ impl<'t> EventLoop<'t> {
                 current.provider.identity().instance.0,
                 current.provider.identity().auth.0
             ),
-            provider: current.model.provider_display_name().to_owned(),
+            provider: self.provider_display_name(&current.model.provider),
             model: current.model.id.clone(),
             status,
             limits,
@@ -3087,12 +3215,12 @@ impl<'t> EventLoop<'t> {
                 }
                 let _ = reply_tx.send(Ok(json!(id)));
             }
-            SessionRequest::Focus { id } => {
-                let reply = parse_session_id(&id)
-                    .and_then(|id| self.focus_session(id))
-                    .map(|()| json!(true));
-                let _ = reply_tx.send(reply);
-            }
+            SessionRequest::Focus { id } => match parse_session_id(&id) {
+                Ok(id) => self.focus_session(id, reply_tx),
+                Err(error) => {
+                    let _ = reply_tx.send(Err(error));
+                }
+            },
             SessionRequest::SetTitle { id, title } => {
                 let title = normalize_title(&title);
                 let reply = (|| {
@@ -3226,18 +3354,136 @@ impl<'t> EventLoop<'t> {
         idx
     }
 
-    fn replace_runtime(&mut self, idx: usize, session: AppSession) -> Result<(), String> {
+    /// Brings {session} up at {target}, first preparing its model off the
+    /// event loop when it needs one: preparing can read credentials or call
+    /// into a plugin, and the loop must keep rendering meanwhile.
+    fn bring_up(&mut self, target: RuntimeTarget, session: AppSession) {
+        let Some(spec) = self.ctx.replacement_spec(&session) else {
+            let result = self.place_runtime(&target, session, None);
+            return self.report_placement(target, result);
+        };
+        let prepare = Arc::clone(&self.ctx.prepare_provider);
+        let internal_tx = self.internal_tx.clone();
+        smol::spawn(async move {
+            let result = prepare(spec).await.map_err(|error| error.to_string());
+            let _ = internal_tx.send(InternalEvent::RuntimePrepared {
+                target,
+                session: Box::new(session),
+                result,
+            });
+        })
+        .detach();
+    }
+
+    fn complete_bring_up(
+        &mut self,
+        target: RuntimeTarget,
+        session: AppSession,
+        result: Result<PreparedProvider, String>,
+    ) {
+        let result =
+            result.and_then(|provider| self.place_runtime(&target, session, Some(provider)));
+        self.report_placement(target, result);
+    }
+
+    fn place_runtime(
+        &mut self,
+        target: &RuntimeTarget,
+        session: AppSession,
+        provider: Option<PreparedProvider>,
+    ) -> Result<(), String> {
+        let (runtime, kind) = match target {
+            RuntimeTarget::Open { .. } => return self.open_runtime(session, provider),
+            RuntimeTarget::Replace { runtime, kind, .. } => (runtime, kind),
+        };
+        let idx = self.runtime_position(runtime).ok_or(RUNTIME_GONE_ERR)?;
+        // Taking a blank tab was decided before the model was prepared; the
+        // user may have typed or started work there since, so look again.
+        if kind.is_none() && !self.blank_and_idle(idx) {
+            return self.open_runtime(session, provider);
+        }
         if self.sessions[idx].lock_lost {
             return Err(LOCK_LOST_REPLACEMENT_ERR.into());
         }
-        self.sessions[idx].app.checkpoint_now();
         let prepared = self.ctx.prepare_replacement_runtime(
             session,
+            provider,
             self.sessions[idx].id(),
             self.sessions[idx].app.permissions.as_ref(),
             self.sessions[idx].handles.offload.as_ref(),
         )?;
-        self.replace_prepared_runtime(idx, prepared)
+        self.replace_prepared_runtime(idx, prepared)?;
+        match kind {
+            Some(SessionReplacementKind::Reset { ended_id }) => {
+                self.fire_session_reset(idx, *ended_id)
+            }
+            #[cfg(test)]
+            Some(SessionReplacementKind::Load) => {}
+            None => {}
+        }
+        Ok(())
+    }
+
+    fn open_runtime(
+        &mut self,
+        session: AppSession,
+        provider: Option<PreparedProvider>,
+    ) -> Result<(), String> {
+        if let Some(idx) = self.position(session.id) {
+            self.set_focused(idx);
+            return Ok(());
+        }
+        let runtime = self
+            .ctx
+            .spawn_runtime_with_provider(session, provider)
+            .map_err(|error| error.to_string())?;
+        let idx = self.push_runtime(runtime);
+        self.set_focused(idx);
+        Ok(())
+    }
+
+    /// Whether the session at {idx} holds nothing worth keeping, so a stored
+    /// session may take its tab: idle, nothing queued, no messages or draft.
+    /// The input box is read too, as a draft typed since the last frame has
+    /// not reached the session yet.
+    fn blank_and_idle(&self, idx: usize) -> bool {
+        let session = &self.sessions[idx];
+        let (manager, root) = session.handles.manager_and_root();
+        let actor_idle = manager.actor(root).is_ok_and(|actor| {
+            let snapshot = actor.snapshot();
+            snapshot.status == maki_agent::actor::ActorStatus::Idle && snapshot.queued == 0
+        });
+        session.quiescent()
+            && actor_idle
+            && !session.app.has_content()
+            && session.app.input_box.buffer.value().is_empty()
+    }
+
+    fn report_placement(&mut self, target: RuntimeTarget, result: Result<(), String>) {
+        match target {
+            RuntimeTarget::Open { reply }
+            | RuntimeTarget::Replace {
+                reply: Some(reply), ..
+            } => {
+                let _ = reply.send(result.map(|()| json!(true)));
+            }
+            RuntimeTarget::Replace {
+                runtime,
+                reply: None,
+                ..
+            } => {
+                if let Err(error) = result {
+                    let idx = self.runtime_position(&runtime).unwrap_or(self.focused);
+                    self.sessions[idx].app.flash(error);
+                }
+            }
+        }
+    }
+
+    fn runtime_position(&self, runtime: &Arc<()>) -> Option<usize> {
+        self.sessions
+            .iter()
+            .position(|session| Arc::ptr_eq(runtime, &session.handles.identity()))
     }
 
     fn replace_prepared_runtime(
@@ -3283,6 +3529,16 @@ impl<'t> EventLoop<'t> {
         } = old;
         let retired_id = app.state.session.id;
         let replaced_session = retired_id != self.sessions[idx].id();
+        let ended_conversation = replaced_session
+            .then(|| handles.history.load().conversation.clone())
+            .flatten()
+            .filter(|conversation| conversation.sent.is_some())
+            .map(|conversation| {
+                (
+                    Arc::clone(&app.root_config().settings.provider),
+                    conversation.id,
+                )
+            });
         if let Err(error) = release_lock_state(session_lock) {
             warn!(%error, "old session lock release failed");
         }
@@ -3293,6 +3549,9 @@ impl<'t> EventLoop<'t> {
             shutdown.await;
             drop(held);
             if replaced_session {
+                if let Some((provider, conversation_id)) = ended_conversation {
+                    end_conversation_detached(&provider, conversation_id, ConversationEnd::Closed);
+                }
                 let _ = coordinator.close().await;
                 storage_writer.forget(retired_id);
             }
@@ -3306,56 +3565,24 @@ impl<'t> EventLoop<'t> {
             .fire_autocmd("SessionReset", json!({ "session_id": ended_id }));
     }
 
-    fn prepare_replacement(
-        &self,
-        idx: usize,
-        request: SessionReplacementRequest,
-    ) -> Result<PendingReplacement, String> {
+    fn request_replacement(&mut self, idx: usize, request: SessionReplacementRequest) {
         let SessionReplacementRequest { mut session, kind } = request;
+        if let Err(error) = ensure_replacement_lock_available(&self.sessions[idx], session.id) {
+            self.sessions[idx].app.flash(error.into());
+            return;
+        }
         if session.id == self.sessions[idx].id() {
             apply_options_to_session(
                 &mut session,
                 &self.sessions[idx].coordinator.read().options(),
             );
         }
-        let prepared = self.ctx.prepare_replacement_runtime(
-            session,
-            self.sessions[idx].id(),
-            self.sessions[idx].app.permissions.as_ref(),
-            self.sessions[idx].handles.offload.as_ref(),
-        )?;
-        Ok(PendingReplacement { prepared, kind })
-    }
-
-    fn commit_replacement(&mut self, idx: usize, pending: PendingReplacement) {
-        let PendingReplacement { prepared, kind } = pending;
-        match self.replace_prepared_runtime(idx, prepared) {
-            Ok(()) => match kind {
-                SessionReplacementKind::Reset { ended_id } => {
-                    self.fire_session_reset(idx, ended_id)
-                }
-                #[cfg(test)]
-                SessionReplacementKind::Load => {}
-            },
-            Err(error) => self.sessions[idx].app.flash(error),
-        }
-    }
-
-    fn request_replacement(&mut self, idx: usize, request: SessionReplacementRequest) {
-        if let Err(error) =
-            ensure_replacement_lock_available(&self.sessions[idx], request.session.id)
-        {
-            self.sessions[idx].app.flash(error.into());
-            return;
-        }
-        let pending = match self.prepare_replacement(idx, request) {
-            Ok(pending) => pending,
-            Err(error) => {
-                self.sessions[idx].app.flash(error);
-                return;
-            }
+        let target = RuntimeTarget::Replace {
+            runtime: self.sessions[idx].handles.identity(),
+            kind: Some(kind),
+            reply: None,
         };
-        self.commit_replacement(idx, pending);
+        self.bring_up(target, session);
     }
 
     fn set_focused(&mut self, next: usize) {
@@ -3371,9 +3598,16 @@ impl<'t> EventLoop<'t> {
     /// as a new runtime so the session you came from stays live. A stored
     /// session from another directory, or one held open by a live process
     /// elsewhere, is rejected.
-    fn focus_session(&mut self, id: MakiId) -> Result<(), String> {
+    fn focus_session(&mut self, id: MakiId, reply: flume::Sender<UiReply>) {
+        if let Err(error) = self.request_focus(id, reply.clone()) {
+            let _ = reply.send(Err(error));
+        }
+    }
+
+    fn request_focus(&mut self, id: MakiId, reply: flume::Sender<UiReply>) -> Result<(), String> {
         if let Some(i) = self.position(id) {
             self.set_focused(i);
+            let _ = reply.send(Ok(json!(true)));
             return Ok(());
         }
         let session = AppSession::load(id, &self.ctx.storage)
@@ -3383,22 +3617,22 @@ impl<'t> EventLoop<'t> {
         if let Some(block) = session_lock::resume_block(&session.cwd, &cwd, open_elsewhere) {
             return Err(block.to_string());
         }
-        let current = &self.sessions[self.focused];
-        let (manager, root) = current.handles.manager_and_root();
-        let actor_idle = manager.actor(root).is_ok_and(|actor| {
-            let snapshot = actor.snapshot();
-            snapshot.status == maki_agent::actor::ActorStatus::Idle && snapshot.queued == 0
-        });
-        if current.quiescent() && actor_idle && !current.app.has_content() {
-            return self.replace_runtime(self.focused, session);
-        }
-        let provider = self.ctx.prepare_replacement_provider(&session)?;
-        let runtime = self
-            .ctx
-            .spawn_runtime_with_provider(session, provider)
-            .map_err(|error| error.to_string())?;
-        let idx = self.push_runtime(runtime);
-        self.set_focused(idx);
+        let target = if self.blank_and_idle(self.focused) {
+            let current = &self.sessions[self.focused];
+            if current.lock_lost {
+                return Err(LOCK_LOST_REPLACEMENT_ERR.into());
+            }
+            let runtime = current.handles.identity();
+            self.sessions[self.focused].app.checkpoint_now();
+            RuntimeTarget::Replace {
+                runtime,
+                kind: None,
+                reply: Some(reply),
+            }
+        } else {
+            RuntimeTarget::Open { reply }
+        };
+        self.bring_up(target, session);
         Ok(())
     }
 
@@ -3594,7 +3828,7 @@ impl<'t> EventLoop<'t> {
                 self.prepare_plan_approval(idx, clear_context, selection, parallel, path);
             }
             Action::CancelPlanApproval => self.sessions[idx].end_plan_approval(),
-            Action::RefreshProvider { slug } => self.refresh_provider(slug),
+            Action::RefreshProvider { slug } => self.refresh_provider(idx, slug),
             Action::AssignTier(spec, tier) => {
                 maki_providers::model_registry::set_and_persist(spec, tier, &self.ctx.storage);
             }
@@ -3793,20 +4027,6 @@ impl<'t> EventLoop<'t> {
         self.sessions
             .get(self.focused)
             .map_or(&self.ctx.model_slot, |rt| &rt.model_slot)
-    }
-
-    fn change_model(&mut self, idx: usize, spec: &str) {
-        self.note_if_deferred(idx, "model");
-        let target = self.selected_target(idx);
-        self.dispatch_model_selection(
-            idx,
-            target,
-            maki_commands::ModelSelection {
-                spec: Some(Arc::from(spec)),
-                ..Default::default()
-            },
-            None,
-        );
     }
 
     /// Runs a command for a keymap or event callback against the agent that
@@ -4117,7 +4337,7 @@ impl<'t> EventLoop<'t> {
                 )
             });
         let policy = target_policy.unwrap_or_else(|| Arc::clone(&self.ctx.model_policy));
-        let prepare = model_preparer(Arc::clone(&self.ctx.prepare_provider), self.ctx.timeouts);
+        let prepare = Arc::clone(&self.ctx.prepare_provider);
         let internal_tx = self.internal_tx.clone();
         let session = self.sessions[idx].id();
         let runtime = self.sessions[idx].handles.identity();
@@ -4161,14 +4381,81 @@ impl<'t> EventLoop<'t> {
 
     /// Re-prepares the root's current model, for instance after logging in to its provider.
     fn reprepare_root_model(&self, idx: usize, spec: String) {
+        let policy = Arc::clone(&self.ctx.model_policy);
+        let prepare = Arc::clone(&self.ctx.prepare_provider);
+        self.refresh_root_model(idx, None, async move {
+            prepare_model(&spec, &policy, &prepare).await
+        });
+    }
+
+    /// The startup prepare for {targets} finished. A failed restore falls
+    /// back to the startup model, as a failed resolution does.
+    fn complete_startup_prepare(
+        &mut self,
+        spec: Arc<str>,
+        root: bool,
+        targets: Vec<(MakiId, PreparedModel)>,
+        result: Result<PreparedModel, String>,
+    ) {
+        let replacement = match result {
+            Ok(prepared) => {
+                if root {
+                    self.ctx
+                        .model_slot
+                        .install(prepared.model.clone(), Arc::clone(&prepared.provider));
+                }
+                prepared
+            }
+            Err(error) if root => {
+                return self
+                    .focused_app()
+                    .flash(format!("failed to prepare model {spec}: {error}"));
+            }
+            Err(error) => {
+                let startup = self.ctx.model_slot.load();
+                let fallback = PreparedModel {
+                    model: startup.model.clone(),
+                    provider: Arc::clone(&startup.provider) as Arc<dyn Provider>,
+                };
+                drop(startup);
+                let warning = restore_warning(&spec, &error, &fallback.model);
+                self.focused_app().flash(warning);
+                fallback
+            }
+        };
+        for (session, expected) in targets {
+            if let Some(idx) = self.position(session) {
+                let replacement = replacement.clone();
+                self.refresh_root_model(idx, Some(expected), async move { Ok(replacement) });
+            }
+        }
+    }
+
+    /// Commits {replacement} as the root's model while the root still runs
+    /// on {expected}, its current model when `None`.
+    fn refresh_root_model(
+        &self,
+        idx: usize,
+        expected: Option<PreparedModel>,
+        replacement: impl Future<Output = Result<PreparedModel, ConfigChangeError>> + Send + 'static,
+    ) {
         let (manager, root) = self.sessions[idx].handles.manager_and_root();
         let reserved = manager
             .actor(root)
             .map_err(ConfigChangeError::from)
             .and_then(|actor| {
-                let expected = actor
-                    .effective_config()
-                    .ok_or("missing actor configuration")?;
+                let expected = match expected {
+                    Some(expected) => expected,
+                    None => {
+                        let current = actor
+                            .effective_config()
+                            .ok_or("missing actor configuration")?;
+                        PreparedModel {
+                            provider: Arc::clone(&current.provider),
+                            model: current.model.clone(),
+                        }
+                    }
+                };
                 let target = manager.lookup(root)?;
                 let ticket = reserve_config_change(&target, &self.sessions[idx].coordinator, None)?;
                 Ok((ticket, expected))
@@ -4176,20 +4463,14 @@ impl<'t> EventLoop<'t> {
         let session = self.sessions[idx].id();
         let identity = self.sessions[idx].handles.identity();
         let internal_tx = self.internal_tx.clone();
-        let policy = Arc::clone(&self.ctx.model_policy);
-        let prepare = model_preparer(Arc::clone(&self.ctx.prepare_provider), self.ctx.timeouts);
         smol::spawn(async move {
             let result = match reserved {
                 Ok((ticket, expected)) => prepare_config_change(
                     ticket,
                     async move {
-                        let replacement = prepare_model(&spec, &policy, &prepare).await?;
                         Ok(ConfigChange::Refresh {
-                            expected: PreparedModel {
-                                provider: Arc::clone(&expected.provider),
-                                model: expected.model.clone(),
-                            },
-                            replacement,
+                            expected,
+                            replacement: replacement.await?,
                         })
                     },
                     async { smol::Timer::after(SESSION_OP_TIMEOUT).await },
@@ -4219,30 +4500,68 @@ impl<'t> EventLoop<'t> {
         );
     }
 
-    /// The UI slot only seeds new tabs, so it is written directly; the
-    /// catalog's discovery refreshes live agents.
+    /// The UI slot only seeds new tabs, so it is written directly once its
+    /// model re-prepares; the catalog's discovery refreshes live agents.
     fn refresh_discovered_models(&mut self) {
         let current = self.ctx.model_slot.load();
-        if let Some(model) =
-            maki_agent::actor::rediscovered_model(&*current.provider, &current.model)
-        {
-            let provider = Arc::clone(&current.provider) as Arc<dyn Provider>;
-            drop(current);
-            self.ctx.model_slot.project(model, provider);
-        }
+        let model = current.model.clone();
+        let provider = current.provider.identity();
+        drop(current);
+        let providers = Arc::clone(&self.ctx.providers);
+        let internal_tx = self.internal_tx.clone();
+        smol::spawn(async move {
+            let Some(refined) = maki_agent::actor::rediscovered_model(&providers, &model).await
+            else {
+                return;
+            };
+            let _ = internal_tx.send(InternalEvent::ModelRediscovered {
+                spec: model.spec(),
+                provider,
+                model: refined,
+            });
+        })
+        .detach();
         self.sync_orchestration();
         self.sync_model_discovery();
     }
 
-    fn refresh_provider(&mut self, slug: String) {
-        let idx = self.focused;
-        let slot = Arc::clone(self.focused_model_slot());
-        let model = slot.load().model.clone();
+    fn apply_rediscovered_model(&mut self, spec: &str, provider: ProviderIdentity, model: Model) {
+        let current = self.ctx.model_slot.load();
+        if current.model.spec() != spec || current.provider.identity() != provider {
+            return;
+        }
+        let tracked = Arc::clone(&current.provider) as Arc<dyn Provider>;
+        drop(current);
+        self.ctx.model_slot.project(model, tracked);
+    }
+
+    fn refresh_provider(&mut self, idx: usize, slug: String) {
+        let model = self.sessions[idx].model_slot.load().model.clone();
         if model.provider.to_string() == slug {
             self.reprepare_root_model(idx, model.spec());
-        } else if let Some(builtin) = maki_config::providers::builtin_provider(&slug) {
-            self.change_model(self.focused, builtin.default_model);
+            return;
         }
+        let Some(spec) = [ModelTier::Strong, ModelTier::Medium, ModelTier::Weak]
+            .into_iter()
+            .find_map(|tier| {
+                self.ctx
+                    .providers
+                    .model_for_tier(&slug, tier, &self.ctx.model_policy)
+                    .ok()
+            })
+            .map(|model| model.spec())
+        else {
+            return;
+        };
+        self.dispatch_model_selection(
+            idx,
+            self.selected_target(idx),
+            maki_commands::ModelSelection {
+                spec: Some(Arc::from(spec)),
+                ..Default::default()
+            },
+            None,
+        );
     }
 
     fn shutdown(mut self) -> ShutdownReport {
@@ -4474,14 +4793,6 @@ fn provider_usage_limit(limit: maki_providers::UsageLimit) -> ProviderUsageLimit
     }
 }
 
-/// The TUI's provider preparation as the coordinator's async preparer.
-fn model_preparer(prepare: PrepareProvider, timeouts: Timeouts) -> ModelPreparer {
-    Arc::new(move |model| {
-        let prepare = Arc::clone(&prepare);
-        Box::pin(smol::unblock(move || prepare(model, timeouts)))
-    })
-}
-
 fn runtime_config_mutations(
     runtime: &SessionRuntime,
     writer: Arc<StorageWriter>,
@@ -4605,15 +4916,6 @@ async fn prepare_config_change<T>(
     }
 }
 
-fn prepare_provider(mut model: Model, timeouts: Timeouts) -> Result<PreparedModel, Arc<str>> {
-    let provider =
-        from_model(&mut model, timeouts).map_err(|error| Arc::from(error.to_string()))?;
-    Ok(PreparedModel {
-        provider: Arc::from(provider),
-        model,
-    })
-}
-
 fn command_target_index(
     targets: impl IntoIterator<Item = maki_commands::InvocationTargetId>,
     target: maki_commands::InvocationTargetId,
@@ -4705,7 +5007,26 @@ fn ring_bell() {
 mod tests {
     use super::*;
     use maki_domain::ThinkingConfig as DomainThinkingConfig;
+    use maki_providers::Invocation;
     use maki_storage::checkpoint::ClaimingWriter;
+
+    /// A preparer for tests, from a blocking one over the resolved model,
+    /// run off the executor as a real prepare may block.
+    pub(super) fn sync_preparer(
+        prepare: impl Fn(Model) -> Result<PreparedModel, Arc<str>> + Send + Sync + 'static,
+    ) -> ModelPreparer {
+        let prepare = Arc::new(prepare);
+        Arc::new(move |spec| {
+            let prepare = Arc::clone(&prepare);
+            Box::pin(async move {
+                let model =
+                    Model::from_spec(&spec).map_err(maki_agent::config_change::unresolved_model)?;
+                smol::unblock(move || prepare(model))
+                    .await
+                    .map_err(ConfigChangeError::ModelPreparation)
+            })
+        })
+    }
 
     /// Projects every pending config commit the way the event loop's tick does,
     /// so a test that mutates config without running a frame still sees what a
@@ -4755,7 +5076,7 @@ mod tests {
     const OBSERVATION: &str = "failed";
     const PENDING_FAST_MODEL: &str = "pending-fast-model";
     const SWITCHED_FAST_MODEL: &str = "switched-fast-model";
-    const DISCOVERY_PROVIDER: &str = "synthetic";
+    const DISCOVERY_PROVIDER: &str = "tui-discovery";
     const STARTUP_MODEL_ID: &str = "tui-discovery-startup";
     const RESUMED_MODEL_ID: &str = "tui-discovery-resumed";
     const UNRELATED_MODEL_ID: &str = "tui-discovery-unrelated";
@@ -4996,7 +5317,7 @@ mod tests {
 
     fn fast_model(id: &str, support: FastSupport) -> Model {
         let mut model = model_named(id);
-        model.supports_fast_override = Some(support);
+        model.fast_support = Some(support);
         model
     }
 
@@ -5106,7 +5427,7 @@ mod tests {
             let predecessor = actor.reserve_prepared_operation(None).unwrap();
             let combined = actor.reserve_prepared_operation(None).unwrap();
             let mut model = model_named("replacement");
-            model.thinking_override = Some(maki_providers::ThinkingSupport::Yes);
+            model.thinking_support = Some(maki_providers::ThinkingSupport::Yes);
             let combined = smol::spawn(combined.commit_when_ready(Some(ConfigChange::Patch(
                 ConfigPatch {
                     model: Some(maki_agent::actor::PreparedModel {
@@ -5471,14 +5792,16 @@ mod tests {
         discovered: &str,
         refreshed: bool,
     ) {
+        let (models, providers) = discovery_providers();
         let spec = |id: &str| format!("{DISCOVERY_PROVIDER}/{id}");
-        with_event_loop_runtime(
+        with_event_loop_runtime_providers(
+            &providers,
             |harness| {
-                let startup = Model::from_spec(&spec(STARTUP_MODEL_ID)).unwrap();
+                let startup = providers.model(&spec(STARTUP_MODEL_ID)).unwrap();
                 harness.ctx.as_mut().unwrap().model_slot =
                     ProviderSlot::new(startup, Arc::new(StubProvider)).0;
                 let resumed = (session_model != STARTUP_MODEL_ID).then(|| PreparedProvider {
-                    model: Model::from_spec(&spec(session_model)).unwrap(),
+                    model: providers.model(&spec(session_model)).unwrap(),
                     provider: Arc::new(StubProvider),
                 });
                 harness
@@ -5492,17 +5815,22 @@ mod tests {
                 assert_eq!(before.model.spec(), spec(session_model));
                 assert_ne!(before.model.context_window, DISCOVERED_WINDOW);
                 let identity = runtime.model_slot.load().provider.identity();
-                maki_providers::model_registry::set_known_models(
-                    DISCOVERY_PROVIDER,
-                    vec![maki_providers::ModelInfo {
-                        context_window: Some(DISCOVERED_WINDOW),
-                        ..maki_providers::ModelInfo::id_only(discovered.into())
-                    }],
-                );
+                discover_window(&models, &providers, discovered);
 
                 event_loop.sync_orchestration();
-                smol::block_on(event_loop.ctx.catalog.apply(Vec::new()));
+                smol::block_on(
+                    event_loop
+                        .ctx
+                        .catalog
+                        .apply(Vec::new(), Some(DISCOVERY_PROVIDER.into())),
+                );
                 event_loop.handle_internal(InternalEvent::ModelsDiscovered);
+                let mut awaiting = refreshed;
+                while awaiting {
+                    let event = event_loop.internal_rx.recv().unwrap();
+                    awaiting = !matches!(event, InternalEvent::ModelRediscovered { .. });
+                    event_loop.handle_internal(event);
+                }
 
                 let runtime = &event_loop.sessions[0];
                 if refreshed {
@@ -5522,10 +5850,12 @@ mod tests {
     #[test_case(true ; "idle_guard")]
     #[test_case(false ; "session_lease")]
     fn busy_discovery_refresh_applies_once_released(idle_guard: bool) {
+        let (models, providers) = discovery_providers();
         let spec = format!("{DISCOVERY_PROVIDER}/{BUSY_MODEL_ID}");
-        with_event_loop_runtime(
+        with_event_loop_runtime_providers(
+            &providers,
             |harness| {
-                let startup = Model::from_spec(&spec).unwrap();
+                let startup = providers.model(&spec).unwrap();
                 harness.ctx.as_mut().unwrap().model_slot =
                     ProviderSlot::new(startup, Arc::new(StubProvider)).0;
                 harness
@@ -5535,13 +5865,7 @@ mod tests {
             },
             |event_loop| {
                 event_loop.sync_orchestration();
-                maki_providers::model_registry::set_known_models(
-                    DISCOVERY_PROVIDER,
-                    vec![maki_providers::ModelInfo {
-                        context_window: Some(DISCOVERED_WINDOW),
-                        ..maki_providers::ModelInfo::id_only(BUSY_MODEL_ID.into())
-                    }],
-                );
+                discover_window(&models, &providers, BUSY_MODEL_ID);
                 let runtime = &event_loop.sessions[0];
                 let (manager, root) = runtime.handles.manager_and_root();
                 let guard =
@@ -5552,7 +5876,12 @@ mod tests {
                         .reserve_transaction(CheckpointPublication::default())
                         .unwrap()
                 });
-                let mut refresh = Box::pin(event_loop.ctx.catalog.apply(Vec::new()));
+                let mut refresh = Box::pin(
+                    event_loop
+                        .ctx
+                        .catalog
+                        .apply(Vec::new(), Some(DISCOVERY_PROVIDER.into())),
+                );
 
                 assert!(smol::block_on(futures_lite::future::poll_once(&mut refresh)).is_none());
                 drop((guard, lease));
@@ -5593,6 +5922,7 @@ mod tests {
             EventHandle::disconnected_for_test(),
             None,
             Arc::new(ModelPolicy::default()),
+            Arc::default(),
             SystemPromptOverride::default(),
         );
         handles.apply_to_app(&mut app);
@@ -5602,7 +5932,7 @@ mod tests {
             &handles,
             Arc::clone(&model_slot),
             coordinator.clone(),
-            Arc::new(|model, _| {
+            sync_preparer(|model| {
                 Ok(maki_agent::PreparedModel {
                     model,
                     provider: Arc::new(StubProvider),
@@ -5664,24 +5994,19 @@ mod tests {
             _event_tx: &'a flume::Sender<maki_providers::ProviderEvent>,
             _opts: maki_providers::RequestOptions,
             _session_id: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, maki_providers::AgentError>,
         > {
             Box::pin(std::future::pending())
         }
-
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
-        }
     }
 
     struct FocusedProvider;
+
+    /// Tells [`FocusedProvider`] apart from every other test provider.
+    const FOCUSED_KEY_COUNT: usize = 7;
 
     impl Provider for FocusedProvider {
         fn stream_message<'a>(
@@ -5693,6 +6018,7 @@ mod tests {
             _event_tx: &'a flume::Sender<maki_providers::ProviderEvent>,
             _opts: maki_providers::RequestOptions,
             _session_id: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, maki_providers::AgentError>,
@@ -5700,29 +6026,104 @@ mod tests {
             Box::pin(std::future::pending())
         }
 
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>,
-        > {
-            Box::pin(async { Ok(vec![maki_providers::ModelInfo::id_only("focused".into())]) })
+        fn key_count(&self) -> usize {
+            FOCUSED_KEY_COUNT
         }
     }
 
     const SHELL_RESULT: &str = "command finished";
     const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+    const PUMP_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Runs the loop's internal, agent and tick work until {done} holds.
+    pub(super) fn pump_until(
+        event_loop: &mut EventLoop<'_>,
+        mut done: impl FnMut(&EventLoop<'_>) -> bool,
+    ) {
+        let deadline = Instant::now() + PUMP_TIMEOUT;
+        loop {
+            while let Ok(event) = event_loop.internal_rx.try_recv() {
+                event_loop.handle_internal(event);
+            }
+            for index in 0..event_loop.sessions.len() {
+                while let Ok(envelope) = event_loop.sessions[index].handles.agent_rx.try_recv() {
+                    event_loop
+                        .handle_wake(Wake::Agent(index, Box::new(envelope)))
+                        .unwrap();
+                }
+            }
+            let _ = event_loop.tick();
+            if done(event_loop) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "event processing timed out");
+            std::thread::yield_now();
+        }
+    }
     const TEST_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+    pub(super) type DiscoveredModels = Arc<std::sync::Mutex<Vec<maki_providers::ModelInfo>>>;
+
+    /// A registry with the discovery provider, and the models its discovery
+    /// reports.
+    pub(super) fn discovery_providers() -> (DiscoveredModels, Arc<ProviderRegistry>) {
+        let models = DiscoveredModels::default();
+        let providers =
+            maki_lua::test_support::offline_registry(DISCOVERY_PROVIDER, Arc::clone(&models));
+        (models, providers)
+    }
+
+    /// Discovery reports {model_id} with the discovered window.
+    fn discover_window(models: &DiscoveredModels, providers: &ProviderRegistry, model_id: &str) {
+        *models.lock().unwrap() = vec![maki_providers::ModelInfo {
+            context_window: Some(DISCOVERED_WINDOW),
+            ..maki_providers::ModelInfo::id_only(model_id.into())
+        }];
+        smol::block_on(providers.fetch_all(&ModelPolicy::default(), false, |_| {}));
+    }
+
+    fn with_event_loop_runtime_providers(
+        providers: &Arc<ProviderRegistry>,
+        runtime: impl FnOnce(&mut RuntimeHarness) -> SessionRuntime,
+        test: impl FnOnce(&mut EventLoop<'_>),
+    ) {
+        let catalog = ModelCatalog::offline(Arc::clone(providers), &ModelPolicy::default());
+        run_event_loop(
+            RuntimeHarness::with(PermissionsConfig::default(), Arc::clone(providers), catalog),
+            runtime,
+            test,
+        );
+    }
 
     pub(super) fn with_event_loop(test: impl FnOnce(&mut EventLoop<'_>)) {
         with_event_loop_runtime(|harness| harness.runtime(harness.session()), test);
+    }
+
+    /// Like `with_event_loop`, with {providers} as the registry.
+    pub(super) fn with_event_loop_providers(
+        providers: Arc<ProviderRegistry>,
+        test: impl FnOnce(&mut EventLoop<'_>),
+    ) {
+        let catalog = ModelCatalog::offline(Arc::clone(&providers), &ModelPolicy::default());
+        run_event_loop(
+            RuntimeHarness::with(PermissionsConfig::default(), providers, catalog),
+            |harness| harness.runtime(harness.session()),
+            test,
+        );
     }
 
     fn with_event_loop_runtime(
         runtime: impl FnOnce(&mut RuntimeHarness) -> SessionRuntime,
         test: impl FnOnce(&mut EventLoop<'_>),
     ) {
-        let mut harness = RuntimeHarness::new();
+        run_event_loop(RuntimeHarness::new(), runtime, test);
+    }
+
+    fn run_event_loop(
+        mut harness: RuntimeHarness,
+        runtime: impl FnOnce(&mut RuntimeHarness) -> SessionRuntime,
+        test: impl FnOnce(&mut EventLoop<'_>),
+    ) {
         let runtime = runtime(&mut harness);
         let ctx = harness.ctx.take().unwrap();
         let initial_provider = ctx.model_slot.load().provider.identity();
@@ -5797,6 +6198,7 @@ mod tests {
                 event: AgentEvent::SubagentHistory {
                     tool_use_id: history_key.clone(),
                     history_epoch: 0,
+                    conversation_id: None,
                     messages: Vec::new(),
                 },
                 subagent: Some(SubagentInfo {
@@ -5836,7 +6238,7 @@ mod tests {
             let target = app.command_target.clone();
             assert!(command_runtime.target_agent(&target).is_none());
             assert!(event_loop.orchestration_revisions.is_empty());
-            event_loop.ctx.prepare_provider = Arc::new(|model, _| {
+            event_loop.ctx.prepare_provider = sync_preparer(|model| {
                 Ok(maki_agent::actor::PreparedModel {
                     model,
                     provider: Arc::new(StubProvider),
@@ -5905,10 +6307,22 @@ mod tests {
 
     impl RuntimeHarness {
         fn with_permissions_config(permissions_config: PermissionsConfig) -> Self {
+            let providers = Arc::new(maki_providers::test_util::offline_ids(&[
+                crate::components::TEST_MODEL_PROVIDER,
+                "openai",
+                "ollama",
+            ]));
+            Self::with(permissions_config, providers, ModelCatalog::default())
+        }
+
+        fn with(
+            permissions_config: PermissionsConfig,
+            providers: Arc<ProviderRegistry>,
+            catalog: ModelCatalog,
+        ) -> Self {
             let temp_dir = tempfile::tempdir().unwrap();
             let storage = StateDir::from_path(temp_dir.path().to_path_buf());
             let sessions_dir = storage.ensure_subdir(SESSIONS_DIR).unwrap();
-            let catalog = ModelCatalog::default();
             let command_registry = maki_commands::CommandRegistry::new();
             let command_runtime = Arc::new(CommandRuntime::new_for_test(
                 &[],
@@ -5933,7 +6347,8 @@ mod tests {
             let storage_writer =
                 Arc::new(StorageWriter::new(storage.clone(), flume::unbounded().0));
             let ctx = SpawnCtx {
-                prepare_provider: Arc::new(prepare_provider),
+                prepare_provider: default_model_preparer(Arc::clone(&providers)),
+                providers,
                 storage,
                 sessions_dir,
                 config: AgentConfig::default(),
@@ -6091,6 +6506,7 @@ mod tests {
         const BODY: &str = "pending background session output";
         const EXISTING_BODY: &str = "referenced output retained if deletion is rejected";
         const ARTIFACT_NAME: &str = "existing-output.txt";
+        const REPLACEMENT_PID: &str = "4294967295";
         with_event_loop(|event_loop| {
             let mut session = AppSession::new("test-model", &event_loop.session_cwd);
             let id = session.id;
@@ -6145,13 +6561,17 @@ mod tests {
                     .is_none()
             );
             assert_eq!(std::fs::read_to_string(&artifact).unwrap(), EXISTING_BODY);
-            let replacement = if lose_ownership {
-                std::fs::remove_file(session_lock::lock_path(&event_loop.ctx.sessions_dir, &id))
-                    .unwrap();
-                Some(claim_lock(&event_loop.ctx.sessions_dir, &id).unwrap())
-            } else {
-                None
-            };
+            if lose_ownership {
+                let path = session_lock::lock_path(&event_loop.ctx.sessions_dir, &id);
+                std::fs::remove_file(&path).unwrap();
+                let replacement = path.with_extension("replacement");
+                std::fs::write(&replacement, REPLACEMENT_PID).unwrap();
+                std::fs::rename(replacement, path).unwrap();
+                assert!(session_lock::open_elsewhere(
+                    &event_loop.ctx.sessions_dir,
+                    &id
+                ));
+            }
             release_tx.send(()).unwrap();
             let saved = worker.join().unwrap().unwrap();
             let reply = reply_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap();
@@ -6173,9 +6593,6 @@ mod tests {
                 assert!(!dir.exists());
             }
             assert!(matches!(store.put(BODY), Err(OffloadError::Closed)));
-            if let Some(replacement) = replacement {
-                replacement.release().unwrap();
-            }
         });
     }
 
@@ -6210,6 +6627,7 @@ mod tests {
                 _event_tx: &'a flume::Sender<maki_providers::ProviderEvent>,
                 _opts: maki_providers::RequestOptions,
                 _session_id: Option<&'a SessionRef>,
+                _invocation: &'a Invocation,
             ) -> maki_providers::provider::BoxFuture<
                 'a,
                 Result<maki_providers::StreamResponse, maki_providers::AgentError>,
@@ -6220,15 +6638,6 @@ mod tests {
                     self.release.recv_async().await.unwrap();
                     std::future::pending().await
                 })
-            }
-
-            fn list_models(
-                &self,
-            ) -> maki_providers::provider::BoxFuture<
-                '_,
-                Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>,
-            > {
-                Box::pin(async { Ok(Vec::new()) })
             }
         }
 
@@ -6374,6 +6783,7 @@ mod tests {
             .ctx()
             .prepare_replacement_runtime(
                 session,
+                None,
                 runtime.id(),
                 runtime.app.permissions.as_ref(),
                 runtime.handles.offload.as_ref(),
@@ -6427,6 +6837,48 @@ mod tests {
     }
 
     #[test]
+    fn login_refresh_reprepares_the_originating_session() {
+        const FOCUSED: &str = "anthropic/claude-sonnet-4-6";
+        const BACKGROUND: &str = "anthropic/claude-opus-4-6";
+        const PROVIDER: &str = "anthropic";
+
+        with_event_loop(|event_loop| {
+            for spec in [FOCUSED, BACKGROUND] {
+                let runtime = event_loop
+                    .ctx
+                    .spawn_runtime_with_provider(
+                        AppSession::new(spec, &event_loop.session_cwd),
+                        Some(PreparedProvider {
+                            model: Model::from_spec(spec).unwrap(),
+                            provider: Arc::new(StubProvider),
+                        }),
+                    )
+                    .unwrap();
+                event_loop.push_runtime(runtime);
+            }
+            let (prepared_tx, prepared_rx) = flume::unbounded();
+            event_loop.ctx.prepare_provider = sync_preparer(move |requested| {
+                prepared_tx.send(requested.spec()).unwrap();
+                Ok(PreparedModel {
+                    model: requested.clone(),
+                    provider: Arc::new(StubProvider),
+                })
+            });
+            event_loop.set_focused(1);
+            event_loop.dispatch(
+                2,
+                vec![Action::RefreshProvider {
+                    slug: PROVIDER.into(),
+                }],
+            );
+            assert_eq!(
+                prepared_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap(),
+                BACKGROUND
+            );
+        });
+    }
+
+    #[test]
     fn new_session_inherits_focused_model_and_provider() {
         const FOCUSED_MODEL: &str = "openai/gpt-5";
 
@@ -6435,14 +6887,7 @@ mod tests {
         let (focused_slot, _) = ProviderSlot::new(focused_model, Arc::new(FocusedProvider));
 
         let (session, provider) = new_session_from_slot(&focused_slot, "/tmp");
-        assert_eq!(
-            smol::block_on(provider.provider.list_models())
-                .unwrap()
-                .first()
-                .unwrap()
-                .id,
-            "focused"
-        );
+        assert_eq!(provider.provider.key_count(), FOCUSED_KEY_COUNT);
         let runtime = harness
             .ctx()
             .spawn_runtime_with_provider(session, Some(provider))
@@ -6486,6 +6931,7 @@ mod tests {
                 _event_tx: &'a flume::Sender<maki_providers::ProviderEvent>,
                 opts: RequestOptions,
                 _session_id: Option<&'a SessionRef>,
+                _invocation: &'a Invocation,
             ) -> maki_providers::provider::BoxFuture<
                 'a,
                 Result<StreamResponse, maki_providers::AgentError>,
@@ -6506,20 +6952,12 @@ mod tests {
                     })
                 })
             }
-
-            fn list_models(
-                &self,
-            ) -> maki_providers::provider::BoxFuture<
-                '_,
-                Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>,
-            > {
-                Box::pin(async { Ok(Vec::new()) })
-            }
         }
 
         fn model(spec: &str) -> Model {
             let mut model = Model::from_spec(spec).unwrap();
-            model.supports_fast_override = Some(FastSupport::Supported);
+            model.fast_support = Some(FastSupport::Supported);
+            model.thinking_support = Some(maki_providers::ThinkingSupport::Yes);
             model
         }
 
@@ -6583,7 +7021,7 @@ mod tests {
 
             let (changed_release, changed_gate) = flume::unbounded();
             let (restored_release, restored_gate) = flume::unbounded();
-            event_loop.ctx.prepare_provider = Arc::new(move |requested, _| {
+            event_loop.ctx.prepare_provider = sync_preparer(move |requested| {
                 let spec = requested.spec();
                 let (name, release) = match spec.as_str() {
                     FIRST => ("changed", changed_gate.clone()),
@@ -6662,13 +7100,8 @@ mod tests {
                 },
                 reply_tx,
             );
-            assert_eq!(
-                reply_rx
-                    .recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT)
-                    .unwrap()
-                    .unwrap(),
-                json!(true)
-            );
+            pump_until(event_loop, |_| !reply_rx.is_empty());
+            assert_eq!(reply_rx.try_recv().unwrap().unwrap(), json!(true));
             let _ = event_loop.tick();
             let restored_index = event_loop.position(stored.id).unwrap();
             assert_eq!(event_loop.focused, restored_index);
@@ -6702,12 +7135,183 @@ mod tests {
         });
     }
 
+    /// Answers every request at once, reporting the model it was sent.
+    struct AnsweringProvider {
+        requests: flume::Sender<String>,
+    }
+
+    impl Provider for AnsweringProvider {
+        fn stream_message<'a>(
+            &'a self,
+            model: &'a Model,
+            _messages: &'a [Message],
+            _system: &'a str,
+            _tools: &'a serde_json::Value,
+            _event_tx: &'a flume::Sender<maki_providers::ProviderEvent>,
+            _opts: maki_providers::RequestOptions,
+            _session_id: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
+        ) -> maki_providers::provider::BoxFuture<
+            'a,
+            Result<maki_providers::StreamResponse, maki_providers::AgentError>,
+        > {
+            Box::pin(async move {
+                self.requests.send(model.spec()).unwrap();
+                Ok(maki_providers::StreamResponse {
+                    message: Message {
+                        role: maki_providers::Role::Assistant,
+                        content: vec![maki_providers::ContentBlock::Text {
+                            text: PREPARED_ANSWER.into(),
+                        }],
+                        ..Message::user(String::new())
+                    },
+                    usage: TokenUsage::default(),
+                    stop_reason: Some(maki_providers::StopReason::EndTurn),
+                })
+            })
+        }
+    }
+
+    const PREPARED_MODEL: &str = "openai/gpt-5";
+    const PREPARED_ANSWER: &str = "answered by the prepared provider";
+    const STARTUP_PROMPT: &str = "sent before the provider was ready";
+
+    /// A preparer that reports each start and waits for a release.
+    fn gated_preparer(
+        provider: Arc<dyn Provider>,
+    ) -> (ModelPreparer, flume::Receiver<()>, flume::Sender<()>) {
+        let (started_tx, started_rx) = flume::unbounded();
+        let (release_tx, release_rx) = flume::unbounded::<()>();
+        let prepare: ModelPreparer = Arc::new(move |spec| {
+            let started_tx = started_tx.clone();
+            let release_rx = release_rx.clone();
+            let provider = Arc::clone(&provider);
+            Box::pin(async move {
+                started_tx.send_async(()).await.unwrap();
+                release_rx.recv_async().await.unwrap();
+                Ok(PreparedModel {
+                    model: Model::from_spec(&spec).unwrap(),
+                    provider,
+                })
+            })
+        });
+        (prepare, started_rx, release_tx)
+    }
+
+    #[test]
+    fn gated_tab_open_prepare_keeps_loop_running_then_opens_tab() {
+        with_event_loop(|event_loop| {
+            let (prepare, started, release) = gated_preparer(Arc::new(StubProvider));
+            event_loop.ctx.prepare_provider = prepare;
+            assert_ne!(
+                event_loop.ctx.model_slot.load().model.spec(),
+                PREPARED_MODEL
+            );
+            let mut stored = AppSession::new(PREPARED_MODEL, &event_loop.session_cwd);
+            stored.push_message(Message::user(STARTUP_PROMPT.into()));
+            stored.save(&event_loop.ctx.storage).unwrap();
+            event_loop.sessions[0]
+                .app
+                .state
+                .session_mut()
+                .push_message(Message::user(STARTUP_PROMPT.into()));
+
+            let (reply_tx, reply_rx) = flume::bounded(1);
+            event_loop.handle_session_request(
+                SessionRequest::Focus {
+                    id: stored.id.to_string(),
+                },
+                reply_tx,
+            );
+            started.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap();
+            let _ = event_loop.tick();
+            assert!(reply_rx.is_empty());
+            assert!(event_loop.position(stored.id).is_none());
+
+            release.send(()).unwrap();
+            pump_until(event_loop, |_| !reply_rx.is_empty());
+            assert_eq!(reply_rx.try_recv().unwrap().unwrap(), json!(true));
+            let index = event_loop.position(stored.id).unwrap();
+            assert_eq!(event_loop.focused, index);
+            assert_eq!(event_loop.sessions.len(), 2);
+            assert_eq!(
+                event_loop.sessions[index].model_slot.load().model.spec(),
+                PREPARED_MODEL
+            );
+        });
+    }
+
+    #[test]
+    fn turn_submitted_at_startup_completes_on_prepared_provider() {
+        with_event_loop(|event_loop| {
+            let pending = Arc::new(PendingProvider::default());
+            let runtime = event_loop
+                .ctx
+                .spawn_runtime_with_provider(
+                    AppSession::new(PREPARED_MODEL, &event_loop.session_cwd),
+                    Some(PreparedProvider {
+                        model: Model::from_spec(PREPARED_MODEL).unwrap(),
+                        provider: Arc::clone(&pending) as Arc<dyn Provider>,
+                    }),
+                )
+                .unwrap();
+            let index = event_loop.push_runtime(runtime);
+            let seeded = {
+                let current = event_loop.sessions[index].model_slot.load();
+                PreparedModel {
+                    model: current.model.clone(),
+                    provider: Arc::clone(&current.provider) as Arc<dyn Provider>,
+                }
+            };
+            event_loop
+                .submit_text(index, STARTUP_PROMPT.into())
+                .unwrap();
+
+            let (requests_tx, requests_rx) = flume::unbounded();
+            let (prepare, started, release) = gated_preparer(Arc::new(AnsweringProvider {
+                requests: requests_tx,
+            }));
+            StartupPrepare {
+                spec: Arc::from(PREPARED_MODEL),
+                pending,
+                root: false,
+                targets: vec![(event_loop.sessions[index].id(), seeded)],
+            }
+            .spawn(prepare, event_loop.internal_tx.clone());
+            started.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap();
+            assert!(requests_rx.is_empty());
+
+            release.send(()).unwrap();
+            assert_eq!(
+                requests_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap(),
+                PREPARED_MODEL
+            );
+            let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let before = event_loop.sessions[index]
+                .model_slot
+                .load()
+                .provider
+                .identity();
+            pump_until(event_loop, |event_loop| {
+                matches!(actor.snapshot().latest, Some(TurnOutcome::Completed { .. }))
+                    && event_loop.sessions[index]
+                        .model_slot
+                        .load()
+                        .provider
+                        .identity()
+                        != before
+            });
+            shutdown_manager(&manager);
+        });
+    }
+
     #[test]
     fn resumed_session_uses_its_stored_model_and_provider() {
         const STORED_MODEL: &str = "openai/gpt-5";
 
         let mut harness = RuntimeHarness::new();
-        harness.ctx.as_mut().unwrap().prepare_provider = Arc::new(|model, _| {
+        harness.ctx.as_mut().unwrap().prepare_provider = sync_preparer(|model| {
             Ok(maki_agent::PreparedModel {
                 model,
                 provider: Arc::new(FocusedProvider),
@@ -6728,8 +7332,8 @@ mod tests {
 
         assert_eq!(runtime.model_slot.load().model.spec(), STORED_MODEL);
         assert_eq!(
-            smol::block_on(runtime.model_slot.load().provider.list_models()).unwrap()[0].id,
-            "focused"
+            runtime.model_slot.load().provider.key_count(),
+            FOCUSED_KEY_COUNT
         );
         assert_eq!(
             runtime.coordinator.read().model().unwrap().as_ref(),
@@ -7015,7 +7619,7 @@ mod tests {
 
     #[test]
     fn replacement_preparation_installs_the_session_provider_on_activation() {
-        const REPLACEMENT_MODEL: &str = "synthetic/hf:test-model";
+        const REPLACEMENT_MODEL: &str = "ollama/hf:test-model";
 
         let harness = RuntimeHarness::new();
         let previous_provider = harness.ctx().model_slot.load().provider.identity();
@@ -7044,42 +7648,68 @@ mod tests {
     fn failed_replacement_provider_preparation_preserves_current_runtime() {
         const INVALID_MODEL: &str = "unsupported-provider/test-model";
 
-        let harness = RuntimeHarness::new();
-        let mut runtime = harness.runtime(harness.session());
-        let current_id = runtime.id();
-        let current_target = runtime.app.command_target.id();
-        let (current_manager, current_root) = runtime.handles.manager_and_root();
-        let current_provider = harness.ctx().model_slot.load().provider.identity();
-        let mut session = harness.session();
-        session.model = INVALID_MODEL.into();
+        with_event_loop(|event_loop| {
+            let current_id = event_loop.sessions[0].id();
+            let current_target = event_loop.sessions[0].app.command_target.id();
+            let (current_manager, current_root) = event_loop.sessions[0].handles.manager_and_root();
+            let current_provider = event_loop.ctx.model_slot.load().provider.identity();
+            let session = AppSession::new(INVALID_MODEL, &event_loop.session_cwd);
+            let (reply_tx, reply_rx) = flume::bounded(1);
+            let target = RuntimeTarget::Replace {
+                runtime: event_loop.sessions[0].handles.identity(),
+                kind: None,
+                reply: Some(reply_tx),
+            };
 
-        runtime.app.checkpoint_now();
-        assert!(
-            harness
-                .ctx()
-                .prepare_replacement_runtime(
-                    session,
-                    runtime.id(),
-                    runtime.app.permissions.as_ref(),
-                    runtime.handles.offload.as_ref(),
-                )
-                .is_err()
-        );
+            event_loop.bring_up(target, session);
+            pump_until(event_loop, |_| !reply_rx.is_empty());
 
-        assert_eq!(runtime.id(), current_id);
-        assert_eq!(runtime.app.command_target.id(), current_target);
-        assert_eq!(
-            runtime.handles.manager_and_root().0.generation(),
-            current_manager.generation()
-        );
-        assert_eq!(runtime.handles.manager_and_root().1, current_root);
-        assert!(runtime.session_lock.is_some());
-        assert_eq!(
-            harness.ctx().model_slot.load().provider.identity(),
-            current_provider
-        );
+            assert!(reply_rx.try_recv().unwrap().is_err());
+            let runtime = &event_loop.sessions[0];
+            assert_eq!(runtime.id(), current_id);
+            assert_eq!(runtime.app.command_target.id(), current_target);
+            assert_eq!(
+                runtime.handles.manager_and_root().0.generation(),
+                current_manager.generation()
+            );
+            assert_eq!(runtime.handles.manager_and_root().1, current_root);
+            assert!(runtime.session_lock.is_some());
+            assert_eq!(
+                event_loop.ctx.model_slot.load().provider.identity(),
+                current_provider
+            );
+        });
+    }
 
-        release_runtime(runtime);
+    #[test]
+    fn deferred_blank_tab_replacement_keeps_a_tab_that_gained_a_draft() {
+        const MODEL: &str = "ollama/hf:test-model";
+        const DRAFT: &str = "typed while the model was prepared";
+
+        with_event_loop(|event_loop| {
+            let current_id = event_loop.sessions[0].id();
+            let session = AppSession::new(MODEL, &event_loop.session_cwd);
+            let loaded_id = session.id;
+            let (reply_tx, reply_rx) = flume::bounded(1);
+            let target = RuntimeTarget::Replace {
+                runtime: event_loop.sessions[0].handles.identity(),
+                kind: None,
+                reply: Some(reply_tx),
+            };
+            event_loop.sessions[0].app.input_box.set_input(DRAFT.into());
+            let provider = PreparedProvider {
+                model: Model::from_spec(MODEL).unwrap(),
+                provider: Arc::new(StubProvider),
+            };
+
+            event_loop.complete_bring_up(target, session, Ok(provider));
+
+            assert!(reply_rx.try_recv().unwrap().is_ok());
+            assert_eq!(event_loop.sessions.len(), 2);
+            assert_eq!(event_loop.sessions[0].id(), current_id);
+            assert_eq!(event_loop.sessions[0].app.input_box.buffer.value(), DRAFT);
+            assert_eq!(event_loop.sessions[event_loop.focused].id(), loaded_id);
+        });
     }
 
     #[test]
@@ -7247,6 +7877,7 @@ mod tests {
             .ctx()
             .prepare_replacement_runtime(
                 replacement,
+                None,
                 runtime.id(),
                 runtime.app.permissions.as_ref(),
                 runtime.handles.offload.as_ref(),
@@ -7490,7 +8121,7 @@ mod tests {
         with_event_loop(|event_loop| {
             if !workflow {
                 let mut model = model_named("fast-model");
-                model.supports_fast_override = Some(FastSupport::Supported);
+                model.fast_support = Some(FastSupport::Supported);
                 let replacement = test_runtime(model);
                 let old = std::mem::replace(&mut event_loop.sessions[0], replacement);
                 release_runtime(old);
@@ -8115,7 +8746,7 @@ mod tests {
         };
         with_event_loop(|event_loop| {
             let command_runtime = Arc::clone(&event_loop.ctx.command_runtime);
-            event_loop.ctx.prepare_provider = Arc::new(|model, _| {
+            event_loop.ctx.prepare_provider = sync_preparer(|model| {
                 Ok(maki_agent::actor::PreparedModel {
                     model,
                     provider: Arc::new(StubProvider),
@@ -8721,6 +9352,7 @@ mod tests {
             .ctx()
             .prepare_replacement_runtime(
                 session,
+                None,
                 runtime.id(),
                 runtime.app.permissions.as_ref(),
                 runtime.handles.offload.as_ref(),
@@ -9660,6 +10292,7 @@ mod tests {
                 _event_tx: &'a flume::Sender<maki_providers::ProviderEvent>,
                 options: RequestOptions,
                 _session_id: Option<&'a SessionRef>,
+                _invocation: &'a maki_providers::Invocation,
             ) -> maki_providers::provider::BoxFuture<
                 'a,
                 Result<maki_providers::StreamResponse, maki_providers::AgentError>,
@@ -9669,20 +10302,11 @@ mod tests {
                     std::future::pending().await
                 })
             }
-
-            fn list_models(
-                &self,
-            ) -> maki_providers::provider::BoxFuture<
-                '_,
-                Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>,
-            > {
-                Box::pin(async { Ok(Vec::new()) })
-            }
         }
 
         fn adjusted(mut model: Model) -> Model {
-            model.thinking_override = Some(ThinkingSupport::Yes);
-            model.supports_fast_override = Some(FastSupport::Supported);
+            model.thinking_support = Some(ThinkingSupport::Yes);
+            model.fast_support = Some(FastSupport::Supported);
             model
         }
 
@@ -9713,7 +10337,7 @@ mod tests {
             let (requests, received) = flume::unbounded();
             let provider: Arc<dyn Provider> = Arc::new(RecordingProvider(requests));
             let committed_provider = Arc::clone(&provider);
-            event_loop.ctx.prepare_provider = Arc::new(move |model, _| {
+            event_loop.ctx.prepare_provider = sync_preparer(move |model| {
                 Ok(PreparedModel {
                     model: adjusted(model),
                     provider: Arc::clone(&provider),
@@ -9732,6 +10356,7 @@ mod tests {
             let app = &mut event_loop.sessions[0].app;
             app.model_picker = ModelPicker::new(
                 Arc::clone(&app.available_models),
+                Arc::new(maki_providers::test_util::offline_ids(&["anthropic"])),
                 seeded(
                     &[(
                         MODEL,

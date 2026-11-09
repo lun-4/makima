@@ -10,6 +10,9 @@ use maki_config::{
 use maki_lua::{PluginHost, PluginOptionSpecs};
 
 use crate::gen_folder_trust::POLICY_EXAMPLE;
+use crate::gen_providers::{builtin_registry, example_specs};
+
+const EXAMPLE_SPECS: usize = 2;
 
 fn write_table_with_min(out: &mut String, fields: &[ConfigField]) {
     writeln!(out, "| Field | Type | Default | Min | Description |").unwrap();
@@ -216,8 +219,10 @@ fn write_net_section(out: &mut String) {
     write_section(out, "[net]", NetConfig::FIELDS);
     writeln!(
         out,
-        "`maki.net` refuses private, loopback and metadata addresses, because \
-         the model picks the URLs. List a host here to let it through:\n"
+        "`maki.net.request` refuses private, loopback and metadata addresses, \
+         because the model picks the URLs. List a host here to let it through. \
+         Providers use `maki.net.send`, which has no such guard, so a local \
+         model server needs no entry:\n"
     )
     .unwrap();
     writeln!(
@@ -271,6 +276,7 @@ fn write_trust_section(out: &mut String) {
 
 pub fn generate() -> String {
     let mut out = String::with_capacity(4096);
+    let examples = example_specs(&builtin_registry(), EXAMPLE_SPECS);
 
     writeln!(
         out,
@@ -311,8 +317,8 @@ maki.setup({{
         max_output_lines = {max_output_lines},
     }},
     provider = {{
-        default_model = \"anthropic/claude-sonnet-4-6\",
-        allowed_models = {{ \"anthropic/*\", \"openai/gpt-5\" }},
+        default_model = \"{default_model}\",
+        allowed_models = {{ \"{allowed_provider}/*\", \"{allowed_model}\" }},
         excluded_models = {{ \"*/*-preview\" }},
     }},
 
@@ -328,7 +334,7 @@ maki.setup({{
 
 All fields are optional. Typos in field names cause an error right away.
 
-`provider.allowed_models` is a list of glob patterns for qualified `provider/model-id` specs. `*` also matches `/`, so `opencode/*` includes nested model IDs. When the list is empty or omitted, every model is allowed. `provider.excluded_models` removes matching models after that, so exclusions always win. A project list replaces the matching global list; omit it to inherit or use `{{}}` to clear it. The policy applies to selectors, CLI and API model changes, delegation, and `makima models`.
+`provider.allowed_models` is a list of glob patterns for qualified `provider/model-id` specs. `*` also matches `/`, so `provider/*` includes nested model IDs. When the list is empty or omitted, every model is allowed. `provider.excluded_models` removes matching models after that, so exclusions always win. A project list replaces the matching global list; omit it to inherit or use `{{}}` to clear it. The policy applies to selectors, CLI and API model changes, delegation, and `makima models`.
 
 `maki.setup()` can only be called once per init.lua.
 
@@ -340,6 +346,9 @@ All fields are optional. Typos in field names cause an error right away.
         tol_read = ToolOutputLines::DEFAULT.read + 2,
         max_output_lines = DEFAULT_MAX_OUTPUT_LINES + 1000,
         max_log_files = DEFAULT_MAX_LOG_FILES / 2,
+        default_model = examples[0],
+        allowed_provider = examples[0].split_once('/').expect("a provider/model spec").0,
+        allowed_model = examples[1],
     )
     .unwrap();
 
@@ -419,7 +428,7 @@ Makima follows platform directory conventions. On Linux and macOS that is XDG. O
 | Logs | `~/.local/logs/makima/` | `%APPDATA%\\makima\\` |
 | Cache | `~/.cache/makima/` | `%LOCALAPPDATA%\\makima\\` |
 
-Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\\makima` on Windows; that is separate from these runtime dirs.
+Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, `providers/` (executable providers), and `commands/`. State holds sessions, provider credentials (`auth/<provider>.json`, readable only by you), memories, plans, and model-tier overrides. Cache holds the provider catalog (`models-dev/`). The install script puts the binary under `%LOCALAPPDATA%\\makima` on Windows; that is separate from these runtime dirs.
 
 ## Personal Instructions
 

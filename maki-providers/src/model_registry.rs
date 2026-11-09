@@ -1,303 +1,127 @@
-//! Per-model tier assignments (strong / medium / weak).
-//!
-//! Three layers, checked in order: user overrides (persisted, one model per
-//! tier) > static entries from the provider registry > auto-assignment by
-//! position in `list_models()`.
-//!
-//! Discovered metadata (context windows, pricing) from `/models` endpoints is
-//! stored in `known_models` and consulted by [`crate::model::Model::from_base`].
+//! User tier overrides (strong / medium / weak / compaction), one model per
+//! tier, persisted across runs.
 //!
 //! The global lock never escapes this module: accessors lock internally and
-//! return owned data, so a caller can never hold a read guard across model
-//! construction (recursive read + queued writer = deadlock). The module owns
-//! persistence: [`load_from_storage`] at startup, [`set_and_persist`] on user
-//! edits. Callers never touch the on-disk format directly.
+//! return owned data. The module owns persistence: [`load_from_storage`] at
+//! startup, [`set_and_persist`] on user edits. Callers never touch the on-disk
+//! format directly.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use maki_storage::{StateDir, atomic_write};
 use tracing::warn;
 
-use crate::manifest::ManifestRegistry;
-use crate::model::{ModelInfo, ModelTier};
+use crate::model::ModelTier;
 
 const TIERS_FILE: &str = "model-tiers";
 
-static REGISTRY: OnceLock<RwLock<ModelRegistry>> = OnceLock::new();
+/// Keyed by tier (not spec) so inserting a model automatically evicts the
+/// previous holder.
+static OVERRIDES: OnceLock<RwLock<Overrides>> = OnceLock::new();
 
-fn read() -> RwLockReadGuard<'static, ModelRegistry> {
-    registry().read().unwrap()
+type Overrides = BTreeMap<ModelTier, String>;
+
+fn read() -> RwLockReadGuard<'static, Overrides> {
+    overrides().read().unwrap()
 }
 
-fn write() -> RwLockWriteGuard<'static, ModelRegistry> {
-    registry().write().unwrap()
+fn write() -> RwLockWriteGuard<'static, Overrides> {
+    overrides().write().unwrap()
 }
 
-fn registry() -> &'static RwLock<ModelRegistry> {
-    REGISTRY.get_or_init(|| RwLock::new(ModelRegistry::default()))
+fn overrides() -> &'static RwLock<Overrides> {
+    OVERRIDES.get_or_init(RwLock::default)
 }
 
-pub fn spec_for_tier(provider: &str, tier: ModelTier) -> Option<String> {
-    read().spec_for_tier(provider, tier)
-}
-
-pub fn spec_for_tier_any(tier: ModelTier) -> Option<String> {
-    read().spec_for_tier_any(tier)
-}
-
-pub fn discovered(provider: &str, model_id: &str) -> Option<ModelInfo> {
-    read().discovered(provider, model_id).cloned()
-}
-
-pub fn discovery_complete(provider: &str) -> bool {
-    read().known_models.contains_key(provider)
-}
-
-/// Typed `provider_info` for a discovered model. Key by the builtin slug, not
-/// `model.provider`: a dynamic wrap's model carries its own slug.
-pub fn provider_info<T: Send + Sync + 'static>(provider: &str, model_id: &str) -> Option<Arc<T>> {
-    let info = read()
-        .discovered(provider, model_id)?
-        .provider_info
-        .clone()?;
-    Arc::downcast(info).ok()
-}
-
-pub fn tier_for(spec: &str, provider: &str, static_tier: Option<ModelTier>) -> ModelTier {
-    read().tier_for(spec, provider, static_tier)
-}
-
-pub fn set_known_models(provider: &str, models: Vec<ModelInfo>) {
-    write().set_known_models(provider, models);
+/// The spec the user assigned to `tier`, whatever its provider.
+pub fn tier_override(tier: ModelTier) -> Option<String> {
+    read().get(&tier).cloned()
 }
 
 /// Tiers whose override points at `spec`, in descending tier order.
 pub fn override_tiers(spec: &str) -> Vec<ModelTier> {
-    read().override_tiers(spec)
+    override_tiers_in(&read(), spec)
+}
+
+/// A spec may hold several tiers; the strongest agent tier wins, and
+/// Compaction only when it is the sole assignment. Without an override the
+/// descriptor's tier stands, else Medium.
+pub fn tier_for(spec: &str, declared: Option<ModelTier>) -> ModelTier {
+    tier_for_in(&read(), spec, declared)
 }
 
 pub fn load_from_storage(dir: &StateDir) {
-    let overrides = read_overrides(dir.path().join(TIERS_FILE).as_path());
-    write().set_overrides(overrides);
+    *write() = read_overrides(dir.path().join(TIERS_FILE).as_path());
 }
 
 pub fn set_and_persist(spec: String, tier: ModelTier, dir: &StateDir) {
-    update_and_persist(dir, |reg| reg.set(spec, tier));
+    update_and_persist(dir, |overrides| {
+        overrides.insert(tier, spec);
+    });
 }
 
 pub fn unset_and_persist(spec: &str, tier: ModelTier, dir: &StateDir) {
-    update_and_persist(dir, |reg| reg.unset(spec, tier));
+    update_and_persist(dir, |overrides| unset(overrides, spec, tier));
 }
 
 /// Snapshot under the lock, persist outside it: file IO must never run while
-/// holding the registry lock.
-fn update_and_persist(dir: &StateDir, update: impl FnOnce(&mut ModelRegistry)) {
+/// holding the lock.
+fn update_and_persist(dir: &StateDir, update: impl FnOnce(&mut Overrides)) {
     let snapshot = {
-        let mut reg = write();
-        update(&mut reg);
-        reg.overrides.clone()
+        let mut overrides = write();
+        update(&mut overrides);
+        overrides.clone()
     };
     write_overrides(dir.path().join(TIERS_FILE).as_path(), &snapshot);
 }
 
-#[derive(Debug, Default)]
-struct ModelRegistry {
-    /// Keyed by tier (not spec) so inserting a model automatically evicts the
-    /// previous holder. Persisted to disk.
-    overrides: BTreeMap<ModelTier, String>,
-    /// Ordered model info per provider, populated from `list_models()`.
-    /// Not persisted - rebuilt every session. Used for auto-tier assignment
-    /// and discovered metadata lookup.
-    known_models: HashMap<String, Vec<ModelInfo>>,
-}
-
-impl ModelRegistry {
-    fn set_overrides(&mut self, overrides: BTreeMap<ModelTier, String>) {
-        self.overrides = overrides;
-    }
-
-    fn set_known_models(&mut self, provider: &str, models: Vec<ModelInfo>) {
-        self.known_models.insert(provider.to_string(), models);
-    }
-
-    fn set(&mut self, spec: String, tier: ModelTier) {
-        self.overrides.insert(tier, spec);
-    }
-
-    fn unset(&mut self, spec: &str, tier: ModelTier) {
-        if self.has_override(spec, tier) {
-            self.overrides.remove(&tier);
-        }
-    }
-
-    fn has_override(&self, spec: &str, tier: ModelTier) -> bool {
-        self.overrides.get(&tier).map(String::as_str) == Some(spec)
-    }
-
-    /// Lookup discovered metadata for a model by ID.
-    fn discovered(&self, provider: &str, model_id: &str) -> Option<&ModelInfo> {
-        self.known_models
-            .get(provider)?
-            .iter()
-            .find(|m| m.id == model_id)
-    }
-
-    fn tier_for(&self, spec: &str, provider: &str, static_tier: Option<ModelTier>) -> ModelTier {
-        // A spec may hold several tiers; prefer the strongest agent tier,
-        // falling back to Compaction only when it is the sole assignment.
-        let mut tiers = self.override_tiers(spec).into_iter();
-        if let Some(first) = tiers.next() {
-            return match first {
-                ModelTier::Compaction => tiers.next().unwrap_or(first),
-                t => t,
-            };
-        }
-        if tiers_from_discovery(provider)
-            && let Some((_, model_id)) = spec.split_once('/')
-            && let Some(models) = self.known_models.get(provider)
-            && let Some(pos) = models.iter().position(|model| model.id == model_id)
-        {
-            if let Some(tier) = models[pos].tier {
-                return tier;
-            }
-            if static_tier.is_none() {
-                return tier_for_position(pos);
-            }
-        }
-        if let Some(t) = static_tier {
-            return t;
-        }
-        ModelTier::Medium
-    }
-
-    fn spec_for_tier(&self, provider: &str, tier: ModelTier) -> Option<String> {
-        let prefix = format!("{provider}/");
-        if let Some(spec) = self.overrides.get(&tier)
-            && spec.starts_with(&prefix)
-        {
-            return Some(spec.clone());
-        }
-
-        let candidate = if tiers_from_discovery(provider) {
-            self.discovered_static_candidate(provider, tier)
-                .or_else(|| self.metadata_candidate(provider, tier))
-                .or_else(|| static_candidate(provider, tier))
-                .or_else(|| self.positional_candidate(provider, tier))
-        } else {
-            static_candidate(provider, tier)
-        }?;
-
-        (!self.claimed_elsewhere(&candidate, tier)).then_some(candidate)
-    }
-
-    /// The curated default the provider actually offers, so discovery cannot
-    /// replace a still available default with whatever it lists first.
-    fn discovered_static_candidate(&self, provider: &str, tier: ModelTier) -> Option<String> {
-        static_prefixes(provider, tier)
-            .find(|prefix| self.discovered(provider, prefix).is_some())
-            .map(|prefix| format!("{provider}/{prefix}"))
-    }
-
-    /// Lowest ID wins, so the tier default survives provider list reordering.
-    fn metadata_candidate(&self, provider: &str, tier: ModelTier) -> Option<String> {
-        self.known_models
-            .get(provider)?
-            .iter()
-            .filter(|model| model.tier == Some(tier))
-            .map(|model| model.id.as_str())
-            .min()
-            .map(|id| format!("{provider}/{id}"))
-    }
-
-    fn positional_candidate(&self, provider: &str, tier: ModelTier) -> Option<String> {
-        let models = self.known_models.get(provider).filter(|m| !m.is_empty())?;
-        let slot = match tier {
-            ModelTier::Strong => 0,
-            ModelTier::Medium => 1,
-            ModelTier::Weak => 2,
-            ModelTier::Compaction => return None,
-        };
-        Some(format!(
-            "{provider}/{}",
-            models[slot.min(models.len() - 1)].id
-        ))
-    }
-
-    fn claimed_elsewhere(&self, spec: &str, tier: ModelTier) -> bool {
-        self.overrides.iter().any(|(&t, s)| s == spec && t != tier)
-    }
-
-    fn spec_for_tier_any(&self, tier: ModelTier) -> Option<String> {
-        if let Some(spec) = self.overrides.get(&tier) {
-            return Some(spec.clone());
-        }
-        for provider in self.known_models.keys() {
-            if let Some(spec) = self.spec_for_tier(provider, tier) {
-                return Some(spec);
-            }
-        }
-        None
-    }
-
-    fn override_tiers(&self, spec: &str) -> Vec<ModelTier> {
-        self.overrides
-            .iter()
-            .rev()
-            .filter(|(_, s)| s.as_str() == spec)
-            .map(|(&t, _)| t)
-            .collect()
+fn unset(overrides: &mut Overrides, spec: &str, tier: ModelTier) {
+    if overrides.get(&tier).map(String::as_str) == Some(spec) {
+        overrides.remove(&tier);
     }
 }
 
-/// Discovery metadata (context window, pricing, vision) is stored for every
-/// provider, but only providers that accept arbitrary models may use the
-/// discovered list for tier auto-assignment; curated providers keep their
-/// static tier tables.
-fn tiers_from_discovery(provider: &str) -> bool {
-    ManifestRegistry::get(provider).is_none_or(|m| m.accepts_arbitrary_models)
+fn override_tiers_in(overrides: &Overrides, spec: &str) -> Vec<ModelTier> {
+    overrides
+        .iter()
+        .rev()
+        .filter(|(_, s)| s.as_str() == spec)
+        .map(|(&t, _)| t)
+        .collect()
 }
 
-fn static_candidate(provider: &str, tier: ModelTier) -> Option<String> {
-    static_prefixes(provider, tier)
-        .next()
-        .map(|prefix| format!("{provider}/{prefix}"))
-}
-
-fn static_prefixes(provider: &str, tier: ModelTier) -> impl Iterator<Item = &'static str> {
-    ManifestRegistry::get(provider)
-        .into_iter()
-        .flat_map(|manifest| manifest.models)
-        .filter(move |entry| entry.default && entry.tier == tier)
-        .flat_map(|entry| entry.prefixes.iter().copied())
-}
-
-fn tier_for_position(pos: usize) -> ModelTier {
-    [ModelTier::Strong, ModelTier::Medium, ModelTier::Weak][pos.min(2)]
+fn tier_for_in(overrides: &Overrides, spec: &str, declared: Option<ModelTier>) -> ModelTier {
+    let mut tiers = override_tiers_in(overrides, spec).into_iter();
+    match tiers.next() {
+        Some(ModelTier::Compaction) => tiers.next().unwrap_or(ModelTier::Compaction),
+        Some(tier) => tier,
+        None => declared.unwrap_or(ModelTier::Medium),
+    }
 }
 
 // On-disk format: { "tier": "spec", ... } keyed by tier, matching the in-memory
-// `BTreeMap<ModelTier, String>`. Tier-keyed storage preserves a model assigned
-// to multiple tiers; a spec-keyed file would collapse them to a single entry.
+// map. Tier-keyed storage preserves a model assigned to multiple tiers; a
+// spec-keyed file would collapse them to a single entry.
 
-fn read_overrides(path: &Path) -> BTreeMap<ModelTier, String> {
+fn read_overrides(path: &Path) -> Overrides {
     let Ok(raw) = std::fs::read_to_string(path) else {
-        return BTreeMap::new();
+        return Overrides::new();
     };
     if raw.trim().is_empty() {
-        return BTreeMap::new();
+        return Overrides::new();
     }
     match serde_json::from_str(&raw) {
         Ok(map) => map,
         Err(e) => {
             warn!(path = %path.display(), error = %e, "failed to parse tier overrides, ignoring");
-            BTreeMap::new()
+            Overrides::new()
         }
     }
 }
 
-fn write_overrides(path: &Path, overrides: &BTreeMap<ModelTier, String>) {
+fn write_overrides(path: &Path, overrides: &Overrides) {
     let json = match serde_json::to_vec_pretty(overrides) {
         Ok(v) => v,
         Err(e) => {
@@ -316,201 +140,23 @@ mod tests {
     use tempfile::TempDir;
     use test_case::test_case;
 
-    fn make_map(overrides: &[(ModelTier, &str)], models: &[&str]) -> ModelRegistry {
-        let mut reg = ModelRegistry::default();
-        reg.set_overrides(overrides.iter().map(|(t, s)| (*t, s.to_string())).collect());
-        if !models.is_empty() {
-            reg.set_known_models(
-                "ollama",
-                models
-                    .iter()
-                    .map(|s| ModelInfo::id_only(s.to_string()))
-                    .collect(),
-            );
-        }
-        reg
+    fn overrides_of(pairs: &[(ModelTier, &str)]) -> Overrides {
+        pairs.iter().map(|(t, s)| (*t, s.to_string())).collect()
     }
 
-    #[test]
-    fn tier_for_resolution_priority() {
-        let mut reg = make_map(&[], &["pos0", "pos1", "pos2"]);
-        reg.set("ollama/pos1".into(), ModelTier::Weak);
-
-        let t = |spec, static_tier| reg.tier_for(spec, "ollama", static_tier);
-
-        assert_eq!(t("ollama/pos1", Some(ModelTier::Strong)), ModelTier::Weak);
-        assert_eq!(t("ollama/pos0", Some(ModelTier::Weak)), ModelTier::Weak);
-        assert_eq!(t("ollama/pos0", None), ModelTier::Strong);
-        assert_eq!(t("ollama/pos1", None), ModelTier::Weak);
-        assert_eq!(t("ollama/pos2", None), ModelTier::Weak);
-        assert_eq!(t("ollama/unknown", None), ModelTier::Medium);
-    }
-
-    #[test]
-    fn curated_provider_ignores_discovered_tiers() {
-        let mut reg = ModelRegistry::default();
-        reg.set_known_models(
-            "synthetic",
-            vec![ModelInfo {
-                tier: Some(ModelTier::Strong),
-                ..ModelInfo::id_only("syn:large:vision".into())
-            }],
-        );
-
-        assert_ne!(
-            reg.tier_for("synthetic/syn:large:vision", "synthetic", None),
-            ModelTier::Strong
-        );
-        assert_ne!(
-            reg.spec_for_tier("synthetic", ModelTier::Strong),
-            Some("synthetic/syn:large:vision".into())
-        );
-    }
-
-    fn make_tiered(models: &[(&str, ModelTier)]) -> ModelRegistry {
-        let mut reg = ModelRegistry::default();
-        reg.set_known_models(
-            "copilot",
-            models
-                .iter()
-                .map(|&(id, tier)| ModelInfo {
-                    tier: Some(tier),
-                    ..ModelInfo::id_only(id.into())
-                })
-                .collect(),
-        );
-        reg
-    }
-
-    #[test]
-    fn discovered_category_tier_beats_position_and_static_fallback() {
-        let reg = make_tiered(&[
-            ("terra", ModelTier::Medium),
-            ("luna", ModelTier::Weak),
-            ("gpt-5.6-sol", ModelTier::Strong),
+    #[test_case("p/pinned", Some(ModelTier::Strong), ModelTier::Weak ; "override_beats_declared")]
+    #[test_case("p/other", Some(ModelTier::Strong), ModelTier::Strong ; "declared_without_override")]
+    #[test_case("p/other", None, ModelTier::Medium ; "medium_without_either")]
+    #[test_case("p/multi", None, ModelTier::Strong ; "strongest_of_several")]
+    #[test_case("p/compact", Some(ModelTier::Strong), ModelTier::Compaction ; "compaction_when_sole_override")]
+    fn tier_for_resolution(spec: &str, declared: Option<ModelTier>, expected: ModelTier) {
+        let overrides = overrides_of(&[
+            (ModelTier::Weak, "p/pinned"),
+            (ModelTier::Medium, "p/multi"),
+            (ModelTier::Strong, "p/multi"),
+            (ModelTier::Compaction, "p/compact"),
         ]);
-
-        assert_eq!(
-            reg.tier_for("copilot/gpt-5.6-sol", "copilot", Some(ModelTier::Medium)),
-            ModelTier::Strong
-        );
-        assert_eq!(
-            reg.tier_for("copilot/terra", "copilot", None),
-            ModelTier::Medium
-        );
-        assert_eq!(
-            reg.tier_for("copilot/luna", "copilot", None),
-            ModelTier::Weak
-        );
-        assert_eq!(
-            reg.spec_for_tier("copilot", ModelTier::Strong),
-            Some("copilot/gpt-5.6-sol".into())
-        );
-    }
-
-    #[test_case(&[("gpt-5.4", ModelTier::Strong), ("claude-opus-4.7", ModelTier::Strong)], "copilot/claude-opus-4.7"; "curated default beats discovered tier")]
-    #[test_case(&[("claude-opus-4.6", ModelTier::Strong), ("alpha", ModelTier::Strong)], "copilot/claude-opus-4.6"; "later curated prefix when first is unavailable")]
-    #[test_case(&[("zeta", ModelTier::Strong), ("alpha", ModelTier::Strong)], "copilot/alpha"; "lowest id when no curated default is entitled")]
-    fn spec_for_tier_prefers_entitled_curated_default(
-        models: &[(&str, ModelTier)],
-        expected: &str,
-    ) {
-        let reg = make_tiered(models);
-        assert_eq!(
-            reg.spec_for_tier("copilot", ModelTier::Strong),
-            Some(expected.into())
-        );
-    }
-
-    #[test]
-    fn spec_for_tier_ignores_discovery_list_order() {
-        let models = [
-            ("zeta", ModelTier::Strong),
-            ("alpha", ModelTier::Strong),
-            ("mid", ModelTier::Medium),
-        ];
-        let mut reversed = models;
-        reversed.reverse();
-
-        assert_eq!(
-            make_tiered(&models).spec_for_tier("copilot", ModelTier::Strong),
-            make_tiered(&reversed).spec_for_tier("copilot", ModelTier::Strong)
-        );
-    }
-
-    #[test]
-    fn tier_for_prefers_strongest_over_multi_tier_spec() {
-        let mut reg = make_map(&[], &[]);
-        reg.set("ollama/multi".into(), ModelTier::Medium);
-        reg.set("ollama/multi".into(), ModelTier::Strong);
-        reg.set("ollama/multi".into(), ModelTier::Compaction);
-        reg.set("ollama/compact-only".into(), ModelTier::Compaction);
-
-        let t = |spec| reg.tier_for(spec, "ollama", None);
-
-        assert_eq!(t("ollama/multi"), ModelTier::Strong);
-        assert_eq!(t("ollama/compact-only"), ModelTier::Compaction);
-    }
-
-    #[test]
-    fn spec_for_tier_resolution() {
-        let reg = make_map(
-            &[(ModelTier::Strong, "ollama/custom")],
-            &["big", "mid", "small"],
-        );
-        let s = |t| reg.spec_for_tier("ollama", t);
-
-        assert_eq!(s(ModelTier::Strong), Some("ollama/custom".into()));
-        assert_eq!(s(ModelTier::Medium), Some("ollama/mid".into()));
-        assert_eq!(s(ModelTier::Weak), Some("ollama/small".into()));
-
-        let scoped = make_map(&[(ModelTier::Strong, "openai/gpt-foo")], &[]);
-        assert_eq!(scoped.spec_for_tier("ollama", ModelTier::Strong), None);
-
-        let conflict = make_map(&[(ModelTier::Weak, "ollama/big")], &["big", "mid", "small"]);
-        assert_eq!(conflict.spec_for_tier("ollama", ModelTier::Strong), None);
-    }
-
-    #[test]
-    fn spec_for_tier_any_cross_provider() {
-        let reg = make_map(
-            &[
-                (ModelTier::Weak, "zai/glm-5"),
-                (ModelTier::Strong, "openai/gpt-foo"),
-            ],
-            &["big", "mid", "small"],
-        );
-        assert_eq!(
-            reg.spec_for_tier_any(ModelTier::Strong),
-            Some("openai/gpt-foo".into())
-        );
-        assert_eq!(
-            reg.spec_for_tier_any(ModelTier::Weak),
-            Some("zai/glm-5".into())
-        );
-        assert_eq!(
-            reg.spec_for_tier_any(ModelTier::Medium),
-            Some("ollama/mid".into())
-        );
-    }
-
-    #[test]
-    fn discovered_looks_up_by_id() {
-        let mut reg = ModelRegistry::default();
-        reg.set_known_models(
-            "llama-cpp",
-            vec![
-                ModelInfo::id_only("model-a".into()),
-                ModelInfo {
-                    context_window: Some(128_000),
-                    ..ModelInfo::id_only("model-b".into())
-                },
-            ],
-        );
-        let info = reg.discovered("llama-cpp", "model-b").unwrap();
-        assert_eq!(info.context_window, Some(128_000));
-        assert!(reg.discovered("llama-cpp", "model-x").is_none());
-        assert!(reg.discovered("ollama", "model-a").is_none());
+        assert_eq!(tier_for_in(&overrides, spec, declared), expected);
     }
 
     #[test]
@@ -520,14 +166,14 @@ mod tests {
 
         assert!(read_overrides(&path).is_empty());
 
-        let mut m = BTreeMap::new();
-        m.insert(ModelTier::Strong, "ollama/qwen3".into());
-        m.insert(ModelTier::Medium, "ollama/qwen3:8b".into());
+        let mut m = Overrides::new();
+        m.insert(ModelTier::Strong, "p/qwen3".into());
+        m.insert(ModelTier::Medium, "p/qwen3:8b".into());
         write_overrides(&path, &m);
 
         let loaded = read_overrides(&path);
-        assert_eq!(loaded.get(&ModelTier::Strong).unwrap(), "ollama/qwen3");
-        assert_eq!(loaded.get(&ModelTier::Medium).unwrap(), "ollama/qwen3:8b");
+        assert_eq!(loaded.get(&ModelTier::Strong).unwrap(), "p/qwen3");
+        assert_eq!(loaded.get(&ModelTier::Medium).unwrap(), "p/qwen3:8b");
     }
 
     #[test]
@@ -546,32 +192,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn unset_removes_matching_override() {
-        let mut reg = make_map(&[(ModelTier::Strong, "ollama/a")], &[]);
-        reg.unset("ollama/a", ModelTier::Strong);
-        assert!(!reg.has_override("ollama/a", ModelTier::Strong));
-        assert!(reg.overrides.is_empty());
-    }
-
-    #[test]
-    fn unset_ignores_mismatched_spec() {
-        let mut reg = make_map(&[(ModelTier::Strong, "ollama/a")], &[]);
-        reg.unset("ollama/b", ModelTier::Strong);
-        assert!(reg.has_override("ollama/a", ModelTier::Strong));
-    }
-
-    #[test]
-    fn unset_ignores_mismatched_tier() {
-        let mut reg = make_map(&[(ModelTier::Strong, "ollama/a")], &[]);
-        reg.unset("ollama/a", ModelTier::Weak);
-        assert!(reg.has_override("ollama/a", ModelTier::Strong));
-    }
-
-    #[test]
-    fn has_override_returns_false_for_no_override() {
-        let reg = make_map(&[], &[]);
-        assert!(!reg.has_override("ollama/a", ModelTier::Strong));
+    #[test_case("p/a", ModelTier::Strong, true ; "matching_override_removed")]
+    #[test_case("p/b", ModelTier::Strong, false ; "mismatched_spec_kept")]
+    #[test_case("p/a", ModelTier::Weak, false ; "mismatched_tier_kept")]
+    fn unset_removes_only_a_matching_override(spec: &str, tier: ModelTier, removed: bool) {
+        let mut overrides = overrides_of(&[(ModelTier::Strong, "p/a")]);
+        unset(&mut overrides, spec, tier);
+        assert_eq!(overrides.is_empty(), removed);
     }
 
     #[test]
@@ -579,15 +206,15 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join(TIERS_FILE);
 
-        let mut m = BTreeMap::new();
-        m.insert(ModelTier::Strong, "ollama/qwen3".into());
-        m.insert(ModelTier::Medium, "ollama/qwen3".into());
-        m.insert(ModelTier::Weak, "ollama/qwen3:8b".into());
+        let mut m = Overrides::new();
+        m.insert(ModelTier::Strong, "p/qwen3".into());
+        m.insert(ModelTier::Medium, "p/qwen3".into());
+        m.insert(ModelTier::Weak, "p/qwen3:8b".into());
         write_overrides(&path, &m);
 
         let loaded = read_overrides(&path);
-        assert_eq!(loaded.get(&ModelTier::Strong).unwrap(), "ollama/qwen3");
-        assert_eq!(loaded.get(&ModelTier::Medium).unwrap(), "ollama/qwen3");
-        assert_eq!(loaded.get(&ModelTier::Weak).unwrap(), "ollama/qwen3:8b");
+        assert_eq!(loaded.get(&ModelTier::Strong).unwrap(), "p/qwen3");
+        assert_eq!(loaded.get(&ModelTier::Medium).unwrap(), "p/qwen3");
+        assert_eq!(loaded.get(&ModelTier::Weak).unwrap(), "p/qwen3:8b");
     }
 }

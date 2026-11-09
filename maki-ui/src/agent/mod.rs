@@ -1,5 +1,6 @@
 mod agent_loop;
 mod command_router;
+pub(crate) mod pending;
 pub(crate) mod shared_queue;
 
 use std::path::PathBuf;
@@ -18,8 +19,8 @@ use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    AgentError, KeyRotation, Message, Model, ModelInfo, ProviderEvent, ProviderUsage,
-    RequestOptions, StreamResponse,
+    AgentError, ConversationEnd, Invocation, Message, Model, ProviderEvent, ProviderRegistry,
+    ProviderUsage, RequestOptions, StreamResponse,
 };
 use maki_storage::id::SessionRef;
 use tracing::{info, warn};
@@ -90,13 +91,11 @@ impl Provider for TrackedProvider {
         event_tx: &'a flume::Sender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
+        invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-        self.inner
-            .stream_message(model, messages, system, tools, event_tx, opts, session_id)
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        self.inner.list_models()
+        self.inner.stream_message(
+            model, messages, system, tools, event_tx, opts, session_id, invocation,
+        )
     }
 
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
@@ -119,12 +118,20 @@ impl Provider for TrackedProvider {
         })
     }
 
-    fn keys(&self) -> Option<KeyRotation<'_>> {
-        self.inner.keys()
+    fn key_count(&self) -> usize {
+        self.inner.key_count()
     }
 
-    fn adjust_model(&self, model: &mut Model) {
-        self.inner.adjust_model(model);
+    fn rotate_key(&self) -> BoxFuture<'_, bool> {
+        self.inner.rotate_key()
+    }
+
+    fn end_conversation(
+        &self,
+        conversation_id: &str,
+        reason: ConversationEnd,
+    ) -> BoxFuture<'_, ()> {
+        self.inner.end_conversation(conversation_id, reason)
     }
 }
 
@@ -321,6 +328,7 @@ impl AgentHandles {
         lua_handle: EventHandle,
         mcp_handle: Option<McpHandle>,
         model_policy: Arc<ModelPolicy>,
+        providers: Arc<ProviderRegistry>,
         system_prompt: SystemPromptOverride,
     ) -> Self {
         let selected = model_slot.load();
@@ -349,6 +357,7 @@ impl AgentHandles {
             lua_handle,
             mcp_handle,
             model_policy,
+            providers,
             system_prompt,
         )
         .activate();
@@ -371,6 +380,7 @@ impl AgentHandles {
         lua_handle: EventHandle,
         mcp_handle: Option<McpHandle>,
         model_policy: Arc<ModelPolicy>,
+        providers: Arc<ProviderRegistry>,
         system_prompt: SystemPromptOverride,
     ) -> PreparedAgentHandles {
         spawn_agent_internal(
@@ -387,6 +397,7 @@ impl AgentHandles {
             timeouts,
             lua_handle,
             model_policy,
+            providers,
             system_prompt,
         )
     }
@@ -511,6 +522,7 @@ fn spawn_agent_internal(
     timeouts: maki_providers::Timeouts,
     lua_handle: EventHandle,
     model_policy: Arc<ModelPolicy>,
+    providers: Arc<ProviderRegistry>,
     system_prompt: SystemPromptOverride,
 ) -> PreparedAgentHandles {
     let (agent_tx, agent_rx) = flume::unbounded::<Envelope>();
@@ -568,6 +580,7 @@ fn spawn_agent_internal(
                     lua_handle,
                     Arc::clone(&subagent_cancels),
                     Arc::clone(&model_policy),
+                    Arc::clone(&providers),
                     system_prompt.clone(),
                     Arc::new(maki_agent::tools::FileWriteLocks::new()),
                     offload.clone(),
@@ -623,7 +636,7 @@ mod tests {
 
     use maki_config::PermissionsConfig;
     use maki_providers::provider::BoxFuture;
-    use maki_providers::{AgentError, ModelInfo, ProviderEvent, RequestOptions, StreamResponse};
+    use maki_providers::{AgentError, Invocation, ProviderEvent, RequestOptions, StreamResponse};
 
     use super::*;
 
@@ -643,12 +656,9 @@ mod tests {
             _event_tx: &'a flume::Sender<ProviderEvent>,
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(std::future::pending())
-        }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-            Box::pin(async { Ok(Vec::new()) })
         }
     }
 
@@ -666,12 +676,9 @@ mod tests {
             _event_tx: &'a flume::Sender<ProviderEvent>,
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(std::future::pending())
-        }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-            Box::pin(async { Ok(Vec::new()) })
         }
 
         fn refresh_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
@@ -719,6 +726,7 @@ mod tests {
             EventHandle::disconnected_for_test(),
             None,
             Arc::new(ModelPolicy::default()),
+            Arc::default(),
             SystemPromptOverride::default(),
         )
     }

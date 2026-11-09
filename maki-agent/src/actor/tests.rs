@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    ContentBlock, ImageMediaType, ImageSource, Message, Model, ProviderEvent, RequestOptions, Role,
-    StreamResponse, TokenUsage,
+    ContentBlock, ImageMediaType, ImageSource, Invocation, Message, Model, ProviderEvent,
+    RequestOptions, Role, StreamResponse, TokenUsage,
 };
 use maki_storage::id::SessionRef;
 use serde_json::Value;
@@ -61,14 +61,9 @@ impl Provider for PolicyTestProvider {
         _: &'a flume::Sender<ProviderEvent>,
         _: RequestOptions,
         _: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, maki_providers::AgentError>> {
         Box::pin(async { unreachable!() })
-    }
-
-    fn list_models(
-        &self,
-    ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
     }
 }
 
@@ -81,7 +76,7 @@ fn fast_change(fast: bool) -> super::ConfigChange {
 
 pub(super) fn policy(fast: bool) -> crate::RunSettings {
     let mut model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
-    model.supports_fast_override = Some(maki_providers::model::FastSupport::Supported);
+    model.fast_support = Some(maki_providers::model::FastSupport::Supported);
     crate::RunSettings {
         provider: Arc::new(PolicyTestProvider),
         model,
@@ -1051,7 +1046,7 @@ fn failed_admission_delivers_fifo_predecessor_before_backend(preparation_panic: 
             .unwrap();
         assert!(ticket.peek().is_none());
         let mut model = Model::from_spec(MODEL).unwrap();
-        model.supports_fast_override = Some(maki_providers::model::FastSupport::Supported);
+        model.fast_support = Some(maki_providers::model::FastSupport::Supported);
         barrier
             .commit_when_ready(Some(super::ConfigChange::PatchAndMode {
                 patch: super::ConfigPatch {

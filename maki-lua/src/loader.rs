@@ -12,6 +12,7 @@ use maki_agent::tools::{ToolRegistry, ToolSource};
 use maki_agent::{AgentManagerHandle, AgentRef};
 use maki_commands::{CommandBehavior, CommandRegistry};
 use maki_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
+use maki_providers::{ProviderRegistry, Timeouts};
 
 use crate::api::completion::{CompletionCtx, ItemSpec};
 use crate::api::fs::{FsBackend, RealFs};
@@ -34,7 +35,7 @@ use maki_agent::agent::PromptSlotSource;
 use maki_agent::prompt::ResolvedSlots;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
-const GLOBAL_INIT_OWNER: &str = "maki_init.global";
+pub(crate) const GLOBAL_INIT_OWNER: &str = "maki_init.global";
 const PROJECT_INIT_OWNER: &str = "maki_init.project";
 #[allow(dead_code)]
 pub const SKIPPED_PLUGIN_WARNING: &str = "skipping plugin lua";
@@ -184,6 +185,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
         name: "list",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/list"),
+    },
+    BundledPlugin {
+        name: "providers",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/providers"),
     },
     // Bundled splashes: the default starfield plus the named picker entries.
     BundledPlugin {
@@ -648,6 +653,24 @@ impl PluginHost {
         self.inner
             .tx
             .send(Request::CollectPluginOptions { reply: reply_tx })
+            .map_err(|_| PluginError::HostDead)?;
+        reply_rx.recv().map_err(|_| PluginError::HostDead)
+    }
+
+    /// Builds the provider registry from what the loaded plugins registered
+    /// and makes it the one `maki.model` reads. `timeouts` are the defaults
+    /// for every request a provider sends through `ctx.send`.
+    pub fn provider_registry(
+        &self,
+        timeouts: Timeouts,
+    ) -> Result<Arc<ProviderRegistry>, PluginError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::BuildProviderRegistry {
+                timeouts,
+                reply: reply_tx,
+            })
             .map_err(|_| PluginError::HostDead)?;
         reply_rx.recv().map_err(|_| PluginError::HostDead)
     }

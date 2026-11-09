@@ -60,6 +60,17 @@ fn logs_dir(_lua: &Lua) -> mlua::Result<Option<String>> {
     Ok(maki_storage::paths::logs_dir().ok().and_then(utf8))
 }
 
+/// Return the directory where makima keeps caches it can rebuild, such as
+/// downloaded catalogs. Typically something like `~/.cache/makima`.
+///
+/// @return (string?) Cache directory path, or nil if it cannot be determined.
+/// @example
+/// local dir = maki.env.cache_dir()
+#[lua_fn(guard = Env)]
+fn cache_dir(_lua: &Lua) -> mlua::Result<Option<String>> {
+    Ok(maki_storage::paths::cache_dir().ok().and_then(utf8))
+}
+
 /// Whether maki was started with `--no-project`. A plugin that reads files
 /// from the project's `.makima` directory should skip them when this is true.
 ///
@@ -74,7 +85,7 @@ fn no_project(lua: &Lua) -> mlua::Result<bool> {
 }
 
 lua_table! {
-    /// Paths to makima's own directories (config, state, logs), and whether
+    /// Paths to makima's own directories (config, state, logs, cache), and whether
     /// the project's `.makima` directory is off limits.
     ///
     /// Use these to locate config files or persistent state without hard-coding paths.
@@ -83,6 +94,7 @@ lua_table! {
     /// local cfg = maki.env.config_dir()
     /// ```
     "maki.env" => pub(crate) fn create_env_table(perms: &PluginPermissions), DOCS [
-        state_dir(perms), config_dir(perms), logs_dir(perms), no_project(perms),
+        state_dir(perms), config_dir(perms), logs_dir(perms), cache_dir(perms),
+        no_project(perms),
     ]
 }

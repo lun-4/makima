@@ -1,9 +1,6 @@
-//! Model registry with prefix-based lookup and token accounting.
-//! Lookup is prefix-based: `claude-sonnet-4-20250514` matches the `claude-sonnet-4` entry,
-//! so dated snapshots resolve without registry churn. `context_tokens()` sums input + output
+//! Resolved models and token accounting. `context_tokens()` sums input + output
 //! + cache reads/writes because the context window limit applies to all of them combined.
 
-use std::any::Any;
 use std::cmp::Ordering;
 use std::fmt;
 use std::ops::AddAssign;
@@ -11,83 +8,92 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use jiff::Timestamp;
-use maki_config::ModelPolicy;
-use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredTokenUsage};
-use serde::{Deserialize, Serialize};
+use maki_storage::sessions::StoredTokenUsage;
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 
-use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model_registry;
-use crate::providers::catalog::{self, CatalogMeta};
-use crate::providers::{anthropic, custom, dynamic};
-use crate::types::ThinkingFields;
+use crate::pricing::PricingSchedule;
 
 const PER_MILLION: f64 = 1_000_000.0;
+const FAST_PENDING: &str = "pending";
+pub const UNKNOWN_CONTEXT_WINDOW: u32 = 128_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
-    #[error("model must be in 'provider/model' format (e.g. anthropic/claude-sonnet-4-20250514)")]
+    #[error("model must be in 'provider/model' format")]
     InvalidFormat,
     #[error("unsupported provider '{0}'")]
     UnsupportedProvider(String),
-    #[error("unknown model '{0}'")]
-    UnknownModel(String),
     #[error("invalid model tier '{0}' (expected: strong, medium, weak)")]
     InvalidTier(String),
     #[error("no allowed model for {0}/{1}")]
     NoAllowedModel(String, ModelTier),
-    #[error("no default model for {0}/{1}")]
-    NoDefault(String, ModelTier),
     #[error("model '{0}' is not allowed by provider model policy")]
     NotAllowed(String),
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelPricing {
     pub input: f64,
     pub output: f64,
     pub cache_write: f64,
     pub cache_read: f64,
-    /// Anthropic fast mode charges a premium that differs per model. `None`
+    /// Fast mode charges a premium that differs per model. `None`
     /// means the model has no fast tier, so asking for fast mode quietly falls
     /// back to standard rates instead of overcharging.
     #[serde(default)]
     pub fast: Option<FastPricing>,
 }
 
-/// Metadata discovered at runtime from a provider's `/models` endpoint.
-/// All fields optional -- most providers only return an ID.
-#[derive(Debug, Clone, Default)]
+/// What is known about one model, from a curated descriptor or discovery.
+/// Absent fields stay unknown.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub id: String,
+    #[serde(default)]
     pub context_window: Option<u32>,
+    #[serde(default)]
     pub max_output_tokens: Option<u32>,
+    #[serde(default)]
     pub pricing: Option<ModelPricing>,
+    /// Scales `pricing` by the wall clock, for providers with peak hours.
+    #[serde(default)]
+    pub pricing_schedule: Option<PricingSchedule>,
+    #[serde(default)]
     pub supports_thinking: Option<bool>,
+    #[serde(default)]
+    pub requires_thinking: Option<bool>,
+    #[serde(default)]
     pub supports_vision: Option<bool>,
+    /// `true`, `false`, or `"pending"` while the provider cannot tell yet.
+    #[serde(default)]
+    pub supports_fast: Option<FastSupport>,
+    #[serde(default)]
+    pub supports_tool_examples: Option<bool>,
+    #[serde(default)]
     pub tier: Option<ModelTier>,
-    /// Store of additional metadata from the provider.
-    pub provider_info: Option<Arc<dyn Any + Send + Sync>>,
+    /// Offered at no charge; the model picker marks it.
+    #[serde(default)]
+    pub free: Option<bool>,
+    #[serde(default)]
+    pub provider_data: Option<Value>,
 }
 
 impl ModelInfo {
     pub fn id_only(id: String) -> Self {
         Self {
             id,
-            context_window: None,
-            max_output_tokens: None,
-            pricing: None,
-            supports_thinking: None,
-            supports_vision: None,
-            tier: None,
-            provider_info: None,
+            ..Self::default()
         }
     }
 }
 
-/// Cache rates are missing on purpose: Anthropic derives them from `input` with
-/// the same multipliers it uses for standard pricing, so storing them would just
-/// invite the two copies to drift apart.
-#[derive(Debug, Clone, Deserialize)]
+/// Cache rates are missing on purpose: they derive from `input` with the same
+/// multipliers as standard pricing, so storing them would just invite the two
+/// copies to drift apart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FastPricing {
     pub input: f64,
     pub output: f64,
@@ -106,19 +112,9 @@ impl ModelPricing {
         self.input == 0.0 && self.output == 0.0 && self.cache_write == 0.0 && self.cache_read == 0.0
     }
 
-    /// Cache multipliers Anthropic applies on top of the base input rate.
+    /// Cache multipliers applied on top of the fast input rate.
     const CACHE_WRITE_MULTIPLIER: f64 = 1.25;
     const CACHE_READ_MULTIPLIER: f64 = 0.10;
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelFamily {
-    Claude,
-    Generic,
-    Gemini,
-    Glm,
-    Gpt,
-    Synthetic,
 }
 
 /// Ordering is a cost guarantee (a subagent may never run on a pricier tier
@@ -198,130 +194,6 @@ impl FromStr for ModelTier {
     }
 }
 
-impl From<maki_config::providers::Tier> for ModelTier {
-    fn from(t: maki_config::providers::Tier) -> Self {
-        use maki_config::providers::Tier;
-        match t {
-            Tier::Weak => Self::Weak,
-            Tier::Medium => Self::Medium,
-            Tier::Strong => Self::Strong,
-            Tier::Compaction => Self::Compaction,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct ModelEntry {
-    pub prefixes: &'static [&'static str],
-    pub tier: ModelTier,
-    pub family: ModelFamily,
-    /// Gates vision-only tools (`view_image`) and image blocks at request time.
-    pub vision: bool,
-    pub default: bool,
-    pub pricing: ModelPricing,
-    pub max_output_tokens: Option<u32>,
-    pub context_window: u32,
-}
-
-pub(crate) fn lookup_entry<'a>(
-    entries: &'a [ModelEntry],
-    model_id: &str,
-) -> Result<&'a ModelEntry, ModelError> {
-    entries
-        .iter()
-        .flat_map(|e| e.prefixes.iter().map(move |p| (p, e)))
-        .filter(|(p, _)| model_id.starts_with(*p))
-        .max_by_key(|(p, _)| p.len())
-        .map(|(_, e)| e)
-        .ok_or_else(|| ModelError::UnknownModel(model_id.to_string()))
-}
-
-const SNAPSHOT_DATE_DIGITS: usize = 8;
-
-/// A provider pins a release by stamping a date on an id it already ships,
-/// either `claude-sonnet-4-5-20250929` or `gpt-5.4-2026-03-11`. Both are the
-/// same model as the row they extend, unlike a version bump such as
-/// `claude-opus-5-2`, and the digit count is what tells the two apart.
-fn is_snapshot_suffix(suffix: &str) -> bool {
-    let Some(date) = suffix.strip_prefix('-') else {
-        return false;
-    };
-    date.bytes().all(|b| b.is_ascii_digit() || b == b'-')
-        && date.bytes().filter(u8::is_ascii_digit).count() == SNAPSHOT_DATE_DIGITS
-}
-
-/// Whether a curated row names *this* model rather than merely sharing a prefix
-/// with it. [`lookup_entry`] matches by prefix so dated snapshots resolve to
-/// their base row, which also means `glm-5` answers for `glm-5.4`, a model it
-/// has never been checked against.
-fn names_exactly(entry: &ModelEntry, model_id: &str) -> bool {
-    entry.prefixes.iter().any(|prefix| {
-        model_id
-            .strip_prefix(prefix)
-            .is_some_and(|rest| rest.is_empty() || is_snapshot_suffix(rest))
-    })
-}
-
-/// Everything that can describe one model, ranked by how sure it is to be about
-/// that model and not its neighbour.
-struct ModelSources<'a> {
-    /// The curated row [`lookup_entry`] reached, exact or not.
-    entry: Option<&'a ModelEntry>,
-    /// `entry` names this id. Such a row was checked against the provider's own
-    /// pricing page, so nothing outranks it but live discovery. A row reached
-    /// by prefix is still the right family and a usable guess at the rest, but
-    /// nobody ever checked it against the id we were handed.
-    exact: bool,
-    /// models.dev, which lists releases our tables have not caught up to. Read
-    /// only when already warm, so this is `None` on a cold start.
-    catalog: Option<CatalogMeta>,
-}
-
-impl<'a> ModelSources<'a> {
-    fn resolve(manifest: &'a ProviderManifest, model_id: &str) -> Self {
-        let entry = lookup_entry(manifest.models, model_id).ok();
-        let exact = entry.is_some_and(|entry| names_exactly(entry, model_id));
-        Self {
-            entry,
-            exact,
-            catalog: (!exact)
-                .then(|| catalog::model_meta_if_available(manifest.slug, model_id))
-                .flatten(),
-        }
-    }
-
-    /// Exact row, then the catalog, then the same row as a mere relative, so
-    /// the last rung only ever answers when the first was skipped.
-    fn pick<T>(
-        &self,
-        from_entry: impl Fn(&ModelEntry) -> Option<T>,
-        from_catalog: impl Fn(&CatalogMeta) -> Option<T>,
-    ) -> Option<T> {
-        self.entry
-            .filter(|_| self.exact)
-            .and_then(&from_entry)
-            .or_else(|| self.catalog.as_ref().and_then(from_catalog))
-            .or_else(|| self.entry.and_then(&from_entry))
-    }
-}
-
-impl ModelFamily {
-    pub fn supports_tool_examples(self) -> bool {
-        match self {
-            ModelFamily::Claude | ModelFamily::Gpt | ModelFamily::Synthetic => true,
-            ModelFamily::Generic | ModelFamily::Gemini | ModelFamily::Glm => false,
-        }
-    }
-
-    /// Fallback for models missing from the static tables; per-model truth
-    /// lives in `ModelEntry::vision`.
-    pub fn supports_vision(self) -> bool {
-        matches!(self, Self::Claude | Self::Gpt | Self::Gemini)
-    }
-}
-
-const FAST_PROVIDER: &str = "anthropic";
-
 /// `Required` marks APIs that reject requests with thinking disabled;
 /// [`crate::RequestOptions::clamped`] raises `Off` to minimal effort for them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -346,9 +218,49 @@ impl ThinkingSupport {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FastSupport {
+    /// The provider learns it from discovery, which has not answered yet.
     Pending,
     Supported,
     Unsupported,
+}
+
+impl Serialize for FastSupport {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Pending => serializer.serialize_str(FAST_PENDING),
+            Self::Supported => serializer.serialize_bool(true),
+            Self::Unsupported => serializer.serialize_bool(false),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FastSupport {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Declared {
+            Known(bool),
+            Word(String),
+        }
+        match Declared::deserialize(deserializer)? {
+            Declared::Known(true) => Ok(Self::Supported),
+            Declared::Known(false) => Ok(Self::Unsupported),
+            Declared::Word(word) if word == FAST_PENDING => Ok(Self::Pending),
+            Declared::Word(word) => Err(D::Error::custom(format!(
+                "supports_fast must be a boolean or \"{FAST_PENDING}\", not \"{word}\""
+            ))),
+        }
+    }
+}
+
+impl From<bool> for FastSupport {
+    fn from(supported: bool) -> Self {
+        if supported {
+            Self::Supported
+        } else {
+            Self::Unsupported
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -356,210 +268,69 @@ pub struct Model {
     pub id: String,
     pub provider: Arc<str>,
     pub tier: ModelTier,
-    pub family: ModelFamily,
-    pub supports_tool_examples_override: Option<bool>,
-    /// Resolved thinking support, used by gateway providers (e.g. Aperture)
-    /// that stream through a native provider chosen at runtime. `None` falls
-    /// back to discovery, then the provider manifest.
-    pub thinking_override: Option<ThinkingSupport>,
-    pub supports_vision_override: Option<bool>,
-    pub supports_fast_override: Option<FastSupport>,
+    pub tool_examples: Option<bool>,
+    /// `None` when the descriptor does not say, which reads as no thinking.
+    pub thinking_support: Option<ThinkingSupport>,
+    pub vision: Option<bool>,
+    pub fast_support: Option<FastSupport>,
     pub pricing: ModelPricing,
-    /// What the model declares it can generate, `None` when unknown (see
-    /// [`ProviderKind::fallback_max_output`]). Stays the same across requests,
-    /// because [`Self::max_thinking_budget`] scales effort levels off it.
+    pub pricing_schedule: Option<PricingSchedule>,
+    /// What the model declares it can generate, `None` when unknown.
     pub max_output_tokens: Option<u32>,
-    /// What this one request may generate, when a caller trimmed the cap to a
-    /// turn budget. `None` leaves the declared cap standing.
-    pub turn_output_tokens: Option<u32>,
     pub context_window: u32,
-    pub thinking_fields: Option<Box<ThinkingFields>>,
+    /// Offered at no charge, as the provider's descriptor says.
+    pub free: bool,
 }
 
 impl Model {
-    /// Rates and limits come from the most specific source that names this
-    /// model: live discovery, then [`ModelSources`], then provider defaults.
-    /// Family and tier are about which dialect a model speaks and what role it
-    /// plays, which a relative answers just as well, so they read the curated
-    /// row whether or not it was an exact match.
-    fn from_base(manifest: &ProviderManifest, slug: &str, model_id: &str) -> Self {
-        let sources = ModelSources::resolve(manifest, model_id);
-        let entry = sources.entry;
-        let spec = format!("{slug}/{model_id}");
-        // Discovery keys `known_models` by the builtin slug, so a dynamic or
-        // custom slug reads positional tiers and metadata through its base.
-        let discovered = model_registry::discovered(manifest.slug, model_id);
-        let discovered = discovered.as_ref();
-        let tier = model_registry::tier_for(&spec, manifest.slug, entry.map(|e| e.tier));
-        let family = entry.map_or(manifest.family, |entry| entry.family);
-        let discovered_pricing = discovered.and_then(|info| info.pricing.as_ref());
-        let pricing = discovered_pricing
-            .cloned()
-            .or_else(|| {
-                sources.pick(
-                    |entry| Some(entry.pricing.clone()),
-                    |meta| meta.pricing.clone(),
-                )
-            })
-            .unwrap_or_default();
-        let max_output_tokens = discovered
-            .and_then(|info| info.max_output_tokens)
-            .or_else(|| sources.pick(|entry| entry.max_output_tokens, |meta| meta.output))
-            .or(manifest.fallback_max_output);
-        let context_window = discovered
-            .and_then(|info| info.context_window)
-            .or_else(|| anthropic::shared::long_context_window(model_id))
-            .or_else(|| sources.pick(|entry| Some(entry.context_window), |meta| meta.context))
-            .unwrap_or(manifest.fallback_context_window);
+    /// A model described by a registered provider's descriptor. A capability
+    /// the descriptor leaves out reads as unsupported.
+    pub fn from_info(provider: &str, info: &ModelInfo) -> Self {
+        let spec = format!("{provider}/{}", info.id);
         Self {
-            id: model_id.to_string(),
-            provider: Arc::from(slug),
-            tier,
-            family,
-            supports_tool_examples_override: None,
-            thinking_override: None,
-            supports_vision_override: None,
-            supports_fast_override: None,
-            pricing,
-            max_output_tokens,
-            turn_output_tokens: None,
-            context_window,
-            thinking_fields: None,
-        }
-    }
-
-    /// Build a `Model` from a models.dev catalogue sub-provider (nvidia,
-    /// fireworks, groq, ...). The slug is the catalogue sub-provider key, not a
-    /// builtin; metadata is read once from the models.dev catalog and cached on
-    /// the `Model` so `supports_thinking`/`supports_vision` do not need a live
-    /// catalog lookup.
-    fn from_catalog(slug: &str, model_id: &str, meta: CatalogMeta) -> Self {
-        let (context_window, max_output_tokens) = (meta.context_window(), meta.max_output());
-        Self {
-            id: model_id.to_string(),
-            provider: Arc::from(slug),
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            supports_tool_examples_override: None,
-            thinking_override: ThinkingSupport::from_flags(meta.supports_thinking, false),
-            supports_vision_override: meta.supports_vision,
-            supports_fast_override: None,
-            pricing: meta.pricing.unwrap_or_default(),
-            max_output_tokens: Some(max_output_tokens),
-            turn_output_tokens: None,
-            context_window,
-            thinking_fields: None,
+            id: info.id.clone(),
+            provider: Arc::from(provider),
+            tier: model_registry::tier_for(&spec, info.tier),
+            tool_examples: info.supports_tool_examples,
+            thinking_support: ThinkingSupport::from_flags(
+                info.supports_thinking,
+                info.requires_thinking == Some(true),
+            ),
+            vision: info.supports_vision,
+            fast_support: info.supports_fast,
+            pricing: info.pricing.clone().unwrap_or_default(),
+            pricing_schedule: info.pricing_schedule.clone(),
+            max_output_tokens: info.max_output_tokens,
+            context_window: info.context_window.unwrap_or(UNKNOWN_CONTEXT_WINDOW),
+            free: info.free == Some(true),
         }
     }
 
     pub fn supports_thinking(&self) -> bool {
-        if let Some(thinking) = self.thinking_override {
-            return thinking != ThinkingSupport::No;
-        }
-        // Discovery keys `known_models` by the builtin slug; resolve dynamic
-        // and custom slugs through their base manifest before looking up.
-        let Some(manifest) = ManifestRegistry::for_slug(&self.provider) else {
-            return false;
-        };
-        model_registry::discovered(manifest.slug, &self.id)
-            .and_then(|d| d.supports_thinking)
-            .or_else(|| {
-                ModelSources::resolve(manifest, &self.id)
-                    .catalog?
-                    .supports_thinking
-            })
-            .unwrap_or(manifest.supports_thinking)
+        self.thinking_support
+            .is_some_and(|thinking| thinking != ThinkingSupport::No)
     }
 
     pub fn requires_thinking(&self) -> bool {
-        self.thinking_override == Some(ThinkingSupport::Required)
+        self.thinking_support == Some(ThinkingSupport::Required)
     }
 
-    /// Vision support, most specific first: per-model override, discovery,
-    /// [`ModelSources`], the family default.
     pub fn supports_vision(&self) -> bool {
-        if let Some(vision) = self.supports_vision_override {
-            return vision;
-        }
-        let Some(manifest) = ManifestRegistry::for_slug(&self.provider) else {
-            return self.family.supports_vision();
-        };
-        model_registry::discovered(manifest.slug, &self.id)
-            .and_then(|d| d.supports_vision)
-            .or_else(|| {
-                ModelSources::resolve(manifest, &self.id)
-                    .pick(|entry| Some(entry.vision), |meta| meta.supports_vision)
-            })
-            .unwrap_or_else(|| self.family.supports_vision())
+        self.vision == Some(true)
     }
 
     pub fn supports_tool_examples(&self) -> bool {
-        self.supports_tool_examples_override
-            .unwrap_or_else(|| self.family.supports_tool_examples())
+        self.tool_examples == Some(true)
     }
 
-    /// The `max_tokens` this request should carry.
-    ///
-    /// The turn budget is clamped on read rather than where it is set, because
-    /// providers that resolve limits per request (catalog, opencode) rewrite
-    /// `max_output_tokens` on the way out, long after the budget was sized.
-    /// Doing it here means such a provider only has to report the cap it knows,
-    /// and cannot send a budget its endpoint never offered by forgetting to
-    /// re-apply the trim.
-    pub fn output_tokens(&self) -> Option<u32> {
-        [self.turn_output_tokens, self.max_output_tokens]
-            .into_iter()
-            .flatten()
-            .min()
-    }
-
-    /// Half the output window, so the answer always has room after the
-    /// thinking. `None` when the window is unknown: callers must then let
-    /// budgets through unclamped. Providers cap further only where the API
-    /// documents a hard limit (currently just Google).
-    pub fn max_thinking_budget(&self) -> Option<u32> {
-        self.max_output_tokens
-            .map(|n| (n / 2).max(MIN_THINKING_BUDGET))
-    }
-
-    /// This model carrying one request's output budget, leaving the declared
-    /// cap to say what the model can do.
-    pub fn with_turn_output(&self, budget: u32) -> Self {
-        Self {
-            turn_output_tokens: Some(budget),
-            ..self.clone()
-        }
-    }
-
-    /// Ceiling for the thinking one *request* may ask for: half the
-    /// `max_tokens` it carries, so the answer always has room after the
-    /// thinking, and no dialect is handed a budget its own `max_tokens` refuses
-    /// (Anthropic 400s when the two meet).
-    pub fn thinking_ceiling(&self) -> Option<u32> {
-        self.output_tokens().map(|n| n / 2)
-    }
-
-    /// A provider that knows its own plan speaks through the override: a Codex
-    /// subscription bills a flat rate, so there is no fast per-token price to
-    /// read. Everyone else falls back to fast-tier pricing, so capability and
-    /// billing can never disagree. The provider gate keeps that path to
-    /// Anthropic-based providers, resolved through the base manifest so oauth
-    /// scripts keep it; Bedrock separately ignores `opts.fast` at request time.
     pub fn supports_fast(&self) -> bool {
-        match self.supports_fast_override {
-            Some(support) => support == FastSupport::Supported,
-            None => {
-                self.pricing.fast.is_some()
-                    && ManifestRegistry::for_slug(&self.provider)
-                        .is_some_and(|m| m.slug == FAST_PROVIDER)
-            }
-        }
+        self.fast_support == Some(FastSupport::Supported)
     }
 
     /// Discovery has not answered yet, so the `false` from [`Self::supports_fast`]
     /// is provisional. Frontends park the user's wish instead of rejecting it.
     pub fn fast_pending(&self) -> bool {
-        self.supports_fast_override == Some(FastSupport::Pending)
+        self.fast_support == Some(FastSupport::Pending)
     }
 
     pub fn spec(&self) -> String {
@@ -568,15 +339,18 @@ impl Model {
 
     /// What the provider charges right now, so it is only ever correct for a
     /// turn that just finished: under a
-    /// [`PricingSchedule`](crate::pricing::PricingSchedule) the answer moves
+    /// [`PricingSchedule`] the answer moves
     /// with the clock. Anything historical wants [`Self::list_cost`].
     ///
     /// `None` on an unpriced model (oauth, local), so callers can hide the cost
     /// instead of showing a misleading "$0.000".
     pub fn billed_cost(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
         let cost = self.list_cost(usage, fast)?;
-        let schedule = ManifestRegistry::for_slug(&self.provider).and_then(|m| m.pricing_schedule);
-        Some(schedule.map_or(cost, |s| cost * s.multiplier_at(Timestamp::now())))
+        Some(
+            self.pricing_schedule
+                .as_ref()
+                .map_or(cost, |s| cost * s.multiplier_at(Timestamp::now())),
+        )
     }
 
     /// The quoted rates, with no wall-clock surcharge. Deterministic, which is
@@ -587,83 +361,6 @@ impl Model {
         (!self.pricing.is_zero()).then(|| usage.cost(&self.pricing, fast && self.supports_fast()))
     }
 
-    pub fn provider_display_name(&self) -> &'static str {
-        ManifestRegistry::for_slug(&self.provider).map_or("Unknown", |m| m.display_name)
-    }
-
-    pub fn from_tier(slug: &str, tier: ModelTier) -> Result<Self, ModelError> {
-        if let Some(spec) = model_registry::spec_for_tier(slug, tier) {
-            return Self::from_spec(&spec);
-        }
-        let entry = ManifestRegistry::find_default_for_tier(slug, tier)
-            .ok_or_else(|| ModelError::NoDefault(slug.to_string(), tier))?;
-        let model_id = entry.prefixes[0];
-        Self::from_spec(&format!("{slug}/{model_id}"))
-    }
-
-    pub fn from_tier_with_policy(
-        slug: &str,
-        tier: ModelTier,
-        policy: &ModelPolicy,
-    ) -> Result<Self, ModelError> {
-        if let Ok(model) = Self::from_tier_dynamic(slug, tier)
-            && policy.allows(&model.spec())
-        {
-            return Ok(model);
-        }
-
-        let Some(manifest) = ManifestRegistry::for_slug(slug) else {
-            return Err(ModelError::NoAllowedModel(slug.to_string(), tier));
-        };
-        manifest
-            .models
-            .iter()
-            .filter(|entry| entry.tier == tier)
-            .flat_map(|entry| entry.prefixes)
-            .map(|model_id| format!("{slug}/{model_id}"))
-            .find(|spec| policy.allows(spec))
-            .map(|spec| Self::from_spec(&spec))
-            .transpose()?
-            .ok_or_else(|| ModelError::NoAllowedModel(slug.to_string(), tier))
-    }
-
-    pub fn from_tier_dynamic(slug: &str, tier: ModelTier) -> Result<Self, ModelError> {
-        if let Some(model) = dynamic::find_model_for_tier(slug, tier) {
-            return Ok(model);
-        }
-        // One providers.toml read, three answers: a model declared at this tier,
-        // the provider exists but declares nothing here (inherit the base
-        // protocol default under the custom slug, keeping its tier and pricing),
-        // or no such provider.
-        match custom::resolve_tier(slug, tier) {
-            custom::TierLookup::Model(model) => return Ok(model),
-            custom::TierLookup::NoModelForTier(base) => {
-                let manifest = ManifestRegistry::get(&base.to_string())
-                    .ok_or_else(|| ModelError::NoDefault(slug.to_string(), tier))?;
-                let entry = manifest
-                    .models
-                    .iter()
-                    .find(|e| e.default && e.tier == tier)
-                    .ok_or_else(|| ModelError::NoDefault(slug.to_string(), tier))?;
-                return Ok(Self::from_base(manifest, slug, entry.prefixes[0]));
-            }
-            custom::TierLookup::Unknown => {}
-        }
-        // Builtin or dynamic slug: resolve the base default under the slug
-        // (dynamic slugs route through `base_for_slug`).
-        if ManifestRegistry::get(slug).is_some() || dynamic::base_for_slug(slug).is_some() {
-            return Self::from_tier(slug, tier);
-        }
-        Err(ModelError::UnsupportedProvider(slug.to_string()))
-    }
-
-    pub fn from_spec_with_policy(spec: &str, policy: &ModelPolicy) -> Result<Self, ModelError> {
-        if !policy.allows(spec) {
-            return Err(ModelError::NotAllowed(spec.to_string()));
-        }
-        Self::from_spec(spec)
-    }
-
     pub fn parse_spec(spec: &str) -> Result<(&str, &str), ModelError> {
         let (slug, model_id) = spec.split_once('/').ok_or(ModelError::InvalidFormat)?;
         if slug.is_empty() || model_id.is_empty() {
@@ -672,50 +369,27 @@ impl Model {
         Ok((slug, model_id))
     }
 
+    /// A model that supports thinking, vision, fast mode and tool examples,
+    /// for tests that need one without a registry. Production code resolves
+    /// through `ProviderRegistry`.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn from_spec(spec: &str) -> Result<Self, ModelError> {
-        let (slug, model_id) = Self::parse_spec(spec)?;
-
-        // Precedence: builtin, then dynamic script, then providers.toml custom,
-        // then models.dev catalogue sub-provider.
-        // Discovery drops any script slug a builtin or custom entry already owns,
-        // so a script and a custom provider can never share a slug here.
-        if let Some(manifest) = ManifestRegistry::get(slug) {
-            return Ok(Self::from_base(manifest, slug, model_id));
-        }
-
-        if let Some(model) = dynamic::lookup_model(slug, model_id) {
-            return Ok(model);
-        }
-
-        if let Some(base) = dynamic::base_for_slug(slug)
-            && let Some(manifest) = ManifestRegistry::get(&base.to_string())
-        {
-            return Ok(Self::from_base(manifest, slug, model_id));
-        }
-
-        if let Some(model) = custom::lookup_model(slug, model_id) {
-            return Ok(model);
-        }
-
-        if let Some(meta) = catalog::model_meta_if_available(slug, model_id) {
-            return Ok(Self::from_catalog(slug, model_id, meta));
-        }
-
-        Err(ModelError::UnsupportedProvider(slug.to_string()))
-    }
-
-    /// Free public models surfaced through the OpenCode provider (Zen/Go),
-    /// using the catalog's definition of free (zero input and output price),
-    /// the same one that gates `enable_free_models`.
-    ///
-    /// Queries the live catalog rather than `self.pricing`, which may not yet
-    /// reflect catalog prices when discovery hasn't seeded the registry.
-    pub fn is_free(&self) -> bool {
-        crate::providers::catalog::free_model_if_available(&self.provider, &self.id)
+        let (provider, model_id) = Self::parse_spec(spec)?;
+        Ok(Self::from_info(
+            provider,
+            &ModelInfo {
+                supports_thinking: Some(true),
+                supports_vision: Some(true),
+                supports_fast: Some(FastSupport::Supported),
+                supports_tool_examples: Some(true),
+                ..ModelInfo::id_only(model_id.to_string())
+            },
+        ))
     }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TokenUsage {
     /// Non-cached input tokens. Total input = `input + cache_read + cache_creation`.
     #[serde(rename = "input_tokens")]
@@ -840,28 +514,8 @@ impl AddAssign for TokenUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use test_case::test_case;
-
-    fn warm_empty_catalog() -> std::sync::MutexGuard<'static, ()> {
-        let tmp = tempfile::tempdir().unwrap();
-        crate::providers::catalog::warm_empty_catalog_for_tests(maki_storage::StateDir::from_path(
-            tmp.path().to_path_buf(),
-        ))
-    }
-
-    fn policy(allowed: &[&str], excluded: &[&str]) -> ModelPolicy {
-        ModelPolicy::new(
-            &allowed
-                .iter()
-                .map(|pattern| (*pattern).into())
-                .collect::<Vec<_>>(),
-            &excluded
-                .iter()
-                .map(|pattern| (*pattern).into())
-                .collect::<Vec<_>>(),
-        )
-        .unwrap()
-    }
 
     const TIERS: [ModelTier; 4] = [
         ModelTier::Weak,
@@ -875,10 +529,10 @@ mod tests {
     /// Declaration index of `Compaction`, which a derived `Ord` would read as
     /// the strongest tier.
     const COMPACTION_DECLARED_LAST: u8 = 3;
-    /// The only builtin whose rates move with the wall clock.
-    const SCHEDULED_PROVIDERS: [&str; 1] = ["deepseek"];
-    const DEEPSEEK_SPEC: &str = "deepseek/deepseek-v4-pro";
-    const UNPRICED_DEEPSEEK_SPEC: &str = "deepseek/my-custom-model";
+    const SCHEDULED_PROVIDER: &str = "scheduled";
+    const SCHEDULED_MODEL: &str = "peak-priced";
+    const UNKNOWN_FAST_WORD: &str = "maybe";
+    const SCHEDULED_INPUT_RATE: f64 = 0.66;
     const MILLION: u32 = 1_000_000;
     const INPUT_ONLY: TokenUsage = TokenUsage {
         input: MILLION,
@@ -894,48 +548,7 @@ mod tests {
         cache_read: 44,
     };
     const RECORDED_COST: f64 = 0.25;
-
-    #[test_case(&["claude-sonnet-4-5"], "claude-sonnet-4-5"; "the id itself")]
-    #[test_case(&["claude-sonnet-4-5"], "claude-sonnet-4-5-20250929"; "anthropic snapshot")]
-    #[test_case(&["gpt-5.4"], "gpt-5.4-2026-03-11"; "openai snapshot")]
-    fn a_curated_row_names_its_own_dated_snapshots(
-        prefixes: &'static [&'static str],
-        model_id: &str,
-    ) {
-        assert!(names_exactly(&entry_named(prefixes), model_id));
-    }
-
-    /// Each of these is a different model that merely starts with the row's id.
-    /// Letting the row answer for them is how `glm-5.4` would bill at `glm-5`
-    /// rates forever, silently, rather than reading models.dev.
-    #[test_case(&["glm-5"], "glm-5.4"; "version bump")]
-    #[test_case(&["glm-5"], "glm-5-code"; "named variant")]
-    #[test_case(&["claude-opus-5"], "claude-opus-5-2"; "version bump behind a dash")]
-    #[test_case(&["deepseek-flash"], "deepseek-flash-preview"; "preview of a relative")]
-    fn a_curated_row_does_not_name_its_relatives(
-        prefixes: &'static [&'static str],
-        model_id: &str,
-    ) {
-        let entry = entry_named(prefixes);
-        assert!(!names_exactly(&entry, model_id));
-        assert!(
-            lookup_entry(std::slice::from_ref(&entry), model_id).is_ok(),
-            "still the right row for family and tier, just not for rates"
-        );
-    }
-
-    fn entry_named(prefixes: &'static [&'static str]) -> ModelEntry {
-        ModelEntry {
-            prefixes,
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: false,
-            default: false,
-            pricing: ModelPricing::default(),
-            max_output_tokens: None,
-            context_window: 0,
-        }
-    }
+    const FAST_RATE: f64 = 30.0;
 
     #[test_case(999, "999"         ; "under_thousand")]
     #[test_case(1_000, "1.0k"      ; "thousand")]
@@ -967,90 +580,12 @@ mod tests {
     #[test_case("no-slash-here", ModelError::InvalidFormat ; "invalid_format")]
     #[test_case("/gpt-4", ModelError::InvalidFormat ; "missing_provider")]
     #[test_case("foobar/", ModelError::InvalidFormat ; "missing_model")]
-    #[test_case("foobar/gpt-4", ModelError::UnsupportedProvider("foobar".into()) ; "unsupported_provider")]
     fn from_spec_errors(spec: &str, expected: ModelError) {
-        let _catalog = warm_empty_catalog();
         let err = Model::from_spec(spec).unwrap_err();
         assert_eq!(
             std::mem::discriminant(&err),
             std::mem::discriminant(&expected)
         );
-    }
-
-    const SMALL_CAP: u32 = 8_192;
-    const TURN_BUDGET: u32 = 32_768;
-
-    /// Providers that resolve limits per request rewrite `max_output_tokens`
-    /// after the agent sized the turn, so a budget above the cap they report
-    /// must not survive to the wire.
-    #[test_case(Some(TURN_BUDGET), Some(SMALL_CAP), Some(SMALL_CAP) ; "a_lowered_cap_clamps_the_budget")]
-    #[test_case(Some(SMALL_CAP), Some(TURN_BUDGET), Some(SMALL_CAP) ; "a_trimmed_turn_is_what_the_request_carries")]
-    #[test_case(None, Some(SMALL_CAP), Some(SMALL_CAP) ; "an_untrimmed_turn_leaves_the_cap_standing")]
-    #[test_case(Some(TURN_BUDGET), None, Some(TURN_BUDGET) ; "an_undeclared_cap_keeps_the_budget")]
-    #[test_case(None, None, None ; "nothing_to_send")]
-    fn output_tokens_never_exceeds_the_declared_cap(
-        turn_output_tokens: Option<u32>,
-        max_output_tokens: Option<u32>,
-        expected: Option<u32>,
-    ) {
-        let model = Model {
-            turn_output_tokens,
-            max_output_tokens,
-            ..Model::from_spec("openai/gpt-5.6-sol").unwrap()
-        };
-
-        assert_eq!(model.output_tokens(), expected);
-    }
-
-    #[test]
-    fn from_spec_with_policy_rejects_disallowed_exact_spec() {
-        let policy = policy(&["anthropic/*"], &[]);
-        let spec = "openai/gpt-5.6-sol";
-
-        let error = Model::from_spec_with_policy(spec, &policy).unwrap_err();
-
-        assert!(matches!(error, ModelError::NotAllowed(disallowed) if disallowed == spec));
-    }
-
-    #[test]
-    fn from_spec_with_policy_resolves_allowed_exact_spec() {
-        let policy = policy(&["openai/gpt-5.6-sol"], &[]);
-
-        let model = Model::from_spec_with_policy("openai/gpt-5.6-sol", &policy).unwrap();
-
-        assert_eq!(model.spec(), "openai/gpt-5.6-sol");
-    }
-
-    #[test]
-    fn tier_with_policy_uses_allowed_alternative() {
-        let policy = policy(&["openai/gpt-5.4-nano"], &[]);
-
-        let model = Model::from_tier_with_policy("openai", ModelTier::Weak, &policy).unwrap();
-
-        assert_eq!(model.spec(), "openai/gpt-5.4-nano");
-        assert_eq!(model.tier, ModelTier::Weak);
-    }
-
-    #[test]
-    fn tier_with_policy_errors_without_allowed_candidate() {
-        let policy = policy(&["anthropic/*"], &[]);
-
-        let error = Model::from_tier_with_policy("openai", ModelTier::Weak, &policy).unwrap_err();
-
-        assert!(matches!(
-            error,
-            ModelError::NoAllowedModel(provider, ModelTier::Weak) if provider == "openai"
-        ));
-    }
-
-    #[test]
-    fn from_spec_unknown_catalogue_subprovider_is_unsupported() {
-        // A cold-cache model resolution now warms the catalog from the on-disk
-        // cache (or fetches once), so seed an empty catalog to stay hermetic:
-        // the generic fallback still fires because the slug is not in it.
-        let _catalog = warm_empty_catalog();
-        let err = Model::from_spec("definitely-not-a-catalog-slug/any-model").unwrap_err();
-        assert!(matches!(err, ModelError::UnsupportedProvider(_)));
     }
 
     #[test]
@@ -1126,78 +661,13 @@ mod tests {
         assert_eq!(usage.cost(&pricing, true), usage.cost(&pricing, false));
     }
 
-    #[test]
-    fn fast_pricing_is_always_a_premium() {
-        for manifest in ManifestRegistry::builtins() {
-            for entry in manifest.models {
-                let Some(fast) = &entry.pricing.fast else {
-                    continue;
-                };
-                assert!(
-                    fast.input >= entry.pricing.input && fast.output >= entry.pricing.output,
-                    "{}/{}: fast pricing must not be cheaper than standard",
-                    manifest.slug,
-                    entry.prefixes[0],
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn spec_roundtrip() {
-        for manifest in ManifestRegistry::builtins() {
-            if manifest.accepts_arbitrary_models {
-                continue;
-            }
-            let model = Model::from_tier(manifest.slug, ModelTier::Medium).unwrap();
-            let round = Model::from_spec(&model.spec()).unwrap();
-            assert_eq!(round.id, model.id);
-            assert_eq!(round.provider, model.provider);
-        }
-    }
-
-    #[test]
-    fn opencode_from_spec_parses_four_levels() {
-        let spec = "opencode/nvidia/openai/gpt-oss-120b";
+    #[test_case("p/nvidia/openai/gpt-oss-120b", "nvidia/openai/gpt-oss-120b" ; "four_levels")]
+    #[test_case("p/opencode/big-pickle", "opencode/big-pickle" ; "three_levels")]
+    fn from_spec_keeps_nested_model_ids(spec: &str, expected_id: &str) {
         let model = Model::from_spec(spec).unwrap();
-        assert_eq!(model.provider, Arc::<str>::from("opencode"));
-        assert_eq!(model.id, "nvidia/openai/gpt-oss-120b");
+        assert_eq!(model.provider, Arc::<str>::from("p"));
+        assert_eq!(model.id, expected_id);
         assert_eq!(model.spec(), spec);
-    }
-
-    #[test]
-    fn opencode_from_spec_parses_three_levels() {
-        let spec = "opencode/opencode/big-pickle";
-        let model = Model::from_spec(spec).unwrap();
-        assert_eq!(model.provider, Arc::<str>::from("opencode"));
-        assert_eq!(model.id, "opencode/big-pickle");
-        assert_eq!(model.spec(), spec);
-    }
-
-    #[test]
-    fn from_tier_covers_all_providers() {
-        for manifest in ManifestRegistry::builtins() {
-            if manifest.accepts_arbitrary_models {
-                continue;
-            }
-            let slug: Arc<str> = Arc::from(manifest.slug);
-            for &tier in &TIERS {
-                // DeepSeek has no Weak tier model
-                if manifest.slug == "deepseek" && tier == ModelTier::Weak {
-                    continue;
-                }
-                // Compaction is user-assigned only, not in static registry
-                if tier == ModelTier::Compaction {
-                    continue;
-                }
-                let model = Model::from_tier(manifest.slug, tier).unwrap();
-                assert_eq!(model.provider, slug);
-                assert_eq!(model.tier, tier);
-                let max_output = model.max_output_tokens.unwrap();
-                assert!(max_output > 0);
-                assert!(model.context_window >= max_output);
-            }
-        }
     }
 
     #[test_case(ModelTier::Strong, ModelTier::Weak, ModelTier::Weak ; "strong_child_capped_to_weak_parent")]
@@ -1256,213 +726,87 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn exactly_one_default_per_provider_tier() {
-        for manifest in ManifestRegistry::builtins() {
-            if manifest.accepts_arbitrary_models {
-                continue;
-            }
-            let entries = manifest.models;
-            for &tier in &TIERS {
-                if manifest.slug == "deepseek" && tier == ModelTier::Weak {
-                    continue;
-                }
-                // Compaction is user-assigned only, not in static registry
-                if tier == ModelTier::Compaction {
-                    continue;
-                }
-                let count = entries
-                    .iter()
-                    .filter(|e| e.tier == tier && e.default)
-                    .count();
-                assert_eq!(
-                    count, 1,
-                    "{}/{}: expected exactly 1 default, found {count}",
-                    manifest.slug, tier
-                );
-            }
-        }
-    }
-
-    #[test_case("anthropic/claude-99-turbo", "anthropic", "claude-99-turbo" ; "unknown_anthropic_model_accepted")]
-    #[test_case("zai/glm-99", "zai", "glm-99" ; "unknown_zai_model_accepted")]
-    #[test_case("openai/gpt-99", "openai", "gpt-99" ; "unknown_openai_model_accepted")]
-    #[test_case("synthetic/hf:nonexistent", "synthetic", "hf:nonexistent" ; "unknown_synthetic_model_accepted")]
-    #[test_case("ollama/my-custom-model", "ollama", "my-custom-model" ; "unknown_ollama_model_accepted")]
-    #[test_case("deepseek/my-custom-model", "deepseek", "my-custom-model" ; "unknown_deepseek_model_accepted")]
-    fn unknown_model_accepted(spec: &str, expected_slug: &str, expected_id: &str) {
-        let model = Model::from_spec(spec).unwrap();
-        assert_eq!(model.provider, Arc::<str>::from(expected_slug));
-        assert_eq!(model.id, expected_id);
-        let manifest = ManifestRegistry::get(expected_slug).unwrap();
-        assert_eq!(model.family, manifest.family);
+    #[test_case(json!(true), FastSupport::Supported ; "supported")]
+    #[test_case(json!(false), FastSupport::Unsupported ; "unsupported")]
+    #[test_case(json!(FAST_PENDING), FastSupport::Pending ; "pending")]
+    fn fast_support_round_trips(declared: Value, expected: FastSupport) {
+        let info: ModelInfo =
+            serde_json::from_value(json!({ "id": SCHEDULED_MODEL, "supports_fast": declared }))
+                .unwrap();
+        assert_eq!(info.supports_fast, Some(expected));
+        assert_eq!(serde_json::to_value(expected).unwrap(), declared);
+        let model = Model::from_info(SCHEDULED_PROVIDER, &info);
+        assert_eq!(model.fast_pending(), expected == FastSupport::Pending);
     }
 
     #[test]
-    fn from_base_unknown_model_uses_provider_fallbacks() {
-        // Deliberately fake id so this stays valid when the model table changes.
-        let model = Model::from_base(
-            ManifestRegistry::get("anthropic").unwrap(),
-            "anthropic",
-            "claude-nonexistent-99",
-        );
-        assert_eq!(model.provider, Arc::<str>::from("anthropic"));
-        assert_eq!(model.id, "claude-nonexistent-99");
-        assert_eq!(model.spec(), "anthropic/claude-nonexistent-99");
-        assert_eq!(model.family, ModelFamily::Claude);
-        assert_eq!(model.max_output_tokens, Some(128_000));
-        assert_eq!(model.context_window, 200_000);
-        let p = &model.pricing;
+    fn fast_support_rejects_other_words() {
+        let declared = json!({ "id": SCHEDULED_MODEL, "supports_fast": UNKNOWN_FAST_WORD });
+        assert!(serde_json::from_value::<ModelInfo>(declared).is_err());
+    }
+
+    #[test_case(None, false ; "undeclared_is_unsupported")]
+    #[test_case(Some(true), true ; "declared")]
+    #[test_case(Some(false), false ; "declared_off")]
+    fn fast_follows_the_descriptor(declared: Option<bool>, expected: bool) {
+        let info = ModelInfo {
+            supports_fast: declared.map(FastSupport::from),
+            pricing: Some(ModelPricing {
+                fast: Some(FastPricing {
+                    input: FAST_RATE,
+                    output: FAST_RATE,
+                }),
+                ..ModelPricing::ZERO
+            }),
+            ..ModelInfo::id_only(SCHEDULED_MODEL.into())
+        };
         assert_eq!(
-            (p.input, p.output, p.cache_write, p.cache_read),
-            (0.0, 0.0, 0.0, 0.0)
+            Model::from_info(SCHEDULED_PROVIDER, &info).supports_fast(),
+            expected
         );
     }
 
-    #[test_case("anthropic/claude-opus-4-8",       true  ; "claude")]
-    #[test_case("openai/gpt-5.4",                   true  ; "gpt")]
-    #[test_case("google/gemini-2.5-pro",            true  ; "gemini")]
-    #[test_case("copilot/claude-opus-4.7",          true  ; "copilot_entry_beats_generic_family")]
-    #[test_case("zai/glm-5-code",                   false ; "glm_code_text_only")]
-    #[test_case("deepseek/deepseek-v4-pro",         false ; "deepseek_text_only")]
-    #[test_case("mistral/mistral-medium-latest",    true  ; "mistral_medium")]
-    #[test_case("mistral/ministral-14b-latest",     false ; "ministral_text_only")]
-    #[test_case("anthropic/claude-nonexistent-99",  true  ; "unknown_model_uses_family_fallback")]
-    #[test_case("deepseek/my-custom-model",         false ; "unknown_generic_defaults_off")]
-    fn vision_resolved_from_entry_or_family(spec: &str, expected: bool) {
-        assert_eq!(Model::from_spec(spec).unwrap().supports_vision(), expected);
-    }
-
-    #[test_case("claude-opus-5",    true  ; "entry_with_fast_pricing")]
-    #[test_case("claude-opus-5-1m", true  ; "long_context_suffix_still_matches_prefix")]
-    #[test_case("claude-opus-4-7",  false ; "fast_withdrawn_from_the_table")]
-    #[test_case("claude-sonnet-5",  false ; "entry_without_fast_pricing")]
-    #[test_case("claude-opus-99",   false ; "no_entry_at_all")]
-    fn supports_fast_follows_anthropic_table(model_id: &str, expected: bool) {
-        let model = Model::from_base(
-            ManifestRegistry::get("anthropic").unwrap(),
-            "anthropic",
-            model_id,
-        );
-        assert_eq!(model.supports_fast(), expected);
-    }
-
-    #[test_case("google/gemini-2.5-pro", Some(FastSupport::Supported), true ; "override_enables_without_fast_pricing")]
-    #[test_case("anthropic/claude-opus-5", Some(FastSupport::Unsupported), false ; "override_disables_native_support")]
-    #[test_case("anthropic/claude-opus-5", None, true ; "no_override_falls_back_to_pricing")]
-    #[test_case("anthropic/claude-opus-5", Some(FastSupport::Pending), false ; "pending_disables_native_support")]
-    fn supports_fast_respects_override(
-        spec: &str,
-        fast_override: Option<FastSupport>,
-        expected: bool,
-    ) {
-        let mut model = Model::from_spec(spec).unwrap();
-        model.supports_fast_override = fast_override;
-        assert_eq!(model.supports_fast(), expected);
-    }
-
-    #[test_case("google/gemini-2.5-pro" ; "non_anthropic")]
-    #[test_case("anthropic/claude-sonnet-5" ; "anthropic")]
-    fn fast_override_without_fast_pricing_uses_standard_rates(spec: &str) {
-        let mut model = Model::from_spec(spec).unwrap();
-        model.supports_fast_override = Some(FastSupport::Supported);
-        assert!(model.supports_fast());
-        assert!(model.pricing.fast.is_none());
-        assert!(!model.pricing.is_zero());
+    #[test]
+    fn fast_without_fast_pricing_uses_standard_rates() {
+        let model = Model {
+            fast_support: Some(FastSupport::Supported),
+            pricing: ModelPricing {
+                input: SCHEDULED_INPUT_RATE,
+                ..ModelPricing::ZERO
+            },
+            ..Model::from_spec("p/m").unwrap()
+        };
         assert_eq!(
             model.list_cost(&COUNTERS, true),
             Some(COUNTERS.cost(&model.pricing, false))
         );
     }
 
-    /// Without an override, fast mode is Anthropic-only, so a fast rate that
-    /// lands on anyone else is dead weight: nobody can turn it on, and an
-    /// `always_fast` carried in from config must not quietly reprice the
-    /// session with it.
-    #[test]
-    fn supports_fast_false_for_non_anthropic_even_with_fast_pricing() {
-        let mut model = Model::from_base(
-            ManifestRegistry::get("google").unwrap(),
-            "google",
-            "gemini-2.5-pro",
+    /// A descriptor quoting off-peak rates with a peak-hours schedule.
+    fn scheduled_model(input_rate: Option<f64>) -> Model {
+        let pricing = input_rate.map(
+            |input| json!({"input": input, "output": 0.0, "cache_write": 0.0, "cache_read": 0.0}),
         );
-        model.pricing.fast = Some(FastPricing {
-            input: 30.0,
-            output: 150.0,
-        });
-        assert!(!model.supports_fast());
+        let info: ModelInfo = serde_json::from_value(json!({
+            "id": SCHEDULED_MODEL,
+            "pricing": pricing,
+            "pricing_schedule": {
+                "windows": [{"start": 1, "end": 4}, {"start": 6, "end": 10}],
+                "weekdays_only": true,
+                "multiplier": 2.0,
+            },
+        }))
+        .unwrap();
+        Model::from_info(SCHEDULED_PROVIDER, &info)
     }
 
-    #[test]
-    fn discovered_vision_flows_into_curated_provider_model() {
-        use crate::model::ModelInfo;
-
-        model_registry::set_known_models(
-            "synthetic",
-            vec![
-                ModelInfo {
-                    supports_vision: Some(true),
-                    ..ModelInfo::id_only("syn:test-vision".into())
-                },
-                ModelInfo::id_only("syn:test-blind".into()),
-            ],
-        );
-
-        let vision = |id| Model::from_spec(id).unwrap().supports_vision();
-        assert!(vision("synthetic/syn:test-vision"));
-        assert!(!vision("synthetic/syn:test-blind"));
-    }
-
-    #[test]
-    fn discovered_context_window_flows_into_from_base_for_unknown_model() {
-        use crate::model::ModelInfo;
-
-        let model_id = "test-discovered-context-window-model";
-        let expected_window: u32 = 131_072;
-
-        model_registry::set_known_models(
-            "ollama",
-            vec![ModelInfo {
-                context_window: Some(expected_window),
-                ..ModelInfo::id_only(model_id.to_string())
-            }],
-        );
-
-        let model = Model::from_base(ManifestRegistry::get("ollama").unwrap(), "ollama", model_id);
-        assert_eq!(model.context_window, expected_window);
-
-        // A dynamic/custom slug shares its base provider's discovery.
-        let wrapped = Model::from_base(
-            ManifestRegistry::get("ollama").unwrap(),
-            "my-ollama-wrap",
-            model_id,
-        );
-        assert_eq!(wrapped.spec(), format!("my-ollama-wrap/{model_id}"));
-        assert_eq!(wrapped.context_window, expected_window);
-    }
-
-    /// A schedule hung on the wrong manifest silently doubles every turn of a
-    /// provider that bills flat.
-    #[test]
-    fn only_deepseek_bills_by_the_clock() {
-        let scheduled: Vec<&str> = ManifestRegistry::builtins()
-            .iter()
-            .filter(|m| m.pricing_schedule.is_some())
-            .map(|m| m.slug)
-            .collect();
-        assert_eq!(scheduled, SCHEDULED_PROVIDERS);
-    }
-
-    /// Nothing else pins the wiring: a real DeepSeek model has to pick the
-    /// schedule up out of its manifest, and `list_cost` has to stay out of it.
+    /// `list_cost` stays out of the schedule, `billed_cost` applies it.
     /// `billed_cost` reads the real clock, so the expectation is sampled either
     /// side of the call in case the hour ticks over mid-test.
     #[test]
-    fn deepseek_bills_its_peak_surcharge_on_top_of_the_table() {
-        let model = Model::from_spec(DEEPSEEK_SPEC).unwrap();
-        let schedule = ManifestRegistry::for_slug(&model.provider)
-            .and_then(|m| m.pricing_schedule)
-            .expect("deepseek bills by the clock");
+    fn a_scheduled_model_bills_its_peak_surcharge_on_top_of_the_table() {
+        let model = scheduled_model(Some(SCHEDULED_INPUT_RATE));
+        let schedule = model.pricing_schedule.as_ref().unwrap();
 
         let list = model.list_cost(&INPUT_ONLY, false).unwrap();
         let table_price = f64::from(INPUT_ONLY.input) * model.pricing.input / PER_MILLION;
@@ -1486,7 +830,7 @@ mod tests {
     /// and any multiple of nothing is still nothing.
     #[test]
     fn unpriced_models_stay_unpriced_under_a_schedule() {
-        let model = Model::from_spec(UNPRICED_DEEPSEEK_SPEC).unwrap();
+        let model = scheduled_model(None);
         assert!(model.pricing.is_zero());
         assert_eq!(model.list_cost(&INPUT_ONLY, false), None);
         assert_eq!(model.billed_cost(&INPUT_ONLY, false), None);

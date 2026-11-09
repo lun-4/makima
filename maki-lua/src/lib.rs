@@ -2,15 +2,19 @@ pub mod agent_autocmd;
 pub mod agent_errors;
 mod api;
 mod coalesced_latest;
+mod credentials;
+mod ctx;
 pub mod docs;
 pub mod docs_render;
 mod error;
 pub(crate) mod hook;
 pub mod language;
 mod loader;
+mod login_ui;
 pub mod orchestration;
 pub use runtime::current_managed_turn;
 pub(crate) mod plugin_permissions;
+mod provider;
 mod runtime;
 pub mod session_snapshot;
 mod splash;
@@ -58,12 +62,82 @@ pub mod test_support {
         CommandContent, CommandError, CommandFuture, CommandHost, CommandOutcome, CommandRegistry,
         HostRequest, HostResponse, TargetCapabilities,
     };
-    use std::sync::Arc;
+    use maki_providers::login::{AuthSpec, AuthStatus, InteractionService};
+    use maki_providers::provider::{BoxFuture, unconfigured};
+    use maki_providers::{
+        AgentError, Model, ModelInfo, PreparedProvider, ProviderBackend, ProviderRegistry,
+        RegisteredProvider,
+    };
+    use serde_json::Value;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     pub use crate::api::util::dispatch::MAX_HOOK_DEPTH;
 
     pub const COMMAND_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+    type SharedModels = Arc<Mutex<Vec<ModelInfo>>>;
+
+    struct OfflineBackend(SharedModels);
+
+    impl ProviderBackend for OfflineBackend {
+        fn prepare(
+            &self,
+            model: Model,
+            _info: ModelInfo,
+        ) -> BoxFuture<'static, Result<PreparedProvider, AgentError>> {
+            Box::pin(async move {
+                Ok(PreparedProvider {
+                    model,
+                    provider: unconfigured(),
+                })
+            })
+        }
+
+        fn discover(
+            &self,
+            _refresh: bool,
+        ) -> Option<BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>> {
+            let models = self.0.lock().unwrap().clone();
+            Some(Box::pin(async move { Ok(models) }))
+        }
+
+        fn login(
+            &self,
+            _method: String,
+            _config: Value,
+            _ui: Arc<dyn InteractionService>,
+        ) -> BoxFuture<'static, Result<Option<String>, AgentError>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn auth_status(
+            &self,
+            _config: Value,
+        ) -> Option<BoxFuture<'static, Result<AuthStatus, AgentError>>> {
+            None
+        }
+
+        fn logout(&self) -> Option<BoxFuture<'static, Result<(), AgentError>>> {
+            None
+        }
+    }
+
+    /// A registry with the one provider {id}, for tests that need a provider
+    /// without the network. Every model id resolves, with the metadata
+    /// {models} holds; `prepare` hands out a provider that fails each
+    /// request; and discovery reports what {models} holds by then.
+    pub fn offline_registry(id: &str, models: SharedModels) -> Arc<ProviderRegistry> {
+        let listed = models.lock().unwrap().clone();
+        Arc::new(ProviderRegistry::new(vec![RegisteredProvider {
+            id: id.into(),
+            display_name: id.into(),
+            models: listed,
+            backend: Arc::new(OfflineBackend(models)),
+            auth: AuthSpec::default(),
+            docs: None,
+        }]))
+    }
 
     struct DetachedCommandHost;
 

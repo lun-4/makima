@@ -101,9 +101,11 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
         &api::r#async::SEMAPHORE_DOCS,
         &api::r#async::PERMIT_DOCS,
         &api::base64::DOCS,
+        &api::crypto::DOCS,
         &api::env::DOCS,
         &api::r#fn::DOCS,
         &api::fs::DOCS,
+        &api::host::DOCS,
         &api::image::DOCS,
         &api::image::IMAGE_DOCS,
         &api::interpreter::DOCS,
@@ -115,8 +117,14 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
         &api::mode::DOCS,
         &api::model::DOCS,
         &api::net::DOCS,
+        &api::net::send::RESPONSE_DOCS,
         &api::session::DOCS,
         &api::session_option::DOCS,
+        &api::provider::DOCS,
+        &crate::credentials::DOCS,
+        &crate::credentials::STORE_DOCS,
+        &crate::ctx::CTX_DOCS,
+        &crate::login_ui::LOGIN_UI_DOCS,
         &api::usage::DOCS,
         &api::text::DOCS,
         &api::time::DOCS,
@@ -203,13 +211,16 @@ mod tests {
                     crate::runtime::PromptHintCallbacks::default(),
                 )),
                 pending_hint: Arc::new(std::sync::Mutex::new(None)),
+                pending_providers: Arc::default(),
             },
+            Arc::from("docs-test"),
             Arc::from("docs-test"),
             Some(ui_tx),
             &PluginPermissions::trusted(),
             Arc::default(),
         )
-        .unwrap();
+        .unwrap()
+        .0;
 
         let mut documented: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
         for module in api_docs() {

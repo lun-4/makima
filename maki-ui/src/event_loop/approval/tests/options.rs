@@ -15,7 +15,7 @@ use super::{
     RecordingProvider, SOURCE_MODEL, Status, TARGET_MODEL, WAIT, apply_patch, approve,
     assert_preserved, capable_model, checkpoint, final_ready, implementation_options,
     implementation_selection, next_ready, pump_until, read_model, read_prefs, read_recents, setup,
-    with_event_loop,
+    sync_preparer, with_event_loop,
 };
 
 const CHECKPOINT_FAILURE: &str = "approval checkpoint failed";
@@ -62,11 +62,11 @@ fn approval_selection_uses_predecessor_and_explicit_disables(
         );
         let preparations = Arc::new(AtomicUsize::new(0));
         let preparation_count = Arc::clone(&preparations);
-        event_loop.ctx.prepare_provider = Arc::new(move |model, _| {
+        event_loop.ctx.prepare_provider = sync_preparer(move |model| {
             preparation_count.fetch_add(1, Ordering::SeqCst);
             let mut model = capable_model(&model.spec());
             if required {
-                model.thinking_override = Some(ThinkingSupport::Required);
+                model.thinking_support = Some(ThinkingSupport::Required);
             }
             Ok(PreparedModel {
                 model,
@@ -188,14 +188,17 @@ fn approval_rejects_unsupported_explicit_options(fast: bool) {
             .plan_form
             .set_implementation_selection(selection.clone());
         let prepare = event_loop.ctx.prepare_provider.clone();
-        event_loop.ctx.prepare_provider = Arc::new(move |model, timeouts| {
-            let mut prepared = prepare(model, timeouts)?;
-            if fast {
-                prepared.model.supports_fast_override = Some(FastSupport::Unsupported);
-            } else {
-                prepared.model.thinking_override = Some(ThinkingSupport::No);
-            }
-            Ok(prepared)
+        event_loop.ctx.prepare_provider = Arc::new(move |spec| {
+            let prepared = prepare(spec);
+            Box::pin(async move {
+                let mut prepared = prepared.await?;
+                if fast {
+                    prepared.model.fast_support = Some(FastSupport::Unsupported);
+                } else {
+                    prepared.model.thinking_support = Some(ThinkingSupport::No);
+                }
+                Ok(prepared)
+            })
         });
         approve(event_loop, index, false);
         pump_until(event_loop, |event_loop| {

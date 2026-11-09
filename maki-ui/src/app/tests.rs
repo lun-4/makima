@@ -6,7 +6,7 @@ use crate::components::btw_modal::BtwEvent;
 use crate::components::command::ParsedCommand;
 use crate::components::file_picker::EMPTY_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
-use crate::components::{Action, ExitRequest, buffer_text, key, test_model};
+use crate::components::{Action, ExitRequest, TEST_MODEL_PROVIDER, buffer_text, key, test_model};
 use crate::model_capabilities::test_support::seeded;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
@@ -29,6 +29,7 @@ use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{BuiltinAction, CommandArgumentItem, HintReader, KeymapReader};
 use maki_providers::model::FastSupport;
+use maki_providers::test_util::offline_ids;
 use maki_providers::{
     ContentBlock, Effort, Message, ModelCapabilities, Role, ThinkingConfig, ThinkingSupport,
     TokenUsage,
@@ -49,8 +50,8 @@ const SETTLE_POLL: Duration = Duration::from_millis(1);
 const TASK_ID: &str = "task1";
 const SUB_TOOL_ID: &str = "sub_t1";
 const TOOL_OUTPUT_LINE: &str = "hello from the subagent";
-const LATE_MODEL_SPEC: &str = "zai/glm-5";
-const MODEL_SPEC_GLM4: &str = "zai/glm-4";
+const LATE_MODEL_SPEC: &str = "ollama/glm-5";
+const MODEL_SPEC_GLM4: &str = "ollama/glm-4";
 const MODEL_SPEC_GPT9: &str = "openai/gpt-9";
 const HINT_PLUGIN: &str = "statusline";
 const HINT_TEXT: &str = "2/4 staged";
@@ -702,7 +703,16 @@ fn install_model_slot(app: &mut App) -> Arc<ArcSwapOption<Vec<String>>> {
         LATE_MODEL_SPEC,
     ]
     .map(|spec| (spec, options));
-    app.model_picker = ModelPicker::new(Arc::clone(&models), seeded(&resolved, &[]));
+    app.model_picker = ModelPicker::new(
+        Arc::clone(&models),
+        Arc::new(offline_ids(&[
+            TEST_MODEL_PROVIDER,
+            "ollama",
+            "openai",
+            "zai",
+        ])),
+        seeded(&resolved, &[]),
+    );
     app.available_models = Arc::clone(&models);
     models
 }
@@ -4648,12 +4658,35 @@ fn open_task_picker_refreshes_after_subagent_history() {
 
     app.update(agent_msg(AgentEvent::SubagentHistory {
         history_epoch: 0,
+        conversation_id: None,
         tool_use_id: "session-abc".into(),
         messages: vec![],
     }));
 
     assert!(app.task_picker.is_open());
     assert_eq!(app.task_picker.item(1).unwrap().finished, Some(true));
+}
+
+#[test]
+fn subagent_history_stores_the_child_conversation_id() {
+    const CHILD_KEY: &str = "session-abc";
+    const CHILD_CONVERSATION: &str = "child-conversation";
+    let mut app = app_with_subagent_id(CHILD_KEY);
+    app.update(agent_msg(AgentEvent::SubagentHistory {
+        history_epoch: 0,
+        conversation_id: Some(CHILD_CONVERSATION.into()),
+        tool_use_id: CHILD_KEY.into(),
+        messages: vec![Message::user("child".into())],
+    }));
+
+    let stored = app.state.session.subagent_history_snapshot(CHILD_KEY);
+    assert_eq!(
+        stored
+            .and_then(|history| history.conversation)
+            .map(|conversation| conversation.id)
+            .as_deref(),
+        Some(CHILD_CONVERSATION)
+    );
 }
 
 #[test]
@@ -5072,7 +5105,10 @@ fn malformed_model_arg_flashes_invalid_model() {
     assert_eq!(app.root_config().model.spec(), before);
     assert_eq!(
         app.status_bar.flash_text().unwrap(),
-        "command failed: model must be in 'provider/model' format (e.g. anthropic/claude-sonnet-4-20250514)"
+        format!(
+            "command failed: {}",
+            maki_providers::ModelError::InvalidFormat
+        )
     );
 }
 
@@ -8212,6 +8248,7 @@ fn standalone_compaction_preserves_error_recovery_text_in_checkpoint(failed: boo
     for event in [
         AgentEvent::ModelSwitched {
             spec: test_model().spec(),
+            context_window: test_model().context_window,
         },
         AgentEvent::TextDelta {
             text: SUMMARY.into(),
@@ -8286,12 +8323,12 @@ fn configure_model_options(
     supported: bool,
 ) {
     let mut model = Model::from_spec(spec).unwrap();
-    model.thinking_override = Some(if supported {
+    model.thinking_support = Some(if supported {
         ThinkingSupport::Yes
     } else {
         ThinkingSupport::No
     });
-    model.supports_fast_override = Some(if supported {
+    model.fast_support = Some(if supported {
         FastSupport::Supported
     } else {
         FastSupport::Unsupported
@@ -9012,7 +9049,7 @@ fn plan_model_picker_stages_without_switching(row: bool) {
     // process, which rewrite the model, recents and prefs this test pins.
     let (_tmp, _dir, _writer, mut app) = tempdir_app();
     let models = install_model_slot(&mut app);
-    const MODEL: &str = "zai/glm-5";
+    const MODEL: &str = "ollama/glm-5";
     models.store(Some(Arc::new(vec![MODEL.into()])));
     set_root_mode(&mut app, Mode::Plan);
     app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
@@ -9726,16 +9763,15 @@ fn model_switch_updates_active_run_status() {
     app.status = Status::Streaming;
     app.run_context_window = Some(INITIAL_CONTEXT_WINDOW);
 
+    let expected_context_window = crate::components::TEST_CONTEXT_WINDOW;
     app.update(agent_msg_with_run_id(
         AgentEvent::ModelSwitched {
             spec: SWITCHED_MODEL_SPEC.into(),
+            context_window: expected_context_window,
         },
         app.run_id,
     ));
 
-    let expected_context_window = maki_providers::Model::from_spec(SWITCHED_MODEL_SPEC)
-        .unwrap()
-        .context_window;
     let status = rendered_rows(&mut app, 120, 24).pop().expect("status row");
 
     assert!(status.contains(SWITCHED_MODEL_SPEC));
@@ -9759,6 +9795,7 @@ fn subagent_history_finishes_workflow_chat() {
     app.update(agent_msg_with_run_id(
         AgentEvent::SubagentHistory {
             history_epoch: 0,
+            conversation_id: None,
             tool_use_id: "session-abc".into(),
             messages: vec![],
         },
@@ -9894,6 +9931,7 @@ fn reusable_subagent_processes_distinct_turn_outcomes() {
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentHistory {
             history_epoch: 0,
+            conversation_id: None,
             tool_use_id: TASK_ID.into(),
             messages: vec![Message {
                 role: Role::Assistant,
@@ -9946,6 +9984,7 @@ fn stamped_child_failure_wins_over_prior_history_snapshot() {
     app.update(subagent_msg_with_run_id(
         AgentEvent::SubagentHistory {
             history_epoch: 0,
+            conversation_id: None,
             tool_use_id: TASK_ID.into(),
             messages: vec![],
         },
@@ -11999,10 +12038,10 @@ fn seed_models(backend: &maki_lua::TestCompletionBackend, models: &[&str]) {
 fn at_m_prefix_lists_models() {
     let (_tmp, mut app, backend) = completion_app();
     app.available_models.store(Some(Arc::new(vec![
-        "zai/glm-5".into(),
+        "ollama/glm-5".into(),
         "anthropic/claude".into(),
     ])));
-    seed_models(&backend, &["zai/glm-5", "anthropic/claude"]);
+    seed_models(&backend, &["ollama/glm-5", "anthropic/claude"]);
     for c in "@m:".chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
     }
@@ -12019,7 +12058,7 @@ fn at_m_prefix_lists_models() {
         .collect();
     assert_eq!(
         specs,
-        vec!["zai/glm-5".to_string(), "anthropic/claude".to_string()]
+        vec!["ollama/glm-5".to_string(), "anthropic/claude".to_string()]
     );
 }
 
@@ -12041,8 +12080,8 @@ fn mixed_list_includes_skills_subagents_and_models() {
     seed_skill(&backend, "review");
     seed_subagents(&backend, "build");
     app.available_models
-        .store(Some(Arc::new(vec!["zai/glm-5".into()])));
-    seed_models(&backend, &["zai/glm-5"]);
+        .store(Some(Arc::new(vec!["ollama/glm-5".into()])));
+    seed_models(&backend, &["ollama/glm-5"]);
     app.update(Msg::Key(key(KeyCode::Char('@'))));
     let deadline = Instant::now() + Duration::from_secs(5);
     let items = loop {
@@ -12100,13 +12139,13 @@ fn submit_expands_subagent_model_and_skill_in_place() {
 fn submit_standalone_model_expands_in_place_no_action() {
     let (_tmp, mut app, backend) = completion_app();
     bind_root(&mut app, parked_root());
-    seed_models(&backend, &["zai/glm-5"]);
+    seed_models(&backend, &["ollama/glm-5"]);
     // No ChangeModel: the `@model` path no longer switches the session model.
     assert!(matches!(
-        app.submit_prompt(queued_msg("@model:zai/glm-5 fix the bug")),
+        app.submit_prompt(queued_msg("@model:ollama/glm-5 fix the bug")),
         SubmitOutcome::Started(actions) if actions.is_empty()
     ));
-    assert_eq!(root_submissions(&app), ["<model:zai/glm-5> fix the bug"]);
+    assert_eq!(root_submissions(&app), ["<model:ollama/glm-5> fix the bug"]);
 }
 
 #[test]
@@ -12654,6 +12693,7 @@ fn final_history_after_subagent_closed_only_persists_messages() {
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentHistory {
             history_epoch: 0,
+            conversation_id: None,
             tool_use_id: TASK_ID.into(),
             messages: messages.clone(),
         },
@@ -12782,6 +12822,7 @@ fn reconstructed_subagent_history_cannot_resurrect_rewound_history(closed: bool)
         event: AgentEvent::SubagentHistory {
             tool_use_id: TASK_ID.into(),
             history_epoch: earlier.epoch,
+            conversation_id: None,
             messages: earlier.messages.as_ref().clone(),
         },
         subagent: Some(info),
@@ -12924,6 +12965,7 @@ fn subagent_history_updates_storage_without_queuing_parent_work() {
         subagent_msg(
             AgentEvent::SubagentHistory {
                 history_epoch: 0,
+                conversation_id: None,
                 tool_use_id: TASK_ID.to_string(),
                 messages,
             },
@@ -12969,6 +13011,7 @@ fn grandchild_history_is_visible_but_not_promoted_to_root() {
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentHistory {
             history_epoch: 0,
+            conversation_id: None,
             tool_use_id: "grandchild-task".into(),
             messages: vec![Message {
                 role: Role::Assistant,
@@ -13437,7 +13480,11 @@ fn app_with_tall_model_picker() -> App {
         .iter()
         .map(|spec| (spec.as_str(), ModelCapabilities::NONE))
         .collect();
-    app.model_picker = ModelPicker::new(Arc::clone(&models), seeded(&resolved, &[]));
+    app.model_picker = ModelPicker::new(
+        Arc::clone(&models),
+        Arc::new(offline_ids(&[TEST_MODEL_PROVIDER])),
+        seeded(&resolved, &[]),
+    );
     models.store(Some(Arc::new(names)));
     app.run_builtin(BuiltinAction::ModelPicker);
     assert!(app.model_picker.is_open());

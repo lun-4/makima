@@ -132,8 +132,8 @@ mod tests {
         thinking_note: Option<&str>,
     ) {
         let mut model = Model::from_spec("anthropic/claude-opus-4-6").unwrap();
-        model.thinking_override = Some(thinking);
-        model.supports_fast_override = Some(fast);
+        model.thinking_support = Some(thinking);
+        model.fast_support = Some(fast);
         let capabilities = ModelCapabilities::from(&model);
         assert_eq!(
             capabilities.supports(ModelOption::Thinking),

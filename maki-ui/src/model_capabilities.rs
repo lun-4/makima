@@ -1,8 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use maki_providers::provider::adjust_model;
-use maki_providers::{Model, ModelCapabilities, Timeouts};
+use maki_providers::{ModelCapabilities, ProviderRegistry};
 use tracing::debug;
 
 type Resolve = Box<dyn Fn(&str) -> ModelCapabilities + Send + Sync>;
@@ -39,10 +38,10 @@ impl ModelCapabilityCache {
     }
 
     pub(crate) fn provider_adjusted(
-        timeouts: Timeouts,
+        providers: Arc<ProviderRegistry>,
         notify: impl Fn() + Send + Sync + 'static,
     ) -> Arc<Self> {
-        Self::new(move |spec| provider_adjusted(spec, timeouts), notify)
+        Self::new(move |spec| provider_adjusted(spec, &providers), notify)
     }
 
     /// Returns the cached capabilities of `spec`, or starts resolving them.
@@ -112,14 +111,17 @@ impl ModelCapabilityCache {
 /// Falls back to the static capabilities when the provider cannot be built,
 /// so a broken provider shows what the model table knows instead of loading
 /// forever. Applying the selection still validates against the real provider.
-fn provider_adjusted(spec: &str, timeouts: Timeouts) -> ModelCapabilities {
-    let Ok(mut model) = Model::from_spec(spec) else {
+fn provider_adjusted(spec: &str, providers: &ProviderRegistry) -> ModelCapabilities {
+    let Ok(model) = providers.model(spec) else {
         return ModelCapabilities::NONE;
     };
-    if let Err(error) = adjust_model(&mut model, timeouts) {
-        debug!(spec, %error, "model capabilities fall back to static metadata");
+    match smol::block_on(providers.prepare(model.clone())) {
+        Ok(prepared) => ModelCapabilities::from(&prepared.model),
+        Err(error) => {
+            debug!(spec, %error, "model capabilities fall back to static metadata");
+            ModelCapabilities::from(&model)
+        }
     }
-    ModelCapabilities::from(&model)
 }
 
 #[cfg(test)]
@@ -173,19 +175,27 @@ mod tests {
 
     struct Gate {
         cache: Arc<ModelCapabilityCache>,
-        started: flume::Receiver<()>,
-        answer: flume::Sender<ModelCapabilities>,
+        started: flume::Receiver<flume::Sender<ModelCapabilities>>,
         notified: flume::Receiver<()>,
     }
 
-    /// Each resolution announces itself, then waits for an answer.
+    impl Gate {
+        /// The answer channel of the next resolution once it starts. Each
+        /// resolution has its own, so a stale one can never take the answer
+        /// meant for a fresh one.
+        fn next_resolution(&self) -> flume::Sender<ModelCapabilities> {
+            self.started.recv_timeout(RESOLVE_TIMEOUT).unwrap()
+        }
+    }
+
+    /// Each resolution announces itself with its answer channel, then waits.
     fn gate() -> Gate {
         let (started_tx, started) = flume::unbounded();
-        let (answer, answer_rx) = flume::unbounded::<ModelCapabilities>();
         let (notified_tx, notified) = flume::unbounded();
         let cache = ModelCapabilityCache::new(
             move |_| {
-                started_tx.send(()).unwrap();
+                let (answer, answer_rx) = flume::bounded(1);
+                started_tx.send(answer).unwrap();
                 answer_rx.recv().unwrap()
             },
             move || notified_tx.send(()).unwrap(),
@@ -193,7 +203,6 @@ mod tests {
         Gate {
             cache,
             started,
-            answer,
             notified,
         }
     }
@@ -203,8 +212,7 @@ mod tests {
         let gate = gate();
         assert_eq!(gate.cache.get(SPEC), None);
         assert_eq!(gate.cache.get(SPEC), None);
-        gate.started.recv_timeout(RESOLVE_TIMEOUT).unwrap();
-        gate.answer.send(THINKING_ONLY).unwrap();
+        gate.next_resolution().send(THINKING_ONLY).unwrap();
         gate.notified.recv_timeout(RESOLVE_TIMEOUT).unwrap();
         assert_eq!(gate.cache.get(SPEC), Some(THINKING_ONLY));
         assert!(gate.started.try_recv().is_err());
@@ -214,16 +222,15 @@ mod tests {
     fn clear_discards_resolution_in_flight() {
         let gate = gate();
         assert_eq!(gate.cache.get(SPEC), None);
-        gate.started.recv_timeout(RESOLVE_TIMEOUT).unwrap();
+        let stale = gate.next_resolution();
         gate.cache.clear();
-        gate.answer.send(ModelCapabilities::NONE).unwrap();
+        stale.send(ModelCapabilities::NONE).unwrap();
         assert_eq!(gate.cache.get(SPEC), None);
-        gate.started.recv_timeout(RESOLVE_TIMEOUT).unwrap();
         let fresh = ModelCapabilities {
             thinking: ThinkingSupport::Required,
             fast: true,
         };
-        gate.answer.send(fresh).unwrap();
+        gate.next_resolution().send(fresh).unwrap();
         gate.notified.recv_timeout(RESOLVE_TIMEOUT).unwrap();
         assert_eq!(gate.cache.get(SPEC), Some(fresh));
     }

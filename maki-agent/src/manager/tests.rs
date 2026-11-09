@@ -9,7 +9,9 @@ use test_case::test_case;
 
 use event_listener::Event;
 use maki_providers::provider::{BoxFuture, Provider};
-use maki_providers::{Model, ProviderEvent, RequestOptions, StreamResponse, TokenUsage};
+use maki_providers::{
+    Invocation, Model, ProviderEvent, RequestOptions, StreamResponse, TokenUsage,
+};
 use maki_storage::checkpoint::CheckpointPublication;
 use maki_storage::id::SessionRef;
 use serde_json::Value;
@@ -1951,14 +1953,9 @@ impl Provider for ConfigTestProvider {
         _: &'a flume::Sender<ProviderEvent>,
         _: RequestOptions,
         _: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, maki_providers::AgentError>> {
         Box::pin(async { unreachable!() })
-    }
-
-    fn list_models(
-        &self,
-    ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
     }
 }
 

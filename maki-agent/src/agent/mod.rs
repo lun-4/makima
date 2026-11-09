@@ -22,3 +22,4 @@ pub use run::{
     RunSettings, SharedModel, TurnAdmissionSnapshot, TurnPromptInputs, estimate_message_tokens,
     resolve_compaction_model,
 };
+pub use streaming::end_conversation_detached;

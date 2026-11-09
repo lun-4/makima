@@ -6,7 +6,7 @@ use std::sync::{Arc, MutexGuard};
 
 use maki_config::ModelPolicy;
 use maki_domain::ModelSelection;
-use maki_providers::Model;
+use maki_providers::ModelError;
 use maki_storage::StateDir;
 use maki_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
 use thiserror::Error;
@@ -21,7 +21,7 @@ use crate::session_coordinator::{
     ConfigMutation, ModelPreparer, SessionCoordinatorError, SessionCoordinatorHandle,
     publication_claim,
 };
-use crate::session_options::{MODEL_OPTION_ID, SessionOptionError};
+use crate::session_options::SessionOptionError;
 use crate::{ActorError, AgentActorHandle, AgentRef, ManagerError};
 
 #[derive(Debug, Clone, PartialEq, Error)]
@@ -311,13 +311,12 @@ pub async fn prepare_model(
     if !policy.allows(spec) {
         return Err(SessionOptionError::PolicyRejected(spec.into()).into());
     }
-    let model = Model::from_spec(spec).map_err(|_| SessionOptionError::InvalidValue {
-        id: MODEL_OPTION_ID.into(),
-        value: spec.into(),
-    })?;
-    prepare(model)
-        .await
-        .map_err(ConfigChangeError::ModelPreparation)
+    prepare(Arc::from(spec)).await
+}
+
+/// The error a preparer reports for a spec that names no model.
+pub fn unresolved_model(error: ModelError) -> ConfigChangeError {
+    SessionOptionError::UnresolvedModel(error.to_string().into()).into()
 }
 
 /// Fills {patch}'s model from {spec}, when one is given.

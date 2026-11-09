@@ -99,9 +99,11 @@ The rules:
 | [`maki.async.Semaphore`](#maki-async-Semaphore) | A counting semaphore for limiting how many tasks run at once. |
 | [`maki.async.Permit`](#maki-async-Permit) | One slot in a semaphore, obtained from `Semaphore:acquire()`. |
 | [`maki.base64`](#maki-base64) | Base64 encoding and decoding, modelled after `vim.base64`. |
-| [`maki.env`](#maki-env) | Paths to makima's own directories (config, state, logs), and whether |
+| [`maki.crypto`](#maki-crypto) | Hashing on binary strings. |
+| [`maki.env`](#maki-env) | Paths to makima's own directories (config, state, logs, cache), and whether |
 | [`maki.fn`](#maki-fn) | Process and environment helpers, modeled after Neovim's `vim.fn` job |
 | [`maki.fs`](#maki-fs) | File-system utilities, modelled after `vim.fs` and `vim.uv`. |
+| [`maki.host`](#maki-host) | Actions on the host machine: opening a browser, reading the keyring. |
 | [`maki.image`](#maki-image) | Small building blocks for working with images: probe metadata, decode |
 | [`maki.image.Image`](#maki-image-Image) | A decoded image you can inspect, resize, and re-encode. |
 | [`maki.interpreter`](#maki-interpreter) | Run Python code in a memory-safe, time-limited sandbox. |
@@ -112,8 +114,13 @@ The rules:
 | [`maki.match`](#maki-match) | Fuzzy matching via nucleo, the same matcher makima's built-in pickers use. |
 | [`maki.api.mode`](#maki-api-mode) | `maki.api.mode`: define, override and list agent modes. |
 | [`maki.model`](#maki-model) | Model catalog reads that address no agent. |
-| [`maki.net`](#maki-net) | HTTP client for fetching web content. |
+| [`maki.net`](#maki-net) | HTTP clients: a guarded `request` for web content and a raw, streaming |
+| [`maki.net.Response`](#maki-net-Response) | A streaming HTTP response from `maki.net.send`. |
 | [`maki.session`](#maki-session) | Host session primitives. |
+| [`maki.credentials`](#maki-credentials) | Credential stores for plugins. |
+| [`maki.credentials.Store`](#maki-credentials-Store) | A credentials file: a provider's (its ctx's `credentials`) or a |
+| [`maki.Ctx`](#maki-Ctx) | A plugin's authority. |
+| [`maki.provider.LoginUi`](#maki-provider-LoginUi) | The `ui` a provider's `login(ctx, ui, config)` receives. |
 | [`maki.usage`](#maki-usage) | Provider-side quota snapshots. |
 | [`maki.text`](#maki-text) | Text transformation utilities. |
 | [`maki.time`](#maki-time) | Wall-clock timestamps and relative-age formatting. |
@@ -1169,6 +1176,211 @@ session's current values are in `Agent:config(ctx).options`.
 for _, option in ipairs(maki.api.get_session_options()) do
   print(option.id, option.name)
 end
+```
+
+---
+
+### `maki.api.register_provider()` {#maki-api-register_provider}
+
+```lua
+maki.api.register_provider({ctx?}, {spec?})
+```
+
+Registers a model provider under {ctx}, or under the plugin's root ctx
+without one. Call it while the plugin loads, such as from a `setup(ctx)`
+that `init.lua` calls. A provider id belongs to one plugin; registering
+an id another plugin already owns fails and names both plugins.
+
+{spec} fields:
+  `id` (string) Required. The provider part of `provider/model` specs,
+  made of ASCII letters, digits, `-`, `_` and `.`, not starting with `.`.
+  `display_name` (string) Required.
+  `models` (table) Model descriptors: `id` plus optional
+  `context_window`, `max_output_tokens`, `pricing`, `pricing_schedule`
+  (`{ windows = { { start, end } }, weekdays_only?, multiplier }`, whole
+  UTC hours that scale `pricing` by `multiplier`), `supports_thinking`,
+  `requires_thinking`, `supports_vision`, `supports_fast`,
+  `supports_tool_examples`, `tier`, `free` (offered at no charge, marked
+  in the model picker) and `provider_data`. The first descriptor with a
+  tier is that tier's default. `supports_fast` may be `"pending"` while
+  the provider cannot tell before its discovery answers: a saved or typed
+  `/fast` then waits for the model prepared after discovery.
+  `prepare` (function) Required. `prepare(ctx, model, config)` returns an
+  instance for one model descriptor, optionally followed by an adjusted
+  descriptor with the same id, or nil plus an error. `config` is the
+  provider's `providers.toml` section as a table, read at each call.
+  `discover` (function) Optional. `discover(ctx, config, refresh)`
+  returns the descriptors the provider offers now. `refresh` is true when
+  the user asked to bypass caches (`maki models --refresh`).
+  `config` (table) Optional. `providers.toml` fields asked before login:
+  `{ key, prompt, default?, secret?, optional?, choices? }`, where
+  `choices` is a list of `{ id, label, detail? }`. Each answer is saved
+  as a text field of the provider's section, such as `base_url`.
+  `auth` (table) Login methods: `{ id, label, login }`.
+  `login(ctx, ui, config)` gets a `maki.provider.LoginUi` and the
+  provider's section with this login's answers applied, not yet saved.
+  It returns a truthy value, optionally a table with `model` to choose
+  the default model, or nil plus an error.
+  `aliases` (table) Optional. `{ id, label, method }` names that log in
+  with a preset method.
+  `section` (string) Optional. The heading the provider is listed under
+  in the login picker, after the providers without one.
+  `auth_status` (function) Optional. `auth_status(ctx, config)` returns
+  `{ state, detail? }`, where `state` is `saved`, `env`, `configured`,
+  `missing` or `failed` (the check could not tell, shown as an error and
+  treated as missing). It must work without credentials. Without it, the
+  provider counts as logged in while its credentials file exists.
+  `logout` (function) Optional. `logout(ctx)`. Without it, logout
+  deletes the credentials file.
+  `docs` (table) Optional. What the providers reference page says
+  beyond models, login methods and config fields: `env` (the
+  environment variables it reads), `endpoint` (its default endpoint) and
+  `notes` (Markdown). Providers without it are left off that page.
+
+Config is saved and the default model chosen only after `login`
+succeeds and `auth_status` no longer reports `missing`.
+
+Callbacks receive a provider `maki.Ctx` derived from {ctx}: `id`, `send`
+(`maki.net.send` with the `[provider]` connect, low-speed and stream
+timeouts as defaults) and `credentials` (the provider's
+`maki.credentials.Store`); `maki.credentials.open` reaches {ctx}'s plugin
+stores through it. Only the registering plugin's callbacks receive it, so
+a provider id's credentials belong to the plugin that registered it. An instance has
+`stream(ctx, request, emit)` and optionally `fetch_usage(ctx)`,
+`refresh_auth(ctx)`, `reload_auth(ctx)`, `rotate_key(ctx)`,
+`end_conversation(ctx, conversation_id, reason)` and `key_count` (a
+number, or a function read at prepare and after each `reload_auth` or
+`refresh_auth`, for a pool those can change). `request` has `model`
+(`id`, `max_output_tokens`, `context_window`), `system`, `messages`,
+`tools`, `thinking`, `fast`, `session_id` and `invocation`
+(`conversation_id`, `operation_id`, `attempt`, `purpose`, `agent_id`,
+`previous`). `previous` is `{ id, relation, shared }` on every request of
+a conversation started from another: `relation` is `continues` (after a
+cancel or rewind) or `branches` (a fork, isolated turn or compaction
+summary), and the first `shared` messages equal those of the last request
+sent under `id`. `max_output_tokens` is what the model declares. `reason`
+is `cancelled`, `closed`, `compacted` or `rewound`; the host never uses an
+ended conversation id again, but a successor may name a `cancelled` or
+`rewound` one in `previous`. `emit(event)` takes `{ type = "text_delta", text }`
+and the other provider events, and returns false once the call is over.
+`stream` returns `{ message, usage, stop_reason }`. A failure returns nil
+plus an error: `{ kind = "config", message }` is a configuration error,
+such as a missing key or setting, and is not retried; a table with
+`status`, `message` and optional `retry_after` seconds is an API error,
+and `overflow = true` on it says the request does not fit the model's
+context, which the host answers by compacting instead of retrying;
+anything else is a transport error. An error is retried only when it
+names `retry`: `rate_limit`, `transient`, `connect`, `timeout` or `none`.
+The bundled `http.classify` names it from the status or the
+`maki.net.send` failure. A bare string and a raised error are not
+retried. Every callback that returns nil plus an error follows these
+rules.
+
+**Parameters:**
+
+- `{ctx?}` ([`maki.Ctx?`](#maki-Ctx)) The ctx to register under; omit it for the plugin's root ctx.
+- `{spec?}` (`table`) Required. Provider definition (see above).
+
+**Example:**
+
+```lua
+maki.api.register_provider({
+  id = "echo",
+  display_name = "Echo",
+  models = { { id = "echo-1", tier = "strong" } },
+  auth = {
+    { id = "api_key", label = "API key", login = function(ctx, ui, config)
+      local key, err = ui:input("API key", true)
+      if not key then return nil, err end
+      return ctx.credentials:write({ api_key = key })
+    end },
+  },
+  prepare = function(ctx, model, config)
+    return {
+      stream = function(ctx, request, emit)
+        emit({ type = "text_delta", text = "hi" })
+        return {
+          message = { role = "assistant", content = { { type = "text", text = "hi" } } },
+          stop_reason = "end_turn",
+        }
+      end,
+    }
+  end,
+})
+```
+
+---
+
+### `maki.api.provider_config()` {#maki-api-provider_config}
+
+```lua
+maki.api.provider_config({id?})
+```
+
+Read `providers.toml`: the section of provider {id}, or every section by
+provider id when {id} is nil. The file is read at each call, so a section
+saved earlier in the session is seen. A malformed file is logged and
+treated as empty because this API may run during an active session. A
+section has the fields a provider's `config` argument has. Use it for a
+setting another provider's section holds.
+
+Requires the `env` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{id?}` (`string?`) Provider id.
+
+**Returns:** (`table?`) The section, nil when there is none, or every section.
+
+**Example:**
+
+```lua
+local opencode = maki.api.provider_config("opencode") or {}
+for id, section in pairs(maki.api.provider_config()) do print(id, section.protocol) end
+```
+
+---
+
+### `maki.api.startup_provider_config()` {#maki-api-startup_provider_config}
+
+```lua
+maki.api.startup_provider_config()
+```
+
+Read every `providers.toml` section while registering providers. Unlike
+`provider_config`, malformed TOML is fatal so startup cannot silently
+continue with an empty provider registry. This function is only available
+while the calling plugin is loading.
+
+Requires the `env` [plugin permission](#plugin-permissions).
+
+**Returns:** table Sections by provider id.
+
+---
+
+### `maki.api.save_provider_config()` {#maki-api-save_provider_config}
+
+```lua
+maki.api.save_provider_config({id}, {section})
+```
+
+Save {section} as provider {id}'s `providers.toml` section, replacing
+any section it had. Fields the file does not know are dropped. Fails
+without touching the file when it does not parse.
+
+Requires the `fs_write` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{id}` (`string`) Provider id.
+- `{section}` (`table`) Fields such as `protocol`, `base_url` and `api_key_env`.
+
+**Returns:** (`boolean?`, `string?`) true, or nil plus an error.
+
+**Example:**
+
+```lua
+maki.api.save_provider_config("my-llm", { protocol = "openai", base_url = "http://localhost:8000/v1" })
 ```
 
 
@@ -2416,9 +2628,64 @@ maki.base64.decode("aGVsbG8=") -- "hello"
 ```
 
 
+## maki.crypto {#maki-crypto}
+
+Hashing on binary strings. Digests come back as raw bytes, not hex.
+Both functions accept strings and Luau buffers.
+
+```lua
+local signature = maki.crypto.hmac_sha256(key, maki.crypto.sha256(body))
+```
+
+---
+
+### `maki.crypto.sha256()` {#maki-crypto-sha256}
+
+```lua
+maki.crypto.sha256({data})
+```
+
+SHA-256 digest of {data}, as 32 raw bytes.
+
+**Parameters:**
+
+- `{data}` (`string|buffer`) Bytes to hash.
+
+**Returns:** (`string`) Raw 32-byte digest.
+
+**Example:**
+
+```lua
+local digest = maki.crypto.sha256("abc")
+```
+
+---
+
+### `maki.crypto.hmac_sha256()` {#maki-crypto-hmac_sha256}
+
+```lua
+maki.crypto.hmac_sha256({key}, {data})
+```
+
+HMAC-SHA256 of {data} keyed with {key}, as 32 raw bytes.
+
+**Parameters:**
+
+- `{key}` (`string|buffer`) Secret key, any length.
+- `{data}` (`string|buffer`) Message to authenticate.
+
+**Returns:** (`string`) Raw 32-byte MAC.
+
+**Example:**
+
+```lua
+local mac = maki.crypto.hmac_sha256("secret", "message")
+```
+
+
 ## maki.env {#maki-env}
 
-Paths to makima's own directories (config, state, logs), and whether
+Paths to makima's own directories (config, state, logs, cache), and whether
 the project's `.makima` directory is off limits.
 
 Use these to locate config files or persistent state without hard-coding paths.
@@ -2488,6 +2755,27 @@ Requires the `env` [plugin permission](#plugin-permissions).
 
 ```lua
 local dir = maki.env.logs_dir()
+```
+
+---
+
+### `maki.env.cache_dir()` {#maki-env-cache_dir}
+
+```lua
+maki.env.cache_dir()
+```
+
+Return the directory where makima keeps caches it can rebuild, such as
+downloaded catalogs. Typically something like `~/.cache/makima`.
+
+Requires the `env` [plugin permission](#plugin-permissions).
+
+**Returns:** (`string?`) Cache directory path, or nil if it cannot be determined.
+
+**Example:**
+
+```lua
+local dir = maki.env.cache_dir()
 ```
 
 ---
@@ -2631,15 +2919,15 @@ end
 maki.fn.executable({name})
 ```
 
-Check whether {name} can be found on `$PATH` or is an absolute path
-to a file. Returns 1 when found, 0 otherwise (matches Neovim's
-`vim.fn.executable`).
+Check whether {name} can be found on `$PATH` or is a path to a file,
+and on Unix whether that file may be executed. Returns 1 when found, 0
+otherwise (matches Neovim's `vim.fn.executable`).
 
 Requires the `env` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
-- `{name}` (`string`) Program name (e.g. `"git"`) or absolute path.
+- `{name}` (`string`) Program name (e.g. `"git"`) or path.
 
 **Returns:** (`integer`) `1` if found, `0` otherwise.
 
@@ -3222,6 +3510,66 @@ for _, file in ipairs(hits) do
     end
   end
 end
+```
+
+
+## maki.host {#maki-host}
+
+Actions on the host machine: opening a browser, reading the keyring.
+
+```lua
+maki.host.open("https://example.com")
+```
+
+---
+
+### `maki.host.open()` {#maki-host-open}
+
+```lua
+maki.host.open({url})
+```
+
+Open {url} in the user's default browser. Only `http` and `https` URLs
+are accepted.
+
+Requires the `run` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{url}` (`string`) URL to open.
+
+**Returns:** (`boolean?`, `string?`) true, or nil plus an error string.
+
+**Example:**
+
+```lua
+local ok, err = maki.host.open("https://example.com/login")
+```
+
+---
+
+### `maki.host.keyring_get()` {#maki-host-keyring_get}
+
+```lua
+maki.host.keyring_get({service}, {account})
+```
+
+Read a secret another program stored in the system keyring, such as the
+token the GitHub CLI keeps there.
+
+Requires the `env` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{service}` (`string`) Keyring service name, such as `gh:github.com`.
+- `{account}` (`string`) Account name within the service; may be empty.
+
+**Returns:** (`string?`, `string?`) The secret, nil when there is no such entry, or nil plus an error when the keyring cannot be read.
+
+**Example:**
+
+```lua
+local token, err = maki.host.keyring_get("gh:github.com", "octocat")
 ```
 
 
@@ -3950,11 +4298,14 @@ local levels = maki.model.thinking_levels()
 
 ## maki.net {#maki-net}
 
-HTTP client for fetching web content. All traffic goes over HTTPS
-(plain HTTP is upgraded). Private and metadata IP addresses are
-blocked to prevent SSRF, including after a redirect. Hosts listed in
-the `net.allowed_private_hosts` config option are exempt.
-Failed requests (5xx) are retried automatically.
+HTTP clients: a guarded `request` for web content and a raw, streaming
+`send` for trusted plugin code.
+
+With `request`, all traffic goes over HTTPS (plain HTTP is upgraded),
+private and metadata IP addresses are blocked to prevent SSRF,
+including after a redirect, and failed requests (5xx) are retried.
+Hosts listed in the `net.allowed_private_hosts` config option are
+exempt from the block. `send` has none of these guards.
 
 ```lua
 local res, err = maki.net.request("https://example.com")
@@ -4003,6 +4354,119 @@ if err then
 else
   print(res.status, res.body)
 end
+```
+
+---
+
+### `maki.net.send()` {#maki-net-send}
+
+```lua
+maki.net.send({request})
+```
+
+Send one HTTP request and return a streaming response. This is the raw
+primitive for trusted plugin code, such as LLM providers: there is no
+private address blocking, no https upgrade, no retry, no size cap, and
+redirects are not followed (a 3xx comes back as is). Never pass it a URL
+that came from the model without checking it first; use
+`maki.net.request` for that.
+
+The response arrives with the first body byte or when the transfer ends,
+not at the end of the headers. A server that sends headers and then stalls
+blocks `send` until its first byte or until `low_speed_timeout` fires.
+
+A connection that is refused or a host name that does not resolve fails
+with an error starting `could not connect`. A `read()` that times out
+fails with an error containing `idle timeout`. The providers plugin's
+`http.classify` reads these to name a provider error's retry class.
+
+{request} fields:
+  `url` (string) Required, `http://` or `https://`.
+  `method` (string) HTTP verb (default `"GET"`).
+  `headers` (table) Header name/value pairs. `User-Agent` defaults to `maki/<version>`.
+  `body` (string|buffer) Request body, binary safe.
+  `connect_timeout` (number) Seconds to connect (default 10).
+  `low_speed_timeout` (number) Seconds without any received byte before
+  the transfer fails (default 30).
+  `idle_timeout` (number) Seconds a single `read()` may wait (default 300).
+  `unix_socket` (string) Connect through this Unix domain socket instead of
+  TCP. `url` still supplies the path and the Host header. Unix only.
+
+Requires the `net` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{request}` (`table`) Request description (see above).
+
+**Returns:** ([`maki.net.Response?`](#maki-net-Response), `string?`) Response handle, or nil plus an error string.
+
+**Example:**
+
+```lua
+local res, err = maki.net.send({
+  url = "https://api.example.com/v1/stream",
+  method = "POST",
+  headers = { ["content-type"] = "application/json" },
+  body = maki.json.encode({ stream = true }),
+})
+if not res then return print(err) end
+local parts = {}
+while true do
+  local chunk, read_err = res:read()
+  if read_err then print(read_err) end
+  if not chunk then break end
+  table.insert(parts, chunk)
+end
+res:close()
+```
+
+
+## maki.net.Response {#maki-net-Response}
+
+A streaming HTTP response from `maki.net.send`.
+
+`status` is the integer status code. `headers` is a table keyed by
+lowercase header name, with repeated headers joined by `", "`. Read
+the body with `:read()`. Closing or dropping the handle, or the end of
+the task that sent the request, closes the connection once the next
+byte arrives from the server.
+
+---
+
+### `Response:read()` {#Response-read}
+
+```lua
+Response:read()
+```
+
+Read the next chunk of the body, up to 64 KiB. Returns nil at the end of
+the stream, or nil plus an error when the read fails, when no byte arrives
+within `idle_timeout`, or after `close()`.
+
+**Returns:** (`string?`, `string?`) Binary chunk, nil at the end, or nil plus an error string.
+
+**Example:**
+
+```lua
+local chunk, err = res:read()
+```
+
+---
+
+### `Response:close()` {#Response-close}
+
+```lua
+Response:close()
+```
+
+Drop the body and close the connection. Safe to call more than once.
+The socket itself closes when the next byte arrives from the server, or
+when `low_speed_timeout` fires.
+
+**Example:**
+
+```lua
+res:close()
 ```
 
 
@@ -4272,6 +4736,353 @@ the saved default alone.
 
 ```lua
 maki.session.set_default_thinking("medium")
+```
+
+
+## maki.credentials {#maki-credentials}
+
+Credential stores for plugins. A provider's own credentials are its
+ctx's `credentials`; state a plugin shares across its providers, such
+as one sign-in, goes in a plugin store.
+
+---
+
+### `maki.credentials.open()` {#maki-credentials-open}
+
+```lua
+maki.credentials.open({ctx}, {key})
+```
+
+Open plugin store {key} of {ctx}: a credentials file only that ctx and
+the ctxs it was narrowed from reach. A provider ctx opens its plugin
+ctx's stores.
+
+**Parameters:**
+
+- `{ctx}` ([`maki.Ctx`](#maki-Ctx)) The plugin's ctx, or a provider ctx.
+- `{key}` (`string`) ASCII letters, digits, `-`, `_` or `.`, not starting with `.`.
+
+**Returns:** ([`maki.credentials.Store`](#maki-credentials-Store)) The store.
+
+**Example:**
+
+```lua
+local account = maki.credentials.open(ctx, "account")
+local saved = account:read()
+```
+
+
+## maki.credentials.Store {#maki-credentials-Store}
+
+A credentials file: a provider's (its ctx's `credentials`) or a
+plugin's (`maki.credentials.open`). The value is whatever JSON table
+is stored, such as `{ api_key }` or `{ access, refresh, expires }`.
+
+---
+
+### `Store:read()` {#Store-read}
+
+```lua
+Store:read()
+```
+
+Read the stored credentials.
+
+**Returns:** (`table?`, `string?`) The stored table, nil when there is none or it does not parse, or nil plus an error.
+
+**Example:**
+
+```lua
+local saved = ctx.credentials:read()
+```
+
+---
+
+### `Store:write()` {#Store-write}
+
+```lua
+Store:write({value})
+```
+
+Replace the stored credentials with {value}. The write is atomic and the
+file is readable only by the user.
+
+**Parameters:**
+
+- `{value}` (`table`) Any JSON-compatible table.
+
+**Returns:** (`boolean?`, `string?`) true, or nil plus an error.
+
+**Example:**
+
+```lua
+local ok, err = ctx.credentials:write({ api_key = key })
+```
+
+---
+
+### `Store:delete()` {#Store-delete}
+
+```lua
+Store:delete()
+```
+
+Delete the stored credentials.
+
+**Returns:** (`boolean?`, `string?`) true if a file was removed, false if there was none, or nil plus an error.
+
+**Example:**
+
+```lua
+ctx.credentials:delete()
+```
+
+---
+
+### `Store:refresh()` {#Store-refresh}
+
+```lua
+Store:refresh({fn})
+```
+
+Refresh the stored credentials as one transaction. {fn}`(current)` runs
+with a cross-process lock held and `current` reread from disk after the
+lock was taken. It returns a new table to store, nil to keep `current`
+(another process already refreshed), or nil plus an error.
+
+Concurrent refreshes of one store share a single call of {fn}. The call
+runs on its own and is not cancelled with the caller, so a rotated token
+that the server already issued is always written. During plugin load,
+which nothing cancels, {fn} runs in the first caller instead.
+
+**Parameters:**
+
+- `{fn}` (`function`) `fn(current)` returning the table to store.
+
+**Returns:** (`table?`, `any?`) The stored table after the refresh, or nil plus the error {fn} returned, unchanged.
+
+**Example:**
+
+```lua
+local tokens, err = ctx.credentials:refresh(function(current)
+  if current and current.expires > maki.time.now().secs * 1000 + 60000 then return nil end
+  return exchange(current.refresh)
+end)
+```
+
+---
+
+### `Store:lock()` {#Store-lock}
+
+```lua
+Store:lock({fn})
+```
+
+Run {fn} with the store's cross-process lock held, the same
+lock `refresh` takes, for work that must not overlap another process
+changing these credentials. Unlike `refresh`, every call runs its own
+{fn}, nothing is reread or written, and dropping the caller ends {fn}.
+
+**Parameters:**
+
+- `{fn}` (`function`) Called with no arguments.
+
+**Returns:** any Whatever {fn} returns.
+
+**Example:**
+
+```lua
+local result, err = ctx.credentials:lock(function()
+  return run_login_script()
+end)
+```
+
+
+## maki.Ctx {#maki-Ctx}
+
+A plugin's authority. An entry chunk (a bundled plugin, or `init.lua`)
+receives its root ctx as `...`; pass it on by reference, such as to
+a module's `setup(ctx)`, and narrow it with `with_name`. APIs that
+act for the plugin take it, such as `maki.credentials.open` and
+`maki.api.register_provider`. Its fields cannot be assigned.
+
+`send` is `maki.net.send` with default timeouts: from
+`MAKIMA_NET_TIMEOUT_SECS` (default 30 seconds) on a plugin ctx, from
+`[provider]` on a provider ctx. A provider ctx, which a provider's
+callbacks receive, also has `id` (the provider id) and `credentials`
+(the provider's `maki.credentials.Store`).
+
+---
+
+### `Ctx:with_name()` {#Ctx-with_name}
+
+```lua
+Ctx:with_name({name})
+```
+
+A child ctx whose plugin stores live under {name}, inside this ctx's.
+It reaches neither this ctx's stores nor a sibling's. A provider ctx's
+child is a plain plugin ctx.
+
+**Parameters:**
+
+- `{name}` (`string`) ASCII letters, digits, `-`, `_` or `.`, not starting with `.`.
+
+**Returns:** ([`maki.Ctx`](#maki-Ctx)) The child ctx.
+
+**Example:**
+
+```lua
+local ctx = ...
+require("fountain.provider").setup(ctx:with_name("fountain"))
+```
+
+
+## maki.provider.LoginUi {#maki-provider-LoginUi}
+
+The `ui` a provider's `login(ctx, ui, config)` receives.
+
+The CLI or the TUI shows it. `input` and `choice` wait for the user. The notices `instructions`,
+`device_code` and `open_browser` return at once. `run` waits for a program on the terminal.
+
+---
+
+### `LoginUi:input()` {#LoginUi-input}
+
+```lua
+LoginUi:input({prompt}, {secret?}, {default?})
+```
+
+Ask the user for text.
+
+**Parameters:**
+
+- `{prompt}` (`string`) What to ask for.
+- `{secret?}` (`boolean?`) Hide the input, for keys and passwords.
+- `{default?}` (`string?`) Text offered for editing.
+
+**Returns:** (`string?`, `string?`) The entered text, or nil plus an error (`"cancelled"` when the user backed out).
+
+**Example:**
+
+```lua
+local key, err = ui:input("API key", true)
+```
+
+---
+
+### `LoginUi:choice()` {#LoginUi-choice}
+
+```lua
+LoginUi:choice({prompt}, {options})
+```
+
+Ask the user to choose one of {options}.
+
+**Parameters:**
+
+- `{prompt}` (`string`) What the choice is about.
+- `{options}` (`table`) List of `{ id, label, detail? }`.
+
+**Returns:** (`string?`, `string?`) The chosen id, or nil plus an error.
+
+**Example:**
+
+```lua
+local plan = ui:choice("Plan", { { id = "standard", label = "Standard" } })
+```
+
+---
+
+### `LoginUi:instructions()` {#LoginUi-instructions}
+
+```lua
+LoginUi:instructions({text})
+```
+
+Show {text} to the user. Returns at once.
+
+**Parameters:**
+
+- `{text}` (`string`) Instructions to show.
+
+**Returns:** (`boolean?`, `string?`) true, or nil plus an error.
+
+**Example:**
+
+```lua
+ui:instructions("Create a key in the dashboard first.")
+```
+
+---
+
+### `LoginUi:device_code()` {#LoginUi-device_code}
+
+```lua
+LoginUi:device_code({url}, {code})
+```
+
+Show a device login: the user opens {url} and enters {code}. Returns at
+once, so the provider can poll while the code is on screen.
+
+**Parameters:**
+
+- `{url}` (`string`) Verification URL.
+- `{code}` (`string`) Code the user enters.
+
+**Returns:** (`boolean?`, `string?`) true, or nil plus an error.
+
+**Example:**
+
+```lua
+ui:device_code("https://example.com/device", "ABCD-1234")
+```
+
+---
+
+### `LoginUi:open_browser()` {#LoginUi-open_browser}
+
+```lua
+LoginUi:open_browser({url})
+```
+
+Ask the frontend to open {url} in the user's browser. It also shows the
+URL, in case the browser does not open. Returns at once.
+
+**Parameters:**
+
+- `{url}` (`string`) An `http` or `https` URL.
+
+**Returns:** (`boolean?`, `string?`) true, or nil plus an error.
+
+**Example:**
+
+```lua
+ui:open_browser("https://example.com/keys")
+```
+
+---
+
+### `LoginUi:run()` {#LoginUi-run}
+
+```lua
+LoginUi:run({argv})
+```
+
+Run the program {argv} on the user's terminal, handing it input and
+output until it exits, for a login that is an interactive program. Only
+`makima auth login` has a terminal to hand over; the TUI fails this.
+
+**Parameters:**
+
+- `{argv}` (`table`) The program and its arguments.
+
+**Returns:** (`boolean?`, `string?`) true once the program exited successfully, or nil plus an error.
+
+**Example:**
+
+```lua
+local ok, err = ui:run({ "/home/me/.config/makima/providers/corp", "login" })
 ```
 
 
@@ -7132,6 +7943,24 @@ function M.eq(actual, expected, msg)
 function M.has(s, substr, msg)
 function M.mktmpdir(prefix)
 function M.rmtree(dir)
+
+-- A scripted `maki.net.send` response that yields {chunks} in order. A
+-- `read_error` is returned once the chunks run out instead of the end.
+function M.response(chunks, opts)
+
+-- A provider `ctx` whose `send` records each request and returns the next of
+-- {responses}, and whose credentials live in memory. `refresh` and `lock`
+-- run their function at once, without a lock.
+function M.provider_ctx(responses, saved)
+
+-- An `emit` for provider streams, plus the list it records into.
+function M.recorder()
+
+-- Runs {fn} with `maki.uv.os_getenv` reading from {env} instead.
+function M.with_env(env, fn)
+
+-- Compares JSON-like values structurally.
+function M.same(actual, expected, path)
 function M.report()
 ```
 

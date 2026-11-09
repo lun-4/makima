@@ -1,5 +1,5 @@
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{AnyUserData, Lua, LuaSerdeExt, Result as LuaResult, UserData, UserDataMethods, Value};
+use mlua::{AnyUserData, Lua, Result as LuaResult, UserData, UserDataMethods, Value};
 
 use super::util::convert::{json_to_lua, lua_to_json};
 use super::util::pair::{Pair, pair, try_pair};
@@ -73,9 +73,10 @@ impl UserData for LuaSchemaValidator {
 /// local s, err = maki.json.encode({ name = "maki", version = 1 })
 /// print(s) -- {"name":"maki","version":1}
 #[lua_fn]
-fn encode(lua: &Lua, value: Value) -> LuaResult<Pair<String>> {
-    let serde_val: serde_json::Value = try_pair!(lua.from_value(value));
-    Ok(pair(serde_json::to_string(&serde_val)))
+fn encode(_lua: &Lua, value: Value) -> LuaResult<Pair<String>> {
+    Ok(pair(serde_json::to_string(
+        &value.to_serializable().sort_keys(true),
+    )))
 }
 
 /// Parse a JSON string into a Lua value. Objects become tables and
@@ -153,6 +154,18 @@ mod tests {
     }
 
     #[test]
+    fn encode_sorts_keys_and_keeps_arrays_and_numbers() {
+        let lua = lua_with_json();
+        let result: String = lua
+            .load(
+                r#"return (json.encode({ b = 1, a = { 2, 3.5 }, c = {}, d = json.decode("[]") }))"#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(result, r#"{"a":[2,3.5],"b":1,"c":{},"d":[]}"#);
+    }
+
+    #[test]
     fn decode_string() {
         let lua = lua_with_json();
         let result: i64 = lua
@@ -199,6 +212,23 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!(result, "test:3");
+    }
+
+    // A file mtime in seconds; the default float parser misreads it by one
+    // ulp, so a cache keyed on it would never hit.
+    #[test]
+    fn float_roundtrips_exactly() {
+        let lua = lua_with_json();
+        let exact: bool = lua
+            .load(
+                r#"
+                local mtime = 1762000000.0246913
+                return json.decode(json.encode({ mtime = mtime })).mtime == mtime
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert!(exact);
     }
 
     #[test]

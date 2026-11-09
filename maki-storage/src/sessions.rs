@@ -17,6 +17,7 @@ use std::time::UNIX_EPOCH;
 use tempfile::NamedTempFile;
 use tracing::{info, warn};
 
+use crate::conversation::ConversationState;
 use crate::id::MakiId;
 use crate::offload_cleanup::Root;
 use crate::session_lock::SessionPublicationGuard;
@@ -148,6 +149,8 @@ pub fn add_cost(total: &mut Option<f64>, addend: Option<f64>) {
 pub struct SessionMeta {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub compacted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<ConversationState>,
     #[serde(default)]
     pub mode: Option<StoredMode>,
     #[serde(default)]
@@ -188,6 +191,7 @@ pub enum HistoryDestination {
 pub struct HistorySnapshot<M> {
     pub epoch: u64,
     pub compacted: bool,
+    pub conversation: Option<ConversationState>,
     pub messages: Arc<Vec<M>>,
 }
 
@@ -202,6 +206,7 @@ impl<M> HistorySnapshot<M> {
         Self {
             epoch: next_epoch(),
             compacted: false,
+            conversation: None,
             messages: Arc::new(messages),
         }
     }
@@ -236,6 +241,7 @@ pub struct Session<M, U, T> {
     tool_outputs: HashMap<String, Arc<T>>,
     subagent_messages: HashMap<String, Arc<Vec<M>>>,
     subagent_history_epochs: HashMap<String, u64>,
+    subagent_conversations: HashMap<String, Arc<str>>,
     subagents: Vec<StoredSubagent>,
     posts: Vec<StoredPost>,
     usage_by_model: HashMap<String, StoredTokenUsage>,
@@ -425,9 +431,11 @@ enum LogRecord<M, U, T> {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         subagents: Vec<StoredSubagent>,
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        subagent_conversations: HashMap<String, Arc<str>>,
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         usage_by_model: HashMap<String, StoredTokenUsage>,
         #[serde(flatten)]
-        meta: SessionMeta,
+        meta: Box<SessionMeta>,
     },
 }
 
@@ -853,8 +861,9 @@ where
             token_usage: &session.token_usage,
             updated_at: session.updated_at,
             subagents: session.subagents.clone(),
+            subagent_conversations: session.subagent_conversations.clone(),
             usage_by_model: session.usage_by_model.clone(),
-            meta: session.meta.clone(),
+            meta: Box::new(session.meta.clone()),
         },
     )?;
     Ok(buf)
@@ -938,6 +947,7 @@ where
     let mut token_usage = U::default();
     let mut updated_at = 0u64;
     let mut subagents = Vec::new();
+    let mut subagent_conversations = HashMap::new();
     let mut posts = Vec::new();
     let mut usage_by_model = HashMap::new();
     let mut meta = SessionMeta::default();
@@ -1001,6 +1011,7 @@ where
                 token_usage: m_usage,
                 updated_at: m_updated,
                 subagents: m_subagents,
+                subagent_conversations: m_subagent_conversations,
                 usage_by_model: m_usage_by_model,
                 meta: m_meta,
             } => {
@@ -1008,8 +1019,9 @@ where
                 token_usage = m_usage;
                 updated_at = m_updated;
                 subagents = m_subagents;
+                subagent_conversations = m_subagent_conversations;
                 usage_by_model = m_usage_by_model;
-                meta = m_meta;
+                meta = *m_meta;
             }
         }
     }
@@ -1032,6 +1044,7 @@ where
             .map(|(id, msgs)| (id, Arc::new(msgs)))
             .collect(),
         subagent_history_epochs: HashMap::new(),
+        subagent_conversations,
         subagents,
         posts,
         usage_by_model,
@@ -1326,6 +1339,7 @@ where
             tool_outputs: HashMap::new(),
             subagent_messages: HashMap::new(),
             subagent_history_epochs: HashMap::new(),
+            subagent_conversations: HashMap::new(),
             subagents: Vec::new(),
             posts: Vec::new(),
             usage_by_model: HashMap::new(),
@@ -1357,6 +1371,7 @@ where
         HistorySnapshot {
             epoch: self.epoch,
             compacted: self.meta.compacted,
+            conversation: self.meta.conversation.clone(),
             messages: Arc::clone(&self.messages),
         }
     }
@@ -1439,6 +1454,7 @@ where
         self.messages = Arc::clone(&snapshot.messages);
         self.epoch = snapshot.epoch;
         self.meta.compacted = snapshot.compacted;
+        self.meta.conversation = snapshot.conversation.clone();
         self.touch();
     }
 
@@ -1456,9 +1472,17 @@ where
         U: PartialEq + Clone,
         T: Clone,
     {
-        meta.compacted = history.map_or(this.meta.compacted, |snapshot| snapshot.compacted);
+        if let Some(snapshot) = history {
+            meta.compacted = snapshot.compacted;
+            meta.conversation = snapshot.conversation.clone();
+        } else {
+            meta.compacted = this.meta.compacted;
+            meta.conversation = this.meta.conversation.clone();
+        }
         let history = history.filter(|h| {
-            !Arc::ptr_eq(&this.messages, &h.messages) || h.compacted != this.meta.compacted
+            !Arc::ptr_eq(&this.messages, &h.messages)
+                || h.compacted != this.meta.compacted
+                || h.conversation != this.meta.conversation
         });
         if history.is_none() && this.meta == meta && this.token_usage == token_usage {
             return;
@@ -1494,6 +1518,11 @@ where
                     .copied()
                     .unwrap_or_default(),
                 compacted: false,
+                conversation: self
+                    .subagent_conversations
+                    .get(id)
+                    .cloned()
+                    .map(ConversationState::new),
                 messages: Arc::clone(messages),
             })
     }
@@ -1509,6 +1538,11 @@ where
         }
         self.subagent_history_epochs
             .insert(id.clone(), snapshot.epoch);
+        // Frontend replays of a child transcript carry no id; keep the last known one.
+        if let Some(conversation) = &snapshot.conversation {
+            self.subagent_conversations
+                .insert(id.clone(), Arc::clone(&conversation.id));
+        }
         if self
             .subagent_messages
             .insert(id, Arc::clone(&snapshot.messages))
@@ -1680,6 +1714,8 @@ where
         self.subagent_messages
             .retain(|id, _| reachable.contains(id));
         self.subagent_history_epochs
+            .retain(|id, _| reachable.contains(id));
+        self.subagent_conversations
             .retain(|id, _| reachable.contains(id));
         self.subagents
             .retain(|sa| reachable.contains(&sa.tool_use_id));
@@ -1862,6 +1898,7 @@ mod tests {
     use super::{Post, PostLevel, StoredPost};
     use super::{Prefs, read_prefs, write_prefs};
     use crate::StateDir;
+    use crate::conversation::{ConversationLink, ConversationRelation, ConversationState};
     use crate::id::MakiId;
     use crate::session_lock;
     use serde_json::Value;
@@ -2477,6 +2514,56 @@ mod tests {
     }
 
     #[test]
+    fn conversations_round_trip_and_a_rotation_alone_reaches_disk() {
+        const FIRST: &str = "conversation-1";
+        const ROTATED: &str = "conversation-2";
+        const CHILD: &str = "child-conversation";
+        const CHILD_KEY: &str = "sub-1";
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: Arc<TestSession> = Arc::new(Session::new("m", "/project"));
+        let mut snapshot = HistorySnapshot::new(vec![user_message("hi")]);
+        snapshot.conversation = Some(ConversationState::new(FIRST.into()));
+        let mut child = HistorySnapshot::new(vec![user_message("child")]);
+        child.conversation = Some(ConversationState::new(CHILD.into()));
+        let meta = session.meta.clone();
+        Session::checkpoint(&mut session, Some(&snapshot), meta.clone(), Value::Null);
+        let writable = Arc::make_mut(&mut session);
+        assert!(writable.adopt_subagent_history(CHILD_KEY.into(), &child));
+        child.conversation = None;
+        assert!(writable.adopt_subagent_history(CHILD_KEY.into(), &child));
+        let mut log = SessionLog::rewrite(dir, &session).unwrap();
+
+        snapshot.conversation = Some(ConversationState {
+            previous: Some(ConversationLink {
+                id: FIRST.into(),
+                relation: ConversationRelation::Continues,
+                shared: 1,
+            }),
+            sent: Some(1),
+            ..ConversationState::new(ROTATED.into())
+        });
+        let revision = session.revision();
+        Session::checkpoint(&mut session, Some(&snapshot), meta, Value::Null);
+        assert_ne!(session.revision(), revision);
+        write_through(&mut log, dir, &session);
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(
+            loaded.history_snapshot().conversation,
+            snapshot.conversation
+        );
+        assert_eq!(
+            loaded
+                .subagent_history_snapshot(CHILD_KEY)
+                .and_then(|child| child.conversation)
+                .map(|conversation| conversation.id)
+                .as_deref(),
+            Some(CHILD)
+        );
+    }
+
+    #[test]
     fn snapshot_adoption_does_not_erase_a_local_rewrite() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
@@ -2484,6 +2571,7 @@ mod tests {
         let run = HistorySnapshot {
             epoch: next_epoch(),
             compacted: false,
+            conversation: None,
             messages: Arc::new(vec![user_message("hi")]),
         };
         let meta = session.meta.clone();
@@ -2497,6 +2585,7 @@ mod tests {
         let advanced = HistorySnapshot {
             epoch: run.epoch,
             compacted: run.compacted,
+            conversation: None,
             messages: Arc::new(vec![user_message("hi"), assistant_message("reply")]),
         };
         Session::checkpoint(&mut session, Some(&advanced), meta, Value::Null);

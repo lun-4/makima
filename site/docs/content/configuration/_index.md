@@ -34,8 +34,8 @@ maki.setup({
         max_output_lines = 3000,
     },
     provider = {
-        default_model = "anthropic/claude-sonnet-4-6",
-        allowed_models = { "anthropic/*", "openai/gpt-5" },
+        default_model = "anthropic/claude-sonnet-5",
+        allowed_models = { "anthropic/*", "openai/gpt-5.6-terra" },
         excluded_models = { "*/*-preview" },
     },
 
@@ -51,7 +51,7 @@ maki.setup({
 
 All fields are optional. Typos in field names cause an error right away.
 
-`provider.allowed_models` is a list of glob patterns for qualified `provider/model-id` specs. `*` also matches `/`, so `opencode/*` includes nested model IDs. When the list is empty or omitted, every model is allowed. `provider.excluded_models` removes matching models after that, so exclusions always win. A project list replaces the matching global list; omit it to inherit or use `{}` to clear it. The policy applies to selectors, CLI and API model changes, delegation, and `makima models`.
+`provider.allowed_models` is a list of glob patterns for qualified `provider/model-id` specs. `*` also matches `/`, so `provider/*` includes nested model IDs. When the list is empty or omitted, every model is allowed. `provider.excluded_models` removes matching models after that, so exclusions always win. A project list replaces the matching global list; omit it to inherit or use `{}` to clear it. The policy applies to selectors, CLI and API model changes, delegation, and `makima models`.
 
 `maki.setup()` can only be called once per init.lua.
 
@@ -63,7 +63,7 @@ All fields are optional. Typos in field names cause an error right away.
 |-------|------|---------|-------------|
 | `always_yolo` | bool | `false` | Start every session with YOLO mode (skip permission prompts, deny rules still apply) |
 | `always_automode` | bool | `false` | Start every session with bash auto mode (classify every bash command) |
-| `always_fast` | bool | `false` | Start every session with fast mode (Anthropic Opus or eligible Codex subscription models, ignored elsewhere) |
+| `always_fast` | bool | `false` | Start every session with fast mode on models that offer it, ignored elsewhere |
 | `always_workflow` | bool | `false` | Start every session with workflow mode (task tools callable inside code_execution) |
 | `always_thinking` | bool \| string | `false` | Start every session with extended thinking (true/"adaptive", "off", an effort level ("minimal" to "max"), or a token budget). A default saved with `/thinking` wins over it |
 
@@ -163,7 +163,7 @@ Ring the terminal bell (`\x07`) on these events. All values are `bool`, defaulti
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `default_model` | String | `none` | - | Default model identifier (e.g. `anthropic/claude-sonnet-4-6`) |
+| `default_model` | String | `none` | - | Default model identifier, as `provider/model` |
 | `allowed_models` | string[] | `[]` | - | Glob patterns for permitted qualified model specs; empty permits all models |
 | `excluded_models` | string[] | `[]` | - | Glob patterns for excluded qualified model specs; exclusions take precedence |
 | `connect_timeout_secs` | u64 | `10` | 1 | HTTP connect timeout (seconds) |
@@ -188,7 +188,7 @@ Ring the terminal bell (`\x07`) on these events. All values are `bool`, defaulti
 |-------|------|---------|-------------|
 | `allowed_private_hosts` | string[] | `[]` | Hosts allowed to resolve to a private or loopback address, as `host`, `host:port`, or a CIDR range. Plain `http://` is kept for them instead of being upgraded to `https://` |
 
-`maki.net` refuses private, loopback and metadata addresses, because the model picks the URLs. List a host here to let it through:
+`maki.net.request` refuses private, loopback and metadata addresses, because the model picks the URLs. List a host here to let it through. Providers use `maki.net.send`, which has no such guard, so a local model server needs no entry:
 
 ```lua
 maki.setup({
@@ -344,7 +344,7 @@ Makima follows platform directory conventions. On Linux and macOS that is XDG. O
 | Logs | `~/.local/logs/makima/` | `%APPDATA%\makima\` |
 | Cache | `~/.cache/makima/` | `%LOCALAPPDATA%\makima\` |
 
-Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\makima` on Windows; that is separate from these runtime dirs.
+Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, `providers/` (executable providers), and `commands/`. State holds sessions, provider credentials (`auth/<provider>.json`, readable only by you), memories, plans, and model-tier overrides. Cache holds the provider catalog (`models-dev/`). The install script puts the binary under `%LOCALAPPDATA%\makima` on Windows; that is separate from these runtime dirs.
 
 ## Personal Instructions
 

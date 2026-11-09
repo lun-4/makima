@@ -5,11 +5,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tracing::debug;
 
 use crate::{StateDir, StorageError, atomic_write_permissions};
 
 const AUTH_DIR: &str = "auth";
+/// The dir under `auth/` that holds plugin stores, apart from provider files.
+pub const PLUGIN_STORES_DIR: &str = "plugins";
 const AUTH_FILE_MODE: u32 = 0o600;
 const REFRESH_BUFFER_SECS: u64 = 60;
 const LOCK_SUFFIX: &str = ".lock";
@@ -29,10 +32,6 @@ impl OAuthTokens {
     pub fn is_expired(&self) -> bool {
         now_millis() + REFRESH_BUFFER_SECS * 1000 >= self.expires
     }
-
-    pub fn is_hard_expired(&self) -> bool {
-        now_millis() >= self.expires
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -49,27 +48,6 @@ pub struct McpAuthData {
     /// cannot redirect the refresh token and client secret elsewhere.
     #[serde(default)]
     pub token_endpoint: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderCredentials {
-    pub api_key: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub host: Option<String>,
-}
-
-impl ProviderCredentials {
-    pub fn masked_api_key(&self) -> String {
-        if self.api_key.len() > 8 {
-            format!(
-                "{}...{}",
-                &self.api_key[..4],
-                &self.api_key[self.api_key.len() - 4..]
-            )
-        } else {
-            "****".to_string()
-        }
-    }
 }
 
 /// Refresh tokens rotate and a rotated one is single use, so two processes
@@ -103,8 +81,8 @@ pub fn lock_exclusive(path: &Path) -> Option<File> {
 
 /// Every write replaces the token file, so the lock sits beside it under a name
 /// no loader reads.
-pub fn lock_tokens(dir: &StateDir, provider: &str) -> Option<File> {
-    lock_exclusive(&auth_path(dir, &format!("{provider}{LOCK_SUFFIX}")))
+pub fn lock_tokens(dir: &StateDir, name: &str) -> Option<File> {
+    lock_exclusive(&auth_path(dir, &format!("{name}{LOCK_SUFFIX}")))
 }
 
 pub fn now_millis() -> u64 {
@@ -142,22 +120,6 @@ fn delete_auth(path: &Path) -> Result<bool, StorageError> {
     Ok(false)
 }
 
-pub fn load_tokens(dir: &StateDir, provider: &str) -> Option<OAuthTokens> {
-    load_auth(&auth_path(dir, provider))
-}
-
-pub fn save_tokens(
-    dir: &StateDir,
-    provider: &str,
-    tokens: &OAuthTokens,
-) -> Result<(), StorageError> {
-    save_auth(&auth_path(dir, provider), tokens)
-}
-
-pub fn delete_tokens(dir: &StateDir, provider: &str) -> Result<bool, StorageError> {
-    delete_auth(&auth_path(dir, provider))
-}
-
 pub fn load_mcp_auth(dir: &StateDir, server_name: &str, expected_url: &str) -> Option<McpAuthData> {
     let data: McpAuthData = load_auth(&auth_path(dir, &format!("mcp-{server_name}")))?;
     if data.server_url != expected_url {
@@ -183,31 +145,31 @@ pub fn delete_mcp_auth(dir: &StateDir, server_name: &str) -> Result<bool, Storag
     delete_auth(&auth_path(dir, &format!("mcp-{server_name}")))
 }
 
-pub fn load_provider_credentials(dir: &StateDir, slug: &str) -> Option<ProviderCredentials> {
-    load_auth(&auth_path(dir, slug))
+/// The credentials file {name} as stored, whatever its shape. {name} is a
+/// provider id or a plugin store path under [`PLUGIN_STORES_DIR`].
+pub fn load_credentials(dir: &StateDir, name: &str) -> Option<Value> {
+    load_auth(&auth_path(dir, name))
 }
 
-pub fn save_provider_credentials(
-    dir: &StateDir,
-    slug: &str,
-    creds: &ProviderCredentials,
-) -> Result<(), StorageError> {
-    save_auth(&auth_path(dir, slug), creds)
+pub fn save_credentials(dir: &StateDir, name: &str, value: &Value) -> Result<(), StorageError> {
+    save_auth(&auth_path(dir, name), value)
 }
 
-pub fn delete_provider_credentials(dir: &StateDir, slug: &str) -> Result<bool, StorageError> {
-    delete_auth(&auth_path(dir, slug))
+pub fn delete_credentials(dir: &StateDir, name: &str) -> Result<bool, StorageError> {
+    delete_auth(&auth_path(dir, name))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
     use test_case::test_case;
 
     const TEST_URL: &str = "https://mcp.example.com";
+    const TEST_PROVIDER: &str = "provider";
 
     fn test_mcp_data() -> McpAuthData {
         McpAuthData {
@@ -237,28 +199,20 @@ mod tests {
     fn save_load_delete_round_trip() {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
-        let tokens = OAuthTokens {
-            access: "access_tok".into(),
-            refresh: "refresh_tok".into(),
-            expires: 9999999999,
-            account_id: None,
-        };
-        save_tokens(&dir, "anthropic", &tokens).unwrap();
-
-        let loaded = load_tokens(&dir, "anthropic").unwrap();
-        assert_eq!(loaded.access, "access_tok");
-        assert_eq!(loaded.refresh, "refresh_tok");
-        assert_eq!(loaded.expires, 9999999999);
+        let saved =
+            json!({ "access": "access_tok", "refresh": "refresh_tok", "expires": 9999999999u64 });
+        save_credentials(&dir, TEST_PROVIDER, &saved).unwrap();
+        assert_eq!(load_credentials(&dir, TEST_PROVIDER), Some(saved));
 
         #[cfg(unix)]
         {
-            let metadata = fs::metadata(auth_path(&dir, "anthropic")).unwrap();
+            let metadata = fs::metadata(auth_path(&dir, TEST_PROVIDER)).unwrap();
             assert_eq!(metadata.permissions().mode() & 0o777, AUTH_FILE_MODE);
         }
 
-        assert!(delete_tokens(&dir, "anthropic").unwrap());
-        assert!(load_tokens(&dir, "anthropic").is_none());
-        assert!(!delete_tokens(&dir, "anthropic").unwrap());
+        assert!(delete_credentials(&dir, TEST_PROVIDER).unwrap());
+        assert!(load_credentials(&dir, TEST_PROVIDER).is_none());
+        assert!(!delete_credentials(&dir, TEST_PROVIDER).unwrap());
     }
 
     #[test]

@@ -3,9 +3,11 @@ pub(crate) mod r#async;
 pub(crate) mod autocmd;
 pub(crate) mod base64;
 pub(crate) mod completion;
+pub(crate) mod crypto;
 pub(crate) mod env;
 pub(crate) mod r#fn;
 pub(crate) mod fs;
+pub(crate) mod host;
 pub(crate) mod image;
 pub(crate) mod interpreter;
 pub(crate) mod json;
@@ -17,6 +19,7 @@ pub(crate) mod model;
 pub(crate) mod net;
 pub(crate) mod options;
 pub(crate) mod perf;
+pub(crate) mod provider;
 pub(crate) mod session;
 pub(crate) mod session_option;
 pub(crate) mod slot;
@@ -40,10 +43,13 @@ use mlua::{Lua, Result as LuaResult, Table, Value};
 
 use crate::api::keymap::PendingKeymapStore;
 use crate::api::options::PluginOpts;
+use crate::api::provider::PendingProviders;
 use crate::api::session_option::PendingSessionOptions;
 use crate::api::store::PendingStore;
 use crate::api::tool::{PendingRules, PendingTools};
 use crate::api::util::command::{PendingCommandMap, UiAction};
+use crate::credentials::create_credentials_table;
+use crate::ctx::PluginCtx;
 use crate::plugin_permissions::PluginPermissions;
 
 #[derive(Clone)]
@@ -62,16 +68,20 @@ pub(crate) struct PluginLoadContext {
     pub(crate) pending_slots: crate::api::slot::PendingSlotStore,
     pub(crate) pending_prompts: crate::runtime::PendingPromptHintCallbacks,
     pub(crate) pending_hint: crate::api::ui::PendingHintStore,
+    pub(crate) pending_providers: PendingProviders,
 }
 
+/// The plugin's `maki` table and its root ctx, whose stores live under
+/// {root_name}.
 pub(crate) fn create_maki_global(
     lua: &Lua,
     context: PluginLoadContext,
     plugin: Arc<str>,
+    root_name: Arc<str>,
     ui_action_tx: Option<flume::Sender<UiAction>>,
     permissions: &PluginPermissions,
     opts: PluginOpts,
-) -> LuaResult<Table> {
+) -> LuaResult<(Table, PluginCtx)> {
     let maki = lua.create_table()?;
     lua.set_app_data(context.pending_prompts.clone());
     lua.set_app_data(context.pending_hint.clone());
@@ -86,7 +96,7 @@ pub(crate) fn create_maki_global(
     lua.set_app_data(context.pending_slots.clone());
     slot::add_slot_methods(&api, lua, Arc::clone(&plugin))?;
     api.set("mode", mode::create_mode_table(lua)?)?;
-    maki.set("api", api)?;
+    maki.set("api", &api)?;
     maki.set("env", env::create_env_table(lua, permissions)?)?;
     maki.set("fs", fs::create_fs_table(lua, permissions)?)?;
     maki.set("log", log::create_log_table(lua, Arc::clone(&plugin))?)?;
@@ -96,7 +106,20 @@ pub(crate) fn create_maki_global(
     maki.set("image", image::create_image_table(lua)?)?;
     maki.set("json", json::create_json_table(lua)?)?;
     maki.set("yaml", yaml::create_yaml_table(lua)?)?;
-    maki.set("net", net::create_net_table(lua, permissions)?)?;
+    let net = net::create_net_table(lua, permissions)?;
+    let root = PluginCtx::root(lua, root_name, net.get("send")?)?;
+    provider::add_provider_fn(
+        &api,
+        lua,
+        context.pending_providers.clone(),
+        Arc::clone(&plugin),
+        root.clone(),
+        permissions,
+    )?;
+    maki.set("net", net)?;
+    maki.set("credentials", create_credentials_table(lua)?)?;
+    maki.set("crypto", crypto::create_crypto_table(lua)?)?;
+    maki.set("host", host::create_host_table(lua, permissions)?)?;
     maki.set("text", text::create_text_table(lua)?)?;
     maki.set("match", r#match::create_match_table(lua)?)?;
     maki.set(
@@ -163,5 +186,5 @@ pub(crate) fn create_maki_global(
     meta.set("__newindex", notify_router)?;
     maki.set_metatable(Some(meta))?;
 
-    Ok(maki)
+    Ok((maki, root))
 }

@@ -22,7 +22,7 @@ use maki_lua::{
 };
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
+    AgentError, ContentBlock, Invocation, Message, Model, ProviderEvent, RequestOptions, Role,
     StopReason, StreamResponse, TokenUsage,
 };
 use maki_storage::id::SessionRef;
@@ -435,7 +435,7 @@ fn spawn_and_wait_stub(reg: &ToolRegistry, input: Value) -> Result<Value, String
     spawn_and_wait(reg, &stub_ctx(&AgentMode::Build), input)
 }
 
-const FULL_MODEL_SPEC: &str = "aperture/ollama/glm-5.2";
+const FULL_MODEL_SPEC: &str = "gateway/ollama/glm-5.2";
 
 #[test]
 fn model_spec_forwards_full_spec_to_resolve_model() {
@@ -1206,6 +1206,7 @@ impl Provider for GatedProvider {
         _event_tx: &'a flume::Sender<ProviderEvent>,
         _opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let message = messages.last().expect("provider request has input").clone();
@@ -1213,10 +1214,6 @@ impl Provider for GatedProvider {
             common::bounded(self.release_rx.recv_async()).await.unwrap();
             Ok(common::canned_reply("done"))
         })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { unimplemented!() })
     }
 }
 
@@ -1237,6 +1234,7 @@ impl Provider for SteeringReportProvider {
         _event_tx: &'a flume::Sender<ProviderEvent>,
         _opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             match self.request.fetch_add(1, Ordering::SeqCst) {
@@ -1269,10 +1267,6 @@ impl Provider for SteeringReportProvider {
                 _ => Ok(common::canned_reply(PLAIN_TEXT)),
             }
         })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { unimplemented!() })
     }
 }
 
@@ -1990,12 +1984,9 @@ impl Provider for NestedTaskProvider {
         _event_tx: &'a flume::Sender<ProviderEvent>,
         _opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move { Ok(Self::reply(messages)) })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { unimplemented!() })
     }
 }
 

@@ -7,14 +7,14 @@ use maki_config::SessionDefaults;
 use maki_providers::model::Model;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    Effort, Message, ModelInfo, ProviderEvent, RequestOptions, StopReason, StreamResponse,
+    Effort, Invocation, Message, ProviderEvent, RequestOptions, StopReason, StreamResponse,
     TokenUsage,
 };
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::{Effort as StoredEffort, StoredThinking};
 use test_case::test_case;
 
-use super::tests::{select_child_chat, with_event_loop};
+use super::tests::{select_child_chat, with_event_loop, with_event_loop_providers};
 use super::{
     AppSession, CLOSED_TARGET_ERR, CommandEvent, EventLoop, PreparedProvider, SESSION_OP_TIMEOUT,
     SessionRequest, UiAction,
@@ -200,7 +200,7 @@ fn live_slash_controls_commit_on_the_admitted_actor(command: &str) {
         if command == "/fast" {
             let config = actor.effective_config().unwrap();
             let mut model = config.model.clone();
-            model.supports_fast_override = Some(maki_providers::model::FastSupport::Supported);
+            model.fast_support = Some(maki_providers::model::FastSupport::Supported);
             let ticket = actor.reserve_prepared_operation(None).unwrap();
             smol::block_on(
                 ticket.commit_when_ready(Some(ConfigChange::Patch(ConfigPatch {
@@ -526,12 +526,11 @@ fn rejected_session_prompt_preserves_shell_context(oversized: bool) {
     });
 }
 
-const GLM_4: &str = "ollama/glm-4";
-const GLM_5: &str = "ollama/glm-5";
-const OTHER_PROVIDER: &str = "zai/glm-5";
-const UNREACHABLE_OLLAMA_HOST: &str = "http://127.0.0.1:1";
+const GLM_4: &str = "tui-discovery/glm-4";
+const GLM_5: &str = "tui-discovery/glm-5";
+const OTHER_PROVIDER: &str = "google/glm-5";
 
-#[test_case(&[GLM_5, OTHER_PROVIDER], "ollama", Ok(GLM_5) ; "provider_section_switches")]
+#[test_case(&[GLM_5, OTHER_PROVIDER], "tui-discovery", Ok(GLM_5) ; "provider_section_switches")]
 #[test_case(&[GLM_5], "glm", Ok(GLM_5) ; "unique_fragment_switches")]
 #[test_case(&[GLM_4, GLM_5], "glm", Err("command failed: ambiguous model: glm") ; "ambiguous_fragment_fails")]
 #[test_case(&[GLM_5], "xyz", Err("command failed: no model matches: xyz") ; "unknown_fragment_fails")]
@@ -540,9 +539,8 @@ fn model_argument_resolves_against_the_catalog(
     argument: &str,
     expected: Result<&str, &str>,
 ) {
-    // SAFETY: nextest runs each test in its own process.
-    unsafe { std::env::set_var("OLLAMA_HOST", UNREACHABLE_OLLAMA_HOST) };
-    with_event_loop(|event_loop| {
+    let (_, providers) = super::tests::discovery_providers();
+    with_event_loop_providers(providers, |event_loop| {
         event_loop.ctx.catalog.specs().store(Some(Arc::new(
             catalog.iter().map(|spec| spec.to_string()).collect(),
         )));
@@ -584,6 +582,7 @@ impl Provider for RecordingProvider {
         _: &'a flume::Sender<ProviderEvent>,
         options: RequestOptions,
         _: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         let _ = self.0.send((system.to_owned(), options));
         Box::pin(async {
@@ -593,10 +592,6 @@ impl Provider for RecordingProvider {
                 stop_reason: Some(StopReason::EndTurn),
             })
         })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
     }
 }
 

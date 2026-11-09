@@ -42,7 +42,7 @@ use maki_config::{
 use maki_lua::orchestration::{AgentOrchestration, ModelCatalog, TrustedTarget};
 use maki_lua::session_snapshot::HeadlessObserver;
 use maki_providers::model::Model;
-use maki_providers::{Message, TokenUsage, add_cost, settle_session};
+use maki_providers::{Message, ProviderRegistry, TokenUsage, add_cost, settle_session};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::session_lock;
@@ -65,7 +65,7 @@ const EVENT_STREAM_ENDED: &str = "session event stream ended";
 const ROOT_CONFIG_UNAVAILABLE: &str = "session root configuration is unavailable";
 const GRAPH_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const AUTH_FAILED_MSG: &str =
-    "Authentication failed. Run `maki auth login`, then send the prompt again.";
+    "Authentication failed. Run `makima auth login`, then send the prompt again.";
 
 /// Ids come from here and are never reused, so a late answer for a closed
 /// session cannot match a request of the session that replaced it.
@@ -301,7 +301,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
 
     let mut server = Server {
         out_tx,
-        catalog: ModelCatalog::offline(&params.model_policy),
+        catalog: ModelCatalog::offline(Arc::clone(&params.providers), &params.model_policy),
         session: None,
         elicitation: false,
         supports_boolean: false,
@@ -574,7 +574,7 @@ async fn load_session(
     .await;
     let sid = SessionId::from(session_ref.to_string());
     let home = maki_storage::paths::home();
-    let recorded_model = match Model::from_spec(&restored.model) {
+    let recorded_model = match params.providers.model(&restored.model) {
         Ok(model) if params.model_policy.allows(&model.spec()) => model,
         _ => params.model.clone(),
     };
@@ -610,6 +610,7 @@ async fn load_session(
         &mut restored.by_model,
         &recorded_model,
         defaults.fast,
+        &params.providers,
     );
     let snapshot = install_session(
         srv,
@@ -697,6 +698,7 @@ fn spawn_session_with_history(
         append_system_prompt: params.append_system_prompt.clone(),
         defaults,
         model_policy: Arc::clone(&params.model_policy),
+        providers: Arc::clone(&params.providers),
         question_mode: if elicitation {
             QuestionMode::Elicitation
         } else {
@@ -711,7 +713,7 @@ fn spawn_session_with_history(
     let (binding, root_target) = maki_lua::orchestration::root_binding();
     let handle = headless::spawn_interactive_with_binding(
         interactive,
-        headless::default_preparation(),
+        headless::default_preparation(Arc::clone(&params.providers)),
         snapshot,
         Some(binding),
     );
@@ -984,7 +986,7 @@ async fn install_session_with_lock(
         &handle,
         &coordinator,
         &root_target,
-        headless::default_model_preparer(params.timeouts),
+        headless::default_model_preparer(Arc::clone(&params.providers)),
     )
     .await
     {
@@ -1028,7 +1030,8 @@ async fn install_session_with_lock(
         &coordinator,
         &trusted_root,
         &orchestration,
-        headless::default_model_preparer(params.timeouts),
+        headless::default_model_preparer(Arc::clone(&params.providers)),
+        Arc::clone(&params.providers),
     );
     orchestration.bind_commands(
         &trusted_root.target,
@@ -1084,6 +1087,7 @@ fn session_command_target(
     root: &TrustedTarget,
     orchestration: &Arc<AgentOrchestration>,
     prepare_model: ModelPreparer,
+    providers: Arc<ProviderRegistry>,
 ) -> TargetHandle {
     registry.bind_target_with_presentation(
         maki_agent::command::session_capabilities(),
@@ -1092,6 +1096,7 @@ fn session_command_target(
             maki_agent::command::SessionCommandHost::new(
                 handle.control_tx.clone(),
                 coordinator.clone(),
+                providers,
             )
             .with_reset_session_guidance(NEW_SESSION_GUIDANCE),
             root.clone(),
@@ -1735,6 +1740,7 @@ fn config_error(error: ConfigChangeError) -> AcpError {
                 option,
                 SessionOptionError::UnknownId(_)
                     | SessionOptionError::InvalidValue { .. }
+                    | SessionOptionError::UnresolvedModel(_)
                     | SessionOptionError::FastUnsupported
                     | SessionOptionError::PolicyRejected(_)
                     | SessionOptionError::CallbackFailed(_)
@@ -2439,7 +2445,9 @@ mod tests {
     use maki_agent::{AgentMode, TurnTicket};
     use maki_commands::TargetCapabilities;
     use maki_lua::orchestration::{OrchestrationServices, TurnCompletion};
-    use maki_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
+    use maki_providers::{
+        ContentBlock as MsgBlock, FastSupport, Invocation, ModelInfo, Role, TokenUsage,
+    };
     use maki_storage::StateDir;
     use maki_storage::checkpoint::{ClaimingWriter, accept_all};
     use maki_storage::sessions::StoredMode;
@@ -2458,12 +2466,31 @@ mod tests {
     const THINKING_MODEL_ID: &str = "acp-load-thinker";
     const PRIMARY_TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
     const LIFECYCLE_STRESS_ITERATIONS: usize = 64;
-    const SPAWN_TEST_SPEC: &str = "ollama/acp-end-turn-test";
-    const DISCOVERY_PROVIDER: &str = "ollama";
+    const SPAWN_TEST_SPEC: &str = "acp-test/acp-end-turn-test";
+    const DISCOVERY_PROVIDER: &str = "acp-test";
     const DISCOVERY_MODEL_ID: &str = "acp-discovery-refresh-test";
     const DISCOVERED_WINDOW: u32 = 524_000;
     const NEW_SESSION_REQUEST: i64 = 91;
     static MANAGED_PLUGIN_TEST: Mutex<()> = Mutex::new(());
+
+    /// The providers of the specs above: only [`FAST_SPEC`] supports fast mode.
+    fn spec_providers() -> Arc<ProviderRegistry> {
+        let model = |spec: &'static str, fast| {
+            let (provider, id) = Model::parse_spec(spec).unwrap();
+            let info = ModelInfo {
+                supports_thinking: Some(true),
+                supports_vision: Some(true),
+                supports_fast: Some(FastSupport::from(fast)),
+                ..ModelInfo::id_only(id.into())
+            };
+            (provider, vec![info])
+        };
+        Arc::new(maki_providers::test_util::offline_registry(vec![
+            model(FAST_SPEC, true),
+            model(OFFLINE_SPEC, false),
+            model(SPAWN_TEST_SPEC, false),
+        ]))
+    }
     const ACP_TURN_END: &str = "turn end ";
     const PARKED_THOUGHT: &str = "parked thought";
     const PARKED_REPLY: &str = "parked reply";
@@ -2502,6 +2529,7 @@ mod tests {
             events: &'a Sender<maki_providers::ProviderEvent>,
             options: maki_providers::RequestOptions,
             session: Option<&'a SessionRef>,
+            invocation: &'a Invocation,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, maki_agent::AgentError>,
@@ -2628,16 +2656,8 @@ mod tests {
                 events,
                 options,
                 session,
+                invocation,
             )
-        }
-
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, maki_agent::AgentError>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
         }
     }
 
@@ -2734,7 +2754,7 @@ mod tests {
         let (binding, root_target) = maki_lua::orchestration::root_binding();
         let handle = headless::spawn_interactive_with_binding(
             InteractiveParams {
-                model: Model::from_spec(FAST_SPEC).unwrap(),
+                model: spec_providers().model(FAST_SPEC).unwrap(),
                 config: maki_agent::AgentConfig {
                     max_concurrent_agent_turns: 1,
                     ..Default::default()
@@ -2755,6 +2775,7 @@ mod tests {
                 append_system_prompt: None,
                 defaults: Default::default(),
                 model_policy: Arc::default(),
+                providers: spec_providers(),
                 modes: Arc::new(maki_agent::ModeRegistry::builtin()),
                 question_mode: QuestionMode::Headless,
                 plugin_rules: Arc::default(),
@@ -2763,7 +2784,14 @@ mod tests {
                 state_dir: None,
                 answers: true,
             },
-            Box::new(move |model, _| Box::pin(async move { Ok((model, initial)) })),
+            Box::new(move |model| {
+                Box::pin(async move {
+                    Ok(maki_agent::actor::PreparedModel {
+                        model,
+                        provider: initial,
+                    })
+                })
+            }),
             None,
             Some(Box::new(move |manager, target, template| {
                 Box::pin(async move {
@@ -2784,8 +2812,9 @@ mod tests {
             &handle,
             &coordinator,
             &root_target,
-            Arc::new(move |model| {
+            Arc::new(move |spec| {
                 let provider = Arc::clone(&replacement);
+                let model = spec_providers().model(&spec).unwrap();
                 Box::pin(async move { Ok(maki_agent::actor::PreparedModel { provider, model }) })
             }),
         )
@@ -2841,7 +2870,8 @@ mod tests {
             &coordinator,
             &root,
             &services,
-            headless::default_model_preparer(Default::default()),
+            headless::default_model_preparer(Arc::default()),
+            Arc::default(),
         );
         session.coordinator = Some(coordinator.clone());
         session.option_projection = Some(Arc::new(OptionProjection {
@@ -2904,6 +2934,7 @@ mod tests {
             _: &'a Sender<maki_providers::ProviderEvent>,
             _: maki_providers::RequestOptions,
             _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, maki_agent::AgentError>,
@@ -2921,15 +2952,6 @@ mod tests {
                     stop_reason: Some(maki_providers::StopReason::EndTurn),
                 })
             })
-        }
-
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, maki_agent::AgentError>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
         }
     }
 
@@ -2950,6 +2972,7 @@ mod tests {
             events: &'a Sender<maki_providers::ProviderEvent>,
             _: maki_providers::RequestOptions,
             _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, maki_agent::AgentError>,
@@ -2985,15 +3008,6 @@ mod tests {
                     stop_reason: Some(maki_providers::StopReason::EndTurn),
                 })
             })
-        }
-
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, maki_agent::AgentError>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
         }
     }
 
@@ -3105,6 +3119,7 @@ mod tests {
             system_prompt_override: Some(String::new()),
             append_system_prompt: None,
             model_policy: Arc::default(),
+            providers: test_providers(Arc::default()),
             plugin_rules: Arc::default(),
             lua_event_handle: maki_lua::EventHandle::disconnected_for_test(),
             command_registry: test_registry(&[]),
@@ -3139,8 +3154,12 @@ mod tests {
                 maki_agent::command::session_capabilities(),
                 maki_agent::command::portable_capabilities(),
                 Arc::new(
-                    maki_agent::command::SessionCommandHost::new(control_tx, coordinator)
-                        .with_reset_session_guidance(NEW_SESSION_GUIDANCE),
+                    maki_agent::command::SessionCommandHost::new(
+                        control_tx,
+                        coordinator,
+                        spec_providers(),
+                    )
+                    .with_reset_session_guidance(NEW_SESSION_GUIDANCE),
                 ),
             )
         }
@@ -3265,7 +3284,7 @@ mod tests {
         let session_id = MakiId::generate();
         let mut handle = headless::spawn_interactive_with_binding(
             InteractiveParams {
-                model: Model::from_spec(OFFLINE_SPEC).unwrap(),
+                model: spec_providers().model(OFFLINE_SPEC).unwrap(),
                 config: Default::default(),
                 permissions_config: Default::default(),
                 timeouts: Default::default(),
@@ -3281,6 +3300,7 @@ mod tests {
                 append_system_prompt: None,
                 defaults: Default::default(),
                 model_policy: Arc::default(),
+                providers: spec_providers(),
                 question_mode: QuestionMode::Headless,
                 plugin_rules: Arc::default(),
                 project_config: ProjectConfig::for_project(Path::new("/project")),
@@ -3288,7 +3308,14 @@ mod tests {
                 state_dir: None,
                 answers: true,
             },
-            Box::new(move |model, _| Box::pin(async move { Ok((model, prepared)) })),
+            Box::new(move |model| {
+                Box::pin(async move {
+                    Ok(maki_agent::actor::PreparedModel {
+                        model,
+                        provider: prepared,
+                    })
+                })
+            }),
             None,
             None,
         );
@@ -3308,11 +3335,17 @@ mod tests {
         coordinator
             .bind_actor(
                 root.clone(),
-                Arc::new(move |model| {
+                Arc::new(move |spec| {
                     let provider = Arc::clone(&provider);
-                    Box::pin(
-                        async move { Ok(maki_agent::actor::PreparedModel { model, provider }) },
-                    )
+                    let model = spec_providers()
+                        .model(&spec)
+                        .map_err(maki_agent::config_change::unresolved_model);
+                    Box::pin(async move {
+                        Ok(maki_agent::actor::PreparedModel {
+                            model: model?,
+                            provider,
+                        })
+                    })
                 }),
                 Arc::new({
                     let model = handle.model.clone();
@@ -3334,6 +3367,7 @@ mod tests {
                 maki_agent::command::SessionCommandHost::new(
                     handle.control_tx.clone(),
                     coordinator.clone(),
+                    spec_providers(),
                 )
                 .with_reset_session_guidance(NEW_SESSION_GUIDANCE),
             ),
@@ -3390,7 +3424,7 @@ mod tests {
             let cwd = TempDir::new().unwrap();
             let state_path = cwd.path().join("not-a-directory");
             std::fs::write(&state_path, "file").unwrap();
-            let params = test_params(Model::from_spec(OFFLINE_SPEC).unwrap(), state_path);
+            let params = test_params(spec_providers().model(OFFLINE_SPEC).unwrap(), state_path);
             let (out_tx, _) = flume::unbounded();
             let mut srv = Server {
                 out_tx,
@@ -3453,7 +3487,7 @@ mod tests {
         smol::block_on(async {
             let cwd = TempDir::new().unwrap();
             let params = test_params(
-                Model::from_spec(OFFLINE_SPEC).unwrap(),
+                spec_providers().model(OFFLINE_SPEC).unwrap(),
                 cwd.path().to_path_buf(),
             );
             let (out_tx, _) = flume::unbounded();
@@ -3992,20 +4026,29 @@ mod tests {
     }
 
     const GHOST_MODE: &str = "ghost";
-    const UNREACHABLE_OLLAMA_HOST: &str = "http://127.0.0.1:1";
+
+    fn configure_test_provider() -> TempDir {
+        let root = TempDir::new().unwrap();
+        maki_storage::paths::init_at(root.path().to_path_buf()).unwrap();
+        root
+    }
+
+    fn test_providers(models: Arc<Mutex<Vec<ModelInfo>>>) -> Arc<ProviderRegistry> {
+        maki_lua::test_support::offline_registry(DISCOVERY_PROVIDER, models)
+    }
+
+    fn test_model(spec: &str) -> Model {
+        test_providers(Arc::default()).model(spec).unwrap()
+    }
 
     #[test]
     fn closing_a_session_releases_its_orchestration() {
-        // SAFETY: nextest runs each test in its own process.
-        unsafe { std::env::set_var("OLLAMA_HOST", UNREACHABLE_OLLAMA_HOST) };
+        let _providers = configure_test_provider();
         smol::block_on(async {
             let cwd = TempDir::new().unwrap();
             let host = maki_lua::PluginHost::new(Arc::new(maki_agent::tools::ToolRegistry::new()))
                 .unwrap();
-            let mut params = test_params(
-                Model::from_spec(SPAWN_TEST_SPEC).unwrap(),
-                cwd.path().to_path_buf(),
-            );
+            let mut params = test_params(test_model(SPAWN_TEST_SPEC), cwd.path().to_path_buf());
             params.lua_event_handle = host.event_handle();
             let (out_tx, _out_rx) = flume::unbounded();
             let mut srv = Server {
@@ -4042,6 +4085,7 @@ mod tests {
     /// session is closed, so the client keeps the session it had.
     #[test]
     fn broken_permissions_keep_the_live_session() {
+        let _providers = configure_test_provider();
         smol::block_on(async {
             let (mut srv, _, _, turns) = server_awaiting_answer();
             let live = srv.session.as_ref().unwrap().handle.session_id.to_string();
@@ -4049,10 +4093,7 @@ mod tests {
             let project = cwd.path().join(maki_config::PROJECT_DIR);
             std::fs::create_dir_all(&project).unwrap();
             std::fs::write(project.join("permissions.toml"), "[bash]\ndeyn = [\"x\"]\n").unwrap();
-            let params = test_params(
-                Model::from_spec(SPAWN_TEST_SPEC).unwrap(),
-                cwd.path().to_path_buf(),
-            );
+            let params = test_params(test_model(SPAWN_TEST_SPEC), cwd.path().to_path_buf());
             let error = new_session(
                 &mut srv,
                 &serde_json::json!({ "params": { "cwd": cwd.path(), "mcpServers": [] } }),
@@ -4072,14 +4113,10 @@ mod tests {
     #[test_case("plan", false ; "plan_lands_in_the_state_dir")]
     #[test_case(GHOST_MODE, true ; "unknown_mode_is_invalid_params")]
     fn set_mode_commits_through_the_shared_setter(mode: &str, invalid: bool) {
-        // SAFETY: nextest runs each test in its own process.
-        unsafe { std::env::set_var("OLLAMA_HOST", UNREACHABLE_OLLAMA_HOST) };
+        let _providers = configure_test_provider();
         smol::block_on(async {
             let cwd = TempDir::new().unwrap();
-            let params = test_params(
-                Model::from_spec(SPAWN_TEST_SPEC).unwrap(),
-                cwd.path().to_path_buf(),
-            );
+            let params = test_params(test_model(SPAWN_TEST_SPEC), cwd.path().to_path_buf());
             let (out_tx, _out_rx) = flume::unbounded();
             let mut srv = Server {
                 out_tx,
@@ -4130,6 +4167,7 @@ mod tests {
 
     #[test]
     fn acp_rejects_stale_session_ids_for_prompt_set_option_mode_and_cancel() {
+        let _providers = configure_test_provider();
         let (mut srv, answer_rx, _, turns) = server_awaiting_answer();
         let stale = MakiId::generate().to_string();
         let prompt_error = smol::block_on(handle_prompt(
@@ -4154,7 +4192,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(config_error.code, AcpError::resource_not_found(None).code);
 
-        let params = test_params(Model::from_spec(SPAWN_TEST_SPEC).unwrap(), PathBuf::new());
+        let params = test_params(test_model(SPAWN_TEST_SPEC), PathBuf::new());
         let mode_error = smol::block_on(handle_set_mode(
             &mut srv,
             &serde_json::json!({
@@ -4439,7 +4477,7 @@ mod tests {
             let (mut srv, _, out_rx, turns) = server_awaiting_answer();
             let old_session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
             let params = test_params(
-                Model::from_spec(OFFLINE_SPEC).unwrap(),
+                spec_providers().model(OFFLINE_SPEC).unwrap(),
                 PathBuf::from("/project"),
             );
             handle_prompt(
@@ -4490,7 +4528,7 @@ mod tests {
 
             let cwd = TempDir::new().unwrap();
             let params = test_params(
-                Model::from_spec(OFFLINE_SPEC).unwrap(),
+                spec_providers().model(OFFLINE_SPEC).unwrap(),
                 cwd.path().to_owned(),
             );
             handle_line(
@@ -5948,11 +5986,10 @@ mod tests {
     #[test]
     fn spawned_primary_turn_end_turn_releases_pending_operation() {
         smol::block_on(async {
-            let previous_host = std::env::var_os("OLLAMA_HOST");
-            unsafe { std::env::set_var("OLLAMA_HOST", "http://127.0.0.1:1") };
+            let _providers = configure_test_provider();
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
             let session_id = srv.session.as_ref().unwrap().handle.session_id.clone();
-            let model = Model::from_spec(SPAWN_TEST_SPEC).unwrap();
+            let model = test_model(SPAWN_TEST_SPEC);
             let (handle, _root_target) = spawn_session(
                 &AcpParams {
                     model: model.clone(),
@@ -5967,6 +6004,7 @@ mod tests {
                     system_prompt_override: Some(String::new()),
                     append_system_prompt: None,
                     model_policy: Arc::default(),
+                    providers: test_providers(Arc::default()),
                     plugin_rules: Arc::default(),
                     lua_event_handle: maki_lua::EventHandle::disconnected_for_test(),
                     command_registry: test_registry(&[]),
@@ -6011,7 +6049,7 @@ mod tests {
                     maki_agent::actor::ConfigPatch {
                         model: Some(maki_agent::actor::PreparedModel {
                             provider: Arc::new(EndTurnProvider),
-                            model: Model::from_spec(OFFLINE_SPEC).unwrap(),
+                            model: spec_providers().model(OFFLINE_SPEC).unwrap(),
                         }),
                         ..Default::default()
                     },
@@ -6094,10 +6132,6 @@ mod tests {
                 "terminal response must release the pending primary operation"
             );
             close_session(&mut srv).await;
-            match previous_host {
-                Some(host) => unsafe { std::env::set_var("OLLAMA_HOST", host) },
-                None => unsafe { std::env::remove_var("OLLAMA_HOST") },
-            }
         });
     }
 
@@ -6329,12 +6363,11 @@ mod tests {
     #[test]
     fn prompt_immediately_after_new_session_is_queued() {
         smol::block_on(async {
-            let previous_host = std::env::var_os("OLLAMA_HOST");
-            unsafe { std::env::set_var("OLLAMA_HOST", "http://127.0.0.1:1") };
+            let _providers = configure_test_provider();
             let temp = TempDir::new().unwrap();
             let cwd = temp.path().to_path_buf();
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
-            let model = Model::from_spec(SPAWN_TEST_SPEC).unwrap();
+            let model = test_model(SPAWN_TEST_SPEC);
             let params = test_params(model, cwd.clone());
             let request = serde_json::json!({
                 "params": { "cwd": cwd, "mcpServers": [] }
@@ -6407,25 +6440,26 @@ mod tests {
                 "queued prompt must not return a terminal response"
             );
             close_session(&mut srv).await;
-            match previous_host {
-                Some(host) => unsafe { std::env::set_var("OLLAMA_HOST", host) },
-                None => unsafe { std::env::remove_var("OLLAMA_HOST") },
-            }
         });
     }
 
     #[test]
     fn discovery_reaches_the_root_its_catalog_and_the_client() {
         smol::block_on(async {
-            let previous_host = std::env::var_os("OLLAMA_HOST");
-            unsafe { std::env::set_var("OLLAMA_HOST", "http://127.0.0.1:1") };
+            let _providers = configure_test_provider();
             let temp = TempDir::new().unwrap();
             let cwd = temp.path().to_path_buf();
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
-            let model =
-                Model::from_spec(&format!("{DISCOVERY_PROVIDER}/{DISCOVERY_MODEL_ID}")).unwrap();
+            let models = Arc::default();
+            let providers = test_providers(Arc::clone(&models));
+            let model = providers
+                .model(&format!("{DISCOVERY_PROVIDER}/{DISCOVERY_MODEL_ID}"))
+                .unwrap();
             assert_ne!(model.context_window, DISCOVERED_WINDOW);
-            let params = test_params(model, cwd.clone());
+            let mut params = test_params(model, cwd.clone());
+            params.providers = Arc::clone(&providers);
+            srv.catalog =
+                ModelCatalog::offline(Arc::clone(&providers), &maki_config::ModelPolicy::default());
             handle_request(
                 &mut srv,
                 "session/new",
@@ -6444,15 +6478,20 @@ mod tests {
             let read = session.coordinator.as_ref().unwrap().read();
             let actor = root.actor().unwrap();
             let commits = actor.subscribe_config_commits();
-            maki_providers::model_registry::set_known_models(
-                DISCOVERY_PROVIDER,
-                vec![maki_providers::ModelInfo {
-                    context_window: Some(DISCOVERED_WINDOW),
-                    ..maki_providers::ModelInfo::id_only(DISCOVERY_MODEL_ID.into())
-                }],
-            );
+            *models.lock().unwrap() = vec![ModelInfo {
+                context_window: Some(DISCOVERED_WINDOW),
+                ..ModelInfo::id_only(DISCOVERY_MODEL_ID.into())
+            }];
+            providers
+                .fetch_all(&maki_config::ModelPolicy::default(), false, |_| {})
+                .await;
 
-            srv.catalog.apply(vec![DISCOVERED_SPEC.to_owned()]).await;
+            srv.catalog
+                .apply(
+                    vec![DISCOVERED_SPEC.to_owned()],
+                    Some(DISCOVERY_PROVIDER.into()),
+                )
+                .await;
 
             let commit = commits.recv_async().await.unwrap();
             assert_eq!(commit.config.model.context_window, DISCOVERED_WINDOW);
@@ -6480,21 +6519,21 @@ mod tests {
                     .any(|option| option["value"] == DISCOVERED_SPEC)
             );
             let version = read.options().version;
-            srv.catalog.apply(vec![DISCOVERED_SPEC.to_owned()]).await;
+            srv.catalog
+                .apply(
+                    vec![DISCOVERED_SPEC.to_owned()],
+                    Some(DISCOVERY_PROVIDER.into()),
+                )
+                .await;
             assert_eq!(read.options().version, version);
             close_session(&mut srv).await;
-            match previous_host {
-                Some(host) => unsafe { std::env::set_var("OLLAMA_HOST", host) },
-                None => unsafe { std::env::remove_var("OLLAMA_HOST") },
-            }
         });
     }
 
     #[test]
     fn completed_then_cancelled_session_can_be_replaced_and_prompted() {
         smol::block_on(async {
-            let previous_host = std::env::var_os("OLLAMA_HOST");
-            unsafe { std::env::set_var("OLLAMA_HOST", "http://127.0.0.1:1") };
+            let _providers = configure_test_provider();
             let temp = TempDir::new().unwrap();
             let cwd = temp.path().to_path_buf();
             let (mut srv, _, out_rx, turns) = server_awaiting_answer();
@@ -6549,7 +6588,7 @@ mod tests {
                 &serde_json::json!({ "params": { "sessionId": old_id } }),
             );
 
-            let params = test_params(Model::from_spec(SPAWN_TEST_SPEC).unwrap(), cwd.clone());
+            let params = test_params(test_model(SPAWN_TEST_SPEC), cwd.clone());
             new_session(
                 &mut srv,
                 &serde_json::json!({
@@ -6613,7 +6652,7 @@ mod tests {
                     maki_agent::actor::ConfigPatch {
                         model: Some(maki_agent::actor::PreparedModel {
                             provider: Arc::new(EndTurnProvider),
-                            model: Model::from_spec(OFFLINE_SPEC).unwrap(),
+                            model: spec_providers().model(OFFLINE_SPEC).unwrap(),
                         }),
                         ..Default::default()
                     },
@@ -6671,10 +6710,6 @@ mod tests {
                 lifecycle_state(&srv)
             );
             close_session(&mut srv).await;
-            match previous_host {
-                Some(host) => unsafe { std::env::set_var("OLLAMA_HOST", host) },
-                None => unsafe { std::env::remove_var("OLLAMA_HOST") },
-            }
         });
     }
 
@@ -7115,20 +7150,15 @@ mod tests {
     /// with, even when `always_thinking` says otherwise.
     #[test]
     fn load_restores_saved_mode_and_thinking_over_config() {
-        // SAFETY: nextest runs each test in its own process.
-        unsafe { std::env::set_var("OLLAMA_HOST", UNREACHABLE_OLLAMA_HOST) };
         smol::block_on(async {
             let tmp = TempDir::new().unwrap();
             maki_storage::paths::init_at(tmp.path().to_path_buf()).unwrap();
             let plan = tmp.path().join(SAVED_PLAN_FILE);
             std::fs::write(&plan, "").unwrap();
-            maki_providers::model_registry::set_known_models(
-                DISCOVERY_PROVIDER,
-                vec![maki_providers::ModelInfo {
-                    supports_thinking: Some(true),
-                    ..maki_providers::ModelInfo::id_only(THINKING_MODEL_ID.into())
-                }],
-            );
+            let providers = test_providers(Arc::new(Mutex::new(vec![ModelInfo {
+                supports_thinking: Some(true),
+                ..ModelInfo::id_only(THINKING_MODEL_ID.into())
+            }])));
             let spec = format!("{DISCOVERY_PROVIDER}/{THINKING_MODEL_ID}");
             let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
                 Session::new(&spec, &tmp.path().to_string_lossy());
@@ -7138,9 +7168,10 @@ mod tests {
             session.meta.thinking = Some(StoredThinking::Off);
             let storage = StateDir::from_path(tmp.path().to_path_buf());
             session.save(&storage).unwrap();
-            let model = Model::from_spec(&spec).unwrap();
+            let model = providers.model(&spec).unwrap();
             assert!(model.supports_thinking());
             let mut params = test_params(model, tmp.path().to_path_buf());
+            params.providers = providers;
             params.defaults.thinking = Some(StoredThinking::Effort {
                 level: Effort::High,
             });
@@ -7183,7 +7214,7 @@ mod tests {
             session.save(&storage).unwrap();
             let coordinator = test_coordinator(session.id, OFFLINE_SPEC);
             let params = test_params(
-                Model::from_spec(OFFLINE_SPEC).unwrap(),
+                spec_providers().model(OFFLINE_SPEC).unwrap(),
                 tmp.path().to_path_buf(),
             );
             let (out_tx, out_rx) = flume::unbounded();

@@ -5,8 +5,8 @@ use maki_agent::actor::{AgentContextSnapshot, EffectiveAgentConfig};
 use maki_agent::{AgentMode, ModeRegistry, RunSettings, SessionDefaults};
 use maki_agent::{modes, session_defaults};
 use maki_config::{Effect, ModelPolicy};
-use maki_providers::provider::{Provider, adjust_model};
-use maki_providers::{Model, Timeouts, TokenUsage, settle_session};
+use maki_providers::provider::Provider;
+use maki_providers::{Model, ProviderRegistry, TokenUsage, settle_session};
 use maki_storage::StateDir;
 use maki_storage::sessions::{StoredEffect, StoredMode, StoredRule, read_prefs};
 
@@ -69,8 +69,9 @@ impl SessionState {
         mut session: AppSession,
         fallback_model: &Model,
         model_policy: &ModelPolicy,
+        providers: &ProviderRegistry,
     ) -> Self {
-        let model = resumed_model(&mut session, fallback_model, model_policy);
+        let model = resumed_model(&mut session, fallback_model, model_policy, providers);
 
         let mut warnings = Vec::new();
 
@@ -92,7 +93,13 @@ impl SessionState {
         let fast_pending = session.meta.fast && !model.supports_fast() && model.fast_pending();
         let token_usage = session.token_usage;
         let fast = session.meta.fast && model.supports_fast();
-        let cost = settle_session(&token_usage, session.usage_by_model_mut(), &model, fast);
+        let cost = settle_session(
+            &token_usage,
+            session.usage_by_model_mut(),
+            &model,
+            fast,
+            providers,
+        );
         let context_size = session.meta.context_size;
 
         Self {
@@ -186,30 +193,23 @@ fn resumed_model(
     session: &mut AppSession,
     fallback_model: &Model,
     model_policy: &ModelPolicy,
+    providers: &ProviderRegistry,
 ) -> Model {
     // A caller that resolved the session's own model hands in a value that
-    // has already been through the provider (and its `adjust_model`), so it
-    // is richer than anything a rebuild from the spec could produce. Only a
-    // saved model the caller did not resolve gets rebuilt and adjusted.
+    // has already been through its provider, so it is richer than anything a
+    // rebuild from the spec could produce. Only a saved model the caller did
+    // not resolve gets rebuilt.
     if model_policy.allows(&session.model) && fallback_model.spec() == session.model {
         fallback_model.clone()
     } else {
         match model_policy
             .allows(&session.model)
-            .then(|| Model::from_spec(&session.model))
+            .then(|| providers.model(&session.model))
             .transpose()
             .ok()
             .flatten()
         {
-            Some(mut model) => {
-                // Apply the provider's per-model adjustments (e.g. ZAI's
-                // glm-5.2 thinking support) so a resumed session matches one
-                // started fresh.
-                if let Err(e) = adjust_model(&mut model, Timeouts::default()) {
-                    tracing::warn!(model = %model.id, error = %e, "failed to adjust resumed model");
-                }
-                model
-            }
+            Some(model) => model,
             None => {
                 session.model = fallback_model.spec();
                 fallback_model.clone()
@@ -308,7 +308,12 @@ mod tests {
     const UNRESOLVABLE_MODEL: &str = "a-model-no-table-has-ever-heard-of";
 
     fn resumed(session: AppSession, model: &Model) -> SessionState {
-        SessionState::from_session(session, model, &ModelPolicy::default())
+        SessionState::from_session(
+            session,
+            model,
+            &ModelPolicy::default(),
+            &ProviderRegistry::default(),
+        )
     }
 
     /// An old session: counters, no per-model breakdown.
@@ -348,6 +353,7 @@ mod tests {
         let mut session = session_with_counters();
         session.meta.fast = fast;
         let model = Model {
+            fast_support: Some(FastSupport::Supported),
             pricing: ModelPricing {
                 fast: Some(FastPricing {
                     input: FAST_INPUT_RATE,
@@ -368,14 +374,19 @@ mod tests {
         let mut session = session_with_counters();
         session.meta.fast = true;
         let mut model = test_model();
-        model.supports_fast_override = Some(support);
+        model.fast_support = Some(support);
         model.pricing.fast = Some(FastPricing {
             input: FAST_INPUT_RATE,
             output: test_pricing().output,
         });
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
-        let state = SessionState::from_session(session, &model, &ModelPolicy::default());
+        let state = SessionState::from_session(
+            session,
+            &model,
+            &ModelPolicy::default(),
+            &ProviderRegistry::default(),
+        );
         assert_eq!(state.fast_pending, pending);
         assert_eq!(
             state.cost,
@@ -404,13 +415,13 @@ mod tests {
         let mut session = session_with_counters();
         session.meta.fast = true;
         let mut model = test_model();
-        model.supports_fast_override = Some(FastSupport::Pending);
+        model.fast_support = Some(FastSupport::Pending);
         let mut state = resumed(session, &model);
         assert!(state.fast_pending);
         if switch {
             model.id = UNRESOLVABLE_MODEL.into();
         }
-        model.supports_fast_override = Some(support);
+        model.fast_support = Some(support);
         state.update_model(&model);
         assert_eq!(state.fast_pending, ready || support == FastSupport::Pending);
         assert_eq!(state.resolve_pending_fast(false, &model), ready);
@@ -424,7 +435,12 @@ mod tests {
     /// then let the app adopt it.
     fn restore(session: AppSession, storage: &StateDir) -> (SessionState, EffectiveAgentConfig) {
         let model = test_model();
-        let mut state = SessionState::from_session(session, &model, &ModelPolicy::default());
+        let mut state = SessionState::from_session(
+            session,
+            &model,
+            &ModelPolicy::default(),
+            &ProviderRegistry::default(),
+        );
         let config = state.starting_config(
             maki_agent::tools::cli_tool_ctx(std::env::temp_dir()).provider,
             &model,
@@ -499,7 +515,12 @@ mod tests {
         .unwrap();
         let policy = raw.into_config().unwrap().provider.model_policy;
 
-        let model = resumed_model(&mut session, &fallback, &policy);
+        let model = resumed_model(
+            &mut session,
+            &fallback,
+            &policy,
+            &ProviderRegistry::default(),
+        );
 
         assert_eq!(model.spec(), fallback.spec());
         assert_eq!(session.model, fallback.spec());
@@ -512,17 +533,5 @@ mod tests {
         let (state, _) = restore(make_plan_session(Some(StoredMode::Build), None), &storage);
         assert!(state.plan.path().is_none());
         assert!(state.warnings.is_empty());
-    }
-
-    #[test]
-    fn from_session_applies_provider_adjust_model() {
-        // SAFETY: this test runs single-threaded; no other thread reads the env.
-        unsafe { std::env::set_var("APERTURE_HOST", "https://example.com") };
-        let mut session = AppSession::new("aperture/zai/glm-5.2", "/tmp");
-        let model = resumed_model(&mut session, &test_model(), &ModelPolicy::default());
-        assert!(
-            model.supports_thinking(),
-            "resumed aperture/zai/glm-5.2 should inherit thinking support from adjust_model",
-        );
     }
 }
