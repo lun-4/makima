@@ -5,6 +5,16 @@ ListPicker.__index = ListPicker
 
 local DETAIL_RIGHT_PAD = 2
 local NO_MATCHES_LABEL = "  (no matches)"
+local TITLE_MIN_WIDTH = 4
+local COLUMN_SEPARATOR_WIDTH = 1
+local AGE_ELLIPSIS_MIN_WIDTH = 6
+local NANOS_PER_MS = 1000000
+local NANOS_PER_SEC = 1000000000
+local TICK_MS = 1000
+
+local function dispw(s)
+  return maki.ui.display_width(s)
+end
 
 local function split_words(query)
   local words = {}
@@ -123,8 +133,50 @@ local function filter_items(items, query)
   return filtered, indices
 end
 
-local function render_lines(items, selected, width, query)
+local function elide_left(text, max_width)
+  if max_width <= 0 then
+    return ""
+  end
+  if dispw(text) <= max_width then
+    return text
+  end
+  local chars = {}
+  for _, cp in utf8.codes(text) do
+    chars[#chars + 1] = utf8.char(cp)
+  end
+  local keep = max_width
+  local ellipsis = ""
+  if max_width >= AGE_ELLIPSIS_MIN_WIDTH then
+    keep = max_width - 1
+    ellipsis = "…"
+  end
+  return ellipsis .. table.concat(chars, "", math.max(#chars - keep + 1, 1))
+end
+
+local function truncate_label(label, max_width)
+  if max_width <= 0 then
+    return ""
+  end
+  if dispw(label) <= max_width then
+    return label
+  end
+  local chars = {}
+  local width = 0
+  for _, cp in utf8.codes(label) do
+    local ch = utf8.char(cp)
+    local cw = dispw(ch)
+    if width + cw > max_width - 1 then
+      break
+    end
+    width = width + cw
+    chars[#chars + 1] = ch
+  end
+  return table.concat(chars) .. "…"
+end
+
+local function render_lines(items, selected, width, query, reference)
   width = width or 80
+  reference = reference or maki.time.now()
   local words = split_words(query)
   local lines = {}
   local item_lines = {}
@@ -153,29 +205,58 @@ local function render_lines(items, selected, width, query)
 
     item_lines[i] = #lines + 1
 
-    local spans = highlight_spans(label, words, style, match_style)
-    if spans[1][2] == style then
-      spans[1][1] = "  " .. spans[1][1]
-    else
-      table.insert(spans, 1, { "  ", style })
-    end
-
-    if detail then
-      local pad = width - 2 - #label - #detail - DETAIL_RIGHT_PAD
-      if pad < 1 then
-        pad = 1
+    local age = type(item) == "table" and item.age and maki.time.ago(item.age, reference) or nil
+    if age then
+      local title_min = math.min(TITLE_MIN_WIDTH, math.max(width - 2 - DETAIL_RIGHT_PAD, 0))
+      local right_room = math.max(width - 2 - title_min - DETAIL_RIGHT_PAD - COLUMN_SEPARATOR_WIDTH, 0)
+      local right = detail and (detail .. " " .. age) or age
+      if dispw(right) > right_room then
+        right = age
       end
+      if dispw(right) > right_room then
+        right = elide_left(right, right_room)
+      end
+      local separator = right ~= "" and COLUMN_SEPARATOR_WIDTH or 0
+      local label_budget = math.max(width - 2 - dispw(right) - DETAIL_RIGHT_PAD - separator, 0)
+      label = truncate_label(label, label_budget)
+      local spans = highlight_spans(label, words, style, match_style)
+      if spans[1][2] == style then
+        spans[1][1] = "  " .. spans[1][1]
+      else
+        table.insert(spans, 1, { "  ", style })
+      end
+      local pad = math.max(width - 2 - dispw(label) - dispw(right) - DETAIL_RIGHT_PAD, 0)
       spans[#spans + 1] = { string.rep(" ", pad), style }
-      spans[#spans + 1] = { detail, detail_style }
-      spans[#spans + 1] = { string.rep(" ", DETAIL_RIGHT_PAD), style }
-    else
-      local trail = width - 2 - #label
-      if trail > 0 then
-        spans[#spans + 1] = { string.rep(" ", trail), style }
+      if right ~= "" then
+        spans[#spans + 1] = { right, detail_style }
       end
-    end
+      spans[#spans + 1] = { string.rep(" ", DETAIL_RIGHT_PAD), style }
+      lines[#lines + 1] = spans
+    else
+      local spans = highlight_spans(label, words, style, match_style)
+      if spans[1][2] == style then
+        spans[1][1] = "  " .. spans[1][1]
+      else
+        table.insert(spans, 1, { "  ", style })
+      end
 
-    lines[#lines + 1] = spans
+      if detail then
+        local pad = width - 2 - #label - #detail - DETAIL_RIGHT_PAD
+        if pad < 1 then
+          pad = 1
+        end
+        spans[#spans + 1] = { string.rep(" ", pad), style }
+        spans[#spans + 1] = { detail, detail_style }
+        spans[#spans + 1] = { string.rep(" ", DETAIL_RIGHT_PAD), style }
+      else
+        local trail = width - 2 - #label
+        if trail > 0 then
+          spans[#spans + 1] = { string.rep(" ", trail), style }
+        end
+      end
+
+      lines[#lines + 1] = spans
+    end
   end
   return lines, item_lines
 end
@@ -195,7 +276,10 @@ function ListPicker.render_header(win, lines, input, prefix, inner)
 end
 
 -- Open a fuzzy-filter picker in a floating window and block until the user
--- decides. {items} is a list of strings or { label, detail? } tables. {opts}:
+-- decides. {items} is a list of strings or { label, detail?, age? } tables,
+-- where `age` is a timestamp from `maki.time.now` or `maki.time.at` and
+-- refreshes once per displayed second while the dialog is open.
+-- {opts}:
 -- title, footer, cursor (initial index), submit_keys (extra submit keys
 -- besides enter), action_keys (keys that close the picker and report
 -- themselves, like { "R" } for a refresh binding. Use uppercase keys, since
@@ -219,6 +303,21 @@ function ListPicker.open(items, opts)
   local width
   local input = TextInput.new()
   local filtered, original_indices = filter_items(items, "")
+  local age_secs, age_visible
+
+  local function record_age_bucket(reference)
+    age_secs = reference.secs
+  end
+
+  local function age_bucket_changed()
+    return age_secs ~= maki.time.now().secs
+  end
+
+  local function age_timeout_ms()
+    local now = maki.time.now()
+    local remaining = NANOS_PER_SEC - now.nanosecs
+    return math.max(1, math.min(math.ceil(remaining / NANOS_PER_MS), TICK_MS))
+  end
 
   local cursor = math.max(math.min(opts.cursor or 1, #filtered), 1)
   local item_lines = {}
@@ -226,12 +325,21 @@ function ListPicker.open(items, opts)
   local win
 
   local function build_lines()
+    local reference = maki.time.now()
+    record_age_bucket(reference)
+    age_visible = false
+    for _, item in ipairs(filtered) do
+      if type(item) == "table" and item.age then
+        age_visible = true
+        break
+      end
+    end
     local content
     if #filtered == 0 then
       content = { { { NO_MATCHES_LABEL, "dim" } } }
       item_lines = {}
     else
-      content, item_lines = render_lines(filtered, cursor, width, input:value())
+      content, item_lines = render_lines(filtered, cursor, width, input:value(), reference)
     end
     input_start = #content
     input_render = input:render("\xe2\x9d\xaf ", nil, width)
@@ -280,12 +388,21 @@ function ListPicker.open(items, opts)
   end
 
   while true do
-    local ev = win:recv()
+    local ev
+    if age_visible then
+      ev = win:recv(age_timeout_ms())
+    else
+      ev = win:recv()
+    end
     if not ev or ev.type == "close" then
       return { type = "close" }
     end
 
-    if ev.type == "resize" then
+    if ev.type == "timeout" then
+      if age_visible and age_bucket_changed() then
+        buf:set_lines(build_lines())
+      end
+    elseif ev.type == "resize" then
       width = ev.width
       height = ev.height
       move_cursor(cursor)
@@ -354,6 +471,9 @@ function ListPicker.open(items, opts)
           move_cursor(cursor)
         end
       end
+    end
+    if age_visible and age_bucket_changed() then
+      buf:set_lines(build_lines())
     end
   end
 end

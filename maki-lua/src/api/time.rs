@@ -7,13 +7,20 @@
 //! on `ago` (and `at` to wrap stored whole-second values) instead of hand
 //! rolling epoch arithmetic.
 
+use std::fmt::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{Lua, Result as LuaResult, Table};
+use mlua::{Lua, Result as LuaResult, Table, Value};
 
 const NANOS_PER_SEC: u128 = 1_000_000_000;
-const FIELD_RANGE_ERR: &str = "timestamp secs must be an integer; nanosecs an integer 0..1e9";
+const MILLIS_PER_SEC: u128 = 1_000;
+const SECS_PER_MIN: u64 = 60;
+const SECS_PER_HOUR: u64 = 60 * SECS_PER_MIN;
+const SECS_PER_DAY: u64 = 24 * SECS_PER_HOUR;
+const U64_RANGE_END: f64 = 18_446_744_073_709_551_616.0;
+const TIMESTAMP_FIELD_ERR: &str =
+    "timestamp requires non-negative integer secs and nanosecs 0..1e9";
 
 #[derive(Clone, Copy)]
 struct Timestamp {
@@ -42,19 +49,30 @@ fn ts_to_table(lua: &Lua, ts: Timestamp) -> LuaResult<Table> {
     Ok(t)
 }
 
-fn ts_from_table(t: &Table) -> LuaResult<Timestamp> {
-    let secs = t.get::<u64>("secs")?;
-    let nanosecs = t.get::<u32>("nanosecs")?;
-    if nanosecs >= NANOS_PER_SEC as u32 {
-        return Err(mlua::Error::runtime(FIELD_RANGE_ERR));
+fn timestamp_field(t: &Table, field: &str) -> LuaResult<u64> {
+    match t.get::<Value>(field)? {
+        Value::Integer(value) if value >= 0 => Ok(value as u64),
+        Value::Number(value)
+            if value.is_finite()
+                && (0.0..U64_RANGE_END).contains(&value)
+                && value.fract() == 0.0 =>
+        {
+            Ok(value as u64)
+        }
+        _ => Err(mlua::Error::runtime(TIMESTAMP_FIELD_ERR)),
     }
-    Ok(Timestamp { secs, nanosecs })
 }
 
-fn elapsed_ns(from: Timestamp, to: Timestamp) -> u128 {
-    let from = from.secs as u128 * NANOS_PER_SEC + from.nanosecs as u128;
-    let to = to.secs as u128 * NANOS_PER_SEC + to.nanosecs as u128;
-    to.saturating_sub(from)
+/// Decode the opaque Lua timestamp table into a Unix-epoch [`Duration`].
+pub(crate) fn duration_from_table(t: &Table) -> LuaResult<Duration> {
+    let secs = timestamp_field(t, "secs")?;
+    let nanosecs = timestamp_field(t, "nanosecs")?;
+    if nanosecs >= NANOS_PER_SEC as u64 {
+        return Err(mlua::Error::runtime(TIMESTAMP_FIELD_ERR));
+    }
+    Duration::from_secs(secs)
+        .checked_add(Duration::from_nanos(nanosecs))
+        .ok_or_else(|| mlua::Error::runtime(TIMESTAMP_FIELD_ERR))
 }
 
 /// Return the current wall-clock time as a timestamp table.
@@ -92,46 +110,53 @@ fn at(lua: &Lua, secs: u64) -> LuaResult<Table> {
     ts_to_table(lua, Timestamp { secs, nanosecs: 0 })
 }
 
-/// Format {instant} as a relative age like `3h ago`, or `just now` for less
-/// than a minute. {instant} is a timestamp from `maki.time.now` (or
-/// `maki.time.at`). If {reference} is given, age is measured from it instead
-/// of the current time.
-///
-/// A timestamp in the future renders as `just now`.
+/// Format {instant} as a live delta like `9s` or `4d 7h 23m 9s`.
+/// {instant} is a timestamp from `maki.time.now` (or `maki.time.at`). If
+/// {reference} is given, age is measured from it instead of the current time.
+/// Fractions truncate to whole seconds, and higher zero units are omitted.
+/// A timestamp in the future renders as `0s`.
 ///
 /// @param instant table Timestamp from `maki.time.now`/`maki.time.at`.
 /// @param reference table? Timestamp to measure from; defaults to `maki.time.now`.
-/// @return (string) Relative age, e.g. `42min ago`.
+/// @return (string) Elapsed delta, e.g. `2m 9s`.
 /// @example
 /// local t0 = maki.time.now()
 /// -- ...work...
 /// print(maki.time.ago(t0))
 #[lua_fn]
 fn ago(_lua: &Lua, instant: Table, reference: Option<Table>) -> LuaResult<String> {
-    let from = ts_from_table(&instant)?;
+    let from = duration_from_table(&instant)?;
     let to = match reference {
-        Some(t) => ts_from_table(&t)?,
-        None => now_timestamp(),
+        Some(t) => duration_from_table(&t)?,
+        None => system_now(),
     };
-    Ok(format_ago((elapsed_ns(from, to) / NANOS_PER_SEC) as u64))
+    Ok(format_ago(to.saturating_sub(from)))
 }
 
-/// Shared relative-age formatter. Consumed by `maki.time.ago` for plugins and
-/// by makima's own pickers (they feed it `Instant::elapsed().as_secs()`, the
-/// same whole-second duration).
-pub fn format_ago(secs: u64) -> String {
-    if secs < 60 {
-        return "just now".into();
+fn push_unit(out: &mut String, value: u64, unit: char) {
+    if value == 0 {
+        return;
     }
-    let mins = secs / 60;
-    if mins < 60 {
-        return format!("{mins}min ago");
+    if !out.is_empty() {
+        out.push(' ');
     }
-    let hrs = mins / 60;
-    if hrs < 24 {
-        return format!("{hrs}h ago");
+    let _ = write!(out, "{value}{unit}");
+}
+
+/// Shared elapsed-time formatter. Consumed by `maki.time.ago` for plugins and
+/// by makima's own pickers. Fractions truncate to whole seconds, and higher
+/// zero units stay omitted.
+pub fn format_ago(elapsed: Duration) -> String {
+    let secs = (elapsed.as_millis() / MILLIS_PER_SEC) as u64;
+    let mut out = String::with_capacity(24);
+    push_unit(&mut out, secs / SECS_PER_DAY, 'd');
+    push_unit(&mut out, secs % SECS_PER_DAY / SECS_PER_HOUR, 'h');
+    push_unit(&mut out, secs % SECS_PER_HOUR / SECS_PER_MIN, 'm');
+    if !out.is_empty() {
+        out.push(' ');
     }
-    format!("{}d ago", hrs / 24)
+    let _ = write!(out, "{}s", secs % SECS_PER_MIN);
+    out
 }
 
 lua_table! {
@@ -158,23 +183,30 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
-    const ONE_MIN: u64 = 60;
-    const ONE_HOUR: u64 = 3600;
-    const ONE_DAY: u64 = 86400;
+    const ONE_SEC_MS: u64 = 1_000;
+    const ONE_MIN_MS: u64 = 60 * ONE_SEC_MS;
+    const ONE_HOUR_MS: u64 = 60 * ONE_MIN_MS;
+    const ONE_DAY_MS: u64 = 24 * ONE_HOUR_MS;
+    const EPOCH_SECS: u64 = 1_700_000_000;
 
-    #[test_case(0 => "just now" ; "zero")]
-    #[test_case(ONE_MIN - 1 => "just now" ; "under a minute")]
-    #[test_case(ONE_MIN => "1min ago" ; "one minute")]
-    #[test_case(5 * ONE_MIN => "5min ago" ; "five minutes")]
-    #[test_case(ONE_HOUR - 1 => "59min ago" ; "just under an hour")]
-    #[test_case(ONE_HOUR => "1h ago" ; "one hour")]
-    #[test_case(2 * ONE_HOUR => "2h ago" ; "two hours")]
-    #[test_case(ONE_DAY - 1 => "23h ago" ; "just under a day")]
-    #[test_case(ONE_DAY => "1d ago" ; "one day")]
-    #[test_case(3 * ONE_DAY => "3d ago" ; "three days")]
-    #[test_case(30 * ONE_DAY => "30d ago" ; "a month of days")]
-    fn formats_elapsed(secs: u64) -> String {
-        format_ago(secs)
+    #[test_case(0 => "0s" ; "zero")]
+    #[test_case(9_400 => "9s" ; "subsecond truncated")]
+    #[test_case(ONE_MIN_MS - 1 => "59s" ; "just under a minute")]
+    #[test_case(ONE_MIN_MS => "1m 0s" ; "one minute")]
+    #[test_case(ONE_MIN_MS + 5_500 => "1m 5s" ; "minute and seconds")]
+    #[test_case(ONE_HOUR_MS - 1 => "59m 59s" ; "just under an hour")]
+    #[test_case(ONE_HOUR_MS => "1h 0s" ; "one hour")]
+    #[test_case(ONE_HOUR_MS + ONE_MIN_MS + 1_200 => "1h 1m 1s" ; "hour minute seconds")]
+    #[test_case(ONE_DAY_MS => "1d 0s" ; "one day")]
+    #[test_case(4 * ONE_DAY_MS + 7 * ONE_HOUR_MS + 23 * ONE_MIN_MS + 9_400 => "4d 7h 23m 9s" ; "compound")]
+    #[test_case(30 * ONE_DAY_MS => "30d 0s" ; "many days")]
+    fn formats_compound_elapsed_seconds(ms: u64) -> String {
+        format_ago(Duration::from_millis(ms))
+    }
+
+    #[test]
+    fn format_truncates_subsecond() {
+        assert_eq!(format_ago(Duration::from_micros(9_499_999)), "9s");
     }
 
     fn ts_tbl(lua: &Lua, secs: u64, nanosecs: u32) -> Table {
@@ -191,49 +223,67 @@ mod tests {
     }
 
     #[test]
-    fn ago_measures_reference_to_instant_in_seconds() {
+    fn ago_preserves_fractional_reference_and_clamps_future() {
         let lua = Lua::new();
-        let epoch = system_now().as_secs();
         assert_eq!(
-            call_ago(&lua, ts_tbl(&lua, epoch - 300, 0), ts_tbl(&lua, epoch, 0)),
-            "5min ago"
+            call_ago(
+                &lua,
+                ts_tbl(&lua, EPOCH_SECS - 60, 0),
+                ts_tbl(&lua, EPOCH_SECS, 500_000_000),
+            ),
+            "1m 0s"
         );
         assert_eq!(
-            call_ago(&lua, ts_tbl(&lua, epoch - 7200, 0), ts_tbl(&lua, epoch, 0)),
-            "2h ago"
+            call_ago(
+                &lua,
+                ts_tbl(&lua, EPOCH_SECS - 60, 500_000_000),
+                ts_tbl(&lua, EPOCH_SECS, 0),
+            ),
+            "59s"
+        );
+        assert_eq!(
+            call_ago(
+                &lua,
+                ts_tbl(&lua, EPOCH_SECS + ONE_HOUR_MS / 1_000, 0),
+                ts_tbl(&lua, EPOCH_SECS, 0),
+            ),
+            "0s"
         );
     }
 
     #[test]
-    fn ago_counts_sub_second_nanosecs() {
+    fn timestamp_decoder_rejects_invalid_fields() {
         let lua = Lua::new();
-        // 59.5 seconds apart -> under a minute once truncated to whole secs.
-        let secs = system_now().as_secs();
-        let out = call_ago(
-            &lua,
-            ts_tbl(&lua, secs - 59, 500_000_000),
-            ts_tbl(&lua, secs, 0),
-        );
-        assert_eq!(out, "just now");
-    }
+        let into_duration = |t: &Table| duration_from_table(t).map(|d| d.as_nanos());
 
-    #[test]
-    fn ago_clamps_future_and_rejects_bad_range() {
-        let lua = Lua::new();
-        let secs = system_now().as_secs();
-        // Future instant -> "just now".
-        assert_eq!(
-            call_ago(&lua, ts_tbl(&lua, secs + ONE_DAY, 0), ts_tbl(&lua, secs, 0)),
-            "just now"
-        );
-        let bad = ts_tbl(&lua, secs, NANOS_PER_SEC as u32);
+        let bad_range = ts_tbl(&lua, EPOCH_SECS, NANOS_PER_SEC as u32);
+        assert!(into_duration(&bad_range).is_err());
+
+        let missing = lua.create_table().unwrap();
+        assert!(into_duration(&missing).is_err());
+
+        let negative = lua.create_table().unwrap();
+        negative.set("secs", -1).unwrap();
+        negative.set("nanosecs", 0).unwrap();
+        assert!(into_duration(&negative).is_err());
+
+        let fractional = lua.create_table().unwrap();
+        fractional.set("secs", 1.5).unwrap();
+        fractional.set("nanosecs", 0).unwrap();
+        assert!(into_duration(&fractional).is_err());
+
+        let oversized = lua.create_table().unwrap();
+        oversized.set("secs", 1e20).unwrap();
+        oversized.set("nanosecs", 0).unwrap();
+        assert!(into_duration(&oversized).is_err());
+
         let err = create_time_table(&lua)
             .unwrap()
             .get::<mlua::Function>("ago")
             .unwrap()
-            .call::<String>((bad, ts_tbl(&lua, secs, 0)))
+            .call::<String>((bad_range, ts_tbl(&lua, EPOCH_SECS, 0)))
             .unwrap_err();
-        assert!(err.to_string().contains(FIELD_RANGE_ERR));
+        assert!(err.to_string().contains(TIMESTAMP_FIELD_ERR));
     }
 
     #[test]
@@ -248,7 +298,6 @@ mod tests {
         let (secs, nanosecs) = read(now.call::<Table>(()).unwrap());
         assert!(secs > 1_700_000_000, "should be contemporary epoch seconds");
         assert!(nanosecs < NANOS_PER_SEC as u32);
-        // A second call must not move backwards in real time.
         let (secs2, nanosecs2) = read(now.call::<Table>(()).unwrap());
         assert!(secs2 > secs || (secs2 == secs && nanosecs2 >= nanosecs));
     }
@@ -257,8 +306,8 @@ mod tests {
     fn at_wraps_whole_seconds() {
         let lua = Lua::new();
         let at: mlua::Function = create_time_table(&lua).unwrap().get("at").unwrap();
-        let t = at.call::<Table>(1_780_000_000u64).unwrap();
-        assert_eq!(t.get::<u64>("secs").unwrap(), 1_780_000_000);
+        let t = at.call::<Table>(EPOCH_SECS).unwrap();
+        assert_eq!(t.get::<u64>("secs").unwrap(), EPOCH_SECS);
         assert_eq!(t.get::<u32>("nanosecs").unwrap(), 0);
     }
 }

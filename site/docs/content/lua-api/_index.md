@@ -4515,19 +4515,18 @@ print(maki.time.ago(maki.time.at(session.updated_at)))
 maki.time.ago({instant}, {reference?})
 ```
 
-Format {instant} as a relative age like `3h ago`, or `just now` for less
-than a minute. {instant} is a timestamp from `maki.time.now` (or
-`maki.time.at`). If {reference} is given, age is measured from it instead
-of the current time.
-
-A timestamp in the future renders as `just now`.
+Format {instant} as a live delta like `9s` or `4d 7h 23m 9s`.
+{instant} is a timestamp from `maki.time.now` (or `maki.time.at`). If
+{reference} is given, age is measured from it instead of the current time.
+Fractions truncate to whole seconds, and higher zero units are omitted.
+A timestamp in the future renders as `0s`.
 
 **Parameters:**
 
 - `{instant}` (`table`) Timestamp from `maki.time.now`/`maki.time.at`.
 - `{reference?}` (`table?`) Timestamp to measure from; defaults to `maki.time.now`.
 
-**Returns:** (`string`) Relative age, e.g. `42min ago`.
+**Returns:** (`string`) Elapsed delta, e.g. `2m 9s`.
 
 **Example:**
 
@@ -6171,9 +6170,15 @@ decides. Items are ranked by match score with matched characters
 highlighted, exactly like the built-in pickers. Filter edits keep the
 current row instead of jumping to the best match.
 
+An item's optional `age` field is a timestamp from `maki.time.now` or
+`maki.time.at`, not an elapsed duration. The host renders it as a live
+delta (for example `9s` or `4d 7h 23m 9s`) and refreshes it about once
+per second while the dialog is open. `detail` and `age` can coexist;
+age follows the detail.
+
 **Parameters:**
 
-- `{items}` (`table`) List of items: plain strings, or `{ label, detail?, section?, section_detail? }` tables.
+- `{items}` (`table`) List of items: plain strings, or `{ label, detail?, section?, section_detail?, age? }` tables.
 - `{opts?}` (`table?`) Options:
   - `title` (`string`) dialog title.
   - `footer` (`table`) key-hint pairs for the footer border. Each entry is `{key, label}`.
@@ -6952,7 +6957,10 @@ function M.replace(content, old_string, new_string, replace_all, max_line_bytes)
 function ListPicker.render_header(win, lines, input, prefix, inner)
 
 -- Open a fuzzy-filter picker in a floating window and block until the user
--- decides. {items} is a list of strings or { label, detail? } tables. {opts}:
+-- decides. {items} is a list of strings or { label, detail?, age? } tables,
+-- where `age` is a timestamp from `maki.time.now` or `maki.time.at` and
+-- refreshes once per displayed second while the dialog is open.
+-- {opts}:
 -- title, footer, cursor (initial index), submit_keys (extra submit keys
 -- besides enter), action_keys (keys that close the picker and report
 -- themselves, like { "R" } for a refresh binding. Use uppercase keys, since

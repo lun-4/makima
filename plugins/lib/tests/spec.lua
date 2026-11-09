@@ -1626,6 +1626,111 @@ case("list_picker_clicks_filter_caret_and_respects_section_rows", function()
   eq(closed, true)
 end)
 
+local LIST_PICKER_NOW = os.time()
+local LIST_PICKER_NANOS_PER_SEC = 1000000000
+local LIST_PICKER_NANOS_PER_MS = 1000000
+
+local function list_picker_probe(events, items, opts)
+  local ListPicker = require("maki.list_picker")
+  local originals = {
+    buf = maki.ui.buf,
+    open_win = maki.ui.open_win,
+    now = maki.time.now,
+  }
+  local clock = { secs = LIST_PICKER_NOW, nanosecs = 0 }
+  local snapshots, timeouts = {}, {}
+  local step = 0
+  local function advance_clock(ms)
+    clock.nanosecs = clock.nanosecs + ms * LIST_PICKER_NANOS_PER_MS
+    while clock.nanosecs >= LIST_PICKER_NANOS_PER_SEC do
+      clock.nanosecs = clock.nanosecs - LIST_PICKER_NANOS_PER_SEC
+      clock.secs = clock.secs + 1
+    end
+  end
+  maki.time.now = function()
+    return { secs = clock.secs, nanosecs = clock.nanosecs }
+  end
+  maki.ui.buf = function()
+    return {
+      set_lines = function(_, value)
+        snapshots[#snapshots + 1] = value
+      end,
+    }
+  end
+  maki.ui.open_win = function()
+    return {
+      width = 80,
+      height = 20,
+      set_config = function() end,
+      set_cursor = function() end,
+      close = function() end,
+      recv = function(_, timeout)
+        timeouts[#timeouts + 1] = timeout or "blocking"
+        step = step + 1
+        local event = events[step]
+        if type(event) == "function" then
+          return event(snapshots[#snapshots])
+        end
+        if type(event) == "table" and event.advance_ms then
+          advance_clock(event.advance_ms)
+        end
+        return event or { type = "close" }
+      end,
+    }
+  end
+  local ok, result = pcall(ListPicker.open, items, opts)
+  maki.ui.buf, maki.ui.open_win, maki.time.now = originals.buf, originals.open_win, originals.now
+  assert(ok, tostring(result))
+  return result, snapshots, timeouts
+end
+
+case("list_picker_live_age_preserves_filter_and_confirmation", function()
+  local items = {
+    { label = "alpha", age = maki.time.at(LIST_PICKER_NOW - 9) },
+    { label = "beta", age = maki.time.at(LIST_PICKER_NOW - 3) },
+  }
+  local result, snapshots, timeouts = list_picker_probe({
+    { type = "paste", text = "alp" },
+    { type = "key", key = "ctrl+d" },
+    { type = "timeout", advance_ms = 1000 },
+    { type = "key", key = "ctrl+d" },
+  }, items)
+  eq(result.type, "delete")
+  eq(result.index, 1, "the filtered original index survives the age refresh")
+  assert(span_text(snapshots[#snapshots][1]):find("10s", 1, true), "the age advances without refiltering")
+  eq(timeouts[1], 1000, "age polling waits for the next second")
+end)
+
+case("list_picker_compound_age_layout", function()
+  local ListPicker = require("maki.list_picker")
+  local reference = maki.time.at(LIST_PICKER_NOW)
+  local age = maki.time.at(LIST_PICKER_NOW - (4 * 86400 + 7 * 3600 + 23 * 60 + 9))
+  local items = { { label = "title", detail = "detail", age = age } }
+  local wide = ListPicker._render_lines(items, 1, 80, "", reference)
+  assert(span_text(wide[1]):find("4d 7h 23m 9s", 1, true), "ordinary width keeps the compound age")
+  assert(maki.ui.display_width(span_text(wide[1])) <= 80)
+  local narrow = ListPicker._render_lines(items, 1, 19, "", reference)
+  assert(span_text(narrow[1]):find("…7h 23m 9s", 1, true), "narrow width elides higher units")
+  assert(maki.ui.display_width(span_text(narrow[1])) <= 19)
+end)
+
+case("list_picker_age_stays_separated_from_full_label", function()
+  local ListPicker = require("maki.list_picker")
+  local reference = maki.time.at(LIST_PICKER_NOW)
+  local items = { { label = "build-test", age = maki.time.at(LIST_PICKER_NOW - 9) } }
+  local lines = ListPicker._render_lines(items, 1, 16, "", reference)
+  assert(span_text(lines[1]):find("… 9s", 1, true), "a budget-filling label keeps a gap before the age")
+  assert(maki.ui.display_width(span_text(lines[1])) <= 16)
+end)
+
+case("list_picker_static_items_keep_blocking_recv", function()
+  local _, _, timeouts = list_picker_probe({
+    { type = "close" },
+  }, { "alpha", "beta" })
+  eq(#timeouts, 1)
+  eq(timeouts[1], "blocking", "static pickers still block without an age poll")
+end)
+
 if #failures > 0 then
   error(#failures .. " case(s) failed:\n\n" .. table.concat(failures, "\n\n"))
 end

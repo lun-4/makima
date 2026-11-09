@@ -5,6 +5,8 @@ local case = th.case
 local eq = th.eq
 
 local NOW = os.time()
+local NANOS_PER_SEC = 1000000000
+local NANOS_PER_MS = 1000000
 local MINUTE = 60
 local HOUR = 3600
 
@@ -85,8 +87,8 @@ case("right_selected_focused_wins_over_accent", function()
 end)
 
 case("right_shows_age_for_idle_rows", function()
-  local text, style = sh.right(stored_row({}), false)
-  eq(text, "just now")
+  local text, style = sh.right(stored_row({}), false, maki.time.at(NOW))
+  eq(text, "0s")
   eq(style, "dim")
 end)
 
@@ -194,12 +196,13 @@ case("sessions_filter_clamps_missing_selection", function()
 end)
 
 case("age_buckets", function()
-  eq(sh.age(NOW), "just now")
-  eq(sh.age(NOW - 5 * MINUTE), "5m ago")
-  eq(sh.age(NOW - 3 * HOUR), "3h ago")
-  eq(sh.age(NOW - 50 * HOUR), "2d ago")
-  eq(sh.age(NOW - 30 * 24 * HOUR), "1mo ago")
-  eq(sh.age(NOW + HOUR), "just now", "future timestamps clamp to now")
+  local reference = maki.time.at(NOW)
+  eq(sh.age(NOW, reference), "0s")
+  eq(sh.age(NOW - 5 * MINUTE, reference), "5m 0s")
+  eq(sh.age(NOW - 3 * HOUR, reference), "3h 0s")
+  eq(sh.age(NOW - 50 * HOUR, reference), "2d 2h 0s")
+  eq(sh.age(NOW - 30 * 24 * HOUR, reference), "30d 0s")
+  eq(sh.age(NOW + HOUR, reference), "0s", "future timestamps clamp to now")
 end)
 
 case("message_count_formatting", function()
@@ -210,12 +213,14 @@ case("message_count_formatting", function()
 end)
 
 case("picker_row_contains_count_then_status", function()
-  local spans = sh.row_spans({ { "title", "item" } }, "42", "dim", 5, "1d ago", "selected")
+  local columns = sh.layout(80, { "1d 0s" }, { "42" })
+  local count_text, padding = sh.row_right_columns(5, 80, 42, columns)
+  local spans = sh.row_spans({ { "title", "item" } }, count_text, "dim", padding, "1d 0s", "selected", columns)
   local texts = {}
   for _, span in ipairs(spans) do
     texts[#texts + 1] = span[1]
   end
-  eq(table.concat(texts), "title" .. string.rep(" ", 18) .. "42" .. string.rep(" ", 5) .. "1d ago")
+  eq(table.concat(texts), "title" .. string.rep(" ", padding + columns.count_width - 2) .. "42" .. " " .. "1d 0s")
   eq(spans[2][2], "dim", "pad shares the count style")
   eq(spans[3][2], "dim", "count keeps the selection-driven style")
   eq(spans[4][1], "42")
@@ -226,32 +231,60 @@ case("picker_row_contains_count_then_status", function()
 end)
 
 case("picker_row_right_columns_remain_separated_at_narrow_width", function()
-  local count_text, padding = sh.row_right_columns(9, 80, 5)
+  local columns = sh.layout(80, { "1d 0s" }, { "5" })
+  local count_text, padding = sh.row_right_columns(9, 80, 5, columns)
   eq(count_text, "5")
-  eq(padding, 45, "a short title pushes the columns to the right edge")
-  local _, edge = sh.row_right_columns(80 - 27, 80, 5)
+  eq(padding, 80 - 9 - columns.right_width, "a short title pushes the columns to the right edge")
+  local _, edge = sh.row_right_columns(80 - columns.right_width, 80, 5, columns)
   eq(edge, 1, "the budget edge leaves exactly one separator")
-  local _, clamped = sh.row_right_columns(200, 80, 5)
+  local _, clamped = sh.row_right_columns(200, 80, 5, columns)
   eq(clamped, 1, "the separator never underflows below one space")
 end)
 
 case("picker_row_clips_long_titles_before_the_columns", function()
-  local inner, icon_width, confirm_width = 60, 2, 0
-  local budget = sh.title_width_budget(confirm_width, inner)
-  eq(budget, inner - 1 - 26)
+  local inner, confirm_width = 60, 0
+  local columns = sh.layout(inner, { "1d 0s" }, { "7" })
+  local budget = sh.title_width_budget(confirm_width, inner, columns)
+  eq(budget, inner - columns.right_width - 1)
   local title = string.rep("x", 100)
   local clipped = sh.clip_spans({ { "  ", "item" }, { "● ", "accent" }, { title, "item" } }, budget)
   local left = sh.spans_width(clipped)
-  local count_text, padding = sh.row_right_columns(left, inner, 7)
-  local row = sh.row_spans(clipped, count_text, "dim", padding, "1d ago", "dim")
+  local count_text, padding = sh.row_right_columns(left, inner, 7, columns)
+  local row = sh.row_spans(clipped, count_text, "dim", padding, "1d 0s", "dim", columns)
   eq(sh.spans_width(row), inner, "the clipped row fills the width exactly, columns intact")
   eq(padding, 1)
   eq(utf8.len(clipped[3][1]), budget - 4, "only the title tail is cut")
 end)
 
+case("picker_row_with_clipped_confirmation_fills_the_width_exactly", function()
+  local inner = 40
+  local columns = sh.layout(inner, { "1d 0s" }, { "7" })
+  local room = sh.confirm_width_budget(inner, columns)
+  local confirm = sh.clip_spans({ { string.rep("x", 100), "error" } }, room)
+  local confirm_width = sh.spans_width(confirm)
+  local budget = sh.title_width_budget(confirm_width, inner, columns)
+  local title = sh.clip_spans({ { "  ", "item" }, { "● ", "accent" }, { "title", "item" } }, budget)
+  for _, span in ipairs(confirm) do
+    title[#title + 1] = span
+  end
+  local count_text, padding = sh.row_right_columns(sh.spans_width(title), inner, 7, columns)
+  local row = sh.row_spans(title, count_text, "dim", padding, "1d 0s", "dim", columns)
+  eq(sh.spans_width(row), inner, "a confirmation clipped to its budget keeps the columns on their header cells")
+end)
+
+case("confirm_layout_keeps_the_full_hint_beside_a_wide_age", function()
+  local inner, label, hint = 38, "4d 7h 23m 9s", "  Ctrl+D again to delete"
+  local columns = sh.layout(inner, { label }, { "123" })
+  assert(sh.confirm_width_budget(inner, columns) < utf8.len(hint), "the shared layout would clip the hint")
+  local confirming = sh.confirm_layout(columns)
+  eq(confirming.status_width, columns.status_width, "the age keeps its column")
+  assert(sh.confirm_width_budget(inner, confirming) >= utf8.len(hint), "the confirmation lends the count cell")
+end)
+
 case("picker_header_shares_row_columns_and_theme_style", function()
   local inner = 80
-  local header = sh.header_spans(inner)
+  local columns = sh.layout(inner, { "1d 0s" }, { "5" })
+  local header = sh.header_spans(inner, columns)
   eq(sh.spans_width(header), inner)
   for _, span in ipairs(header) do
     eq(span[2], "path")
@@ -260,14 +293,15 @@ case("picker_header_shares_row_columns_and_theme_style", function()
   eq(header[4][1], "messages")
   eq(header[7][1], "age")
 
-  local count_text, padding = sh.row_right_columns(9, inner, 5)
+  local count_text, padding = sh.row_right_columns(9, inner, 5, columns)
   local row = sh.row_spans(
     { { "  ", "item" }, { "  ", "dim" }, { "title", "item" } },
     count_text,
     "dim",
     padding,
-    "1d ago",
-    "dim"
+    "1d 0s",
+    "dim",
+    columns
   )
   eq(sh.spans_width(row), inner)
   -- Both label the same 15-cell count column and 10-cell age column, so the
@@ -296,7 +330,8 @@ case("live_rows_override_stored_message_count", function()
   eq(#all, 1)
 end)
 
-local function picker(events, query)
+local function picker(events, query, opts)
+  opts = opts or {}
   local originals = {
     buf = maki.ui.buf,
     open_win = maki.ui.open_win,
@@ -310,30 +345,61 @@ local function picker(events, query)
     focus = maki.session.focus,
     title = maki.session.set_title,
     delete = maki.session.delete,
+    now = maki.time.now,
+    completion = maki.match.completion,
   }
   local command, lines, focused, renamed, closed, deleted
+  local clock = { secs = NOW, nanosecs = 0 }
+  local async_queue = {}
+  local snapshots, snapshot_counts, timeouts = {}, {}, {}
+  local autocmds = opts.autocmds or {}
+  local live_calls, list_calls, match_calls = 0, 0, 0
+  local function advance_clock(ms)
+    clock.nanosecs = clock.nanosecs + ms * NANOS_PER_MS
+    while clock.nanosecs >= NANOS_PER_SEC do
+      clock.nanosecs = clock.nanosecs - NANOS_PER_SEC
+      clock.secs = clock.secs + 1
+    end
+  end
+  maki.time.now = function()
+    return { secs = clock.secs, nanosecs = clock.nanosecs }
+  end
+  maki.match.completion = function(...)
+    match_calls = match_calls + 1
+    return originals.completion(...)
+  end
   maki.api.register_command = function(spec)
     if spec.name == "/sessions" then
       command = spec.handler
     end
   end
-  maki.api.create_autocmd = function() end
+  maki.api.create_autocmd = function(name, spec)
+    autocmds[name] = spec.callback
+  end
   maki.keymap.set = function() end
   maki.async.run = function(fn)
-    fn()
+    if opts.defer_async then
+      async_queue[#async_queue + 1] = fn
+    else
+      fn()
+    end
   end
-  maki.session.live = function()
+  local function session_live()
+    live_calls = live_calls + 1
     return {}
   end
-  maki.session.list = function()
-    return { stored_row({ id = "one", title = "first" }), stored_row({ id = "two", title = "second" }) }
+  local function session_list()
+    list_calls = list_calls + 1
+    return opts.rows or { stored_row({ id = "one", title = "first" }), stored_row({ id = "two", title = "second" }) }
   end
+  maki.session.live = session_live
+  maki.session.list = session_list
   maki.session.focus = function(id)
     focused = id
     return true
   end
-  maki.session.set_title = function(opts)
-    renamed = opts
+  maki.session.set_title = function(spec)
+    renamed = spec
     return true
   end
   maki.session.delete = function(id)
@@ -345,24 +411,34 @@ local function picker(events, query)
     return {
       set_lines = function(_, value)
         lines = value
+        snapshots[#snapshots + 1] = value
+        snapshot_counts[#snapshot_counts + 1] = {
+          live = live_calls,
+          list = list_calls,
+          match = match_calls,
+        }
       end,
     }
   end
   local step = 0
   maki.ui.open_win = function()
     return {
-      width = 80,
+      width = opts.width or 80,
       height = 20,
       set_config = function() end,
       set_cursor = function() end,
       close = function()
         closed = true
       end,
-      recv = function()
+      recv = function(_, timeout)
+        timeouts[#timeouts + 1] = timeout
         step = step + 1
         local event = events[step]
         if type(event) == "function" then
           return event(lines)
+        end
+        if type(event) == "table" and event.advance_ms then
+          advance_clock(event.advance_ms)
         end
         return event or { type = "close" }
       end,
@@ -377,8 +453,38 @@ local function picker(events, query)
   maki.keymap.set, maki.async.run = originals.keymap, originals.run
   maki.session.live, maki.session.list, maki.session.focus = originals.live, originals.list, originals.focus
   maki.session.set_title, maki.session.delete = originals.title, originals.delete
+  maki.time.now, maki.match.completion = originals.now, originals.completion
   assert(ok, tostring(err))
-  return focused, renamed, closed, deleted
+  return focused,
+    renamed,
+    closed,
+    deleted,
+    {
+      clock = clock,
+      snapshots = snapshots,
+      counts = snapshot_counts,
+      timeouts = timeouts,
+      flush_async = function()
+        local saved_list, saved_live = maki.session.list, maki.session.live
+        maki.session.list, maki.session.live = session_list, session_live
+        local queued = async_queue
+        async_queue = {}
+        for _, fn in ipairs(queued) do
+          fn()
+        end
+        maki.session.list, maki.session.live = saved_list, saved_live
+      end,
+    }
+end
+
+local function all_text(lines)
+  local parts = {}
+  for _, line in ipairs(lines or {}) do
+    for _, span in ipairs(line) do
+      parts[#parts + 1] = span[1]
+    end
+  end
+  return table.concat(parts)
 end
 
 local function row_with(lines, title)
@@ -437,6 +543,136 @@ case("clicking_delete_confirmation_deletes_instead_of_opening", function()
   }, "first")
   eq(focused, nil)
   eq(deleted, "one")
+end)
+
+case("right_preserves_current_and_open_labels", function()
+  local reference = maki.time.at(NOW)
+  local current, current_style = sh.right(live_row({ id = "a1" }), false, reference)
+  eq(current, "current")
+  eq(current_style, "accent")
+  local open, open_style = sh.right(stored_row({ open_elsewhere = true }), false, reference)
+  eq(open, "open")
+  eq(open_style, "dim")
+end)
+
+case("sessions_compound_age_column_layout", function()
+  local label = "4d 7h 23m 9s"
+  local function row_for(inner)
+    local columns = sh.layout(inner, { label }, { "123" })
+    local budget = sh.title_width_budget(0, inner, columns)
+    local title = sh.clip_spans({ { "  ", "item" }, { "● ", "accent" }, { "title", "item" } }, budget)
+    local count_text, padding = sh.row_right_columns(sh.spans_width(title), inner, 123, columns)
+    local row = sh.row_spans(title, count_text, "dim", padding, label, "dim", columns)
+    return columns, row
+  end
+
+  local wide, wide_row = row_for(80)
+  eq(sh.spans_width(sh.header_spans(80, wide)), 80)
+  eq(wide.status_width, utf8.len(label))
+  eq(wide.show_count, true)
+  eq(sh.spans_width(wide_row), 80)
+  assert(all_text({ wide_row }):find(label, 1, true), "ordinary width keeps the full compound age")
+
+  local narrow, narrow_row = row_for(28)
+  eq(sh.spans_width(sh.header_spans(28, narrow)), 28)
+  eq(narrow.show_count, false, "the count is withdrawn before the age is elided")
+  eq(narrow.status_width, utf8.len(label))
+  eq(sh.spans_width(narrow_row), 28)
+  assert(all_text({ narrow_row }):find(label, 1, true), "the full age survives while the count does not")
+
+  local elided, elided_row = row_for(18)
+  eq(sh.spans_width(sh.header_spans(18, elided)), 18)
+  eq(elided.status_width, 10)
+  eq(sh.spans_width(elided_row), 18)
+  assert(all_text({ elided_row }):find("…7h 23m 9s", 1, true), "higher units elide first")
+end)
+
+case("sessions_delete_hit_columns_follow_age_layout", function()
+  local long_ago = NOW - (4 * 24 * HOUR + 7 * HOUR + 23 * MINUTE + 9)
+  local focused, _, _, deleted = picker(
+    {
+      { type = "key", key = "ctrl+d" },
+      function(lines)
+        for row, line in ipairs(lines) do
+          local col = 1
+          for _, span in ipairs(line) do
+            if span[1]:find("again to delete", 1, true) then
+              return { type = "click", row = row, col = col + 2 }
+            end
+            col = col + maki.ui.display_width(span[1])
+          end
+        end
+        error("missing delete confirmation: " .. all_text(lines))
+      end,
+      { type = "key", key = "ctrl+c" },
+    },
+    "first",
+    {
+      width = 60,
+      rows = { stored_row({ id = "one", title = "first", updated_at = long_ago }) },
+    }
+  )
+  eq(focused, nil)
+  eq(deleted, "one", "the confirmation click target follows the age column layout")
+end)
+
+case("age_renders_on_first_second_boundary", function()
+  local _, _, _, _, probe = picker({
+    { type = "timeout", advance_ms = 999 },
+    { type = "timeout", advance_ms = 1 },
+    { type = "close" },
+  })
+  eq(#probe.snapshots, 3, "999ms does not redraw; the next 1ms crosses the boundary")
+  eq(probe.timeouts[1], 100, "the receive timeout stays within the status poll bound")
+  assert(all_text(probe.snapshots[2]):find("0s", 1, true))
+  assert(all_text(probe.snapshots[3]):find("1s", 1, true))
+end)
+
+case("continuous_events_do_not_starve_age_render", function()
+  local events = {}
+  for _ = 1, 10 do
+    events[#events + 1] = { type = "click", row = 0, col = 0, advance_ms = 100 }
+  end
+  events[#events + 1] = { type = "close" }
+  local _, _, _, _, probe = picker(events)
+  eq(#probe.snapshots, 3, "harmless events still allow the second-boundary redraw")
+  assert(all_text(probe.snapshots[3]):find("1s", 1, true))
+end)
+
+case("status_changes_refresh_after_non_timeout_events", function()
+  local autocmds = {}
+  local _, _, _, _, probe = picker({
+    function()
+      autocmds.SessionStatusChanged({ data = { session_id = "x", status = "working", focused = true } })
+      return { type = "click", row = 0, col = 0 }
+    end,
+    { type = "close" },
+  }, nil, { autocmds = autocmds })
+  eq(#probe.snapshots, 3, "a status change arriving with input still refreshes the list")
+end)
+
+case("age_only_render_does_not_scan_or_filter_sessions", function()
+  local _, _, _, _, probe = picker({
+    { type = "timeout", advance_ms = 1000 },
+    { type = "close" },
+  })
+  eq(#probe.snapshots, 3)
+  eq(probe.counts[3].live, probe.counts[2].live, "age refresh does not read live sessions")
+  eq(probe.counts[3].list, probe.counts[2].list, "age refresh does not rescan stored sessions")
+  eq(probe.counts[3].match, probe.counts[2].match, "age refresh does not refilter the list")
+end)
+
+case("close_and_reopen_isolate_age_refresh", function()
+  local _, _, _, _, first = picker({ { type = "close" } }, nil, { defer_async = true })
+  local before = #first.snapshots
+  first.flush_async()
+  eq(#first.snapshots, before, "a stored scan landing after close must not write")
+
+  local _, _, _, _, second = picker({
+    { type = "timeout", advance_ms = 1000 },
+    { type = "close" },
+  })
+  assert(all_text(second.snapshots[#second.snapshots]):find("1s", 1, true))
 end)
 
 th.report()

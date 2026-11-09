@@ -2012,6 +2012,7 @@ impl<'t> EventLoop<'t> {
         // The first frame always paints. After that only a poller, an event or
         // an animation tick owes another.
         let mut dirty = Dirty::YES;
+        let mut paint_due: Option<Instant> = None;
         let result = loop {
             self.sync_orchestration();
             dirty |= self.tick();
@@ -2024,6 +2025,7 @@ impl<'t> EventLoop<'t> {
             }
             self.checkpoint_all();
             if dirty.take() {
+                paint_due = None;
                 let app = &mut self.sessions[self.focused].app;
                 if let Err(e) = self.terminal.draw(|f| {
                     app.view(f);
@@ -2046,7 +2048,19 @@ impl<'t> EventLoop<'t> {
             // Sleeping a whole frame instead of a fraction of one is what
             // makes a spinner cost 12 paints a second instead of 62.
             let cadence = self.sessions[self.focused].app.cadence();
-            match self.next_wake(cadence.frame().unwrap_or(IDLE_POLL)) {
+            let now = Instant::now();
+            let soonest_paint = cadence.paint().map(|paint| now + paint);
+            paint_due = match (paint_due, soonest_paint) {
+                (Some(pending), Some(soonest)) => Some(pending.min(soonest)),
+                (pending, soonest) => pending.or(soonest),
+            };
+            let timeout = cadence
+                .frame()
+                .map_or(IDLE_POLL, |frame| frame.min(IDLE_POLL));
+            let timeout = paint_due.map_or(timeout, |due| {
+                timeout.min(due.saturating_duration_since(now))
+            });
+            match self.next_wake(timeout) {
                 // Any event can change the screen, so paint after handling it
                 // rather than asking every handler to prove it did.
                 Some(wake) => {
@@ -2055,11 +2069,12 @@ impl<'t> EventLoop<'t> {
                         break Err(e);
                     }
                 }
-                // Only the clock moved, so motion alone owes the frame. The
-                // cadence is the one from before the sleep, so motion that
-                // just stopped still gets a last paint to clear itself off
-                // the screen.
-                None => dirty |= Dirty::from(cadence.moves()),
+                // Only the clock moved, so motion alone owes the frame once
+                // its own deadline passes, however much sooner a poll woke
+                // us. A deadline set before the sleep survives the cadence
+                // going idle, so motion that just stopped still gets a last
+                // paint to clear itself off the screen.
+                None => dirty |= Dirty::from(paint_due.is_some_and(|due| Instant::now() >= due)),
             }
         };
         // Fatal errors still save every session, kill MCP process groups,

@@ -9,6 +9,7 @@ use crossterm::event::KeyEvent;
 use mlua::{Function, Result as LuaResult, Table, Value};
 
 use crate::api::keymap::parse_event_key;
+use crate::api::time::duration_from_table;
 use crate::api::ui::parse_footer;
 
 const ITEMS_MUST_BE_TABLE: &str = "open_list_picker: items must be a table";
@@ -16,6 +17,8 @@ const ITEM_MUST_BE_STRING_OR_TABLE: &str = "picker items must be strings or {lab
 const ITEM_MISSING_LABEL: &str = "picker item missing `label`";
 const ITEM_LABEL_MUST_BE_STRING: &str = "picker item `label` must be a string";
 const ITEM_FIELD_MUST_BE_STRING: &str = "picker item field must be a string or nil";
+const ITEM_AGE_MUST_BE_TIMESTAMP: &str =
+    "picker item `age` must be a timestamp from maki.time.now or maki.time.at";
 const TITLE_MUST_BE_STRING: &str = "open_list_picker: title must be a string";
 const CURSOR_MUST_BE_POSITIVE: &str = "open_list_picker: cursor must be >= 1";
 const TIMEOUT_MUST_BE_NON_NEGATIVE: &str = "open_list_picker: timeout_ms must be >= 0";
@@ -29,6 +32,9 @@ pub struct PickerItemSpec {
     pub detail: Option<String>,
     pub section: Option<String>,
     pub section_detail: Option<String>,
+    /// Unix-epoch instant, despite the user-facing `age` name. The host
+    /// formats it against the current time, so it stays live after open.
+    pub age: Option<Duration>,
 }
 
 /// Decoded `maki.ui.open_list_picker` options. Indices are 0-based; the
@@ -162,11 +168,17 @@ fn decode_picker_item(value: &Value) -> Result<PickerItemSpec, mlua::Error> {
                 Some(_) => return Err(mlua::Error::runtime(ITEM_LABEL_MUST_BE_STRING)),
                 None => return Err(mlua::Error::runtime(ITEM_MISSING_LABEL)),
             };
+            let age = match t.get::<Option<Value>>("age")? {
+                None => None,
+                Some(Value::Table(ts)) => Some(duration_from_table(&ts)?),
+                Some(_) => return Err(mlua::Error::runtime(ITEM_AGE_MUST_BE_TIMESTAMP)),
+            };
             Ok(PickerItemSpec {
                 label,
                 detail: optional_string(t, "detail")?,
                 section: optional_string(t, "section")?,
                 section_detail: optional_string(t, "section_detail")?,
+                age,
             })
         }
         _ => Err(mlua::Error::runtime(ITEM_MUST_BE_STRING_OR_TABLE)),
@@ -275,7 +287,7 @@ mod tests {
         let lua = Lua::new();
         let value = eval(
             &lua,
-            r#"{ { label = "x", detail = "d", section = "s", section_detail = "sd" }, { label = "y" } }"#,
+            r#"{ { label = "x", detail = "d", section = "s", section_detail = "sd", age = { secs = 1700000000, nanosecs = 400000000 } }, { label = "y" } }"#,
         );
         let (_, specs) = decode_picker_items(&value).unwrap();
         assert_eq!(
@@ -286,6 +298,7 @@ mod tests {
                     detail: Some("d".into()),
                     section: Some("s".into()),
                     section_detail: Some("sd".into()),
+                    age: Some(Duration::new(1_700_000_000, 400_000_000)),
                 },
                 PickerItemSpec {
                     label: "y".into(),
@@ -293,6 +306,16 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test_case(r#"{ { label = "x", age = "soon" } }"# ; "non_table_age")]
+    #[test_case(r#"{ { label = "x", age = { secs = -1, nanosecs = 0 } } }"# ; "negative_secs")]
+    #[test_case(r#"{ { label = "x", age = { secs = 1.5, nanosecs = 0 } } }"# ; "fractional_secs")]
+    #[test_case(r#"{ { label = "x", age = { secs = 1, nanosecs = 1000000000 } } }"# ; "nanosecs_out_of_range")]
+    #[test_case(r#"{ { label = "x", age = { secs = 1 } } }"# ; "missing_nanosecs")]
+    fn picker_rejects_malformed_age(source: &str) {
+        let lua = Lua::new();
+        assert!(decode_picker_items(&eval(&lua, source)).is_err());
     }
 
     #[test_case(r#"42"# ; "non_table_items")]

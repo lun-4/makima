@@ -41,7 +41,7 @@ use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::help_modal::HelpModal;
 use crate::components::input::{InputAction, InputBox, Submission};
 use crate::components::keybindings::key;
-use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
+use crate::components::list_picker::{ClockSample, ListPicker, PickerAction, PickerItem};
 use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::lua_float::FloatManager;
 use crate::components::lua_picker::{LuaPicker, LuaPickerAction};
@@ -301,8 +301,9 @@ impl PickerItem for TaskEntry {
     fn context_str(&self) -> Option<&str> {
         (!self.context.is_empty()).then_some(self.context.as_str())
     }
-    fn ago(&self) -> Option<String> {
-        self.started_at.map(ago)
+    fn age(&self, now: &ClockSample) -> Option<Duration> {
+        self.started_at
+            .map(|started| now.monotonic.saturating_duration_since(started))
     }
     fn is_finished(&self) -> bool {
         matches!(self.finished, Some(true))
@@ -324,10 +325,6 @@ fn truncate_snippet(text: &str) -> String {
     } else {
         truncated
     }
-}
-
-fn ago(since: Instant) -> String {
-    maki_lua::format_ago(since.elapsed().as_secs())
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
