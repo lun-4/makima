@@ -1227,6 +1227,13 @@ fn bundled_commands_project_complete_metadata() {
                 false
             ),
             (
+                "/goal".into(),
+                "Set a goal, clear it with /goal off, or inspect it with /goal status.".into(),
+                None,
+                None,
+                false
+            ),
+            (
                 "/memory".into(),
                 "View, edit, and delete memory files".into(),
                 None,

@@ -6,6 +6,7 @@ use test_case::test_case;
 
 #[test_case("edit", include_str!("../../plugins/edit/tests/spec.lua") ; "edit_plugin_spec")]
 #[test_case("bash", include_str!("../../plugins/bash/tests/spec.lua") ; "bash_plugin_spec")]
+#[test_case("goal", include_str!("../../plugins/goal/tests/spec.lua") ; "goal_plugin_spec")]
 #[test_case("index", include_str!("../../plugins/index/tests/spec.lua") ; "index_plugin_spec")]
 #[test_case("lib", include_str!("../../plugins/lib/tests/spec.lua") ; "lib_spec")]
 #[test_case("list", include_str!("../../plugins/list/tests/spec.lua") ; "list_plugin_spec")]
@@ -62,6 +63,7 @@ fn plugin_spec(name: &str, spec: &str) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let source = match name {
+        "goal" => Some(include_str!("../../plugins/goal/init.lua")),
         "sessions" => Some(include_str!("../../plugins/sessions/init.lua")),
         "thinking" => Some(include_str!("../../plugins/thinking/init.lua")),
         _ => None,

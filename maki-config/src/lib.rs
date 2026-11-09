@@ -106,6 +106,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "code_execution",
     "edit",
     "glob",
+    "goal",
     "grep",
     "index",
     "list",

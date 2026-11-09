@@ -186,6 +186,14 @@ pub fn generate() -> color_eyre::Result<String> {
     }
 
     writeln!(out).unwrap();
+    writeln!(out, "## Goals").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "The default-enabled `goal` plugin registers `/goal <text>`, `/goal status`, and `/goal off`. A goal belongs to the targeted agent. Setting a goal replaces its previous goal but does not start a turn. After each successful turn, a persistent checker subagent assesses completion and sends a continuation with feedback if the goal remains incomplete. Failed and cancelled turns do not trigger continuations.").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "The `verdict` profile uses transcript evidence only. The `verify` profile also allows the checker to use the agent's subagent tools. Configure the checker model, profile, evidence bounds, timeout, and continuation limit under [`plugins.goal`](/docs/configuration/#plugins-goal). By default, continuations are unlimited and checker waits have no timeout.").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "`/goal off` clears the goal and closes its checker. Goals also stop on completion, checker failure, or agent closure. Goals do not persist across restarts. Pause and resume controls are not available.").unwrap();
+    writeln!(out).unwrap();
     writeln!(out, "## Command arguments").unwrap();
     writeln!(out).unwrap();
     writeln!(
