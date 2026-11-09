@@ -57,8 +57,8 @@ const GREP_NO_MATCHES: &str = "No files found";
 const GREP_ERROR_OUTPUT: &str = "error: pattern is required";
 const TASK_WAIT_TOOL: &str = "task_wait";
 const TASK_SEND_TOOL: &str = "task_send";
-const TASK_SEND_QUEUED: &str = "Queued";
 const TASK_SEND_LINE_PREFIX: &str = "Instruction line";
+const TASK_SEND_QUOTE_BAR: &str = "│ ";
 const TASK_ID: &str = "task-0123456789abcdef";
 const TASK_SHORT_ID: &str = "89abcdef";
 const TASK_TURN_ID: &str = "turn-restored-result";
@@ -445,13 +445,15 @@ fn task_send_restore_message_truncation_click_roundtrip(in_batch: bool) {
         VIEW_CAP + TASK_REPORT_EXTRA_LINES
     );
     if !in_batch {
-        assert_eq!(collapsed.header.trim(), TASK_DESCRIPTION);
-        assert_eq!(collapsed.body.lines().next(), Some(TASK_SEND_QUEUED));
+        assert_eq!(
+            collapsed.header.trim(),
+            format!("To \"{TASK_DESCRIPTION}\"")
+        );
     }
     assert!(
         collapsed
             .body
-            .contains(&format!("{TASK_SEND_LINE_PREFIX} 1")),
+            .contains(&format!("{TASK_SEND_QUOTE_BAR}{TASK_SEND_LINE_PREFIX} 1")),
         "{}",
         collapsed.body
     );
@@ -470,17 +472,15 @@ fn task_send_restore_message_truncation_click_roundtrip(in_batch: bool) {
         Some(state.clone()),
         vec![notice_row],
     );
-    assert!(expanded.body.contains(&tail), "{}", expanded.body);
     assert!(
-        expanded.body.contains(&format!("Task: {TASK_ID}")),
+        expanded
+            .body
+            .contains(&format!("{TASK_SEND_QUOTE_BAR}{tail}")),
         "{}",
         expanded.body
     );
-    assert!(
-        expanded.body.contains(&format!("Turn: {TASK_TURN_ID}")),
-        "{}",
-        expanded.body
-    );
+    assert!(!expanded.body.contains(TASK_ID), "{}", expanded.body);
+    assert!(!expanded.body.contains(EXPAND_HINT), "{}", expanded.body);
     let recollapsed = restore(
         &host,
         tool,

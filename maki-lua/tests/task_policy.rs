@@ -83,9 +83,12 @@ const WAIT_CANCELLED_PENDING: &str = "Wait failed: cancelled";
 const WAIT_DETAILS: &str = "Details (click to expand)";
 const SEND_TOOL_USE_ID: &str = "task_send_presentation";
 const SEND_MESSAGE: &str = "**Focus** on the parser";
-const SEND_MESSAGE_TEXT: &str = "Focus on the parser";
-const SEND_QUEUED: &str = "Queued";
+const SEND_QUOTED_TEXT: &str = "│ Focus on the parser";
 const SEND_UNKNOWN: &str = "Send failed: unknown task_id";
+const LIFECYCLE_TOOL_USE_ID: &str = "task_lifecycle_presentation";
+const SPAWN_QUOTED_PROMPT: &str = "│ do the thing";
+const SPAWN_FAILED_UNKNOWN_TYPE: &str = "Spawn failed: unknown subagent type: bogus";
+const DESPAWN_UNKNOWN: &str = "Despawn failed: unknown task_id";
 
 const NESTED_CHILD_PROMPT: &str = "child prompt";
 const NESTED_CHILD_REPLY: &str = "child finished";
@@ -627,7 +630,7 @@ fn managed_general_child_can_access_all_nested_lifecycle_tools() {
 fn tool_snapshots(
     rx: &flume::Receiver<Envelope>,
     tool_use_id: &str,
-) -> (BufferSnapshot, BufferSnapshot) {
+) -> (BufferSnapshot, Option<BufferSnapshot>) {
     let mut body = None;
     let mut header = None;
     for env in rx.drain() {
@@ -643,7 +646,7 @@ fn tool_snapshots(
             _ => {}
         }
     }
-    (body.expect("tool body"), header.expect("tool header"))
+    (body.expect("tool body"), header)
 }
 
 #[test_case::test_case(SCENARIO_PLAIN, None, WAIT_COMPLETED, Some(PLAIN_TEXT) ; "plain")]
@@ -735,7 +738,7 @@ fn task_wait_presentation_matches_standalone_restore(
         scenario
     };
     assert_eq!(start_header, expected_header);
-    assert_eq!(live.1.text(), expected_header);
+    assert_eq!(live.1.as_ref().unwrap().text(), expected_header);
 
     let (_restore_reg, restore_host) = load_task_host();
     let handle = restore_host.event_handle();
@@ -759,9 +762,9 @@ fn task_wait_presentation_matches_standalone_restore(
     assert_eq!(tool_snapshots(&rx, WAIT_TOOL_USE_ID), live);
 }
 
-#[test_case::test_case(SCENARIO_PLAIN, SEND_QUEUED ; "queued")]
-#[test_case::test_case(UNKNOWN_TASK_ID, SEND_UNKNOWN ; "unknown_task")]
-fn task_send_presentation_shows_message_and_matches_restore(scenario: &str, status: &str) {
+#[test_case::test_case(SCENARIO_PLAIN, None ; "queued")]
+#[test_case::test_case(UNKNOWN_TASK_ID, Some(SEND_UNKNOWN) ; "unknown_task")]
+fn task_send_presentation_shows_message_and_matches_restore(scenario: &str, failure: Option<&str>) {
     let (reg, host) = load_task_host();
     let task_id = if scenario == UNKNOWN_TASK_ID {
         json!(UNKNOWN_TASK_ID)
@@ -794,21 +797,22 @@ fn task_send_presentation_shows_message_and_matches_restore(scenario: &str, stat
         error
     };
 
+    let expected_body = match failure {
+        Some(failure) => format!("{SEND_QUOTED_TEXT}\n{failure}"),
+        None => SEND_QUOTED_TEXT.to_owned(),
+    };
+    assert_eq!(live.0.text(), expected_body);
     assert_eq!(
-        live.0.text(),
-        format!("{status}\n\n{SEND_MESSAGE_TEXT}\n{WAIT_DETAILS}")
-    );
-    assert_eq!(
-        live.0.lines[0].spans[0].style,
+        live.0.lines.last().unwrap().spans[0].style,
         SpanStyle::Named(if known { "dim" } else { "error" }.to_owned())
     );
     let expected_header = if known {
-        scenario
+        format!("To \"{scenario}\"")
     } else {
-        &UNKNOWN_TASK_ID[UNKNOWN_TASK_ID.len() - 8..]
+        format!("To {}", &UNKNOWN_TASK_ID[UNKNOWN_TASK_ID.len() - 8..])
     };
     assert_eq!(start_header, expected_header);
-    assert_eq!(live.1.text(), expected_header);
+    assert_eq!(live.1.as_ref().unwrap().text(), expected_header);
 
     let (_restore_reg, restore_host) = load_task_host();
     let handle = restore_host.event_handle();
@@ -830,6 +834,96 @@ fn task_send_presentation_shows_message_and_matches_restore(scenario: &str, stat
     handle.wait_restore_complete_for_test();
     restore_host.load_source("barrier", "").unwrap();
     assert_eq!(tool_snapshots(&rx, SEND_TOOL_USE_ID), live);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LifecycleCase {
+    Spawn,
+    SpawnRejected,
+    Despawn,
+    DespawnUnknown,
+}
+
+#[test_case::test_case(LifecycleCase::Spawn, SPAWN_QUOTED_PROMPT.to_owned(), Some(SCENARIO_PLAIN.to_owned()) ; "spawn_quotes_prompt")]
+#[test_case::test_case(
+    LifecycleCase::SpawnRejected,
+    format!("{SPAWN_QUOTED_PROMPT}\n{SPAWN_FAILED_UNKNOWN_TYPE}"),
+    Some(SCENARIO_PLAIN.to_owned()) ;
+    "spawn_failure_follows_prompt"
+)]
+#[test_case::test_case(LifecycleCase::Despawn, String::new(), Some(SCENARIO_PLAIN.to_owned()) ; "despawn_header_only")]
+#[test_case::test_case(
+    LifecycleCase::DespawnUnknown,
+    DESPAWN_UNKNOWN.to_owned(),
+    Some(UNKNOWN_TASK_ID[UNKNOWN_TASK_ID.len() - 8..].to_owned()) ;
+    "despawn_failure_line"
+)]
+fn task_lifecycle_presentation_matches_restore(
+    case: LifecycleCase,
+    expected_body: String,
+    expected_header: Option<String>,
+) {
+    let (reg, host) = load_task_host();
+    let (tool, input) = match case {
+        LifecycleCase::Spawn => (TASK_SPAWN_TOOL, task_input(SCENARIO_PLAIN, None)),
+        LifecycleCase::SpawnRejected => {
+            let mut input = task_input(SCENARIO_PLAIN, None);
+            input["subagent_type"] = json!("bogus");
+            (TASK_SPAWN_TOOL, input)
+        }
+        LifecycleCase::Despawn => {
+            let spawned = exec_tool_json(&reg, TASK_SPAWN_TOOL, task_input(SCENARIO_PLAIN, None));
+            (TASK_DESPAWN_TOOL, json!({ "task_id": spawned["task_id"] }))
+        }
+        LifecycleCase::DespawnUnknown => (TASK_DESPAWN_TOOL, json!({ "task_id": UNKNOWN_TASK_ID })),
+    };
+    let (tx, rx) = flume::unbounded();
+    let event_tx = EventSender::new(tx);
+    let ctx = stub_ctx_with(
+        &AgentMode::Build,
+        Some(&event_tx),
+        Some(LIFECYCLE_TOOL_USE_ID),
+    );
+    let invocation = reg.get(tool).unwrap().tool.parse(&input).unwrap();
+    let result = smol::block_on(invocation.execute(&ctx));
+    host.load_source("barrier", "").unwrap();
+    let live = tool_snapshots(&rx, LIFECYCLE_TOOL_USE_ID);
+    let failed = matches!(
+        case,
+        LifecycleCase::SpawnRejected | LifecycleCase::DespawnUnknown
+    );
+    let (output, state) = match result.output {
+        Ok(ToolOutput::Plain(output)) if !failed => (output.text, output.state),
+        Err(error) if failed => (error, None),
+        other => panic!("unexpected {tool} output: {other:?}"),
+    };
+    let expected_state =
+        matches!(case, LifecycleCase::Despawn).then(|| json!({ "description": SCENARIO_PLAIN }));
+    assert_eq!(state, expected_state);
+
+    assert_eq!(live.0.text(), expected_body);
+    assert_eq!(live.1.as_ref().map(BufferSnapshot::text), expected_header);
+
+    let (_restore_reg, restore_host) = load_task_host();
+    let handle = restore_host.event_handle();
+    let (tx, rx) = flume::unbounded();
+    handle.request_restore(
+        RestoreItem {
+            tool: Arc::from(tool),
+            tool_use_id: LIFECYCLE_TOOL_USE_ID.to_owned(),
+            input,
+            output,
+            is_error: failed,
+            tool_output_lines: ctx.tool_output_lines,
+            theme_gen: None,
+            clicks: Vec::new(),
+            state,
+        },
+        EventSender::new(tx),
+    );
+    handle.wait_restore_complete_for_test();
+    restore_host.load_source("barrier", "").unwrap();
+    assert_eq!(tool_snapshots(&rx, LIFECYCLE_TOOL_USE_ID), live);
 }
 
 #[test]
