@@ -56,6 +56,9 @@ const READ_VIEW_CAP: usize = 5;
 const GREP_NO_MATCHES: &str = "No files found";
 const GREP_ERROR_OUTPUT: &str = "error: pattern is required";
 const TASK_WAIT_TOOL: &str = "task_wait";
+const TASK_SEND_TOOL: &str = "task_send";
+const TASK_SEND_QUEUED: &str = "Queued";
+const TASK_SEND_LINE_PREFIX: &str = "Instruction line";
 const TASK_ID: &str = "task-0123456789abcdef";
 const TASK_SHORT_ID: &str = "89abcdef";
 const TASK_TURN_ID: &str = "turn-restored-result";
@@ -404,6 +407,88 @@ fn task_wait_restore_empty_report_and_expanded_details(captured: bool, message: 
     assert!(!expanded.body.contains(EXPAND_HINT), "{}", expanded.body);
 
     let recollapsed = restore(&host, TASK_WAIT_TOOL, input, &output, None, vec![0, 0]);
+    assert_eq!(recollapsed.body, collapsed.body);
+}
+
+#[test_case::test_case(false; "standalone")]
+#[test_case::test_case(true; "batch_child")]
+fn task_send_restore_message_truncation_click_roundtrip(in_batch: bool) {
+    let host = load_host();
+    let message = (1..=VIEW_CAP + TASK_REPORT_EXTRA_LINES)
+        .map(|line| format!("{TASK_SEND_LINE_PREFIX} {line}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let output = json!({ "queued": true, "turn_id": TASK_TURN_ID }).to_string();
+    let input = json!({ "task_id": TASK_ID, "message": message });
+    let state = json!({ "description": TASK_DESCRIPTION });
+    let (tool, input, state) = if in_batch {
+        (
+            "batch",
+            json!({ "tool_calls": [{ "tool": TASK_SEND_TOOL, "parameters": input }] }),
+            json!({ "children": [{
+                "tool": TASK_SEND_TOOL, "status": "success", "output": output, "state": state,
+            }] }),
+        )
+    } else {
+        (TASK_SEND_TOOL, input, state)
+    };
+    let collapsed = restore(
+        &host,
+        tool,
+        input.clone(),
+        &output,
+        Some(state.clone()),
+        Vec::new(),
+    );
+    let tail = format!(
+        "{TASK_SEND_LINE_PREFIX} {}",
+        VIEW_CAP + TASK_REPORT_EXTRA_LINES
+    );
+    if !in_batch {
+        assert_eq!(collapsed.header.trim(), TASK_DESCRIPTION);
+        assert_eq!(collapsed.body.lines().next(), Some(TASK_SEND_QUEUED));
+    }
+    assert!(
+        collapsed
+            .body
+            .contains(&format!("{TASK_SEND_LINE_PREFIX} 1")),
+        "{}",
+        collapsed.body
+    );
+    assert!(!collapsed.body.contains(&tail), "{}", collapsed.body);
+    assert!(!collapsed.body.contains(TASK_ID), "{}", collapsed.body);
+    let notice_row = 1 + collapsed
+        .body
+        .lines()
+        .position(|line| line.contains(EXPAND_HINT))
+        .unwrap();
+    let expanded = restore(
+        &host,
+        tool,
+        input.clone(),
+        &output,
+        Some(state.clone()),
+        vec![notice_row],
+    );
+    assert!(expanded.body.contains(&tail), "{}", expanded.body);
+    assert!(
+        expanded.body.contains(&format!("Task: {TASK_ID}")),
+        "{}",
+        expanded.body
+    );
+    assert!(
+        expanded.body.contains(&format!("Turn: {TASK_TURN_ID}")),
+        "{}",
+        expanded.body
+    );
+    let recollapsed = restore(
+        &host,
+        tool,
+        input,
+        &output,
+        Some(state),
+        vec![notice_row, notice_row],
+    );
     assert_eq!(recollapsed.body, collapsed.body);
 }
 

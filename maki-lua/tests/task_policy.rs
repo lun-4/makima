@@ -81,6 +81,11 @@ const WAIT_UNKNOWN: &str =
     "Cannot retrieve this task: it is no longer available. (unknown task_id)";
 const WAIT_CANCELLED_PENDING: &str = "Wait failed: cancelled";
 const WAIT_DETAILS: &str = "Details (click to expand)";
+const SEND_TOOL_USE_ID: &str = "task_send_presentation";
+const SEND_MESSAGE: &str = "**Focus** on the parser";
+const SEND_MESSAGE_TEXT: &str = "Focus on the parser";
+const SEND_QUEUED: &str = "Queued";
+const SEND_UNKNOWN: &str = "Send failed: unknown task_id";
 
 const NESTED_CHILD_PROMPT: &str = "child prompt";
 const NESTED_CHILD_REPLY: &str = "child finished";
@@ -98,11 +103,11 @@ const STUB_PRELUDE: &str = r#"
 recorder = { prompts = {}, closed = 0, sessions = 0 }
 local register_tool = maki.api.register_tool
 maki.api.register_tool = function(spec)
-  if spec.name == "task_wait" then
+  if spec.name == "task_wait" or spec.name == "task_send" then
     local handler = spec.handler
     spec.handler = function(input, ctx)
       local reply = handler(input, ctx)
-      recorder.wait_state = reply.state
+      recorder[spec.name .. "_state"] = reply.state
       return reply
     end
   end
@@ -298,7 +303,8 @@ maki.api.register_tool({
       prompt_count = #recorder.prompts,
       has_local_tools = recorder.has_local_tools,
       output_schema = recorder.output_schema,
-      wait_state = recorder.wait_state,
+      wait_state = recorder.task_wait_state,
+      send_state = recorder.task_send_state,
     }
     if recorder.resolve_opts then
       snap.resolve_opts = recorder.resolve_opts
@@ -618,23 +624,26 @@ fn managed_general_child_can_access_all_nested_lifecycle_tools() {
     }
 }
 
-fn wait_snapshots(rx: &flume::Receiver<Envelope>) -> (BufferSnapshot, BufferSnapshot) {
+fn tool_snapshots(
+    rx: &flume::Receiver<Envelope>,
+    tool_use_id: &str,
+) -> (BufferSnapshot, BufferSnapshot) {
     let mut body = None;
     let mut header = None;
     for env in rx.drain() {
         match env.event {
             AgentEvent::ToolSnapshot { id, snapshot, .. } => {
-                assert_eq!(id, WAIT_TOOL_USE_ID);
+                assert_eq!(id, tool_use_id);
                 body = Some(snapshot);
             }
             AgentEvent::ToolHeaderSnapshot { id, snapshot, .. } => {
-                assert_eq!(id, WAIT_TOOL_USE_ID);
+                assert_eq!(id, tool_use_id);
                 header = Some(snapshot);
             }
             _ => {}
         }
     }
-    (body.expect("wait body"), header.expect("wait header"))
+    (body.expect("tool body"), header.expect("tool header"))
 }
 
 #[test_case::test_case(SCENARIO_PLAIN, None, WAIT_COMPLETED, Some(PLAIN_TEXT) ; "plain")]
@@ -668,7 +677,7 @@ fn task_wait_presentation_matches_standalone_restore(
     let start_header = smol::block_on(invocation.start_header()).text();
     let result = smol::block_on(invocation.execute(&ctx));
     host.load_source("barrier", "").unwrap();
-    let live = wait_snapshots(&rx);
+    let live = tool_snapshots(&rx, WAIT_TOOL_USE_ID);
     let state = probe(&reg).get("wait_state").cloned();
     let expected_state = (scenario != UNKNOWN_TASK_ID).then(|| json!({ "description": scenario }));
     assert_eq!(state, expected_state);
@@ -747,7 +756,80 @@ fn task_wait_presentation_matches_standalone_restore(
     );
     handle.wait_restore_complete_for_test();
     restore_host.load_source("barrier", "").unwrap();
-    assert_eq!(wait_snapshots(&rx), live);
+    assert_eq!(tool_snapshots(&rx, WAIT_TOOL_USE_ID), live);
+}
+
+#[test_case::test_case(SCENARIO_PLAIN, SEND_QUEUED ; "queued")]
+#[test_case::test_case(UNKNOWN_TASK_ID, SEND_UNKNOWN ; "unknown_task")]
+fn task_send_presentation_shows_message_and_matches_restore(scenario: &str, status: &str) {
+    let (reg, host) = load_task_host();
+    let task_id = if scenario == UNKNOWN_TASK_ID {
+        json!(UNKNOWN_TASK_ID)
+    } else {
+        exec_tool_json(&reg, TASK_SPAWN_TOOL, task_input(scenario, None))["task_id"].clone()
+    };
+    let input = json!({ "task_id": task_id, "message": SEND_MESSAGE });
+    let (tx, rx) = flume::unbounded();
+    let event_tx = EventSender::new(tx);
+    let ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(SEND_TOOL_USE_ID));
+    let invocation = reg.get(TASK_SEND_TOOL).unwrap().tool.parse(&input).unwrap();
+    let start_header = smol::block_on(invocation.start_header()).text();
+    let result = smol::block_on(invocation.execute(&ctx));
+    host.load_source("barrier", "").unwrap();
+    let live = tool_snapshots(&rx, SEND_TOOL_USE_ID);
+    let state = probe(&reg).get("send_state").cloned();
+    let known = scenario != UNKNOWN_TASK_ID;
+    assert_eq!(state, known.then(|| json!({ "description": scenario })));
+    let output = if known {
+        let ToolOutput::Plain(output) = result.output.unwrap() else {
+            panic!("expected plain task_send output");
+        };
+        assert_eq!(output.state, state);
+        let queued = serde_json::from_str::<Value>(&output.text).unwrap();
+        assert_eq!(queued["queued"], json!(true));
+        output.text
+    } else {
+        let error = result.output.unwrap_err();
+        assert_eq!(error, UNKNOWN_TASK_ERR);
+        error
+    };
+
+    assert_eq!(
+        live.0.text(),
+        format!("{status}\n\n{SEND_MESSAGE_TEXT}\n{WAIT_DETAILS}")
+    );
+    assert_eq!(
+        live.0.lines[0].spans[0].style,
+        SpanStyle::Named(if known { "dim" } else { "error" }.to_owned())
+    );
+    let expected_header = if known {
+        scenario
+    } else {
+        &UNKNOWN_TASK_ID[UNKNOWN_TASK_ID.len() - 8..]
+    };
+    assert_eq!(start_header, expected_header);
+    assert_eq!(live.1.text(), expected_header);
+
+    let (_restore_reg, restore_host) = load_task_host();
+    let handle = restore_host.event_handle();
+    let (tx, rx) = flume::unbounded();
+    handle.request_restore(
+        RestoreItem {
+            tool: Arc::from(TASK_SEND_TOOL),
+            tool_use_id: SEND_TOOL_USE_ID.to_owned(),
+            input,
+            output,
+            is_error: !known,
+            tool_output_lines: ctx.tool_output_lines,
+            theme_gen: None,
+            clicks: Vec::new(),
+            state,
+        },
+        EventSender::new(tx),
+    );
+    handle.wait_restore_complete_for_test();
+    restore_host.load_source("barrier", "").unwrap();
+    assert_eq!(tool_snapshots(&rx, SEND_TOOL_USE_ID), live);
 }
 
 #[test]
