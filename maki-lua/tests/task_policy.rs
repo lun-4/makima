@@ -22,8 +22,8 @@ use maki_lua::{
 };
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    AgentError, ContentBlock, Invocation, Message, Model, ProviderEvent, RequestOptions, Role,
-    StopReason, StreamResponse, TokenUsage,
+    AgentError, ContentBlock, Invocation, Message, Model, ProviderEvent, RequestDelivery,
+    RequestOptions, Role, StopReason, StreamResponse, TokenUsage,
 };
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
@@ -1207,6 +1207,7 @@ impl Provider for GatedProvider {
         _opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
         _invocation: &'a Invocation,
+        _delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let message = messages.last().expect("provider request has input").clone();
@@ -1235,6 +1236,7 @@ impl Provider for SteeringReportProvider {
         _opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
         _invocation: &'a Invocation,
+        _delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             match self.request.fetch_add(1, Ordering::SeqCst) {
@@ -1985,6 +1987,7 @@ impl Provider for NestedTaskProvider {
         _opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
         _invocation: &'a Invocation,
+        _delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move { Ok(Self::reply(messages)) })
     }

@@ -5,7 +5,7 @@ use maki_config::AgentConfig;
 use maki_providers::provider::Provider;
 use maki_providers::{
     ContentBlock, ConversationEnd, IMAGE_PLACEHOLDER, InvocationPurpose, Message, Model,
-    RequestOptions, Role, StreamResponse, TokenUsage,
+    RequestDeliveryTracker, RequestOptions, Role, StreamResponse, TokenUsage,
 };
 use maki_storage::id::SessionRef;
 use tracing::info;
@@ -116,6 +116,7 @@ async fn summarize(
 
     for attempt in 0..max_attempts {
         let summary_id = fresh_id();
+        let delivery = RequestDeliveryTracker::new();
         let kept = history
             .as_slice()
             .iter()
@@ -139,9 +140,12 @@ async fn summarize(
             RequestOptions::default(),
             session_id,
             maki_providers::retry::RetryPolicy::default(),
+            &delivery,
         )
         .await;
-        end_conversation_detached(provider, summary_id, ConversationEnd::Closed);
+        if delivery.is_delivered() {
+            end_conversation_detached(provider, summary_id, ConversationEnd::Closed);
+        }
         match result {
             Ok(response) => {
                 if attempt > 0 {
@@ -190,8 +194,9 @@ fn finish_compact(
         Message::user("What did we do so far?".into()),
         response.message,
     ];
-    let previous = history.replace_compacted(new_history);
-    end_conversation_detached(agent_provider, previous, ConversationEnd::Compacted);
+    if let Some(previous) = history.replace_compacted(new_history) {
+        end_conversation_detached(agent_provider, previous, ConversationEnd::Compacted);
+    }
     info!(
         model = %model.id,
         duration_ms = compact_start.elapsed().as_millis() as u64,
@@ -347,7 +352,8 @@ mod tests {
     use maki_providers::provider::BoxFuture;
     use maki_providers::{
         ContentBlock, ConversationLink, ConversationRelation, Invocation, Message, Model,
-        ProviderEvent, RequestOptions, Role, StopReason, StreamResponse, TokenUsage,
+        ProviderEvent, RequestDelivery, RequestOptions, Role, StopReason, StreamResponse,
+        TokenUsage,
     };
     use maki_storage::id::SessionRef;
     use serde_json::Value;
@@ -394,6 +400,7 @@ mod tests {
             _: RequestOptions,
             session_id: Option<&'a SessionRef>,
             invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             self.invocations.lock().unwrap().push(invocation.clone());
             Box::pin(async move {
@@ -414,6 +421,8 @@ mod tests {
             Box::pin(async {})
         }
     }
+
+    const SUMMARY_FAILED: &str = "summary failed";
 
     fn default_model() -> Model {
         Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap()
@@ -596,6 +605,37 @@ mod tests {
             );
             assert_ne!(history.conversation_id(), &original);
             assert_eq!(history.conversation().previous, None);
+        });
+    }
+
+    #[test]
+    fn undelivered_summary_is_not_ended() {
+        smol::block_on(async {
+            let summarizer = MockProvider::new(vec![Err(AgentError::Config {
+                message: SUMMARY_FAILED.into(),
+            })]);
+            let ended = summarizer.ended.1.clone();
+            let mut history = History::new(vec![Message::user("work".into())]);
+            let (raw_tx, _rx) = flume::unbounded();
+
+            let result = compact(
+                &dyn_provider(&summarizer),
+                &dyn_provider(&summarizer),
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx),
+                &CancelToken::none(),
+                &AgentConfig::default(),
+                None,
+                None,
+            )
+            .await;
+
+            assert!(result.is_err());
+            drop(summarizer);
+            // Only a detached end call could still hold the provider, and
+            // with it the sender.
+            assert_eq!(ended.recv_async().await.ok(), None);
         });
     }
 

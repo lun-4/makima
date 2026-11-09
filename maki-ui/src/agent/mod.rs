@@ -20,7 +20,7 @@ use maki_lua::EventHandle;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
     AgentError, ConversationEnd, Invocation, Message, Model, ProviderEvent, ProviderRegistry,
-    ProviderUsage, RequestOptions, StreamResponse,
+    ProviderUsage, RequestDelivery, RequestOptions, StreamResponse,
 };
 use maki_storage::id::SessionRef;
 use tracing::{info, warn};
@@ -92,9 +92,10 @@ impl Provider for TrackedProvider {
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
         invocation: &'a Invocation,
+        delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         self.inner.stream_message(
-            model, messages, system, tools, event_tx, opts, session_id, invocation,
+            model, messages, system, tools, event_tx, opts, session_id, invocation, delivery,
         )
     }
 
@@ -636,7 +637,9 @@ mod tests {
 
     use maki_config::PermissionsConfig;
     use maki_providers::provider::BoxFuture;
-    use maki_providers::{AgentError, Invocation, ProviderEvent, RequestOptions, StreamResponse};
+    use maki_providers::{
+        AgentError, Invocation, ProviderEvent, RequestDelivery, RequestOptions, StreamResponse,
+    };
 
     use super::*;
 
@@ -657,6 +660,7 @@ mod tests {
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
             _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(std::future::pending())
         }
@@ -677,6 +681,7 @@ mod tests {
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
             _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(std::future::pending())
         }

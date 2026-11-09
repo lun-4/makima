@@ -5,7 +5,7 @@ use maki_providers::provider::Provider;
 use maki_providers::retry::{RetryPolicy, RetryState};
 use maki_providers::{
     ContentBlock, ConversationEnd, ConversationLink, Invocation, InvocationPurpose, Message, Model,
-    ProviderEvent, RequestOptions, StreamResponse,
+    ProviderEvent, RequestDeliveryTracker, RequestOptions, StreamResponse,
 };
 use maki_storage::id::{MakiId, SessionRef};
 use serde_json::Value;
@@ -149,6 +149,8 @@ impl From<StreamError> for AgentError {
     }
 }
 
+/// {delivery} learns, while the stream still runs, the first time any
+/// attempt reaches the provider's server.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn stream_with_retry(
     provider: &dyn Provider,
@@ -162,6 +164,7 @@ pub(crate) async fn stream_with_retry(
     opts: RequestOptions,
     session_id: Option<&SessionRef>,
     retry_policy: RetryPolicy,
+    delivery: &RequestDeliveryTracker,
 ) -> Result<StreamResponse, StreamError> {
     let opts = opts.clamped(model);
     let messages = maki_providers::adapt_images_for_model(model, messages).await;
@@ -187,6 +190,7 @@ pub(crate) async fn stream_with_retry(
                 opts,
                 session_id,
                 &invocation,
+                delivery.attempt(invocation.attempt),
             ),
             async {
                 cancel.cancelled().await;
@@ -194,6 +198,7 @@ pub(crate) async fn stream_with_retry(
             },
         )
         .await;
+        delivery.end_attempt(result.is_ok());
         drop(ptx);
         let streamed = forwarder.await;
         match result {
@@ -255,7 +260,7 @@ pub(crate) async fn stream_with_retry(
 
 #[cfg(test)]
 mod tests {
-    use maki_providers::{RetryKind, Role};
+    use maki_providers::{RequestDelivery, RetryKind, Role};
     use serde_json::json;
     use test_case::test_case;
 
@@ -406,6 +411,7 @@ mod tests {
             _: RequestOptions,
             _: Option<&'a SessionRef>,
             invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {
             self.invocations.lock().unwrap().push(invocation.clone());
             Box::pin(async move {
@@ -467,6 +473,7 @@ mod tests {
                     RequestOptions::default(),
                     None,
                     policy,
+                    &RequestDeliveryTracker::new(),
                 )
                 .await
                 .unwrap();
@@ -502,6 +509,7 @@ mod tests {
                     RequestOptions::default(),
                     None,
                     instant_retry(),
+                    &RequestDeliveryTracker::new(),
                 )
                 .await
                 .unwrap();
@@ -554,6 +562,7 @@ mod tests {
             _: RequestOptions,
             _: Option<&'a SessionRef>,
             _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 let index = self.current.load(std::sync::atomic::Ordering::Relaxed);
@@ -601,6 +610,7 @@ mod tests {
             RequestOptions::default(),
             None,
             no_budget(),
+            &RequestDeliveryTracker::new(),
         )
         .await
     }
@@ -634,6 +644,87 @@ mod tests {
 
             assert!(result.is_err(), "no key in the pool is accepted");
             assert_eq!(server.keys_seen().len(), keys, "and no key is tried twice");
+        });
+    }
+
+    enum AttemptEnd {
+        Retryable,
+        Terminal,
+        Success,
+    }
+
+    /// Plays one `(marks, end)` per attempt and keeps every handle it got.
+    struct DeliveryScript {
+        attempts: std::sync::Mutex<std::vec::IntoIter<(bool, AttemptEnd)>>,
+        handles: std::sync::Mutex<Vec<RequestDelivery>>,
+    }
+
+    impl Provider for DeliveryScript {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+            _: &'a Invocation,
+            delivery: RequestDelivery,
+        ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            let (marks, end) = self.attempts.lock().unwrap().next().unwrap();
+            if marks {
+                assert!(delivery.mark());
+            }
+            self.handles.lock().unwrap().push(delivery);
+            Box::pin(async move {
+                match end {
+                    AttemptEnd::Retryable => {
+                        Err(rejected(RATE_LIMITED, Some(RetryKind::RateLimit)))
+                    }
+                    AttemptEnd::Terminal => Err(rejected(UNAUTHORIZED, None)),
+                    AttemptEnd::Success => Ok(StreamResponse {
+                        message: Message::user("ok".into()),
+                        usage: maki_providers::TokenUsage::default(),
+                        stop_reason: Some(maki_providers::StopReason::EndTurn),
+                    }),
+                }
+            })
+        }
+    }
+
+    #[test_case(vec![(false, AttemptEnd::Retryable), (false, AttemptEnd::Success)], true ; "success_delivers_without_a_mark")]
+    #[test_case(vec![(true, AttemptEnd::Retryable), (false, AttemptEnd::Terminal)], true ; "delivered_attempt_stays_delivered_after_a_failed_retry")]
+    #[test_case(vec![(false, AttemptEnd::Retryable), (true, AttemptEnd::Terminal)], true ; "a_later_attempt_delivers")]
+    #[test_case(vec![(false, AttemptEnd::Retryable), (false, AttemptEnd::Terminal)], false ; "failures_without_a_mark_stay_undelivered")]
+    fn delivery_spans_the_logical_request(attempts: Vec<(bool, AttemptEnd)>, delivered: bool) {
+        smol::block_on(async {
+            let provider = DeliveryScript {
+                attempts: std::sync::Mutex::new(attempts.into_iter()),
+                handles: std::sync::Mutex::default(),
+            };
+            let tracker = RequestDeliveryTracker::new();
+            let (tx, _rx) = flume::unbounded();
+            let _ = stream_with_retry(
+                &provider,
+                test_conversation(),
+                &Model::from_spec("ollama/qwen3").unwrap(),
+                &[Message::user("hi".into())],
+                "",
+                &json!([]),
+                &EventSender::new(tx),
+                &CancelToken::none(),
+                RequestOptions::default(),
+                None,
+                instant_retry(),
+                &tracker,
+            )
+            .await;
+            assert_eq!(tracker.is_delivered(), delivered);
+            for handle in provider.handles.lock().unwrap().iter() {
+                assert!(!handle.mark(), "a retired attempt cannot mark");
+            }
+            assert_eq!(tracker.is_delivered(), delivered);
         });
     }
 }

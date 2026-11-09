@@ -757,7 +757,9 @@ impl ActorBackend for HeadlessBackend {
                     .await;
                     match &result {
                         Ok(()) => {
-                            if let Some(config) = &context.policy {
+                            if let Some(config) = &context.policy
+                                && let Some(ended) = ended
+                            {
                                 end_conversation_detached(
                                     &config.settings.provider,
                                     ended,
@@ -1160,7 +1162,9 @@ pub(crate) mod tests {
     use crate::tools::offload::{OffloadBackend, OffloadError};
     use crate::{ModeRegistry, TurnOutcome};
     use maki_providers::provider::Provider;
-    use maki_providers::{ContentBlock, Invocation, Role, StopReason, StreamResponse, TokenUsage};
+    use maki_providers::{
+        ContentBlock, Invocation, RequestDelivery, Role, StopReason, StreamResponse, TokenUsage,
+    };
     use maki_storage::checkpoint::{
         CheckpointAck, CheckpointError, CheckpointFuture, CheckpointRequest, CheckpointWriter,
         accept_all,
@@ -1215,6 +1219,7 @@ pub(crate) mod tests {
             _: RequestOptions,
             _: Option<&'a SessionRef>,
             _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
             Box::pin(async move {
                 self.entered.send_async(()).await.unwrap();
@@ -1248,6 +1253,7 @@ pub(crate) mod tests {
             _: RequestOptions,
             _: Option<&'a SessionRef>,
             invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
             let _ = self.requests.send(Arc::clone(&invocation.conversation_id));
             Box::pin(async { Ok(response(SAVED_OUTPUT)) })
@@ -1274,6 +1280,7 @@ pub(crate) mod tests {
             options: RequestOptions,
             _: Option<&'a SessionRef>,
             _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
             Box::pin(async move {
                 let _ = self

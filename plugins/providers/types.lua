@@ -153,10 +153,16 @@ export type Context = {
   with_name: (self: Context, name: string) -> any,
 }
 
+-- The ctx `stream` gets, which can also mark the request delivered.
+export type StreamContext = Context & {
+  mark_request_delivery: () -> boolean,
+}
+
 export type UsageLimit = { kind: Json, percentage: number?, reset_at: number?, detail: string? }
 
 export type Instance = {
-  stream: (ctx: Context, request: Request, emit: Emit) -> (StreamResult?, Error?),
+  stream: (ctx: StreamContext, request: Request, emit: Emit) -> (StreamResult?, Error?),
+  request_delivery_marker: ("auto" | "manual")?,
   fetch_usage: ((ctx: Context) -> ({ plan: string?, limits: { UsageLimit } }?, Error?))?,
   refresh_auth: ((ctx: Context) -> (boolean?, Error?))?,
   reload_auth: ((ctx: Context) -> (boolean?, Error?))?,

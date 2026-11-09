@@ -814,8 +814,8 @@ mod tests {
         CommandError, CommandFuture, FrontendFeedback, TargetCapabilities, TargetCapability,
     };
     use maki_providers::{
-        ContentBlock, FastSupport, Invocation, Message, ModelInfo, ProviderEvent, RequestOptions,
-        Role, StopReason, StreamResponse, TokenUsage,
+        ContentBlock, FastSupport, Invocation, Message, ModelInfo, ProviderEvent, RequestDelivery,
+        RequestOptions, Role, StopReason, StreamResponse, TokenUsage,
         provider::{BoxFuture, ModelBatch, Provider},
     };
     use maki_storage::sessions::{SESSIONS_DIR, offload_dir};
@@ -1164,6 +1164,7 @@ mod tests {
             options: maki_providers::RequestOptions,
             _: Option<&'a SessionRef>,
             _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> maki_providers::provider::BoxFuture<
             'a,
             Result<maki_providers::StreamResponse, maki_agent::AgentError>,
@@ -1314,6 +1315,7 @@ mod tests {
             _: RequestOptions,
             _: Option<&'a SessionRef>,
             _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 self.polled.send_async(()).await.unwrap();

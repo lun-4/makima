@@ -247,9 +247,15 @@ function M.provider(cache)
     if not socket then
       return nil, http.config_error(NO_SOCKET)
     end
-    local instance = {}
+    -- The bridge takes the conversation over, and may move its
+    -- predecessor's Claude session to it, as soon as a step arrives: before
+    -- it answers, and even for a step it then refuses.
+    local instance = { request_delivery_marker = "manual" }
 
     function instance.stream(ctx, request, emit)
+      if not ctx.mark_request_delivery() then
+        return nil, { message = CANCELLED, retry = "none" }
+      end
       local response, err =
         send(ctx, socket, "POST", STEPS_PATH, { protocol_version = M.PROTOCOL_VERSION, request = request })
       if not response then

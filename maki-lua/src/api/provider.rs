@@ -225,9 +225,10 @@ fn spec_error(message: impl fmt::Display) -> mlua::Error {
 /// a provider id's credentials belong to the plugin that registered it. An instance has
 /// `stream(ctx, request, emit)` and optionally `fetch_usage(ctx)`,
 /// `refresh_auth(ctx)`, `reload_auth(ctx)`, `rotate_key(ctx)`,
-/// `end_conversation(ctx, conversation_id, reason)` and `key_count` (a
+/// `end_conversation(ctx, conversation_id, reason)`, `key_count` (a
 /// number, or a function read at prepare and after each `reload_auth` or
-/// `refresh_auth`, for a pool those can change). `request` has `model`
+/// `refresh_auth`, for a pool those can change) and
+/// `request_delivery_marker`. `request` has `model`
 /// (`id`, `max_output_tokens`, `context_window`), `system`, `messages`,
 /// `tools`, `thinking`, `fast`, `session_id` and `invocation`
 /// (`conversation_id`, `operation_id`, `attempt`, `purpose`, `agent_id`,
@@ -252,6 +253,21 @@ fn spec_error(message: impl fmt::Display) -> mlua::Error {
 /// `maki.net.send` failure. A bare string and a raised error are not
 /// retried. Every callback that returns nil plus an error follows these
 /// rules.
+///
+/// The host links a successor to a conversation, and ends it with
+/// `end_conversation`, only once a request under it was delivered: handed to
+/// a server that may now hold state for it. `request_delivery_marker`
+/// decides when that is. With `"auto"`, the default, a request is delivered
+/// at its first accepted `emit`. With `"manual"` the provider decides alone,
+/// and `emit` never delivers. In both, `ctx.mark_request_delivery()`, which
+/// only `stream`'s ctx has, delivers the request at once and returns true;
+/// once the call is over it returns false, and the provider must then not
+/// send the request. A successful return always delivers; a manual provider
+/// that never marked gets a warning in the log, and a failure without a mark
+/// stays undelivered. Delivery holds across the retries of a request. A
+/// provider whose server keeps state per conversation should mark right
+/// before it sends the model request, since a failure or cancel before the
+/// first event would otherwise leave that state behind.
 ///
 /// @param ctx maki.Ctx? The ctx to register under; omit it for the plugin's root ctx.
 /// @param spec table Required. Provider definition (see above).

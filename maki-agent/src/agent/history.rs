@@ -89,8 +89,9 @@ impl History {
     }
 
     /// Starts a new conversation that carries on from the current one over
-    /// the messages it still holds, and returns the outgoing id.
-    pub fn continue_conversation(&mut self) -> Arc<str> {
+    /// the messages it still holds. Returns the outgoing id when a request
+    /// under it was delivered, the only case that leaves remote state to end.
+    pub fn continue_conversation(&mut self) -> Option<Arc<str>> {
         let previous = self
             .conversation
             .link(ConversationRelation::Continues, self.len());
@@ -98,15 +99,16 @@ impl History {
     }
 
     /// Starts a new conversation whose history does not come from the
-    /// current one, and returns the outgoing id.
-    pub fn restart_conversation(&mut self) -> Arc<str> {
+    /// current one. Returns the outgoing id when a request under it was
+    /// delivered.
+    pub fn restart_conversation(&mut self) -> Option<Arc<str>> {
         self.rotate(None)
     }
 
-    fn rotate(&mut self, previous: Option<ConversationLink>) -> Arc<str> {
+    fn rotate(&mut self, previous: Option<ConversationLink>) -> Option<Arc<str>> {
         let ended = self.set_conversation(ConversationState::fresh(previous));
         self.publish();
-        ended.id
+        ended.sent.map(|_| ended.id)
     }
 
     fn set_conversation(&mut self, conversation: ConversationState) -> ConversationState {
@@ -177,8 +179,9 @@ impl History {
         self.publish();
     }
 
-    /// Returns the conversation id the compacted history leaves behind.
-    pub fn replace_compacted(&mut self, messages: Vec<Message>) -> Arc<str> {
+    /// Returns the conversation id the compacted history leaves behind, when
+    /// a request under it was delivered.
+    pub fn replace_compacted(&mut self, messages: Vec<Message>) -> Option<Arc<str>> {
         self.snapshot.compacted = true;
         self.replace(messages);
         self.restart_conversation()
@@ -373,7 +376,7 @@ mod tests {
         history.mark_sent();
         let sent = history.conversation().clone();
         assert_eq!(mirror_conversation(&mirror), sent);
-        let ended = history.continue_conversation();
+        let ended = history.continue_conversation().unwrap();
         assert_eq!(ended.as_ref(), STORED);
         let current = history.conversation().clone();
         assert_eq!(mirror_conversation(&mirror), current);
@@ -411,7 +414,7 @@ mod tests {
     ) {
         let mut history = sent_history(sent, total);
         history.truncate(kept);
-        let ended = history.continue_conversation();
+        let ended = history.continue_conversation().unwrap();
         assert_eq!(
             history.conversation().previous,
             Some(ConversationLink {
@@ -426,9 +429,9 @@ mod tests {
     #[test]
     fn a_conversation_that_never_sent_passes_its_link_on() {
         let mut history = sent_history(3, 3);
-        let first = history.continue_conversation();
+        let first = history.continue_conversation().unwrap();
         history.truncate(1);
-        history.continue_conversation();
+        assert_eq!(history.continue_conversation(), None);
         assert_eq!(
             history.conversation().previous,
             Some(ConversationLink {
@@ -440,6 +443,25 @@ mod tests {
         assert_eq!(
             history.branch(history.len()).map(|link| link.relation),
             Some(ConversationRelation::Branches)
+        );
+    }
+
+    #[test]
+    fn rotating_an_undelivered_conversation_ends_nothing() {
+        let mut history = History::new(vec![Message::user(FIRST.into())]);
+        assert_eq!(history.restart_conversation(), None);
+        assert_eq!(
+            history.replace_compacted(vec![Message::user(SECOND.into())]),
+            None
+        );
+        history.mark_sent();
+        let delivered = Arc::clone(history.conversation_id());
+        assert_eq!(history.restart_conversation(), Some(delivered));
+        history.mark_sent();
+        let compacted = Arc::clone(history.conversation_id());
+        assert_eq!(
+            history.replace_compacted(vec![Message::user(SECOND.into())]),
+            Some(compacted)
         );
     }
 

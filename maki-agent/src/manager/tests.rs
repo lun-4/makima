@@ -10,7 +10,7 @@ use test_case::test_case;
 use event_listener::Event;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    Invocation, Model, ProviderEvent, RequestOptions, StreamResponse, TokenUsage,
+    Invocation, Model, ProviderEvent, RequestDelivery, RequestOptions, StreamResponse, TokenUsage,
 };
 use maki_storage::checkpoint::CheckpointPublication;
 use maki_storage::id::SessionRef;
@@ -1954,6 +1954,7 @@ impl Provider for ConfigTestProvider {
         _: RequestOptions,
         _: Option<&'a SessionRef>,
         _invocation: &'a Invocation,
+        _delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, maki_providers::AgentError>> {
         Box::pin(async { unreachable!() })
     }

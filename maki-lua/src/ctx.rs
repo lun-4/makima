@@ -106,6 +106,9 @@ pub(crate) enum Ctx {
         plugin: PluginCtx,
         id: Arc<str>,
         send: Function,
+        /// Only on a `stream` call's ctx: the host extends that one ctx so the
+        /// provider can deliver its request.
+        mark_request_delivery: Option<Function>,
     },
 }
 
@@ -183,6 +186,15 @@ fn ctx_fields<F: UserDataFields<Ctx>>(fields: &mut F) {
             Ctx::Provider { id, .. } => Some(id.to_string()),
         })
     });
+    fields.add_field_method_get("mark_request_delivery", |_, this| {
+        Ok(match this {
+            Ctx::Plugin(_) => None,
+            Ctx::Provider {
+                mark_request_delivery,
+                ..
+            } => mark_request_delivery.clone(),
+        })
+    });
     fields.add_field_method_get("credentials", |_, this| {
         Ok(match this {
             Ctx::Plugin(_) => None,
@@ -202,7 +214,8 @@ lua_class! {
     /// `MAKIMA_NET_TIMEOUT_SECS` (default 30 seconds) on a plugin ctx, from
     /// `[provider]` on a provider ctx. A provider ctx, which a provider's
     /// callbacks receive, also has `id` (the provider id) and `credentials`
-    /// (the provider's `maki.credentials.Store`).
+    /// (the provider's `maki.credentials.Store`); a `stream` call's ctx also
+    /// has `mark_request_delivery`, described on `maki.api.register_provider`.
     "maki.Ctx" => Ctx, CTX_DOCS [with_name] fields ctx_fields
 }
 

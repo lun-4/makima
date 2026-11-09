@@ -12,8 +12,9 @@ use maki_config::providers::{ProviderDef, ProvidersConfig};
 use maki_lua::PluginHost;
 use maki_providers::{
     AgentError, ContentBlock, ConversationEnd, ConversationLink, ConversationRelation, Invocation,
-    InvocationPurpose, Message, PreparedProvider, ProviderEvent, ProviderRegistry, RequestOptions,
-    RetryKind, Role, StopReason, Timeouts, UsageLimit, UsageWindow,
+    InvocationPurpose, Message, PreparedProvider, ProviderEvent, ProviderRegistry, RequestDelivery,
+    RequestDeliveryTracker, RequestOptions, RetryKind, Role, StopReason, Timeouts, UsageLimit,
+    UsageWindow,
 };
 use serde_json::json;
 use test_case::test_case;
@@ -64,6 +65,21 @@ const KEY_COUNT: usize = 3;
 const CONFIGURED_URL: &str = "http://configured.invalid";
 const FIVE_HOURS: u64 = 5;
 const USED_PERCENT: u32 = 70;
+const MARKER_ERR: &str = r#"request_delivery_marker must be "auto" or "manual""#;
+const EMIT_THEN_FAIL: &str = r#"emit({ type = "text_delta", text = "hi" })
+            return nil, "boom""#;
+const MARK_TWICE: &str = r#"local first = ctx.mark_request_delivery()
+            local second = ctx.mark_request_delivery()
+            return { message = { role = "assistant",
+                content = { { type = "text", text = tostring(first) .. tostring(second) } } } }"#;
+const KEEP_CTX_THEN_FAIL: &str = r#"if kept_ctx then
+                return { message = { role = "assistant",
+                    content = { { type = "text", text = tostring(kept_ctx.mark_request_delivery()) } } } }
+            end
+            kept_ctx = ctx
+            return nil, "boom""#;
+const MARKED_TWICE: &str = "truetrue";
+const RETIRED_MARK: &str = "false";
 const CONFIG_SOURCE: &str = r#"
     maki.api.register_provider({
         id = "fake",
@@ -188,6 +204,14 @@ fn stream(
     prepared: &PreparedProvider,
     events: &flume::Sender<ProviderEvent>,
 ) -> Result<maki_providers::StreamResponse, AgentError> {
+    stream_tracked(prepared, events, RequestDelivery::untracked())
+}
+
+fn stream_tracked(
+    prepared: &PreparedProvider,
+    events: &flume::Sender<ProviderEvent>,
+    delivery: RequestDelivery,
+) -> Result<maki_providers::StreamResponse, AgentError> {
     smol::block_on(bounded(prepared.provider.stream_message(
         &prepared.model,
         &[user_message()],
@@ -197,7 +221,27 @@ fn stream(
         RequestOptions::default(),
         None,
         &invocation(),
+        delivery,
     )))
+}
+
+/// Streams once under a fresh tracker; returns the result and whether the
+/// request was delivered.
+fn stream_delivery(
+    prepared: &PreparedProvider,
+) -> (Result<maki_providers::StreamResponse, AgentError>, bool) {
+    let tracker = RequestDeliveryTracker::new();
+    let (events, _rx) = flume::unbounded();
+    let result = stream_tracked(prepared, &events, tracker.attempt(ATTEMPT));
+    (result, tracker.is_delivered())
+}
+
+fn marker_instance(marker: &str, body: &str) -> String {
+    format!(
+        r#"return {{ {marker} stream = function(ctx, request, emit)
+            {body}
+        end }}"#
+    )
 }
 
 fn text(message: &Message) -> &str {
@@ -205,6 +249,56 @@ fn text(message: &Message) -> &str {
         ContentBlock::Text { text } => text,
         other => panic!("expected text, got {other:?}"),
     }
+}
+
+#[test_case("" , true ; "absent_marks_on_first_event")]
+#[test_case(r#"request_delivery_marker = "auto","# , true ; "auto_marks_on_first_event")]
+#[test_case(r#"request_delivery_marker = "manual","# , false ; "manual_ignores_events")]
+fn delivery_marker_decides_whether_an_event_delivers(marker: &str, delivered: bool) {
+    let (_host, prepared) = prepare_fake(&marker_instance(marker, EMIT_THEN_FAIL));
+    let (result, was_delivered) = stream_delivery(&prepared);
+    result.unwrap_err();
+    assert_eq!(was_delivered, delivered);
+}
+
+#[test]
+fn unknown_delivery_marker_fails_preparation() {
+    let host = host();
+    let instance = marker_instance(r#"request_delivery_marker = "eager","#, EMIT_THEN_FAIL);
+    host.load_source(PLUGIN, &spec_source(PROVIDER, "", &instance))
+        .unwrap();
+    let providers = registry(&host);
+    let model = providers.model(SPEC).unwrap();
+    let error = smol::block_on(bounded(providers.prepare(model)))
+        .err()
+        .unwrap();
+    assert!(
+        matches!(&error, AgentError::Config { message } if message.contains(MARKER_ERR)),
+        "{error}"
+    );
+}
+
+#[test_case("" ; "auto")]
+#[test_case(r#"request_delivery_marker = "manual","# ; "manual")]
+fn explicit_mark_delivers_and_repeats_as_a_no_op(marker: &str) {
+    let (_host, prepared) = prepare_fake(&marker_instance(marker, MARK_TWICE));
+    let (result, delivered) = stream_delivery(&prepared);
+    assert_eq!(text(&result.unwrap().message), MARKED_TWICE);
+    assert!(delivered);
+}
+
+#[test]
+fn retained_ctx_cannot_mark_after_its_call_ended() {
+    let (_host, prepared) = prepare_fake(&marker_instance(
+        r#"request_delivery_marker = "manual","#,
+        KEEP_CTX_THEN_FAIL,
+    ));
+    let first = RequestDeliveryTracker::new();
+    let (events, _rx) = flume::unbounded();
+    stream_tracked(&prepared, &events, first.attempt(ATTEMPT)).unwrap_err();
+    let (result, _) = stream_delivery(&prepared);
+    assert_eq!(text(&result.unwrap().message), RETIRED_MARK);
+    assert!(!first.is_delivered());
 }
 
 #[test_case(r#"colour = "red","# , UNKNOWN_FIELD_ERR ; "unknown field")]
@@ -535,6 +629,7 @@ fn dropping_the_stream_cancels_the_call_and_closes_the_emitter() {
         RequestOptions::default(),
         None,
         &invocation,
+        RequestDelivery::untracked(),
     );
     let first = smol::block_on(bounded(future::or(
         async {

@@ -12,7 +12,7 @@ use maki_lua::PluginHost;
 use maki_lua::test_support::InMemoryFs;
 use maki_lua::ui_sink::HostUi;
 use maki_providers::{
-    ContentBlock, Invocation, InvocationPurpose, PreparedProvider, RequestOptions,
+    ContentBlock, Invocation, InvocationPurpose, PreparedProvider, RequestDelivery, RequestOptions,
 };
 use maki_storage::StateDir;
 use maki_storage::auth::{load_credentials, lock_tokens, save_credentials};
@@ -276,6 +276,7 @@ async fn run_script(prepared: &PreparedProvider, script: &str) -> String {
             RequestOptions::default(),
             None,
             &invocation,
+            RequestDelivery::untracked(),
         )
         .await
         .unwrap();
