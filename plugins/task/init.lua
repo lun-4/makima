@@ -549,38 +549,37 @@ local function send_label(input, state)
   return "To " .. input.task_id:sub(-8)
 end
 
--- The message as a quote; clicks toggle the truncated view. A failure line
--- follows the quote so the user still sees what was sent.
-local function quote_body(text, ctx, failure)
+-- Renders the message as a quote now and returns a cheap finisher for the
+-- result. Handlers call this before admitting work: a child that runs while
+-- its parent is still rendering can finish and have its result delivered
+-- ahead of the parent's next request. Clicks toggle the truncated view, and a
+-- failure line follows the quote so the user still sees what was sent.
+local function quote_view(text, ctx, failed_prefix, header_text)
   local quote, view = markdown_preview(text, ctx, QUOTE_BAR)
   view:finish()
-  local body = maki.ui.buf()
-  local function render()
-    body:set_lines(quote:get_lines())
-    if failure then
-      body:line({ { failure, "error" } })
+  return function(output, is_error)
+    local body = maki.ui.buf()
+    local function render()
+      body:set_lines(quote:get_lines())
+      if is_error then
+        body:line({ { failed_prefix .. output, "error" } })
+      end
     end
-  end
-  render()
-  body:on("click", function()
-    view:toggle()
     render()
-  end)
-  return body
+    body:on("click", function()
+      view:toggle()
+      render()
+    end)
+    return { body = body, header = label_buf(header_text) }
+  end
 end
 
-local function send_view(input, output, is_error, ctx, state)
-  return {
-    body = quote_body(input.message, ctx, is_error and SEND_FAILED_PREFIX .. output or nil),
-    header = label_buf(send_label(input, state)),
-  }
+local function send_view(input, ctx, state)
+  return quote_view(input.message, ctx, SEND_FAILED_PREFIX, send_label(input, state))
 end
 
-local function spawn_view(input, output, is_error, ctx)
-  return {
-    body = quote_body(input.prompt, ctx, is_error and SPAWN_FAILED_PREFIX .. output or nil),
-    header = label_buf(input.description),
-  }
+local function spawn_view(input, ctx)
+  return quote_view(input.prompt, ctx, SPAWN_FAILED_PREFIX, input.description)
 end
 
 local function despawn_view(input, output, is_error, state)
@@ -609,8 +608,9 @@ local send_schema = {
 local function send_handler(input, ctx)
   local task, access_err = resolve_task(input.task_id)
   local state = task and { description = task.description } or nil
+  local finish_view = send_view(input, ctx, state)
   local function reply(output, is_error)
-    return rendered_reply(send_view(input, output, is_error, ctx, state), output, is_error, state)
+    return rendered_reply(finish_view(output, is_error), output, is_error, state)
   end
   if not task then
     return reply(access_err, true)
@@ -630,8 +630,9 @@ local function send_handler(input, ctx)
 end
 
 local function spawn_handler(input, ctx)
+  local finish_view = spawn_view(input, ctx)
   local function reply(output, is_error)
-    return rendered_reply(spawn_view(input, output, is_error, ctx), output, is_error)
+    return rendered_reply(finish_view(output, is_error), output, is_error)
   end
   local spec, err = prepare(input, ctx)
   if err then
@@ -702,7 +703,11 @@ local function restore_wait(input, output, is_error, ctx)
 end
 
 local function restore_send(input, output, is_error, ctx)
-  return send_view(input, output, is_error, ctx, ctx:state())
+  return send_view(input, ctx, ctx:state())(output, is_error)
+end
+
+local function restore_spawn(input, output, is_error, ctx)
+  return spawn_view(input, ctx)(output, is_error)
 end
 
 local function task_header(input)
@@ -726,7 +731,7 @@ maki.api.register_tool({
   schema = spawn_schema,
   handler = spawn_handler,
   header = header,
-  restore = spawn_view,
+  restore = restore_spawn,
 })
 
 maki.api.register_tool({
