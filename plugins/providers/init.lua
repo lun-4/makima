@@ -55,6 +55,8 @@ register_compat({ "mistral", "openrouter", "requesty", "tensorx" })
 for _, name in ipairs({ "ollama", "llama_cpp" }) do
   register(local_server.provider(require("providers." .. name).def))
 end
+local claude_agent = require("providers.claude_agent")
+register(claude_agent.provider(claude_agent.cache_path()))
 
 -- Seeded from the cache only, so startup never waits on the network.
 local cache = catalog.new(catalog.cache_dir())
