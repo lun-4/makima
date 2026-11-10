@@ -6,8 +6,9 @@ use maki_storage::sessions::{Prefs, SessionMeta};
 /// spoken keeps its own; a {blank} one takes config on top of what it saved,
 /// with the saved `/thinking` preference ahead of `always_thinking`. A stored
 /// thinking (off included) wins on a spoken session; one that never recorded
-/// a level falls back to the preference, then config. What {model} cannot
-/// do starts off. The returned thinking is `None` for off.
+/// a level falls back to the preference, then config. What {model} is known
+/// not to do starts off; a capability still undiscovered keeps the choice.
+/// The returned thinking is `None` for off.
 pub fn resolve(
     config: SessionDefaults,
     prefs: &Prefs,
@@ -24,7 +25,7 @@ pub fn resolve(
     SessionDefaults {
         fast: (meta.fast || blank && config.fast) && model.supports_fast(),
         workflow: meta.workflow || blank && config.workflow,
-        thinking: thinking.filter(|_| model.supports_thinking()),
+        thinking: thinking.filter(|_| model.supports_thinking() != Some(false)),
     }
 }
 
@@ -97,6 +98,24 @@ mod tests {
             default_thinking: case.saved,
         };
         resolve(case.config, &prefs, &meta, case.blank, &model(true))
+    }
+
+    #[test_case(true ; "blank_session")]
+    #[test_case(false ; "spoken_session")]
+    fn resolve_keeps_the_preference_while_thinking_support_is_unknown(blank: bool) {
+        let mut model = model(false);
+        model.thinking_support = None;
+        let prefs = Prefs {
+            default_thinking: HIGH,
+        };
+        let resolved = resolve(
+            knobs(false, false, None),
+            &prefs,
+            &SessionMeta::default(),
+            blank,
+            &model,
+        );
+        assert_eq!(resolved.thinking, HIGH);
     }
 
     #[test]

@@ -104,7 +104,7 @@ fn thinking_clamped_to_off_for_non_supporting_model() {
         ..Model::from_spec("ollama/qwen3").unwrap()
     });
     assert!(
-        !non_thinking.supports_thinking(),
+        non_thinking.supports_thinking() == Some(false),
         "fixture model must not support thinking"
     );
     ctx.model = non_thinking;

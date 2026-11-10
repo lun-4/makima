@@ -217,7 +217,7 @@ impl ConfigChange {
             return Err(crate::session_options::SessionOptionError::FastUnsupported.into());
         }
         if patch.thinking.is_some_and(|thinking| thinking.enabled())
-            && !config.model.supports_thinking()
+            && config.model.supports_thinking() != Some(true)
         {
             return Err(crate::session_options::SessionOptionError::ThinkingUnsupported.into());
         }

@@ -7174,7 +7174,7 @@ mod tests {
             let storage = StateDir::from_path(tmp.path().to_path_buf());
             session.save(&storage).unwrap();
             let model = providers.model(&spec).unwrap();
-            assert!(model.supports_thinking());
+            assert_eq!(model.supports_thinking(), Some(true));
             let mut params = test_params(model, tmp.path().to_path_buf());
             params.providers = providers;
             params.defaults.thinking = Some(StoredThinking::Effort {

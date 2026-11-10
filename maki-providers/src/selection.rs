@@ -45,7 +45,7 @@ impl From<&Model> for ModelCapabilities {
         Self {
             thinking: if model.requires_thinking() {
                 ThinkingSupport::Required
-            } else if model.supports_thinking() {
+            } else if model.supports_thinking() == Some(true) {
                 ThinkingSupport::Yes
             } else {
                 ThinkingSupport::No

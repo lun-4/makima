@@ -586,8 +586,8 @@ impl App {
             suppress_status_content: self.suppress_status_content.load(Ordering::Acquire),
             hover: self.hover,
             thinking_supported: config.as_ref().map_or_else(
-                || self.root_config().model.supports_thinking(),
-                |config| config.model.supports_thinking(),
+                || self.root_config().model.supports_thinking() == Some(true),
+                |config| config.model.supports_thinking() == Some(true),
             ),
         };
         let hits = self.status_bar.view(frame, status_area, &ctx);
