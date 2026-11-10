@@ -28,7 +28,7 @@ fn os_getenv_returns_nil_for_missing_var() {
     host.load_source(
         "getenv_missing",
         r#"
-        local val = maki.uv.os_getenv("MAKI_TEST_VAR_DOES_NOT_EXIST_12345")
+        local val = maki.uv.os_getenv("MAKIMA_TEST_VAR_DOES_NOT_EXIST_12345")
         assert(val == nil, "unset var should return nil, got: " .. tostring(val))
         "#,
     )

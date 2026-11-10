@@ -45,7 +45,7 @@ One convention to remember: fallible runtime operations return a
 ```lua
 local text, err = maki.fs.read("config.json")
 if err then
-  maki.log.error("read failed: " .. err)
+  makima.log.error("read failed: " .. err)
   return
 end
 ```

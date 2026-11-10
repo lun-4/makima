@@ -84,7 +84,7 @@ const PROMPT: &str = "say ok";
 const HIGH: &str = "high";
 const LOW: &str = "low";
 const OFF_EFFORT: &str = "none";
-const APP_DIR: &str = "makima";
+const APP_DIR: &str = makima_storage::paths::APP_NAME;
 const PREFS_FILE: &str = "prefs.json";
 const CATALOG_CACHE_FILE: &str = "models-dev-catalog.json";
 /// Any request that leaves loopback dies here instead of reaching the network.

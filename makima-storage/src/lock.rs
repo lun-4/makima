@@ -30,7 +30,7 @@ pub struct Lock {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LockError {
-    #[error("{path} is locked by another Maki process")]
+    #[error("{path} is locked by another Makima process")]
     Held { path: PathBuf },
     #[error("cannot lock {path}: {source}")]
     Io {

@@ -983,8 +983,8 @@ mod tests {
         assert_eq!(collapse_home_with(path, home), expected);
     }
 
-    #[test_case("~/projects/maki:main", 30, "~/projects/maki:main" ; "fits_untouched")]
-    #[test_case("~/projects/maki:main", 10, "..aki:main"           ; "ascii_tail")]
+    #[test_case("~/projects/makima:main", 30, "~/projects/makima:main" ; "fits_untouched")]
+    #[test_case("~/projects/makima:main", 10, "..ima:main"          ; "ascii_tail")]
     #[test_case("~/文档/proj:分支", 8, "..j:分支"                  ; "cjk_path_and_branch")]
     #[test_case("release/🚀-v2", 6, "..-v2"                        ; "emoji_branch")]
     #[test_case("abc", 2, ".."                                     ; "prefix_only")]

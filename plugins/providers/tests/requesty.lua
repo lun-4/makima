@@ -127,7 +127,7 @@ t.case("auto_cache_effort_and_attribution", function()
     { supports_thinking = true }
   )
   t.same(body, { requesty = { auto_cache = true }, reasoning_effort = "high" })
-  t.same(headers, { ["HTTP-Referer"] = "https://maki.sh", ["X-Title"] = "Makima" })
+  t.same(headers, { ["HTTP-Referer"] = "https://makima.ln4.net", ["X-Title"] = "Makima" })
   body = {}
   requesty.def.encode(body, { thinking = { kind = "off" }, model = {} }, { supports_thinking = false })
   t.eq(body.reasoning_effort, nil)

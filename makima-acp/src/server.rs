@@ -6012,7 +6012,7 @@ mod tests {
                     permissions_config: Default::default(),
                     timeouts: Default::default(),
                     initial_wd: PathBuf::from("/project"),
-                    storage: StateDir::from_path(PathBuf::from("/tmp/maki-acp-test")),
+                    storage: StateDir::from_path(PathBuf::from("/tmp/makima-acp-test")),
                     prompt_slots: Default::default(),
                     yolo: false,
                     defaults: SessionDefaults::default(),

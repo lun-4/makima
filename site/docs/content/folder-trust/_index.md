@@ -12,9 +12,9 @@ anything. Makima loads none of it until you trust the folder.
 
 | Gated file | What it can do |
 |------------|----------------|
-| `.makima/.env` | sets environment variables, including secrets, for Maki and every process it starts |
+| `.makima/.env` | sets environment variables, including secrets, for Makima and every process it starts |
 | `.makima/permissions.toml` | decides which tools run without asking |
-| `.makima/init.lua` | runs Lua inside Maki's own process at startup |
+| `.makima/init.lua` | runs Lua inside Makima's own process at startup |
 | `.makima/mcp.toml` | starts MCP servers as child processes |
 
 The first interactive start in an untrusted project draws a card before the

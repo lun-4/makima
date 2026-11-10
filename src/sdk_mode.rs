@@ -3853,9 +3853,9 @@ mod tests {
     #[test_case("index", "Index")]
     #[test_case("memory", "Memory")]
     #[test_case("question", "Question")]
-    fn makima_to_claude_roundtrip(maki: &str, claude: &str) {
-        assert_eq!(makima_to_claude_tool_name(maki), claude);
-        assert_eq!(claude_to_makima_tool_name(claude), maki);
+    fn makima_to_claude_roundtrip(makima: &str, claude: &str) {
+        assert_eq!(makima_to_claude_tool_name(makima), claude);
+        assert_eq!(claude_to_makima_tool_name(claude), makima);
     }
 
     #[test]

@@ -10,6 +10,7 @@ use futures_lite::io::AsyncReadExt;
 use isahc::config::{Configurable, RedirectPolicy, ResolveMap, VersionNegotiation};
 use isahc::{AsyncBody, HttpClient, Request, Response};
 use makima_lua_macro::{lua_fn, lua_table};
+use makima_storage::paths::APP_NAME;
 use mlua::{Lua, Result as LuaResult, Table};
 use smol::{Timer, unblock};
 use url::Url;
@@ -26,7 +27,7 @@ const MAX_REDIRECTS: u32 = 10;
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const CF_MITIGATED: &str = "cf-mitigated";
 const CF_CHALLENGE: &str = "challenge";
-const FALLBACK_USER_AGENT: &str = "maki";
+const FALLBACK_USER_AGENT: &str = APP_NAME;
 const HTTP_SCHEME: &str = "http://";
 const HTTPS_SCHEME: &str = "https://";
 const HTTP_PORT: u16 = 80;
@@ -718,12 +719,17 @@ mod tests {
     const PUBLIC_URL_OTHER_PORT: &str = "https://8.8.8.8:8443/";
     const BLOCKED_PREFIX: &str = "blocked:";
     /// Reserved by RFC 6761, so every resolver answers NXDOMAIN for it.
-    const UNRESOLVABLE_HOST: &str = "maki.invalid";
+    const UNRESOLVABLE_HOST: &str = "makima.invalid";
     const PAYLOAD: &str = "payload";
     const AUTH_HEADER: &str = "Authorization";
     const AUTH_VALUE: &str = "Bearer tok";
     const ACCEPT_HEADER: &str = "Accept";
     const ACCEPT_VALUE: &str = "text/html";
+
+    #[test]
+    fn fallback_user_agent_uses_app_name() {
+        assert_eq!(FALLBACK_USER_AGENT, APP_NAME);
+    }
 
     fn allowlist(entries: &[&str]) -> HostAllowlist {
         HostAllowlist::parse(&entries.iter().map(|e| (*e).to_string()).collect::<Vec<_>>())

@@ -105,10 +105,10 @@ caller's ctx would count.
 `/reload` rebuilds plugins and config in place, no restart needed. Until it
 runs, an edited plugin is still the old one.
 
-To debug, add `maki.log.info|warn|error(...)` calls. They write to `maki.log`
+To debug, add `makima.log.info|warn|error(...)` calls. They write to `makima.log`
 in the dir `maki.env.logs_dir()` returns (Linux: `~/.local/logs/makima/`). The
-log keeps `info` and above. Set `MAKI_LOG=debug` to also keep `maki.log.debug`,
-or `MAKI_LOG=makima_lua=trace` to narrow it to one target. When a backtrace comes
+log keeps `info` and above. Set `MAKIMA_LOG=debug` to also keep `makima.log.debug`,
+or `MAKIMA_LOG=makima_lua=trace` to narrow it to one target. When a backtrace comes
 out useless, start makima with `--no-jit`: plugins then run on the interpreter,
 with full debug info.
 

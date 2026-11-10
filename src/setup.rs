@@ -14,7 +14,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
 
-const LOG_ENV: &str = "MAKI_LOG";
+const LOG_ENV: &str = "MAKIMA_LOG";
 const LOG_ENV_SHARED: &str = "RUST_LOG";
 const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::INFO;
 
@@ -202,7 +202,9 @@ pub fn init_logging(storage_config: &makima_config::StorageConfig) {
 mod tests {
     use test_case::test_case;
 
-    use super::{DEFAULT_LOG_LEVEL, build_log_filter};
+    use makima_storage::paths::APP_NAME;
+
+    use super::{DEFAULT_LOG_LEVEL, LOG_ENV, build_log_filter};
 
     const FOREIGN: &str = "other_crate=debug";
     const FOREIGN_EMPTY_PIECES: &str = ",other_crate=debug,,";
@@ -226,6 +228,11 @@ mod tests {
             rendered.split(',').any(|d| d == expected),
             "{ours:?} + {shared:?} rendered as {rendered:?}, wanted {expected:?}"
         );
+    }
+
+    #[test]
+    fn log_env_is_the_app_name_upper() {
+        assert_eq!(LOG_ENV, format!("{}_LOG", APP_NAME.to_uppercase()));
     }
 
     #[test]

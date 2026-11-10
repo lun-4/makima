@@ -1,4 +1,4 @@
-# Kanagawa Ink theme for Maki, the kanagawa palette lifted brighter so it still reads on a near-black background.
+# Kanagawa Ink theme for Makima, the kanagawa palette lifted brighter so it still reads on a near-black background.
 
 "comment"                         = { fg = "comment" }
 "comment.block"                   = { fg = "comment" }

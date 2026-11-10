@@ -18,17 +18,16 @@ const TERMINAL_TRUST_QUESTION: &str = "Trust this folder? [y/N]";
 const SHARED_FILE_POWERS: &str =
     "which can change the environment, start processes, and run Lua code";
 const NO_SHARED_FILES_YET: &str =
-    "This project ships no .maki files yet, but any added later would ask again.";
+    "This project ships no .makima files yet, but any added later would ask again.";
 const ADDED_SINCE_TRUSTED: &str = "since you trusted it";
 /// An answer given without knowing what the question covers is not consent, and
 /// the card is too small to explain the whole gate.
-pub const TRUST_DOCS: &str = "Learn more: https://lun-4.github.io/makima/docs/folder-trust/";
+pub const TRUST_DOCS: &str = "Learn more: https://makima.ln4.net/docs/folder-trust/";
 const DECLINED: &str = "Shared project config was skipped.";
 /// Every skip says how to undo itself. `--trust` is here because the runs that
 /// cannot answer a question are the ones that see these warnings.
-const HOW_TO_TRUST: &str =
-    "run `maki trust add --yes PATH` and restart Maki, or pass `--trust` to load it for one run";
-const CLEAR_THE_REJECTION: &str = "or `maki trust remove PATH` to clear the decision";
+const HOW_TO_TRUST: &str = "run `makima trust add --yes PATH` and restart Makima, or pass `--trust` to load it for one run";
+const CLEAR_THE_REJECTION: &str = "or `makima trust remove PATH` to clear the decision";
 const REJECTION_NOT_SAVED: &str = "folder rejection was not saved";
 
 /// A file under `.makima/` that only a trusted folder may hand to Makima.
@@ -66,10 +65,10 @@ impl GatedFile {
     pub const fn describes(self) -> &'static str {
         match self {
             GatedFile::Env => {
-                "sets environment variables, including secrets, for Maki and every process it starts"
+                "sets environment variables, including secrets, for Makima and every process it starts"
             }
             GatedFile::Permissions => "decides which tools run without asking",
-            GatedFile::InitLua => "runs Lua inside Maki's own process at startup",
+            GatedFile::InitLua => "runs Lua inside Makima's own process at startup",
             GatedFile::Mcp => "starts MCP servers as child processes",
         }
     }
@@ -492,7 +491,7 @@ fn record_written_file_in(storage: &StateDir, project_config: &ProjectConfig, fi
     let recorded = CanonicalFolder::resolve(root)
         .and_then(|folder| TrustedFolders::new(storage).cover_written_file(&folder, file));
     if let Err(error) = recorded {
-        warn!(%error, file, folder = %root.display(), "cannot record a file Maki wrote into a trusted project");
+        warn!(%error, file, folder = %root.display(), "cannot record a file Makima wrote into a trusted project");
     }
 }
 
@@ -500,7 +499,7 @@ fn record_written_file_in(storage: &StateDir, project_config: &ProjectConfig, fi
 /// the user agreed to never depends on which one they came through.
 pub fn trust_question_lines(question: &TrustQuestion) -> Vec<String> {
     let mut lines = vec![format!(
-        "Maki can load shared project configuration from {}.",
+        "Makima can load shared project configuration from {}.",
         question.folder.path().display()
     )];
     lines.push(

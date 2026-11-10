@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 
 use crate::paths;
 
-const LOG_FILE_NAME: &str = "maki.log";
-const LOCK_FILE_NAME: &str = "maki.log.lock";
-const ROTATED_PREFIX: &str = "maki.";
+const LOG_FILE_NAME: &str = "makima.log";
+const LOCK_FILE_NAME: &str = "makima.log.lock";
+const ROTATED_PREFIX: &str = "makima.";
 const ROTATED_SUFFIX: &str = ".log";
 const MIN_MAX_FILES: u32 = 1;
 
@@ -16,7 +16,7 @@ fn file_path(dir: &Path, index: u32) -> PathBuf {
     if index == 0 {
         dir.join(LOG_FILE_NAME)
     } else {
-        dir.join(format!("maki.{index}.log"))
+        dir.join(format!("{ROTATED_PREFIX}{index}{ROTATED_SUFFIX}"))
     }
 }
 
@@ -105,7 +105,7 @@ fn shift_up(dir: &Path, last: u32) -> io::Result<()> {
 /// with its lock held, and a log line would take that same lock again on the
 /// same thread and hang the process.
 fn report(args: std::fmt::Arguments<'_>) {
-    eprintln!("maki: log rotation: {args}");
+    eprintln!("makima: log rotation: {args}");
 }
 
 pub struct RotatingFileWriter {
@@ -247,6 +247,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::paths::APP_NAME;
 
     const TEST_MAX_BYTES: u64 = 32;
     const TEST_MAX_FILES: u32 = 3;
@@ -439,7 +440,10 @@ mod tests {
         w.flush().unwrap();
 
         for i in TEST_MAX_FILES..=stranded {
-            assert!(!file_path(tmp.path(), i).exists(), "maki.{i}.log survived");
+            assert!(
+                !file_path(tmp.path(), i).exists(),
+                "makima.{i}.log survived"
+            );
         }
     }
 
@@ -515,11 +519,24 @@ mod tests {
     }
 
     #[test_case(LOG_FILE_NAME, Some(0) ; "primary_is_index_zero")]
-    #[test_case("maki.7.log", Some(7) ; "rotated_index_parses")]
+    #[test_case("makima.7.log", Some(7) ; "rotated_index_parses")]
     #[test_case(LOCK_FILE_NAME, None ; "lock_file_is_not_a_log")]
-    #[test_case("maki.old.log", None ; "non_numeric_index_is_not_ours")]
+    #[test_case("makima.old.log", None ; "non_numeric_index_is_not_ours")]
     #[test_case("other.1.log", None ; "foreign_prefix_is_not_ours")]
     fn rotated_index_reads_our_names_only(name: &str, expected: Option<u32>) {
         assert_eq!(rotated_index(name), expected);
+    }
+
+    #[test]
+    fn log_file_names_use_app_name() {
+        assert_eq!(LOG_FILE_NAME, format!("{APP_NAME}.log"));
+        assert_eq!(LOCK_FILE_NAME, format!("{APP_NAME}.log.lock"));
+        assert_eq!(ROTATED_PREFIX, format!("{APP_NAME}."));
+    }
+
+    #[test]
+    fn rotated_index_rejects_legacy_names() {
+        let legacy = concat!("ma", "ki", ".7.log");
+        assert_eq!(rotated_index(legacy), None);
     }
 }

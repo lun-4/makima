@@ -110,7 +110,7 @@ pub enum TrustedFoldersError {
     RelativeMissing { path: PathBuf },
     #[error("unsupported trusted folder store version {version} in {path:?}; {RESET_HINT}")]
     UnsupportedVersion { path: PathBuf, version: u32 },
-    #[error("trusted folders are being changed by another Maki process: {path:?}")]
+    #[error("trusted folders are being changed by another Makima process: {path:?}")]
     Locked { path: PathBuf },
     #[error("cannot access trusted folder state at {path:?}: {source}")]
     Io {

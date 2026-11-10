@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 
 use etcetera::base_strategy::BaseStrategy;
 
-const APP_NAME: &str = "makima";
+pub const APP_NAME: &str = "makima";
 
 static STRATEGY: OnceLock<Option<Paths>> = OnceLock::new();
 

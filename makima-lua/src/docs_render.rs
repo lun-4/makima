@@ -14,7 +14,7 @@ const REFERENCE_MODULE: &str = "plugin_dev_reference";
 
 const NAME: &str = "maki-plugin-dev";
 const DESCRIPTION: &str = "Write or modify maki plugins or init.lua config in Lua: custom tools, slash commands, keymaps, UI. Authoring guide, real example, indexed maki Lua API reference. Load before any maki plugin work.";
-const REFERENCE_PLACEHOLDER: &str = "__MAKI_REFERENCE_PATH__";
+const REFERENCE_PLACEHOLDER: &str = "__MAKIMA_REFERENCE_PATH__";
 
 const EXAMPLE: &str = include_str!("../../plugins/glob/init.lua");
 
@@ -165,10 +165,10 @@ caller's ctx would count.
 `/reload` rebuilds plugins and config in place, no restart needed. Until it
 runs, an edited plugin is still the old one.
 
-To debug, add `maki.log.info|warn|error(...)` calls. They write to `maki.log`
+To debug, add `makima.log.info|warn|error(...)` calls. They write to `makima.log`
 in the dir `maki.env.logs_dir()` returns (Linux: `~/.local/logs/makima/`). The
-log keeps `info` and above. Set `MAKI_LOG=debug` to also keep `maki.log.debug`,
-or `MAKI_LOG=makima_lua=trace` to narrow it to one target. When a backtrace comes
+log keeps `info` and above. Set `MAKIMA_LOG=debug` to also keep `makima.log.debug`,
+or `MAKIMA_LOG=makima_lua=trace` to narrow it to one target. When a backtrace comes
 out useless, start makima with `--no-jit`: plugins then run on the interpreter,
 with full debug info.
 
@@ -267,7 +267,7 @@ One convention to remember: fallible runtime operations return a
 ```lua
 local text, err = maki.fs.read("config.json")
 if err then
-  maki.log.error("read failed: " .. err)
+  makima.log.error("read failed: " .. err)
   return
 end
 ```

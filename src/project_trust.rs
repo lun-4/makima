@@ -105,7 +105,8 @@ mod tests {
     #[test_case(&["trust", "add", "--yes", "/tmp"] ; "yes_before_path")]
     #[test_case(&["trust", "add", "/tmp", "--yes"] ; "yes_after_path")]
     fn trust_add_accepts_the_flag_on_either_side_of_the_path(args: &[&str]) {
-        let cli = Cli::try_parse_from(std::iter::once("maki").chain(args.iter().copied())).unwrap();
+        let cli =
+            Cli::try_parse_from(std::iter::once("makima").chain(args.iter().copied())).unwrap();
 
         assert!(matches!(
             cli.command,

@@ -366,7 +366,7 @@ pub(crate) fn edit_temp_content(
     terminal: &mut ratatui::DefaultTerminal,
 ) -> Result<String, String> {
     let tmp = tempfile::Builder::new()
-        .prefix("maki-input-")
+        .prefix("makima-input-")
         .suffix(".md")
         .tempfile()
         .map_err(|e| format!("Failed to create temp file: {e}"))?;
@@ -640,8 +640,8 @@ mod tests {
 
     #[test]
     fn window_title_roundtrips_mux_passthrough() {
-        const TITLE: &str = "maki";
-        const OSC2_SEQUENCE: &str = "\u{1b}]2;maki\u{7}";
+        const TITLE: &str = "makima";
+        const OSC2_SEQUENCE: &str = "\u{1b}]2;makima\u{7}";
 
         let tmux = window_title_sequence(TerminalMux::Tmux, TITLE);
         let screen = window_title_sequence(TerminalMux::Screen, TITLE);

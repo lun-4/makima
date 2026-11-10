@@ -7382,14 +7382,15 @@ mod tests {
         let harness = RuntimeHarness::new();
         let mut session = harness.session();
         session.meta.mode = Some(makima_storage::sessions::StoredMode::Plan);
-        session.meta.plan_path = missing_file.then(|| "/nonexistent/maki-plan-test.md".to_owned());
+        session.meta.plan_path =
+            missing_file.then(|| "/nonexistent/makima-plan-test.md".to_owned());
         let runtime = harness.runtime(session);
         let config = runtime.config().unwrap();
         assert!(matches!(config.mode, makima_agent::AgentMode::Plan(_)));
         assert_eq!(config.mode.plan_path(), runtime.app.state.plan.path());
         assert_ne!(
             config.mode.plan_path(),
-            Some(Path::new("/nonexistent/maki-plan-test.md"))
+            Some(Path::new("/nonexistent/makima-plan-test.md"))
         );
         smol::block_on(async {
             let (manager, root) = runtime.handles.manager_and_root();

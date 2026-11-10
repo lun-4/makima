@@ -889,11 +889,11 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
-    const PLAN_FILE: &str = "/home/user/.local/state/maki/plans/test.md";
+    const PLAN_FILE: &str = "/home/user/.local/state/makima/plans/test.md";
     const TEST_CWD: &str = "/tmp";
     const MCP_SERVER: &str = "deepwiki";
     const MCP_TOOL: &str = "deepwiki.search";
-    const MCP_ARGS: &str = "{\"q\":\"maki\"}";
+    const MCP_ARGS: &str = "{\"q\":\"makima\"}";
     const READ_TOOL: &str = "read";
     const READ_SCOPE: &str = "/home/user/project/src/main.rs";
 

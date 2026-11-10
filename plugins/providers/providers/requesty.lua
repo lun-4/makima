@@ -3,7 +3,7 @@ local thinking = require("providers.thinking")
 
 local M = {}
 
-local REFERER = "https://maki.sh"
+local REFERER = "https://makima.ln4.net"
 local APP_TITLE = "Makima"
 local CHAT_API = "chat"
 -- Requesty's curated routing policies, with short stable ids that spread

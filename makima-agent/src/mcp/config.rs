@@ -503,40 +503,40 @@ mod tests {
             r#"
 [mcp.remote]
 url = "https://mcp.example.com/mcp"
-headers = { Authorization = "Bearer ${MAKI_TEST_MCP_UNSET_84421}" }
+headers = { Authorization = "Bearer ${MAKIMA_TEST_MCP_UNSET_84421}" }
 "#,
         )
         .unwrap();
         let err = parse_server("remote".into(), config.mcp["remote"].clone()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("MAKI_TEST_MCP_UNSET_84421"), "got: {msg}");
+        assert!(msg.contains("MAKIMA_TEST_MCP_UNSET_84421"), "got: {msg}");
         assert!(msg.contains("Authorization"), "got: {msg}");
     }
 
     #[test]
     fn header_with_empty_var_fails_the_server_like_unset() {
-        unsafe { std::env::set_var("MAKI_TEST_MCP_EMPTY_84421", "") };
+        unsafe { std::env::set_var("MAKIMA_TEST_MCP_EMPTY_84421", "") };
         let config: McpConfig = toml::from_str(
             r#"
 [mcp.remote]
 url = "https://mcp.example.com/mcp"
-headers = { Authorization = "Bearer ${MAKI_TEST_MCP_EMPTY_84421}" }
+headers = { Authorization = "Bearer ${MAKIMA_TEST_MCP_EMPTY_84421}" }
 "#,
         )
         .unwrap();
         let err = parse_server("remote".into(), config.mcp["remote"].clone()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("MAKI_TEST_MCP_EMPTY_84421"), "got: {msg}");
+        assert!(msg.contains("MAKIMA_TEST_MCP_EMPTY_84421"), "got: {msg}");
     }
 
     #[test]
     fn stdio_environment_expands_from_the_process_env() {
-        unsafe { std::env::set_var("MAKI_TEST_MCP_ENV_84421", "tok") };
+        unsafe { std::env::set_var("MAKIMA_TEST_MCP_ENV_84421", "tok") };
         let config: McpConfig = toml::from_str(
             r#"
 [mcp.local]
 command = ["server"]
-environment = { GITHUB_TOKEN = "${MAKI_TEST_MCP_ENV_84421}" }
+environment = { GITHUB_TOKEN = "${MAKIMA_TEST_MCP_ENV_84421}" }
 "#,
         )
         .unwrap();

@@ -43,7 +43,7 @@ fn build_entries(infos: &[McpServerInfo]) -> (Vec<McpEntry>, Vec<bool>) {
                 }
                 McpServerStatus::NeedsAuth { .. } => {
                     format!(
-                        "{} \u{00b7} needs auth \u{00b7} run 'maki mcp auth {}'",
+                        "{} \u{00b7} needs auth \u{00b7} run 'makima mcp auth {}'",
                         info.transport_kind, info.name
                     )
                 }

@@ -43,7 +43,7 @@ local function next_codepoint_boundary(s, col)
 end
 
 -- Scans past whitespace then past non-whitespace, both backwards.
--- Mirrors `find_prev_word_boundary` in maki-ui/src/text_buffer.rs.
+-- Mirrors `find_prev_word_boundary` in makima-ui/src/text_buffer.rs.
 local function find_prev_word_boundary(line, col)
   local i = col
   while i > 0 and is_ws_byte(line, i) do

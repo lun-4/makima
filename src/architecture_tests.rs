@@ -62,7 +62,7 @@ const PROVIDER_IDS: &[&str] = &[
 const VENDOR_MODEL_PREFIXES: &[&str] = &["claude-", "gpt-", "gemini-"];
 const VENDOR_ENV_PREFIXES: &[&str] = &["AWS_", "CLAUDE_", "GEMINI_"];
 const PROVIDER_MODULES: &str = "plugins/providers/providers";
-const SHARED_HOSTS: &[&str] = &["localhost", "makima.ln4.net", "maki.sh"];
+const SHARED_HOSTS: &[&str] = &["localhost", "makima.ln4.net"];
 const NON_PROVIDER_HOST_VALUES: &[&str] = &[
     "Rewrite bash commands with [rtk](https://github.com/rtk-ai/rtk) when it is installed",
     "https://api.github.com/repos/lun-4/makima/releases/latest",

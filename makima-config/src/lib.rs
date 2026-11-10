@@ -195,7 +195,9 @@ impl Permission {
     /// function belong under".
     pub const fn describes(self) -> &'static str {
         match self {
-            Permission::FsRead => "reading files, and locating the directories maki keeps them in",
+            Permission::FsRead => {
+                "reading files, and locating the directories makima keeps them in"
+            }
             Permission::FsWrite => "creating, changing, and removing files",
             Permission::Net => "outbound network requests",
             Permission::Run => "starting processes",
@@ -328,7 +330,7 @@ pub enum ConfigError {
     )]
     UnknownPlugin { plugin: String, valid: String },
     #[error(
-        "invalid config: the `tools` table in maki.setup was renamed to `plugins` \
+        "invalid config: the `tools` table in makima.setup was renamed to `plugins` \
          (plugins can provide more than tools).\n\n\
          Fix your config with:\n\n    \
          sed -i.bak 's/^\\( *\\)tools *=/\\1plugins =/' ~/.config/makima/init.lua\n\n\
@@ -3089,9 +3091,9 @@ mod tests {
 
     #[test]
     fn env_file_precedence() {
-        const GLOBAL_ONLY: &str = "TEST_MAKI_GLOBAL_ONLY";
-        const PROJECT_SHADOWS: &str = "TEST_MAKI_PROJECT_SHADOWS";
-        const PROCESS_WINS: &str = "TEST_MAKI_PROCESS_WINS";
+        const GLOBAL_ONLY: &str = "TEST_MAKIMA_GLOBAL_ONLY";
+        const PROJECT_SHADOWS: &str = "TEST_MAKIMA_PROJECT_SHADOWS";
+        const PROCESS_WINS: &str = "TEST_MAKIMA_PROCESS_WINS";
 
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());

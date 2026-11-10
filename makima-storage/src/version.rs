@@ -3,6 +3,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use isahc::config::Configurable;
+
+use crate::paths::APP_NAME;
 use isahc::{AsyncReadResponseExt, ReadResponseExt, Request};
 
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
@@ -48,7 +50,7 @@ fn client() -> Result<isahc::HttpClient, VersionError> {
 fn request() -> Result<isahc::Request<()>, VersionError> {
     Ok(Request::get(RELEASES_URL)
         .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "makima")
+        .header("User-Agent", APP_NAME)
         .body(())?)
 }
 
@@ -68,7 +70,7 @@ fn parse_tag(bytes: &[u8]) -> Result<String, VersionError> {
 pub fn curl_fetch(url: &str) -> io::Result<Vec<u8>> {
     let max_time = CONNECT_TIMEOUT + REQUEST_TIMEOUT;
     let out = Command::new("curl")
-        .args(["-fsSL", "-A", "makima", "--max-time"])
+        .args(["-fsSL", "-A", APP_NAME, "--max-time"])
         .arg(max_time.as_secs().to_string())
         .arg(url)
         .output()?;

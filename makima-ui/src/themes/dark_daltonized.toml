@@ -1,4 +1,4 @@
-# Dark Daltonized theme for Maki, built on IBM's colorblind safe palette.
+# Dark Daltonized theme for Makima, built on IBM's colorblind safe palette.
 # Red and green never carry meaning on their own here, so errors and diffs lean on blue, orange and yellow.
 
 "comment"                         = { fg = "comment" }
