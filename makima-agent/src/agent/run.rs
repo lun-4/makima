@@ -1,0 +1,3611 @@
+use std::borrow::Cow;
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::pin::pin;
+use std::sync::{Arc, Mutex};
+
+use futures_lite::future;
+use serde_json::Value;
+use tracing::{error, info, warn};
+
+use makima_providers::provider::Provider;
+use makima_providers::{
+    ContentBlock, ConversationEnd, IMAGE_PLACEHOLDER, InvocationPurpose, Message, Model,
+    ProviderRegistry, RequestDeliveryTracker, RequestOptions, Role, StopReason, StreamResponse,
+    ThinkingConfig, TokenUsage,
+};
+
+use super::compaction;
+use super::history::{History, sanitize_cancelled_history};
+use super::instructions::LoadedInstructions;
+use super::streaming::{Conversation, StreamError, end_conversation_detached, stream_with_retry};
+use super::tool_dispatch::{self, RecentCalls};
+use crate::actor::{TurnContext, TurnInbox};
+use crate::cancel::{CancelMap, CancelToken, ReasonedCancelToken};
+use crate::mcp::McpSession;
+use crate::permissions::PermissionManager;
+use crate::tools::offload::OffloadStore;
+use crate::tools::{
+    Deadline, FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolContext,
+    TurnToolBindings,
+};
+use crate::{
+    AgentConfig, AgentError, AgentEvent, AgentId, AgentInput, AgentMode, DoneReason, EventSender,
+    ExtractedCommand, InterruptSource, RunLedger, SessionMailbox, TurnCancellationReason,
+    TurnCompleteEvent, TurnFailure, TurnId, TurnOutcome,
+};
+use makima_config::{ModelPolicy, ToolOutputLines};
+use makima_storage::id::SessionRef;
+
+const MAX_REAUTH_ATTEMPTS: u32 = 2;
+pub const NO_ADMITTED_CWD_ERR: &str = "turn has no admitted working directory";
+const MAX_COMPLETION_RECOVERY_ATTEMPTS: u32 = 2;
+const COMPLETION_RECOVERY_EXHAUSTED: &str =
+    "required output recovery exhausted before output was reported";
+const INSTRUCTION_BUDGET_EXHAUSTED: &str =
+    "The request budget was exhausted before all accepted instructions reached the provider.";
+const REQUIRED_OUTPUT_BUDGET_EXHAUSTED: &str =
+    "turn budget exhausted before required output was reported";
+const LATE_REPORTS_NOTE: &str = "[system: subagents you started finished after your last answer; their results follow. Reply with your complete final answer, updated with these results.]";
+type CompletionCheck = Arc<dyn Fn() -> Result<Option<String>, String> + Send + Sync>;
+type CompletionExhausted = Arc<dyn Fn() -> String + Send + Sync>;
+const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.";
+/// A model that stalls once often stalls again on the retry, so it gets
+/// plenty of chances before the turn ends empty handed.
+const MAX_NUDGES: u32 = 20;
+/// Counted over non-padding messages.
+const RECENT_TOOL_WINDOW: usize = 5;
+/// Without this note a cancelled reply replays in history as a finished
+/// turn, and a model resuming its own cut-off text can wedge the session
+/// (seen with llama.cpp stuck on an unterminated tool call).
+const CANCELLED_TEXT_NOTE: &str = "[Response cut off by user cancel]";
+const INTERRUPT_NOTE: &str =
+    "The user sent a new message while you were working. Address it and continue.";
+
+pub async fn resolve_compaction_model(
+    provider: &Arc<dyn Provider>,
+    model: &Model,
+    providers: &ProviderRegistry,
+    model_policy: &ModelPolicy,
+) -> (Arc<dyn Provider>, Model) {
+    if let Some(spec) = providers.spec_for_tier_any(makima_providers::ModelTier::Compaction)
+        && model_policy.allows(&spec)
+        && let Ok(model) = providers.model(&spec)
+        && let Ok(prepared) = providers.prepare(model).await
+    {
+        return (prepared.provider, prepared.model);
+    }
+    (Arc::clone(provider), model.clone())
+}
+
+enum TurnProgress {
+    Continue,
+    Done(DoneReason),
+}
+
+/// Keep only the tool definitions in `all` whose `name` is in `allowed`.
+/// Used for mode-scoped toolsets (`ModeDef.tools`).
+fn filter_tools(all: &Value, allowed: &[String]) -> Value {
+    let Some(arr) = all.as_array() else {
+        return all.clone();
+    };
+    let wanted: HashSet<&str> = allowed.iter().map(String::as_str).collect();
+    Value::Array(
+        arr.iter()
+            .filter(|def| {
+                def.get("name")
+                    .and_then(|n| n.as_str())
+                    .is_some_and(|n| wanted.contains(n))
+            })
+            .cloned()
+            .collect(),
+    )
+}
+
+#[derive(Clone)]
+pub struct TurnAdmissionSnapshot {
+    pub mode_def: Option<Arc<crate::ModeDef>>,
+    pub bindings: Arc<TurnToolBindings>,
+    pub prompt_inputs: Option<Arc<TurnPromptInputs>>,
+    pub mcp_startup_notice: Option<usize>,
+}
+
+#[derive(Clone)]
+pub struct TurnPromptInputs {
+    pub cwd: PathBuf,
+    pub instructions: super::instructions::Instructions,
+    pub mcp_prompt: Option<crate::mcp::McpPromptBinding>,
+    pub resolved: Option<flume::Receiver<Result<ResolvedPromptInputs, String>>>,
+    pub ready: Option<ResolvedPromptInputs>,
+}
+
+#[derive(Clone)]
+pub struct ResolvedPromptInputs {
+    pub slots: Arc<crate::prompt::ResolvedSlots>,
+    pub slots_error: Option<String>,
+    pub mcp_messages: Option<Vec<Message>>,
+}
+
+/// The settings captured at the start of a run.
+#[derive(Clone)]
+pub struct RunSettings {
+    pub provider: Arc<dyn Provider>,
+    pub model: Model,
+    pub fast: bool,
+    pub workflow: bool,
+    pub thinking: ThinkingConfig,
+}
+
+/// The provider and model available when a run begins.
+pub trait ModelSource: Send + Sync {
+    /// `None` while the source has nothing to offer yet, which reads as "no
+    /// change" rather than forcing a caller to invent a placeholder provider.
+    fn current(&self) -> Option<(Arc<dyn Provider>, Model)>;
+}
+
+/// A [`ModelSource`] a frontend can install into. Adoption is a store rather
+/// than a round-trip to whatever loop owns the run.
+#[derive(Clone, Default)]
+pub struct SharedModel(Arc<arc_swap::ArcSwapOption<(Arc<dyn Provider>, Model)>>);
+
+impl SharedModel {
+    pub fn install(&self, provider: Arc<dyn Provider>, model: Model) {
+        self.0.store(Some(Arc::new((provider, model))));
+    }
+}
+
+impl ModelSource for SharedModel {
+    fn current(&self) -> Option<(Arc<dyn Provider>, Model)> {
+        self.0
+            .load()
+            .as_ref()
+            .map(|snapshot| (Arc::clone(&snapshot.0), snapshot.1.clone()))
+    }
+}
+
+#[derive(Clone)]
+pub struct AgentParams {
+    pub agent_id: AgentId,
+    pub provider: Arc<dyn Provider>,
+    pub model: Model,
+    pub config: AgentConfig,
+    pub tool_output_lines: ToolOutputLines,
+    pub permissions: Arc<PermissionManager>,
+    pub session_id: Option<SessionRef>,
+    pub mailbox: Option<SessionMailbox>,
+    pub timeouts: makima_providers::Timeouts,
+    pub file_tracker: Arc<FileReadTracker>,
+    pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
+    pub modes: Arc<crate::ModeRegistry>,
+    pub subagent_cancels: Arc<CancelMap<String>>,
+    pub registry: Arc<crate::tools::ToolRegistry>,
+    pub audience: ToolAudience,
+    pub question_mode: crate::tools::QuestionMode,
+    pub model_policy: Arc<ModelPolicy>,
+    pub providers: Arc<ProviderRegistry>,
+    /// Same-process per-path mutation locks, cloned from the parent context
+    /// for subagents so concurrent same-path mutations stay serialized.
+    pub file_write_locks: Arc<crate::tools::FileWriteLocks>,
+    /// One store per session, cloned into subagents so they share its lock
+    /// and quota.
+    pub offload: Option<Arc<OffloadStore>>,
+    pub managed_turn: Option<crate::CurrentManagedTurn>,
+}
+
+pub struct AgentRunParams<'h> {
+    pub history: &'h mut History,
+    pub system: String,
+    pub event_tx: EventSender,
+    pub tools: RequestTools,
+}
+
+pub struct Agent<'h> {
+    agent_id: AgentId,
+    provider: Arc<dyn Provider>,
+    model: Arc<Model>,
+    history: &'h mut History,
+    system: String,
+    event_tx: EventSender,
+    tools: RequestTools,
+    mode: AgentMode,
+    mode_def: Option<Arc<crate::ModeDef>>,
+    user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
+    interrupt_source: Option<Arc<dyn InterruptSource>>,
+    turn_inbox: Option<Arc<dyn TurnInbox>>,
+    instruction_consumed_callback: Option<Arc<dyn Fn() + Send + Sync>>,
+    pending_instruction_request: bool,
+    cancel: CancelToken,
+    cancel_reason_source: Option<ReasonedCancelToken>,
+    ledger: Arc<RunLedger>,
+    context_size: u32,
+    num_turns: u32,
+    recent_calls: RecentCalls,
+    auto_compact: bool,
+    loaded_instructions: LoadedInstructions,
+    rollback_len: usize,
+    mcp: Option<McpSession>,
+    config: AgentConfig,
+    tool_output_lines: ToolOutputLines,
+    reauth_attempts: u32,
+    permissions: Arc<PermissionManager>,
+    opts: RequestOptions,
+    session_id: Option<SessionRef>,
+    mailbox: Option<SessionMailbox>,
+    timeouts: makima_providers::Timeouts,
+    file_tracker: Arc<FileReadTracker>,
+    prompt_slots: Arc<crate::prompt::ResolvedSlots>,
+    modes: Arc<crate::ModeRegistry>,
+    subagent_cancels: Arc<crate::cancel::CancelMap<String>>,
+    registry: Arc<crate::tools::ToolRegistry>,
+    audience: ToolAudience,
+    question_mode: crate::tools::QuestionMode,
+    workflow: bool,
+    local_tools: LocalTools,
+    local_tool_capture: Option<Arc<Mutex<Option<Value>>>>,
+    turn_bindings: Arc<TurnToolBindings>,
+    model_policy: Arc<ModelPolicy>,
+    providers: Arc<ProviderRegistry>,
+    file_write_locks: Arc<crate::tools::FileWriteLocks>,
+    offload: Option<Arc<OffloadStore>>,
+    managed_turn: Option<crate::CurrentManagedTurn>,
+    admission: Option<TurnAdmissionSnapshot>,
+    completion_check: Option<CompletionCheck>,
+    completion_exhausted: Option<CompletionExhausted>,
+    defer_outcome: bool,
+}
+
+impl<'h> Agent<'h> {
+    pub fn for_actor_turn(
+        mut params: AgentParams,
+        mut run: AgentRunParams<'h>,
+        context: &TurnContext,
+        loaded: LoadedInstructions,
+    ) -> Self {
+        params.agent_id = context.agent_id;
+        params.managed_turn = context.managed_turn.clone();
+        if let Some(policy) = &context.policy {
+            params.provider = Arc::clone(&policy.provider);
+            params.model = policy.model.clone();
+        }
+        run.event_tx = run.event_tx.with_output(context.output.clone());
+        let mut agent = Self::new(params, run);
+        if let Some(policy) = &context.policy {
+            agent.mode = policy.mode.clone();
+            agent.workflow = policy.workflow;
+            agent.opts = RequestOptions {
+                thinking: policy.thinking,
+                fast: policy.fast,
+            };
+        }
+        agent = agent
+            .with_loaded_instructions(loaded)
+            .with_turn_inbox(context.inbox.clone())
+            .with_cancel(context.cancel.clone())
+            .with_cancel_reason_source(context.cancel_reason.clone())
+            .with_admission(context.admission.clone())
+            .with_deferred_outcome();
+        if let Some(interrupt) = &context.interrupt {
+            agent = agent.with_interrupt_source(Arc::clone(interrupt));
+        }
+        agent
+    }
+
+    pub fn new(params: AgentParams, mut run: AgentRunParams<'h>) -> Self {
+        crate::prompt::append_model_identity(&mut run.system, &params.model);
+        Self {
+            agent_id: params.agent_id,
+            provider: params.provider,
+            model: Arc::new(params.model),
+            config: params.config,
+            tool_output_lines: params.tool_output_lines,
+            permissions: params.permissions,
+            timeouts: params.timeouts,
+            history: run.history,
+            system: run.system,
+            event_tx: run.event_tx,
+            tools: run.tools,
+            mode: AgentMode::default(),
+            mode_def: None,
+            user_response_rx: None,
+            interrupt_source: None,
+            turn_inbox: None,
+            instruction_consumed_callback: None,
+            pending_instruction_request: false,
+            cancel: CancelToken::none(),
+            cancel_reason_source: None,
+            ledger: Arc::new(RunLedger::default()),
+            context_size: 0,
+            num_turns: 0,
+            recent_calls: RecentCalls::new(),
+            auto_compact: compaction::auto_compact_enabled(),
+            loaded_instructions: LoadedInstructions::new(),
+            rollback_len: 0,
+            mcp: None,
+            reauth_attempts: 0,
+            opts: RequestOptions::default(),
+            session_id: params.session_id,
+            mailbox: params.mailbox,
+            file_tracker: params.file_tracker,
+            prompt_slots: params.prompt_slots,
+            modes: params.modes,
+            subagent_cancels: params.subagent_cancels,
+            registry: params.registry,
+            audience: params.audience,
+            question_mode: params.question_mode,
+            workflow: false,
+            local_tools: LocalTools::default(),
+            local_tool_capture: None,
+            turn_bindings: Arc::new(TurnToolBindings::default()),
+            model_policy: params.model_policy,
+            providers: params.providers,
+            file_write_locks: params.file_write_locks,
+            offload: params.offload,
+            managed_turn: params.managed_turn,
+            admission: None,
+            completion_check: None,
+            completion_exhausted: None,
+            defer_outcome: false,
+        }
+    }
+
+    pub fn with_mcp(mut self, mcp: Option<McpSession>) -> Self {
+        self.mcp = mcp;
+        self
+    }
+
+    pub fn with_user_response_rx(
+        mut self,
+        rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
+    ) -> Self {
+        self.user_response_rx = rx;
+        self
+    }
+
+    pub fn with_interrupt_source(mut self, source: Arc<dyn InterruptSource>) -> Self {
+        self.interrupt_source = Some(source);
+        self
+    }
+
+    pub fn with_turn_inbox(mut self, inbox: Option<Arc<dyn TurnInbox>>) -> Self {
+        self.turn_inbox = inbox;
+        self
+    }
+
+    pub fn with_instruction_consumed_callback(
+        mut self,
+        callback: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        self.instruction_consumed_callback = Some(callback);
+        self
+    }
+
+    pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    /// Installs a reason source for this turn's cancellation. The first reason
+    /// that fires (User from a plain trigger drop, or Closed/Shutdown from the
+    /// actor) wins; `run` reads it once when building the terminal outcome.
+    pub fn with_cancel_reason_source(mut self, source: ReasonedCancelToken) -> Self {
+        self.cancel_reason_source = Some(source);
+        self
+    }
+
+    pub fn with_local_tools(mut self, local_tools: LocalTools) -> Self {
+        self.local_tools = local_tools;
+        self
+    }
+
+    pub fn with_local_tool_capture(mut self, capture: Arc<Mutex<Option<Value>>>) -> Self {
+        self.local_tool_capture = Some(capture);
+        self
+    }
+
+    pub fn with_completion_check(mut self, check: CompletionCheck) -> Self {
+        self.completion_check = Some(check);
+        self
+    }
+
+    pub fn with_completion_exhausted(mut self, exhausted: CompletionExhausted) -> Self {
+        self.completion_exhausted = Some(exhausted);
+        self
+    }
+
+    fn completion_exhaustion(&self, fallback: &str) -> AgentError {
+        AgentError::Config {
+            message: self
+                .completion_exhausted
+                .as_ref()
+                .map_or_else(|| fallback.into(), |exhausted| exhausted()),
+        }
+    }
+
+    pub fn with_loaded_instructions(mut self, loaded: LoadedInstructions) -> Self {
+        self.loaded_instructions = loaded;
+        self
+    }
+
+    pub fn with_admission(mut self, admission: Option<TurnAdmissionSnapshot>) -> Self {
+        self.admission = admission;
+        self
+    }
+
+    /// Leaves terminal event delivery to the actor finalizer after it seals the result.
+    pub fn with_deferred_outcome(mut self) -> Self {
+        self.defer_outcome = true;
+        self
+    }
+
+    /// Returns the terminal outcome and attempts one event delivery unless deferred.
+    /// A closed event channel does not change the outcome and is never retried.
+    pub async fn run(&mut self, turn_id: TurnId, input: AgentInput) -> TurnOutcome {
+        self.num_turns = 0;
+        self.reauth_attempts = 0;
+        self.rollback_len = self.history.len();
+        self.ledger = Arc::new(RunLedger::default());
+
+        let AgentInput {
+            message,
+            images,
+            preamble,
+            prompt: _,
+        } = input;
+        self.push_input_context(preamble);
+        // Observers read this event as "the turn has taken its input", so the
+        // preamble has to be in the history they read before it goes out.
+        if let Some(submission) = self
+            .turn_inbox
+            .as_ref()
+            .and_then(|inbox| inbox.take_initial_submission())
+        {
+            let _ = self.event_tx.send(AgentEvent::QueueItemConsumed {
+                text: submission.text,
+                images: submission.images,
+                mcp_startup_notice: submission.mcp_startup_notice,
+                already_displayed: submission.already_displayed,
+            });
+        }
+        if !message.trim().is_empty() || !images.is_empty() {
+            let mut user_message = Message::user_with_images(message.clone(), images);
+            if let Some(count) = self
+                .admission
+                .as_ref()
+                .and_then(|snapshot| snapshot.mcp_startup_notice)
+            {
+                let notice = format!(
+                    "[system: {count} MCP servers are not ready; MCP tools are unavailable for this turn]"
+                );
+                user_message.content.push(ContentBlock::Text {
+                    text: notice.clone(),
+                });
+                user_message.display_text = Some(if message.is_empty() {
+                    format!("{IMAGE_PLACEHOLDER}\n{notice}")
+                } else {
+                    format!("{message}\n{notice}")
+                });
+            }
+            self.history.push(user_message);
+        }
+        self.mode_def = self
+            .admission
+            .as_ref()
+            .map(|snapshot| snapshot.mode_def.clone())
+            .unwrap_or_else(|| match &self.mode {
+                AgentMode::Custom(id) => self.modes.get(id).map(Arc::new),
+                _ => Some(Arc::new(self.modes.current(&self.mode))),
+            });
+        self.turn_bindings = self
+            .admission
+            .as_ref()
+            .map(|snapshot| Arc::clone(&snapshot.bindings))
+            .unwrap_or_else(|| {
+                Arc::new(TurnToolBindings::capture(
+                    &self.registry,
+                    &self.local_tools,
+                    self.mcp.as_ref(),
+                ))
+            });
+        info!(
+            agent_id = %self.agent_id,
+            %turn_id,
+            model = %self.model.id,
+            mode = ?self.mode,
+            message_len = message.len(),
+            "agent run started"
+        );
+
+        let loop_result = self.run_loop().await;
+        if let Some(inbox) = &self.turn_inbox {
+            inbox.close();
+        }
+        let totals = self.ledger.totals();
+        let context_size = self.context_size;
+        let context_window = self.model.context_window;
+        let outcome = match loop_result {
+            Ok(reason) => TurnOutcome::Completed {
+                agent_id: self.agent_id,
+                turn_id,
+                usage: totals.usage,
+                num_turns: self.num_turns,
+                reason,
+                cost: totals.cost,
+                list_cost: totals.list_cost,
+                context_size,
+                context_window,
+            },
+            Err(AgentError::Cancelled) => {
+                sanitize_cancelled_history(self.history, self.rollback_len);
+                if let Some(ended) = self.history.continue_conversation() {
+                    end_conversation_detached(&self.provider, ended, ConversationEnd::Cancelled);
+                }
+                let reason = match &self.cancel_reason_source {
+                    Some(source) => source
+                        .reason()
+                        .unwrap_or(TurnCancellationReason::Interrupted),
+                    None => TurnCancellationReason::User,
+                };
+                TurnOutcome::Cancelled {
+                    agent_id: self.agent_id,
+                    turn_id,
+                    usage: totals.usage,
+                    num_turns: self.num_turns,
+                    reason,
+                    cost: totals.cost,
+                    list_cost: totals.list_cost,
+                    context_size,
+                    context_window,
+                }
+            }
+            Err(error) => TurnOutcome::Failed {
+                agent_id: self.agent_id,
+                turn_id,
+                usage: totals.usage,
+                num_turns: self.num_turns,
+                failure: TurnFailure::from_agent_error(&error),
+                cost: totals.cost,
+                list_cost: totals.list_cost,
+                context_size,
+                context_window,
+            },
+        };
+        self.emit_outcome(&outcome);
+        outcome
+    }
+
+    fn push_input_context(&mut self, preamble: Vec<Message>) {
+        for message in preamble {
+            self.history.push(message);
+        }
+        if let Some(mailbox) = &self.mailbox {
+            for message in mailbox.drain() {
+                self.history.push(message);
+            }
+        }
+    }
+
+    async fn run_loop(&mut self) -> Result<DoneReason, AgentError> {
+        let mut completion_recovery_attempts = 0;
+        loop {
+            if self.cancel.is_cancelled() {
+                return Err(AgentError::Cancelled);
+            }
+            if let Some(max) = self.config.max_turns
+                && self.num_turns >= max
+            {
+                if self.pending_instruction_request
+                    || self.turn_inbox.as_ref().is_some_and(|inbox| {
+                        !inbox.finish_instructions() || inbox.has_unsubmitted_instructions()
+                    })
+                {
+                    return Err(AgentError::Config {
+                        message: INSTRUCTION_BUDGET_EXHAUSTED.into(),
+                    });
+                }
+                if let Some(check) = &self.completion_check {
+                    match check().map_err(|message| AgentError::Config { message })? {
+                        None => {}
+                        Some(_) => {
+                            return Err(
+                                self.completion_exhaustion(REQUIRED_OUTPUT_BUDGET_EXHAUSTED)
+                            );
+                        }
+                    }
+                }
+                return Ok(DoneReason::MaxTurns);
+            }
+            match self.turn().await? {
+                TurnProgress::Continue => {}
+                TurnProgress::Done(reason) => {
+                    if self.cancel.is_cancelled() {
+                        return Err(AgentError::Cancelled);
+                    }
+                    if self.consume_instruction_inbox()? {
+                        continue;
+                    }
+                    if let Some(inbox) = &self.turn_inbox
+                        && inbox.has_unsubmitted_instructions()
+                    {
+                        continue;
+                    }
+                    if let Some(check) = &self.completion_check
+                        && let Some(message) =
+                            check().map_err(|message| AgentError::Config { message })?
+                    {
+                        if let Some(max) = self.config.max_turns
+                            && self.num_turns >= max
+                        {
+                            return Err(
+                                self.completion_exhaustion(REQUIRED_OUTPUT_BUDGET_EXHAUSTED)
+                            );
+                        }
+                        if completion_recovery_attempts >= MAX_COMPLETION_RECOVERY_ATTEMPTS {
+                            return Err(self.completion_exhaustion(COMPLETION_RECOVERY_EXHAUSTED));
+                        }
+                        completion_recovery_attempts += 1;
+                        self.history.push(Message::user(message));
+                        continue;
+                    }
+                    if let Some(inbox) = self.turn_inbox.clone() {
+                        self.cancel
+                            .race(inbox.join_children())
+                            .await
+                            .map_err(|_| AgentError::Cancelled)?;
+                        if !inbox.finish() {
+                            if self
+                                .config
+                                .max_turns
+                                .is_some_and(|max| self.num_turns >= max)
+                                && inbox.finish_instructions()
+                            {
+                                return Ok(reason);
+                            }
+                            if inbox.is_managed_child() && !inbox.has_unsubmitted_instructions() {
+                                self.invalidate_reports();
+                                self.history.push(Message::user(LATE_REPORTS_NOTE.into()));
+                            }
+                            continue;
+                        }
+                    }
+                    return Ok(reason);
+                }
+            }
+        }
+    }
+
+    fn request_tools(&self) -> Result<Value, AgentError> {
+        let def = self.mode_def.as_ref().ok_or_else(|| AgentError::Config {
+            message: format!("mode '{}' is not defined", self.mode.id().key()),
+        })?;
+        let mut tools = match &self.mcp {
+            Some(mcp) => {
+                let mut tools = self.tools.definitions().clone();
+                self.turn_bindings.extend_mcp_tools(mcp, &mut tools);
+                Cow::Owned(tools)
+            }
+            None => Cow::Borrowed(self.tools.definitions()),
+        };
+        if let Some(names) = &def.tools {
+            tools = Cow::Owned(filter_tools(&tools, names));
+        }
+        let ctx = self.tool_context()?;
+        if let Some(definitions) = tools.to_mut().as_array_mut() {
+            definitions.retain(|definition| {
+                definition
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| tool_dispatch::authorize_advertised(&ctx, name))
+            });
+        }
+        Ok(tools.into_owned())
+    }
+
+    async fn turn(&mut self) -> Result<TurnProgress, AgentError> {
+        if self.cancel.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
+        self.consume_turn_inbox()?;
+        self.pending_instruction_request = false;
+        let tools = self.request_tools()?;
+        if let Some(inbox) = &self.turn_inbox {
+            inbox.instructions_submitted();
+        }
+        let messages = Arc::clone(&self.history.snapshot().messages);
+        let delivery = RequestDeliveryTracker::new();
+        let result = {
+            let mut stream = pin!(stream_with_retry(
+                &*self.provider,
+                Conversation {
+                    id: Arc::clone(self.history.conversation_id()),
+                    purpose: InvocationPurpose::Agent,
+                    agent_id: Some(self.agent_id.to_string().into()),
+                    previous: self.history.conversation().previous.clone(),
+                },
+                &self.model,
+                &messages,
+                &self.system,
+                &tools,
+                &self.event_tx,
+                &self.cancel,
+                self.opts,
+                self.session_id.as_ref(),
+                self.timeouts.retry,
+                &delivery,
+            ));
+            // Marked the moment the provider's server has the request, so a
+            // cancelled or failed stream still leaves its lineage behind. The
+            // history is untouched until the stream ends, so its length is the
+            // request's.
+            let early = future::or(async { Some((&mut stream).await) }, async {
+                delivery.delivered().await;
+                None
+            })
+            .await;
+            let marked = early.is_none();
+            if marked {
+                self.history.mark_sent();
+            }
+            let result = match early {
+                Some(result) => result,
+                None => stream.await,
+            };
+            if !marked && delivery.is_delivered() {
+                self.history.mark_sent();
+            }
+            result
+        };
+        let response = match result {
+            Ok(r) => {
+                self.reauth_attempts = 0;
+                r
+            }
+            Err(StreamError::Cancelled { streamed }) => {
+                let streamed = streamed.trim_end();
+                if !streamed.is_empty() {
+                    self.history.push(Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: format!("{streamed}\n\n{CANCELLED_TEXT_NOTE}"),
+                        }],
+                        ..Default::default()
+                    });
+                }
+                return Err(AgentError::Cancelled);
+            }
+            Err(StreamError::Other(e)) if e.is_auth_error() => {
+                return self.wait_for_reauth(e).await;
+            }
+            Err(StreamError::Other(e)) => {
+                error!(error = %e, model = %self.model.id, self.num_turns, "stream_message failed");
+                return Err(e);
+            }
+        };
+        self.num_turns += 1;
+
+        let has_tools = response.message.has_tool_calls();
+        let stop_reason = response.stop_reason;
+        info!(
+            input_tokens = response.usage.input,
+            output_tokens = response.usage.output,
+            cache_creation = response.usage.cache_creation,
+            cache_read = response.usage.cache_read,
+            has_tools,
+            self.num_turns,
+            model = %self.model.id,
+            stop_reason = stop_reason.map_or("none", Into::into),
+            "API response received"
+        );
+
+        self.context_size = response.usage.total_input();
+        self.emit_turn_complete(&response)?;
+
+        if has_tools {
+            let history_len_before = self.history.len();
+            self.process_tool_calls(response).await?;
+            self.context_size +=
+                estimate_message_tokens(&self.history.as_slice()[history_len_before..]);
+        } else {
+            if response.message.first_text_content().is_some() {
+                self.history.push(response.message);
+            } else if self.recover_stalled_turn()? {
+                return Ok(TurnProgress::Continue);
+            }
+
+            if stop_reason == Some(StopReason::MaxTokens)
+                && self.num_turns <= self.config.max_continuation_turns
+            {
+                warn!(
+                    self.num_turns,
+                    "response truncated (max_tokens), re-prompting"
+                );
+                return Ok(TurnProgress::Continue);
+            }
+        }
+
+        if self.try_auto_compact().await? || self.handle_queued_command().await? {
+            return Ok(TurnProgress::Continue);
+        }
+
+        if has_tools {
+            Ok(TurnProgress::Continue)
+        } else {
+            Ok(TurnProgress::Done(stop_reason.into()))
+        }
+    }
+
+    async fn wait_for_reauth(&mut self, err: AgentError) -> Result<TurnProgress, AgentError> {
+        if self.reauth_attempts >= MAX_REAUTH_ATTEMPTS {
+            error!(error = %err, attempts = self.reauth_attempts, "max re-auth attempts reached");
+            return Err(err);
+        }
+        let Some(rx) = &self.user_response_rx else {
+            error!(error = %err, model = %self.model.id, self.num_turns, "stream_message failed");
+            return Err(err);
+        };
+        self.reauth_attempts += 1;
+        warn!(error = %err, attempt = self.reauth_attempts, "auth error, waiting for re-authentication");
+        self.event_tx.send(AgentEvent::AuthRequired)?;
+        let rx = rx.lock().await;
+        match futures_lite::future::race(rx.recv_async(), async {
+            self.cancel.cancelled().await;
+            Err(flume::RecvError::Disconnected)
+        })
+        .await
+        {
+            Ok(_) => {
+                self.provider.refresh_auth().await?;
+                Ok(TurnProgress::Continue)
+            }
+            Err(_) => Err(AgentError::Cancelled),
+        }
+    }
+
+    fn emit_turn_complete(&self, response: &StreamResponse) -> Result<(), AgentError> {
+        let fast = self.opts.clamped(&self.model).fast;
+        let cost = self.model.billed_cost(&response.usage, fast);
+        let list_cost = self.model.list_cost(&response.usage, fast);
+        self.ledger.add(response.usage, cost, list_cost);
+        self.event_tx
+            .send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+                message: response.message.clone(),
+                usage: response.usage,
+                model: self.model.id.clone(),
+                cost,
+                context_size: Some(self.context_size),
+                context_window: self.model.context_window,
+            })))
+    }
+
+    fn emit_outcome(&self, outcome: &TurnOutcome) {
+        let retryable = match outcome {
+            TurnOutcome::Failed { failure, .. } => Some(failure.retryable),
+            TurnOutcome::Completed { .. } | TurnOutcome::Cancelled { .. } => None,
+        };
+        info!(
+            agent_id = %outcome.agent_id(),
+            turn_id = %outcome.turn_id(),
+            num_turns = outcome.num_turns(),
+            total_input = outcome.usage().input,
+            total_output = outcome.usage().output,
+            ?retryable,
+            outcome = match outcome {
+                TurnOutcome::Completed { .. } => "completed",
+                TurnOutcome::Failed { .. } => "failed",
+                TurnOutcome::Cancelled { .. } => "cancelled",
+            },
+            "agent run terminalized"
+        );
+        if self.defer_outcome {
+            return;
+        }
+        if let Err(error) = self.event_tx.send(AgentEvent::TurnOutcome(outcome.clone())) {
+            error!(
+                agent_id = %outcome.agent_id(),
+                turn_id = %outcome.turn_id(),
+                %error,
+                "terminal outcome delivery failed"
+            );
+        }
+    }
+
+    /// The turn came back without text, so [`Message::empty_marker`] takes its
+    /// place in history. Returns true when the model was nudged to try again.
+    fn recover_stalled_turn(&mut self) -> Result<bool, AgentError> {
+        let nudges = self.history.recent_nudges();
+        let nudge = nudges < MAX_NUDGES && self.history.has_recent_tool_results(RECENT_TOOL_WINDOW);
+        self.history.push(Message::empty_marker());
+        if !nudge {
+            return Ok(false);
+        }
+
+        warn!(
+            nudges = nudges + 1,
+            "empty response after tool calls, nudging model to continue"
+        );
+        self.event_tx.send(AgentEvent::Nudge)?;
+        self.history.push(Message::synthetic(NUDGE_PROMPT.into()));
+        Ok(true)
+    }
+
+    async fn process_tool_calls(&mut self, response: StreamResponse) -> Result<(), AgentError> {
+        let ctx = self.tool_context()?;
+        tool_dispatch::process_tool_calls(
+            response,
+            &mut self.recent_calls,
+            self.history,
+            &self.event_tx,
+            &ctx,
+        )
+        .await
+    }
+
+    /// The working directory comes only from the turn's admission: a turn the
+    /// actor never admitted has no directory to run tools in.
+    pub fn tool_context(&self) -> Result<ToolContext, AgentError> {
+        let cwd = self
+            .admission
+            .as_ref()
+            .and_then(|admission| admission.prompt_inputs.as_ref())
+            .map(|inputs| inputs.cwd.clone())
+            .ok_or_else(|| AgentError::Config {
+                message: NO_ADMITTED_CWD_ERR.into(),
+            })?;
+        Ok(self.tool_context_at(cwd))
+    }
+
+    pub fn tool_context_at(&self, cwd: PathBuf) -> ToolContext {
+        ToolContext {
+            execution_agent_id: Some(self.agent_id),
+            provider: Arc::clone(&self.provider),
+            model: Arc::clone(&self.model),
+            event_tx: self.event_tx.clone(),
+            mode: self.mode.clone(),
+            mode_def: self.mode_def.clone(),
+            question_mode: self.question_mode,
+            session_id: self.session_id.clone(),
+            cwd,
+            tool_use_id: None,
+            user_response_rx: self.user_response_rx.clone(),
+            loaded_instructions: self.loaded_instructions.clone(),
+            cancel: self.cancel.clone(),
+            mcp: self.mcp.clone(),
+            deadline: Deadline::None,
+            config: self.config.clone(),
+            tool_filter: Arc::clone(self.tools.filter()),
+            request_tools: Some(self.tools.clone()),
+            tool_output_lines: self.tool_output_lines,
+            permissions: Arc::clone(&self.permissions),
+            timeouts: self.timeouts,
+            file_tracker: Arc::clone(&self.file_tracker),
+            prompt_slots: Arc::clone(&self.prompt_slots),
+            modes: Arc::clone(&self.modes),
+            opts: self.opts,
+            subagent_cancels: Arc::clone(&self.subagent_cancels),
+            ledger: Arc::clone(&self.ledger),
+            registry: Arc::clone(&self.registry),
+            workflow: self.workflow,
+            audience: self.audience,
+            local_tools: Arc::clone(&self.local_tools),
+            local_tool_capture: self.local_tool_capture.clone(),
+            turn_bindings: Arc::clone(&self.turn_bindings),
+            live_sink: None,
+            model_policy: Arc::clone(&self.model_policy),
+            providers: Arc::clone(&self.providers),
+            file_write_locks: Arc::clone(&self.file_write_locks),
+            offload: self.offload.clone(),
+            pending_output_limits: None,
+            write_lock_chain: Arc::new(Vec::new()),
+            managed_turn: self.managed_turn.clone(),
+        }
+    }
+
+    async fn try_auto_compact(&mut self) -> Result<bool, AgentError> {
+        if !self.auto_compact
+            || !compaction::is_overflow(
+                &TokenUsage {
+                    input: self.context_size,
+                    ..Default::default()
+                },
+                &self.model,
+                &self.config,
+            )
+        {
+            return Ok(false);
+        }
+        info!(context_size = self.context_size, "auto-compacting");
+        self.event_tx.send(AgentEvent::AutoCompacting {
+            context_size: self.context_size,
+            context_window: self.model.context_window,
+        })?;
+        self.do_compact(None).await?;
+        Ok(true)
+    }
+
+    async fn do_compact(&mut self, instructions: Option<&str>) -> Result<(), AgentError> {
+        let context_size_before = self.context_size;
+        let (compact_provider, compact_model) = resolve_compaction_model(
+            &self.provider,
+            &self.model,
+            &self.providers,
+            &self.model_policy,
+        )
+        .await;
+        let compaction_usage = compaction::compact_history(
+            &compact_provider,
+            &self.provider,
+            &compact_model,
+            self.history,
+            &self.event_tx,
+            &self.cancel,
+            &self.config,
+            instructions,
+            self.session_id.as_ref(),
+        )
+        .await?;
+        let fast = self.opts.clamped(&compact_model).fast;
+        let compact_cost = compact_model.billed_cost(&compaction_usage, fast);
+        let compact_list_cost = compact_model.list_cost(&compaction_usage, fast);
+        self.ledger
+            .add(compaction_usage, compact_cost, compact_list_cost);
+        let context_size_after = compaction_usage.output;
+        self.context_size = context_size_after;
+        self.rollback_len = self.history.len();
+        self.event_tx.send(AgentEvent::CompactionDone {
+            context_size_before,
+            context_size_after,
+            context_window: self.model.context_window,
+        })?;
+        self.history
+            .push(Message::synthetic(compaction::continue_message(
+                &self.config,
+            )));
+        Ok(())
+    }
+
+    fn instruction_consumed(&mut self) {
+        self.pending_instruction_request = true;
+        self.invalidate_reports();
+    }
+
+    fn invalidate_reports(&self) {
+        if let Some(capture) = &self.local_tool_capture {
+            *capture.lock().unwrap_or_else(|error| error.into_inner()) = None;
+        }
+        if let Some(callback) = &self.instruction_consumed_callback {
+            callback();
+        }
+    }
+
+    fn consume_instruction_inbox(&mut self) -> Result<bool, AgentError> {
+        let Some(inbox) = self.turn_inbox.clone() else {
+            return Ok(false);
+        };
+        let instructions = inbox.drain_presented_instructions();
+        let consumed = !instructions.is_empty();
+        self.consume_presented_inputs(instructions.into_iter().map(|(presentation, input)| {
+            crate::PresentedInput {
+                input,
+                already_displayed: presentation.already_displayed,
+                mcp_startup_notice: presentation.mcp_startup_notice,
+            }
+        }))?;
+        Ok(consumed)
+    }
+
+    fn consume_turn_inbox(&mut self) -> Result<(), AgentError> {
+        self.consume_instruction_inbox()?;
+        if let Some(inbox) = self.turn_inbox.clone() {
+            inbox.commit_completions(&mut |message| self.history.push(message));
+        }
+        Ok(())
+    }
+
+    async fn handle_queued_command(&mut self) -> Result<bool, AgentError> {
+        let Some(ref source) = self.interrupt_source else {
+            return Ok(false);
+        };
+        let Some(cmd) = self
+            .cancel
+            .race(source.poll_ready())
+            .await
+            .map_err(|_| AgentError::Cancelled)?
+        else {
+            return Ok(false);
+        };
+        match cmd {
+            ExtractedCommand::Interrupt(inputs) => {
+                self.consume_presented_inputs(inputs.into_iter().map(|input| {
+                    crate::PresentedInput {
+                        input,
+                        already_displayed: true,
+                        mcp_startup_notice: None,
+                    }
+                }))?;
+            }
+            ExtractedCommand::PresentedInterrupt(inputs) => {
+                self.consume_presented_inputs(inputs)?;
+            }
+            ExtractedCommand::Compact(instructions) => {
+                self.do_compact(instructions.as_deref()).await?;
+            }
+        }
+        Ok(true)
+    }
+
+    fn consume_presented_inputs(
+        &mut self,
+        inputs: impl IntoIterator<Item = crate::PresentedInput>,
+    ) -> Result<(), AgentError> {
+        let mut presentation_failed = false;
+        for presented in inputs {
+            let input = presented.input;
+            self.instruction_consumed();
+            presentation_failed |= self
+                .event_tx
+                .send(AgentEvent::QueueItemConsumed {
+                    text: input.message.clone(),
+                    images: input.images.clone(),
+                    mcp_startup_notice: presented.mcp_startup_notice,
+                    already_displayed: presented.already_displayed,
+                })
+                .is_err();
+            self.push_input_context(input.preamble);
+            let wrapped = format!(
+                "<user-interrupt>\n{INTERRUPT_NOTE}\n\n{}\n</user-interrupt>",
+                input.message
+            );
+            let mut message = Message {
+                display_text: Some(if input.message.is_empty() && !input.images.is_empty() {
+                    IMAGE_PLACEHOLDER.into()
+                } else {
+                    input.message
+                }),
+                ..Message::user_with_images(wrapped, input.images)
+            };
+            if let Some(count) = presented.mcp_startup_notice {
+                let notice = format!(
+                    "[system: {count} MCP servers are not ready; MCP tools are unavailable for this turn]"
+                );
+                message.content.push(ContentBlock::Text {
+                    text: notice.clone(),
+                });
+                if let Some(display) = &mut message.display_text {
+                    display.push('\n');
+                    display.push_str(&notice);
+                }
+            }
+            self.history.push(message);
+        }
+        if presentation_failed {
+            return Err(AgentError::Channel);
+        }
+        Ok(())
+    }
+}
+
+const CHARS_PER_TOKEN: usize = 4;
+
+/// Counts message content only. The system prompt and the tool schemas, a five
+/// figure baseline on a full tool set, stay invisible here, so never let this
+/// replace a context size the provider measured.
+pub fn estimate_message_tokens(messages: &[Message]) -> u32 {
+    if messages.is_empty() {
+        return 0;
+    }
+    let total_bytes: usize = messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.len()),
+            ContentBlock::ToolResult { content, .. } => Some(content.len()),
+            ContentBlock::ToolUse { input, .. } => Some(input.to_string().len()),
+            ContentBlock::Thinking { thinking, .. } => Some(thinking.len()),
+            _ => None,
+        })
+        .sum();
+    (total_bytes.max(CHARS_PER_TOKEN) / CHARS_PER_TOKEN) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    use arc_swap::ArcSwap;
+    use makima_providers::provider::{BoxFuture, Provider};
+    use makima_providers::{
+        ContentBlock, ConversationLink, ConversationRelation, Invocation, Message, Model,
+        ProviderEvent, RequestDelivery, RequestOptions, RetryKind, Role, StopReason,
+        StreamResponse, TokenUsage,
+    };
+    use serde_json::Value;
+    use test_case::test_case;
+
+    use super::*;
+    use crate::actor::{EffectiveAgentConfig, PendingSubmission, SubmissionId};
+    use crate::agent::{HistorySnapshot, SharedMessages};
+    use crate::mcp::tool_names;
+    use crate::permissions::PermissionManager;
+    use crate::{ActorWorkIdentity, ActorWorkKind, Envelope};
+
+    const TEST_CWD: &str = "/tmp";
+    const TEST_PLAN_PATH: &str = "/tmp/plan.md";
+    const TEST_THINKING_BUDGET: u32 = 8192;
+
+    struct MockInterruptSource {
+        commands: Mutex<VecDeque<ExtractedCommand>>,
+    }
+
+    impl MockInterruptSource {
+        fn new(commands: Vec<ExtractedCommand>) -> Arc<Self> {
+            Arc::new(Self {
+                commands: Mutex::new(commands.into()),
+            })
+        }
+    }
+
+    impl InterruptSource for MockInterruptSource {
+        fn poll(&self) -> Option<ExtractedCommand> {
+            self.commands.lock().unwrap().pop_front()
+        }
+    }
+
+    struct MockProvider {
+        responses: Mutex<Vec<StreamResponse>>,
+        captured_tools: Arc<Mutex<Vec<Value>>>,
+        captured_messages: Arc<Mutex<Vec<Vec<Message>>>>,
+        captured_systems: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl MockProvider {
+        fn new(responses: Vec<StreamResponse>) -> Self {
+            Self {
+                responses: Mutex::new(responses),
+                captured_tools: Arc::default(),
+                captured_messages: Arc::default(),
+                captured_systems: Arc::default(),
+            }
+        }
+    }
+
+    impl Provider for MockProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            messages: &'a [Message],
+            system: &'a str,
+            tools: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async {
+                self.captured_messages
+                    .lock()
+                    .unwrap()
+                    .push(messages.to_vec());
+                self.captured_tools.lock().unwrap().push(tools.clone());
+                self.captured_systems
+                    .lock()
+                    .unwrap()
+                    .push(system.to_owned());
+                let mut responses = self.responses.lock().unwrap();
+                assert!(!responses.is_empty(), "MockProvider: no more responses");
+                Ok(responses.remove(0))
+            })
+        }
+    }
+
+    struct MutatingModeProvider {
+        modes: Arc<crate::ModeRegistry>,
+        advertised: Arc<Mutex<Vec<Value>>>,
+    }
+
+    impl Provider for MutatingModeProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            tools: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                let mut advertised = self.advertised.lock().unwrap();
+                advertised.push(tools.clone());
+                if advertised.len() == 1 {
+                    self.modes
+                        .define(crate::ModeDefSpec {
+                            name: "audit".into(),
+                            restrict_write_to: Some(PathBuf::from("/tmp/new-policy")),
+                            tools: Some(vec!["write".into()]),
+                            ..Default::default()
+                        })
+                        .unwrap();
+                    Ok(text_response(StopReason::MaxTokens))
+                } else {
+                    Ok(text_response(StopReason::EndTurn))
+                }
+            })
+        }
+    }
+
+    struct ScriptedProvider {
+        results: Mutex<VecDeque<Result<StreamResponse, AgentError>>>,
+    }
+
+    impl Provider for ScriptedProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async {
+                self.results
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("ScriptedProvider: no more results")
+            })
+        }
+    }
+
+    /// Streams `delta` (if any), fires `cancel_after_delta` (if any),
+    /// then fails with `fail` (status and retry class) or hangs until cancelled.
+    #[derive(Default)]
+    struct StubStreamProvider {
+        delta: Option<&'static str>,
+        cancel_after_delta: Mutex<Option<crate::cancel::CancelTrigger>>,
+        fail: Option<(u16, Option<RetryKind>)>,
+    }
+
+    impl Provider for StubStreamProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            ptx: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                if let Some(text) = self.delta {
+                    ptx.send(ProviderEvent::TextDelta { text: text.into() })
+                        .unwrap();
+                }
+                if let Some(trigger) = self.cancel_after_delta.lock().unwrap().take() {
+                    trigger.cancel();
+                }
+                match self.fail {
+                    Some((status, retry)) => Err(api_error(status, retry)),
+                    None => futures_lite::future::pending().await,
+                }
+            })
+        }
+    }
+
+    type Ended = (Arc<str>, ConversationEnd);
+
+    fn api_error(status: u16, retry: Option<RetryKind>) -> AgentError {
+        AgentError::Api {
+            status,
+            message: "stub".into(),
+            retry_after: None,
+            overflow: false,
+            retry,
+        }
+    }
+
+    /// Cancels its first request if armed. `end_conversation` never resolves,
+    /// so a caller that waited on it would hang.
+    struct ConversationProbe {
+        cancel_first: Mutex<Option<crate::cancel::CancelTrigger>>,
+        /// Whether the request the probe cancels was delivered first.
+        deliver_before_cancel: bool,
+        /// Each request's invocation and message count.
+        conversations: Arc<Mutex<Vec<(Invocation, usize)>>>,
+        ended: flume::Sender<Ended>,
+    }
+
+    impl Provider for ConversationProbe {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            messages: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+            invocation: &'a Invocation,
+            delivery: RequestDelivery,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            self.conversations
+                .lock()
+                .unwrap()
+                .push((invocation.clone(), messages.len()));
+            let cancel = self.cancel_first.lock().unwrap().take();
+            if cancel.is_some() && self.deliver_before_cancel {
+                assert!(delivery.mark());
+            }
+            Box::pin(async move {
+                match cancel {
+                    Some(trigger) => {
+                        trigger.cancel();
+                        futures_lite::future::pending().await
+                    }
+                    None => Ok(text_response(StopReason::EndTurn)),
+                }
+            })
+        }
+
+        fn end_conversation(
+            &self,
+            conversation_id: &str,
+            reason: ConversationEnd,
+        ) -> BoxFuture<'_, ()> {
+            let _ = self.ended.send((conversation_id.into(), reason));
+            Box::pin(futures_lite::future::pending())
+        }
+    }
+
+    const PROVIDER_FAILED: &str = "provider failed";
+
+    /// Marks delivery or not, optionally reports the mark and waits to be
+    /// released, then fails for good.
+    struct DeliveringProvider {
+        marks: bool,
+        marked: Option<flume::Sender<()>>,
+        release: Option<flume::Receiver<()>>,
+    }
+
+    impl Provider for DeliveringProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+            _: &'a Invocation,
+            delivery: RequestDelivery,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            if self.marks {
+                assert!(delivery.mark());
+            }
+            Box::pin(async move {
+                if let Some(marked) = &self.marked {
+                    marked.send(()).unwrap();
+                }
+                if let Some(release) = &self.release {
+                    let _ = release.recv_async().await;
+                }
+                Err(AgentError::Config {
+                    message: PROVIDER_FAILED.into(),
+                })
+            })
+        }
+    }
+
+    fn default_model() -> Model {
+        Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap()
+    }
+
+    fn text_response(stop_reason: StopReason) -> StreamResponse {
+        StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "response".into(),
+                }],
+                ..Default::default()
+            },
+            usage: TokenUsage::default(),
+            stop_reason: Some(stop_reason),
+        }
+    }
+
+    fn empty_response() -> StreamResponse {
+        assistant_response(vec![])
+    }
+
+    fn thinking_response() -> StreamResponse {
+        assistant_response(vec![ContentBlock::Thinking {
+            thinking: "stalled".into(),
+            signature: None,
+        }])
+    }
+
+    fn assistant_response(content: Vec<ContentBlock>) -> StreamResponse {
+        StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content,
+                ..Default::default()
+            },
+            usage: TokenUsage::default(),
+            stop_reason: Some(StopReason::EndTurn),
+        }
+    }
+
+    /// What the actor admits for the next turn in `mode`: its mode, its tool
+    /// bindings and the working directory tools run in.
+    fn admit(agent: &mut Agent<'_>) {
+        let mode_def = match &agent.mode {
+            AgentMode::Custom(id) => agent.modes.get(id),
+            mode => Some(agent.modes.current(mode)),
+        };
+        let prompt_inputs = TurnPromptInputs {
+            cwd: TEST_CWD.into(),
+            instructions: Default::default(),
+            mcp_prompt: None,
+            resolved: None,
+            ready: None,
+        };
+        agent.admission = Some(TurnAdmissionSnapshot {
+            mode_def: mode_def.map(Arc::new),
+            bindings: Arc::new(TurnToolBindings::capture(
+                &agent.registry,
+                &agent.local_tools,
+                agent.mcp.as_ref(),
+            )),
+            prompt_inputs: Some(Arc::new(prompt_inputs)),
+            mcp_startup_notice: None,
+        });
+    }
+
+    async fn run_admitted(
+        agent: &mut Agent<'_>,
+        turn_id: TurnId,
+        input: AgentInput,
+    ) -> TurnOutcome {
+        admit(agent);
+        agent.run(turn_id, input).await
+    }
+
+    fn make_agent(
+        provider: impl Provider + 'static,
+        history: &mut History,
+    ) -> (Agent<'_>, flume::Receiver<Envelope>) {
+        let (raw_tx, event_rx) = flume::unbounded();
+        make_agent_with_sender(provider, history, raw_tx, event_rx)
+    }
+
+    #[test_case(false, false, false; "standalone_completed")]
+    #[test_case(false, true, false; "standalone_failed")]
+    #[test_case(false, false, true; "standalone_cancelled")]
+    #[test_case(true, false, false; "actor_completed")]
+    #[test_case(true, true, false; "actor_failed")]
+    #[test_case(true, false, true; "actor_cancelled")]
+    fn terminal_delivery_is_explicitly_deferred(deferred: bool, failed: bool, cancelled: bool) {
+        smol::block_on(async {
+            let result = if failed {
+                Err(AgentError::api(400, "invalid request"))
+            } else {
+                Ok(text_response(StopReason::EndTurn))
+            };
+            let provider = ScriptedProvider {
+                results: Mutex::new(VecDeque::from([result])),
+            };
+            let mut history = History::new(Vec::new());
+            let (mut agent, events) = make_agent(provider, &mut history);
+            if deferred {
+                agent = agent.with_deferred_outcome();
+            }
+            if cancelled {
+                let (trigger, token) = CancelToken::new();
+                trigger.cancel();
+                agent = agent.with_cancel(token);
+            }
+            let turn_id = TurnId::generate();
+            let outcome = run_admitted(&mut agent, turn_id, default_input()).await;
+            assert_eq!(outcome.turn_id(), turn_id);
+            assert_eq!(matches!(outcome, TurnOutcome::Failed { .. }), failed);
+            assert_eq!(matches!(outcome, TurnOutcome::Cancelled { .. }), cancelled);
+            let delivered: Vec<_> = events
+                .drain()
+                .filter_map(|envelope| match envelope.event {
+                    AgentEvent::TurnOutcome(outcome) => Some(outcome),
+                    _ => None,
+                })
+                .collect();
+            if deferred {
+                assert!(delivered.is_empty());
+            } else {
+                assert_eq!(delivered, vec![outcome]);
+            }
+        });
+    }
+
+    struct FinishRaceInbox {
+        pending: Mutex<Vec<AgentInput>>,
+        inject_on_finish: Mutex<bool>,
+        submitted: Mutex<bool>,
+    }
+
+    impl TurnInbox for FinishRaceInbox {
+        fn drain_presented_instructions(&self) -> Vec<(PendingSubmission, AgentInput)> {
+            const SUBMISSION: SubmissionId = SubmissionId(1);
+            self.drain_instructions()
+                .into_iter()
+                .map(|input| {
+                    let presentation = PendingSubmission {
+                        id: SUBMISSION,
+                        turn_id: TurnId::generate(),
+                        text: input.message.clone(),
+                        images: input.images.clone(),
+                        already_displayed: true,
+                        mcp_startup_notice: None,
+                    };
+                    (presentation, input)
+                })
+                .collect()
+        }
+
+        fn drain_instructions(&self) -> Vec<AgentInput> {
+            let inputs = std::mem::take(&mut *self.pending.lock().unwrap());
+            if !inputs.is_empty() {
+                *self.submitted.lock().unwrap() = false;
+            }
+            inputs
+        }
+
+        fn drain_completions(&self) -> Vec<Message> {
+            Vec::new()
+        }
+
+        fn finish(&self) -> bool {
+            if std::mem::take(&mut *self.inject_on_finish.lock().unwrap()) {
+                let mut input = default_input();
+                input.message = STEERING_MESSAGE.into();
+                self.pending.lock().unwrap().push(input);
+                return false;
+            }
+            self.finish_instructions()
+        }
+
+        fn finish_instructions(&self) -> bool {
+            self.pending.lock().unwrap().is_empty() && *self.submitted.lock().unwrap()
+        }
+
+        fn instructions_submitted(&self) {
+            *self.submitted.lock().unwrap() = true;
+        }
+
+        fn has_unsubmitted_instructions(&self) -> bool {
+            !self.pending.lock().unwrap().is_empty() || !*self.submitted.lock().unwrap()
+        }
+    }
+
+    const STEERING_MESSAGE: &str = "revise the task before finishing";
+
+    #[test]
+    fn disconnected_presentation_preserves_all_drained_instructions_and_fails() {
+        smol::block_on(async {
+            const INSTRUCTIONS: [&str; 2] =
+                ["first accepted instruction", "second accepted instruction"];
+            let inbox = Arc::new(FinishRaceInbox {
+                pending: Mutex::new(
+                    INSTRUCTIONS
+                        .into_iter()
+                        .map(|message| {
+                            let mut input = default_input();
+                            input.message = message.into();
+                            input
+                        })
+                        .collect(),
+                ),
+                inject_on_finish: Mutex::new(false),
+                submitted: Mutex::new(false),
+            });
+            let provider = MockProvider::new(Vec::new());
+            let requests = Arc::clone(&provider.captured_messages);
+            let mut history = History::new(Vec::new());
+            let (agent, events) = make_agent(provider, &mut history);
+            drop(events);
+            let mut agent = agent.with_turn_inbox(Some(inbox.clone()));
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            assert!(matches!(outcome, TurnOutcome::Failed { .. }));
+            assert!(requests.lock().unwrap().is_empty());
+            assert!(!*inbox.submitted.lock().unwrap());
+            assert!(inbox.pending.lock().unwrap().is_empty());
+            drop(agent);
+            for instruction in INSTRUCTIONS {
+                assert!(history.as_slice().iter().any(|message| {
+                    message.display_text.as_deref() == Some(instruction)
+                        && message
+                            .first_text_content()
+                            .is_some_and(|text| text.contains(instruction))
+                }));
+            }
+        });
+    }
+
+    #[test_case(None; "accepted_instruction_reaches_next_request")]
+    #[test_case(Some(1); "budget_failure_is_not_success")]
+    fn accepted_instruction_request_coverage(max_turns: Option<u32>) {
+        smol::block_on(async {
+            let inbox = Arc::new(FinishRaceInbox {
+                pending: Mutex::new(Vec::new()),
+                inject_on_finish: Mutex::new(true),
+                submitted: Mutex::new(true),
+            });
+            let provider = MockProvider::new(vec![
+                text_response(StopReason::EndTurn),
+                text_response(StopReason::EndTurn),
+            ]);
+            let requests = Arc::clone(&provider.captured_messages);
+            let mut history = History::new(Vec::new());
+            let (agent, events) = make_agent(provider, &mut history);
+            let mut agent = agent.with_turn_inbox(Some(inbox));
+            agent.config.max_turns = max_turns;
+            let turn_id = TurnId::generate();
+            let outcome = run_admitted(&mut agent, turn_id, default_input()).await;
+            assert_eq!(outcome.turn_id(), turn_id);
+            if max_turns.is_some() {
+                assert!(matches!(outcome, TurnOutcome::Failed { failure, .. }
+                    if failure.diagnostic.contains(INSTRUCTION_BUDGET_EXHAUSTED)));
+                assert_eq!(requests.lock().unwrap().len(), 1);
+            } else {
+                assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+                let requests = requests.lock().unwrap();
+                assert_eq!(requests.len(), 2);
+                assert!(requests[1].iter().any(|message| {
+                    matches!(message.role, Role::User)
+                        && message.first_text_content().is_some_and(|text| {
+                            text.contains(STEERING_MESSAGE) && text.starts_with("<user-interrupt>")
+                        })
+                }));
+            }
+            assert_eq!(
+                events
+                    .drain()
+                    .filter(|event| { matches!(event.event, AgentEvent::TurnOutcome(_)) })
+                    .count(),
+                1
+            );
+        });
+    }
+
+    /// A child report still waiting at the turn budget belongs to a successor
+    /// turn; it must not be mistaken for an unsubmitted instruction.
+    #[test]
+    fn pending_completion_at_turn_budget_is_not_instruction_failure() {
+        struct PendingCompletionInbox;
+
+        impl TurnInbox for PendingCompletionInbox {
+            fn drain_presented_instructions(&self) -> Vec<(PendingSubmission, AgentInput)> {
+                Vec::new()
+            }
+
+            fn drain_instructions(&self) -> Vec<AgentInput> {
+                Vec::new()
+            }
+            fn drain_completions(&self) -> Vec<Message> {
+                Vec::new()
+            }
+            fn finish(&self) -> bool {
+                false
+            }
+            fn finish_instructions(&self) -> bool {
+                true
+            }
+            fn instructions_submitted(&self) {}
+            fn has_unsubmitted_instructions(&self) -> bool {
+                false
+            }
+        }
+
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (agent, _events) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::MaxTokens)]),
+                &mut history,
+            );
+            let mut agent = agent.with_turn_inbox(Some(Arc::new(PendingCompletionInbox)));
+            agent.config.max_turns = Some(1);
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            assert!(matches!(
+                outcome,
+                TurnOutcome::Completed {
+                    reason: DoneReason::MaxTurns,
+                    ..
+                }
+            ));
+        });
+    }
+
+    /// Reports that land after a final answer: once the first `finish` refuses,
+    /// one child observation becomes drainable.
+    struct LateReportInbox {
+        managed_child: bool,
+        refused: Mutex<bool>,
+        report: Mutex<Option<Message>>,
+    }
+
+    impl LateReportInbox {
+        fn new(managed_child: bool) -> Self {
+            Self {
+                managed_child,
+                refused: Mutex::new(false),
+                report: Mutex::new(Some(Message::observation(LATE_REPORT.into()))),
+            }
+        }
+    }
+
+    impl TurnInbox for LateReportInbox {
+        fn drain_presented_instructions(&self) -> Vec<(PendingSubmission, AgentInput)> {
+            Vec::new()
+        }
+
+        fn drain_instructions(&self) -> Vec<AgentInput> {
+            Vec::new()
+        }
+        fn drain_completions(&self) -> Vec<Message> {
+            if !*self.refused.lock().unwrap() {
+                return Vec::new();
+            }
+            self.report.lock().unwrap().take().into_iter().collect()
+        }
+        fn finish(&self) -> bool {
+            std::mem::replace(&mut *self.refused.lock().unwrap(), true)
+        }
+        fn finish_instructions(&self) -> bool {
+            true
+        }
+        fn is_managed_child(&self) -> bool {
+            self.managed_child
+        }
+        fn instructions_submitted(&self) {}
+        fn has_unsubmitted_instructions(&self) -> bool {
+            false
+        }
+    }
+
+    const LATE_REPORT: &str = "late child report";
+
+    /// A report that arrives after the final answer of the last allowed request
+    /// stays pending; the turn keeps its own reason instead of `MaxTurns`.
+    #[test]
+    fn late_report_at_turn_budget_keeps_done_reason() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let requests = Arc::clone(&provider.captured_messages);
+            let mut history = History::new(Vec::new());
+            let (agent, _events) = make_agent(provider, &mut history);
+            let inbox = Arc::new(LateReportInbox::new(true));
+            let mut agent = agent.with_turn_inbox(Some(Arc::clone(&inbox) as Arc<dyn TurnInbox>));
+            agent.config.max_turns = Some(1);
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            assert!(matches!(
+                outcome,
+                TurnOutcome::Completed {
+                    reason: DoneReason::EndTurn,
+                    ..
+                }
+            ));
+            assert_eq!(requests.lock().unwrap().len(), 1);
+            assert!(inbox.report.lock().unwrap().is_some());
+        });
+    }
+
+    /// A subagent's single report is its last answer, so late child reports
+    /// invalidate earlier captures and ask for the complete answer again.
+    /// Roots consume them without restating.
+    #[test_case(true; "managed_child_restates")]
+    #[test_case(false; "root_does_not_restate")]
+    fn late_reports_after_final_answer(managed_child: bool) {
+        smol::block_on(async {
+            let capture = Arc::new(Mutex::new(Some(serde_json::json!({"stale": true}))));
+            let invalidations = Arc::new(Mutex::new(0));
+            let called = Arc::clone(&invalidations);
+            let provider = MockProvider::new(vec![
+                text_response(StopReason::EndTurn),
+                text_response(StopReason::EndTurn),
+            ]);
+            let requests = Arc::clone(&provider.captured_messages);
+            let mut history = History::new(Vec::new());
+            let (agent, _events) = make_agent(provider, &mut history);
+            let mut agent = agent
+                .with_turn_inbox(Some(Arc::new(LateReportInbox::new(managed_child))))
+                .with_local_tool_capture(Arc::clone(&capture))
+                .with_instruction_consumed_callback(Arc::new(move || {
+                    *called.lock().unwrap() += 1;
+                }));
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            let texts: Vec<_> = requests[1]
+                .iter()
+                .filter_map(Message::first_text_content)
+                .collect();
+            assert!(texts.contains(&LATE_REPORT));
+            assert_eq!(texts.contains(&LATE_REPORTS_NOTE), managed_child);
+            assert_eq!(*invalidations.lock().unwrap(), usize::from(managed_child));
+            assert_eq!(capture.lock().unwrap().is_none(), managed_child);
+        });
+    }
+
+    #[test_case(false; "instructions_invalidate_local_capture")]
+    #[test_case(true; "observations_preserve_local_capture")]
+    fn steering_capture_freshness(observation_only: bool) {
+        struct FreshnessInbox {
+            instruction: Mutex<Option<AgentInput>>,
+            observation: Mutex<Option<Message>>,
+        }
+
+        impl TurnInbox for FreshnessInbox {
+            fn drain_presented_instructions(&self) -> Vec<(PendingSubmission, AgentInput)> {
+                const SUBMISSION: SubmissionId = SubmissionId(1);
+                self.drain_instructions()
+                    .into_iter()
+                    .map(|input| {
+                        let presentation = PendingSubmission {
+                            id: SUBMISSION,
+                            turn_id: TurnId::generate(),
+                            text: input.message.clone(),
+                            images: input.images.clone(),
+                            already_displayed: true,
+                            mcp_startup_notice: None,
+                        };
+                        (presentation, input)
+                    })
+                    .collect()
+            }
+
+            fn drain_instructions(&self) -> Vec<AgentInput> {
+                self.instruction
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .into_iter()
+                    .collect()
+            }
+            fn drain_completions(&self) -> Vec<Message> {
+                self.observation
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .into_iter()
+                    .collect()
+            }
+            fn finish(&self) -> bool {
+                true
+            }
+            fn finish_instructions(&self) -> bool {
+                true
+            }
+            fn instructions_submitted(&self) {}
+            fn has_unsubmitted_instructions(&self) -> bool {
+                false
+            }
+        }
+
+        smol::block_on(async {
+            let mut input = default_input();
+            input.message = STEERING_MESSAGE.into();
+            let inbox = Arc::new(FreshnessInbox {
+                instruction: Mutex::new((!observation_only).then_some(input)),
+                observation: Mutex::new(
+                    observation_only.then(|| Message::observation(STEERING_MESSAGE.into())),
+                ),
+            });
+            let capture = Arc::new(Mutex::new(Some(serde_json::json!({"old": true}))));
+            let invalidations = Arc::new(Mutex::new(0));
+            let called = Arc::clone(&invalidations);
+            let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let requests = Arc::clone(&provider.captured_messages);
+            let mut history = History::new(Vec::new());
+            let (agent, _events) = make_agent(provider, &mut history);
+            let mut agent = agent
+                .with_turn_inbox(Some(inbox))
+                .with_local_tool_capture(Arc::clone(&capture))
+                .with_instruction_consumed_callback(Arc::new(move || {
+                    *called.lock().unwrap() += 1;
+                }));
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+            assert_eq!(capture.lock().unwrap().is_some(), observation_only);
+            assert_eq!(
+                *invalidations.lock().unwrap(),
+                usize::from(!observation_only)
+            );
+            assert!(requests.lock().unwrap()[0].iter().any(|message| {
+                message.first_text_content().is_some_and(|text| {
+                    text.contains(STEERING_MESSAGE)
+                        && (observation_only || text.starts_with("<user-interrupt>"))
+                })
+            }));
+        });
+    }
+
+    #[test_case(false; "report_after_recovery")]
+    #[test_case(true; "missing_report_exhausts_recovery")]
+    fn completion_recovery_stays_in_one_turn_and_emits_one_outcome(exhaust: bool) {
+        const NUDGE: &str = "report required output";
+        const MISSING: &str = "missing required output";
+        smol::block_on(async {
+            let checks = Arc::new(Mutex::new(0));
+            let mut history = History::new(Vec::new());
+            let (agent, events) = make_agent(
+                MockProvider::new((0..3).map(|_| text_response(StopReason::EndTurn)).collect()),
+                &mut history,
+            );
+            let count = Arc::clone(&checks);
+            let mut agent = agent.with_completion_check(Arc::new(move || {
+                let mut checks = count.lock().unwrap();
+                *checks += 1;
+                match *checks {
+                    1 | 2 => Ok(Some(NUDGE.into())),
+                    _ if exhaust => Err(MISSING.into()),
+                    _ => Ok(None),
+                }
+            }));
+            let turn_id = TurnId::generate();
+            let outcome = run_admitted(&mut agent, turn_id, default_input()).await;
+            assert_eq!(outcome.turn_id(), turn_id);
+            assert_eq!(outcome.num_turns(), 3);
+            assert_eq!(matches!(outcome, TurnOutcome::Failed { .. }), exhaust);
+            drop(agent);
+            assert_eq!(*checks.lock().unwrap(), 3);
+            assert_eq!(
+                events
+                    .drain()
+                    .filter(|event| matches!(event.event, AgentEvent::TurnOutcome(_)))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                history
+                    .as_slice()
+                    .iter()
+                    .filter(|message| matches!(message.role, Role::User)
+                        && message.content.iter().any(
+                            |block| matches!(block, ContentBlock::Text { text } if text == NUDGE)
+                        ))
+                    .count(),
+                2
+            );
+        });
+    }
+
+    #[test_case(None; "unlimited_turn_budget")]
+    #[test_case(Some(10); "larger_turn_budget")]
+    fn completion_recovery_bounds_an_always_nudging_check(max_turns: Option<u32>) {
+        const NUDGE: &str = "report required output";
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (agent, events) = make_agent(
+                MockProvider::new(
+                    (0..=MAX_COMPLETION_RECOVERY_ATTEMPTS)
+                        .map(|_| text_response(StopReason::EndTurn))
+                        .collect(),
+                ),
+                &mut history,
+            );
+            let mut agent = agent.with_completion_check(Arc::new(|| Ok(Some(NUDGE.into()))));
+            agent.config.max_turns = max_turns;
+            let turn_id = TurnId::generate();
+            let outcome = run_admitted(&mut agent, turn_id, default_input()).await;
+            assert_eq!(outcome.turn_id(), turn_id);
+            assert_eq!(outcome.num_turns(), MAX_COMPLETION_RECOVERY_ATTEMPTS + 1);
+            assert!(matches!(outcome, TurnOutcome::Failed { .. }));
+            drop(agent);
+            let outcomes: Vec<_> = events
+                .drain()
+                .filter_map(|event| match event.event {
+                    AgentEvent::TurnOutcome(outcome) => Some(outcome),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(outcomes.len(), 1);
+            assert!(matches!(
+                &outcomes[0],
+                TurnOutcome::Failed { failure, .. }
+                    if failure.diagnostic.contains(COMPLETION_RECOVERY_EXHAUSTED)
+            ));
+            assert_eq!(
+                history
+                    .as_slice()
+                    .iter()
+                    .filter(|message| matches!(message.role, Role::User)
+                        && message.content.iter().any(
+                            |block| matches!(block, ContentBlock::Text { text } if text == NUDGE)
+                        ))
+                    .count(),
+                MAX_COMPLETION_RECOVERY_ATTEMPTS as usize
+            );
+        });
+    }
+
+    #[test_case(None; "recovery_budget")]
+    #[test_case(Some(0); "already_exhausted_turn_budget")]
+    #[test_case(Some(1); "turn_budget")]
+    #[test_case(Some(3); "both_budgets")]
+    fn completion_exhaustion_uses_specific_diagnostic(max_turns: Option<u32>) {
+        const NUDGE: &str = "report required output";
+        const DIAGNOSTIC: &str = "agent result does not match output_schema";
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (agent, _events) = make_agent(
+                MockProvider::new(
+                    (0..=MAX_COMPLETION_RECOVERY_ATTEMPTS)
+                        .map(|_| text_response(StopReason::EndTurn))
+                        .collect(),
+                ),
+                &mut history,
+            );
+            let exhausted = Arc::new(Mutex::new(0));
+            let count = Arc::clone(&exhausted);
+            let mut agent = agent
+                .with_completion_check(Arc::new(|| Ok(Some(NUDGE.into()))))
+                .with_completion_exhausted(Arc::new(move || {
+                    *count.lock().unwrap() += 1;
+                    DIAGNOSTIC.into()
+                }));
+            agent.config.max_turns = max_turns;
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            assert_eq!(
+                outcome.num_turns(),
+                max_turns.unwrap_or(MAX_COMPLETION_RECOVERY_ATTEMPTS + 1)
+            );
+            assert!(matches!(
+                outcome,
+                TurnOutcome::Failed { failure, .. }
+                    if failure.diagnostic.contains(DIAGNOSTIC)
+            ));
+            assert_eq!(*exhausted.lock().unwrap(), 1);
+        });
+    }
+
+    #[test]
+    fn cancellation_does_not_attempt_missing_report_recovery() {
+        smol::block_on(async {
+            let (trigger, cancel) = CancelToken::new();
+            trigger.cancel();
+            let mut history = History::new(Vec::new());
+            let (agent, events) = make_agent(MockProvider::new(Vec::new()), &mut history);
+            let mut agent = agent
+                .with_cancel(cancel)
+                .with_completion_check(Arc::new(|| {
+                    panic!("cancelled turns must not recover output")
+                }));
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            assert!(matches!(outcome, TurnOutcome::Cancelled { .. }));
+            drop(agent);
+            assert_eq!(
+                events
+                    .drain()
+                    .filter(|event| matches!(event.event, AgentEvent::TurnOutcome(_)))
+                    .count(),
+                1
+            );
+        });
+    }
+
+    #[test_case(1; "no_recovery_turn_available")]
+    #[test_case(2; "one_recovery_turn_available")]
+    #[test_case(3; "turn_and_recovery_budgets_exhausted")]
+    fn completion_recovery_respects_turn_budget(max_turns: u32) {
+        const NUDGE: &str = "report required output";
+        smol::block_on(async {
+            let checks = Arc::new(Mutex::new(0));
+            let mut history = History::new(Vec::new());
+            let (agent, events) = make_agent(
+                MockProvider::new(
+                    (0..max_turns)
+                        .map(|_| text_response(StopReason::EndTurn))
+                        .collect(),
+                ),
+                &mut history,
+            );
+            let count = Arc::clone(&checks);
+            let mut agent = agent.with_completion_check(Arc::new(move || {
+                *count.lock().unwrap() += 1;
+                Ok(Some(NUDGE.into()))
+            }));
+            agent.config.max_turns = Some(max_turns);
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            assert!(matches!(
+                &outcome,
+                TurnOutcome::Failed { failure, .. }
+                    if failure.diagnostic.contains(REQUIRED_OUTPUT_BUDGET_EXHAUSTED)
+            ));
+            assert_eq!(outcome.num_turns(), max_turns);
+            drop(agent);
+            assert_eq!(*checks.lock().unwrap(), max_turns);
+            assert_eq!(history.as_slice().len(), 2 * max_turns as usize);
+            assert!(matches!(
+                history.as_slice().last().unwrap().role,
+                Role::Assistant
+            ));
+            assert_eq!(
+                history
+                    .as_slice()
+                    .iter()
+                    .filter(|message| matches!(message.role, Role::User)
+                        && message.content.iter().any(
+                            |block| matches!(block, ContentBlock::Text { text } if text == NUDGE)
+                        ))
+                    .count(),
+                (max_turns - 1) as usize
+            );
+            assert_eq!(
+                events
+                    .drain()
+                    .filter(|event| matches!(event.event, AgentEvent::TurnOutcome(_)))
+                    .count(),
+                1
+            );
+        });
+    }
+
+    #[test_case(false; "complete_output_at_turn_limit")]
+    #[test_case(true; "callback_error_at_turn_limit")]
+    fn completion_check_preserves_result_at_turn_limit(fail: bool) {
+        const CALLBACK_ERROR: &str = "required output check failed";
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (agent, _events) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            let mut agent = agent.with_completion_check(Arc::new(move || {
+                if fail {
+                    Err(CALLBACK_ERROR.into())
+                } else {
+                    Ok(None)
+                }
+            }));
+            agent.config.max_turns = Some(1);
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            assert_eq!(outcome.num_turns(), 1);
+            if fail {
+                assert!(matches!(
+                    outcome,
+                    TurnOutcome::Failed { failure, .. }
+                        if failure.diagnostic.contains(CALLBACK_ERROR)
+                ));
+            } else {
+                assert!(matches!(
+                    outcome,
+                    TurnOutcome::Completed {
+                        reason: DoneReason::EndTurn,
+                        ..
+                    }
+                ));
+            }
+            drop(agent);
+            assert_eq!(history.as_slice().len(), 2);
+            assert!(matches!(
+                history.as_slice().last().unwrap().role,
+                Role::Assistant
+            ));
+        });
+    }
+
+    #[test_case(""; "empty_system")]
+    #[test_case("Custom system prompt"; "custom_system")]
+    fn actor_turn_runs_under_committed_policy(system: &str) {
+        const MODEL_SPEC: &str = "openai/gpt-4o";
+        const MODEL_IDENTITY: &str = "# Model identity\n- Model: gpt-4o\n- Provider: openai";
+        let mut history = History::new(Vec::new());
+        let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+        let captured_systems = Arc::clone(&provider.captured_systems);
+        let params = test_params(provider);
+        let plan = AgentMode::Plan(PathBuf::from(TEST_PLAN_PATH));
+        let policy = EffectiveAgentConfig::new(
+            RunSettings {
+                provider: Arc::clone(&params.provider),
+                model: Model::from_spec(MODEL_SPEC).unwrap(),
+                fast: true,
+                workflow: true,
+                thinking: ThinkingConfig::Budget(TEST_THINKING_BUDGET),
+            },
+            plan.clone(),
+        );
+        let context = TurnContext {
+            agent_id: params.agent_id,
+            turn_id: None,
+            work: ActorWorkIdentity::new(
+                params.agent_id,
+                ActorWorkKind::Turn {
+                    operation_id: 0,
+                    turn_id: TurnId::generate(),
+                },
+                0,
+            ),
+            output: Default::default(),
+            provenance: Default::default(),
+            cancel: CancelToken::none(),
+            cancel_reason: ReasonedCancelToken::none(),
+            generation: 0,
+            policy: Some(Arc::new(policy)),
+            interrupt: None,
+            inbox: None,
+            managed_turn: None,
+            admission: None,
+        };
+        let (raw_tx, _rx) = flume::unbounded();
+        let mut agent = Agent::for_actor_turn(
+            params,
+            AgentRunParams {
+                history: &mut history,
+                system: system.into(),
+                event_tx: EventSender::new(raw_tx),
+                tools: RequestTools::default(),
+            },
+            &context,
+            LoadedInstructions::new(),
+        );
+        smol::block_on(run_admitted(
+            &mut agent,
+            TurnId::generate(),
+            default_input(),
+        ));
+        let expected_system = if system.is_empty() {
+            MODEL_IDENTITY.to_owned()
+        } else {
+            format!("{system}\n\n{MODEL_IDENTITY}")
+        };
+        assert_eq!(*captured_systems.lock().unwrap(), [expected_system]);
+        assert_eq!(agent.mode, plan);
+        assert!(agent.workflow && agent.opts.fast);
+        assert_eq!(
+            agent.opts.thinking,
+            ThinkingConfig::Budget(TEST_THINKING_BUDGET)
+        );
+    }
+
+    fn test_params(provider: impl Provider + 'static) -> AgentParams {
+        AgentParams {
+            agent_id: AgentId::generate(),
+            provider: Arc::new(provider),
+            model: default_model(),
+            config: AgentConfig::default(),
+            tool_output_lines: ToolOutputLines::default(),
+            permissions: Arc::new(PermissionManager::new(
+                makima_config::PermissionsConfig {
+                    default: makima_config::DefaultEffect::Allow,
+                    rules: vec![],
+                    ..Default::default()
+                },
+                PathBuf::from(TEST_CWD),
+                makima_config::ProjectConfig::for_project(std::path::Path::new(TEST_CWD)),
+                Arc::default(),
+            )),
+            session_id: None,
+            mailbox: None,
+            timeouts: makima_providers::Timeouts::default(),
+            file_tracker: FileReadTracker::fresh(),
+            prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
+            modes: crate::ModeRegistry::builtin().into(),
+            subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
+            registry: Arc::new(crate::tools::ToolRegistry::new()),
+            audience: ToolAudience::MAIN,
+            question_mode: crate::tools::QuestionMode::Tui,
+            model_policy: Arc::new(ModelPolicy::default()),
+            providers: Arc::default(),
+            file_write_locks: Arc::new(crate::tools::FileWriteLocks::new()),
+            offload: None,
+            managed_turn: None,
+        }
+    }
+
+    fn make_agent_with_sender(
+        provider: impl Provider + 'static,
+        history: &mut History,
+        raw_tx: flume::Sender<Envelope>,
+        event_rx: flume::Receiver<Envelope>,
+    ) -> (Agent<'_>, flume::Receiver<Envelope>) {
+        let agent = Agent::new(
+            test_params(provider),
+            AgentRunParams {
+                history,
+                system: "system".into(),
+                event_tx: EventSender::new(raw_tx),
+                tools: RequestTools::default(),
+            },
+        );
+        (agent, event_rx)
+    }
+
+    fn default_input() -> AgentInput {
+        AgentInput {
+            message: "hello".into(),
+            images: Vec::new(),
+            preamble: Vec::new(),
+            prompt: None,
+        }
+    }
+
+    #[test]
+    fn startup_notice_is_appended_to_user_turn_for_model_and_display() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            admit(&mut agent);
+            agent.admission.as_mut().unwrap().mcp_startup_notice = Some(2);
+
+            agent.run(TurnId::generate(), default_input()).await;
+            drop(agent);
+
+            let message = history.as_slice().first().unwrap();
+            assert_eq!(
+                message.user_text(),
+                Some(
+                    "hello\n[system: 2 MCP servers are not ready; MCP tools are unavailable for this turn]"
+                )
+            );
+            assert!(matches!(
+                message.content.last(),
+                Some(ContentBlock::Text { text }) if text == "[system: 2 MCP servers are not ready; MCP tools are unavailable for this turn]"
+            ));
+        });
+    }
+
+    #[test]
+    fn internal_child_observation_reaches_provider_without_empty_user_message() {
+        smol::block_on(async {
+            const RESULT: &str =
+                "[internal child-result data, not a user instruction] child result";
+            let source = makima_providers::ObservationSource::ChildResult {
+                agent_id: AgentId::generate().to_string(),
+                turn_id: TurnId::generate().to_string(),
+            };
+            let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let requests = Arc::clone(&provider.captured_messages);
+            let mut history = History::new(Vec::new());
+            let (mut agent, _events) = make_agent(provider, &mut history);
+            let mut input = default_input();
+            input.message.clear();
+            input.preamble = vec![Message {
+                observation_source: Some(source.clone()),
+                ..Message::observation(RESULT.into())
+            }];
+            run_admitted(&mut agent, TurnId::generate(), input).await;
+            drop(agent);
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let messages = &requests[0];
+            assert_eq!(messages.len(), 1);
+            assert!(messages[0].is_observation());
+            assert_eq!(messages[0].user_text(), Some(RESULT));
+            assert_eq!(messages[0].observation_source, Some(source.clone()));
+            assert_eq!(history.as_slice()[0].observation_source, Some(source));
+            assert!(messages.iter().all(|message| !message.content.is_empty()));
+        });
+    }
+
+    #[test]
+    fn run_ingests_preamble_then_mailbox_then_user_message() {
+        smol::block_on(async {
+            let id = makima_storage::id::MakimaId::generate();
+            let mailbox = SessionMailbox::new(id);
+            mailbox.push("mailbox".into(), false);
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.mailbox = Some(mailbox);
+            let mut input = default_input();
+            input.preamble = vec![Message::observation("preamble".into())];
+
+            run_admitted(&mut agent, TurnId::generate(), input).await;
+            drop(agent);
+
+            assert_eq!(history.as_slice()[0].user_text(), Some("preamble"));
+            assert_eq!(history.as_slice()[1].user_text(), Some("mailbox"));
+            assert_eq!(history.as_slice()[2].user_text(), Some("hello"));
+        });
+    }
+
+    #[test]
+    fn queued_input_drains_preamble_and_mailbox() {
+        smol::block_on(async {
+            let id = makima_storage::id::MakimaId::generate();
+            let mailbox = SessionMailbox::new(id);
+            mailbox.push("mailbox".into(), false);
+            let mut input = default_input();
+            input.preamble = vec![Message::observation("preamble".into())];
+            let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(vec![input])]);
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+            agent.mailbox = Some(mailbox);
+            let mut agent = agent.with_interrupt_source(source);
+
+            assert!(agent.handle_queued_command().await.unwrap());
+            drop(agent);
+
+            let text = history
+                .as_slice()
+                .iter()
+                .map(Message::user_text)
+                .collect::<Vec<_>>();
+            assert_eq!(text, [Some("preamble"), Some("mailbox"), Some("hello")]);
+            assert!(history.as_slice()[0].is_observation());
+            assert!(history.as_slice()[1].is_observation());
+        });
+    }
+
+    #[test]
+    fn wake_only_run_does_not_insert_an_empty_user_turn() {
+        smol::block_on(async {
+            let id = makima_storage::id::MakimaId::generate();
+            let mailbox = SessionMailbox::new(id);
+            mailbox.push("failed".into(), true);
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.mailbox = Some(mailbox);
+            let mut input = default_input();
+            input.message.clear();
+
+            run_admitted(&mut agent, TurnId::generate(), input).await;
+            drop(agent);
+
+            assert_eq!(history.as_slice().len(), 2);
+            assert!(history.as_slice()[0].is_observation());
+            assert!(matches!(history.as_slice()[1].role, Role::Assistant));
+        });
+    }
+
+    fn drain_events(rx: &flume::Receiver<Envelope>) -> Vec<Envelope> {
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        events
+    }
+
+    async fn run_agent(provider: MockProvider, max_turns: Option<u32>) -> (u32, DoneReason) {
+        let mut history = History::new(Vec::new());
+        let (mut agent, _event_rx) = make_agent(provider, &mut history);
+        agent.config.max_turns = max_turns;
+        let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+        match outcome {
+            TurnOutcome::Completed {
+                num_turns, reason, ..
+            } => (num_turns, reason),
+            other => panic!("expected completed outcome, got {other:?}"),
+        }
+    }
+
+    fn has_event(events: &[Envelope], predicate: impl Fn(&AgentEvent) -> bool) -> bool {
+        events.iter().any(|e| predicate(&e.event))
+    }
+
+    fn terminal_outcomes(events: &[Envelope]) -> Vec<&TurnOutcome> {
+        events
+            .iter()
+            .filter_map(|envelope| match &envelope.event {
+                AgentEvent::TurnOutcome(outcome) => Some(outcome),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn run_emits_same_completed_outcome_once() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            let turn_id = TurnId::generate();
+            let outcome = run_admitted(&mut agent, turn_id, default_input()).await;
+            let events = drain_events(&event_rx);
+            let terminal = terminal_outcomes(&events);
+            assert_eq!(terminal, [&outcome]);
+            assert_eq!(outcome.turn_id(), turn_id);
+        });
+    }
+
+    #[test]
+    fn run_emits_same_failed_outcome_once() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let provider = StubStreamProvider {
+                fail: Some((400, None)),
+                ..Default::default()
+            };
+            let (mut agent, event_rx) = make_agent(provider, &mut history);
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            assert!(matches!(outcome, TurnOutcome::Failed { .. }));
+            let events = drain_events(&event_rx);
+            assert_eq!(terminal_outcomes(&events), [&outcome]);
+        });
+    }
+
+    #[test]
+    fn reused_agent_fails_then_succeeds() {
+        smol::block_on(async {
+            let provider = ScriptedProvider {
+                results: Mutex::new(VecDeque::from([
+                    Err(AgentError::api(400, "bad request")),
+                    Ok(text_response(StopReason::EndTurn)),
+                ])),
+            };
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(provider, &mut history);
+
+            let failed = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            let completed = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+
+            assert!(matches!(failed, TurnOutcome::Failed { num_turns: 0, .. }));
+            assert!(matches!(
+                completed,
+                TurnOutcome::Completed { num_turns: 1, .. }
+            ));
+            let events = drain_events(&event_rx);
+            assert_eq!(terminal_outcomes(&events), [&failed, &completed]);
+        });
+    }
+
+    #[test]
+    fn reused_agent_reports_per_turn_usage_and_turn_count() {
+        smol::block_on(async {
+            let mut first = text_response(StopReason::EndTurn);
+            first.usage.input = 11;
+            let mut second = text_response(StopReason::EndTurn);
+            second.usage.input = 22;
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) =
+                make_agent(MockProvider::new(vec![first, second]), &mut history);
+
+            let first = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            let second = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+
+            assert_eq!(first.usage().input, 11);
+            assert_eq!(second.usage().input, 22);
+            assert_eq!(first.num_turns(), 1);
+            assert_eq!(second.num_turns(), 1);
+        });
+    }
+
+    #[test]
+    fn terminal_delivery_failure_does_not_change_outcome() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (raw_tx, event_rx) = flume::bounded(1);
+            let (mut agent, event_rx) = make_agent_with_sender(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+                raw_tx,
+                event_rx,
+            );
+
+            let turn_id = TurnId::generate();
+            let outcome = run_admitted(&mut agent, turn_id, default_input()).await;
+
+            assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+            assert_eq!(outcome.turn_id(), turn_id);
+            assert_eq!(outcome.num_turns(), 1);
+            assert_eq!(
+                event_rx
+                    .drain()
+                    .filter(|envelope| matches!(envelope.event, AgentEvent::TurnOutcome(_)))
+                    .count(),
+                0,
+                "terminal delivery must not be retried after the full channel rejects it"
+            );
+        });
+    }
+
+    fn has_interrupt_in_history(history: &[Message]) -> bool {
+        history.iter().any(|m| {
+            m.content.iter().any(
+                |b| matches!(b, ContentBlock::Text { text } if text.contains("<user-interrupt>")),
+            )
+        })
+    }
+
+    fn tool_call_response(tool_name: &str, tool_id: &str) -> StreamResponse {
+        StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(
+                    tool_id,
+                    tool_name,
+                    serde_json::json!({"pattern": "*.nonexistent_test_xyz", "path": "/tmp"}),
+                )],
+                ..Default::default()
+            },
+            usage: TokenUsage::default(),
+            stop_reason: Some(StopReason::ToolUse),
+        }
+    }
+
+    fn tool_use_response(tool_name: &str, input: Value) -> StreamResponse {
+        StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use("t1", tool_name, input)],
+                ..Default::default()
+            },
+            usage: TokenUsage::default(),
+            stop_reason: Some(StopReason::ToolUse),
+        }
+    }
+
+    #[test_case(false, false, false; "text_disconnected")]
+    #[test_case(true, false, false; "text_full")]
+    #[test_case(false, true, false; "tool_disconnected")]
+    #[test_case(true, true, false; "tool_full")]
+    #[test_case(false, true, true; "retry_tool_disconnected")]
+    #[test_case(true, true, true; "retry_tool_full")]
+    fn retained_runs_preserve_presentation_channel_failure(full: bool, tools: bool, retry: bool) {
+        smol::block_on(async {
+            const TOOL: &str = "report_result";
+            const TEXT: &str = "response";
+            let mut results = VecDeque::new();
+            if retry {
+                results.push_back(Err(api_error(429, Some(RetryKind::RateLimit))));
+            }
+            if tools {
+                results.push_back(Ok(tool_use_response(TOOL, serde_json::json!({"ok":true}))));
+            }
+            results.push_back(Ok(text_response(StopReason::EndTurn)));
+            let provider = ScriptedProvider {
+                results: Mutex::new(results),
+            };
+            let (tx, rx) = flume::bounded(1);
+            if full {
+                tx.send(Envelope {
+                    event: AgentEvent::Nudge,
+                    subagent: None,
+                    identity: None,
+                })
+                .unwrap();
+            }
+            let (unused_tx, unused_rx) = flume::unbounded();
+            drop(unused_tx);
+            let mut history = History::new(Vec::new());
+            let (mut agent, _) = make_agent_with_sender(provider, &mut history, tx, unused_rx);
+            let retained_rx = if full {
+                Some(rx)
+            } else {
+                drop(rx);
+                None
+            };
+            let ticket = crate::TurnTicket::new(TurnId::generate(), Arc::new(()));
+            agent.event_tx = agent.event_tx.with_output(ticket.output());
+            agent.timeouts.retry.base_delay = std::time::Duration::ZERO;
+            agent.timeouts.retry.max_delay = std::time::Duration::ZERO;
+            let calls = Arc::new(Mutex::new(0));
+            let recorded = Arc::clone(&calls);
+            let report = crate::tools::local_tool(ToolAudience::MODEL, move |value, _ctx| {
+                assert_eq!(value, serde_json::json!({"ok":true}));
+                *recorded.lock().unwrap() += 1;
+                Box::pin(async { Ok("recorded".into()) })
+            });
+            agent = agent.with_local_tools(Arc::new(std::collections::HashMap::from([(
+                TOOL.into(),
+                report,
+            )])));
+            agent.tools = RequestTools::assembled(
+                serde_json::json!([{"name":TOOL,"description":"fixture","input_schema":{"type":"object"}}]),
+                &agent.config,
+                &agent.model,
+            );
+            let outcome = run_admitted(&mut agent, ticket.turn_id(), default_input()).await;
+            let expected = crate::TurnFailure::from_agent_error(&AgentError::Channel);
+            assert!(matches!(&outcome, TurnOutcome::Failed { failure, .. }
+                if failure.kind == expected.kind && failure.diagnostic == expected.diagnostic));
+            assert_eq!(*calls.lock().unwrap(), 0);
+            ticket.resolve(outcome);
+            assert_eq!(
+                ticket.peek_result().unwrap().text,
+                if retry || tools { "" } else { TEXT }
+            );
+            drop(agent);
+            drop(retained_rx);
+            assert!(!history.as_slice().iter().any(|message| {
+                matches!(message.role, Role::Assistant)
+                    && message
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::Text { text } if text == TEXT))
+            }));
+        });
+    }
+
+    #[test]
+    fn mcp_definitions_refresh_per_request() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![
+                tool_use_response(
+                    crate::mcp::TOOL_SEARCH_TOOL_NAME,
+                    serde_json::json!({"query": "fetch issue"}),
+                ),
+                text_response(StopReason::EndTurn),
+            ]);
+            let captured = Arc::clone(&provider.captured_tools);
+            let mut history = History::new(Vec::new());
+            let (agent, _event_rx) = make_agent(provider, &mut history);
+            let mut agent = agent.with_mcp(Some(crate::mcp::test_support::stub_session(&[(
+                "srv.fetch_issue",
+                "Fetch a GitHub issue",
+            )])));
+            run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+
+            let captured = captured.lock().unwrap();
+            assert_eq!(captured.len(), 2);
+            let first = tool_names(&captured[0]);
+            assert!(first.contains(&crate::mcp::TOOL_SEARCH_TOOL_NAME));
+            assert!(!first.contains(&"srv__fetch_issue"));
+            assert!(tool_names(&captured[1]).contains(&"srv__fetch_issue"));
+        });
+    }
+
+    fn small_context_model(context_window: u32, max_output_tokens: u32) -> Model {
+        let mut model = default_model();
+        model.context_window = context_window;
+        model.max_output_tokens = Some(max_output_tokens);
+        model
+    }
+
+    #[track_caller]
+    fn assert_ends_with_cancel_marker(history: &History) {
+        let last = history.as_slice().last().unwrap();
+        assert!(matches!(last.role, Role::User));
+        assert!(
+            matches!(&last.content[0], ContentBlock::Text { text } if text == "[Cancelled by user]")
+        );
+    }
+
+    /// A truncated answer buys another turn, but only until one of the two
+    /// budgets runs out: the continuation limit or the caller's `max_turns`.
+    #[test_case(&[StopReason::EndTurn], None, 1, DoneReason::EndTurn ; "end_turn_completes")]
+    #[test_case(&[StopReason::MaxTokens, StopReason::EndTurn], None, 2, DoneReason::EndTurn ; "max_tokens_continues")]
+    #[test_case(&[StopReason::MaxTokens; 4], None, 4, DoneReason::MaxTokens ; "max_tokens_gives_up_after_limit")]
+    #[test_case(&[StopReason::MaxTokens, StopReason::EndTurn], Some(1), 1, DoneReason::MaxTurns ; "turn_budget_exhausted")]
+    fn turn_counting(
+        stops: &[StopReason],
+        max_turns: Option<u32>,
+        expected_turns: u32,
+        expected_reason: DoneReason,
+    ) {
+        smol::block_on(async {
+            let responses: Vec<_> = stops.iter().map(|s| text_response(*s)).collect();
+            let provider = MockProvider::new(responses);
+            let (turns, reason) = run_agent(provider, max_turns).await;
+            assert_eq!(turns, expected_turns);
+            assert_eq!(reason, expected_reason);
+        });
+    }
+
+    #[test_case(Some(true),  true,  true  ; "after_tool_use_turn")]
+    #[test_case(Some(false), true,  true  ; "after_text_only_turn")]
+    #[test_case(None,        false, false ; "channel_empty")]
+    fn interrupt_handling(queued: Option<bool>, expect_consumed: bool, expect_injected: bool) {
+        smol::block_on(async {
+            let source = if queued.is_some() {
+                Some(MockInterruptSource::new(vec![ExtractedCommand::Interrupt(
+                    vec![default_input()],
+                )]))
+            } else {
+                None
+            };
+
+            let tool_use = queued.unwrap_or(true);
+            let responses = if tool_use {
+                vec![
+                    tool_call_response("glob", "t1"),
+                    text_response(StopReason::EndTurn),
+                ]
+            } else {
+                vec![
+                    text_response(StopReason::EndTurn),
+                    text_response(StopReason::EndTurn),
+                ]
+            };
+
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+            if let Some(s) = source {
+                agent = agent.with_interrupt_source(s);
+            }
+            let _ = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            let events = drain_events(&event_rx);
+
+            assert_eq!(
+                has_event(&events, |e| matches!(
+                    e,
+                    AgentEvent::QueueItemConsumed { .. }
+                )),
+                expect_consumed,
+            );
+            assert_eq!(
+                has_interrupt_in_history(history.as_slice()),
+                expect_injected
+            );
+        });
+    }
+
+    #[test_case(
+        (0..10).map(|i| Message::user(format!("msg {i}"))).collect(),
+        vec![ExtractedCommand::Compact(None)],
+        vec![tool_call_response("glob", "t1"), text_response(StopReason::EndTurn), text_response(StopReason::EndTurn)]
+        ; "compaction_via_interrupt_source"
+    )]
+    fn compaction_through_interrupt(
+        prior: Vec<Message>,
+        commands: Vec<ExtractedCommand>,
+        responses: Vec<StreamResponse>,
+    ) {
+        smol::block_on(async {
+            let source = MockInterruptSource::new(commands);
+
+            let mut history = History::new(prior);
+            let (agent, _event_rx) = make_agent(MockProvider::new(responses), &mut history);
+            let mut agent = agent.with_interrupt_source(source);
+            let result = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+
+            assert!(matches!(result, TurnOutcome::Completed { .. }));
+        });
+    }
+
+    #[test_case(true,  170_000, true  ; "enabled_and_over_threshold")]
+    #[test_case(true,  150_000, false ; "enabled_but_below_threshold")]
+    #[test_case(false, 170_000, false ; "disabled_even_over_threshold")]
+    fn try_auto_compact_behavior(enabled: bool, context_size: u32, expected: bool) {
+        smol::block_on(async {
+            let responses = if expected {
+                vec![text_response(StopReason::EndTurn)]
+            } else {
+                vec![]
+            };
+            let mut history = History::new(vec![Message::user("go".into())]);
+            let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+            agent.model = Arc::new(small_context_model(200_000, 8_192));
+            agent.auto_compact = enabled;
+            agent.context_size = context_size;
+            let result = agent.try_auto_compact().await.unwrap();
+
+            assert_eq!(result, expected);
+            drop(agent);
+            assert_eq!(
+                has_event(&drain_events(&event_rx), |e| matches!(
+                    e,
+                    AgentEvent::AutoCompacting { .. }
+                )),
+                expected,
+            );
+        });
+    }
+
+    #[test]
+    fn do_compact_appends_post_instructions_to_continue_message() {
+        smol::block_on(async {
+            const POST: &str = "Re-read plan.md";
+            let mut history = History::new(vec![Message::user("go".into())]);
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.config.post_compaction_instructions = Some(POST.into());
+            agent.do_compact(None).await.unwrap();
+            drop(agent);
+
+            let last = history.as_slice().last().unwrap();
+            assert!(matches!(
+                &last.content[0],
+                ContentBlock::Text { text } if text.ends_with(POST) && text != POST
+            ));
+        });
+    }
+
+    #[test]
+    fn cancel_token_aborts_during_api_call() {
+        smol::block_on(async {
+            let (trigger, cancel) = CancelToken::new();
+            trigger.cancel();
+
+            let mut history = History::new(Vec::new());
+            let (agent, event_rx) = make_agent(StubStreamProvider::default(), &mut history);
+            let mut agent = agent.with_cancel(cancel);
+
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            assert!(matches!(outcome, TurnOutcome::Cancelled { .. }));
+            drop(agent);
+            assert_ends_with_cancel_marker(&history);
+            let events = drain_events(&event_rx);
+            assert_eq!(terminal_outcomes(&events), [&outcome]);
+            assert!(matches!(
+                &outcome,
+                TurnOutcome::Cancelled {
+                    turn_id: actual_turn_id,
+                    reason: TurnCancellationReason::User,
+                    ..
+                } if *actual_turn_id == outcome.turn_id()
+            ));
+        });
+    }
+
+    #[test_case(true ; "delivered_is_ended_and_linked")]
+    #[test_case(false ; "undelivered_is_neither_ended_nor_linked")]
+    fn cancelled_turn_ends_its_conversation_and_the_next_turn_starts_another(delivered: bool) {
+        smol::block_on(async {
+            let conversations = Arc::new(Mutex::new(Vec::new()));
+            let (ended_tx, ended_rx) = flume::unbounded();
+            let mut history = History::new(Vec::new());
+            let original = Arc::clone(history.conversation_id());
+            let (trigger, cancel) = CancelToken::new();
+            let probe = ConversationProbe {
+                cancel_first: Mutex::new(Some(trigger)),
+                deliver_before_cancel: delivered,
+                conversations: Arc::clone(&conversations),
+                ended: ended_tx,
+            };
+            let (agent, _events) = make_agent(probe, &mut history);
+            let mut agent = agent.with_cancel(cancel);
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            assert!(matches!(outcome, TurnOutcome::Cancelled { .. }));
+            drop(agent);
+            // With the agent gone only a detached end call still holds the
+            // provider, and with it the sender.
+            assert_eq!(
+                ended_rx.recv_async().await.ok(),
+                delivered.then(|| (Arc::clone(&original), ConversationEnd::Cancelled))
+            );
+
+            let probe = ConversationProbe {
+                cancel_first: Mutex::new(None),
+                deliver_before_cancel: false,
+                conversations: Arc::clone(&conversations),
+                ended: flume::unbounded().0,
+            };
+            let (mut agent, _events) = make_agent(probe, &mut history);
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+            drop(agent);
+            let conversations = conversations.lock().unwrap();
+            let [(cancelled, sent), (next, _)] = &conversations[..] else {
+                panic!("expected two requests, got {}", conversations.len());
+            };
+            assert_eq!(cancelled.conversation_id, original);
+            assert_eq!(cancelled.previous, None);
+            assert_eq!(&next.conversation_id, history.conversation_id());
+            assert_eq!(
+                next.previous,
+                delivered.then_some(ConversationLink {
+                    id: original,
+                    relation: ConversationRelation::Continues,
+                    shared: *sent,
+                })
+            );
+        });
+    }
+
+    #[test_case(false, false, None ; "undelivered_first_request_stays_unsent")]
+    #[test_case(false, true, Some(1) ; "delivered_failure_records_the_request")]
+    #[test_case(true, false, Some(1) ; "undelivered_later_request_keeps_the_last_sent")]
+    #[test_case(true, true, Some(2) ; "delivered_later_request_records_its_length")]
+    fn failed_turn_records_only_a_delivered_request(
+        prior: bool,
+        delivered: bool,
+        sent: Option<usize>,
+    ) {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            if prior {
+                history.push(Message::user("earlier".into()));
+                history.mark_sent();
+            }
+            let provider = DeliveringProvider {
+                marks: delivered,
+                marked: None,
+                release: None,
+            };
+            let (mut agent, _events) = make_agent(provider, &mut history);
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            assert!(matches!(outcome, TurnOutcome::Failed { .. }));
+            drop(agent);
+            assert_eq!(history.conversation().sent, sent);
+        });
+    }
+
+    #[test]
+    fn delivery_is_published_before_the_stream_ends() {
+        smol::block_on(async {
+            let mirror: SharedMessages =
+                Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
+            let mut history = History::new(Vec::new()).with_mirror(Arc::clone(&mirror));
+            let (marked_tx, marked_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            let provider = DeliveringProvider {
+                marks: true,
+                marked: Some(marked_tx),
+                release: Some(release_rx),
+            };
+            let (mut agent, _events) = make_agent(provider, &mut history);
+            let published = async {
+                marked_rx.recv_async().await.unwrap();
+                let sent = mirror.load().conversation.as_ref().and_then(|c| c.sent);
+                release_tx.send(()).unwrap();
+                sent
+            };
+            let (outcome, sent) = futures_lite::future::zip(
+                run_admitted(&mut agent, TurnId::generate(), default_input()),
+                published,
+            )
+            .await;
+            assert!(matches!(outcome, TurnOutcome::Failed { .. }));
+            assert_eq!(sent, Some(1));
+        });
+    }
+
+    #[test]
+    fn cancel_mid_stream_keeps_partial_text_in_history() {
+        const PARTIAL: &str = "partial answer";
+        smol::block_on(async {
+            let (trigger, cancel) = CancelToken::new();
+            let provider = StubStreamProvider {
+                delta: Some(PARTIAL),
+                cancel_after_delta: Mutex::new(Some(trigger)),
+                ..Default::default()
+            };
+            let mut history = History::new(Vec::new());
+            let (agent, _event_rx) = make_agent(provider, &mut history);
+            let mut agent = agent.with_cancel(cancel);
+
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            assert!(matches!(outcome, TurnOutcome::Cancelled { .. }));
+            drop(agent);
+            assert_ends_with_cancel_marker(&history);
+            let messages = history.as_slice();
+            let partial = &messages[messages.len() - 2];
+            assert!(matches!(partial.role, Role::Assistant));
+            let expected = format!("{PARTIAL}\n\n{CANCELLED_TEXT_NOTE}");
+            assert!(
+                matches!(&partial.content[0], ContentBlock::Text { text } if *text == expected),
+                "kept text must carry the truncation note so the model never resumes it"
+            );
+        });
+    }
+
+    /// The `Retry` event already made the view drop the failed attempt's
+    /// text, so history must not resurrect it (see `StreamError`).
+    #[test]
+    fn cancel_during_retry_backoff_discards_failed_attempt_text() {
+        const PARTIAL: &str = "doomed attempt";
+        smol::block_on(async {
+            let (trigger, cancel) = CancelToken::new();
+            let provider = StubStreamProvider {
+                delta: Some(PARTIAL),
+                fail: Some((529, Some(RetryKind::Transient))),
+                ..Default::default()
+            };
+            let mut history = History::new(Vec::new());
+            let (agent, event_rx) = make_agent(provider, &mut history);
+            let mut agent = agent.with_cancel(cancel);
+
+            let mut trigger = Some(trigger);
+            let pump = smol::spawn(async move {
+                while let Ok(envelope) = event_rx.recv_async().await {
+                    if matches!(envelope.event, AgentEvent::Retry { .. })
+                        && let Some(t) = trigger.take()
+                    {
+                        t.cancel();
+                    }
+                }
+            });
+
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            assert!(matches!(outcome, TurnOutcome::Cancelled { .. }));
+            drop(agent);
+            pump.await;
+
+            assert_ends_with_cancel_marker(&history);
+            assert!(
+                history
+                    .as_slice()
+                    .iter()
+                    .all(|m| !m.content.iter().any(
+                        |b| matches!(b, ContentBlock::Text { text } if text.contains(PARTIAL))
+                    )),
+                "failed attempt's text must not reach history"
+            );
+        });
+    }
+
+    #[test_case(
+        vec![tool_call_response("nonexistent_tool_xyz", "t1"), text_response(StopReason::EndTurn)],
+        "t1"
+        ; "parse_error"
+    )]
+    #[test_case(
+        vec![tool_call_response("glob", "t1"), tool_call_response("glob", "t2"), tool_call_response("glob", "t3"), text_response(StopReason::EndTurn)],
+        "t3"
+        ; "doom_loop"
+    )]
+    fn error_emits_tool_done_event(responses: Vec<StreamResponse>, expected_error_id: &str) {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+            let _ = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            drop(agent);
+            let events = drain_events(&event_rx);
+
+            assert!(has_event(&events, |e| matches!(
+                e,
+                AgentEvent::ToolDone(done) if done.is_error && done.id == expected_error_id
+            )));
+        });
+    }
+
+    #[test_case(
+        vec![
+            tool_call_response("glob", "t1"),
+            empty_response(),
+            text_response(StopReason::EndTurn),
+        ],
+        3, 1
+        ; "nudge_on_empty_after_tools"
+    )]
+    #[test_case(
+        [tool_call_response("glob", "t1"), thinking_response()]
+            .into_iter()
+            .chain((0..MAX_NUDGES).map(|_| empty_response()))
+            .collect(),
+        MAX_NUDGES + 2, MAX_NUDGES as usize
+        ; "gives_up_after_max_nudges"
+    )]
+    #[test_case(
+        vec![
+            tool_call_response("glob", "t1"),
+            text_response(StopReason::EndTurn),
+        ],
+        2, 0
+        ; "no_nudge_when_text_after_tools"
+    )]
+    #[test_case(
+        vec![
+            empty_response(),
+            text_response(StopReason::EndTurn),
+        ],
+        1, 0
+        ; "no_nudge_without_recent_tools"
+    )]
+    fn nudge_behavior(responses: Vec<StreamResponse>, expected_turns: u32, expected_nudges: usize) {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+            let _ = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            drop(agent);
+            let events = drain_events(&event_rx);
+
+            let nudges = events
+                .iter()
+                .filter(|e| matches!(e.event, AgentEvent::Nudge))
+                .count();
+            assert_eq!(nudges, expected_nudges);
+
+            let done = events
+                .iter()
+                .find_map(|e| match &e.event {
+                    AgentEvent::TurnOutcome(outcome) => Some(outcome.num_turns()),
+                    _ => None,
+                })
+                .expect("expected terminal outcome");
+            assert_eq!(done, expected_turns);
+
+            assert!(
+                history
+                    .as_slice()
+                    .iter()
+                    .all(|m| m.content.iter().any(|b| !b.is_thinking())),
+                "history holds a message no provider will accept: {:?}",
+                history.as_slice()
+            );
+        });
+    }
+
+    /// Pins the regression where a stale nudge counter made a follow-up
+    /// "continue" end instantly: the budget lives in the history tail, and
+    /// the new user message breaks the streak.
+    #[test]
+    fn nudge_budget_resets_on_new_run() {
+        smol::block_on(async {
+            let responses = [tool_call_response("glob", "t1")]
+                .into_iter()
+                .chain((0..=MAX_NUDGES).map(|_| empty_response()))
+                .chain([empty_response(), text_response(StopReason::EndTurn)])
+                .collect();
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+            let _ = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            let _ = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            drop(agent);
+            let events = drain_events(&event_rx);
+
+            let nudges = events
+                .iter()
+                .filter(|e| matches!(e.event, AgentEvent::Nudge))
+                .count();
+            assert_eq!(nudges, MAX_NUDGES as usize + 1);
+        });
+    }
+
+    /// Wiring this to `None` to make the struct literal compile would
+    /// silently reintroduce the bug the field exists to fix.
+    #[test]
+    fn tool_context_preserves_admitted_tool_definitions_and_filter() {
+        let mut history = History::new(Vec::new());
+        let (mut agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+        let definitions =
+            serde_json::json!([{ "name": "read", "description": "pinned description" }]);
+        agent.tools =
+            crate::tools::RequestTools::assembled(definitions.clone(), &agent.config, &agent.model);
+        admit(&mut agent);
+        let context = agent.tool_context().unwrap();
+        assert_eq!(context.execution_agent_id, Some(agent.agent_id));
+        let snapshot = context.request_tools.unwrap();
+        assert_eq!(snapshot.definitions(), &definitions);
+        assert!(Arc::ptr_eq(snapshot.filter(), &context.tool_filter));
+        assert!(Arc::ptr_eq(snapshot.filter(), agent.tools.filter()));
+    }
+
+    #[test]
+    fn tool_context_needs_an_admitted_cwd() {
+        let mut history = History::new(Vec::new());
+        let (mut agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+        let error = agent.tool_context().err().expect("no admission, no cwd");
+        assert_eq!(error.to_string(), NO_ADMITTED_CWD_ERR);
+
+        admit(&mut agent);
+        let session: SessionRef = "CNK1hV6GWoysH3KQMm5wu".parse().expect("valid session id");
+        agent.session_id = Some(session.clone());
+        let context = agent.tool_context().unwrap();
+        assert_eq!(context.session_id, Some(session));
+        assert_eq!(context.cwd, PathBuf::from(TEST_CWD));
+    }
+
+    #[test]
+    fn filter_tools_keeps_only_allowed_names() {
+        let all = serde_json::json!([
+            {"name": "read", "description": "r"},
+            {"name": "write", "description": "w"},
+            {"name": "grep", "description": "g"},
+        ]);
+        let filtered = filter_tools(&all, &["read".to_owned(), "grep".to_owned()]);
+        let names: Vec<&str> = filtered
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|d| d["name"].as_str())
+            .collect();
+        assert_eq!(names, ["read", "grep"]);
+    }
+
+    #[test]
+    fn filter_tools_non_array_passes_through() {
+        let all = serde_json::json!({"name": "read"});
+        assert_eq!(filter_tools(&all, &["write".to_owned()]), all);
+    }
+
+    #[test]
+    fn mode_tools_swaps_requested_toolset() {
+        let modes = crate::ModeRegistry::builtin();
+        modes
+            .define(crate::ModeDefSpec {
+                name: "audit".into(),
+                tools: Some(vec!["read".into(), "grep".into()]),
+                ..Default::default()
+            })
+            .unwrap();
+        let all = serde_json::json!([
+            {"name": "read"},
+            {"name": "write"},
+            {"name": "grep"},
+            {"name": "task"},
+        ]);
+        let def = modes.current(&AgentMode::Custom(crate::ModeId::Custom("audit".into())));
+        let tools = def
+            .tools
+            .as_ref()
+            .map(|names| filter_tools(&all, names))
+            .unwrap_or_else(|| all.clone());
+        let names: Vec<&str> = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|d| d["name"].as_str())
+            .collect();
+        assert_eq!(names, ["read", "grep"]);
+    }
+
+    #[test]
+    fn missing_custom_mode_fails_closed() {
+        let mut history = History::new(Vec::new());
+        let (mut agent, _rx) = make_agent(MockProvider::new(vec![]), &mut history);
+        agent.mode = AgentMode::Custom(crate::ModeId::Custom("removed".into()));
+        assert!(matches!(
+            agent.request_tools(),
+            Err(AgentError::Config { .. })
+        ));
+        let outcome = smol::block_on(run_admitted(
+            &mut agent,
+            TurnId::generate(),
+            default_input(),
+        ));
+        assert!(matches!(outcome, TurnOutcome::Failed { num_turns: 0, .. }));
+        assert!(agent.mode_def.is_none());
+        assert_eq!(agent.history.conversation().sent, None);
+        assert_eq!(agent.history.continue_conversation(), None);
+        assert_eq!(agent.history.conversation().previous, None);
+    }
+
+    #[test]
+    fn mode_policy_stays_pinned_across_continuation_and_context_clones() {
+        let mut history = History::new(Vec::new());
+        let modes = Arc::new(crate::ModeRegistry::builtin());
+        modes
+            .define(crate::ModeDefSpec {
+                name: "audit".into(),
+                tools: Some(vec!["read".into()]),
+                ..Default::default()
+            })
+            .unwrap();
+        let advertised = Arc::new(Mutex::new(Vec::new()));
+        let provider = MutatingModeProvider {
+            modes: Arc::clone(&modes),
+            advertised: Arc::clone(&advertised),
+        };
+        let (mut agent, _rx) = make_agent(provider, &mut history);
+        agent.modes = Arc::clone(&modes);
+        for name in ["read", "write"] {
+            agent
+                .registry
+                .register(
+                    crate::tools::test_support::mock_tool(name, ToolAudience::MAIN),
+                    crate::tools::registry::ToolSource::Lua {
+                        plugin: name.into(),
+                    },
+                )
+                .unwrap();
+        }
+        agent.tools = RequestTools::assembled(
+            serde_json::json!([{"name": "read"}, {"name": "write"}]),
+            &AgentConfig::default(),
+            &default_model(),
+        );
+        agent.mode = AgentMode::Custom(crate::ModeId::Custom("audit".into()));
+        let outcome = smol::block_on(run_admitted(
+            &mut agent,
+            TurnId::generate(),
+            default_input(),
+        ));
+        assert!(matches!(
+            outcome,
+            TurnOutcome::Completed { num_turns: 2, .. }
+        ));
+        let context = agent.tool_context().unwrap();
+        assert_eq!(context.clone().restrict_write_to(), None);
+        assert_eq!(
+            context.mode_def.as_ref().unwrap().tools.as_ref().unwrap(),
+            &["read"]
+        );
+        assert_eq!(
+            modes.current(&context.mode).tools.as_ref().unwrap(),
+            &["write"]
+        );
+        assert!(modes.current(&context.mode).restrict_write_to.is_some());
+        assert_eq!(
+            *advertised.lock().unwrap(),
+            vec![serde_json::json!([{"name": "read"}]); 2]
+        );
+    }
+
+    #[test]
+    fn mode_allowlist_filters_mcp_tools() {
+        let mut history = History::new(Vec::new());
+        let (mut agent, _rx) = make_agent(MockProvider::new(vec![]), &mut history);
+        agent
+            .modes
+            .define(crate::ModeDefSpec {
+                name: "audit".into(),
+                tools: Some(vec!["srv__probe".into()]),
+                ..Default::default()
+            })
+            .unwrap();
+        agent.mode = AgentMode::Custom(crate::ModeId::Custom("audit".into()));
+        agent.mode_def = Some(Arc::new(agent.modes.current(&agent.mode)));
+        agent.mcp = Some(crate::mcp::test_support::stub_session(&[(
+            "srv.probe",
+            "probe",
+        )]));
+        assert_eq!(agent.mcp.as_ref().unwrap().wire_names(), ["srv__probe"]);
+        agent.turn_bindings = Arc::new(TurnToolBindings::capture(
+            &agent.registry,
+            &agent.local_tools,
+            agent.mcp.as_ref(),
+        ));
+        admit(&mut agent);
+        assert!(tool_dispatch::authorize_advertised(
+            &agent.tool_context().unwrap(),
+            "srv__probe"
+        ));
+        agent
+            .mcp
+            .as_ref()
+            .unwrap()
+            .search_tools("probe", crate::tools::CallOrigin::Model)
+            .unwrap();
+        let tools = agent.request_tools().unwrap();
+        let names: Vec<&str> = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|definition| definition.get("name").and_then(Value::as_str))
+            .collect();
+        assert_eq!(names, ["srv__probe"]);
+    }
+
+    #[test]
+    fn plan_mode_advertises_mcp_search_and_loaded_tools() {
+        let mut history = History::new(Vec::new());
+        let (mut agent, _rx) = make_agent(MockProvider::new(vec![]), &mut history);
+        agent.mode = AgentMode::Plan(PathBuf::from("/tmp/plan"));
+        agent.mode_def = Some(Arc::new(agent.modes.current(&agent.mode)));
+        agent.mcp = Some(crate::mcp::test_support::stub_session(&[(
+            "srv.probe",
+            "probe",
+        )]));
+        agent.turn_bindings = Arc::new(TurnToolBindings::capture(
+            &agent.registry,
+            &agent.local_tools,
+            agent.mcp.as_ref(),
+        ));
+        admit(&mut agent);
+        let tools = agent.request_tools().unwrap();
+        let names = tool_names(&tools);
+        assert!(names.contains(&crate::mcp::TOOL_SEARCH_TOOL_NAME));
+        assert!(!names.contains(&"srv__probe"));
+        agent
+            .mcp
+            .as_ref()
+            .unwrap()
+            .search_tools("probe", crate::tools::CallOrigin::Model)
+            .unwrap();
+        let tools = agent.request_tools().unwrap();
+        let names = tool_names(&tools);
+        assert!(names.contains(&"srv__probe"));
+    }
+
+    #[test]
+    fn build_mode_inherits_full_toolset() {
+        let modes = crate::ModeRegistry::builtin();
+        let def = modes.current(&AgentMode::Build);
+        assert!(def.tools.is_none(), "build inherits the default toolset");
+        assert_eq!(modes.current(&AgentMode::Build).id, crate::ModeId::Build);
+    }
+}

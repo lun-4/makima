@@ -11,7 +11,7 @@
 //! on, and fold a message sent mid-turn into the running turn; a resumed SDK
 //! session comes back in the mode it was saved in.
 //!
-//! The TUI cannot join without a pty. Its in-process tests in maki-ui check
+//! The TUI cannot join without a pty. Its in-process tests in makima-ui check
 //! the same scenarios at the provider:
 //! `event_loop::tests::live_session_requests_remain_independent_during_changes_and_restore`
 //! (model switch between turns),
@@ -34,11 +34,11 @@ use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
-use maki_agent::ToolOutput;
-use maki_lua::ui_sink::NO_UI_ERR;
-use maki_providers::{Message, TokenUsage};
-use maki_storage::StateDir;
-use maki_storage::sessions::{Effort, Prefs, Session, StoredMode, StoredThinking};
+use makima_agent::ToolOutput;
+use makima_lua::ui_sink::NO_UI_ERR;
+use makima_providers::{Message, TokenUsage};
+use makima_storage::StateDir;
+use makima_storage::sessions::{Effort, Prefs, Session, StoredMode, StoredThinking};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use test_case::test_case;
@@ -254,7 +254,7 @@ impl Scenario {
                 let plans = home
                     .join(".local/state")
                     .join(APP_DIR)
-                    .join(maki_storage::plans::PLANS_DIR);
+                    .join(makima_storage::plans::PLANS_DIR);
                 assert!(
                     system_text(body).contains(plans.to_string_lossy().as_ref()),
                     "the plan file is not in {}",

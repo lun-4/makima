@@ -1,5 +1,5 @@
 [package]
-name = "maki"
+name = "makima"
 version.workspace = true
 edition = "2024"
 authors = ["Tony Solomonik <tony.solomonik@gmail.com>"]
@@ -17,14 +17,14 @@ name = "makima"
 path = "src/main.rs"
 
 [dependencies]
-maki-ui = { workspace = true }
-maki-agent = { workspace = true }
-maki-acp = { workspace = true }
-maki-config = { workspace = true }
-maki-commands = { workspace = true }
-maki-providers = { workspace = true }
-maki-storage = { workspace = true }
-maki-lua = { workspace = true }
+makima-ui = { workspace = true }
+makima-agent = { workspace = true }
+makima-acp = { workspace = true }
+makima-config = { workspace = true }
+makima-commands = { workspace = true }
+makima-providers = { workspace = true }
+makima-storage = { workspace = true }
+makima-lua = { workspace = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }
 crossterm = { workspace = true }
@@ -44,38 +44,38 @@ event-listener = { workspace = true }
 open = { workspace = true }
 
 [dev-dependencies]
-maki-providers = { workspace = true, features = ["test-util"] }
-maki-storage = { workspace = true, features = ["test-util"] }
-maki-config = { workspace = true, features = ["test-util"] }
-maki-lua = { workspace = true, features = ["test-support"] }
+makima-providers = { workspace = true, features = ["test-util"] }
+makima-storage = { workspace = true, features = ["test-util"] }
+makima-config = { workspace = true, features = ["test-util"] }
+makima-lua = { workspace = true, features = ["test-support"] }
 test-case = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-rust = { workspace = true }
 
 [workspace]
 members = [
-  "maki-acp",
-  "maki-domain",
-  "maki-agent",
-  "maki-config",
-  "maki-commands",
-  "maki-docgen",
-  "maki-highlight",
-  "maki-interpreter",
-  "maki-lua",
-  "maki-markdown",
-  "maki-match",
-  "maki-providers",
-  "maki-storage",
-  "maki-config-macro",
-  "maki-lua-macro",
-  "maki-ui",
+  "makima-acp",
+  "makima-domain",
+  "makima-agent",
+  "makima-config",
+  "makima-commands",
+  "makima-docgen",
+  "makima-highlight",
+  "makima-interpreter",
+  "makima-lua",
+  "makima-markdown",
+  "makima-match",
+  "makima-providers",
+  "makima-storage",
+  "makima-config-macro",
+  "makima-lua-macro",
+  "makima-ui",
 ]
 resolver = "3"
 
 [workspace.package]
 # When changing the version, also update the "v<version>" cells on row 0 of
-# maki-ui/src/splash_golden.txt (right-aligned, ending at x=78), or
+# makima-ui/src/splash_golden.txt (right-aligned, ending at x=78), or
 # splash::tests::test_splash_lua_matches_rust_golden fails.
 version = "0.5.0"
 edition = "2024"
@@ -85,21 +85,21 @@ repository = "https://github.com/lun-4/makima"
 rust-version = "1.88"
 
 [workspace.dependencies]
-maki-agent = { path = "maki-agent" }
-maki-domain = { path = "maki-domain" }
-maki-acp = { path = "maki-acp" }
-maki-config = { path = "maki-config" }
-maki-commands = { path = "maki-commands" }
-maki-interpreter = { path = "maki-interpreter" }
-maki-providers = { path = "maki-providers" }
-maki-storage = { path = "maki-storage" }
-maki-ui = { path = "maki-ui" }
-maki-lua = { path = "maki-lua" }
-maki-config-macro = { path = "maki-config-macro" }
-maki-lua-macro = { path = "maki-lua-macro" }
-maki-highlight = { path = "maki-highlight" }
-maki-markdown = { path = "maki-markdown" }
-maki-match = { path = "maki-match" }
+makima-agent = { path = "makima-agent" }
+makima-domain = { path = "makima-domain" }
+makima-acp = { path = "makima-acp" }
+makima-config = { path = "makima-config" }
+makima-commands = { path = "makima-commands" }
+makima-interpreter = { path = "makima-interpreter" }
+makima-providers = { path = "makima-providers" }
+makima-storage = { path = "makima-storage" }
+makima-ui = { path = "makima-ui" }
+makima-lua = { path = "makima-lua" }
+makima-config-macro = { path = "makima-config-macro" }
+makima-lua-macro = { path = "makima-lua-macro" }
+makima-highlight = { path = "makima-highlight" }
+makima-markdown = { path = "makima-markdown" }
+makima-match = { path = "makima-match" }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 bs58 = "0.5"

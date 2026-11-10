@@ -7,20 +7,20 @@ use color_eyre::Result;
 use color_eyre::eyre::{Context, bail};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
-use maki_agent::mcp::{config as mcp_config, oauth as mcp_oauth};
-use maki_agent::tools::ToolRegistry;
-use maki_config::project::{self, ProjectConfig, TrustMode};
-use maki_config::{Config, ModelPolicy, load_env_files, load_permissions};
-use maki_lua::PluginHost;
-use maki_lua::ui_sink::{HeadlessUi, HostUi};
-use maki_providers::login::{
+use makima_agent::mcp::{config as mcp_config, oauth as mcp_oauth};
+use makima_agent::tools::ToolRegistry;
+use makima_config::project::{self, ProjectConfig, TrustMode};
+use makima_config::{Config, ModelPolicy, load_env_files, load_permissions};
+use makima_lua::PluginHost;
+use makima_lua::ui_sink::{HeadlessUi, HostUi};
+use makima_providers::login::{
     self, AuthState, AuthStatus, InteractionRequest, InteractionService, LoginOutcome,
     LoginRequest, ProviderStatus, drive_login,
 };
-use maki_providers::provider::BoxFuture;
-use maki_providers::{AgentError, ProviderRegistry, Timeouts};
-use maki_storage::StateDir;
-use maki_ui::AppSession;
+use makima_providers::provider::BoxFuture;
+use makima_providers::{AgentError, ProviderRegistry, Timeouts};
+use makima_storage::StateDir;
+use makima_ui::AppSession;
 
 const SESSIONS_JSON_ONLY_ERR: &str =
     "the sessions command only supports --json; use `makima sessions --json`";
@@ -324,7 +324,7 @@ fn load_effective_config(
         .unwrap_or_default()
         .into_config()
         .context("invalid config")?;
-    maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
+    makima_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
     Ok(config)
 }
 
@@ -360,7 +360,7 @@ pub fn index(
         .unwrap_or_default()
         .into_config()
         .context("invalid config")?;
-    maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
+    makima_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
     config.permissions = load_permissions(&trust.project_config)?;
 
     host.load_builtins(&config.plugins)
@@ -378,7 +378,7 @@ pub fn index(
         .tool
         .parse(&input)
         .map_err(|e| color_eyre::eyre::eyre!("parse index input: {e}"))?;
-    let ctx = maki_agent::tools::cli_tool_ctx(cwd.to_path_buf());
+    let ctx = makima_agent::tools::cli_tool_ctx(cwd.to_path_buf());
     let result = smol::block_on(async { inv.execute(&ctx).await });
     match result.output {
         Ok(output) => print!("{}", output.as_text()),
@@ -415,7 +415,7 @@ pub fn mcp_auth(cwd: &Path, server: &str, storage: &StateDir, trust_mode: TrustM
 }
 
 pub fn mcp_logout(server: &str, storage: &StateDir) -> Result<()> {
-    let deleted = maki_storage::auth::delete_mcp_auth(storage, server)?;
+    let deleted = makima_storage::auth::delete_mcp_auth(storage, server)?;
     if deleted {
         eprintln!("Removed OAuth credentials for MCP server '{server}'");
     } else {
@@ -436,10 +436,10 @@ pub fn prompt(
     trust_mode: TrustMode,
 ) -> Result<()> {
     use crate::cli::PromptVariant;
-    use maki_agent::agent::{build_system_prompt, load_instruction_text};
-    use maki_agent::prompt::{PromptId, assemble};
-    use maki_agent::template;
-    use maki_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry};
+    use makima_agent::agent::{build_system_prompt, load_instruction_text};
+    use makima_agent::prompt::{PromptId, assemble};
+    use makima_agent::template;
+    use makima_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry};
 
     if plan && !matches!(variant, PromptVariant::System) {
         bail!("--plan can only be used with the 'system' prompt variant");
@@ -460,7 +460,7 @@ pub fn prompt(
         .unwrap_or_default()
         .into_config()
         .context("invalid config")?;
-    maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
+    makima_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
     host.load_builtins(&config.plugins)
         .context("load builtin plugins")?;
 
@@ -494,9 +494,9 @@ pub fn prompt(
     let output = match variant {
         PromptVariant::System => {
             let mode = if plan {
-                maki_agent::AgentMode::Plan(std::path::PathBuf::from("plan.md"))
+                makima_agent::AgentMode::Plan(std::path::PathBuf::from("plan.md"))
             } else {
-                maki_agent::AgentMode::Build
+                makima_agent::AgentMode::Build
             };
             let modes = host.event_handle().mode_registry();
             build_system_prompt(&vars, &modes, &mode, &instructions, &slots)
@@ -512,10 +512,10 @@ pub fn prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maki_lua::test_support::InMemoryFs;
-    use maki_providers::login::ChoiceOption;
-    use maki_storage::auth::{load_credentials, save_credentials};
-    use maki_storage::sessions::SessionSummary;
+    use makima_lua::test_support::InMemoryFs;
+    use makima_providers::login::ChoiceOption;
+    use makima_storage::auth::{load_credentials, save_credentials};
+    use makima_storage::sessions::SessionSummary;
     use serde_json::json;
     use std::collections::BTreeSet;
     use std::io::Cursor;
@@ -613,7 +613,7 @@ mod tests {
     #[test]
     fn registered_status_and_logout_use_the_shared_functions() {
         let state = TempDir::new().unwrap();
-        maki_storage::paths::init_at(state.path().to_path_buf()).unwrap();
+        makima_storage::paths::init_at(state.path().to_path_buf()).unwrap();
         let storage = StateDir::from_path(state.path().to_path_buf());
         let host = PluginHost::with_session_provider_preparer(
             Arc::new(ToolRegistry::new()),

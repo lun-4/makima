@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 
 use color_eyre::Result;
 use color_eyre::eyre::bail;
-use maki_config::ProjectConfig;
-use maki_config::project::{self, TrustMode, TrustQuestion, confirm_trust};
-use maki_storage::StateDir;
-use maki_storage::trusted_folders::{CanonicalFolder, Change, TrustStatus, TrustedFolders};
+use makima_config::ProjectConfig;
+use makima_config::project::{self, TrustMode, TrustQuestion, confirm_trust};
+use makima_storage::StateDir;
+use makima_storage::trusted_folders::{CanonicalFolder, Change, TrustStatus, TrustedFolders};
 
 const NEEDS_A_TERMINAL: &str = "trust add needs a terminal confirmation or --yes";
 

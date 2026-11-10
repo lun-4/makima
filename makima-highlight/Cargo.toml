@@ -1,0 +1,18 @@
+[package]
+name = "makima-highlight"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+flume = { workspace = true }
+serde_json = { workspace = true }
+syntect = { workspace = true }
+tracing = { workspace = true }
+two-face = { workspace = true }
+
+[dev-dependencies]
+test-case = { workspace = true }

@@ -4,12 +4,12 @@ use std::sync::Arc;
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
-use maki_agent::{command, tools::ToolRegistry};
-use maki_config::project::{self, TrustMode};
-use maki_config::{load_env_files, load_permissions};
-use maki_lua::PluginHost;
-use maki_lua::ui_sink::{HeadlessUi, HostUi};
-use maki_storage::StateDir;
+use makima_agent::{command, tools::ToolRegistry};
+use makima_config::project::{self, TrustMode};
+use makima_config::{load_env_files, load_permissions};
+use makima_lua::PluginHost;
+use makima_lua::ui_sink::{HeadlessUi, HostUi};
+use makima_storage::StateDir;
 
 use crate::setup;
 
@@ -26,12 +26,12 @@ pub fn run(
     trust_mode: TrustMode,
 ) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
-    maki_providers::model_registry::load_from_storage(&storage);
+    makima_providers::model_registry::load_from_storage(&storage);
 
     let trust = project::resolve(&storage, &cwd, trust_mode);
     load_env_files(&trust.project_config);
 
-    let command_registry = maki_commands::CommandRegistry::new();
+    let command_registry = makima_commands::CommandRegistry::new();
     let standard_commands = command::StandardCommands::register(
         &command_registry,
         &command::discover_commands(&cwd, &trust.project_config),
@@ -58,7 +58,7 @@ pub fn run(
         .unwrap_or_default()
         .into_config()
         .context("invalid config")?;
-    maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
+    makima_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
     config.permissions = load_permissions(&trust.project_config)?;
 
     if yolo || config.always_yolo {
@@ -72,7 +72,7 @@ pub fn run(
         .load_builtins(&config.plugins)
         .context("load builtin plugins")?;
 
-    let timeouts = maki_providers::Timeouts::from(&config.provider);
+    let timeouts = makima_providers::Timeouts::from(&config.provider);
     let providers = plugin_host
         .provider_registry(timeouts)
         .context("build provider registry")?;
@@ -88,7 +88,7 @@ pub fn run(
     let lua_event_handle = plugin_host.event_handle();
     let yolo = config.permissions.yolo;
 
-    let result = maki_acp::run(maki_acp::AcpParams {
+    let result = makima_acp::run(makima_acp::AcpParams {
         model,
         config: config.agent,
         permissions_config: config.permissions,

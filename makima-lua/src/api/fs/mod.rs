@@ -1,0 +1,1571 @@
+//! `maki.fs` — the plugin-facing file-system namespace.
+//!
+//! All I/O dispatches through the [`FsBackend`] trait: [`RealFs`] is the
+//! production backend (real disk, symlinks, gitignore, permissions);
+//! `InMemoryFs` (behind the `test-support` feature) is the hermetic test
+//! backend, a deliberately dumb `BTreeMap` model — no symlinks, no
+//! gitignore, no permissions, and file mtime is an insertion counter.
+//! Behavior tests must not rely on real-filesystem vagaries; those belong
+//! in the real-backend suite below.
+
+#[cfg(feature = "test-support")]
+mod in_memory;
+mod real;
+
+use std::io::ErrorKind;
+use std::path::{Component, Path, PathBuf};
+use std::time::UNIX_EPOCH;
+
+use makima_lua_macro::{lua_fn, lua_table};
+use mlua::{Buffer, Lua, Result as LuaResult, Table, Value};
+
+use crate::api::util::convert::opt_bool;
+use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
+use crate::plugin_permissions::PluginPermissions;
+
+#[cfg(feature = "test-support")]
+pub use in_memory::{InMemoryFs, InMemoryOffloadBackend};
+pub use real::RealFs;
+
+/// `dir` entry type tags, shared by both backends and asserted by tests.
+pub(crate) const TYPE_FILE: &str = "file";
+pub(crate) const TYPE_DIRECTORY: &str = "directory";
+pub(crate) const TYPE_LINK: &str = "link";
+pub(crate) const TYPE_UNKNOWN: &str = "unknown";
+
+/// `dir` error prefixes, shared by both backends and asserted by tests.
+pub(crate) const DIR_MISSING_PREFIX: &str = "dir: path does not exist: ";
+pub(crate) const DIR_NOT_A_DIR_PREFIX: &str = "dir: not a directory: ";
+
+/// Metadata as seen by plugins.
+#[derive(Debug)]
+pub struct FsMeta {
+    pub size: u64,
+    pub is_file: bool,
+    pub is_dir: bool,
+    pub mtime: Option<std::time::SystemTime>,
+}
+
+/// Backend failure: a real I/O error, or a plain message the wrappers
+/// surface verbatim (e.g. the `dir:` prefixes).
+#[derive(thiserror::Error, Debug)]
+pub enum FsError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Message(String),
+}
+
+/// Object-safe async return: a boxed future borrowing from `&self` only.
+pub(crate) type BoxFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// All methods return a boxed future so the trait stays object-safe; a
+/// backend that performs blocking I/O hops to a thread pool itself
+/// (`RealFs` uses `smol::unblock`).
+pub trait FsBackend: Send + Sync + std::any::Any {
+    fn read(&self, path: PathBuf) -> BoxFuture<'_, std::io::Result<String>>;
+    fn read_bytes(&self, path: PathBuf) -> BoxFuture<'_, std::io::Result<Vec<u8>>>;
+    fn stat(&self, path: PathBuf) -> BoxFuture<'_, std::io::Result<FsMeta>>;
+    fn write(&self, path: PathBuf, content: Vec<u8>) -> BoxFuture<'_, std::io::Result<()>>;
+    fn atomic_write(&self, path: PathBuf, content: Vec<u8>) -> BoxFuture<'_, std::io::Result<()>>;
+    fn rm(&self, path: PathBuf, recursive: bool, force: bool)
+    -> BoxFuture<'_, std::io::Result<()>>;
+    fn mkdir(&self, path: PathBuf, parents: bool) -> BoxFuture<'_, std::io::Result<()>>;
+    fn dir(
+        &self,
+        path: PathBuf,
+        max_depth: u32,
+    ) -> BoxFuture<'_, Result<Vec<(String, &'static str)>, FsError>>;
+    fn glob(
+        &self,
+        patterns: Vec<String>,
+        path: Option<String>,
+        limit: Option<usize>,
+        gitignore: bool,
+        sort_mtime: bool,
+    ) -> BoxFuture<'_, Result<Vec<String>, FsError>>;
+    fn grep(
+        &self,
+        params: makima_agent::tools::grep::GrepParams,
+    ) -> BoxFuture<'_, Result<(PathBuf, Vec<makima_agent::GrepFileEntry>), FsError>>;
+}
+
+pub(crate) struct FsBackendHandle(pub(crate) std::sync::Arc<dyn FsBackend>);
+
+/// The backend for the current Lua state. Falls back to `RealFs` when the
+/// state carries none, so bare `Lua::new()` suites still exercise the disk.
+fn backend(lua: &Lua) -> std::sync::Arc<dyn FsBackend> {
+    lua.app_data_ref::<FsBackendHandle>()
+        .map(|h| std::sync::Arc::clone(&h.0))
+        .unwrap_or_else(default_real_backend)
+}
+
+fn default_real_backend() -> std::sync::Arc<dyn FsBackend> {
+    static DEFAULT: std::sync::OnceLock<std::sync::Arc<dyn FsBackend>> = std::sync::OnceLock::new();
+    DEFAULT.get_or_init(|| std::sync::Arc::new(RealFs)).clone()
+}
+
+pub(crate) fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = makima_storage::paths::home() {
+            return home.join(rest);
+        }
+    } else if path == "~"
+        && let Some(home) = makima_storage::paths::home()
+    {
+        return home;
+    }
+    PathBuf::from(path)
+}
+
+fn make_absolute(path: &str) -> LuaResult<PathBuf> {
+    let p = expand_tilde(path);
+    if p.is_absolute() {
+        Ok(p)
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&p))
+            .map_err(|e| mlua::Error::runtime(format!("cannot resolve cwd: {e}")))
+    }
+}
+
+fn path_to_string(p: &Path) -> LuaResult<String> {
+    p.to_str()
+        .map(|s| s.to_owned())
+        .ok_or_else(|| mlua::Error::runtime("non-utf8 path"))
+}
+
+/// Read the entire file at {path} as a UTF-8 string.
+/// If the file contains bytes that are not valid UTF-8, this function throws.
+/// Use `read_bytes` for binary files.
+///
+/// @param path string Absolute or relative file path. `~/` is expanded to the home directory.
+/// @return (string?, string?) File contents, or nil plus an error message.
+/// @example
+/// local text, err = maki.fs.read("config.toml")
+/// if err then
+///   maki.log.warn("could not read config: " .. err)
+///   return
+/// end
+#[lua_fn(guard = FsRead)]
+async fn read(lua: Lua, path: String) -> LuaResult<Pair<String>> {
+    let abs = make_absolute(&path)?;
+    let fs = backend(&lua);
+    match fs.read(abs).await {
+        Ok(s) => Ok((Some(s), None)),
+        Err(e) if e.kind() == ErrorKind::InvalidData => {
+            Err(mlua::Error::runtime("non-utf8 content; use read_bytes"))
+        }
+        Err(e) => Ok(err_pair(e)),
+    }
+}
+
+/// Read the entire file at {path} as raw bytes, returned as a Luau buffer.
+/// Useful for binary files or when you need to pass the data to `maki.base64.encode`.
+///
+/// @param path string Absolute or relative file path. `~/` is expanded to the home directory.
+/// @return (buffer?, string?) File bytes as a Luau buffer, or nil plus an error message.
+/// @example
+/// local buf, err = maki.fs.read_bytes("image.png")
+/// if err then return end
+/// local encoded = maki.base64.encode(buf)
+#[lua_fn(guard = FsRead)]
+async fn read_bytes(lua: Lua, path: String) -> LuaResult<Pair<Buffer>> {
+    let abs = make_absolute(&path)?;
+    let fs = backend(&lua);
+    let bytes = try_pair!(fs.read_bytes(abs).await);
+    Ok((Some(lua.create_buffer(bytes)?), None))
+}
+
+/// Get metadata for the file or directory at {path}.
+/// Returns a table with `size` (integer), `is_file` (boolean), `is_dir` (boolean),
+/// and `mtime` (number, fractional seconds since the Unix epoch; absent when the
+/// filesystem does not report a modification time).
+/// If {path} does not exist, returns nil with no error.
+///
+/// @param path string Absolute or relative path.
+/// @return (table?, string?) Metadata table, nil if missing, or nil plus an error message.
+/// @example
+/// local meta = maki.fs.metadata("src/main.rs")
+/// if meta and meta.is_file then
+///   print("size: " .. meta.size)
+/// end
+#[lua_fn(guard = FsRead)]
+async fn metadata(lua: Lua, path: String) -> LuaResult<Pair<Table>> {
+    let abs = make_absolute(&path)?;
+    let fs = backend(&lua);
+    match fs.stat(abs).await {
+        Ok(meta) => {
+            let tbl = lua.create_table()?;
+            tbl.set("size", meta.size)?;
+            tbl.set("is_file", meta.is_file)?;
+            tbl.set("is_dir", meta.is_dir)?;
+            if let Some(mtime) = meta.mtime
+                && let Ok(dur) = mtime.duration_since(UNIX_EPOCH)
+            {
+                tbl.set("mtime", dur.as_secs_f64())?;
+            }
+            Ok((Some(tbl), None))
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok((None, None)),
+        Err(e) => Ok(err_pair(e)),
+    }
+}
+
+/// Return the parent directory of {path}. Like `vim.fs.dirname`.
+///
+/// @param path string File path.
+/// @return (string?) Parent directory, or nil if {path} has no parent.
+/// @example
+/// maki.fs.dirname("/home/user/init.lua") -- "/home/user"
+#[lua_fn]
+fn dirname(_lua: &Lua, path: String) -> LuaResult<Option<String>> {
+    Ok(Path::new(&path)
+        .parent()
+        .and_then(|p| p.to_str())
+        .map(|s| s.to_owned()))
+}
+
+/// Return the final component (the file name) of {path}. Like `vim.fs.basename`.
+///
+/// @param path string File path.
+/// @return (string?) File name, or nil for paths like `/`.
+/// @example
+/// maki.fs.basename("/home/user/init.lua") -- "init.lua"
+#[lua_fn]
+fn basename(_lua: &Lua, path: String) -> LuaResult<Option<String>> {
+    Ok(Path::new(&path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_owned()))
+}
+
+/// Join one or more path segments into a single path. Like `vim.fs.joinpath`.
+///
+/// @param parts string One or more path segments to join.
+/// @return (string) The joined path.
+/// @example
+/// maki.fs.joinpath("src", "api", "fs.rs") -- "src/api/fs.rs"
+#[lua_fn]
+fn joinpath(_lua: &Lua, parts: mlua::Variadic<String>) -> LuaResult<String> {
+    let mut buf = PathBuf::new();
+    for part in parts.iter() {
+        buf.push(part);
+    }
+    path_to_string(&buf)
+}
+
+/// Clean up `.` and `..` segments and make {path} absolute. Like `vim.fs.normalize`.
+/// This is purely string-based and does not touch the filesystem.
+///
+/// @param path string Path to normalize. `~/` is expanded.
+/// @return (string) Normalized absolute path.
+/// @example
+/// maki.fs.normalize("src/../src/api") -- "/home/user/project/src/api"
+#[lua_fn]
+fn normalize(_lua: &Lua, path: String) -> LuaResult<String> {
+    let abs = make_absolute(&path)?;
+    let mut components = Vec::new();
+    for comp in abs.components() {
+        match comp {
+            Component::ParentDir => {
+                components.pop();
+            }
+            Component::CurDir => {}
+            _ => components.push(comp),
+        }
+    }
+    let result: PathBuf = components.iter().collect();
+    path_to_string(&result)
+}
+
+/// Make {path} absolute by prepending the current working directory when needed.
+/// Unlike `normalize`, this does not resolve `.` or `..` segments.
+///
+/// @param path string Relative or absolute path. `~/` is expanded.
+/// @return (string) Absolute path.
+/// @example
+/// maki.fs.abspath("src/main.rs") -- "/home/user/project/src/main.rs"
+#[lua_fn]
+fn abspath(_lua: &Lua, path: String) -> LuaResult<String> {
+    path_to_string(&make_absolute(&path)?)
+}
+
+/// Return all ancestor directories of {path}, from the immediate parent up to the root.
+/// Handy for walking up a directory tree.
+///
+/// @param path string File or directory path.
+/// @return (string[]) Array of ancestor directory paths.
+/// @example
+/// local dirs = maki.fs.parents("/home/user/project/src")
+/// -- { "/home/user/project", "/home/user", "/home", "/" }
+#[lua_fn]
+fn parents(lua: &Lua, path: String) -> LuaResult<Table> {
+    let p = Path::new(&path);
+    let tbl = lua.create_table()?;
+    let mut i = 1;
+    let mut current = p.parent();
+    while let Some(parent) = current {
+        if let Some(s) = parent.to_str() {
+            tbl.set(i, s)?;
+            i += 1;
+        }
+        current = parent.parent();
+    }
+    Ok(tbl)
+}
+
+/// Walk upward from {source} looking for a directory that contains one of the
+/// {marker} files or directories. Like `vim.fs.root`. Useful for finding the
+/// project root.
+///
+/// @param source string Starting file or directory path.
+/// @param marker string|string[] Marker filename(s) to look for, e.g. `".git"` or `{"package.json", ".git"}`.
+/// @return (string?, string?) Root directory path, or nil when not found.
+/// @example
+/// local root = maki.fs.root("src/main.rs", { ".git", "Cargo.toml" })
+/// if root then print("project root: " .. root) end
+#[lua_fn(guard = FsRead)]
+async fn root(lua: Lua, source: String, marker: Value) -> LuaResult<Option<String>> {
+    let markers: Vec<String> = match marker {
+        Value::String(s) => vec![s.to_str()?.to_owned()],
+        Value::Table(t) => {
+            let mut v = Vec::new();
+            for pair in t.sequence_values::<String>() {
+                v.push(pair?);
+            }
+            v
+        }
+        _ => {
+            return Err(mlua::Error::runtime(
+                "fs.root: marker must be a string or list of strings",
+            ));
+        }
+    };
+
+    let fs = backend(&lua);
+    // `stat` follows symlinks, like the old `is_file`/`exists` probes.
+    // Any stat error counts as missing, as `!Path::exists()` did.
+    let start = Path::new(&source);
+    let stat = fs.stat(start.to_path_buf()).await;
+    let start_is_file = matches!(&stat, Ok(meta) if meta.is_file);
+    let start = if start_is_file || stat.is_err() {
+        start.parent().unwrap_or(start)
+    } else {
+        start
+    };
+
+    let mut dir = make_absolute(start.to_str().unwrap_or_default())?;
+
+    loop {
+        for m in &markers {
+            if fs.stat(dir.join(m)).await.is_ok() {
+                return Ok(Some(path_to_string(&dir)?));
+            }
+        }
+        if !dir.pop() {
+            return Ok(None);
+        }
+    }
+}
+
+/// Compute a relative path from {base} to {target}.
+///
+/// @param base string Base directory path.
+/// @param target string Target path.
+/// @return (string) Relative path from {base} to {target}.
+/// @example
+/// maki.fs.relpath("/home/user", "/home/user/project/src") -- "project/src"
+#[lua_fn]
+fn relpath(_lua: &Lua, base: String, target: String) -> LuaResult<String> {
+    let base_comps: Vec<_> = Path::new(&base).components().collect();
+    let target_comps: Vec<_> = Path::new(&target).components().collect();
+
+    let common = base_comps
+        .iter()
+        .zip(target_comps.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let mut result = PathBuf::new();
+    for _ in common..base_comps.len() {
+        result.push("..");
+    }
+    for comp in &target_comps[common..] {
+        result.push(comp);
+    }
+    path_to_string(&result)
+}
+
+/// Return the file extension of {path}, without the leading dot.
+///
+/// @param path string File path.
+/// @return (string?) Extension, or nil if the path has no extension.
+/// @example
+/// maki.fs.ext("main.rs")   -- "rs"
+/// maki.fs.ext("Makefile")  -- nil
+#[lua_fn]
+fn ext(_lua: &Lua, path: String) -> LuaResult<Option<String>> {
+    Ok(Path::new(&path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_owned()))
+}
+
+/// List the contents of the directory at {path}.
+/// Each entry is a two-element array `{name, type}` where type is one of
+/// `"file"`, `"directory"`, `"link"`, or `"unknown"`. Follows symlinks.
+///
+/// @param path string Directory path.
+/// @param opts table? `depth` (integer, default 1): how many levels deep to recurse.
+/// @return (table?, string?) Array of `{name, type}` entries, or nil plus an error message.
+/// @example
+/// local entries, err = maki.fs.dir("src", { depth = 2 })
+/// if err then return end
+/// for _, e in ipairs(entries) do
+///   print(e[1], e[2]) -- "main.rs"  "file"
+/// end
+#[lua_fn(guard = FsRead)]
+async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Table>> {
+    let abs = make_absolute(&path)?;
+    let max_depth: u32 = match &opts {
+        Some(t) => t.get::<u32>("depth").unwrap_or(1),
+        None => 1,
+    };
+    let fs = backend(&lua);
+
+    let result = fs.dir(abs, max_depth).await;
+
+    let entries = try_pair!(result);
+    let tbl = lua.create_table()?;
+    for (i, (name, typ)) in entries.iter().enumerate() {
+        let entry = lua.create_table()?;
+        entry.set(1, name.as_str())?;
+        entry.set(2, *typ)?;
+        tbl.set(i + 1, entry)?;
+    }
+    Ok((Some(tbl), None))
+}
+
+/// Write {content} to the file at {path}, creating it if it does not exist
+/// or overwriting it if it does.
+///
+/// @param path string Destination file path. `~/` is expanded.
+/// @param content string Text to write.
+/// @return (true?, string?) `true` on success, or nil plus an error message.
+/// @example
+/// local ok, err = maki.fs.write("out.txt", "hello world")
+/// if err then print("write failed: " .. err) end
+#[lua_fn(guard = FsWrite)]
+async fn write(lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
+    let abs = make_absolute(&path)?;
+    let result = backend(&lua).write(abs, content.into_bytes()).await;
+    Ok(pair(result.map(|()| true)))
+}
+
+/// Atomically replace {path} with {content}. The parent directory must exist.
+/// Readers observe either the old file or the complete new file.
+/// Existing file permissions are preserved. On Unix, new files use mode 0600.
+///
+/// @param path string Destination file path. `~/` is expanded.
+/// @param content string Text to write.
+/// @return (true?, string?) `true` on success, or nil plus an error message.
+/// @example
+/// local ok, err = maki.fs.atomic_write("state.json", encoded)
+/// if err then print("atomic write failed: " .. err) end
+#[lua_fn(guard = FsWrite)]
+async fn atomic_write(lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
+    let abs = make_absolute(&path)?;
+    let result = backend(&lua).atomic_write(abs, content.into_bytes()).await;
+    Ok(pair(result.map(|()| true)))
+}
+
+/// Delete the file, symlink, or directory at {path}.
+/// Pass `recursive = true` to remove a non-empty directory tree (like `rm -r`).
+/// Unlike `vim.fs.rm`, this also removes an empty directory without `recursive`.
+/// Symlinks are removed themselves, never followed.
+///
+/// @param path string Path to the file or directory to remove.
+/// @param opts table? `recursive` (boolean, default false): remove a directory and its contents recursively. `force` (boolean, default false): silently ignore a missing path.
+/// @return (true?, string?) `true` on success, or nil plus an error message.
+/// @example
+/// local ok, err = maki.fs.rm("temp.txt")
+/// if err then print("rm failed: " .. err) end
+/// maki.fs.rm("stale_dir", { recursive = true, force = true })
+#[lua_fn(guard = FsWrite)]
+async fn rm(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
+    let abs = make_absolute(&path)?;
+    let recursive = opts
+        .as_ref()
+        .and_then(|t| opt_bool(t, "recursive"))
+        .unwrap_or(false);
+    let force = opts
+        .as_ref()
+        .and_then(|t| opt_bool(t, "force"))
+        .unwrap_or(false);
+    let fs = backend(&lua);
+    let result = fs.rm(abs, recursive, force).await;
+    Ok(pair(result.map(|()| true)))
+}
+
+/// Create the directory at {path}. Set `parents = true` to create
+/// intermediate directories, like `mkdir -p`.
+///
+/// @param path string Directory path to create.
+/// @param opts table? `parents` (boolean, default false): create intermediate parent directories.
+/// @return (true?, string?) `true` on success, or nil plus an error message.
+/// @example
+/// maki.fs.mkdir("a/b/c", { parents = true })
+#[lua_fn(guard = FsWrite)]
+async fn mkdir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
+    let abs = make_absolute(&path)?;
+    let parents = opts
+        .as_ref()
+        .and_then(|t| opt_bool(t, "parents"))
+        .unwrap_or(false);
+    let fs = backend(&lua);
+    let result = fs.mkdir(abs, parents).await;
+    Ok(pair(result.map(|()| true)))
+}
+
+/// Find files matching one or more glob patterns.
+/// Respects `.gitignore` by default. Pass `sort = "mtime"` to get the most
+/// recently modified files first.
+///
+/// @param pattern string|string[] Glob pattern or array of patterns.
+/// @param opts table? `path` (string): search root. `limit` (integer): max results. `gitignore` (boolean, default true): respect .gitignore. `sort` (string): `"mtime"` sorts newest first.
+/// @return (string[]?, string?) Array of absolute file paths, or nil plus an error message.
+/// @example
+/// local files, err = maki.fs.glob("**/*.lua", { path = "plugins", limit = 10 })
+/// if err then return end
+/// for _, f in ipairs(files) do print(f) end
+#[lua_fn(guard = FsRead)]
+async fn glob(lua: Lua, pattern: Value, opts: Option<Table>) -> LuaResult<Pair<Table>> {
+    let patterns: Vec<String> = match pattern {
+        Value::String(s) => vec![s.to_str()?.to_owned()],
+        Value::Table(t) => {
+            let mut v = Vec::new();
+            for val in t.sequence_values::<String>() {
+                v.push(val?);
+            }
+            v
+        }
+        _ => {
+            return Err(mlua::Error::runtime(
+                "glob: patterns must be a string or array of strings",
+            ));
+        }
+    };
+
+    let path = opts.as_ref().and_then(|t| t.get::<String>("path").ok());
+    let limit = opts.as_ref().and_then(|t| t.get::<usize>("limit").ok());
+    let gitignore = opts
+        .as_ref()
+        .and_then(|t| opt_bool(t, "gitignore"))
+        .unwrap_or(true);
+    let sort = opts.as_ref().and_then(|t| t.get::<String>("sort").ok());
+    let sort_mtime = sort.as_deref() == Some("mtime");
+
+    let fs = backend(&lua);
+    let result: Result<Vec<String>, String> = fs
+        .glob(patterns, path, limit, gitignore, sort_mtime)
+        .await
+        .map_err(|e| e.to_string());
+
+    let paths = try_pair!(result.map_err(|e| format!("glob: {e}")));
+    let tbl = lua.create_table()?;
+    for (i, path) in paths.iter().enumerate() {
+        tbl.set(i + 1, path.as_str())?;
+    }
+    Ok((Some(tbl), None))
+}
+
+/// Search file contents for a regex {pattern}. Returns structured matches
+/// grouped by file, similar to ripgrep output.
+///
+/// Each result entry has a `path` and a list of `groups`. Each group contains
+/// `lines`, where every line has `line_nr`, `text`, and `is_match`.
+///
+/// @param pattern string Regular expression to search for.
+/// @param opts table? `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`). `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `max_line_bytes` (integer): skip lines longer than this.
+/// @return (table?, string?) Array of `{path, groups}` tables, or nil plus an error message.
+/// @example
+/// local hits, err = maki.fs.grep("TODO", { path = "src", include = "*.rs", limit = 5 })
+/// if err then return end
+/// for _, file in ipairs(hits) do
+///   for _, g in ipairs(file.groups) do
+///     for _, line in ipairs(g.lines) do
+///       if line.is_match then print(file.path .. ":" .. line.line_nr) end
+///     end
+///   end
+/// end
+#[lua_fn(guard = FsRead)]
+async fn grep(lua: Lua, pattern: String, opts: Option<Table>) -> LuaResult<Pair<Table>> {
+    let mut params = makima_agent::tools::grep::GrepParams::new(pattern);
+    if let Some(ref opts) = opts {
+        if let Ok(v) = opts.get::<String>("path") {
+            params.path = Some(v);
+        }
+        if let Ok(v) = opts.get::<String>("include") {
+            params.include = Some(v);
+        }
+        if let Ok(v) = opts.get::<usize>("context_before") {
+            params.context_before = v;
+        }
+        if let Ok(v) = opts.get::<usize>("context_after") {
+            params.context_after = v;
+        }
+        if let Ok(v) = opts.get::<usize>("limit") {
+            params.limit = v;
+        }
+        if let Ok(v) = opts.get::<usize>("max_line_bytes") {
+            params.max_line_bytes = v;
+        }
+    }
+
+    let fs = backend(&lua);
+    let result = fs.grep(params).await;
+
+    let (base, entries) = try_pair!(result.map_err(|e| e.to_string()));
+    let arr = lua.create_table()?;
+    for (i, entry) in entries.iter().enumerate() {
+        let etbl = lua.create_table()?;
+        etbl.set("path", base.join(&entry.path).to_string_lossy().as_ref())?;
+        let groups_tbl = lua.create_table()?;
+        for (gi, group) in entry.groups.iter().enumerate() {
+            let gtbl = lua.create_table()?;
+            let lines_tbl = lua.create_table()?;
+            for (li, line) in group.lines.iter().enumerate() {
+                let ltbl = lua.create_table()?;
+                ltbl.set("line_nr", line.line_nr)?;
+                ltbl.set("text", line.text.as_str())?;
+                ltbl.set("is_match", line.is_match)?;
+                lines_tbl.set(li + 1, ltbl)?;
+            }
+            gtbl.set("lines", lines_tbl)?;
+            groups_tbl.set(gi + 1, gtbl)?;
+        }
+        etbl.set("groups", groups_tbl)?;
+        arr.set(i + 1, etbl)?;
+    }
+    Ok((Some(arr), None))
+}
+
+lua_table! {
+    /// File-system utilities, modelled after `vim.fs` and `vim.uv`.
+    ///
+    /// Fallible operations return `(value, err)` pairs and never throw.
+    /// Paths support `~/` expansion. Relative paths resolve from the current working directory.
+    ///
+    /// ```lua
+    /// local text, err = maki.fs.read("init.lua")
+    /// if err then return end
+    /// ```
+    "maki.fs" => pub(crate) fn create_fs_table(perms: &PluginPermissions), DOCS [
+        read(perms), read_bytes(perms), metadata(perms), dirname, basename,
+        joinpath, normalize, abspath, parents, root(perms), relpath, ext,
+        dir(perms), write(perms), atomic_write(perms), rm(perms), mkdir(perms),
+        glob(perms), grep(perms),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::OpenOptions;
+    use std::time::{Duration, SystemTime};
+
+    use super::*;
+    use crate::plugin_permissions::PluginPermissions;
+    use mlua::Lua;
+    use tempfile::TempDir;
+    use test_case::test_case;
+
+    const FIRST_CONTENT: &str = "first";
+    const REPLACEMENT_CONTENT: &str = "replacement";
+    const FS_WRITE_PERMISSION: &str = "fs_write";
+
+    #[test]
+    fn read_file_ok() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("hello.txt");
+        std::fs::write(&file, "world").unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let read: mlua::Function = tbl.get("read").unwrap();
+        let result: String = smol::block_on(read.call_async(file.to_str().unwrap())).unwrap();
+        assert_eq!(result, "world");
+    }
+
+    #[test]
+    fn writes_dispatch_to_backend_without_restrictive_path_plumbing() {
+        let lua = Lua::new();
+        let fs = std::sync::Arc::new(InMemoryFs::new());
+        lua.set_app_data(FsBackendHandle(fs.clone()));
+        let table = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let write: mlua::Function = table.get("write").unwrap();
+        let atomic_write: mlua::Function = table.get("atomic_write").unwrap();
+        smol::block_on(write.call_async::<Pair<bool>>(("/ordinary.txt", FIRST_CONTENT))).unwrap();
+        smol::block_on(atomic_write.call_async::<Pair<bool>>(("/plan.md", REPLACEMENT_CONTENT)))
+            .unwrap();
+        assert_eq!(
+            fs.files(),
+            vec![
+                (
+                    PathBuf::from("/ordinary.txt"),
+                    FIRST_CONTENT.as_bytes().to_vec()
+                ),
+                (
+                    PathBuf::from("/plan.md"),
+                    REPLACEMENT_CONTENT.as_bytes().to_vec()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn read_missing_returns_nil_err() {
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+
+        for func_name in ["read", "read_bytes"] {
+            let f: mlua::Function = tbl.get(func_name).unwrap();
+            let (val, err): (mlua::Value, mlua::Value) =
+                smol::block_on(f.call_async("/nonexistent/path")).unwrap();
+            assert_eq!(val, mlua::Value::Nil, "{func_name} should return nil");
+            assert!(
+                matches!(err, mlua::Value::String(_)),
+                "{func_name} should return error"
+            );
+        }
+    }
+
+    #[test]
+    fn dir_lists_entries() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "").unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let dir: mlua::Function = tbl.get("dir").unwrap();
+        let (result, err): (Table, mlua::Value) =
+            smol::block_on(dir.call_async::<(Table, mlua::Value)>(tmp.path().to_str().unwrap()))
+                .unwrap();
+        assert!(matches!(err, mlua::Value::Nil), "dir should succeed");
+
+        let mut names: Vec<String> = Vec::new();
+        let mut types: Vec<String> = Vec::new();
+        for i in 1..=result.len().unwrap() {
+            let entry: Table = result.get(i).unwrap();
+            names.push(entry.get::<String>(1).unwrap());
+            types.push(entry.get::<String>(2).unwrap());
+        }
+        names.sort();
+        assert_eq!(names, vec!["a.txt", "sub"]);
+        assert!(types.contains(&"file".to_owned()));
+        assert!(types.contains(&"directory".to_owned()));
+    }
+
+    #[test]
+    fn dir_recursive() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("d")).unwrap();
+        std::fs::write(tmp.path().join("d/nested.txt"), "").unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let dir: mlua::Function = tbl.get("dir").unwrap();
+
+        let opts = lua.create_table().unwrap();
+        opts.set("depth", 2).unwrap();
+
+        let (result, err): (Table, mlua::Value) = smol::block_on(
+            dir.call_async::<(Table, mlua::Value)>((tmp.path().to_str().unwrap(), opts)),
+        )
+        .unwrap();
+        assert!(matches!(err, mlua::Value::Nil));
+
+        let mut names: Vec<String> = Vec::new();
+        for i in 1..=result.len().unwrap() {
+            let entry: Table = result.get(i).unwrap();
+            names.push(entry.get::<String>(1).unwrap());
+        }
+        names.sort();
+        assert!(names.contains(&"d".to_owned()));
+        assert!(names.iter().any(|n| n.contains("nested.txt")));
+    }
+
+    #[test]
+    fn dir_nonexistent_returns_nil_err() {
+        let tmp = TempDir::new().unwrap();
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let dir: mlua::Function = tbl.get("dir").unwrap();
+        let missing = tmp.path().join("does_not_exist");
+        let (val, err): (mlua::Value, mlua::Value) =
+            smol::block_on(dir.call_async::<(mlua::Value, mlua::Value)>(missing.to_str().unwrap()))
+                .unwrap();
+        assert_eq!(
+            val,
+            mlua::Value::Nil,
+            "dir should return nil for nonexistent path"
+        );
+        assert!(
+            matches!(err, mlua::Value::String(_)),
+            "dir should return error for nonexistent path"
+        );
+    }
+
+    #[test]
+    fn metadata_file_dir_and_missing() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("probe.txt");
+        std::fs::write(&file, "hello").unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let metadata: mlua::Function = tbl.get("metadata").unwrap();
+
+        let f: Table =
+            smol::block_on(metadata.call_async::<Table>(file.to_str().unwrap())).unwrap();
+        assert!(f.get::<bool>("is_file").unwrap());
+        assert!(!f.get::<bool>("is_dir").unwrap());
+        assert_eq!(f.get::<u64>("size").unwrap(), 5);
+        assert!(f.get::<f64>("mtime").unwrap() > 0.0);
+
+        let d: Table =
+            smol::block_on(metadata.call_async::<Table>(tmp.path().to_str().unwrap())).unwrap();
+        assert!(!d.get::<bool>("is_file").unwrap());
+        assert!(d.get::<bool>("is_dir").unwrap());
+
+        let missing = tmp.path().join("nope");
+        let nil: mlua::Value =
+            smol::block_on(metadata.call_async(missing.to_str().unwrap())).unwrap();
+        assert!(matches!(nil, mlua::Value::Nil));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_follows_symlinks() {
+        let tmp = TempDir::new().unwrap();
+        let real_dir = tmp.path().join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        std::fs::write(real_dir.join("inner.txt"), "").unwrap();
+        std::os::unix::fs::symlink(&real_dir, tmp.path().join("link")).unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let dir: mlua::Function = tbl.get("dir").unwrap();
+
+        let opts = lua.create_table().unwrap();
+        opts.set("depth", 2u32).unwrap();
+
+        let (result, err): (Table, mlua::Value) = smol::block_on(
+            dir.call_async::<(Table, mlua::Value)>((tmp.path().to_str().unwrap(), opts)),
+        )
+        .unwrap();
+        assert!(matches!(err, mlua::Value::Nil));
+
+        let mut names: Vec<String> = Vec::new();
+        let mut types: Vec<String> = Vec::new();
+        for i in 1..=result.len().unwrap() {
+            let entry: Table = result.get(i).unwrap();
+            names.push(entry.get::<String>(1).unwrap());
+            types.push(entry.get::<String>(2).unwrap());
+        }
+
+        assert!(names.iter().any(|n| n.contains("inner.txt")));
+        let link_idx = names.iter().position(|n| n == "link").unwrap();
+        assert_eq!(types[link_idx], "directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_dangling_symlink() {
+        let tmp = TempDir::new().unwrap();
+        std::os::unix::fs::symlink("/nonexistent_target_xyz", tmp.path().join("broken")).unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let dir: mlua::Function = tbl.get("dir").unwrap();
+
+        let (result, err): (Table, mlua::Value) =
+            smol::block_on(dir.call_async::<(Table, mlua::Value)>(tmp.path().to_str().unwrap()))
+                .unwrap();
+        assert!(matches!(err, mlua::Value::Nil), "dir should succeed");
+
+        let mut found = false;
+        for i in 1..=result.len().unwrap() {
+            let entry: Table = result.get(i).unwrap();
+            let name: String = entry.get::<String>(1).unwrap();
+            if name == "broken" {
+                let typ: String = entry.get::<String>(2).unwrap();
+                assert_eq!(typ, "link");
+                found = true;
+            }
+        }
+        assert!(found, "dangling symlink should still appear in listing");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_symlink_cycle_does_not_loop() {
+        let tmp = TempDir::new().unwrap();
+        let child = tmp.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        std::os::unix::fs::symlink(tmp.path(), child.join("loop")).unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let dir: mlua::Function = tbl.get("dir").unwrap();
+
+        let opts = lua.create_table().unwrap();
+        opts.set("depth", 10u32).unwrap();
+
+        let (result, err): (Table, mlua::Value) = smol::block_on(
+            dir.call_async::<(Table, mlua::Value)>((tmp.path().to_str().unwrap(), opts)),
+        )
+        .unwrap();
+        assert!(matches!(err, mlua::Value::Nil));
+
+        let len = result.len().unwrap();
+        assert!(
+            len < 20,
+            "symlink cycle produced {len} entries, expected bounded"
+        );
+    }
+
+    #[test]
+    fn write_and_overwrite() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("new.txt");
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let write: mlua::Function = tbl.get("write").unwrap();
+
+        let (ok, err): (mlua::Value, mlua::Value) =
+            smol::block_on(write.call_async((file.to_str().unwrap(), "first"))).unwrap();
+        assert!(matches!(ok, mlua::Value::Boolean(true)));
+        assert!(matches!(err, mlua::Value::Nil));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "first");
+
+        smol::block_on(
+            write.call_async::<(mlua::Value, mlua::Value)>((file.to_str().unwrap(), "second")),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "second");
+    }
+
+    #[test]
+    fn atomic_write_creates_and_replaces_file() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("state.json");
+        let lua = Lua::new();
+        let table = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let atomic_write: mlua::Function = table.get("atomic_write").unwrap();
+
+        for content in [FIRST_CONTENT, REPLACEMENT_CONTENT] {
+            let (ok, err): (Value, Value) =
+                smol::block_on(atomic_write.call_async((file.to_str().unwrap(), content))).unwrap();
+            assert_eq!(ok, Value::Boolean(true));
+            assert_eq!(err, Value::Nil);
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+        }
+    }
+
+    #[test]
+    fn atomic_write_returns_error_when_parent_is_missing() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("missing/state.json");
+        let lua = Lua::new();
+        let table = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let atomic_write: mlua::Function = table.get("atomic_write").unwrap();
+
+        let (ok, err): (Value, Value) =
+            smol::block_on(atomic_write.call_async((file.to_str().unwrap(), FIRST_CONTENT)))
+                .unwrap();
+
+        assert_eq!(ok, Value::Nil);
+        assert!(matches!(err, Value::String(_)));
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn atomic_write_requires_fs_write_permission() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("state.json");
+        let lua = Lua::new();
+        let table = create_fs_table(&lua, &PluginPermissions::denied()).unwrap();
+        let atomic_write: mlua::Function = table.get("atomic_write").unwrap();
+
+        let error = smol::block_on(
+            atomic_write.call_async::<(Value, Value)>((file.to_str().unwrap(), FIRST_CONTENT)),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains(FS_WRITE_PERMISSION));
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn rm_deletes_file() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("doomed.txt");
+        std::fs::write(&file, "bye").unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let rm: mlua::Function = tbl.get("rm").unwrap();
+        let (ok, _): (mlua::Value, mlua::Value) =
+            smol::block_on(rm.call_async(file.to_str().unwrap())).unwrap();
+        assert!(matches!(ok, mlua::Value::Boolean(true)));
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn rm_nonexistent_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("ghost.txt");
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let rm: mlua::Function = tbl.get("rm").unwrap();
+        let (ok, err): (mlua::Value, mlua::Value) =
+            smol::block_on(rm.call_async(file.to_str().unwrap())).unwrap();
+        assert!(
+            matches!(ok, mlua::Value::Nil),
+            "should fail for nonexistent"
+        );
+        assert!(matches!(err, mlua::Value::String(_)));
+    }
+
+    #[test]
+    fn rm_force_ignores_missing() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("ghost.txt");
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let rm: mlua::Function = tbl.get("rm").unwrap();
+        let opts = lua.create_table().unwrap();
+        opts.set("force", true).unwrap();
+        let (ok, err): (mlua::Value, mlua::Value) =
+            smol::block_on(rm.call_async((file.to_str().unwrap(), opts))).unwrap();
+        assert!(
+            matches!(ok, mlua::Value::Boolean(true)),
+            "force should suppress NotFound"
+        );
+        assert!(matches!(err, mlua::Value::Nil));
+    }
+
+    #[test]
+    fn rm_force_ignores_missing_dir() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("never_existed");
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let rm: mlua::Function = tbl.get("rm").unwrap();
+        let opts = lua.create_table().unwrap();
+        opts.set("recursive", true).unwrap();
+        opts.set("force", true).unwrap();
+        let (ok, err): (mlua::Value, mlua::Value) =
+            smol::block_on(rm.call_async((dir.to_str().unwrap(), opts))).unwrap();
+        assert!(matches!(ok, mlua::Value::Boolean(true)));
+        assert!(matches!(err, mlua::Value::Nil));
+    }
+
+    #[test]
+    fn rm_empty_dir_without_recursive() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("emptydir");
+        std::fs::create_dir(&dir).unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let rm: mlua::Function = tbl.get("rm").unwrap();
+        let (ok, _): (mlua::Value, mlua::Value) =
+            smol::block_on(rm.call_async(dir.to_str().unwrap())).unwrap();
+        assert!(matches!(ok, mlua::Value::Boolean(true)));
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn rm_nonempty_dir_without_recursive_fails() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("nonempty");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("child.txt"), "x").unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let rm: mlua::Function = tbl.get("rm").unwrap();
+        let (ok, err): (mlua::Value, mlua::Value) =
+            smol::block_on(rm.call_async(dir.to_str().unwrap())).unwrap();
+        assert!(
+            matches!(ok, mlua::Value::Nil),
+            "should fail without recursive"
+        );
+        assert!(matches!(err, mlua::Value::String(_)));
+        assert!(dir.exists(), "non-empty dir should still exist");
+    }
+
+    #[test]
+    fn rm_recursive_removes_tree() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("tree");
+        std::fs::create_dir_all(dir.join("sub/deeper")).unwrap();
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        std::fs::write(dir.join("sub/b.txt"), "b").unwrap();
+        std::fs::write(dir.join("sub/deeper/c.txt"), "c").unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let rm: mlua::Function = tbl.get("rm").unwrap();
+        let opts = lua.create_table().unwrap();
+        opts.set("recursive", true).unwrap();
+        let (ok, _): (mlua::Value, mlua::Value) =
+            smol::block_on(rm.call_async((dir.to_str().unwrap(), opts))).unwrap();
+        assert!(matches!(ok, mlua::Value::Boolean(true)));
+        assert!(!dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rm_symlink_removes_link_not_target() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("target.txt");
+        std::fs::write(&target, "data").unwrap();
+        let link = tmp.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let rm: mlua::Function = tbl.get("rm").unwrap();
+        let (ok, _): (mlua::Value, mlua::Value) =
+            smol::block_on(rm.call_async(link.to_str().unwrap())).unwrap();
+        assert!(matches!(ok, mlua::Value::Boolean(true)));
+        assert!(!link.exists(), "symlink should be removed");
+        assert!(target.exists(), "target should remain");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rm_recursive_symlink_to_dir_does_not_follow() {
+        let tmp = TempDir::new().unwrap();
+        let real_dir = tmp.path().join("real");
+        std::fs::create_dir_all(real_dir.join("sub")).unwrap();
+        std::fs::write(real_dir.join("sub/keep.txt"), "data").unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real_dir, &link).unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let rm: mlua::Function = tbl.get("rm").unwrap();
+        let opts = lua.create_table().unwrap();
+        opts.set("recursive", true).unwrap();
+        let (ok, _): (mlua::Value, mlua::Value) =
+            smol::block_on(rm.call_async((link.to_str().unwrap(), opts))).unwrap();
+        assert!(matches!(ok, mlua::Value::Boolean(true)));
+        assert!(!link.exists(), "symlink should be removed");
+        assert!(real_dir.exists(), "target dir should remain");
+        assert!(
+            real_dir.join("sub/keep.txt").exists(),
+            "target dir contents should remain"
+        );
+    }
+
+    #[test]
+    fn mkdir_creates_single_dir() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("newdir");
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let mkdir: mlua::Function = tbl.get("mkdir").unwrap();
+        let (ok, _): (mlua::Value, mlua::Value) =
+            smol::block_on(mkdir.call_async(dir.to_str().unwrap())).unwrap();
+        assert!(matches!(ok, mlua::Value::Boolean(true)));
+        assert!(dir.is_dir());
+    }
+
+    #[test]
+    fn mkdir_without_parents_fails_on_deep_path() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("a/b/c");
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let mkdir: mlua::Function = tbl.get("mkdir").unwrap();
+        let (ok, err): (mlua::Value, mlua::Value) =
+            smol::block_on(mkdir.call_async(dir.to_str().unwrap())).unwrap();
+        assert!(
+            matches!(ok, mlua::Value::Nil),
+            "should fail without parents option"
+        );
+        assert!(matches!(err, mlua::Value::String(_)));
+    }
+
+    #[test]
+    fn mkdir_with_parents_creates_nested() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("x/y/z");
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let mkdir: mlua::Function = tbl.get("mkdir").unwrap();
+        let opts = lua.create_table().unwrap();
+        opts.set("parents", true).unwrap();
+        let (ok, _): (mlua::Value, mlua::Value) =
+            smol::block_on(mkdir.call_async((dir.to_str().unwrap(), opts))).unwrap();
+        assert!(matches!(ok, mlua::Value::Boolean(true)));
+        assert!(dir.is_dir());
+    }
+
+    #[test]
+    fn glob_finds_matching_files() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "fn main(){}").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "hello").unwrap();
+        let dir_str = tmp.path().to_string_lossy().to_string();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let glob: mlua::Function = tbl.get("glob").unwrap();
+
+        let opts = lua.create_table().unwrap();
+        opts.set("path", dir_str.as_str()).unwrap();
+
+        let (result, err): (Table, mlua::Value) =
+            smol::block_on(glob.call_async::<(Table, mlua::Value)>(("*.rs", opts))).unwrap();
+        assert!(matches!(err, mlua::Value::Nil));
+
+        let mut paths: Vec<String> = Vec::new();
+        for i in 1..=result.len().unwrap() {
+            paths.push(result.get::<String>(i).unwrap());
+        }
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("a.rs"));
+
+        let opts2 = lua.create_table().unwrap();
+        opts2.set("path", dir_str.as_str()).unwrap();
+        let (empty, err2): (Table, mlua::Value) =
+            smol::block_on(glob.call_async::<(Table, mlua::Value)>(("*.nope", opts2))).unwrap();
+        assert!(matches!(err2, mlua::Value::Nil));
+        assert_eq!(empty.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn glob_multiple_patterns_union() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "").unwrap();
+        std::fs::write(tmp.path().join("c.py"), "").unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let glob: mlua::Function = tbl.get("glob").unwrap();
+
+        let patterns = lua.create_table().unwrap();
+        patterns.set(1, "*.rs").unwrap();
+        patterns.set(2, "*.txt").unwrap();
+
+        let opts = lua.create_table().unwrap();
+        opts.set("path", tmp.path().to_str().unwrap()).unwrap();
+
+        let (result, err): (Table, mlua::Value) =
+            smol::block_on(glob.call_async::<(Table, mlua::Value)>((patterns, opts))).unwrap();
+        assert!(matches!(err, mlua::Value::Nil));
+
+        let mut paths: Vec<String> = Vec::new();
+        for i in 1..=result.len().unwrap() {
+            paths.push(result.get::<String>(i).unwrap());
+        }
+        paths.sort();
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].ends_with("a.rs"));
+        assert!(paths[1].ends_with("b.txt"));
+    }
+
+    #[test]
+    fn glob_limit_caps_results() {
+        let tmp = TempDir::new().unwrap();
+        for i in 0..5 {
+            std::fs::write(tmp.path().join(format!("f{i}.rs")), "").unwrap();
+        }
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let glob: mlua::Function = tbl.get("glob").unwrap();
+
+        let opts = lua.create_table().unwrap();
+        opts.set("path", tmp.path().to_str().unwrap()).unwrap();
+        opts.set("limit", 2).unwrap();
+
+        let (result, err): (Table, mlua::Value) =
+            smol::block_on(glob.call_async::<(Table, mlua::Value)>(("*.rs", opts))).unwrap();
+        assert!(matches!(err, mlua::Value::Nil));
+        assert_eq!(result.len().unwrap(), 2);
+    }
+
+    #[test]
+    fn glob_invalid_pattern_type_errors() {
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let glob: mlua::Function = tbl.get("glob").unwrap();
+
+        let result =
+            smol::block_on(glob.call_async::<Table>((mlua::Value::Integer(42), mlua::Nil)));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn glob_invalid_pattern_returns_nil_err() {
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let glob: mlua::Function = tbl.get("glob").unwrap();
+
+        let opts = lua.create_table().unwrap();
+        opts.set("path", "/tmp").unwrap();
+
+        let (val, err): (mlua::Value, mlua::Value) =
+            smol::block_on(glob.call_async::<(mlua::Value, mlua::Value)>(("[invalid", opts)))
+                .unwrap();
+        assert_eq!(val, mlua::Value::Nil);
+        assert!(
+            matches!(&err, mlua::Value::String(s) if s.to_str().unwrap().starts_with("glob: ")),
+            "should return nil, err with glob: prefix, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn dir_path_is_file_returns_nil_err() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("not_a_dir.txt");
+        std::fs::write(&file, "i am a file").unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let dir: mlua::Function = tbl.get("dir").unwrap();
+
+        let (val, err): (mlua::Value, mlua::Value) =
+            smol::block_on(dir.call_async::<(mlua::Value, mlua::Value)>(file.to_str().unwrap()))
+                .unwrap();
+        assert_eq!(val, mlua::Value::Nil);
+        assert!(
+            matches!(&err, mlua::Value::String(s) if s.to_str().unwrap().starts_with("dir: ")),
+            "should return nil, err with dir: prefix, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn glob_mtime_sort_newest_first() {
+        let tmp = TempDir::new().unwrap();
+        let old_path = tmp.path().join("old.rs");
+        let new_path = tmp.path().join("new.rs");
+        std::fs::write(&old_path, "").unwrap();
+        std::fs::write(&new_path, "").unwrap();
+
+        let old_time = SystemTime::now() - Duration::from_secs(60);
+        let new_time = SystemTime::now();
+        OpenOptions::new()
+            .write(true)
+            .open(&old_path)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&new_path)
+            .unwrap()
+            .set_modified(new_time)
+            .unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let glob: mlua::Function = tbl.get("glob").unwrap();
+
+        let opts = lua.create_table().unwrap();
+        opts.set("path", tmp.path().to_str().unwrap()).unwrap();
+        opts.set("sort", "mtime").unwrap();
+
+        let (result, err): (Table, mlua::Value) =
+            smol::block_on(glob.call_async::<(Table, mlua::Value)>(("*.rs", opts))).unwrap();
+        assert!(matches!(err, mlua::Value::Nil));
+
+        let first: String = result.get(1).unwrap();
+        let second: String = result.get(2).unwrap();
+        assert!(first.ends_with("new.rs"));
+        assert!(second.ends_with("old.rs"));
+    }
+
+    /// The fixture ignores through `.ignore` so the walker needs no git repo,
+    /// and hides a directory rather than a file because the glob patterns turn
+    /// into whitelist overrides that outrank a file-level ignore rule.
+    #[test_case(None, 0 ; "omitted_key_keeps_the_true_default")]
+    #[test_case(Some(false), 1 ; "false_includes_ignored_files")]
+    fn glob_gitignore_option(gitignore: Option<bool>, expected_hits: i64) {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".ignore"), "sub/\n").unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        std::fs::write(tmp.path().join("sub/ignored.log"), "").unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let glob: mlua::Function = tbl.get("glob").unwrap();
+
+        let opts = lua.create_table().unwrap();
+        opts.set("path", tmp.path().to_str().unwrap()).unwrap();
+        if let Some(gitignore) = gitignore {
+            opts.set("gitignore", gitignore).unwrap();
+        }
+
+        let (result, err): (Table, mlua::Value) =
+            smol::block_on(glob.call_async::<(Table, mlua::Value)>(("**/*.log", opts))).unwrap();
+        assert!(matches!(err, mlua::Value::Nil));
+        assert_eq!(result.len().unwrap(), expected_hits);
+    }
+
+    #[test]
+    fn glob_path_option_scopes_to_directory() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("inner.rs"), "").unwrap();
+        std::fs::write(tmp.path().join("outer.rs"), "").unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let glob: mlua::Function = tbl.get("glob").unwrap();
+
+        let opts = lua.create_table().unwrap();
+        opts.set("path", sub.to_str().unwrap()).unwrap();
+
+        let (result, err): (Table, mlua::Value) =
+            smol::block_on(glob.call_async::<(Table, mlua::Value)>(("*.rs", opts))).unwrap();
+        assert!(matches!(err, mlua::Value::Nil));
+
+        let mut paths: Vec<String> = Vec::new();
+        for i in 1..=result.len().unwrap() {
+            paths.push(result.get::<String>(i).unwrap());
+        }
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("inner.rs"));
+    }
+
+    fn grep_call(tbl: &Table, pattern: &str, opts: Table) -> (mlua::Value, mlua::Value) {
+        let grep: mlua::Function = tbl.get("grep").unwrap();
+        smol::block_on(grep.call_async((pattern, opts))).unwrap()
+    }
+
+    #[test]
+    fn grep_returns_matches_with_context_and_limit() {
+        let tmp = TempDir::new().unwrap();
+        let mut content = String::new();
+        for i in 1..=20 {
+            content.push_str(&format!("line_{i}\n"));
+        }
+        std::fs::write(tmp.path().join("data.txt"), &content).unwrap();
+        std::fs::write(tmp.path().join("other.txt"), "no hits here\n").unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+
+        // basic match: hits data.txt, skips other.txt
+        let opts = lua.create_table().unwrap();
+        opts.set("path", tmp.path().to_str().unwrap()).unwrap();
+        let (val, err) = grep_call(&tbl, "line_", opts);
+        assert_eq!(err, mlua::Value::Nil);
+        let result: Table = mlua::FromLua::from_lua(val, &lua).unwrap();
+        assert_eq!(result.len().unwrap(), 1);
+        let entry: Table = result.get(1).unwrap();
+        let path = entry.get::<String>("path").unwrap();
+        assert!(path.ends_with("data.txt"));
+        assert!(std::path::Path::new(&path).is_absolute());
+        let groups: Table = entry.get("groups").unwrap();
+        assert!(groups.len().unwrap() > 0);
+        let line: Table = groups
+            .get::<Table>(1)
+            .unwrap()
+            .get::<Table>("lines")
+            .unwrap()
+            .get(1)
+            .unwrap();
+        assert!(line.get::<bool>("is_match").unwrap());
+        assert!(line.get::<usize>("line_nr").unwrap() > 0);
+
+        // context lines
+        let opts = lua.create_table().unwrap();
+        opts.set("path", tmp.path().to_str().unwrap()).unwrap();
+        opts.set("context_before", 1).unwrap();
+        opts.set("context_after", 1).unwrap();
+        let (val, _) = grep_call(&tbl, "line_10", opts);
+        let result: Table = mlua::FromLua::from_lua(val, &lua).unwrap();
+        let lines: Table = result
+            .get::<Table>(1)
+            .unwrap()
+            .get::<Table>("groups")
+            .unwrap()
+            .get::<Table>(1)
+            .unwrap()
+            .get("lines")
+            .unwrap();
+        assert_eq!(lines.len().unwrap(), 3);
+        assert!(
+            !lines
+                .get::<Table>(1)
+                .unwrap()
+                .get::<bool>("is_match")
+                .unwrap()
+        );
+        assert!(
+            lines
+                .get::<Table>(2)
+                .unwrap()
+                .get::<bool>("is_match")
+                .unwrap()
+        );
+        assert!(
+            !lines
+                .get::<Table>(3)
+                .unwrap()
+                .get::<bool>("is_match")
+                .unwrap()
+        );
+
+        // limit caps group count
+        let opts = lua.create_table().unwrap();
+        opts.set("path", tmp.path().to_str().unwrap()).unwrap();
+        opts.set("limit", 5).unwrap();
+        let (val, _) = grep_call(&tbl, "line_", opts);
+        let result: Table = mlua::FromLua::from_lua(val, &lua).unwrap();
+        let groups: Table = result.get::<Table>(1).unwrap().get("groups").unwrap();
+        assert_eq!(groups.len().unwrap(), 5);
+
+        // no match returns empty table, not error
+        let opts = lua.create_table().unwrap();
+        opts.set("path", tmp.path().to_str().unwrap()).unwrap();
+        let (val, err) = grep_call(&tbl, "zzz_no_match", opts);
+        assert_eq!(err, mlua::Value::Nil);
+        let result: Table = mlua::FromLua::from_lua(val, &lua).unwrap();
+        assert_eq!(result.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn grep_invalid_regex_returns_nil_err() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("x.txt"), "hello\n").unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+
+        let opts = lua.create_table().unwrap();
+        opts.set("path", tmp.path().to_str().unwrap()).unwrap();
+        let (val, err) = grep_call(&tbl, "[invalid", opts);
+        assert_eq!(val, mlua::Value::Nil);
+        assert!(matches!(err, mlua::Value::String(_)));
+    }
+}

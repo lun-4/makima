@@ -1,0 +1,29 @@
+[package]
+name = "makima-docgen"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "makima-docgen"
+path = "src/main.rs"
+
+[dependencies]
+color-eyre = { workspace = true }
+makima-agent = { workspace = true }
+makima-config = { workspace = true }
+makima-commands = { workspace = true }
+makima-lua = { workspace = true }
+makima-providers = { workspace = true }
+makima-ui = { workspace = true }
+regex = { workspace = true }
+serde_json = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-lua = { workspace = true }
+
+[dev-dependencies]
+test-case = { workspace = true }
+tempfile = { workspace = true }

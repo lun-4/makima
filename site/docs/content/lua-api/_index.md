@@ -9,7 +9,7 @@ group = "Reference"
 
 Maki plugins are plain Lua files. Everything a plugin can touch lives under
 one global table: `maki`. This reference documents every module, function,
-and method. It is generated straight from the source code by `maki-docgen`.
+and method. It is generated straight from the source code by `makima-docgen`.
 For where plugin files live and how to load them, read the
 [Plugins guide](/docs/plugins/) first.
 
@@ -1137,8 +1137,8 @@ maki.api.register_session_option({spec})
 Registers one selectable session option owned by the loading plugin.
 
 The `id` must use the plugin namespace, such as `bash.auto_mode`. Global
-`init.lua` uses `maki_init.global.*`, and project `init.lua` uses
-`maki_init.project.*`. Core owns
+`init.lua` uses `makima_init.global.*`, and project `init.lua` uses
+`makima_init.project.*`. Core owns
 unqualified ids. The definition supplies `name`, `description`, `category`,
 an ordered non-empty `values` list, and `initial_value`. Set `persistent` to
 retain each session's value across reloads.

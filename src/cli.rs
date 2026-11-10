@@ -4,8 +4,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 
-use maki_agent::tools::{all_builtin_tool_names, is_builtin_tool};
-use maki_config::project::TrustMode;
+use makima_agent::tools::{all_builtin_tool_names, is_builtin_tool};
+use makima_config::project::TrustMode;
 
 use crate::print::OutputFormat;
 
@@ -373,6 +373,11 @@ mod tests {
     const PROMPT: &str = "hello";
     const PROMPT_EQUALS_ARG: &str = "--prompt=hello";
     const MODEL_HELP: &str = "Defaults to the saved, configured, or auto-detected model";
+
+    #[test]
+    fn cli_name_is_makima() {
+        assert_eq!(Cli::command().get_name(), "makima");
+    }
 
     #[test_case("Read", "read")]
     #[test_case("Bash", "bash")]

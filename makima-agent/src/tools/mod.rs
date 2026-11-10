@@ -1,0 +1,1619 @@
+//! Shared plumbing for tools. The registry itself lives in `registry.rs`; this file
+//! holds the helpers every tool leans on: `ToolFilter` to enable/disable per caller,
+//! `Deadline` so a parent tool can cap a child's timeout, the walker that skips `.git`,
+//! and `sanitize_tool_input` which patches up small JSON mistakes models make (stray
+//! quotes, camelCase keys, extra wrappers). Plan mode rejects writes to
+//! anything but the plan file before they reach the tool.
+
+pub mod file_locks;
+mod file_tracker;
+pub mod grep;
+pub mod hook;
+pub mod interpreter_bridge;
+pub mod offload;
+pub mod registry;
+pub mod schema;
+
+pub use file_locks::FileWriteLocks;
+pub use file_tracker::{FileReadTracker, STALE_READ_MSG};
+pub use hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
+pub use registry::{
+    BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes,
+    RegisteredTool, RegistryError, Tool, ToolAudience, ToolExecResult, ToolInvocation,
+    ToolRegistry, ToolSource,
+};
+
+use std::collections::HashMap;
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant, SystemTime};
+
+use humantime::format_duration;
+use ignore::WalkBuilder;
+use serde_json::Value;
+
+use crate::agent::LoadedInstructions;
+use crate::cancel::{CancelMap, CancelToken};
+use crate::mcp::{
+    McpPublishedBinding, McpSession, McpToolBinding, TOOL_SEARCH_TOOL_NAME, wire_tool_name,
+};
+use crate::permissions::PermissionManager;
+use crate::{
+    AgentConfig, AgentId, AgentMode, CurrentManagedTurn, EventSender, RunLedger, SharedBuf,
+};
+use makima_config::{ModelPolicy, ToolOutputLines};
+use makima_providers::RequestOptions;
+use makima_providers::provider::Provider;
+use makima_providers::{Invocation, Model, ModelInfo, ProviderRegistry, RequestDelivery};
+use makima_storage::id::SessionRef;
+
+pub struct DescriptionContext<'a> {
+    pub filter: &'a ToolFilter,
+    pub audience: ToolAudience,
+    pub workflow: bool,
+    pub mcp: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub enum ToolFilter {
+    #[default]
+    All,
+    Only(Vec<String>),
+    AllExcept(Vec<String>),
+}
+
+impl ToolFilter {
+    pub fn matches(&self, name: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(allowed) => allowed.iter().any(|n| n == name),
+            Self::AllExcept(blocked) => !blocked.iter().any(|n| n == name),
+        }
+    }
+
+    pub fn excluding(self, names: &[&str]) -> Self {
+        if names.is_empty() {
+            return self;
+        }
+        match self {
+            Self::All => Self::AllExcept(names.iter().map(|s| (*s).to_owned()).collect()),
+            Self::Only(allowed) => Self::Only(
+                allowed
+                    .into_iter()
+                    .filter(|n| !names.iter().any(|x| *x == n))
+                    .collect(),
+            ),
+            Self::AllExcept(mut blocked) => {
+                for &n in names {
+                    if !blocked.iter().any(|b| b == n) {
+                        blocked.push(n.to_owned());
+                    }
+                }
+                Self::AllExcept(blocked)
+            }
+        }
+    }
+
+    pub fn from_config(config: &AgentConfig, model: &Model, extra_exclude: &[&str]) -> Self {
+        let base = if config.allowed_tools.is_empty() {
+            Self::All
+        } else {
+            Self::Only(
+                config
+                    .allowed_tools
+                    .iter()
+                    .filter(|s| is_builtin_tool(s))
+                    .cloned()
+                    .collect(),
+            )
+        };
+        let mut exclude: Vec<&str> = extra_exclude.to_vec();
+        exclude.extend(capability_exclusions(model));
+        exclude.extend(config.disabled_tools.iter().map(|s| s.as_str()));
+        base.excluding(&exclude)
+    }
+}
+
+/// One gate for every definitions builder (main loop, headless, Lua): a model
+/// without vision never learns `view_image` exists.
+pub fn capability_exclusions(model: &Model) -> &'static [&'static str] {
+    if model.supports_vision() {
+        &[]
+    } else {
+        &[VIEW_IMAGE_TOOL_NAME]
+    }
+}
+
+/// A tool is enabled unless named in `disabled_tools` (config, or the raw
+/// list a Lua caller holds, e.g. `maki.api.get_tools`).
+pub fn is_tool_enabled(disabled_tools: &[String], name: &str) -> bool {
+    !disabled_tools.iter().any(|s| s == name)
+}
+
+pub(crate) const TOOL_NAME_FIELD: &str = "name";
+
+/// The tool array one run sends to the model, paired with the filter that
+/// produced it. A run context carries the pair, never a loose array, so the
+/// names dispatch offers in-process (`tool_dispatch::callable`, and through it
+/// the `code_execution` sandbox) cannot drift from what the model was shown.
+#[derive(Debug, Clone)]
+pub struct RequestTools {
+    definitions: Arc<Value>,
+    filter: Arc<ToolFilter>,
+}
+
+impl Default for RequestTools {
+    fn default() -> Self {
+        Self {
+            definitions: Arc::new(Value::Array(Vec::new())),
+            filter: Arc::default(),
+        }
+    }
+}
+
+impl RequestTools {
+    /// The one place a run's tool array is built. Host exclusions (a client
+    /// that cannot service `question`) go through here and nowhere else, so
+    /// the array and the filter always agree on them.
+    pub fn build(
+        registry: &ToolRegistry,
+        vars: &crate::template::Vars,
+        model: &Model,
+        config: &AgentConfig,
+        excluded: &[&str],
+        workflow: bool,
+        mcp: bool,
+    ) -> Self {
+        let filter = ToolFilter::from_config(config, model, excluded);
+        let ctx = DescriptionContext {
+            filter: &filter,
+            audience: ToolAudience::MAIN,
+            workflow,
+            mcp,
+        };
+        Self {
+            definitions: Arc::new(registry.definitions(vars, &ctx, model.supports_tool_examples())),
+            filter: Arc::new(filter),
+        }
+    }
+
+    /// For an array the host built itself, like a Lua subagent publishing what
+    /// its caller picked. The filter is read back off that array, so the names
+    /// the model was shown and the names a script may reach are one set, and
+    /// the caller's `only`/`except` never has to be passed twice. MCP names are
+    /// never matched against this filter and stay reachable.
+    ///
+    /// An array nobody can read a name out of says nothing about intent, so it
+    /// falls back to the config's filter instead of an `Only` of nothing that
+    /// would leave the session unable to do anything. An array that is
+    /// genuinely empty is an answer, and is kept as one.
+    pub fn assembled(definitions: Value, config: &AgentConfig, model: &Model) -> Self {
+        let published: Option<Vec<String>> = definitions.as_array().and_then(|defs| {
+            let names: Vec<String> = defs
+                .iter()
+                .filter_map(|def| def[TOOL_NAME_FIELD].as_str().map(str::to_owned))
+                .collect();
+            (defs.is_empty() || !names.is_empty()).then_some(names)
+        });
+        let filter = published.map_or_else(
+            || ToolFilter::from_config(config, model, &[]),
+            ToolFilter::Only,
+        );
+        Self {
+            definitions: Arc::new(definitions),
+            filter: Arc::new(filter),
+        }
+    }
+
+    pub fn definitions(&self) -> &Value {
+        &self.definitions
+    }
+
+    pub fn filter(&self) -> &Arc<ToolFilter> {
+        &self.filter
+    }
+}
+
+pub const BASH_TOOL_NAME: &str = "bash";
+pub const CODE_EXECUTION_TOOL_NAME: &str = "code_execution";
+pub const EDIT_TOOL_NAME: &str = "edit";
+pub const GLOB_TOOL_NAME: &str = "glob";
+pub const GREP_TOOL_NAME: &str = "grep";
+pub const MULTIEDIT_TOOL_NAME: &str = "multiedit";
+pub const QUESTION_TOOL_NAME: &str = "question";
+pub const READ_TOOL_NAME: &str = "read";
+pub const TASK_SPAWN_TOOL_NAME: &str = "task_spawn";
+pub const TODOWRITE_TOOL_NAME: &str = "todo_write";
+pub const VIEW_IMAGE_TOOL_NAME: &str = "view_image";
+pub const WRITE_TOOL_NAME: &str = "write";
+
+pub const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
+pub(crate) const DEADLINE_EXCEEDED: &str = "timeout exceeded";
+/// How long a timed-out tool's output hook and offload write may still run.
+/// Both cross threads, so a loaded machine needs seconds here; a shorter window
+/// throws away partial output a slow scheduler was about to deliver.
+pub const TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(5);
+/// Provider and model id of the placeholder model a context without a model
+/// carries.
+const NO_MODEL: &str = "none";
+
+#[derive(Clone, Copy, Debug, Default)]
+pub enum Deadline {
+    #[default]
+    None,
+    At(Instant),
+}
+
+impl Deadline {
+    pub fn after(duration: Duration) -> Self {
+        Self::At(Instant::now() + duration)
+    }
+
+    pub fn min(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::None, deadline) | (deadline, Self::None) => deadline,
+            (Self::At(left), Self::At(right)) => Self::At(left.min(right)),
+        }
+    }
+
+    pub fn check(self) -> Result<(), String> {
+        match self {
+            Self::None => Ok(()),
+            Self::At(instant) if instant.saturating_duration_since(Instant::now()).is_zero() => {
+                Err(DEADLINE_EXCEEDED.into())
+            }
+            Self::At(_) => Ok(()),
+        }
+    }
+
+    pub fn cap_timeout(self, timeout_secs: u64) -> Result<u64, String> {
+        match self {
+            Self::None => Ok(timeout_secs),
+            Self::At(instant) => {
+                let remaining = instant.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    Err(DEADLINE_EXCEEDED.into())
+                } else {
+                    Ok(timeout_secs.min(remaining.as_secs().max(1)))
+                }
+            }
+        }
+    }
+}
+
+pub fn timeout_annotation(secs: u64) -> String {
+    let d = Duration::from_secs(secs);
+    let formatted: String = format_duration(d)
+        .to_string()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    format!("{formatted} timeout")
+}
+
+/// Who made a tool call. A resumed session rebuilds its state from the `ToolUse`
+/// blocks in history, and those hold the model's own calls only, so a nested
+/// call must never change what the next request carries.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CallOrigin {
+    /// Emitted by the model and recorded in history under its own id.
+    Model,
+    /// Made on the model's behalf and invisible to history: batch children,
+    /// `code_execution` scripts, Lua `call_tool`.
+    Nested,
+}
+
+impl CallOrigin {
+    pub fn is_model(self) -> bool {
+        matches!(self, Self::Model)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Nested => "nested",
+        }
+    }
+}
+
+pub type LocalToolResult = BoxFuture<'static, Result<String, String>>;
+pub type LocalToolFn = Arc<dyn Fn(Value, ToolContext) -> LocalToolResult + Send + Sync>;
+
+/// A tool the session's host supplies: an ACP client tool, a subagent's
+/// `structured_output`. Dispatch puts it ahead of the registry, so it carries
+/// its own audience: a host tool must not reach a sandbox by wearing the name
+/// of a registry tool that may.
+#[derive(Clone)]
+pub struct LocalTool {
+    pub handler: LocalToolFn,
+    pub audience: ToolAudience,
+}
+
+pub type LocalTools = Arc<HashMap<String, LocalTool>>;
+
+#[derive(Clone)]
+pub enum TurnToolRoute {
+    Local(LocalTool),
+    Native(RegisteredTool),
+    Mcp(McpToolBinding),
+    ToolSearch,
+}
+
+#[derive(Clone, Default)]
+pub struct TurnToolBindings {
+    routes: HashMap<String, TurnToolRoute>,
+    mcp_published: Option<McpPublishedBinding>,
+}
+
+impl TurnToolBindings {
+    pub fn capture(
+        registry: &ToolRegistry,
+        local_tools: &LocalTools,
+        mcp: Option<&McpSession>,
+    ) -> Self {
+        let mut routes = HashMap::new();
+        let mcp_published = mcp.map(McpSession::published_binding);
+        if let Some((mcp, published)) = mcp.zip(mcp_published.as_ref()) {
+            routes.insert(TOOL_SEARCH_TOOL_NAME.to_owned(), TurnToolRoute::ToolSearch);
+            for binding in mcp.tool_bindings(published) {
+                let qualified = binding.qualified_name().to_string();
+                routes.insert(
+                    wire_tool_name(&qualified),
+                    TurnToolRoute::Mcp(binding.clone()),
+                );
+                routes.insert(qualified, TurnToolRoute::Mcp(binding));
+            }
+        }
+        for entry in registry.iter().iter() {
+            routes.insert(
+                entry.name().to_owned(),
+                TurnToolRoute::Native(entry.clone()),
+            );
+        }
+        for (name, tool) in local_tools.iter() {
+            routes.insert(name.clone(), TurnToolRoute::Local(tool.clone()));
+        }
+        Self {
+            routes,
+            mcp_published,
+        }
+    }
+
+    pub fn extend_mcp_tools(&self, mcp: &McpSession, tools: &mut Value) {
+        if let Some(binding) = &self.mcp_published {
+            mcp.extend_bound_tools(binding, tools);
+        }
+    }
+
+    pub fn search_mcp_tools(
+        &self,
+        mcp: &McpSession,
+        query: &str,
+        origin: CallOrigin,
+    ) -> Result<String, String> {
+        let binding = self
+            .mcp_published
+            .as_ref()
+            .ok_or("MCP unavailable this turn")?;
+        mcp.search_bound_tools(binding, query, origin)
+    }
+
+    pub fn get(&self, name: &str) -> Option<&TurnToolRoute> {
+        self.routes
+            .get(name.strip_prefix("functions.").unwrap_or(name))
+    }
+
+    pub fn is_current(
+        &self,
+        name: &str,
+        registry: &ToolRegistry,
+        local_tools: &LocalTools,
+        mcp: Option<&McpSession>,
+    ) -> bool {
+        let name = name.strip_prefix("functions.").unwrap_or(name);
+        match self.routes.get(name) {
+            Some(TurnToolRoute::Native(entry)) => registry.is_current(entry),
+            Some(TurnToolRoute::Local(tool)) => local_tools
+                .get(name)
+                .is_some_and(|current| Arc::ptr_eq(&current.handler, &tool.handler)),
+            Some(TurnToolRoute::Mcp(binding)) => {
+                mcp.is_some_and(|mcp| mcp.binding_is_current(binding))
+            }
+            Some(TurnToolRoute::ToolSearch) => mcp.is_some(),
+            None => false,
+        }
+    }
+}
+
+/// Coerces a closure into a [`LocalTool`]; the bound gives the boxed
+/// future a coercion target that `Arc::new` alone does not.
+pub fn local_tool<F>(audience: ToolAudience, f: F) -> LocalTool
+where
+    F: Fn(Value, ToolContext) -> LocalToolResult + Send + Sync + 'static,
+{
+    LocalTool {
+        handler: Arc::new(f),
+        audience,
+    }
+}
+
+/// How the `question` tool gathers user input. The interactive maki TUI
+/// renders its own form; an ACP host renders an elicitation form; anything
+/// else must fail gracefully instead of blocking on a UI that is not there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuestionMode {
+    #[default]
+    Tui,
+    Elicitation,
+    Headless,
+}
+
+pub struct OutputFinalization {
+    pub limits: Option<offload::OutputLimitOptions>,
+    pub deadline: Option<Instant>,
+    pub terminal_cleanup: bool,
+}
+
+#[derive(Clone)]
+pub struct ToolContext {
+    pub execution_agent_id: Option<AgentId>,
+    pub provider: Arc<dyn Provider>,
+    pub model: Arc<Model>,
+    pub event_tx: EventSender,
+    pub mode: AgentMode,
+    pub mode_def: Option<Arc<crate::ModeDef>>,
+    pub question_mode: QuestionMode,
+    /// The session this run belongs to. A subagent inherits its parent's,
+    /// so a tool can always tell which conversation it is serving. `None`
+    /// when there is no session at all, like the `maki index` one-shot.
+    pub session_id: Option<SessionRef>,
+    pub cwd: PathBuf,
+    pub tool_use_id: Option<String>,
+    pub user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
+    pub loaded_instructions: LoadedInstructions,
+    pub cancel: CancelToken,
+    pub mcp: Option<McpSession>,
+    pub deadline: Deadline,
+    pub config: AgentConfig,
+    pub tool_filter: Arc<ToolFilter>,
+    /// Admitted tool definitions and filter, retained for exact child inheritance.
+    pub request_tools: Option<RequestTools>,
+    pub tool_output_lines: ToolOutputLines,
+    pub permissions: Arc<PermissionManager>,
+    pub timeouts: makima_providers::Timeouts,
+    pub file_tracker: Arc<FileReadTracker>,
+    pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
+    pub modes: Arc<crate::ModeRegistry>,
+    pub opts: RequestOptions,
+    pub subagent_cancels: Arc<CancelMap<String>>,
+    pub ledger: Arc<RunLedger>,
+    pub registry: Arc<ToolRegistry>,
+    pub workflow: bool,
+    pub audience: ToolAudience,
+    pub local_tools: LocalTools,
+    pub local_tool_capture: Option<Arc<Mutex<Option<Value>>>>,
+    pub turn_bindings: Arc<TurnToolBindings>,
+    /// Streams a dispatched child's live bufs and annotations back to the
+    /// caller (`maki.agent.call_tool` with `on_live_buf`/`on_annotation`).
+    /// Never inherited: `to_tool_context` clears it, and each caller sets
+    /// it for its own call only.
+    pub live_sink: Option<flume::Sender<ToolLive>>,
+    pub model_policy: Arc<ModelPolicy>,
+    pub providers: Arc<ProviderRegistry>,
+    /// Shared same-process per-path mutation locks for every context cloned
+    /// from this one (batch siblings, subagents, recursive `call_tool`). See
+    /// [`FileWriteLocks`].
+    pub file_write_locks: Arc<FileWriteLocks>,
+    /// Where output past the limits is saved, shared by every agent in the
+    /// session. `None` without a session, and tools then cut output instead.
+    pub offload: Option<Arc<offload::OffloadStore>>,
+    pub pending_output_limits: Option<Arc<Mutex<Option<OutputFinalization>>>>,
+    /// Logical owner chain of the dispatch that produced this context: the
+    /// tokens of every ancestor dispatch, root first. Empty for root agent
+    /// contexts; [`crate::agent::tool_dispatch::run`] appends its own token
+    /// before execution so recursive same-path calls are detected as reentry
+    /// while sibling dispatches stay independent. Serves as the reentry
+    /// check input only and is never used for filesystem access.
+    pub(crate) write_lock_chain: Arc<Vec<u64>>,
+    pub managed_turn: Option<CurrentManagedTurn>,
+}
+
+impl ToolContext {
+    /// Overlays an agent's committed configuration onto this template.
+    pub fn apply_effective_config(&mut self, config: &crate::EffectiveAgentConfig) {
+        self.cwd = config.context.cwd().to_path_buf();
+        self.model = Arc::new(config.settings.model.clone());
+        self.provider = Arc::clone(&config.settings.provider);
+        self.opts = RequestOptions {
+            thinking: config.settings.thinking,
+            fast: config.settings.fast,
+        };
+        self.workflow = config.settings.workflow;
+        self.mode = config.mode.clone();
+        self.mode_def = config.mode_def.clone().map(Arc::new);
+    }
+
+    pub fn defer_output_limits(&self, mut opts: offload::OutputLimitOptions) -> bool {
+        let Some(pending) = &self.pending_output_limits else {
+            return false;
+        };
+        opts.deadline = match (opts.deadline, self.deadline) {
+            (Some(current), Deadline::At(deadline)) => Some(current.min(deadline)),
+            (None, Deadline::At(deadline)) => Some(deadline),
+            (current, Deadline::None) => current,
+        };
+        let mut pending = pending.lock().unwrap_or_else(|error| error.into_inner());
+        let metadata = pending.get_or_insert_with(|| OutputFinalization {
+            limits: None,
+            deadline: opts.deadline,
+            terminal_cleanup: false,
+        });
+        metadata.limits = Some(opts);
+        true
+    }
+
+    pub fn resolve_turn_route(&self, name: &str) -> Option<&TurnToolRoute> {
+        self.turn_bindings.get(name).filter(|_| {
+            self.turn_bindings.is_current(
+                name,
+                &self.registry,
+                &self.local_tools,
+                self.mcp.as_ref(),
+            )
+        })
+    }
+
+    /// Write-restriction pinned for this turn; the dynamic plan path wins.
+    pub fn restrict_write_to(&self) -> Option<PathBuf> {
+        match &self.mode {
+            AgentMode::Plan(path) => Some(path.clone()),
+            AgentMode::Build | AgentMode::Custom(_) => self
+                .mode_def
+                .as_ref()
+                .and_then(|def| def.restrict_write_to.clone()),
+        }
+    }
+
+    pub fn resolve_path(&self, path: &str) -> Result<String, String> {
+        resolve_path_from(path, &self.cwd)
+    }
+
+    pub fn resolve_search_path(&self, path: Option<&str>) -> Result<String, String> {
+        match path {
+            Some(path) => self.resolve_path(path),
+            None => Ok(self.cwd.to_string_lossy().into_owned()),
+        }
+    }
+}
+
+/// Live progress of a dispatched child tool, streamed while it runs.
+pub enum ToolLive {
+    Buf(Arc<SharedBuf>),
+    Annotation(String),
+    Usage(String),
+}
+
+pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
+    let cwd = env::current_dir().map_err(|error| format!("cwd error: {error}"))?;
+    resolve_path_from(path, &cwd)
+}
+
+fn resolve_path_from(path: &str, cwd: &Path) -> Result<String, String> {
+    let expanded = if let Some(rest) = path.strip_prefix("~/") {
+        let home = HOME.as_deref().ok_or("cannot expand ~: HOME not set")?;
+        home.join(rest).to_string_lossy().into_owned()
+    } else if path == "~" {
+        let home = HOME.as_deref().ok_or("cannot expand ~: HOME not set")?;
+        home.to_string_lossy().into_owned()
+    } else {
+        path.to_string()
+    };
+
+    if Path::new(&expanded).is_relative() {
+        Ok(cwd.join(&expanded).to_string_lossy().into_owned())
+    } else {
+        Ok(expanded)
+    }
+}
+
+pub fn resolve_search_path(path: Option<&str>) -> Result<String, String> {
+    match path {
+        Some(p) => resolve_path(p),
+        None => env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .map_err(|e| format!("cwd error: {e}")),
+    }
+}
+
+static CWD: LazyLock<Option<PathBuf>> = LazyLock::new(|| env::current_dir().ok());
+static HOME: LazyLock<Option<PathBuf>> = LazyLock::new(makima_storage::paths::home);
+
+pub(crate) fn relative_path(path: &str) -> String {
+    let p = Path::new(path);
+    if let Some(cwd) = CWD.as_deref()
+        && let Ok(rel) = p.strip_prefix(cwd)
+    {
+        return format_rel("", ".", rel);
+    }
+    if let Some(home) = HOME.as_deref()
+        && let Ok(rel) = p.strip_prefix(home)
+    {
+        return format_rel("~/", "~", rel);
+    }
+    path.to_string()
+}
+
+fn format_rel(prefix: &str, fallback: &str, rel: &Path) -> String {
+    let s = rel.to_string_lossy();
+    if s.is_empty() {
+        fallback.into()
+    } else {
+        format!("{prefix}{s}")
+    }
+}
+
+/// Convenience wrapper that always respects gitignore.
+pub fn walk_builder(root: &str, patterns: &[&str]) -> Result<WalkBuilder, String> {
+    walk_builder_opts(root, patterns, true)
+}
+
+/// `.git` is always excluded, even when `gitignore` is false.
+pub fn walk_builder_opts(
+    root: &str,
+    patterns: &[&str],
+    gitignore: bool,
+) -> Result<WalkBuilder, String> {
+    let mut ob = ignore::overrides::OverrideBuilder::new(root);
+
+    for p in patterns {
+        ob.add(p)
+            .map_err(|e| format!("invalid glob pattern: {e}"))?;
+    }
+
+    let overrides = ob
+        .build()
+        .map_err(|e| format!("invalid glob pattern: {e}"))?;
+
+    let mut wb = WalkBuilder::new(root);
+    wb.hidden(false)
+        .require_git(false)
+        .filter_entry(|entry| entry.file_name() != ".git");
+    if !patterns.is_empty() {
+        wb.overrides(overrides);
+    }
+    if !gitignore {
+        wb.ignore(false)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false);
+    }
+    Ok(wb)
+}
+
+pub fn mtime(path: &Path) -> SystemTime {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+pub const LINE_TRUNCATED_PREFIX: &str = "[line truncated";
+pub const LEGACY_LINE_TRUNCATED_MARKER: &str = "[line truncated]";
+pub const FILE_TRUNCATED_MARKER: &str = "[file truncated]";
+
+pub fn format_line_truncated_marker(hidden_bytes: usize) -> String {
+    format!("{LINE_TRUNCATED_PREFIX}, +{hidden_bytes} bytes]")
+}
+
+pub fn truncate_line(line: &str, max_bytes: usize) -> String {
+    if line.len() <= max_bytes {
+        return line.to_owned();
+    }
+    // The hidden count is at most the whole line, so its marker is the widest
+    // one this cut can need.
+    let reserve = format_line_truncated_marker(line.len()).len();
+    let boundary = line.floor_char_boundary(max_bytes.saturating_sub(reserve));
+    format!(
+        "{}{}",
+        &line[..boundary],
+        format_line_truncated_marker(line.len() - boundary)
+    )
+}
+
+/// Which tool output a line-ending truncation marker came from, so a
+/// mutation guard can reject pasted markers with the right recovery advice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TruncationMarker {
+    ReadLine,
+    PreviewCut,
+}
+
+impl TruncationMarker {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadLine => "read",
+            Self::PreviewCut => "preview",
+        }
+    }
+}
+
+pub fn trailing_truncation_marker(line: &str) -> Option<TruncationMarker> {
+    let line = line.trim_end();
+    if line.ends_with(LEGACY_LINE_TRUNCATED_MARKER) {
+        return Some(TruncationMarker::ReadLine);
+    }
+    let counted = line.strip_suffix(" bytes]")?;
+    let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if let Some((head, hidden)) = counted.rsplit_once(", +")
+        && head.ends_with(LINE_TRUNCATED_PREFIX)
+        && all_digits(hidden)
+    {
+        return Some(TruncationMarker::ReadLine);
+    }
+    let (_, cut) = counted.rsplit_once(offload::LINE_CUT_PREFIX)?;
+    let (end, counts) = cut.split_once(' ')?;
+    let (kept, of) = counts.split_once(" of ")?;
+    (matches!(end, "first" | "last") && all_digits(kept) && all_digits(of))
+        .then_some(TruncationMarker::PreviewCut)
+}
+
+/// For strings that stored rules match against, such as MCP permission
+/// scopes: a fixed suffix keeps them stable across inputs of any length.
+pub fn truncate_scope(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let boundary =
+        text.floor_char_boundary(max_bytes.saturating_sub(LEGACY_LINE_TRUNCATED_MARKER.len()));
+    format!("{}{}", &text[..boundary], LEGACY_LINE_TRUNCATED_MARKER)
+}
+
+pub fn truncate_file(
+    text: &str,
+    max_lines: usize,
+    max_bytes: usize,
+    remaining_lines: Option<usize>,
+) -> String {
+    let mut result = String::new();
+    let mut truncated = remaining_lines.is_some_and(|lines| lines > 0);
+    let mut emitted = 0;
+    for (index, line) in text.split('\n').enumerate() {
+        if index >= max_lines
+            || result.len() + line.len() + usize::from(!result.is_empty()) > max_bytes
+        {
+            truncated = true;
+            break;
+        }
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str(line);
+        emitted += 1;
+    }
+    if truncated {
+        if !result.is_empty() {
+            result.push_str("\n\n");
+        }
+        let cut_here = text.split('\n').count() - emitted;
+        result.push_str(&format_file_truncated_marker(
+            remaining_lines.map(|lines| lines + cut_here),
+        ));
+    }
+    result
+}
+
+pub fn format_file_truncated_marker(remaining_lines: Option<usize>) -> String {
+    match remaining_lines {
+        Some(lines) => format!("[file truncated, {lines} lines remaining]"),
+        None => FILE_TRUNCATED_MARKER.to_owned(),
+    }
+}
+
+pub fn truncate_output(text: String, max_lines: usize, max_bytes: usize) -> String {
+    truncate_file(&text, max_lines, max_bytes, None)
+}
+
+pub fn is_builtin_tool(name: &str) -> bool {
+    makima_config::DEFAULT_BUILTINS.contains(&name) || makima_config::EDIT_SUB_TOOLS.contains(&name)
+}
+
+pub fn all_builtin_tool_names() -> Vec<&'static str> {
+    makima_config::DEFAULT_BUILTINS
+        .iter()
+        .chain(makima_config::EDIT_SUB_TOOLS.iter())
+        .copied()
+        .collect()
+}
+
+use makima_providers::{Message, ProviderEvent, StreamResponse};
+
+pub(crate) struct NullProvider;
+
+impl Provider for NullProvider {
+    fn stream_message<'a>(
+        &'a self,
+        _: &'a Model,
+        _: &'a [Message],
+        _: &'a str,
+        _: &'a Value,
+        _: &'a flume::Sender<ProviderEvent>,
+        _: RequestOptions,
+        _: Option<&'a SessionRef>,
+        _invocation: &'a Invocation,
+        _delivery: RequestDelivery,
+    ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
+        Box::pin(async { unimplemented!() })
+    }
+}
+
+pub fn interpreter_ctx(
+    mode: &AgentMode,
+    event_tx: &EventSender,
+    cancel: CancelToken,
+    permissions: Arc<PermissionManager>,
+    file_tracker: Arc<FileReadTracker>,
+    registry: Arc<ToolRegistry>,
+    cwd: PathBuf,
+) -> ToolContext {
+    static PROVIDER: LazyLock<Arc<dyn Provider>> = LazyLock::new(|| Arc::new(NullProvider));
+    static MODEL: LazyLock<Arc<Model>> = LazyLock::new(|| {
+        Arc::new(Model::from_info(
+            NO_MODEL,
+            &ModelInfo::id_only(NO_MODEL.into()),
+        ))
+    });
+    let modes = Arc::new(crate::ModeRegistry::builtin());
+    ToolContext {
+        execution_agent_id: None,
+        provider: Arc::clone(&PROVIDER),
+        model: Arc::clone(&MODEL),
+        event_tx: event_tx.clone(),
+        mode: mode.clone(),
+        mode_def: match mode {
+            AgentMode::Custom(id) => modes.get(id).map(Arc::new),
+            _ => Some(Arc::new(modes.current(mode))),
+        },
+        question_mode: QuestionMode::Headless,
+        session_id: None,
+        cwd,
+        tool_use_id: None,
+        user_response_rx: None,
+        loaded_instructions: LoadedInstructions::new(),
+        cancel,
+        mcp: None,
+        deadline: Deadline::None,
+        config: AgentConfig::default(),
+        tool_filter: Arc::default(),
+        request_tools: None,
+        tool_output_lines: ToolOutputLines::default(),
+        permissions,
+        timeouts: makima_providers::Timeouts::default(),
+        file_tracker,
+        prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
+        modes,
+        opts: RequestOptions::default(),
+        subagent_cancels: Arc::new(CancelMap::new()),
+        ledger: Arc::new(RunLedger::default()),
+        turn_bindings: Arc::new(TurnToolBindings::capture(
+            &registry,
+            &LocalTools::default(),
+            None,
+        )),
+        registry,
+        workflow: false,
+        audience: ToolAudience::MAIN,
+        local_tools: LocalTools::default(),
+        local_tool_capture: None,
+        live_sink: None,
+        model_policy: Arc::new(ModelPolicy::default()),
+        providers: Arc::default(),
+        file_write_locks: Arc::new(FileWriteLocks::new()),
+        offload: None,
+        pending_output_limits: None,
+        write_lock_chain: Arc::new(Vec::new()),
+        managed_turn: None,
+    }
+}
+
+/// Minimal ToolContext for CLI one-shot tool execution (e.g. `maki index`).
+/// Allows everything, sends events to a dummy channel, uses no model.
+pub fn cli_tool_ctx(cwd: PathBuf) -> ToolContext {
+    let (tx, _rx) = flume::unbounded::<crate::Envelope>();
+    let event_tx = crate::EventSender::new(tx);
+    let project_config = makima_config::ProjectConfig::discover(&cwd);
+    interpreter_ctx(
+        &AgentMode::Build,
+        &event_tx,
+        CancelToken::none(),
+        Arc::new(PermissionManager::new(
+            makima_config::PermissionsConfig {
+                default: makima_config::DefaultEffect::Allow,
+                rules: vec![],
+                ..Default::default()
+            },
+            cwd.clone(),
+            project_config,
+            Arc::default(),
+        )),
+        Arc::new(FileReadTracker::new()),
+        Arc::clone(ToolRegistry::global_arc()),
+        cwd,
+    )
+}
+
+pub mod test_support {
+    use std::borrow::Cow;
+
+    use crate::{Envelope, EventSender, ToolOutput};
+
+    use super::*;
+
+    pub const GUARDED_TOOL_NAME: &str = "guarded_mock";
+    const TEST_CWD_ERR: &str = "test process has a current directory";
+
+    /// Registry and routing tests care about the name and audience only, never
+    /// about what the tool returns.
+    pub fn mock_tool(name: &str, audience: ToolAudience) -> Arc<dyn registry::Tool> {
+        Arc::new(MockTool {
+            name: name.to_owned(),
+            audience,
+        })
+    }
+
+    struct MockTool {
+        name: String,
+        audience: ToolAudience,
+    }
+
+    struct MockInvocation;
+
+    impl registry::ToolInvocation for MockInvocation {
+        fn start_header(&self) -> registry::HeaderFuture {
+            registry::HeaderFuture::Ready(registry::HeaderResult::plain("mock".into()))
+        }
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> registry::ExecFuture<'a> {
+            Box::pin(async { Ok(ToolOutput::Plain(String::new().into())).into() })
+        }
+    }
+
+    impl registry::Tool for MockTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+            "mock tool".into()
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false})
+        }
+        fn audience(&self) -> ToolAudience {
+            self.audience
+        }
+        fn parse(
+            &self,
+            _input: &Value,
+        ) -> Result<Box<dyn registry::ToolInvocation>, registry::ParseError> {
+            Ok(Box::new(MockInvocation))
+        }
+    }
+
+    pub struct GuardedMock;
+
+    struct GuardedInvocation;
+
+    impl registry::ToolInvocation for GuardedInvocation {
+        fn start_header(&self) -> registry::HeaderFuture {
+            registry::HeaderFuture::Ready(registry::HeaderResult::plain("mock".into()))
+        }
+        fn permission_scopes(
+            &self,
+            _session_id: Option<&SessionRef>,
+        ) -> registry::BoxFuture<'_, Option<registry::PermissionScopes>> {
+            Box::pin(std::future::ready(Some(
+                registry::PermissionScopes::single("guarded".into()),
+            )))
+        }
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> registry::ExecFuture<'a> {
+            Box::pin(async {
+                registry::ToolExecResult::from(Ok::<_, String>(ToolOutput::Plain("ok".into())))
+            })
+        }
+    }
+
+    impl registry::Tool for GuardedMock {
+        fn name(&self) -> &str {
+            GUARDED_TOOL_NAME
+        }
+        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+            "guarded mock".into()
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false})
+        }
+        fn parse(
+            &self,
+            _input: &Value,
+        ) -> Result<Box<dyn registry::ToolInvocation>, registry::ParseError> {
+            Ok(Box::new(GuardedInvocation))
+        }
+    }
+
+    static TEST_PERMISSIONS: LazyLock<Arc<PermissionManager>> = LazyLock::new(|| {
+        Arc::new(PermissionManager::new(
+            makima_config::PermissionsConfig {
+                default: makima_config::DefaultEffect::Allow,
+                rules: vec![],
+                ..Default::default()
+            },
+            std::path::PathBuf::from("/tmp"),
+            makima_config::ProjectConfig::discover(Path::new("/tmp")),
+            Arc::default(),
+        ))
+    });
+
+    pub fn stub_ctx_with(
+        mode: &AgentMode,
+        event_tx: Option<&EventSender>,
+        tool_use_id: Option<&str>,
+    ) -> ToolContext {
+        let fallback_tx;
+        let event_tx = match event_tx {
+            Some(tx) => tx,
+            None => {
+                fallback_tx = EventSender::new(flume::unbounded::<Envelope>().0);
+                &fallback_tx
+            }
+        };
+        let mut ctx = interpreter_ctx(
+            mode,
+            event_tx,
+            CancelToken::none(),
+            Arc::clone(&TEST_PERMISSIONS),
+            Arc::new(FileReadTracker::new()),
+            Arc::new(ToolRegistry::new()),
+            env::current_dir().expect(TEST_CWD_ERR),
+        );
+        ctx.tool_use_id = tool_use_id.map(String::from);
+        ctx
+    }
+
+    pub fn stub_ctx_with_session(
+        mode: &AgentMode,
+        event_tx: Option<&EventSender>,
+        tool_use_id: Option<&str>,
+        session_id: makima_storage::id::MakimaId,
+    ) -> ToolContext {
+        let mut ctx = stub_ctx_with(mode, event_tx, tool_use_id);
+        set_session(&mut ctx, session_id);
+        ctx
+    }
+
+    pub fn set_session(ctx: &mut ToolContext, session_id: makima_storage::id::MakimaId) {
+        ctx.session_id = Some(SessionRef::from(session_id));
+    }
+
+    pub fn stub_ctx(mode: &AgentMode) -> ToolContext {
+        stub_ctx_with(mode, None, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stub_ctx_with_permissions(
+        mode: &AgentMode,
+        permissions: Arc<PermissionManager>,
+    ) -> ToolContext {
+        let (tx, _rx) = flume::unbounded::<crate::Envelope>();
+        let event_tx = EventSender::new(tx);
+        let mut ctx = interpreter_ctx(
+            mode,
+            &event_tx,
+            CancelToken::none(),
+            permissions,
+            Arc::new(FileReadTracker::new()),
+            Arc::new(ToolRegistry::new()),
+            env::current_dir().expect(TEST_CWD_ERR),
+        );
+        ctx.tool_use_id = None;
+        ctx
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::{self, File};
+
+    use tempfile::TempDir;
+    use test_case::test_case;
+
+    use super::*;
+
+    const LINE_LIMIT: usize = 500;
+    const PINNED_TOOL: &str = "pinned";
+
+    #[test]
+    fn cloned_tool_context_shares_published_definitions() {
+        let mut context = cli_tool_ctx(env::current_dir().unwrap());
+        context.request_tools = Some(RequestTools::assembled(
+            serde_json::json!([{ "name": PINNED_TOOL }]),
+            &context.config,
+            &context.model,
+        ));
+        let cloned = context.clone();
+        let original = context.request_tools.as_ref().unwrap();
+        let copied = cloned.request_tools.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&original.definitions, &copied.definitions));
+        assert!(copied.filter().matches(PINNED_TOOL));
+        assert!(!copied.filter().matches(READ_TOOL_NAME));
+    }
+
+    #[test_case(false ; "removed")]
+    #[test_case(true ; "replaced")]
+    fn local_binding_does_not_rebind(replace: bool) {
+        let registry = ToolRegistry::new();
+        let original = local_tool(ToolAudience::MAIN, |_, _| {
+            Box::pin(async { Ok(String::new()) })
+        });
+        let mut entries = HashMap::from([(PINNED_TOOL.to_owned(), original)]);
+        let locals = Arc::new(entries.clone());
+        let bindings = TurnToolBindings::capture(&registry, &locals, None);
+        assert!(bindings.is_current(PINNED_TOOL, &registry, &locals, None));
+        entries.remove(PINNED_TOOL);
+        if replace {
+            entries.insert(
+                PINNED_TOOL.to_owned(),
+                local_tool(ToolAudience::MAIN, |_, _| {
+                    Box::pin(async { Ok(String::new()) })
+                }),
+            );
+        }
+        assert!(!bindings.is_current(PINNED_TOOL, &registry, &Arc::new(entries), None));
+    }
+
+    #[test_case("pinned" ; "bare")]
+    #[test_case("functions.pinned" ; "provider_prefix")]
+    fn local_binding_canonical_name(name: &str) {
+        let registry = ToolRegistry::new();
+        let locals = Arc::new(HashMap::from([(
+            PINNED_TOOL.to_owned(),
+            local_tool(ToolAudience::MAIN, |_, _| {
+                Box::pin(async { Ok(String::new()) })
+            }),
+        )]));
+        let bindings = TurnToolBindings::capture(&registry, &locals, None);
+        assert!(matches!(bindings.get(name), Some(TurnToolRoute::Local(_))));
+        assert!(bindings.is_current(name, &registry, &locals, None));
+    }
+
+    #[test_case(true  ; "vision_model_keeps_view_image")]
+    #[test_case(false ; "text_only_model_loses_view_image")]
+    fn from_config_gates_view_image_on_vision(vision: bool) {
+        let mut model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+        model.vision = Some(vision);
+        let filter = ToolFilter::from_config(&AgentConfig::default(), &model, &[]);
+        assert_eq!(filter.matches(VIEW_IMAGE_TOOL_NAME), vision);
+        assert!(
+            filter.matches(READ_TOOL_NAME),
+            "unrelated tools stay enabled"
+        );
+    }
+
+    #[test_case(30,  "30s timeout"   ; "seconds_only")]
+    #[test_case(120, "2m timeout"    ; "minutes_only")]
+    #[test_case(90,  "1m30s timeout" ; "mixed")]
+    fn timeout_annotation_cases(secs: u64, expected: &str) {
+        assert_eq!(timeout_annotation(secs), expected);
+    }
+
+    #[test_case(Deadline::None,                          120, 120 ; "none_passes_through")]
+    #[test_case(Deadline::after(Duration::from_secs(60)), 10,  10  ; "requested_under_remaining")]
+    fn cap_timeout_ok(deadline: Deadline, requested: u64, expected: u64) {
+        assert_eq!(deadline.cap_timeout(requested).unwrap(), expected);
+    }
+
+    #[test]
+    fn cap_timeout_clamps_to_remaining() {
+        let clamped = Deadline::after(Duration::from_secs(3600))
+            .cap_timeout(7200)
+            .unwrap();
+        assert!(clamped <= 3600, "expected <= 3600, got {clamped}");
+    }
+
+    #[test]
+    fn cap_timeout_expired() {
+        let expired = Deadline::At(Instant::now().checked_sub(Duration::from_secs(1)).unwrap());
+        assert_eq!(expired.cap_timeout(120).unwrap_err(), DEADLINE_EXCEEDED);
+    }
+
+    #[test_case("short",                            "short"                             ; "short_passthrough")]
+    #[test_case(&"x".repeat(LINE_LIMIT),       &"x".repeat(LINE_LIMIT)        ; "exact_boundary")]
+    #[test_case(&"x".repeat(1000), &format!("{}{}", "x".repeat(471), format_line_truncated_marker(529)) ; "ascii_reports_hidden_bytes")]
+    #[test_case(&"é".repeat(500), &format!("{}{}", "é".repeat(235), format_line_truncated_marker(530)) ; "multibyte_reports_hidden_bytes")]
+    fn truncate_line_cases(input: &str, expected: &str) {
+        let result = truncate_line(input, LINE_LIMIT);
+        assert_eq!(result, expected);
+        assert!(result.len() <= LINE_LIMIT);
+    }
+
+    #[test_case("plain line", None ; "no_marker")]
+    #[test_case(&format!("abc{}", format_line_truncated_marker(42)), Some(TruncationMarker::ReadLine) ; "current_marker")]
+    #[test_case("abc[line truncated]", Some(TruncationMarker::ReadLine) ; "legacy_marker")]
+    #[test_case("abc[line truncated, +42 bytes] tail", None ; "marker_mid_line")]
+    #[test_case("abc[line truncated, +x bytes]", None ; "non_numeric_count")]
+    #[test_case("abc[line truncated, + bytes]", None ; "empty_count")]
+    #[test_case("abc[line truncated, +42 bytes]  ", Some(TruncationMarker::ReadLine) ; "trailing_whitespace")]
+    #[test_case(&format!("abc{}", offload::format_line_cut(3, 900, true)), Some(TruncationMarker::PreviewCut) ; "preview_head_cut")]
+    #[test_case(&format!("abc{}", offload::format_line_cut(3, 900, false)), Some(TruncationMarker::PreviewCut) ; "preview_tail_cut")]
+    #[test_case("abc[line cut: middle 3 of 900 bytes]", None ; "preview_unknown_end")]
+    fn trailing_truncation_marker_cases(line: &str, expected: Option<TruncationMarker>) {
+        assert_eq!(trailing_truncation_marker(line), expected);
+    }
+
+    #[test_case("short", "short" ; "short_passthrough")]
+    #[test_case(&"x".repeat(LINE_LIMIT + 500), &format!("{}{}", "x".repeat(LINE_LIMIT - LEGACY_LINE_TRUNCATED_MARKER.len()), LEGACY_LINE_TRUNCATED_MARKER) ; "long_keeps_fixed_suffix")]
+    fn truncate_scope_cases(input: &str, expected: &str) {
+        assert_eq!(truncate_scope(input, LINE_LIMIT), expected);
+    }
+
+    #[test]
+    fn truncate_file_counts_byte_cut_lines_when_none_remained() {
+        let result = truncate_file("aaaa\nbbbb\ncccc", usize::MAX, 9, Some(0));
+        assert!(
+            result.ends_with(&format_file_truncated_marker(Some(1))),
+            "{result}"
+        );
+        assert_eq!(truncate_file("aaaa", usize::MAX, 9, Some(0)), "aaaa");
+    }
+
+    #[test]
+    fn truncate_file_counts_byte_cut_lines_as_remaining() {
+        let result = truncate_file("aaaa\nbbbb\ncccc\ndddd", usize::MAX, 9, Some(3));
+        assert_eq!(
+            result,
+            format!("aaaa\nbbbb\n\n{}", format_file_truncated_marker(Some(5)))
+        );
+    }
+
+    #[test]
+    fn truncate_file_includes_remaining_line_count() {
+        let result = truncate_file("a\nb\nc", 2, usize::MAX, Some(7));
+        assert!(result.ends_with(&format_file_truncated_marker(Some(8))));
+    }
+
+    #[test]
+    fn truncate_output_respects_line_and_byte_limits() {
+        const MAX_LINES: usize = 2000;
+        const MAX_BYTES: usize = 50 * 1024;
+
+        let many_lines: String = (0..MAX_LINES + 500)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result = truncate_output(many_lines, MAX_LINES, MAX_BYTES);
+        assert!(result.ends_with(FILE_TRUNCATED_MARKER));
+
+        let many_bytes = "x".repeat(MAX_BYTES + 1000);
+        let result = truncate_output(many_bytes, MAX_LINES, MAX_BYTES);
+        assert!(result.ends_with(FILE_TRUNCATED_MARKER));
+    }
+
+    #[test]
+    fn grep_search_finds_filters_and_skips_binary() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a.txt"), "hello world\ngoodbye world").unwrap();
+        fs::write(dir.path().join("b.rs"), "hello rust").unwrap();
+        fs::write(dir.path().join("bin.dat"), b"hello \x00 binary").unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        let mut params = grep::GrepParams::new("hello".into());
+        params.path = Some(dir_str.clone());
+        let (_, entries) = grep::grep_search(params).unwrap();
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert!(paths.contains(&"a.txt"));
+        assert!(paths.contains(&"b.rs"));
+        assert!(!paths.contains(&"bin.dat"));
+
+        let mut params = grep::GrepParams::new("hello".into());
+        params.path = Some(dir_str.clone());
+        params.include = Some("*.rs".into());
+        let (_, entries) = grep::grep_search(params).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "b.rs");
+
+        let mut params = grep::GrepParams::new("zzzznotfound".into());
+        params.path = Some(dir_str);
+        let (_, entries) = grep::grep_search(params).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn grep_search_single_file_preserves_filename() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("demo.rs");
+        fs::write(&file, "fn main() {}\n").unwrap();
+
+        let mut params = grep::GrepParams::new("fn main".into());
+        params.path = Some(file.to_string_lossy().into());
+        let (_, entries) = grep::grep_search(params).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "demo.rs");
+    }
+
+    #[test]
+    fn grep_search_invalid_regex_returns_error() {
+        let dir = TempDir::new().unwrap();
+        let mut params = grep::GrepParams::new("[invalid".into());
+        params.path = Some(dir.path().to_string_lossy().into());
+        let err = grep::grep_search(params).unwrap_err();
+        assert!(err.contains(grep::INVALID_REGEX), "got: {err}");
+    }
+
+    #[test]
+    fn grep_search_multiline_groups_spanning_lines() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("span.rs"), "fn foo() {\n    bar\n}\n").unwrap();
+
+        let mut params = grep::GrepParams::new("(?s)foo.*\\n}".into());
+        params.path = Some(dir.path().to_string_lossy().into());
+        let (_, entries) = grep::grep_search(params).unwrap();
+        assert_eq!(entries.len(), 1);
+        let lines = &entries[0].groups[0].lines;
+        assert!(lines.iter().any(|l| l.text.contains("foo") && l.is_match));
+    }
+
+    #[test]
+    fn grep_search_context_lines_surround_matches() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("ctx.rs"),
+            "l1\nl2\nA\nl4\nl5\nl6\nl7\nl8\nB\nl10\n",
+        )
+        .unwrap();
+
+        let mut params = grep::GrepParams::new("A|B".into());
+        params.path = Some(dir.path().to_string_lossy().into());
+        params.context_before = 1;
+        params.context_after = 1;
+        let (_, entries) = grep::grep_search(params).unwrap();
+        assert_eq!(entries[0].groups.len(), 2);
+
+        let g0 = &entries[0].groups[0].lines;
+        assert!(g0.iter().any(|l| l.text == "l2" && !l.is_match));
+        assert!(g0.iter().any(|l| l.text == "A" && l.is_match));
+
+        let g1 = &entries[0].groups[1].lines;
+        assert!(g1.iter().any(|l| l.text == "B" && l.is_match));
+        assert!(g1.iter().any(|l| l.text == "l10" && !l.is_match));
+    }
+
+    #[test]
+    fn grep_search_parallel_stable_under_repeated_calls() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let tied_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        for i in 0..20u32 {
+            let path = root.join(format!("f{i:03}.rs"));
+            fs::write(&path, format!("needle {i}\n")).unwrap();
+            let f = File::options().write(true).open(&path).unwrap();
+            f.set_modified(tied_mtime).unwrap();
+        }
+        let path_str = root.to_string_lossy().to_string();
+
+        let mut reference: Option<Vec<(String, usize, bool)>> = None;
+        for _ in 0..20 {
+            let mut params = grep::GrepParams::new("needle".into());
+            params.path = Some(path_str.clone());
+            params.limit = 1000;
+            let (_, entries) = grep::grep_search(params).unwrap();
+
+            let flat: Vec<(String, usize, bool)> = entries
+                .iter()
+                .flat_map(|e| {
+                    e.groups.iter().flat_map(|g| {
+                        g.lines
+                            .iter()
+                            .map(|l| (e.path.clone(), l.line_nr, l.is_match))
+                    })
+                })
+                .collect();
+            match &reference {
+                None => reference = Some(flat),
+                Some(prev) => assert_eq!(flat, *prev),
+            }
+        }
+    }
+
+    #[test]
+    fn grep_search_limit_truncates_groups_after_sort() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        for i in 0..10u32 {
+            fs::write(root.join(format!("m_{i}.rs")), "hit\n").unwrap();
+        }
+
+        let mut params = grep::GrepParams::new("hit".into());
+        params.path = Some(root.to_string_lossy().into());
+        params.limit = 3;
+        let (_, entries) = grep::grep_search(params).unwrap();
+
+        let total_groups: usize = entries.iter().map(|e| e.groups.len()).sum();
+        assert_eq!(total_groups, 3);
+    }
+
+    #[test]
+    fn walk_builder_excludes_dot_git_shows_dotfiles_and_filters_globs() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join(".git/objects")).unwrap();
+        fs::write(root.join(".git/config"), "stuff").unwrap();
+        fs::write(root.join(".git/objects/abc123"), "blob").unwrap();
+        fs::write(root.join(".env"), "SECRET=42").unwrap();
+        fs::write(root.join("lib.rs"), "pub fn foo() {}").unwrap();
+        fs::write(root.join("main.py"), "print('hi')").unwrap();
+
+        let root_str = root.to_string_lossy();
+        let collect = |patterns: &[&str]| -> Vec<String> {
+            walk_builder(&root_str, patterns)
+                .unwrap()
+                .build()
+                .flatten()
+                .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
+                .map(|e| {
+                    e.path()
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect()
+        };
+
+        let all = collect(&[]);
+        assert!(all.contains(&"lib.rs".into()));
+        assert!(all.contains(&".env".into()), "dotfiles must be shown");
+        assert!(
+            !all.iter().any(|p| p.starts_with(".git")),
+            ".git must be excluded"
+        );
+
+        let rs_only = collect(&["*.rs"]);
+        assert!(rs_only.contains(&"lib.rs".into()));
+        assert!(!rs_only.contains(&"main.py".into()), "glob must filter");
+        assert!(!rs_only.iter().any(|p| p.starts_with(".git")));
+    }
+
+    #[test]
+    fn relative_path_cases() {
+        let cwd = env::current_dir().unwrap();
+        let home = makima_storage::paths::home().unwrap();
+
+        let cases: &[(&str, &str)] = &[
+            (&format!("{}/src/main.rs", cwd.display()), "src/main.rs"),
+            (&cwd.to_string_lossy(), "."),
+            (
+                &format!("{}/.config/something.toml", home.display()),
+                "~/.config/something.toml",
+            ),
+            ("/etc/hosts", "/etc/hosts"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(relative_path(input), *expected, "input: {input}");
+        }
+
+        let no_partial = format!("{}sibling/file.txt", home.display());
+        assert_eq!(relative_path(&no_partial), no_partial);
+    }
+
+    #[test]
+    fn tool_context_resolves_paths_against_session_cwd() {
+        let dir = TempDir::new().unwrap();
+        let mut ctx = test_support::stub_ctx(&AgentMode::Build);
+        ctx.cwd = dir.path().to_path_buf();
+
+        assert_eq!(
+            ctx.resolve_path("nested/file.txt").unwrap(),
+            dir.path().join("nested/file.txt").to_string_lossy()
+        );
+        assert_eq!(
+            ctx.resolve_search_path(None).unwrap(),
+            dir.path().to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn resolve_path_cases() {
+        let cwd = env::current_dir().unwrap();
+        let home = makima_storage::paths::home().unwrap();
+
+        assert_eq!(
+            resolve_path("~/foo/bar").unwrap(),
+            home.join("foo/bar").to_string_lossy()
+        );
+        assert_eq!(resolve_path("~").unwrap(), home.to_string_lossy());
+        assert_eq!(
+            resolve_path("src/main.rs").unwrap(),
+            cwd.join("src/main.rs").to_string_lossy()
+        );
+
+        // `/etc/hosts` is absolute on Unix (passed through unchanged) but
+        // root-relative on Windows (no drive prefix, so `is_relative()` is
+        // true and it gets joined with cwd, producing e.g. `C:\etc\hosts`).
+        #[cfg(windows)]
+        {
+            #[allow(clippy::join_absolute_paths)]
+            let expected = cwd.join("/etc/hosts");
+            assert_eq!(
+                resolve_path("/etc/hosts").unwrap(),
+                expected.to_string_lossy()
+            );
+        }
+        #[cfg(not(windows))]
+        assert_eq!(resolve_path("/etc/hosts").unwrap(), "/etc/hosts");
+    }
+
+    #[test]
+    fn walk_builder_opts_gitignore_false_includes_ignored() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        fs::write(root.join("test.log"), "log data").unwrap();
+        fs::write(root.join("test.txt"), "text data").unwrap();
+
+        let root_str = root.to_string_lossy();
+
+        let collect = |wb: WalkBuilder| -> Vec<String> {
+            wb.build()
+                .flatten()
+                .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
+                .map(|e| e.into_path().to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let with_ignored = collect(walk_builder_opts(&root_str, &[], false).unwrap());
+        assert!(
+            with_ignored.iter().any(|p| p.ends_with("test.log")),
+            "gitignore=false should include test.log, got: {with_ignored:?}"
+        );
+        assert!(
+            with_ignored.iter().any(|p| p.ends_with("test.txt")),
+            "gitignore=false should include test.txt, got: {with_ignored:?}"
+        );
+
+        let without_ignored = collect(walk_builder_opts(&root_str, &[], true).unwrap());
+        assert!(
+            !without_ignored.iter().any(|p| p.ends_with("test.log")),
+            "gitignore=true should exclude test.log, got: {without_ignored:?}"
+        );
+        assert!(
+            without_ignored.iter().any(|p| p.ends_with("test.txt")),
+            "gitignore=true should include test.txt, got: {without_ignored:?}"
+        );
+
+        assert!(
+            !with_ignored.iter().any(|p| p.contains(".git/")),
+            ".git/ must be excluded even with gitignore=false, got: {with_ignored:?}"
+        );
+    }
+
+    #[test]
+    fn walk_builder_invalid_pattern_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let root_str = tmp.path().to_string_lossy();
+        let err = walk_builder(&root_str, &["["]).unwrap_err();
+        assert!(
+            err.contains("invalid glob pattern"),
+            "expected 'invalid glob pattern', got: {err}"
+        );
+    }
+
+    #[test]
+    fn all_builtin_names_no_duplicates() {
+        let names = all_builtin_tool_names();
+        let mut seen = std::collections::HashSet::new();
+        for name in &names {
+            assert!(seen.insert(name), "duplicate builtin tool name: {name}");
+        }
+    }
+}

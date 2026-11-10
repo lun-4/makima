@@ -4,12 +4,12 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 
-use maki_providers::ProviderRegistry;
-use maki_providers::login::{AuthState, auth_status};
-use maki_providers::model::{Model, ModelTier};
-use maki_storage::StateDir;
-use maki_storage::log::RotatingFileWriter;
-use maki_storage::model::read_model;
+use makima_providers::ProviderRegistry;
+use makima_providers::login::{AuthState, auth_status};
+use makima_providers::model::{Model, ModelTier};
+use makima_storage::StateDir;
+use makima_storage::log::RotatingFileWriter;
+use makima_storage::model::read_model;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
@@ -21,7 +21,7 @@ const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::INFO;
 pub fn resolve_model(
     providers: &ProviderRegistry,
     explicit: Option<&str>,
-    provider_config: &maki_config::ProviderConfig,
+    provider_config: &makima_config::ProviderConfig,
     storage: &StateDir,
 ) -> Result<Model> {
     let policy = &provider_config.model_policy;
@@ -70,7 +70,7 @@ pub fn resolve_model(
 /// has a model for the tier.
 fn auto_detect_model(
     providers: &ProviderRegistry,
-    policy: &maki_config::ModelPolicy,
+    policy: &makima_config::ModelPolicy,
     storage: &StateDir,
 ) -> Option<Model> {
     let usable: Vec<_> = smol::block_on(auth_status(providers, storage))
@@ -182,7 +182,7 @@ fn sets_a_level(value: &str) -> bool {
 /// Logging is the first thing to set up and the last thing allowed to stop the
 /// program, but a failure here used to be swallowed whole, so an unwritable log
 /// dir looked exactly like an idle one: no logs, no reason, no clue.
-pub fn init_logging(storage_config: &maki_config::StorageConfig) {
+pub fn init_logging(storage_config: &makima_config::StorageConfig) {
     let writer =
         match RotatingFileWriter::new(storage_config.max_log_bytes, storage_config.max_log_files) {
             Ok(writer) => writer,

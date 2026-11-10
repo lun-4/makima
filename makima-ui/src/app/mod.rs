@@ -1,0 +1,4158 @@
+//! Elm-style `update(Msg) -> Vec<Action>`; side effects are dispatched by the caller.
+//! Double-esc: first esc flashes a hint, second within `flash_duration` cancels/rewinds.
+//! `run_id` invalidates in-flight agent events. Only `record_run_start` and
+//! the cancel fence write it. Everything else only reads it.
+
+mod btw;
+mod image_paste;
+pub(crate) mod mode;
+mod mouse;
+mod queue;
+mod session;
+pub(crate) mod session_state;
+pub(crate) mod shell;
+#[cfg(test)]
+pub(crate) mod tests;
+pub(crate) mod view;
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use crate::AppSession;
+use crate::chat::Chat;
+use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
+use crate::click::{ClickTarget, CompletionGrid, HitRegistry, PickerId, ScrollOwner, Surface};
+use crate::clipboard::ClipboardState;
+use crate::command_runtime::{CommandRuntime, PreparedCommandTarget};
+use crate::model_capabilities::ModelCapabilityCache;
+use makima_agent::HistorySnapshot;
+
+use crate::components::btw_modal::BtwModal;
+#[cfg(test)]
+use crate::components::command::ParsedCommand;
+use crate::components::command::{CommandAction, CommandPalette, ConfirmedCommand};
+use crate::components::file_completion::{
+    CompletionAction, CompletionItem, FileCompletionMenu, at_token_query, at_token_range,
+};
+use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
+use crate::components::help_modal::HelpModal;
+use crate::components::input::{InputAction, InputBox, Submission};
+use crate::components::keybindings::key;
+use crate::components::list_picker::{ClockSample, ListPicker, PickerAction, PickerItem};
+use crate::components::login_picker::{LoginPicker, LoginPickerAction};
+use crate::components::lua_float::FloatManager;
+use crate::components::lua_picker::{LuaPicker, LuaPickerAction};
+use crate::components::mcp_picker::{McpPicker, McpPickerAction};
+use crate::components::menu::{Menu, MenuAction, MenuItem, MenuKind};
+use crate::components::model_picker::{ModelPicker, ModelPickerAction};
+use crate::components::permission_prompt::PermissionPrompt;
+use crate::components::plan_form::{PlanForm, PlanFormAction};
+use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
+use crate::components::scrollbar;
+use crate::components::search_modal::{SearchAction, SearchModal};
+use crate::components::status_bar::StatusBar;
+use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
+use crate::components::{
+    Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
+};
+use crate::image;
+use crate::repaint::{Cadence, Dirty, Watch};
+use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
+use crate::text_buffer::is_newline_key;
+use arc_swap::{ArcSwap, ArcSwapOption};
+#[cfg(test)]
+pub(crate) use crossterm::event::KeyEventKind;
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind as CrosstermKeyEventKind, KeyModifiers, MouseEvent,
+};
+use makima_agent::actor::{EffectiveAgentConfig, TranscriptRequest};
+use makima_agent::agent::isolated_turn::IsolatedTurnRequest;
+use makima_agent::permissions::PermissionManager;
+use makima_agent::tools::ToolFilter;
+use makima_agent::{
+    ActorWorkKind, AgentConfig, AgentEvent, AgentId, AgentInput, AgentMode, AgentRef, Envelope,
+    ImageMediaType, ImageSource, McpConfigErrors, McpPromptRef, McpSnapshotReader, Post, SharedBuf,
+    SharedMessages, SubagentInfo, TurnCompleteEvent,
+};
+use makima_commands::{
+    AgentTurn, BuiltinOperation, CommandAttachment, CommandContent, CommandError,
+    HostContextRequest, HostContextResponse, HostRequest, HostResponse, SlashClass, TargetHandle,
+    classify_input,
+};
+use makima_config::project::{self, GatedFile, TrustQuestion};
+use makima_config::{ModelPolicy, ToolKey, UiConfig};
+use makima_lua::orchestration::TrustedTarget;
+use makima_lua::{
+    BuiltinAction, CompletionCtx, EventHandle, FloatConfig, HintReader, HintSnapshot, ItemSpec,
+    KeymapReader, Split, StatusContentReader, StatusContentSnapshot, WinCommand, WinEvent, WinView,
+};
+use makima_providers::{
+    ContentBlock, Message, Model, ModelCapabilities, ModelSelection, ProviderRegistry,
+    ThinkingConfig, add_cost, format_tokens,
+};
+use makima_storage::StateDir;
+use makima_storage::conversation::ConversationState;
+use makima_storage::input_history::InputHistory;
+use makima_storage::model::persist_model;
+use makima_storage::sessions::StoredPost;
+
+use crate::storage_writer::StorageWriter;
+use crate::theme::ThemesProvider;
+use ratatui::layout::Position;
+
+const COMMAND_TRANSCRIPT_MESSAGES: usize = 1000;
+const COMMAND_TRANSCRIPT_BYTES: usize = 1024 * 1024;
+const SUBAGENT_STREAMING_STATUS: Status = Status::Streaming;
+const SUBAGENT_IDLE_STATUS: Status = Status::Idle;
+#[cfg(test)]
+use crate::chat::{COMPLETION_PREVIEW_CHARS, COMPLETION_TRUNCATED};
+
+#[cfg(test)]
+pub(crate) use crate::agent::QueuedMessage;
+
+pub(crate) use mode::{Mode, PlanState, PlanTrigger};
+#[cfg(test)]
+use mouse::EDGE_SCROLL_LINES;
+use mouse::{MIDDLE_SCROLL_INTERVAL, MiddleScroll};
+pub(crate) use queue::{EMPTY_PROMPT_ERR, MessageQueue, SubmitOutcome};
+use session::Sent;
+pub(crate) use session::session_has_content;
+pub(crate) use session_state::stored_to_rules;
+use session_state::{ConfigSource, SessionState};
+
+const CANCEL_MSG: &str = "Cancelled.";
+/// Presentation reserved for re-bake replies. They belong to no agent run, so
+/// the staleness filter skips them outright.
+pub(crate) const RESTORE_PRESENTATION: u64 = u64::MAX;
+/// Presentation reserved for re-bake replies. It is not actor work, so it
+/// carries no work identity and bypasses the per-run staleness filter.
+const FLASH_CANCEL: &str = "Press esc again to stop...";
+const FLASH_REWIND: &str = "Press esc again to rewind...";
+const AUTH_EXPIRED_MSG: &str =
+    "Token expired. Run `makima auth login` in another terminal, then press Enter to retry.";
+const FLASH_NO_AGENT_CHAT: &str = "Agent chat is unavailable";
+const FLASH_NO_PLAN: &str = "No plan file";
+const FLASH_NO_PLAN_BODY: &str = "Plan file is empty or unreadable";
+const PLAN_SUBMIT_TOOL: &str = "plan_submit";
+const SESSION_PICKER_REQUESTED_EVENT: &str = "SessionPickerRequested";
+const THEME_APPLIED_PREFIX: &str = "Theme";
+
+/// Stands in for the runtime provider in fixtures that build an app without
+/// spawning an agent. Nothing streams through it; it only lets the starting
+/// config resolve to the same shape a live runtime would hand the app.
+#[cfg(test)]
+struct DetachedProvider;
+
+#[cfg(test)]
+impl makima_providers::provider::Provider for DetachedProvider {
+    fn stream_message<'a>(
+        &'a self,
+        _model: &'a Model,
+        _messages: &'a [makima_providers::Message],
+        _system: &'a str,
+        _tools: &'a serde_json::Value,
+        _event_tx: &'a flume::Sender<makima_providers::ProviderEvent>,
+        _opts: makima_providers::RequestOptions,
+        _session_id: Option<&'a makima_storage::id::SessionRef>,
+        _invocation: &'a makima_providers::Invocation,
+        _delivery: makima_providers::RequestDelivery,
+    ) -> makima_providers::provider::BoxFuture<
+        'a,
+        Result<makima_providers::StreamResponse, makima_agent::AgentError>,
+    > {
+        Box::pin(async { std::future::pending().await })
+    }
+}
+pub(crate) const NOTHING_TO_TRUST_MSG: &str = "nothing to trust in this folder";
+const TRUSTED_PREFIX: &str = "Trusted this folder: ";
+
+const TASK_DONE_DETAIL: &str = "✓ ";
+const MISSING_TOOL_COMPLETION: &str = "Tool did not report completion before the turn ended";
+/// Length cap for the `/tasks` row message snippet (AC.10).
+const SNIPPET_CHARS: usize = 64;
+
+const NOTIFICATION_PREVIEW_CHARS: usize = 120;
+
+/// A tool-call demand that needs the user's input is held this long after the
+/// last keystroke before it steals focus, so it does not interrupt mid-typing.
+const INPUT_DEFER: Duration = Duration::from_secs(2);
+
+fn command_palette_defaults(runtime: &CommandRuntime) -> makima_commands::CompletionProviders {
+    makima_commands::CompletionProviders::default()
+        .with(
+            makima_commands::CompletionKind::File,
+            Arc::clone(&runtime.path_completion) as Arc<dyn makima_commands::CommandCompletion>,
+        )
+        .with(
+            makima_commands::CompletionKind::Directory,
+            Arc::clone(&runtime.path_completion) as Arc<dyn makima_commands::CommandCompletion>,
+        )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Notification {
+    TurnComplete { response: Option<String> },
+    PermissionRequested { tool: Option<String> },
+    AuthenticationRequired,
+    QuestionRequested,
+    PlanReady,
+}
+
+impl Notification {
+    pub(crate) fn is_urgent(&self) -> bool {
+        !matches!(self, Self::TurnComplete { .. })
+    }
+
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::TurnComplete { response } => response
+                .clone()
+                .unwrap_or_else(|| "Agent turn complete".into()),
+            Self::PermissionRequested { tool: Some(tool) } => {
+                format!("Permission requested: {tool}")
+            }
+            Self::PermissionRequested { tool: None } => "Permission requested".into(),
+            Self::AuthenticationRequired => "Authentication required".into(),
+            Self::QuestionRequested => "Question requested".into(),
+            Self::PlanReady => "Plan ready".into(),
+        }
+    }
+
+    pub(crate) fn error_completion() -> Self {
+        Self::TurnComplete {
+            response: Some("Agent stopped with an error".into()),
+        }
+    }
+}
+
+fn notification_preview(text: &str) -> Option<String> {
+    let preview: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!preview.is_empty()).then(|| preview.chars().take(NOTIFICATION_PREVIEW_CHARS).collect())
+}
+
+fn normalize_preview(text: &str) -> Option<String> {
+    notification_preview(text)
+}
+
+pub(crate) fn turn_response(message: &Message) -> Option<String> {
+    if message.has_tool_calls() {
+        return None;
+    }
+    notification_preview(
+        &message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum TaskIdentity {
+    Main,
+    Agent(AgentId),
+    Restored(String),
+    Unidentified(usize),
+}
+
+#[derive(Clone)]
+pub(super) struct TaskEntry {
+    name: String,
+    finished: Option<bool>,
+    chat_index: usize,
+    identity: TaskIdentity,
+    parent_chat_index: Option<usize>,
+    depth: usize,
+    /// First `SNIPPET_CHARS` of the subagent chat's last message, shown dimly.
+    snippet: String,
+    context: String,
+    started_at: Option<Instant>,
+}
+
+impl PickerItem for TaskEntry {
+    fn label(&self) -> &str {
+        &self.name
+    }
+    fn depth(&self) -> usize {
+        self.depth
+    }
+    fn detail(&self) -> Option<&str> {
+        matches!(self.finished, Some(true)).then_some(TASK_DONE_DETAIL)
+    }
+    fn suffix(&self) -> Option<&str> {
+        (!self.snippet.is_empty()).then_some(self.snippet.as_str())
+    }
+    fn is_spinning(&self) -> bool {
+        matches!(self.finished, Some(false))
+    }
+    fn context_str(&self) -> Option<&str> {
+        (!self.context.is_empty()).then_some(self.context.as_str())
+    }
+    fn age(&self, now: &ClockSample) -> Option<Duration> {
+        self.started_at
+            .map(|started| now.monotonic.saturating_duration_since(started))
+    }
+    fn is_finished(&self) -> bool {
+        matches!(self.finished, Some(true))
+    }
+}
+
+/// Channels held for a live subagent tab.
+#[derive(Clone, Default)]
+struct SubagentChannels {
+    answer_tx: Option<flume::Sender<String>>,
+    closed: bool,
+}
+
+fn truncate_snippet(text: &str) -> String {
+    let mut chars = text.chars();
+    let truncated: String = chars.by_ref().take(SNIPPET_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) enum PendingInput {
+    #[default]
+    None,
+    AuthRetry {
+        agent_id: Option<makima_agent::AgentId>,
+    },
+}
+
+pub enum Msg {
+    Key(KeyEvent),
+    Paste(String),
+    Mouse(MouseEvent),
+    Scroll { column: u16, row: u16, delta: i32 },
+    Agent(Box<Envelope>),
+}
+
+/// The two input-demanding surfaces that can be deferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputKind {
+    Permission,
+    Question,
+}
+
+/// A queued permission request's payload; lives in the queue so the prompt is
+/// not opened (and does not contaminate overlay state) until activation.
+#[derive(Debug, Clone)]
+pub(crate) struct PermissionPayload {
+    id: String,
+    tool: ToolKey,
+    scopes: Vec<String>,
+    agent_id: Option<makima_agent::AgentId>,
+}
+
+/// One entry in the input-arbitration queue. FIFO: only the head can activate.
+#[derive(Debug, Clone)]
+pub(crate) struct InputDemand {
+    kind: InputKind,
+    blocked_by_modal: bool,
+    /// Alt+M manual deferral: held until the next submit instead of the 2s
+    /// idle timer. Auto-deferrals keep this `false`.
+    hold_until_submit: bool,
+    perm: Option<PermissionPayload>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum ModelPickerPurpose {
+    #[default]
+    Session,
+    PlanImplementation,
+}
+
+pub struct App {
+    pub(super) chats: Vec<Chat>,
+    pub(super) active_chat: usize,
+    pub(super) chat_index: HashMap<String, usize>,
+    pub(super) live_chat_index: HashMap<makima_agent::AgentId, usize>,
+    terminal_subagents: HashSet<makima_agent::AgentId>,
+    pub(crate) input_box: InputBox,
+    pub(super) command_palette: CommandPalette,
+    pub(crate) command_runtime: Arc<CommandRuntime>,
+    pub(crate) command_target: TargetHandle,
+    pub(super) task_picker: ListPicker<TaskEntry>,
+    pub(super) task_picker_original: Option<usize>,
+    pub(super) lua_picker: LuaPicker,
+    pub(super) theme_picker: ThemePicker,
+    pub(super) model_picker: ModelPicker,
+    model_picker_purpose: ModelPickerPurpose,
+    pub(crate) model_picker_target: Option<AgentRef>,
+    pub(crate) plan_approval_pending: bool,
+    pub(super) login_picker: LoginPicker,
+    pub(super) mcp_picker: McpPicker,
+    pub(super) rewind_picker: RewindPicker,
+    pub(super) help_modal: HelpModal,
+    pub(super) btw_modal: BtwModal,
+    pub(super) float_mgr: FloatManager,
+    pub(super) search_modal: SearchModal,
+    pub(super) file_picker: FilePickerModal,
+    pub(super) file_completion: FileCompletionMenu,
+    pub(super) permission_prompt: PermissionPrompt,
+    pub(super) plan_form: PlanForm,
+    plan_form_target: Option<AgentId>,
+    plan_forms: HashMap<Option<AgentId>, (PlanForm, bool)>,
+    pub(super) status_bar: StatusBar,
+    pub(super) menu: Menu,
+    pub status: Status,
+    pub(crate) state: session_state::SessionState,
+    /// The config the root was seeded with, shown until the root answers.
+    seed_config: Arc<makima_agent::EffectiveAgentConfig>,
+    pub exit_request: ExitRequest,
+    pub(crate) exit_on_done: bool,
+    pub(crate) queue: MessageQueue,
+    recoverable_queue: Vec<String>,
+    pub answer_tx: Option<flume::Sender<String>>,
+    pub(crate) root_agent: Option<makima_agent::AgentRef>,
+    pub(crate) cmd_tx: Option<flume::Sender<super::AgentCommand>>,
+    pub(super) pending_input: PendingInput,
+    pub(crate) run_id: u64,
+    /// The model the in-flight turn started on. A turn captures its provider
+    /// when it starts, so a model changed part-way through applies to the next
+    /// turn; this is what lets the status bar say so instead of showing a name
+    /// the running turn is not using.
+    pub(crate) run_model: Option<String>,
+    pub(crate) run_context_window: Option<u32>,
+    pub(super) zones: ZoneRegistry,
+    pub(super) hits: HitRegistry,
+    pub(super) pending_click: Option<(ClickTarget, Position)>,
+    scroll_drag: Option<mouse::ScrollDrag>,
+    pub(super) hover: Option<ClickTarget>,
+    pub(super) selection_state: Option<SelectionState>,
+    middle_scroll: Option<MiddleScroll>,
+    pub(super) clipboard: ClipboardState,
+    pub(super) last_esc: Option<Instant>,
+    /// Last user keystroke/paste; `None` until the first. Drives input deferral.
+    pub(super) last_input: Option<Instant>,
+    /// The input surface currently shown/focused (`None` when nothing is live).
+    pub(super) active_input: Option<InputKind>,
+    /// Pending input demands in arrival order; the head promotes when idle.
+    pub(super) input_queue: VecDeque<InputDemand>,
+    /// Bell owed by a promotion/arrival; drained by the event loop after tick.
+    pub(super) pending_bell: bool,
+    /// Armed by a keyboard submit (main or subagent input) to release a manual
+    /// Alt+M hold; consumed by the next promotion pass.
+    pub(super) submit_released: bool,
+    pub(crate) pending_dirty: Dirty,
+
+    pub(crate) storage: StateDir,
+    pub(crate) trust_question: Option<TrustQuestion>,
+    pub(crate) theme_provider: Arc<dyn ThemesProvider>,
+    pub(crate) available_models: Arc<ArcSwapOption<Vec<String>>>,
+    model_picker_models: Arc<ArcSwapOption<Vec<String>>>,
+    pub(crate) shared_history: Option<SharedMessages>,
+    pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
+    pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
+    storage_writer: Arc<StorageWriter>,
+    last_sent: Option<Sent>,
+    pub(crate) shell: shell::ShellState,
+    pub(crate) ui_config: UiConfig,
+    pub(crate) permissions: Arc<PermissionManager>,
+    pub(crate) coordinator: Option<makima_agent::session_coordinator::SessionCoordinatorHandle>,
+    pub(crate) model_policy: Arc<ModelPolicy>,
+    pub(crate) lua_event_handle: EventHandle,
+    tool_filter: ToolFilter,
+    pub(super) keymap_reader: KeymapReader,
+    pub(super) hint_reader: HintReader,
+    hints: Watch<HintSnapshot>,
+    pub(super) status_content_reader: StatusContentReader,
+    status_content: Watch<StatusContentSnapshot>,
+    pub(crate) suppress_status_content: Arc<AtomicBool>,
+    pub(crate) restore_event_tx: Option<makima_agent::EventSender>,
+    pub(super) restoring: Arc<AtomicBool>,
+    /// Per-live-agent channels for interrupt replies and background input.
+    subagent_channels: HashMap<makima_agent::AgentId, SubagentChannels>,
+    /// Stamped child outcomes outrank duplicate terminal delivery.
+    stamped_subagent_outcomes: HashSet<(makima_agent::AgentId, makima_agent::TurnId)>,
+}
+
+pub(crate) struct PreparedApp {
+    pub(crate) app: App,
+    command_target: PreparedCommandTarget,
+}
+
+impl PreparedApp {
+    pub(crate) fn session_id(&self) -> makima_storage::id::MakimaId {
+        self.app.state.session.id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn command_target_id(&self) -> makima_commands::InvocationTargetId {
+        self.command_target.handle().id()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session_rule_allows(&self, tool: &ToolKey, scope: &str) -> bool {
+        matches!(
+            self.app.permissions.check(tool, scope, None),
+            makima_agent::permissions::PermissionCheck::Allowed
+        )
+    }
+
+    pub(crate) fn activate(mut self) -> App {
+        self.app.command_target = self.command_target.activate();
+        scrollbar::set_enabled(self.app.ui_config.scrollbar);
+        self.app
+    }
+}
+
+impl App {
+    pub(crate) fn handle_actor_event(&mut self, event: makima_agent::actor::ActorEvent) {
+        let makima_agent::actor::ActorEvent::Delivery(event) = event else {
+            return;
+        };
+        if !matches!(
+            event.status,
+            makima_agent::actor::DeliveryStatus::Executed { .. }
+        ) {
+            return;
+        }
+        let delivery = event.delivery;
+        let source = delivery.label.as_deref().map_or_else(
+            || delivery.result.outcome.agent_id().to_string(),
+            str::to_owned,
+        );
+        let notice = crate::chat::format_child_result_notice(
+            &source,
+            &delivery.result.text,
+            &delivery.result.output,
+            Some(delivery.result.outcome.agent_id()),
+        );
+        self.chats[0].push(notice);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare(
+        config: EffectiveAgentConfig,
+        agent_config: &AgentConfig,
+        session: AppSession,
+        storage: StateDir,
+        available_models: Arc<ArcSwapOption<Vec<String>>>,
+        mcp_reader: McpSnapshotReader,
+        mcp_config_errors: McpConfigErrors,
+        keymap_reader: KeymapReader,
+        hint_reader: HintReader,
+        status_content_reader: StatusContentReader,
+        storage_writer: Arc<StorageWriter>,
+        ui_config: UiConfig,
+        input_history_size: usize,
+        permissions: Arc<PermissionManager>,
+        lua_event_handle: EventHandle,
+        model_policy: Arc<ModelPolicy>,
+        providers: Arc<ProviderRegistry>,
+        theme_provider: Arc<dyn ThemesProvider>,
+        command_runtime: Arc<CommandRuntime>,
+        model_capabilities: Arc<ModelCapabilityCache>,
+    ) -> PreparedApp {
+        let mut state =
+            SessionState::from_session(session, &config.model, &model_policy, &providers);
+        state.adopt(&config);
+        permissions.load_session_rules(session_state::stored_to_rules(
+            &state.session.meta.session_rules,
+        ));
+        let typewriter = ui_config.typewriter_ms_per_char;
+        let flash = ui_config.flash_duration();
+        let input_box = InputBox::new(
+            InputHistory::load(&storage, input_history_size),
+            ui_config.max_input_lines,
+        );
+        let model_picker_models = Arc::new(ArcSwapOption::from(Some(Arc::new(Vec::new()))));
+        let prepared_command_target = command_runtime.prepare_target();
+        let command_target = prepared_command_target.handle().clone();
+        let login_picker = LoginPicker::new(
+            Arc::clone(&providers),
+            storage.clone(),
+            Arc::clone(&model_policy),
+        );
+        let mut app = Self {
+            chats: vec![Chat::new(
+                "Main".into(),
+                ui_config.clone(),
+                lua_event_handle.clone(),
+                Arc::clone(&theme_provider),
+            )],
+            active_chat: 0,
+            chat_index: HashMap::new(),
+            live_chat_index: HashMap::new(),
+            terminal_subagents: HashSet::new(),
+            input_box,
+            command_runtime: Arc::clone(&command_runtime),
+            command_target: command_target.clone(),
+            command_palette: CommandPalette::prepared(
+                command_runtime.registry.clone(),
+                command_target,
+                prepared_command_target.snapshot(),
+                command_palette_defaults(&command_runtime),
+                Arc::from(state.session.cwd.as_str()),
+            ),
+            task_picker: ListPicker::new().with_picker(PickerId::Task),
+            task_picker_original: None,
+            lua_picker: LuaPicker::new(lua_event_handle.clone()),
+            theme_picker: ThemePicker::new(Arc::clone(&theme_provider)),
+            model_picker: ModelPicker::new(
+                Arc::clone(&model_picker_models),
+                providers,
+                model_capabilities,
+            ),
+            model_picker_purpose: ModelPickerPurpose::Session,
+            model_picker_target: None,
+            plan_approval_pending: false,
+            login_picker,
+            mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
+            rewind_picker: RewindPicker::new(),
+            help_modal: HelpModal::new(),
+            btw_modal: BtwModal::new(typewriter),
+            float_mgr: FloatManager::new(),
+            search_modal: SearchModal::new(),
+            file_picker: FilePickerModal::new(),
+            file_completion: FileCompletionMenu::new(),
+            permission_prompt: PermissionPrompt::new(),
+            plan_form: PlanForm::new(),
+            plan_form_target: None,
+            plan_forms: HashMap::new(),
+            status_bar: StatusBar::new(flash, config.context.cwd().to_path_buf()),
+            menu: Menu::default(),
+            status: Status::Idle,
+            state,
+            tool_filter: ToolFilter::from_config(agent_config, &config.model, &[]),
+            seed_config: Arc::new(config),
+            exit_request: ExitRequest::None,
+            exit_on_done: false,
+            queue: MessageQueue::default(),
+            recoverable_queue: Vec::new(),
+            answer_tx: None,
+            root_agent: None,
+            cmd_tx: None,
+            pending_input: PendingInput::None,
+            run_id: 0,
+            run_model: None,
+            run_context_window: None,
+            zones: ZoneRegistry::new(),
+            hits: HitRegistry::default(),
+            pending_click: None,
+            scroll_drag: None,
+            hover: None,
+            selection_state: None,
+            middle_scroll: None,
+            clipboard: ClipboardState::new(),
+            last_esc: None,
+            last_input: None,
+            active_input: None,
+            input_queue: VecDeque::new(),
+            pending_bell: false,
+            submit_released: false,
+            storage,
+            trust_question: None,
+            theme_provider,
+            available_models,
+            model_picker_models,
+            shared_history: None,
+            btw_system: None,
+            image_paste_rx: vec![],
+            storage_writer,
+            last_sent: None,
+            shell: shell::ShellState::default(),
+            ui_config,
+            permissions,
+            coordinator: None,
+            model_policy: Arc::clone(&model_policy),
+            lua_event_handle,
+            hints: Watch::seeded(hint_reader.load_full()),
+            status_content: Watch::seeded(status_content_reader.load_full()),
+            suppress_status_content: Arc::new(AtomicBool::new(false)),
+            keymap_reader,
+            hint_reader,
+            status_content_reader,
+            restore_event_tx: None,
+            restoring: Arc::new(AtomicBool::new(false)),
+            subagent_channels: HashMap::new(),
+            stamped_subagent_outcomes: HashSet::new(),
+            pending_dirty: Dirty::NO,
+        };
+        app.model_picker.set_recents(
+            makima_storage::model::read_recents(&app.storage)
+                .into_iter()
+                .filter(|spec| model_policy.allows(spec))
+                .collect(),
+        );
+        PreparedApp {
+            app,
+            command_target: prepared_command_target,
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        model: &Model,
+        session: AppSession,
+        storage: StateDir,
+        available_models: Arc<ArcSwapOption<Vec<String>>>,
+        mcp_reader: McpSnapshotReader,
+        mcp_config_errors: McpConfigErrors,
+        keymap_reader: KeymapReader,
+        hint_reader: HintReader,
+        status_content_reader: StatusContentReader,
+        storage_writer: Arc<StorageWriter>,
+        ui_config: UiConfig,
+        input_history_size: usize,
+        permissions: Arc<PermissionManager>,
+        lua_event_handle: EventHandle,
+        model_policy: Arc<ModelPolicy>,
+        theme_provider: Arc<dyn ThemesProvider>,
+        command_runtime: Arc<CommandRuntime>,
+    ) -> Self {
+        let config = session_state::SessionState::from_session(
+            session.clone(),
+            model,
+            &model_policy,
+            &ProviderRegistry::default(),
+        )
+        .starting_config(
+            Arc::new(DetachedProvider),
+            model,
+            PathBuf::from(&session.cwd),
+            &lua_event_handle.mode_registry(),
+            &storage,
+            makima_config::SessionDefaults::default(),
+        );
+        Self::prepare(
+            config,
+            &AgentConfig::default(),
+            session,
+            storage,
+            available_models,
+            mcp_reader,
+            mcp_config_errors,
+            keymap_reader,
+            hint_reader,
+            status_content_reader,
+            storage_writer,
+            ui_config,
+            input_history_size,
+            permissions,
+            lua_event_handle,
+            model_policy,
+            Arc::default(),
+            theme_provider,
+            command_runtime,
+            ModelCapabilityCache::new(|_| ModelCapabilities::NONE, || {}),
+        )
+        .activate()
+    }
+
+    pub(crate) fn focused_config(&self) -> Option<Arc<makima_agent::EffectiveAgentConfig>> {
+        self.command_runtime
+            .target_agent(&self.command_target)
+            .filter(|target| Some(target.id()) == self.selected_agent_id())
+            .and_then(|target| target.effective_config().ok().flatten())
+    }
+
+    /// The request settings the visible chat is rendered with, resolved from
+    /// exactly one source so a frame cannot show one source's thinking next to
+    /// another's fast flag.
+    pub(crate) fn displayed_config(&self, chat_index: usize) -> ConfigSource {
+        if let Some(config) = self.focused_config() {
+            ConfigSource::Actor(config)
+        } else if chat_index == 0 {
+            ConfigSource::Actor(self.root_config())
+        } else {
+            ConfigSource::Chat(self.chats[chat_index].opts.unwrap_or_default())
+        }
+    }
+
+    pub(crate) fn seed_mode(&self) -> AgentMode {
+        self.seed_config.mode.clone()
+    }
+
+    /// The root's committed config, or the seed before the root is bound.
+    pub(crate) fn root_config(&self) -> Arc<makima_agent::EffectiveAgentConfig> {
+        self.queue
+            .root_config()
+            .unwrap_or_else(|| Arc::clone(&self.seed_config))
+    }
+
+    pub(super) fn focused_model_spec(&self) -> String {
+        self.focused_config()
+            .map(|config| config.model.spec())
+            .unwrap_or_else(|| {
+                self.chats[self.active_chat]
+                    .model_id
+                    .clone()
+                    .unwrap_or_else(|| self.root_config().model.spec())
+            })
+    }
+
+    pub(super) fn focused_mode(&self) -> Mode {
+        match self.focused_config() {
+            Some(config) => Mode::from(&config.mode),
+            None if self.is_main_chat() => self.root_mode(),
+            None => Mode::Build,
+        }
+    }
+
+    pub(crate) fn root_mode(&self) -> Mode {
+        Mode::from(&self.root_config().mode)
+    }
+
+    pub(super) fn focused_retry(&self) -> Option<&RetryInfo> {
+        self.chats[self.active_chat].retry_info.as_ref()
+    }
+
+    pub(crate) fn focused_cwd(&self) -> PathBuf {
+        self.focused_config()
+            .map(|config| config.context.cwd().to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(&self.state.session.cwd))
+    }
+
+    pub(crate) fn selected_agent_id(&self) -> Option<makima_agent::AgentId> {
+        self.chats
+            .get(self.active_chat)
+            .and_then(|chat| chat.agent_id)
+    }
+
+    pub(crate) fn main_chat(&mut self) -> &mut Chat {
+        &mut self.chats[0]
+    }
+
+    pub(crate) fn is_main_chat(&self) -> bool {
+        self.active_chat == 0
+    }
+
+    pub(super) fn focused_streaming(&self) -> bool {
+        if let Some(actor) = self
+            .command_runtime
+            .target_agent(&self.command_target)
+            .filter(|target| Some(target.id()) == self.selected_agent_id())
+            .and_then(|target| target.actor().ok())
+        {
+            return matches!(
+                actor.snapshot().status,
+                makima_agent::actor::ActorStatus::Running(_)
+            );
+        }
+        *self.status_for_chat(self.active_chat) == Status::Streaming
+    }
+
+    fn status_for_chat(&self, chat_idx: usize) -> &Status {
+        if chat_idx == 0 {
+            &self.status
+        } else if self
+            .chats
+            .get(chat_idx)
+            .is_some_and(|chat| !chat.is_finished())
+        {
+            &SUBAGENT_STREAMING_STATUS
+        } else {
+            &SUBAGENT_IDLE_STATUS
+        }
+    }
+
+    pub(super) fn focused_plan_path(&self) -> Option<PathBuf> {
+        if self.is_main_chat() {
+            self.state.plan.path().map(Path::to_path_buf)
+        } else {
+            self.focused_config()
+                .and_then(|config| config.mode.plan_path().map(Path::to_path_buf))
+        }
+    }
+
+    fn sync_plan_form_target(&mut self) {
+        let target = if self.is_main_chat() {
+            None
+        } else {
+            self.selected_agent_id()
+        };
+        if target == self.plan_form_target {
+            return;
+        }
+        if self.model_picker_purpose == ModelPickerPurpose::PlanImplementation {
+            self.close_model_picker();
+        }
+        let (form, pending) = self
+            .plan_forms
+            .remove(&target)
+            .unwrap_or_else(|| (PlanForm::new(), false));
+        let previous = std::mem::replace(&mut self.plan_form, form);
+        let previous_pending = std::mem::replace(&mut self.plan_approval_pending, pending);
+        self.plan_forms
+            .insert(self.plan_form_target, (previous, previous_pending));
+        self.plan_form_target = target;
+    }
+
+    /// Brings the focused plan form forward, and retires its staging once
+    /// the focused agent's plan is gone or replaced.
+    pub(crate) fn sync_focused_plan_form(&mut self) {
+        self.sync_plan_form_target();
+        let path = if self.is_main_chat() {
+            self.focused_plan_path()
+        } else if let Some(config) = self.focused_config() {
+            config.mode.plan_path().map(Path::to_path_buf)
+        } else {
+            return;
+        };
+        self.sync_plan_form_path(self.plan_form_target, path.as_deref());
+        if path.is_none() && self.plan_picker_edits(self.plan_form_target) {
+            self.close_model_picker();
+            self.pending_dirty |= Dirty::YES;
+        }
+    }
+
+    /// Retires the staging of saved child plan forms whose plans are gone.
+    pub(crate) fn sync_child_plan_paths(
+        &mut self,
+        mut path_for: impl FnMut(AgentId) -> Option<PathBuf>,
+    ) {
+        let targets = self
+            .plan_forms
+            .keys()
+            .copied()
+            .flatten()
+            .chain(self.plan_form_target)
+            .collect::<Vec<_>>();
+        for target in targets {
+            self.sync_plan_form_path(Some(target), path_for(target).as_deref());
+        }
+    }
+
+    /// A form staged for one plan never carries over to the next, and a
+    /// picker editing it closes with it.
+    pub(super) fn sync_plan_form_path(&mut self, key: Option<AgentId>, path: Option<&Path>) {
+        let Some((form, pending)) = self.plan_form_entry(key) else {
+            return;
+        };
+        if !form.sync_plan_path(path) {
+            return;
+        }
+        *pending = false;
+        if self.plan_picker_edits(key) {
+            self.close_model_picker();
+        }
+        self.pending_dirty |= Dirty::YES;
+    }
+
+    /// The plan form for `key` (`None` is the root) and its approval-pending
+    /// flag, whether it is the focused form or a saved one.
+    pub(super) fn plan_form_entry(
+        &mut self,
+        key: Option<AgentId>,
+    ) -> Option<(&mut PlanForm, &mut bool)> {
+        if self.plan_form_target == key {
+            Some((&mut self.plan_form, &mut self.plan_approval_pending))
+        } else {
+            self.plan_forms
+                .get_mut(&key)
+                .map(|(form, pending)| (form, pending))
+        }
+    }
+
+    pub(super) fn plan_picker_edits(&self, key: Option<AgentId>) -> bool {
+        self.model_picker_purpose == ModelPickerPurpose::PlanImplementation
+            && self.plan_form_target == key
+    }
+
+    fn plan_form_active(&self) -> bool {
+        self.focused_plan_path().is_some() && self.plan_form.is_visible()
+    }
+
+    pub(crate) fn update_model(&mut self, model: &Model) {
+        self.state.update_model(model);
+        persist_model(&self.storage, &self.state.session.model);
+    }
+
+    pub(crate) fn record_recent_model(&mut self, spec: &str) {
+        let recents = makima_storage::model::push_recent(&self.storage, spec)
+            .into_iter()
+            .filter(|spec| self.model_policy.allows(spec))
+            .collect();
+        self.model_picker.set_recents(recents);
+    }
+
+    pub(crate) fn flash(&mut self, msg: String) {
+        self.status_bar.flash(msg);
+    }
+
+    pub(crate) fn fire_session_autocmd(&self, event: &str, mut data: serde_json::Value) {
+        if let Some(map) = data.as_object_mut() {
+            map.insert(
+                "session_id".into(),
+                serde_json::Value::String(self.state.session.id.to_string()),
+            );
+        }
+        self.lua_event_handle.fire_autocmd(event, data);
+    }
+
+    pub(crate) fn attention(&self) -> Option<Notification> {
+        if self.permission_active() {
+            let tool = self
+                .permission_prompt
+                .tool()
+                .filter(|t| !matches!(t, ToolKey::Wildcard))
+                .and_then(|t| normalize_preview(&t.to_string()));
+            return Some(Notification::PermissionRequested { tool });
+        }
+        if matches!(self.pending_input, PendingInput::AuthRetry { .. }) {
+            return Some(Notification::AuthenticationRequired);
+        }
+        if self.status != Status::Streaming && self.plan_form_active() {
+            return Some(Notification::PlanReady);
+        }
+        self.question_active()
+            .then_some(Notification::QuestionRequested)
+    }
+
+    pub fn tick_error_expiry(&mut self) -> Dirty {
+        if !self.status.is_error_expired() {
+            return Dirty::NO;
+        }
+        self.status = Status::Idle;
+        Dirty::YES
+    }
+
+    pub fn poll_login_picker(&mut self) -> (Dirty, Vec<Action>) {
+        let (dirty, action) = self.login_picker.poll();
+        let actions = action.map_or_else(Vec::new, |action| self.login_picker_actions(action));
+        (dirty, actions)
+    }
+
+    fn login_picker_actions(&self, action: LoginPickerAction) -> Vec<Action> {
+        match action {
+            LoginPickerAction::Consumed | LoginPickerAction::Close => vec![],
+            LoginPickerAction::Authenticated { model_spec } => {
+                vec![Action::ChangeModel(model_spec), Action::RefreshModels]
+            }
+            LoginPickerAction::Configured { slug } => {
+                vec![Action::RefreshProvider { slug }, Action::RefreshModels]
+            }
+        }
+    }
+
+    fn active_chat(&mut self) -> &mut Chat {
+        &mut self.chats[self.active_chat]
+    }
+
+    pub(crate) fn win_view(&self) -> WinView {
+        self.chats[self.active_chat].win_view()
+    }
+
+    pub(crate) fn set_scroll_top(&mut self, top: u16) {
+        self.active_chat().set_scroll_top(top);
+    }
+
+    fn clear_selection_unless_pending_copy(&mut self) {
+        if !self
+            .selection_state
+            .as_ref()
+            .is_some_and(|s| s.is_pending_copy())
+        {
+            self.selection_state = None;
+        }
+    }
+
+    pub(crate) fn sync_focused_queue(&mut self) {
+        self.sync_focused_plan_form();
+        let id = self.selected_agent_id();
+        let actor = self
+            .command_runtime
+            .target_agent(&self.command_target)
+            .filter(|target| Some(target.id()) == id)
+            .and_then(|target| target.actor().ok());
+        self.queue.select(id, !self.is_main_chat(), actor);
+    }
+
+    pub fn update(&mut self, msg: Msg) -> Vec<Action> {
+        self.sync_focused_queue();
+        match &msg {
+            Msg::Key(key) if key.kind == CrosstermKeyEventKind::Release => return vec![],
+            Msg::Key(key) => {
+                let active = self.middle_scroll.is_some();
+                let dirty = self.cancel_middle_scroll();
+                self.pending_dirty |= dirty;
+                if active && key.code == KeyCode::Esc {
+                    return vec![];
+                }
+            }
+            Msg::Paste(_) | Msg::Scroll { .. } => {
+                let dirty = self.cancel_middle_scroll();
+                self.pending_dirty |= dirty;
+            }
+            _ => {}
+        }
+        let actions = match msg {
+            Msg::Key(key) => {
+                self.last_input = Some(Instant::now());
+                self.handle_key(key)
+            }
+            Msg::Paste(text) => {
+                self.last_input = Some(Instant::now());
+                let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                self.route_paste(&text);
+                vec![]
+            }
+            Msg::Mouse(event) => {
+                let (dirty, actions) = self.handle_mouse(event);
+                self.pending_dirty |= dirty;
+                actions
+            }
+            Msg::Scroll { column, row, delta } => {
+                self.handle_scroll(column, row, delta);
+                vec![]
+            }
+            Msg::Agent(envelope) => self.handle_agent_event(*envelope),
+        };
+        self.sync_plan_form_target();
+        // A modal-closing key or an answered permission yields the next demand
+        // immediately, rather than waiting for the next 100ms tick.
+        let dirty = self.promote_deferred_if_ready();
+        self.pending_dirty |= dirty;
+        if self.has_modal_overlay() || self.permission_active() {
+            self.menu.close();
+        }
+        let dirty = self.validate_middle_scroll();
+        self.pending_dirty |= dirty;
+        let dirty = self.validate_scroll_drag();
+        self.pending_dirty |= dirty;
+        actions
+    }
+
+    fn send_answer(&self, answer: String) {
+        if let Some(tx) = &self.answer_tx {
+            let _ = tx.try_send(answer);
+        }
+    }
+
+    fn active_subagent_closed(&self) -> bool {
+        if !self.is_main_chat() && self.selected_agent_id().is_none() {
+            return true;
+        }
+        self.chats
+            .get(self.active_chat)
+            .and_then(|chat| chat.agent_id)
+            .and_then(|agent_id| self.subagent_channels.get(&agent_id))
+            .is_some_and(|channels| channels.closed)
+    }
+
+    fn send_to_agent(&self, agent_id: Option<makima_agent::AgentId>, answer: String) {
+        let routed = agent_id
+            .and_then(|id| self.subagent_channels.get(&id))
+            .and_then(|channels| channels.answer_tx.as_ref());
+        if let Some(tx) = routed {
+            let _ = tx.try_send(answer);
+        } else {
+            self.send_answer(answer);
+        }
+    }
+
+    pub(super) fn scroll_content_len(&self, owner: ScrollOwner) -> Option<u16> {
+        match owner {
+            ScrollOwner::Messages => Some(self.chats[self.resolve_render_chat()].content_len()),
+            ScrollOwner::Input => Some(self.input_box.content_len()),
+            ScrollOwner::Picker(picker) => match picker {
+                PickerId::Model => self.model_picker.content_len(),
+                PickerId::Task => self
+                    .task_picker
+                    .is_open()
+                    .then(|| self.task_picker.content_len())
+                    .flatten(),
+                PickerId::Theme => self.theme_picker.content_len(),
+                PickerId::Rewind => self.rewind_picker.content_len(),
+                PickerId::Login => self.login_picker.content_len(),
+                PickerId::Mcp => self.mcp_picker.content_len(),
+                PickerId::Lua => self.lua_picker.content_len(),
+                PickerId::Search => self
+                    .search_modal
+                    .is_open()
+                    .then(|| self.search_modal.content_len()),
+                PickerId::File => self.file_picker.content_len(),
+            },
+            ScrollOwner::Help => self
+                .help_modal
+                .is_open()
+                .then(|| self.help_modal.content_len()),
+            ScrollOwner::Btw => self
+                .btw_modal
+                .is_open()
+                .then(|| self.btw_modal.content_len()),
+            ScrollOwner::Float(id) => self.float_mgr.content_len(id),
+        }
+    }
+
+    pub(super) fn scroll_line(&self, owner: ScrollOwner) -> u16 {
+        match owner {
+            ScrollOwner::Messages => self.chats[self.resolve_render_chat()].scroll_top(),
+            ScrollOwner::Input => self.input_box.scroll_y(),
+            ScrollOwner::Picker(picker) => match picker {
+                PickerId::Model => self.model_picker.scroll_line().unwrap_or(0),
+                PickerId::Task => self.task_picker.scroll_line(),
+                PickerId::Theme => self.theme_picker.scroll_line().unwrap_or(0),
+                PickerId::Rewind => self.rewind_picker.scroll_line().unwrap_or(0),
+                PickerId::Login => self.login_picker.scroll_line().unwrap_or(0),
+                PickerId::Mcp => self.mcp_picker.scroll_line().unwrap_or(0),
+                PickerId::Lua => self.lua_picker.scroll_line().unwrap_or(0),
+                PickerId::Search => self.search_modal.scroll_line(),
+                PickerId::File => self.file_picker.scroll_line(),
+            },
+            ScrollOwner::Help => self.help_modal.scroll_line(),
+            ScrollOwner::Btw => self.btw_modal.scroll_line(),
+            ScrollOwner::Float(id) => self.float_mgr.scroll_line(id).unwrap_or(0),
+        }
+    }
+
+    pub(super) fn scroll_owner_to(&mut self, owner: ScrollOwner, line: u16) {
+        let chat = self.resolve_render_chat();
+        match owner {
+            ScrollOwner::Messages => self.chats[chat].scroll_to_line(line),
+            ScrollOwner::Input => self.input_box.scroll_to_line(line),
+            ScrollOwner::Picker(picker) => match picker {
+                PickerId::Model => self.model_picker.scroll_to_line(line),
+                PickerId::Task => self.task_picker.scroll_to_line(line),
+                PickerId::Theme => self.theme_picker.scroll_to_line(line),
+                PickerId::Rewind => self.rewind_picker.scroll_to_line(line),
+                PickerId::Login => self.login_picker.scroll_to_line(line),
+                PickerId::Mcp => self.mcp_picker.scroll_to_line(line),
+                PickerId::Lua => self.lua_picker.scroll_to_line(line),
+                PickerId::Search => self.search_modal.scroll_to_line(line),
+                PickerId::File => self.file_picker.scroll_to_line(line),
+            },
+            ScrollOwner::Help => self.help_modal.scroll_to_line(line),
+            ScrollOwner::Btw => self.btw_modal.scroll_to_line(line),
+            ScrollOwner::Float(id) => self.float_mgr.scroll_to_line(id, line),
+        }
+    }
+
+    fn answer_permission(&mut self, answer: makima_agent::permissions::PermissionAnswer) {
+        let agent_id = self.permission_prompt.agent_id();
+        let request_id = self.permission_prompt.request_id().unwrap_or_default();
+        let encoded = makima_agent::permissions::TaggedAnswer::new(request_id, answer).encode();
+        self.permission_prompt.close();
+        self.send_to_agent(agent_id, encoded);
+    }
+
+    pub(super) fn dispatch_click(&mut self, target: ClickTarget, pos: Position) -> Vec<Action> {
+        match target {
+            ClickTarget::DeferInput => {
+                self.toggle_defer_input();
+                vec![]
+            }
+            ClickTarget::KeyHint(key) => match self.hits.surface_at(pos) {
+                Some(Surface::Picker(picker)) => self.handle_picker_key(picker, key),
+                Some(Surface::Plan) => self.handle_key(key),
+                _ => vec![],
+            },
+            ClickTarget::PermissionChip => {
+                self.toggle_permission_menu();
+                vec![]
+            }
+            ClickTarget::PickerInput(picker) => {
+                match picker {
+                    PickerId::Model => self.model_picker.click_input(pos),
+                    PickerId::Task => self.task_picker.click_input(pos),
+                    PickerId::Theme => self.theme_picker.click_input(pos),
+                    PickerId::Rewind => self.rewind_picker.click_input(pos),
+                    PickerId::Login => self.login_picker.click_input(pos),
+                    PickerId::Mcp => self.mcp_picker.click_input(pos),
+                    PickerId::Lua => self.lua_picker.click_input(pos),
+                    PickerId::Search => self.search_modal.click_input(pos),
+                    PickerId::File => self.file_picker.click_input(pos),
+                };
+                vec![]
+            }
+            ClickTarget::ModeChip => {
+                self.toggle_mode_menu();
+                vec![]
+            }
+            ClickTarget::ThinkingChip => {
+                self.toggle_thinking_menu();
+                vec![]
+            }
+            ClickTarget::ModelChip => {
+                if self.plan_approval_pending {
+                    vec![]
+                } else if self.plan_form_active() {
+                    self.handle_plan_form_action(PlanFormAction::OpenModelPicker)
+                } else {
+                    self.run_builtin(BuiltinAction::ModelPicker)
+                }
+            }
+            ClickTarget::AgentChip | ClickTarget::TasksHint => {
+                self.run_builtin(BuiltinAction::Tasks)
+            }
+            ClickTarget::AutoScrollChip => {
+                self.active_chat().enable_auto_scroll();
+                vec![]
+            }
+            ClickTarget::StatusEntry(id) => {
+                self.lua_event_handle.click_region(id);
+                vec![]
+            }
+            ClickTarget::WindowFooter { id, index } => {
+                self.float_mgr.click_footer(id, index);
+                vec![]
+            }
+            ClickTarget::WindowContent(id) | ClickTarget::WindowChrome(id) => {
+                self.float_mgr.click_at(id, pos);
+                vec![]
+            }
+            ClickTarget::PermissionHint { row, cell } => {
+                if let Some(answer) = self.permission_prompt.click_hint(row, cell) {
+                    self.answer_permission(answer);
+                }
+                vec![]
+            }
+            ClickTarget::PermissionGuidance => {
+                self.permission_prompt.click_guidance(pos);
+                vec![]
+            }
+            ClickTarget::CompletionRow { grid, index } => {
+                let selected = match grid {
+                    CompletionGrid::PaletteCommands => self.command_palette.select_command(index),
+                    CompletionGrid::PaletteArguments => self.command_palette.select_argument(index),
+                    CompletionGrid::PaletteGrid => self.command_palette.select_grid(index),
+                    CompletionGrid::FileCompletion => self.file_completion.select_grid(index),
+                };
+                if selected {
+                    self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                } else {
+                    vec![]
+                }
+            }
+            ClickTarget::PlanRow(row) => {
+                if !self.plan_approval_pending && self.plan_form.select_row(row as usize) {
+                    self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                } else {
+                    vec![]
+                }
+            }
+            ClickTarget::QueueRow(index) => {
+                if self.queue.focus() == Some(index) {
+                    self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                } else {
+                    self.queue.set_focus_at(index);
+                    vec![]
+                }
+            }
+            ClickTarget::PickerRow { picker, index } => {
+                if self.select_picker_row(picker, index) {
+                    self.handle_picker_key(
+                        picker,
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    )
+                } else {
+                    vec![]
+                }
+            }
+            ClickTarget::MenuRow(index) => {
+                let action = self.menu.click_row(index as usize);
+                if let Some(action) = action {
+                    self.menu.close();
+                    self.apply_menu_action(action)
+                } else {
+                    vec![]
+                }
+            }
+            _ => vec![],
+        }
+    }
+
+    fn handle_picker_key(&mut self, picker: PickerId, key: KeyEvent) -> Vec<Action> {
+        match picker {
+            PickerId::Lua => match self.lua_picker.handle_key(key) {
+                LuaPickerAction::Confirming(msg) => {
+                    self.flash(msg);
+                    vec![]
+                }
+                LuaPickerAction::Consumed
+                | LuaPickerAction::Choice(..)
+                | LuaPickerAction::Delete(..)
+                | LuaPickerAction::Close => vec![],
+            },
+            PickerId::Search => {
+                match self.search_modal.handle_key(key) {
+                    SearchAction::Consumed => self.refresh_search_matches(),
+                    SearchAction::Navigate => {
+                        sync_search_highlight(
+                            &self.search_modal,
+                            &mut self.chats[self.active_chat],
+                        );
+                    }
+                    SearchAction::Select(idx) => {
+                        let chat = &mut self.chats[self.active_chat];
+                        chat.scroll_to_segment(idx);
+                        chat.set_highlight_segment(None);
+                        self.search_modal.close();
+                    }
+                    SearchAction::Close(saved) => {
+                        let chat = &mut self.chats[self.active_chat];
+                        chat.set_highlight_segment(None);
+                        if let Some((top, auto)) = saved {
+                            chat.restore_scroll(top, auto);
+                        }
+                        self.search_modal.close();
+                    }
+                }
+                vec![]
+            }
+            PickerId::File => match self.file_picker.handle_key(key) {
+                FilePickerModalAction::Consumed => vec![],
+                FilePickerModalAction::Select(path) => {
+                    self.file_picker.close();
+                    if let InputAction::PaletteSync(val) =
+                        self.input_box.handle_paste_with_spaces(&path)
+                    {
+                        self.pending_dirty |= self.command_palette.sync(&val);
+                        self.sync_command_arguments(
+                            &val,
+                            self.input_box.buffer.cursor_byte_offset(),
+                        );
+                        self.sync_file_completion();
+                    }
+                    vec![]
+                }
+                FilePickerModalAction::Close => {
+                    self.file_picker.close();
+                    vec![]
+                }
+            },
+            PickerId::Task => {
+                if key::TASKS.matches(key) {
+                    self.task_picker.close();
+                    return vec![];
+                }
+                match self.task_picker.handle_key(key) {
+                    PickerAction::Consumed
+                    | PickerAction::Toggle(..)
+                    | PickerAction::Delete(..) => {
+                        vec![]
+                    }
+                    PickerAction::Select(entry) => {
+                        self.task_picker_original = None;
+                        self.active_chat = entry.chat_index;
+                        vec![]
+                    }
+                    PickerAction::Close => {
+                        self.active_chat = self.task_picker_original.take().unwrap_or(0);
+                        vec![]
+                    }
+                }
+            }
+            PickerId::Rewind => match self.rewind_picker.handle_key(key) {
+                RewindPickerAction::Consumed => vec![],
+                RewindPickerAction::Select(entry) => self.rewind_to(entry),
+                RewindPickerAction::Close => vec![],
+            },
+            PickerId::Theme => match self.theme_picker.handle_key(key) {
+                ThemePickerAction::Consumed => vec![],
+                ThemePickerAction::Closed => vec![],
+            },
+            PickerId::Model => self.handle_model_picker_key(key),
+            PickerId::Login => {
+                let action = self.login_picker.handle_key(key);
+                self.login_picker_actions(action)
+            }
+            PickerId::Mcp => match self.mcp_picker.handle_key(key) {
+                McpPickerAction::Consumed => vec![],
+                McpPickerAction::Toggle {
+                    server_name,
+                    enabled,
+                } => {
+                    vec![Action::ToggleMcp(server_name, enabled)]
+                }
+                McpPickerAction::Close => vec![],
+            },
+        }
+    }
+
+    fn select_picker_row(&mut self, picker: PickerId, index: usize) -> bool {
+        match picker {
+            PickerId::Model => self.model_picker.select(index),
+            PickerId::Task => self.task_picker.select(index),
+            PickerId::Theme => self.theme_picker.select(index),
+            PickerId::Rewind => self.rewind_picker.select(index),
+            PickerId::Login => self.login_picker.click_row(index),
+            PickerId::Mcp => self.mcp_picker.select(index),
+            PickerId::Lua => self.lua_picker.select(index),
+            PickerId::Search => self.search_modal.select(index),
+            PickerId::File => self.file_picker.select(index),
+        }
+    }
+
+    fn apply_menu_action(&mut self, action: MenuAction) -> Vec<Action> {
+        match action {
+            MenuAction::Permission(enabled) => {
+                if self.coordinator.is_none() {
+                    self.permissions.set_yolo(enabled);
+                    self.apply_toggled_option(
+                        makima_agent::session_options::YOLO_OPTION_ID,
+                        enabled,
+                    );
+                    vec![]
+                } else {
+                    vec![Action::SetSessionOption {
+                        id: makima_agent::session_options::YOLO_OPTION_ID,
+                        enabled,
+                    }]
+                }
+            }
+            MenuAction::Mode(key) => vec![Action::ChangeMode(key)],
+            MenuAction::Thinking(thinking) => {
+                vec![Action::SelectModel(makima_commands::ModelSelection {
+                    spec: None,
+                    thinking: Some(thinking),
+                    fast: None,
+                })]
+            }
+        }
+    }
+
+    fn toggle_permission_menu(&mut self) {
+        if self.menu.kind() == Some(MenuKind::Permission) {
+            self.menu.close();
+            return;
+        }
+        let Some(anchor) = self.hits.rect_of(ClickTarget::PermissionChip) else {
+            return;
+        };
+        self.menu
+            .open_permission(anchor, self.permissions.is_yolo());
+    }
+
+    fn toggle_mode_menu(&mut self) {
+        if self.menu.kind() == Some(MenuKind::Mode) {
+            self.menu.close();
+            return;
+        }
+        let Some(anchor) = self.hits.rect_of(ClickTarget::ModeChip) else {
+            return;
+        };
+        let registry = self.lua_event_handle.mode_registry();
+        let current = self.focused_mode().def(&registry).id.key().to_owned();
+        let mut defs = registry.list();
+        defs.sort_by(|a, b| {
+            let rank = |id: &makima_agent::ModeId| match id {
+                makima_agent::ModeId::Build => 0,
+                makima_agent::ModeId::Plan => 1,
+                makima_agent::ModeId::Custom(_) => 2,
+            };
+            rank(&a.id)
+                .cmp(&rank(&b.id))
+                .then_with(|| a.label.cmp(&b.label))
+        });
+        let items = defs
+            .into_iter()
+            .map(|def| {
+                let key = def.id.key().to_owned();
+                MenuItem {
+                    current: key == current,
+                    label: def.label.to_string(),
+                    action: MenuAction::Mode(key),
+                }
+            })
+            .collect();
+        self.menu.open(MenuKind::Mode, anchor, items);
+    }
+
+    fn toggle_thinking_menu(&mut self) {
+        if self.menu.kind() == Some(MenuKind::Thinking) {
+            self.menu.close();
+            return;
+        }
+        let Some(anchor) = self.hits.rect_of(ClickTarget::ThinkingChip) else {
+            return;
+        };
+        let current = self.displayed_config(self.active_chat).options().thinking;
+        let items = ThinkingConfig::options()
+            .iter()
+            .filter_map(|option| {
+                option
+                    .parse::<ThinkingConfig>()
+                    .ok()
+                    .map(|thinking| (*option, thinking))
+            })
+            .map(|(label, thinking)| MenuItem {
+                current: thinking == current,
+                label: label.to_string(),
+                action: MenuAction::Thinking(thinking),
+            })
+            .collect();
+        self.menu.open(MenuKind::Thinking, anchor, items);
+    }
+
+    fn scroll_surface(&mut self, surface: Surface, delta: i32) {
+        match surface {
+            Surface::Picker(PickerId::Model) => self.model_picker.scroll(delta),
+            Surface::Picker(PickerId::Task) => self.task_picker.scroll(delta),
+            Surface::Picker(PickerId::Theme) => self.theme_picker.scroll(delta),
+            Surface::Picker(PickerId::Rewind) => self.rewind_picker.scroll(delta),
+            Surface::Picker(PickerId::Login) => self.login_picker.scroll(delta),
+            Surface::Picker(PickerId::Mcp) => self.mcp_picker.scroll(delta),
+            Surface::Picker(PickerId::Lua) => self.lua_picker.scroll(delta),
+            Surface::Picker(PickerId::Search) => self.search_modal.scroll(delta),
+            Surface::Picker(PickerId::File) => self.file_picker.scroll(delta),
+            Surface::Help => self.help_modal.scroll(delta),
+            Surface::Btw => self.btw_modal.scroll(delta),
+            Surface::Float(id) => self.float_mgr.scroll_window(id, delta),
+            _ => {}
+        }
+    }
+
+    fn scroll_at(&mut self, column: u16, row: u16, delta: i32) -> Option<SelectionZone> {
+        let pos = Position::new(column, row);
+        if let Some(surface) = self.hits.scroll_surface_at(pos) {
+            self.scroll_surface(surface, delta);
+            return None;
+        }
+        let zone = [SelectionZone::Input, SelectionZone::Messages]
+            .into_iter()
+            .find(|&zone| {
+                self.zones
+                    .find(zone)
+                    .is_some_and(|entry| entry.area.contains(pos))
+            })?;
+        self.scroll_zone(zone, delta);
+        Some(zone)
+    }
+
+    fn task_entries(&self) -> Vec<TaskEntry> {
+        let mut entries: Vec<TaskEntry> = self
+            .chats
+            .iter()
+            .enumerate()
+            .map(|(chat_index, chat)| TaskEntry {
+                name: chat.name.clone(),
+                finished: (chat_index > 0).then_some(chat.is_finished()),
+                chat_index,
+                identity: if chat_index == 0 {
+                    TaskIdentity::Main
+                } else if let Some(agent_id) = chat.agent_id {
+                    TaskIdentity::Agent(agent_id)
+                } else if let Some(subagent_id) = &chat.subagent_id {
+                    TaskIdentity::Restored(subagent_id.clone())
+                } else {
+                    TaskIdentity::Unidentified(chat_index)
+                },
+                parent_chat_index: chat.parent_agent_id.and_then(|parent_id| {
+                    self.chats
+                        .iter()
+                        .position(|parent| parent.agent_id == Some(parent_id))
+                }),
+                depth: 0,
+                snippet: if chat_index == 0 {
+                    String::new()
+                } else {
+                    truncate_snippet(chat.last_message_text())
+                },
+                context: if chat_index > 0 && chat.context_size > 0 {
+                    format_tokens(chat.context_size)
+                } else {
+                    String::new()
+                },
+                started_at: (chat_index > 0).then_some(chat.started_at()).flatten(),
+            })
+            .collect();
+        entries[1..].sort_by(|a, b| {
+            a.is_finished()
+                .cmp(&b.is_finished())
+                .then_with(|| b.started_at.cmp(&a.started_at))
+        });
+        Self::order_task_hierarchy(entries)
+    }
+
+    fn order_task_hierarchy(mut entries: Vec<TaskEntry>) -> Vec<TaskEntry> {
+        fn append_subtree(
+            mut entry: TaskEntry,
+            depth: usize,
+            remaining: &mut Vec<TaskEntry>,
+            ordered: &mut Vec<TaskEntry>,
+        ) {
+            entry.depth = depth;
+            let parent = entry.chat_index;
+            ordered.push(entry);
+            while let Some(index) = remaining
+                .iter()
+                .position(|entry| entry.parent_chat_index == Some(parent))
+            {
+                let child = remaining.remove(index);
+                append_subtree(child, depth + 1, remaining, ordered);
+            }
+        }
+
+        let mut ordered = Vec::with_capacity(entries.len());
+        while !entries.is_empty() {
+            let index = entries
+                .iter()
+                .position(|entry| entry.parent_chat_index.is_none())
+                .unwrap_or(0);
+            let root = entries.remove(index);
+            append_subtree(root, 0, &mut entries, &mut ordered);
+        }
+        ordered
+    }
+
+    fn open_tasks(&mut self) {
+        self.task_picker_original = Some(self.active_chat);
+        self.task_picker.open(self.task_entries(), " Tasks ");
+        self.task_picker
+            .select_item_by(|entry| entry.chat_index == self.active_chat);
+    }
+
+    fn sync_task_picker(&mut self) {
+        if !self.task_picker.is_open() {
+            return;
+        }
+        let selected = self
+            .task_picker
+            .selected_item()
+            .map(|entry| entry.identity.clone());
+        let previous = self
+            .task_picker
+            .items()
+            .unwrap_or_default()
+            .iter()
+            .map(|entry| entry.identity.clone())
+            .collect::<Vec<_>>();
+        self.task_picker.replace_items_preserving_order(
+            Self::reconcile_task_entries(&previous, self.task_entries()),
+            |previous, current| previous.identity == current.identity,
+        );
+        if let Some(identity) = selected {
+            self.task_picker
+                .select_item_by(|entry| entry.identity == identity);
+        }
+    }
+
+    fn reconcile_task_entries(
+        previous: &[TaskIdentity],
+        mut current: Vec<TaskEntry>,
+    ) -> Vec<TaskEntry> {
+        let mut ordered = Vec::with_capacity(current.len());
+        for identity in previous {
+            if let Some(index) = current.iter().position(|entry| &entry.identity == identity) {
+                ordered.push(current.remove(index));
+            }
+        }
+        ordered.extend(current);
+        Self::order_task_hierarchy(ordered)
+    }
+
+    fn sync_command_arguments(&mut self, input: &str, cursor: usize) {
+        self.command_palette
+            .set_cwd(Arc::from(self.focused_cwd().to_string_lossy().as_ref()));
+        if self
+            .command_palette
+            .sync_arguments(input, cursor, &self.focused_mode().id_key())
+        {
+            self.command_runtime
+                .finish_theme_preview(self.command_target.id(), false);
+        }
+    }
+
+    fn close_command_palette(&mut self) {
+        if self.command_palette.has_accepted_argument() {
+            self.command_runtime
+                .finish_theme_preview(self.command_target.id(), false);
+        }
+        self.command_palette.close();
+    }
+
+    #[cfg(test)]
+    fn rotate_command_target(&mut self) {
+        self.command_runtime
+            .finish_theme_preview(self.command_target.id(), false);
+        self.command_palette.close();
+        self.command_target = self.command_runtime.bind_target();
+        self.command_palette = CommandPalette::with_defaults(
+            self.command_runtime.registry.clone(),
+            self.command_target.clone(),
+            command_palette_defaults(&self.command_runtime),
+            Arc::from(self.state.session.cwd.as_str()),
+        );
+    }
+
+    fn handle_ctrl(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
+        if !is_ctrl(&key) {
+            return None;
+        }
+        if key::QUIT.matches(key) {
+            self.close_command_palette();
+            self.sync_file_completion();
+            return Some(if self.input_box.is_empty() {
+                if self.focused_streaming() {
+                    return Some(self.handle_cancel());
+                }
+                self.quit()
+            } else {
+                self.input_box.discard();
+                vec![]
+            });
+        }
+        if key::HELP.matches(key) {
+            return Some(self.run_builtin(BuiltinAction::Help));
+        }
+        if key::TASKS.matches(key) {
+            return Some(self.run_builtin(BuiltinAction::Tasks));
+        }
+        if key::SCROLL_HALF_UP.matches(key) {
+            let half = self.chats[self.active_chat].half_page();
+            self.active_chat().scroll(half);
+            return Some(vec![]);
+        }
+        if key::SCROLL_HALF_DOWN.matches(key) {
+            let half = self.chats[self.active_chat].half_page();
+            self.active_chat().scroll(-half);
+            return Some(vec![]);
+        }
+        if key::SCROLL_TOP.matches(key) {
+            self.active_chat().scroll_to_top();
+            return Some(vec![]);
+        }
+        if key::SCROLL_BOTTOM.matches(key) {
+            self.active_chat().enable_auto_scroll();
+            return Some(vec![]);
+        }
+        None
+    }
+
+    fn dispatch_overlay(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
+        // Alt+M hides the active permission/ask surface and returns focus to
+        // the input box; pressed again while a demand is held it restores it.
+        // It is still consumed when neither side of the toggle applies.
+        if key::DEFER_INPUT.matches(key) {
+            self.toggle_defer_input();
+            return Some(vec![]);
+        }
+
+        if self.permission_active() {
+            if let Some(answer) = self.permission_prompt.handle_key(key) {
+                self.answer_permission(answer);
+            }
+            return Some(vec![]);
+        }
+
+        if self.menu.is_open() && !self.has_modal_overlay() {
+            match key.code {
+                KeyCode::Up => {
+                    self.menu.up();
+                    return Some(vec![]);
+                }
+                KeyCode::Down => {
+                    self.menu.down();
+                    return Some(vec![]);
+                }
+                KeyCode::Enter => {
+                    if let Some(action) = self.menu.take_action() {
+                        self.menu.close();
+                        return Some(self.apply_menu_action(action));
+                    }
+                    return Some(vec![]);
+                }
+                KeyCode::Esc => {
+                    self.menu.close();
+                    return Some(vec![]);
+                }
+                _ => self.menu.close(),
+            }
+        }
+
+        if self.help_modal.is_open() {
+            self.help_modal.handle_key(key);
+            return Some(vec![]);
+        }
+        if self.btw_modal.is_open() {
+            self.btw_modal.handle_key(key);
+            return Some(vec![]);
+        }
+        if self.float_mgr.is_focused() && self.float_mgr.handle_key(key) {
+            return Some(vec![]);
+        }
+
+        if self.plan_approval_pending {
+            return Some(if key.code == KeyCode::Esc || key::QUIT.matches(key) {
+                vec![Action::CancelPlanApproval]
+            } else {
+                vec![]
+            });
+        }
+
+        if self.model_picker.is_open() && self.plan_form_active() {
+            return Some(self.handle_model_picker_key(key));
+        }
+
+        // plan_form is non-modal: Passthrough falls through to the rest of dispatch
+        if self.plan_form_active() {
+            let model = self.focused_model_spec();
+            self.plan_form.clear_model_if_current(&model);
+            let action = self.plan_form.handle_key(key);
+            if action != PlanFormAction::Passthrough {
+                return Some(self.handle_plan_form_action(action));
+            }
+        }
+
+        if self.lua_picker.is_open() {
+            return Some(self.handle_picker_key(PickerId::Lua, key));
+        }
+
+        if !self.permission_active() && self.float_mgr.handle_key(key) {
+            return Some(vec![]);
+        }
+
+        if self.search_modal.is_open() {
+            return Some(self.handle_picker_key(PickerId::Search, key));
+        }
+
+        if self.file_picker.is_open() {
+            return Some(self.handle_picker_key(PickerId::File, key));
+        }
+
+        if self.queue.focus().is_some() {
+            match key.code {
+                KeyCode::Up => self.queue.move_focus_up(),
+                KeyCode::Down => self.queue.move_focus_down(),
+                KeyCode::Enter => {
+                    self.queue.remove_focused();
+                }
+                KeyCode::Esc => self.queue.unfocus(),
+                _ if key::QUIT.matches(key) => self.queue.unfocus(),
+                _ if key::POP_QUEUE.matches(key) => {
+                    self.queue.pop_newest();
+                }
+                _ => {}
+            }
+            return Some(vec![]);
+        }
+
+        if self.task_picker.is_open() {
+            return Some(self.handle_picker_key(PickerId::Task, key));
+        }
+
+        if self.rewind_picker.is_open() {
+            return Some(self.handle_picker_key(PickerId::Rewind, key));
+        }
+
+        if self.theme_picker.is_open() {
+            return Some(self.handle_picker_key(PickerId::Theme, key));
+        }
+
+        if self.model_picker.is_open() {
+            return Some(self.handle_picker_key(PickerId::Model, key));
+        }
+
+        if self.login_picker.is_open() {
+            return Some(self.handle_picker_key(PickerId::Login, key));
+        }
+
+        if self.mcp_picker.is_open() {
+            return Some(self.handle_picker_key(PickerId::Mcp, key));
+        }
+
+        if key::PLAN_TOGGLE.matches(key) && self.plan_toggle_ready() {
+            return Some(self.run_builtin(BuiltinAction::PlanToggle));
+        }
+
+        None
+    }
+
+    pub(crate) fn project_model_discovery(&mut self, specs: Vec<String>) {
+        self.model_picker_models.store(Some(Arc::new(specs)));
+        self.command_palette.refresh_model_arguments();
+        self.pending_dirty |= self.model_picker.refresh();
+    }
+
+    pub(crate) fn open_pinned_model_picker(
+        &mut self,
+        target: AgentRef,
+    ) -> Result<(), CommandError> {
+        target
+            .validate_live()
+            .map_err(|_| CommandError::StaleTarget)?;
+        let config = target
+            .effective_config()
+            .map_err(|_| CommandError::StaleTarget)?
+            .ok_or(CommandError::StaleTarget)?;
+        self.model_picker_purpose = ModelPickerPurpose::Session;
+        self.model_picker_target = Some(target);
+        self.model_picker.open(
+            config.model_selection(),
+            ModelCapabilities::from(&config.model),
+            &ModelSelection::default(),
+        );
+        Ok(())
+    }
+
+    fn open_model_picker(&mut self, purpose: ModelPickerPurpose) {
+        if purpose == ModelPickerPurpose::Session
+            && let Some(target) = self.command_runtime.target_agent(&self.command_target)
+        {
+            if let Err(error) = self.open_pinned_model_picker(target) {
+                self.close_model_picker();
+                self.flash(error.to_string());
+            }
+            return;
+        }
+        if purpose == ModelPickerPurpose::Session
+            && (self.selected_agent_id().is_some() || self.coordinator.is_some())
+        {
+            self.close_model_picker();
+            self.flash(CommandError::StaleTarget.to_string());
+            return;
+        }
+        let config = self.focused_config().unwrap_or_else(|| self.root_config());
+        let draft = match purpose {
+            ModelPickerPurpose::PlanImplementation => {
+                self.plan_form.implementation_selection().clone()
+            }
+            ModelPickerPurpose::Session => ModelSelection::default(),
+        };
+        self.model_picker_target = None;
+        self.model_picker_purpose = purpose;
+        self.model_picker.open(
+            config.model_selection(),
+            ModelCapabilities::from(&config.model),
+            &draft,
+        );
+    }
+
+    /// Closes the picker and retires its purpose together, so the open state
+    /// and the purpose can never disagree.
+    fn close_model_picker(&mut self) {
+        self.model_picker.close();
+        self.model_picker_purpose = ModelPickerPurpose::Session;
+        self.model_picker_target = None;
+    }
+
+    fn handle_model_picker_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        match self.model_picker.handle_key(key) {
+            ModelPickerAction::Consumed => vec![],
+            ModelPickerAction::Select(selection) => {
+                let purpose = self.model_picker_purpose;
+                let target = self.model_picker_target.clone();
+                self.close_model_picker();
+                if purpose == ModelPickerPurpose::PlanImplementation {
+                    self.plan_form.set_implementation_selection(selection);
+                    vec![]
+                } else if let Some(target) = target {
+                    vec![Action::SelectPinnedModel { target, selection }]
+                } else {
+                    vec![Action::SelectModel(selection)]
+                }
+            }
+            ModelPickerAction::AssignTier(spec, tier) => vec![Action::AssignTier(spec, tier)],
+            ModelPickerAction::UnassignTier(spec, tier) => vec![Action::UnassignTier(spec, tier)],
+            ModelPickerAction::Close => {
+                self.close_model_picker();
+                vec![]
+            }
+        }
+    }
+
+    fn plan_toggle_ready(&self) -> bool {
+        if self.is_main_chat() {
+            self.root_mode() == Mode::Plan && self.state.plan.is_ready()
+        } else {
+            self.focused_plan_path().is_some() && self.plan_form.is_visible()
+        }
+    }
+
+    fn plan_submit_active(&self) -> bool {
+        if self.focused_plan_path().is_none() {
+            return false;
+        }
+        let def = self
+            .focused_config()
+            .and_then(|config| config.mode_def.clone())
+            .unwrap_or_else(|| {
+                self.focused_mode()
+                    .def(&self.lua_event_handle.mode_registry())
+            });
+        def.tools
+            .as_deref()
+            .is_none_or(|tools| tools.iter().any(|t| t.as_str() == PLAN_SUBMIT_TOOL))
+            && self.tool_filter.matches(PLAN_SUBMIT_TOOL)
+            && self.lua_event_handle.has_native_tool(PLAN_SUBMIT_TOOL)
+    }
+
+    fn submit_plan(&mut self) -> Vec<Action> {
+        let Some(path) = self.focused_plan_path() else {
+            self.flash(FLASH_NO_PLAN.into());
+            return vec![];
+        };
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) if !c.trim().is_empty() => c,
+            _ => {
+                self.flash(FLASH_NO_PLAN_BODY.into());
+                return vec![];
+            }
+        };
+        if self.is_main_chat() {
+            self.state.plan.mark_ready();
+        }
+        self.plan_form.on_plan_ready();
+        self.active_chat()
+            .push(DisplayMessage::plan(content, path.display().to_string()));
+        vec![]
+    }
+
+    /// Single implementation behind both the default keybindings and
+    /// `maki.ui.action`, so a Lua rebind can never drift from the
+    /// original key's behavior.
+    pub(crate) fn run_builtin(&mut self, action: BuiltinAction) -> Vec<Action> {
+        match action {
+            BuiltinAction::FilePicker => {
+                self.file_picker.open(&self.state.session.cwd);
+            }
+            BuiltinAction::Search => {
+                let top = self.chats[self.active_chat].scroll_top();
+                let auto = self.chats[self.active_chat].auto_scroll();
+                self.search_modal.open(top, auto);
+            }
+            BuiltinAction::Tasks => {
+                if self.task_picker.is_open() {
+                    self.task_picker.close();
+                } else {
+                    self.open_tasks();
+                }
+            }
+            BuiltinAction::Help => self.help_modal.toggle(),
+            BuiltinAction::PlanToggle => {
+                if self.plan_toggle_ready() {
+                    self.plan_form.toggle();
+                }
+            }
+            BuiltinAction::PlanEditor => {
+                return match self.state.plan.path() {
+                    Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
+                    None => {
+                        self.flash(FLASH_NO_PLAN.into());
+                        vec![]
+                    }
+                };
+            }
+            BuiltinAction::PlanSubmit => return self.submit_plan(),
+            BuiltinAction::EditInput => return vec![Action::EditInputInEditor],
+            BuiltinAction::PopQueue => {
+                self.queue.pop_newest();
+            }
+            BuiltinAction::PrevChat => self.active_chat = self.active_chat.saturating_sub(1),
+            BuiltinAction::NextChat => {
+                self.active_chat = (self.active_chat + 1).min(self.chats.len() - 1);
+            }
+            BuiltinAction::ModelPicker => {
+                self.open_model_picker(ModelPickerPurpose::Session);
+                return vec![Action::RefreshModels];
+            }
+        }
+        vec![]
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        self.clear_selection_unless_pending_copy();
+
+        if key::SUSPEND.matches(key) && cfg!(unix) {
+            return vec![Action::Suspend];
+        }
+
+        if let Some(actions) = self.dispatch_overlay(key) {
+            return actions;
+        }
+
+        if !(self.focused_streaming() && is_streaming_stop_key(key))
+            && let Some(id) = self.dispatch_override(key)
+        {
+            return vec![Action::RunKeybind(id)];
+        }
+
+        if let Some(actions) = self.handle_ctrl(key) {
+            return actions;
+        }
+
+        self.handle_chat_key(key)
+    }
+
+    fn dispatch_override(&self, key: KeyEvent) -> Option<u64> {
+        let (code, modifiers) = match key.code {
+            KeyCode::BackTab => (KeyCode::Tab, key.modifiers | KeyModifiers::SHIFT),
+            _ => (key.code, key.modifiers),
+        };
+        self.keymap_reader
+            .load()
+            .entries
+            .iter()
+            .find(|entry| entry.key == code && entry.modifiers == modifiers)
+            .filter(|_| !self.lua_event_handle.is_disconnected())
+            .map(|entry| entry.id)
+    }
+
+    fn handle_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        if key::EDIT_INPUT.matches(key) {
+            return self.run_builtin(BuiltinAction::EditInput);
+        }
+        if key::MODEL_PICKER.matches(key) {
+            return self.run_builtin(BuiltinAction::ModelPicker);
+        }
+        if is_ctrl(&key) {
+            if key::POP_QUEUE.matches(key) {
+                return self.run_builtin(BuiltinAction::PopQueue);
+            } else if key::OPEN_EDITOR.matches(key) {
+                return self.run_builtin(BuiltinAction::PlanEditor);
+            } else if key::SEARCH.matches(key) {
+                return self.run_builtin(BuiltinAction::Search);
+            } else if key::FILE_PICKER.matches(key) {
+                return self.run_builtin(BuiltinAction::FilePicker);
+            } else if key.code == KeyCode::Char('v') && self.image_paste_rx.is_empty() {
+                self.start_image_paste();
+            } else {
+                let action = self.input_box.handle_key(key);
+                return self.handle_input_action(action);
+            }
+            return vec![];
+        }
+
+        if self.focused_streaming() {
+            self.file_completion.close();
+        }
+        if is_newline_key(&key) && self.typed_path_completion_context().is_some() {
+            let action = self.input_box.handle_key(key);
+            return self.handle_input_action(action);
+        }
+        let command_action = self
+            .command_palette
+            .handle_key(key, &self.input_box.buffer.value());
+        match command_action {
+            CommandAction::Consumed => {
+                if key.code == KeyCode::Esc {
+                    self.sync_file_completion();
+                }
+                return vec![];
+            }
+            CommandAction::SelectionChanged => {
+                let input = self.input_box.buffer.value();
+                self.sync_command_arguments(&input, self.input_box.buffer.cursor_byte_offset());
+                return vec![];
+            }
+            CommandAction::Execute(cmd) => {
+                let attachments = self
+                    .input_box
+                    .take_pending_images()
+                    .into_iter()
+                    .map(|image| CommandAttachment {
+                        media_type: Arc::from(image.media_type.mime()),
+                        data: image.data,
+                    })
+                    .collect();
+                self.input_box.discard();
+                self.file_completion.close();
+                return self
+                    .dispatch_confirmed_command(
+                        cmd,
+                        CommandContent {
+                            text: Arc::from(""),
+                            attachments,
+                        },
+                        0,
+                    )
+                    .unwrap_or_else(|error| {
+                        self.flash(error);
+                        Vec::new()
+                    });
+            }
+            CommandAction::AcceptArgument { text, cursor } => {
+                self.pending_dirty |= self.command_palette.sync(&text);
+                self.refresh_at_ref_labels(&text);
+                self.input_box.set_input(text.clone());
+                self.input_box.buffer.set_cursor_byte_offset(cursor);
+                self.sync_file_completion();
+                return vec![];
+            }
+            CommandAction::Complete { text, cursor } => {
+                self.pending_dirty |= self.command_palette.sync(&text);
+                self.refresh_at_ref_labels(&text);
+                self.input_box.set_input(text.clone());
+                self.input_box.buffer.set_cursor_byte_offset(cursor);
+                self.sync_command_arguments(&text, cursor);
+                self.sync_file_completion();
+                return vec![];
+            }
+            CommandAction::Passthrough => {}
+        }
+
+        if self.file_completion.is_active() && self.handle_completion_key(key) {
+            return vec![];
+        }
+
+        let action = self.input_box.handle_key(key);
+        self.handle_input_action(action)
+    }
+
+    fn handle_completion_key(&mut self, key: KeyEvent) -> bool {
+        match self.file_completion.handle_key(key) {
+            CompletionAction::Consumed => {}
+            CompletionAction::Close => self.file_completion.close(),
+            CompletionAction::Select(item) => self.insert_completion(item),
+            CompletionAction::Advance(item) => self.advance_completion(item),
+            CompletionAction::Passthrough => return false,
+        }
+        true
+    }
+
+    fn handle_input_action(&mut self, action: InputAction) -> Vec<Action> {
+        let streaming = self.focused_streaming();
+        match action {
+            InputAction::Submit(sub) => {
+                self.file_completion.close();
+                self.handle_submit(sub)
+            }
+            InputAction::PaletteSync(val) => {
+                self.pending_dirty |= self.command_palette.sync(&val);
+                self.sync_command_arguments(&val, self.input_box.buffer.cursor_byte_offset());
+                self.sync_file_completion();
+                vec![]
+            }
+            InputAction::CursorMoved | InputAction::ContinueLine => {
+                let val = self.input_box.buffer.value();
+                self.sync_command_arguments(&val, self.input_box.buffer.cursor_byte_offset());
+                self.sync_file_completion();
+                vec![]
+            }
+            InputAction::Passthrough(key) => {
+                if key.code != KeyCode::Esc {
+                    self.last_esc = None;
+                }
+                match key.code {
+                    KeyCode::Up if streaming => {
+                        self.active_chat().scroll(1);
+                        vec![]
+                    }
+                    KeyCode::Down if streaming => {
+                        self.active_chat().scroll(-1);
+                        vec![]
+                    }
+                    KeyCode::BackTab if !self.is_bash_input() => self.toggle_mode(),
+                    KeyCode::Tab
+                        if key.modifiers.contains(KeyModifiers::SHIFT) && !self.is_bash_input() =>
+                    {
+                        self.toggle_mode()
+                    }
+                    KeyCode::Esc => {
+                        if let Some(t) = self.last_esc.take()
+                            && t.elapsed() < self.status_bar.flash_duration
+                        {
+                            if streaming {
+                                self.handle_cancel()
+                            } else {
+                                self.open_rewind_picker()
+                            }
+                        } else {
+                            self.last_esc = Some(Instant::now());
+                            self.status_bar.flash(
+                                if streaming {
+                                    FLASH_CANCEL
+                                } else {
+                                    FLASH_REWIND
+                                }
+                                .into(),
+                            );
+                            vec![]
+                        }
+                    }
+                    _ => vec![],
+                }
+            }
+            InputAction::None => vec![],
+        }
+    }
+
+    /// Store the labels the completion sources currently offer in the input,
+    /// replacing any previous set: the sources' full item list *is* the known
+    /// set for the current mode and models, so the input can style `@`-tokens
+    /// as detected or undetected.
+    fn store_at_ref_labels(&mut self, items: &[ItemSpec]) {
+        self.input_box.at_ref_labels = items.iter().map(|i| i.label.clone()).collect();
+    }
+
+    /// The context completion sources receive: the current mode id and the
+    /// available-models list, already loaded.
+    fn completion_ctx(&self) -> CompletionCtx {
+        CompletionCtx {
+            mode: self.focused_mode().id_key(),
+            models: self
+                .available_models
+                .load_full()
+                .map(|arc| (*arc).clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Refresh the input's known `@`-label set after external text (restore,
+    /// rewind, command completion, editor edit) may have put a token in the
+    /// input. File references resolve by path existence, so the Lua round-trip
+    /// is skipped unless the text has a tagged `@`-token.
+    pub(crate) fn refresh_at_ref_labels(&mut self, text: &str) {
+        if !makima_lua::parse_at_tokens(text)
+            .iter()
+            .any(|t| !t.prefix.is_empty())
+        {
+            return;
+        }
+        let items = self
+            .lua_event_handle
+            .collect_completion_items(&self.completion_ctx());
+        self.store_at_ref_labels(&items);
+    }
+
+    fn typed_path_completion_context(
+        &self,
+    ) -> Option<(makima_commands::ArgumentKind, String, (usize, usize))> {
+        if self.input_box.buffer.y() != 0 {
+            return None;
+        }
+        let (kind, range, query) = self.command_palette.typed_path_argument(
+            &self.input_box.buffer.lines()[0],
+            self.input_box.buffer.cursor_byte_offset(),
+        )?;
+        Some((kind, query, range))
+    }
+
+    fn sync_file_completion(&mut self) {
+        let cwd = self.focused_cwd().to_string_lossy().into_owned();
+        self.command_palette.set_cwd(Arc::from(cwd.as_str()));
+        if self.focused_streaming() || self.typed_path_completion_context().is_some() {
+            self.file_completion.close();
+            return;
+        }
+        let buf = &self.input_box.buffer;
+        let Some(range) = at_token_range(&buf.lines()[buf.y()], buf.x()) else {
+            self.file_completion.close();
+            return;
+        };
+        if self.command_palette.is_active() || self.any_overlay_open() {
+            self.file_completion.close();
+            return;
+        }
+        let query = at_token_query(&buf.lines()[buf.y()], buf.x()).unwrap_or_default();
+        self.file_completion.set_token_byte_range(range);
+        if self.file_completion.is_active() && !self.file_completion.needs_reopen(&cwd) {
+            self.file_completion.sync_query(&query);
+            return;
+        }
+        let items = self
+            .lua_event_handle
+            .collect_completion_items(&self.completion_ctx());
+        self.store_at_ref_labels(&items);
+        self.file_completion.open(&cwd, items, &query, range);
+    }
+
+    /// Replaces the `@` token with a final completion and closes the popup.
+    fn insert_completion(&mut self, item: CompletionItem) {
+        self.apply_completion(item, true);
+    }
+
+    /// Replaces the `@` token with an explicit directory and refreshes its children.
+    fn advance_completion(&mut self, item: CompletionItem) {
+        self.apply_completion_replacement(item.advance_replacement(), false);
+        self.sync_file_completion();
+    }
+
+    fn apply_completion(&mut self, item: CompletionItem, close: bool) {
+        self.apply_completion_replacement(item.replacement(), close);
+    }
+
+    fn apply_completion_replacement(&mut self, replacement: String, close: bool) {
+        let (start, end) = self.file_completion.token_byte_range();
+        if close {
+            self.file_completion.close();
+        }
+        self.input_box
+            .buffer
+            .replace_range_on_current_line(start, end, &replacement);
+        let value = self.input_box.buffer.value();
+        self.pending_dirty |= self.command_palette.sync(&value);
+        self.sync_command_arguments(&value, self.input_box.buffer.cursor_byte_offset());
+    }
+
+    fn quit(&mut self) -> Vec<Action> {
+        self.quit_with(ExitRequest::Success)
+    }
+
+    /// `maki trust` lives outside the TUI, so without this a "not now" or a
+    /// `.makima/` created mid-session is unrecoverable without quitting.
+    fn trust_folder(&mut self) -> Vec<Action> {
+        let Some(question) = self.trust_question.clone() else {
+            self.flash(NOTHING_TO_TRUST_MSG.into());
+            return Vec::new();
+        };
+        if let Err(error) = project::grant(&self.storage, &question) {
+            self.flash(error);
+            return Vec::new();
+        }
+        let covered: Vec<String> = question.present.iter().map(GatedFile::to_string).collect();
+        self.flash(format!("{TRUSTED_PREFIX}{}", covered.join(", ")));
+        self.quit_with(ExitRequest::Reload)
+    }
+
+    fn quit_with(&mut self, req: ExitRequest) -> Vec<Action> {
+        self.save_input_history();
+        self.exit_request = req;
+        vec![Action::ManualExit]
+    }
+
+    pub(crate) fn clear_exit_request(&mut self) {
+        self.exit_request = ExitRequest::None;
+    }
+
+    pub(crate) fn handle_submit(&mut self, mut sub: Submission) -> Vec<Action> {
+        // Any main-input submit releases a manual Alt+M hold, so the deferred
+        // panel re-promotes once the user has placed their message.
+        self.submit_released = true;
+        match std::mem::take(&mut self.pending_input) {
+            PendingInput::AuthRetry { agent_id } => {
+                self.send_to_agent(agent_id, String::new());
+                return vec![];
+            }
+            PendingInput::None => {}
+        }
+        if sub.is_empty() {
+            return vec![];
+        }
+        if sub.text.trim() == "exit" {
+            return self.quit();
+        }
+
+        if let Some(prefix) = shell::parse_shell_prefix(&sub.text) {
+            if self.active_subagent_closed() {
+                self.flash(queue::NO_SUBAGENT_ERR.into());
+                return vec![];
+            }
+            let cmd = prefix.command.trim();
+            if cmd == "cd" || cmd.starts_with("cd ") {
+                self.flash("Only /cd can change the working directory".into());
+            }
+            let id = self.shell.reserve_for(self.selected_agent_id());
+            let sigil = if prefix.visible { "!" } else { "!!" };
+            let display = format!("{sigil} {}", prefix.command);
+            self.active_chat().show_user_message(display, Vec::new());
+            return vec![Action::ShellCommand {
+                target: self.selected_agent_id(),
+                cwd: self.focused_cwd(),
+                id,
+                command: prefix.command,
+                visible: prefix.visible,
+            }];
+        }
+        match classify_input(&sub.text) {
+            SlashClass::Plain => self.submit_or_queue(sub.into()),
+            SlashClass::EscapedLiteral(literal) => {
+                sub.text = literal.to_owned();
+                self.submit_or_queue(sub.into())
+            }
+            SlashClass::Command(_) => {
+                let attachments = sub
+                    .images
+                    .iter()
+                    .map(|image| CommandAttachment {
+                        media_type: Arc::from(image.media_type.mime()),
+                        data: Arc::clone(&image.data),
+                    })
+                    .collect::<Arc<[_]>>();
+                self.command_runtime.dispatch_input(
+                    &self.command_target,
+                    CommandContent {
+                        text: Arc::from(sub.text.as_str()),
+                        attachments,
+                    },
+                );
+                vec![]
+            }
+        }
+    }
+
+    fn handle_cancel(&mut self) -> Vec<Action> {
+        let Some(target) = self
+            .command_runtime
+            .target_agent(&self.command_target)
+            .filter(|target| Some(target.id()) == self.selected_agent_id())
+        else {
+            self.flash(queue::NO_SUBAGENT_ERR.into());
+            return Vec::new();
+        };
+        let run_id = self.run_id;
+        let (turn_id, fence) = match target.manager().local_cancel(target.id(), run_id) {
+            Ok(cut) => cut,
+            Err(error) => {
+                self.flash(error.to_string());
+                return Vec::new();
+            }
+        };
+        self.shell.cancel_for(Some(target.id()));
+        self.active_chat().flush();
+        self.active_chat().cancel_in_progress();
+        self.active_chat().retry_info = None;
+        self.queue.unfocus();
+        if !self.is_main_chat() {
+            return Vec::new();
+        }
+        self.run_id = fence;
+        self.queue.fence_cancelled_presentations(fence);
+        self.close_all_overlays();
+        self.pending_input = PendingInput::None;
+        self.input_queue.clear();
+        self.active_input = None;
+        self.main_chat()
+            .push(DisplayMessage::new(DisplayRole::Error, CANCEL_MSG.into()));
+        self.recoverable_queue.clear();
+        self.status = Status::Idle;
+        vec![Action::CancelAgent { turn_id, run_id }]
+    }
+
+    pub(crate) fn adopt_actor_presentation(&mut self, envelope: &Envelope) {
+        let Some(presentation) = envelope.presentation() else {
+            return;
+        };
+        if envelope.subagent.is_none()
+            && matches!(
+                envelope.event,
+                AgentEvent::QueueItemConsumed { .. } | AgentEvent::ModelSwitched { .. }
+            )
+            && presentation > self.run_id
+            && self.queue.accepts_actor_presentation(presentation)
+        {
+            if envelope
+                .identity
+                .is_some_and(|identity| matches!(identity.kind, ActorWorkKind::Compact { .. }))
+            {
+                self.record_presentation_start(presentation);
+            } else {
+                self.record_run_start(presentation);
+            }
+        }
+    }
+
+    fn handle_agent_event(&mut self, envelope: Envelope) -> Vec<Action> {
+        // Re-bake replies belong to no run and arrive on the restore channel,
+        // so they skip the staleness filter outright.
+        if envelope.presentation() == Some(RESTORE_PRESENTATION) {
+            let (id, snapshot, theme_gen, is_header) = match envelope.event {
+                AgentEvent::ToolSnapshot {
+                    id,
+                    snapshot,
+                    theme_gen,
+                } => (id, snapshot, theme_gen, false),
+                AgentEvent::ToolHeaderSnapshot {
+                    id,
+                    snapshot,
+                    theme_gen,
+                } => (id, snapshot, theme_gen, true),
+                _ => return vec![],
+            };
+            for chat in &mut self.chats {
+                if is_header {
+                    chat.tool_header_snapshot(&id, snapshot.clone(), theme_gen);
+                } else {
+                    chat.tool_snapshot(&id, snapshot.clone(), theme_gen);
+                }
+            }
+            return vec![];
+        }
+        // Posts belong to no run, so the stale-run filter below must not see them.
+        if let AgentEvent::Post(post) = envelope.event {
+            self.push_post(envelope.subagent.as_ref(), post, None);
+            return vec![];
+        }
+        self.adopt_actor_presentation(&envelope);
+        let presentation = envelope.presentation();
+        if envelope.subagent.is_none() && presentation != Some(self.run_id) {
+            // A snapshot dropped here degrades the tool body to llm_output.
+            if let AgentEvent::ToolSnapshot { id, .. }
+            | AgentEvent::ToolHeaderSnapshot { id, .. }
+            | AgentEvent::LiveToolBuf { id, .. } = &envelope.event
+            {
+                tracing::debug!(
+                    tool_id = %id,
+                    ?presentation,
+                    current_run_id = self.run_id,
+                    "tool render event dropped: stale presentation"
+                );
+            }
+            return vec![];
+        }
+
+        // The run reached its next request and picked the model up; the bar
+        // can stop marking the switch as queued.
+        if envelope.subagent.is_none()
+            && let AgentEvent::ModelSwitched {
+                spec,
+                context_window,
+            } = &envelope.event
+        {
+            self.chats[0].retry_info = None;
+            self.run_model = Some(spec.clone());
+            self.run_context_window = Some(*context_window);
+            return vec![];
+        }
+
+        if let Some(subagent) = &envelope.subagent {
+            if self.terminal_subagents.contains(&subagent.agent_id) {
+                match envelope.event {
+                    AgentEvent::SubagentHistory {
+                        tool_use_id,
+                        history_epoch,
+                        conversation_id,
+                        messages,
+                    } => {
+                        self.state.session_mut().adopt_subagent_history(
+                            tool_use_id,
+                            &HistorySnapshot {
+                                epoch: history_epoch,
+                                compacted: false,
+                                conversation: conversation_id.map(ConversationState::new),
+                                messages: Arc::new(messages),
+                            },
+                        );
+                    }
+                    AgentEvent::TurnComplete(turn) => {
+                        let chat_idx = self.live_chat_index.get(&subagent.agent_id).copied();
+                        self.account_turn_complete(chat_idx, &turn);
+                    }
+                    _ => {}
+                }
+                return vec![];
+            }
+            if matches!(&envelope.event, AgentEvent::SubagentClosed) {
+                self.finish_child_plan_approval(subagent.agent_id);
+                if self.plan_picker_edits(Some(subagent.agent_id))
+                    || self
+                        .model_picker_target
+                        .as_ref()
+                        .is_some_and(|target| target.id() == subagent.agent_id)
+                {
+                    self.close_model_picker();
+                }
+                self.terminal_subagents.insert(subagent.agent_id);
+                if let Some(channels) = self.subagent_channels.get_mut(&subagent.agent_id) {
+                    channels.closed = true;
+                }
+                self.stamped_subagent_outcomes
+                    .retain(|(agent_id, _)| *agent_id != subagent.agent_id);
+                self.cleanup_subagent_input(subagent.agent_id);
+                if let Some(&chat_idx) = self.live_chat_index.get(&subagent.agent_id) {
+                    self.chats[chat_idx].cancel_in_progress();
+                    self.chats[chat_idx].retry_info = None;
+                    if !self.chats[chat_idx].is_finished() {
+                        self.chats[chat_idx].mark_finished(DisplayRole::Error, CANCELLED_TEXT);
+                    }
+                    self.sync_task_picker();
+                }
+                return vec![];
+            }
+        }
+
+        if let (Some(subagent), AgentEvent::TurnOutcome(outcome)) =
+            (&envelope.subagent, &envelope.event)
+        {
+            let agent_id = subagent.agent_id;
+            let turn_id = match outcome {
+                makima_agent::TurnOutcome::Completed { turn_id, .. }
+                | makima_agent::TurnOutcome::Cancelled { turn_id, .. }
+                | makima_agent::TurnOutcome::Failed { turn_id, .. } => *turn_id,
+            };
+            if !self.stamped_subagent_outcomes.insert((agent_id, turn_id)) {
+                return vec![];
+            }
+            let chat_idx = self.resolve_or_create_chat(subagent);
+            self.chats[chat_idx].retry_info = None;
+            match outcome {
+                makima_agent::TurnOutcome::Completed { .. } => {
+                    self.chats[chat_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
+                }
+                makima_agent::TurnOutcome::Cancelled { .. } => {
+                    self.chats[chat_idx].mark_finished(DisplayRole::Error, CANCELLED_TEXT);
+                }
+                makima_agent::TurnOutcome::Failed { failure, .. } => {
+                    self.chats[chat_idx].mark_failed(&failure.user_message);
+                }
+            }
+            self.sync_task_picker();
+            return vec![];
+        }
+
+        let subagent_agent_id = envelope.subagent.as_ref().map(|subagent| subagent.agent_id);
+        if let AgentEvent::SubagentHistory {
+            tool_use_id,
+            history_epoch,
+            conversation_id,
+            messages,
+        } = envelope.event
+        {
+            // Workflow sessions use synthetic ids that no ToolDone will match,
+            // so we finish them here on SubagentHistory.
+            let subagent_chat = envelope
+                .subagent
+                .as_ref()
+                .map(|subagent| self.resolve_or_create_chat(subagent))
+                .or_else(|| self.chat_index.get(&tool_use_id).copied());
+            if subagent_agent_id.is_none()
+                && let Some(sub_idx) = subagent_chat
+                && !self.chats[sub_idx].is_finished()
+            {
+                self.chats[sub_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
+            }
+            self.sync_task_picker();
+            self.state.session_mut().adopt_subagent_history(
+                tool_use_id,
+                &HistorySnapshot {
+                    epoch: history_epoch,
+                    compacted: false,
+                    conversation: conversation_id.map(ConversationState::new),
+                    messages: Arc::new(messages),
+                },
+            );
+            return vec![];
+        }
+
+        if let Some(root) = &self.root_agent {
+            makima_lua::agent_autocmd::dispatch(&self.lua_event_handle, root, &envelope);
+        }
+
+        let subagent_id = envelope
+            .subagent
+            .as_ref()
+            .map(|s| s.parent_tool_use_id.clone());
+
+        let chat_idx = match envelope.subagent {
+            Some(ref subagent) => self.resolve_or_create_chat(subagent),
+            None => 0,
+        };
+        if chat_idx > 0
+            && !matches!(
+                envelope.event,
+                AgentEvent::TurnOutcome(_) | AgentEvent::SubagentHistory { .. }
+            )
+        {
+            self.chats[chat_idx].reopen();
+            self.sync_task_picker();
+        }
+
+        if let AgentEvent::ToolDone(ref e) = envelope.event {
+            if chat_idx > 0
+                && self
+                    .focused_config()
+                    .filter(|_| self.active_chat == chat_idx)
+                    .and_then(|config| config.mode.plan_path().map(Path::to_path_buf))
+                    .is_some_and(|path| e.wrote_to(&path))
+            {
+                self.plan_form.on_plan_ready();
+            }
+            if chat_idx == 0
+                && self.root_mode() == Mode::Plan
+                && !self.plan_submit_active()
+                && self.state.plan.path().is_some_and(|pp| e.wrote_to(pp))
+            {
+                self.transition_plan(PlanTrigger::WriteDone);
+            }
+            self.state
+                .session_mut()
+                .insert_tool_output(e.id.clone(), e.output.clone());
+            let sub_idx = subagent_agent_id
+                .is_none()
+                .then(|| self.chat_index.get(&e.id).copied())
+                .flatten();
+            if let Some(sub_idx) = sub_idx {
+                let (role, text) = if e.is_error {
+                    let text = e.output.as_text();
+                    let text = if text.is_empty() {
+                        ERROR_TEXT.into()
+                    } else {
+                        text
+                    };
+                    (DisplayRole::Error, text)
+                } else {
+                    (DisplayRole::Done, DONE_TEXT.into())
+                };
+                if !self.chats[sub_idx].is_finished() {
+                    if e.is_error {
+                        self.chats[sub_idx].mark_failed(&text);
+                    } else {
+                        self.chats[sub_idx].mark_finished(role, &text);
+                    }
+                }
+            }
+            self.sync_task_picker();
+        }
+
+        if let AgentEvent::Retry {
+            attempt,
+            message,
+            delay_ms,
+        } = envelope.event
+        {
+            self.chats[chat_idx].stream_reset();
+            let retry = RetryInfo {
+                attempt,
+                message,
+                deadline: Instant::now() + Duration::from_millis(delay_ms),
+            };
+            self.chats[chat_idx].retry_info = Some(retry);
+            return vec![];
+        }
+
+        self.chats[chat_idx].retry_info = None;
+
+        if let AgentEvent::TurnComplete(ref tc) = envelope.event {
+            self.account_turn_complete(Some(chat_idx), tc);
+            let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
+            self.chats[chat_idx].context_size = ctx_size;
+            if chat_idx == 0 {
+                self.state.context_size = ctx_size;
+            }
+            self.chats[chat_idx].set_pending_turn_usage(tc.usage.format(tc.cost));
+            if let Some(tool_id) = &subagent_id {
+                let formatted = tc.usage.format_sum_cost(self.chats[chat_idx].cost);
+                self.chats[0].set_tool_turn_usage(tool_id, formatted);
+            }
+        }
+
+        let plan_path = if self.root_mode() == Mode::Plan && !self.plan_submit_active() {
+            self.state.plan.path()
+        } else {
+            None
+        };
+        let result = self.chats[chat_idx].handle_event(envelope.event, plan_path);
+
+        if let ChatEventResult::QueueItemConsumed {
+            text,
+            images,
+            mcp_startup_notice,
+            already_displayed,
+        } = result
+        {
+            let notice = mcp_startup_notice
+                .map(|count| format!("{count} MCP servers are not ready; no MCP tools exposed"));
+            if !already_displayed {
+                self.chats[chat_idx].show_user_message_with_notice(text, images, notice);
+            } else if let Some(notice) = notice {
+                self.chats[chat_idx].annotate_last_user_message(notice);
+            }
+            if chat_idx == 0 {
+                self.status = Status::Streaming;
+            }
+            return vec![];
+        }
+
+        if let ChatEventResult::PermissionRequest { id, tool, scopes } = result {
+            let demand = InputDemand {
+                kind: InputKind::Permission,
+                blocked_by_modal: self.has_blocking_modal(),
+                hold_until_submit: false,
+                perm: Some(PermissionPayload {
+                    id,
+                    tool,
+                    scopes,
+                    agent_id: subagent_agent_id,
+                }),
+            };
+            let defer = self.begin_input_demand(demand);
+            if !defer && self.ui_config.bell.permission {
+                self.pending_bell = true;
+            }
+            return vec![];
+        }
+
+        if let ChatEventResult::AuthRequired = result {
+            self.chats[chat_idx].push(DisplayMessage::new(
+                DisplayRole::Error,
+                AUTH_EXPIRED_MSG.into(),
+            ));
+            if chat_idx != 0 {
+                self.main_chat().push(DisplayMessage::new(
+                    DisplayRole::Error,
+                    AUTH_EXPIRED_MSG.into(),
+                ));
+            }
+            self.pending_input = PendingInput::AuthRetry {
+                agent_id: subagent_agent_id,
+            };
+            return vec![];
+        }
+
+        let mut actions = Vec::new();
+        if chat_idx == 0 {
+            match result {
+                ChatEventResult::Done => {
+                    self.status_bar.clear_flash();
+                    self.terminalize_turn(MISSING_TOOL_COMPLETION);
+                    self.status = Status::Idle;
+                    if self.exit_on_done {
+                        self.exit_request = ExitRequest::Success;
+                    }
+                    if self.ui_config.bell.turn_complete {
+                        actions.push(Action::Bell);
+                    }
+                }
+                ChatEventResult::Error(message) => {
+                    self.status = Status::error(message.clone());
+                    self.status_bar.clear_flash();
+                    self.terminalize_turn(&message);
+                    let pending = self.queue.root_text_messages();
+                    if envelope.identity.is_some_and(|identity| {
+                        matches!(identity.kind, ActorWorkKind::Compact { .. })
+                    }) {
+                        self.recoverable_queue.extend(pending);
+                    } else {
+                        self.recoverable_queue = pending;
+                    }
+                    self.queue.clear_root_user_work();
+                    if self.exit_on_done {
+                        self.exit_request = ExitRequest::Error;
+                    }
+                }
+                ChatEventResult::AuthRequired
+                | ChatEventResult::PermissionRequest { .. }
+                | ChatEventResult::QueueItemConsumed { .. } => unreachable!(),
+                ChatEventResult::ControlComplete => {
+                    self.status = Status::Idle;
+                }
+                ChatEventResult::Continue => {}
+            }
+        }
+        actions
+    }
+
+    fn account_turn_complete(&mut self, chat_idx: Option<usize>, turn: &TurnCompleteEvent) {
+        self.state.token_usage += turn.usage;
+        if let Some(chat_idx) = chat_idx {
+            add_cost(&mut self.chats[chat_idx].cost, turn.cost);
+        }
+        self.state
+            .session_mut()
+            .add_model_usage(&turn.model, turn.usage.billed(turn.cost));
+    }
+
+    /// Shared `UiAction::OpenWin` path. Returns `true` when the window went
+    /// active immediately, `false` when an input demand was queued. Non-input
+    /// windows (tool output, panels, centered popups) always return `true`
+    /// and keep their original focus.
+    pub(crate) fn handle_open_win(
+        &mut self,
+        buf: Arc<SharedBuf>,
+        config: FloatConfig,
+        focus: bool,
+        event_tx: flume::Sender<WinEvent>,
+        cmd_rx: flume::Receiver<WinCommand>,
+    ) -> bool {
+        let is_input_demand = config.needs_input && config.split == Split::Below;
+        let defer = is_input_demand
+            && self.begin_input_demand(InputDemand {
+                kind: InputKind::Question,
+                blocked_by_modal: self.has_blocking_modal(),
+                hold_until_submit: false,
+                perm: None,
+            });
+        let open_focus = if is_input_demand { !defer } else { focus };
+        self.float_mgr
+            .open(buf, config, open_focus, event_tx, cmd_rx);
+        if is_input_demand && !defer {
+            self.transition_plan(PlanTrigger::InteractivePrompt);
+            if self.ui_config.bell.ask {
+                self.pending_bell = true;
+            }
+        }
+        !defer
+    }
+
+    pub(crate) fn push_post(
+        &mut self,
+        subagent: Option<&SubagentInfo>,
+        post: Post,
+        committed_messages: Option<usize>,
+    ) {
+        let (chat_idx, chat) = match subagent {
+            Some(subagent) => (
+                self.resolve_or_create_chat(subagent),
+                Some(subagent.parent_tool_use_id.clone()),
+            ),
+            None => (0, None),
+        };
+        self.chats[chat_idx].push_post(&post);
+        let session = &self.state.session;
+        let after_message = committed_messages.unwrap_or_else(|| match &chat {
+            Some(id) => session
+                .subagent_messages()
+                .get(id)
+                .map_or(0, |messages| messages.len()),
+            None => session.messages().len(),
+        });
+        self.state.session_mut().push_post(StoredPost {
+            chat,
+            after_message,
+            post,
+        });
+    }
+
+    fn historical_chat_index(&self, agent_id: makima_agent::AgentId) -> Option<usize> {
+        let session = &self.state.session;
+        let id = agent_id.to_string();
+        let mut matching = session
+            .subagents()
+            .iter()
+            .filter(|entry| entry.agent_id.as_deref() == Some(&id));
+        let entry = matching.next()?;
+        if entry.ambiguous
+            || matching.next().is_some()
+            || session
+                .subagents()
+                .iter()
+                .filter(|other| other.tool_use_id == entry.tool_use_id)
+                .count()
+                != 1
+            || !session.subagent_messages().contains_key(&entry.tool_use_id)
+        {
+            return None;
+        }
+        let mut chats = self
+            .chats
+            .iter()
+            .enumerate()
+            .filter(|(_, chat)| chat.subagent_id.as_deref() == Some(&entry.tool_use_id));
+        let (index, chat) = chats.next()?;
+        if chat.agent_id.is_some() || chats.next().is_some() {
+            return None;
+        }
+        Some(index)
+    }
+
+    fn resolve_or_create_chat(&mut self, subagent: &SubagentInfo) -> usize {
+        let id = &subagent.parent_tool_use_id;
+        if let Some(&idx) = self.live_chat_index.get(&subagent.agent_id) {
+            return idx;
+        }
+        let idx = self.chats.len();
+        self.chat_index.entry(id.clone()).or_insert(idx);
+        self.live_chat_index.insert(subagent.agent_id, idx);
+        self.subagent_channels.insert(
+            subagent.agent_id,
+            SubagentChannels {
+                answer_tx: subagent.answer_tx.clone(),
+                closed: false,
+            },
+        );
+        self.chats[0].update_tool_summary(id, &subagent.name);
+        if let Some(ref model) = subagent.model {
+            self.chats[0].update_tool_model(id, model);
+        }
+        let mut chat = Chat::new(
+            subagent.name.clone(),
+            self.ui_config.clone(),
+            self.lua_event_handle.clone(),
+            Arc::clone(&self.theme_provider),
+        );
+        chat.set_restore_channel(self.restore_event_tx.clone());
+        chat.model_id = subagent.model.clone();
+        chat.opts = subagent.opts;
+        chat.subagent_id = Some(id.clone());
+        chat.agent_id = Some(subagent.agent_id);
+        chat.parent_agent_id = subagent.parent_agent_id;
+        chat.set_started_at_now();
+        if let Some(ref prompt) = subagent.prompt {
+            chat.push_user_message(prompt);
+        }
+        self.chats.push(chat);
+        self.sync_task_picker();
+        self.sync_subagents();
+        idx
+    }
+
+    /// Resolves and enqueues `cmdline` against this session. The caller only
+    /// waits on resolution; the command's effects are applied by the event
+    /// loop on a later iteration, so state inspected immediately after this
+    /// call may predate them.
+    #[cfg(test)]
+    pub(crate) fn run_cmdline(&mut self, cmdline: &str, depth: u8) -> Result<Vec<Action>, String> {
+        let trimmed = cmdline.trim();
+        let input = format!("/{}", trimmed.trim_start_matches('/'));
+        let resolved = self
+            .command_runtime
+            .registry
+            .resolve_input_for(&self.command_target, &input)
+            .map_err(|error| match error {
+                makima_commands::ResolutionError::UnknownCommand(name) => {
+                    format!("unknown command '{name}'")
+                }
+                makima_commands::ResolutionError::StaleTarget => error.to_string(),
+            })?;
+        self.command_runtime.dispatch_command(
+            &self.command_target,
+            resolved.command,
+            resolved.arguments,
+            CommandContent::default(),
+            depth.into(),
+        );
+        #[cfg(test)]
+        return Ok(self.execute_pending_commands());
+        #[cfg(not(test))]
+        Ok(Vec::new())
+    }
+
+    #[cfg(test)]
+    fn execute_command(&mut self, command: ParsedCommand, depth: u8) -> Vec<Action> {
+        self.run_cmdline(&format!("{} {}", command.name, command.args), depth)
+            .unwrap_or_default()
+    }
+
+    fn dispatch_confirmed_command(
+        &mut self,
+        command: ConfirmedCommand,
+        content: CommandContent,
+        depth: u8,
+    ) -> Result<Vec<Action>, String> {
+        self.command_runtime.dispatch_command(
+            &self.command_target,
+            command.command,
+            Arc::from(command.args),
+            content,
+            depth.into(),
+        );
+        #[cfg(test)]
+        return Ok(self.execute_pending_commands());
+        #[cfg(not(test))]
+        Ok(Vec::new())
+    }
+
+    #[cfg(test)]
+    fn execute_pending_commands(&mut self) -> Vec<Action> {
+        let mut actions = Vec::new();
+        loop {
+            let Some(event) = self.command_runtime.recv_for_test() else {
+                break;
+            };
+            match event {
+                crate::command_runtime::CommandEvent::Host { request, reply, .. } => {
+                    match self.execute_host_request(request) {
+                        Ok((response, host_actions)) => {
+                            actions.extend(host_actions);
+                            let _ = reply.send(Ok(response));
+                        }
+                        Err(error) => {
+                            let _ = reply.send(Err(error));
+                        }
+                    }
+                }
+                crate::command_runtime::CommandEvent::Outcome {
+                    outcome, admission, ..
+                } => match outcome {
+                    makima_commands::CommandOutcome::AgentTurn(turn) => {
+                        actions.extend(self.submit_command_turn(turn, admission.as_deref()))
+                    }
+                    makima_commands::CommandOutcome::IsolatedTurn(turn) => {
+                        actions.extend(self.submit_isolated_turn(turn, admission.as_deref()))
+                    }
+                    makima_commands::CommandOutcome::FrontendFeedback(feedback) => {
+                        self.present_frontend_feedback(feedback)
+                    }
+                    makima_commands::CommandOutcome::Failed(error) => self.flash(error.to_string()),
+                    makima_commands::CommandOutcome::ManualCompaction(_)
+                    | makima_commands::CommandOutcome::Completed => break,
+                },
+            }
+        }
+        actions
+    }
+
+    /// Hands the toggle to the event loop rather than awaiting the
+    /// coordinator on the UI thread (see the event loop's SessionOpKind).
+    /// Without a coordinator there is nothing to await, so it applies at once.
+    fn toggle_coordinator_option(&mut self, id: &'static str, current: bool) -> Vec<Action> {
+        if self.coordinator.is_none() {
+            if id == makima_agent::session_options::YOLO_OPTION_ID {
+                self.permissions.set_yolo(!current);
+            }
+            self.apply_toggled_option(id, !current);
+            return Vec::new();
+        }
+        vec![Action::ToggleSessionOption { id }]
+    }
+
+    /// The app-side half of a toggle, run once the coordinator has committed
+    /// it (or immediately when there is no coordinator); the commit itself
+    /// already projected YOLO onto the permissions.
+    pub(crate) fn apply_toggled_option(&mut self, id: &str, enabled: bool) {
+        use makima_agent::session_options::YOLO_OPTION_ID;
+        let message = match id {
+            YOLO_OPTION_ID => {
+                if enabled {
+                    "YOLO mode enabled"
+                } else {
+                    "YOLO mode disabled"
+                }
+            }
+            other => {
+                self.flash(format!("unknown session option: {other}"));
+                return;
+            }
+        };
+        self.flash(message.into());
+    }
+
+    pub(crate) fn execute_host_request(
+        &mut self,
+        request: HostRequest,
+    ) -> Result<(HostResponse, Vec<Action>), CommandError> {
+        let operation = match request {
+            HostRequest::Context(request) => {
+                let response = match request {
+                    HostContextRequest::ThemeNames => HostContextResponse::Values(
+                        self.theme_provider
+                            .names()
+                            .into_iter()
+                            .map(Arc::from)
+                            .collect::<Vec<_>>()
+                            .into(),
+                    ),
+                    HostContextRequest::ModelSpecs
+                    | HostContextRequest::WorkingDirectory
+                    | HostContextRequest::FastModeSupported => {
+                        return Err(CommandError::StaleTarget);
+                    }
+                    HostContextRequest::SessionId => {
+                        HostContextResponse::SessionId(Arc::from(self.state.session.id.to_string()))
+                    }
+                };
+                return Ok((HostResponse::Context(response), vec![]));
+            }
+            HostRequest::Builtin(operation) => operation,
+        };
+        let actions = match operation {
+            BuiltinOperation::OpenTasks => {
+                self.open_tasks();
+                vec![]
+            }
+            BuiltinOperation::Compact(_)
+            | BuiltinOperation::ChangeDirectory { .. }
+            | BuiltinOperation::ToggleFast
+            | BuiltinOperation::ToggleWorkflow => return Err(CommandError::StaleTarget),
+            BuiltinOperation::ResetSession => self.reset_session(),
+            BuiltinOperation::ToggleHelp => {
+                self.help_modal.toggle();
+                vec![]
+            }
+            BuiltinOperation::FocusQueue => {
+                self.queue.set_focus();
+                vec![]
+            }
+            BuiltinOperation::OpenModelPicker => {
+                self.open_model_picker(ModelPickerPurpose::Session);
+                vec![Action::RefreshModels]
+            }
+            BuiltinOperation::SetModel { spec } => vec![Action::ChangeModel(spec.to_string())],
+            BuiltinOperation::SelectModel(selection) => vec![Action::SelectModel(selection)],
+            BuiltinOperation::OpenThemePicker => {
+                self.theme_picker.open();
+                self.command_runtime
+                    .finish_theme_preview(self.command_target.id(), false);
+                vec![]
+            }
+            BuiltinOperation::SetTheme { name } => {
+                let applied = match self.theme_provider.install(&name) {
+                    Ok(()) => {
+                        self.theme_provider.persist(&name);
+                        self.flash(format!("{THEME_APPLIED_PREFIX}: {name}"));
+                        true
+                    }
+                    Err(error) => {
+                        self.flash(error);
+                        false
+                    }
+                };
+                self.command_runtime
+                    .finish_theme_preview(self.command_target.id(), applied);
+                vec![]
+            }
+            BuiltinOperation::OpenMcpPicker => {
+                self.mcp_picker.open();
+                vec![]
+            }
+            BuiltinOperation::OpenLoginPicker => {
+                self.login_picker.open();
+                vec![]
+            }
+            BuiltinOperation::QuickQuestion {
+                question,
+                attachments,
+            } => {
+                let images = attachments
+                    .iter()
+                    .filter_map(|attachment| {
+                        ImageMediaType::from_mime(&attachment.media_type).map(|media_type| {
+                            ImageSource::new(media_type, Arc::clone(&attachment.data))
+                        })
+                    })
+                    .collect();
+                vec![Action::Btw(question.to_string(), images)]
+            }
+            BuiltinOperation::ToggleYolo => self.toggle_coordinator_option(
+                makima_agent::session_options::YOLO_OPTION_ID,
+                self.permissions.is_yolo(),
+            ),
+            BuiltinOperation::Exit => self.quit(),
+            BuiltinOperation::Reload => self.quit_with(ExitRequest::Reload),
+            BuiltinOperation::Trust => self.trust_folder(),
+        };
+        Ok((HostResponse::Completed, actions))
+    }
+
+    pub(crate) fn submit_isolated_turn(
+        &mut self,
+        turn: makima_commands::IsolatedTurn,
+        admission: Option<&TrustedTarget>,
+    ) -> Vec<Action> {
+        let Some(admission) = admission else {
+            self.flash(CommandError::StaleTarget.to_string());
+            return vec![];
+        };
+        let actor = match admission
+            .target
+            .validate_live()
+            .and_then(|()| admission.target.actor())
+        {
+            Ok(actor) => actor,
+            Err(error) => {
+                self.flash(error.to_string());
+                return vec![];
+            }
+        };
+        let history = match actor
+            .transcript(TranscriptRequest {
+                through_turn: None,
+                last_messages: COMMAND_TRANSCRIPT_MESSAGES,
+                max_bytes: COMMAND_TRANSCRIPT_BYTES,
+            })
+            .map_err(|error| error.to_string())
+            .and_then(|snapshot| {
+                serde_json::from_value::<Vec<Message>>(snapshot.messages)
+                    .map_err(|error| error.to_string())
+            }) {
+            Ok(history) => history,
+            Err(error) => {
+                self.flash(error);
+                return vec![];
+            }
+        };
+        let images = turn
+            .content
+            .attachments
+            .iter()
+            .filter_map(|attachment| {
+                ImageMediaType::from_mime(&attachment.media_type)
+                    .map(|media_type| ImageSource::new(media_type, Arc::clone(&attachment.data)))
+            })
+            .collect();
+        let system = if self.chats[0].agent_id == Some(admission.target.id()) {
+            self.btw_system
+                .as_ref()
+                .map(|system| String::clone(&system.load()))
+                .filter(|system| !system.is_empty())
+        } else {
+            None
+        }
+        .unwrap_or_else(|| btw::BTW_FALLBACK_SYSTEM.to_string());
+        self.start_btw_request(IsolatedTurnRequest {
+            provider: Arc::clone(&admission.template.provider),
+            model: (*admission.template.model).clone(),
+            history,
+            previous: None,
+            system,
+            question: turn.content.text.to_string(),
+            images,
+            session_id: admission.template.session_id.clone(),
+            cancel: makima_agent::CancelToken::none(),
+        });
+        vec![]
+    }
+
+    pub(crate) fn present_frontend_feedback(
+        &mut self,
+        feedback: makima_commands::FrontendFeedback,
+    ) {
+        self.flash(feedback.to_string());
+    }
+
+    pub(crate) fn submit_command_turn(
+        &mut self,
+        turn: AgentTurn,
+        admission: Option<&TrustedTarget>,
+    ) -> Vec<Action> {
+        let Some(admission) = admission else {
+            self.flash(CommandError::StaleTarget.to_string());
+            return vec![];
+        };
+        let images = turn
+            .content
+            .attachments
+            .iter()
+            .filter_map(|attachment| {
+                ImageMediaType::from_mime(&attachment.media_type)
+                    .map(|media_type| ImageSource::new(media_type, Arc::clone(&attachment.data)))
+            })
+            .collect();
+        let input = AgentInput {
+            message: turn.content.text.to_string(),
+            images,
+            preamble: Vec::new(),
+            prompt: turn.prompt.map(|prompt| {
+                Box::new(McpPromptRef {
+                    qualified_name: prompt.qualified_name.to_string(),
+                    arguments: prompt
+                        .arguments
+                        .iter()
+                        .map(|(name, value)| (name.to_string(), value.to_string()))
+                        .collect(),
+                })
+            }),
+        };
+        if let Err(error) = self.admit_user_turn(&admission.target, input, None) {
+            self.flash(error);
+        }
+        vec![]
+    }
+
+    pub(crate) fn open_startup_session_picker(&self) {
+        self.lua_event_handle
+            .fire_autocmd(SESSION_PICKER_REQUESTED_EVENT, serde_json::json!({}));
+    }
+
+    /// The app-side half of `/cd`, run once the coordinator has adopted the
+    /// canonical path.
+    pub(crate) fn apply_directory_change(&mut self, path: PathBuf) {
+        self.state
+            .session_mut()
+            .set_cwd(path.to_string_lossy().into_owned());
+        self.status_bar.set_cwd(path.clone());
+        let input = self.input_box.buffer.value();
+        self.sync_command_arguments(&input, self.input_box.buffer.cursor_byte_offset());
+        if self.file_completion.is_active() {
+            self.sync_file_completion();
+        }
+        self.flash(format!("cd {}", path.display()));
+    }
+
+    fn overlays(&self) -> [&dyn Overlay; 13] {
+        [
+            &self.help_modal,
+            &self.btw_modal,
+            &self.float_mgr,
+            &self.search_modal,
+            &self.file_picker,
+            &self.task_picker,
+            &self.lua_picker,
+            &self.rewind_picker,
+            &self.theme_picker,
+            &self.model_picker,
+            &self.login_picker,
+            &self.mcp_picker,
+            &self.permission_prompt,
+        ]
+    }
+
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 13] {
+        [
+            &mut self.help_modal,
+            &mut self.btw_modal,
+            &mut self.float_mgr,
+            &mut self.search_modal,
+            &mut self.file_picker,
+            &mut self.task_picker,
+            &mut self.lua_picker,
+            &mut self.rewind_picker,
+            &mut self.theme_picker,
+            &mut self.model_picker,
+            &mut self.login_picker,
+            &mut self.mcp_picker,
+            &mut self.permission_prompt,
+        ]
+    }
+
+    /// Last user keystroke/paste is recent enough that stealing focus would
+    /// interrupt mid-typing.
+    pub(crate) fn is_busy(&self) -> bool {
+        self.last_input.is_some_and(|t| t.elapsed() < INPUT_DEFER)
+    }
+
+    /// A modal overlay (e.g. the `/model` picker) is open. Neither the
+    /// permission prompt (non-modal) nor a deferred question float
+    /// (`focused_id == None`, so not `Overlay::is_open`) self-counts.
+    pub(crate) fn has_blocking_modal(&self) -> bool {
+        self.has_modal_overlay()
+    }
+
+    /// Clears a stale `active_input` once the active surface closed on its own
+    /// (permission answered, question float dismissed). Called before any
+    /// promotion check so the queue head can become promotable.
+    pub(crate) fn reconcile_active(&mut self) {
+        match self.active_input {
+            Some(InputKind::Permission) if !self.permission_prompt.is_open() => {
+                self.active_input = None;
+            }
+            Some(InputKind::Question) if !self.float_mgr.below_is_input() => {
+                self.active_input = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn cleanup_subagent_input(&mut self, agent_id: makima_agent::AgentId) {
+        self.input_queue.retain(|demand| {
+            demand
+                .perm
+                .as_ref()
+                .is_none_or(|perm| perm.agent_id != Some(agent_id))
+        });
+        if self.permission_prompt.agent_id() == Some(agent_id) {
+            self.permission_prompt.close();
+        }
+        if matches!(
+            self.pending_input,
+            PendingInput::AuthRetry {
+                agent_id: Some(retry_agent_id)
+            } if retry_agent_id == agent_id
+        ) {
+            self.pending_input = PendingInput::None;
+        }
+        self.reconcile_active();
+        let dirty = self.promote_deferred_if_ready();
+        self.pending_dirty |= dirty;
+    }
+
+    pub(crate) fn permission_active(&self) -> bool {
+        self.active_input == Some(InputKind::Permission) && self.permission_prompt.is_open()
+    }
+
+    pub(crate) fn question_active(&self) -> bool {
+        self.active_input == Some(InputKind::Question) && self.float_mgr.below_is_input()
+    }
+
+    pub(crate) fn any_input_active(&self) -> bool {
+        self.permission_active() || self.question_active()
+    }
+
+    /// Time until the deferral window (2s after the last keystroke) elapses.
+    pub(crate) fn defer_remaining(&self) -> Duration {
+        self.last_input
+            .map(|t| INPUT_DEFER.saturating_sub(t.elapsed()))
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// The single arbitration entry point. Returns `true` when the demand was
+    /// queued (caller must not open/ring/transition); `false` when it went
+    /// active immediately. For a Permission the prompt is opened here on the
+    /// active path; for a Question the caller owns opening the float.
+    pub(crate) fn begin_input_demand(&mut self, demand: InputDemand) -> bool {
+        if self.is_busy() || self.any_input_active() || !self.input_queue.is_empty() {
+            self.input_queue.push_back(demand);
+            return true;
+        }
+        self.active_input = Some(demand.kind);
+        if let Some(perm) = demand.perm {
+            self.permission_prompt.open_for_agent(
+                perm.id,
+                perm.tool,
+                perm.scopes,
+                perm.agent_id.and_then(|id| {
+                    self.live_chat_index
+                        .get(&id)
+                        .and_then(|&index| self.chats[index].subagent_id.clone())
+                }),
+                perm.agent_id,
+            );
+        }
+        false
+    }
+
+    /// Pops the queue head and activates it once the user is idle or the modal
+    /// that was blocking it has closed. Idempotent; sets `pending_bell` on a
+    /// promotion (the event loop drains it).
+    pub(crate) fn promote_deferred_if_ready(&mut self) -> Dirty {
+        self.reconcile_active();
+        if self.any_input_active() {
+            return Dirty::NO;
+        }
+        // A submit arms the release once, even for the auto-idle path; consume
+        // it here so it cannot leak into later promotions.
+        let released = std::mem::take(&mut self.submit_released);
+        while let Some((kind, blocked_by_modal, hold_until_submit)) = self
+            .input_queue
+            .front()
+            .map(|d| (d.kind, d.blocked_by_modal, d.hold_until_submit))
+        {
+            // A queued Question whose float already closed is stale: drop it.
+            if kind == InputKind::Question && !self.float_mgr.below_is_input() {
+                self.input_queue.pop_front();
+                continue;
+            }
+            // An Alt+M hold ignores the idle/blocking-modal timers and waits
+            // for the user's next submit.
+            let ready = if hold_until_submit {
+                released
+            } else {
+                !self.is_busy() || (blocked_by_modal && !self.has_blocking_modal())
+            };
+            if !ready {
+                return Dirty::NO;
+            }
+            let d = self.input_queue.pop_front().expect("front checked above");
+            return self.activate_deferred_input(d);
+        }
+        Dirty::NO
+    }
+
+    fn activate_deferred_input(&mut self, d: InputDemand) -> Dirty {
+        self.active_input = Some(d.kind);
+        let bell = match d.kind {
+            InputKind::Permission => {
+                if let Some(perm) = d.perm {
+                    self.permission_prompt.open_for_agent(
+                        perm.id,
+                        perm.tool,
+                        perm.scopes,
+                        perm.agent_id.and_then(|id| {
+                            self.live_chat_index
+                                .get(&id)
+                                .and_then(|&index| self.chats[index].subagent_id.clone())
+                        }),
+                        perm.agent_id,
+                    );
+                }
+                self.ui_config.bell.permission
+            }
+            InputKind::Question => {
+                self.float_mgr.focus_input_window();
+                self.transition_plan(PlanTrigger::InteractivePrompt);
+                self.ui_config.bell.ask
+            }
+        };
+        if bell {
+            self.pending_bell = true;
+        }
+        Dirty::YES
+    }
+
+    /// Alt+M toggles: defer the active input surface, or restore one this key
+    /// deferred earlier (a hold-until-submit demand at the queue head).
+    pub(crate) fn toggle_defer_input(&mut self) -> bool {
+        if self.defer_active_input() {
+            return true;
+        }
+        if !self
+            .input_queue
+            .front()
+            .is_some_and(|d| d.hold_until_submit)
+        {
+            return false;
+        }
+        // Arm the submit release so `promote_deferred_if_ready` treats the held
+        // head as ready regardless of idle/modal timers.
+        self.submit_released = true;
+        let dirty = self.promote_deferred_if_ready();
+        self.pending_dirty |= dirty;
+        true
+    }
+
+    /// Alt+M: hide the active input surface and hold it until the user's next
+    /// submit (instead of the 2s idle timer). Returns `false` when nothing was
+    /// active. The surface is re-promoted by `promote_deferred_if_ready` once
+    /// `submit_released` is armed by a keyboard submit.
+    pub(crate) fn defer_active_input(&mut self) -> bool {
+        if self.permission_active() {
+            let demand = InputDemand {
+                kind: InputKind::Permission,
+                blocked_by_modal: false,
+                hold_until_submit: true,
+                perm: Some(self.active_permission_payload()),
+            };
+            self.permission_prompt.close();
+            self.active_input = None;
+            self.input_queue.push_back(demand);
+            return true;
+        }
+        if self.question_active() {
+            self.float_mgr.release_focus();
+            self.active_input = None;
+            self.input_queue.push_back(InputDemand {
+                kind: InputKind::Question,
+                blocked_by_modal: false,
+                hold_until_submit: true,
+                perm: None,
+            });
+            return true;
+        }
+        false
+    }
+
+    /// Snapshots the open permission prompt into a queueable payload. Only
+    /// called while `permission_active()`, so the prompt is guaranteed open.
+    fn active_permission_payload(&self) -> PermissionPayload {
+        match &self.permission_prompt {
+            PermissionPrompt::Open {
+                id,
+                tool,
+                scopes,
+                agent_id,
+                ..
+            } => PermissionPayload {
+                id: id.clone(),
+                tool: tool.clone(),
+                scopes: scopes.clone(),
+                agent_id: *agent_id,
+            },
+            PermissionPrompt::Closed => unreachable!("permission_active requires an open prompt"),
+        }
+    }
+
+    /// Drains the bell owed by a promotion/arrival. The event loop rings it.
+    pub fn take_pending_bell(&mut self) -> bool {
+        std::mem::take(&mut self.pending_bell)
+    }
+
+    /// A below-split input window that is *not* the active surface (queued).
+    pub(crate) fn below_input_hidden(&self) -> bool {
+        self.float_mgr.below_is_input() && !self.question_active()
+    }
+
+    /// A manually deferred (Alt+M) input demand is waiting in the queue.
+    pub(crate) fn held_input_pending(&self) -> bool {
+        self.input_queue.iter().any(|d| d.hold_until_submit)
+    }
+
+    pub fn any_overlay_open(&self) -> bool {
+        self.overlays().iter().any(|o| o.is_open())
+    }
+
+    /// Derived fresh every time rather than snapshotted on open: output can
+    /// land behind the modal, and a `!` shell command streams into a segment
+    /// that already existed without ever setting [`Status::Streaming`]. The
+    /// copy is cheaper than the match pass that follows it over the same bytes.
+    fn refresh_search_matches(&mut self) {
+        let chat = &mut self.chats[self.active_chat];
+        self.search_modal
+            .update_matches(|| chat.segment_search_texts());
+        sync_search_highlight(&self.search_modal, chat);
+    }
+
+    /// True when the agent is parked on user input. Drives the `needs_input`
+    /// session status.
+    pub(crate) fn awaiting_input(&self) -> bool {
+        self.permission_active()
+            || self.pending_input != PendingInput::None
+            || self.question_active()
+    }
+
+    /// True while `recoverable_queue` holds user text captured at an agent
+    /// error; a background run would wipe it (`start_run` clears the queue).
+    pub(crate) fn holds_recovery_text(&self) -> bool {
+        !self.recoverable_queue.is_empty()
+    }
+
+    pub fn has_modal_overlay(&self) -> bool {
+        self.overlays().iter().any(|o| o.is_open() && o.is_modal())
+    }
+
+    pub fn close_all_overlays(&mut self) {
+        self.close_model_picker();
+        self.close_command_palette();
+        self.file_completion.close();
+        self.overlays_mut().iter_mut().for_each(|o| o.close());
+    }
+
+    /// Every poller that feeds the screen, in one place and never in `view`;
+    /// see [`crate::repaint`] for why.
+    pub(crate) fn reconcile_status_content(&mut self) -> (u64, Dirty) {
+        let snapshot = self.status_content_reader.load_full();
+        let dirty = self.status_content.poll(Arc::clone(&snapshot));
+        (snapshot.generation, dirty)
+    }
+
+    pub fn tick(&mut self) -> Dirty {
+        self.tick_at(Instant::now())
+    }
+
+    pub(crate) fn tick_at(&mut self, now: Instant) -> Dirty {
+        // `|` never short-circuits: every poller must run on every tick.
+        let mut dirty = std::mem::take(&mut self.pending_dirty)
+            | self.float_mgr.tick()
+            | self.lua_picker.tick()
+            | self.tick_edge_scroll()
+            | self.tick_error_expiry()
+            | self.poll_image_paste()
+            | self.btw_modal.poll()
+            | self.status_bar.poll_branch_update()
+            | self.status_bar.clear_expired_hint()
+            | self.mcp_picker.refresh()
+            | self.model_picker.refresh()
+            | self.hints.poll(self.hint_reader.load_full())
+            | self
+                .status_content
+                .poll(self.status_content_reader.load_full())
+            | self.tick_file_picker()
+            | self.tick_file_completion()
+            | self.command_palette.tick();
+        dirty |= self.tick_chats();
+        while let Some(shown) = self.chats[0].take_splash_event() {
+            // The autocmd is fire-and-forget; repainting is the frame pull's
+            // job (which already reports dirty), so the event itself owes none.
+            self.fire_session_autocmd(
+                if shown { "SplashShown" } else { "SplashHidden" },
+                serde_json::json!({}),
+            );
+        }
+        // `float_mgr.tick` above may have closed the active question float; the
+        // promote call reconciles that, then pops the queue head when idle.
+        dirty |= self.promote_deferred_if_ready();
+        dirty |= self.tick_middle_scroll_at(now);
+        dirty
+    }
+
+    fn tick_chats(&mut self) -> Dirty {
+        Dirty::any(self.chats.iter_mut().map(Chat::tick))
+    }
+
+    fn tick_file_picker(&mut self) -> Dirty {
+        let (dirty, flash) = self.file_picker.tick();
+        if let Some(flash) = flash {
+            self.status_bar.flash(flash);
+        }
+        dirty
+    }
+
+    fn tick_file_completion(&mut self) -> Dirty {
+        let (dirty, flash) = self.file_completion.tick();
+        if let Some(flash) = flash {
+            self.status_bar.flash(flash);
+        }
+        dirty
+    }
+
+    /// What moves with the clock alone; changes that come from arriving data
+    /// are reported by [`Self::tick`] instead. Overlays answer as a group, so
+    /// adding one to [`Self::overlays`] is enough.
+    pub fn cadence(&self) -> Cadence {
+        Cadence::any([
+            Cadence::when(
+                self.middle_scroll.is_some(),
+                Cadence::after(MIDDLE_SCROLL_INTERVAL),
+            ),
+            Cadence::any(self.overlays().into_iter().map(Overlay::cadence)),
+            StatusBar::cadence(
+                self.status_for_chat(self.active_chat),
+                self.restoring.load(Ordering::Relaxed),
+                self.focused_retry().is_some(),
+            ),
+            self.selection_state
+                .as_ref()
+                .map_or(Cadence::IDLE, SelectionState::cadence),
+            self.file_completion.cadence(),
+            self.command_palette.cadence(),
+            Cadence::any(self.chats.iter().map(Chat::cadence)),
+            // Wake precisely at the 2s idle mark to promote a queued demand.
+            Cadence::when(
+                !self.input_queue.is_empty() && !self.any_input_active(),
+                Cadence::after(self.defer_remaining()),
+            ),
+        ])
+    }
+
+    /// Finishes only the main turn's tools; descendants own their terminal events.
+    fn terminalize_turn(&mut self, message: &str) {
+        self.chats[0].fail_in_progress_except(message.into(), self.shell.active_ids());
+        self.sync_subagents();
+        self.sync_task_picker();
+    }
+
+    pub fn flush_all_chats(&mut self) {
+        for chat in &mut self.chats {
+            chat.flush();
+        }
+    }
+
+    fn route_paste(&mut self, text: &str) {
+        if self.permission_active() {
+            self.permission_prompt.handle_paste(text);
+            return;
+        }
+        if self.help_modal.is_open() || self.btw_modal.is_open() {
+            return;
+        }
+        if self.float_mgr.is_focused() {
+            self.float_mgr.handle_paste(text);
+            return;
+        }
+        if self.plan_approval_pending {
+            return;
+        }
+        if self.model_picker.is_open() && self.plan_form_active() {
+            self.model_picker.handle_paste(text);
+            return;
+        }
+        if self.plan_form_active() {
+            return;
+        }
+        if self.lua_picker.handle_paste(text) {
+            return;
+        }
+        if self.float_mgr.handle_paste(text) {
+            return;
+        }
+        if self.search_modal.is_open() {
+            self.search_modal.handle_paste(text);
+            self.refresh_search_matches();
+            return;
+        }
+        macro_rules! try_picker {
+            ($picker:expr) => {
+                if $picker.handle_paste(text) {
+                    return;
+                }
+            };
+        }
+        try_picker!(self.file_picker);
+        try_picker!(self.task_picker);
+        try_picker!(self.rewind_picker);
+        try_picker!(self.theme_picker);
+        try_picker!(self.model_picker);
+        try_picker!(self.mcp_picker);
+        try_picker!(self.login_picker);
+        if self.attach_pasted_images(text) {
+            return;
+        }
+        if let InputAction::PaletteSync(val) = self.input_box.handle_paste(text) {
+            self.pending_dirty |= self.command_palette.sync(&val);
+            self.sync_command_arguments(&val, self.input_box.buffer.cursor_byte_offset());
+            self.sync_file_completion();
+        }
+    }
+
+    fn attach_pasted_images(&mut self, text: &str) -> bool {
+        if text.is_empty() {
+            if self.image_paste_rx.is_empty() {
+                self.start_image_paste();
+            }
+            return true;
+        }
+        let mut any_image = false;
+        for line in text.lines() {
+            if let Some((path, media_type)) = image::try_parse_image_path(line) {
+                self.start_file_image_paste(path, media_type);
+                any_image = true;
+            }
+        }
+        any_image
+    }
+
+    fn handle_plan_form_action(&mut self, action: PlanFormAction) -> Vec<Action> {
+        match action {
+            PlanFormAction::UseCurrentModel => {
+                self.plan_form.use_current_model();
+                vec![]
+            }
+            PlanFormAction::OpenModelPicker => {
+                self.open_model_picker(ModelPickerPurpose::PlanImplementation);
+                vec![Action::RefreshModels]
+            }
+            PlanFormAction::Consumed | PlanFormAction::Passthrough => vec![],
+            PlanFormAction::Hide => {
+                self.plan_form.hide();
+                vec![]
+            }
+            PlanFormAction::OpenEditor => match self.focused_plan_path() {
+                Some(p) => vec![Action::OpenEditor(p)],
+                None => {
+                    self.flash(FLASH_NO_PLAN.into());
+                    vec![]
+                }
+            },
+            PlanFormAction::Implement => self.implement_plan(false),
+            PlanFormAction::ClearAndImplement => self.implement_plan(true),
+        }
+    }
+
+    fn implement_plan(&mut self, clear_context: bool) -> Vec<Action> {
+        let Some(path) = self.focused_plan_path() else {
+            self.flash(FLASH_NO_PLAN.into());
+            return vec![];
+        };
+        self.plan_approval_pending = true;
+        vec![Action::ApprovePlan {
+            clear_context,
+            selection: self.plan_form.implementation_selection().clone(),
+            parallel: self.plan_form.parallel(),
+            path,
+        }]
+    }
+
+    fn plan_form_key(&self, target: AgentId) -> Option<AgentId> {
+        (self.chats.first().and_then(|chat| chat.agent_id) != Some(target)).then_some(target)
+    }
+
+    pub(crate) fn plan_approval_matches(
+        &self,
+        target: AgentId,
+        selection: &ModelSelection,
+        parallel: bool,
+    ) -> bool {
+        let key = self.plan_form_key(target);
+        let (form, pending) = if self.plan_form_target == key {
+            (&self.plan_form, self.plan_approval_pending)
+        } else {
+            match self.plan_forms.get(&key) {
+                Some((form, pending)) => (form, *pending),
+                None => return false,
+            }
+        };
+        pending && form.implementation_selection() == selection && form.parallel() == parallel
+    }
+
+    pub(crate) fn clear_plan_approval_pending(&mut self, target: AgentId) {
+        if let Some((_, pending)) = self.plan_form_entry(self.plan_form_key(target)) {
+            *pending = false;
+        }
+    }
+
+    pub(crate) fn finish_child_plan_approval(&mut self, target: AgentId) {
+        if let Some((form, pending)) = self.plan_form_entry(self.plan_form_key(target)) {
+            form.reset();
+            *pending = false;
+        }
+    }
+
+    pub(crate) fn record_plan_implementation(
+        &mut self,
+        run_id: u64,
+        content: String,
+        path: String,
+        prompt: String,
+    ) {
+        self.state.plan = PlanState::None;
+        self.main_chat().push(DisplayMessage::plan(content, path));
+        self.main_chat().show_user_message(prompt, vec![]);
+        self.queue.set_run_id(run_id);
+        self.record_run_start(run_id);
+    }
+}
+
+fn is_streaming_stop_key(key: KeyEvent) -> bool {
+    key::QUIT.matches(key) || key.code == KeyCode::Esc
+}
+
+fn sync_search_highlight(modal: &SearchModal, chat: &mut Chat) {
+    let idx = modal.current_segment_index();
+    if let Some(i) = idx {
+        chat.scroll_to_segment(i);
+    }
+}

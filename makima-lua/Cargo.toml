@@ -1,0 +1,122 @@
+[package]
+name = "makima-lua"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+test-support = ["dep:globset"]
+
+[dependencies]
+arc-swap = { workspace = true }
+async-lock = { workspace = true }
+base64 = { workspace = true }
+image = { workspace = true, features = ["jpeg", "gif", "webp"] }
+crossterm = { workspace = true }
+makima-agent = { workspace = true }
+makima-config = { workspace = true }
+makima-commands = { workspace = true }
+makima-highlight = { workspace = true }
+makima-interpreter = { workspace = true }
+makima-match = { workspace = true }
+nucleo-matcher = { workspace = true }
+makima-lua-macro = { workspace = true }
+makima-markdown = { workspace = true }
+makima-providers = { workspace = true }
+mlua = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+keyring = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+smol = { workspace = true }
+strum = { workspace = true }
+event-listener = { workspace = true }
+flume = { workspace = true }
+globset = { workspace = true, optional = true }
+futures = { workspace = true }
+futures-lite = { workspace = true }
+pin-project-lite = { workspace = true }
+tree-sitter = { workspace = true }
+unicode-width = { workspace = true }
+regex = { workspace = true }
+include_dir = { workspace = true }
+makima-storage = { workspace = true }
+jiff = { workspace = true }
+humantime = { workspace = true }
+isahc = { workspace = true }
+htmd = { workspace = true }
+hmac = { workspace = true }
+open = { workspace = true }
+sha2 = { workspace = true }
+jsonschema = { workspace = true }
+toml = { workspace = true }
+tree-sitter-bash = { workspace = true }
+tree-sitter-c = { workspace = true }
+tree-sitter-c-sharp = { workspace = true }
+tree-sitter-cpp = { workspace = true }
+tree-sitter-elixir = { workspace = true }
+tree-sitter-gleam = { workspace = true }
+tree-sitter-go = { workspace = true }
+tree-sitter-html = { workspace = true }
+tree-sitter-java = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-kotlin-ng = { workspace = true }
+tree-sitter-lua = { workspace = true }
+tree-sitter-md = { workspace = true }
+tree-sitter-nix = { workspace = true }
+tree-sitter-php = { workspace = true }
+tree-sitter-python = { workspace = true }
+tree-sitter-ruby = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-scala = { workspace = true }
+tree-sitter-sequel = { workspace = true }
+tree-sitter-starlark = { workspace = true }
+tree-sitter-swift = { workspace = true }
+tree-sitter-toml-ng = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-vlang = { workspace = true }
+tree-sitter-zig = { workspace = true }
+tree-sitter-dart = { workspace = true }
+tree-sitter-yaml = { workspace = true }
+tree-sitter-containerfile = { workspace = true }
+tree-sitter-css = { workspace = true }
+tree-sitter-hcl = { workspace = true }
+tree-sitter-json = { workspace = true }
+tree-sitter-make = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
+[dev-dependencies]
+makima-providers = { workspace = true, features = ["test-util"] }
+makima-config = { workspace = true, features = ["test-util"] }
+makima-lua = { path = ".", features = ["test-support"] }
+base64 = { workspace = true }
+criterion = { workspace = true }
+image = { workspace = true }
+makima-agent = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }
+test-case = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[[bench]]
+name = "luau_perf"
+harness = false
+
+[[bench]]
+name = "splash_perf"
+harness = false
+
+[[bench]]
+name = "provider_perf"
+harness = false
+
+[[bench]]
+name = "provider_wire"
+harness = false
