@@ -360,11 +360,27 @@ fn humantime(_lua: &Lua, secs: u64) -> LuaResult<String> {
 /// local half_width = math.floor(size.cols / 2)
 #[lua_fn]
 fn terminal_size(lua: &Lua) -> LuaResult<Table> {
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let (cols, rows) = tty_size().unwrap_or((80, 24));
     let tbl = lua.create_table()?;
     tbl.set("cols", cols)?;
     tbl.set("rows", rows)?;
     Ok(tbl)
+}
+
+/// `crossterm::terminal::size` runs `tput cols` and `tput lines` when there is
+/// no tty, two process spawns that block the Lua thread on every call in
+/// headless and test runs. The ioctl alone gives the same answer whenever a
+/// terminal is attached.
+#[cfg(unix)]
+fn tty_size() -> Option<(u16, u16)> {
+    crossterm::terminal::window_size()
+        .ok()
+        .map(|size| (size.columns, size.rows))
+}
+
+#[cfg(not(unix))]
+fn tty_size() -> Option<(u16, u16)> {
+    crossterm::terminal::size().ok()
 }
 
 /// Returns the display width of a string in terminal cells, matching

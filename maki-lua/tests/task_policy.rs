@@ -632,12 +632,17 @@ fn tool_snapshots(
     tool_use_id: &str,
 ) -> (BufferSnapshot, Option<BufferSnapshot>) {
     let mut body = None;
+    let mut live_body = None;
     let mut header = None;
     for env in rx.drain() {
         match env.event {
             AgentEvent::ToolSnapshot { id, snapshot, .. } => {
                 assert_eq!(id, tool_use_id);
                 body = Some(snapshot);
+            }
+            AgentEvent::LiveToolBuf { id, body } => {
+                assert_eq!(id, tool_use_id);
+                live_body = Some(body);
             }
             AgentEvent::ToolHeaderSnapshot { id, snapshot, .. } => {
                 assert_eq!(id, tool_use_id);
@@ -646,6 +651,9 @@ fn tool_snapshots(
             _ => {}
         }
     }
+    // The UI keeps reading the returned body after the call, so a live run's
+    // final view is that buf, including Markdown rendered in the background.
+    let body = live_body.map(|live| live.take()).or(body);
     (body.expect("tool body"), header)
 }
 

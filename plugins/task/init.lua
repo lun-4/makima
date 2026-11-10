@@ -433,9 +433,13 @@ local function wait_label(input, state)
   return input.task_id:sub(-8)
 end
 
--- Unfinished so callers can append a fallback line before `view:finish()`.
--- A `prefix` span starts every line, narrowing the wrap width to fit it.
-local function markdown_preview(text, ctx, prefix)
+-- Shows {text} as plain lines at once and swaps in its Markdown rendering
+-- from a background task, then calls {on_rendered} so the caller redraws.
+-- Rendering hops to the highlight thread, which a busy machine can make slow,
+-- so a tool call must never wait on it. Unfinished so callers can append a
+-- fallback line before `view:finish()`. A `prefix` span starts every line,
+-- narrowing the wrap width to fit it.
+local function markdown_preview(text, ctx, prefix, on_rendered)
   local tol = ctx and ctx:tool_output_lines()
   local preview = maki.ui.buf()
   local view = ToolView.new(preview, {
@@ -443,16 +447,10 @@ local function markdown_preview(text, ctx, prefix)
     keep = "head",
     max_line_bytes = output_limits.DEFAULT_MAX_LINE_BYTES,
   })
-  if type(text) == "string" and text ~= "" then
-    local prefix_cols = prefix and utf8.len(prefix) or 0
-    local width = math.max(maki.ui.terminal_size().cols - BODY_INDENT_COLS - prefix_cols, MIN_MD_WIDTH)
-    local ok, lines = pcall(maki.ui.markdown, text, width)
-    if not ok then
-      lines = {}
-      for _, line in ipairs(maki.split(text, "\n")) do
-        lines[#lines + 1] = { { line } }
-      end
-    end
+  if type(text) ~= "string" or text == "" then
+    return preview, view
+  end
+  local function append_lines(lines)
     for _, line in ipairs(lines) do
       if prefix then
         table.insert(line, 1, { prefix, "dim" })
@@ -460,6 +458,23 @@ local function markdown_preview(text, ctx, prefix)
       view:append(line)
     end
   end
+  local plain = {}
+  for _, line in ipairs(maki.split(text, "\n")) do
+    plain[#plain + 1] = { { line } }
+  end
+  append_lines(plain)
+  local prefix_cols = prefix and utf8.len(prefix) or 0
+  local width = math.max(maki.ui.terminal_size().cols - BODY_INDENT_COLS - prefix_cols, MIN_MD_WIDTH)
+  maki.async.run(function()
+    local ok, lines = pcall(maki.ui.markdown, text, width)
+    if not ok then
+      return
+    end
+    view:clear()
+    append_lines(lines)
+    view:finish()
+    on_rendered()
+  end)
   return preview, view
 end
 
@@ -485,7 +500,7 @@ local function details_view(status, style, preview, view, details)
     view:toggle()
     render()
   end)
-  return buf
+  return buf, render
 end
 
 local function wait_view(input, output, is_error, ctx, state)
@@ -515,7 +530,10 @@ local function wait_view(input, output, is_error, ctx, state)
     status = status .. " · " .. maki.ui.humantime(result.duration_ms / 1000)
   end
 
-  local preview, view = markdown_preview(report, ctx)
+  local redraw
+  local preview, view = markdown_preview(report, ctx, nil, function()
+    redraw()
+  end)
   if (type(report) ~= "string" or report == "") and envelope.status == "done" and style ~= "error" then
     view:append({
       { result.captured ~= nil and "Structured result available in details." or "No report returned.", "dim" },
@@ -539,7 +557,9 @@ local function wait_view(input, output, is_error, ctx, state)
     details[#details + 1] = "Captured: "
       .. maki.text.truncate_line(maki.json.encode(result.captured), output_limits.DEFAULT_MAX_LINE_BYTES)
   end
-  return { body = details_view(status, style, preview, view, details), header = label_buf(wait_label(input, state)) }
+  local body
+  body, redraw = details_view(status, style, preview, view, details)
+  return { body = body, header = label_buf(wait_label(input, state)) }
 end
 
 local function send_label(input, state)
@@ -549,27 +569,31 @@ local function send_label(input, state)
   return "To " .. input.task_id:sub(-8)
 end
 
--- Renders the message as a quote now and returns a cheap finisher for the
--- result. Handlers call this before admitting work: a child that runs while
--- its parent is still rendering can finish and have its result delivered
--- ahead of the parent's next request. Clicks toggle the truncated view, and a
+-- Builds the quoted message before the handler admits any work and returns a
+-- finisher for the result. A child that runs while its parent is still busy
+-- can finish and have its result delivered ahead of the parent's next
+-- request. The Markdown may land while the handler waits on admission, so
+-- the body exists from the start. Clicks toggle the truncated view, and a
 -- failure line follows the quote so the user still sees what was sent.
 local function quote_view(text, ctx, failed_prefix, header_text)
-  local quote, view = markdown_preview(text, ctx, QUOTE_BAR)
-  view:finish()
-  return function(output, is_error)
-    local body = maki.ui.buf()
-    local function render()
-      body:set_lines(quote:get_lines())
-      if is_error then
-        body:line({ { failed_prefix .. output, "error" } })
-      end
+  local body = maki.ui.buf()
+  local quote, view, failure
+  local function render()
+    body:set_lines(quote:get_lines())
+    if failure then
+      body:line({ { failure, "error" } })
     end
+  end
+  quote, view = markdown_preview(text, ctx, QUOTE_BAR, render)
+  view:finish()
+  render()
+  body:on("click", function()
+    view:toggle()
     render()
-    body:on("click", function()
-      view:toggle()
-      render()
-    end)
+  end)
+  return function(output, is_error)
+    failure = is_error and failed_prefix .. output or nil
+    render()
     return { body = body, header = label_buf(header_text) }
   end
 end
