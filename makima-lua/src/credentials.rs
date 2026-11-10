@@ -1,5 +1,5 @@
-//! `maki.credentials.Store`: credentials stored for a provider (its ctx's
-//! `credentials`) or for a plugin (`maki.credentials.open`), and the shared,
+//! `makima.credentials.Store`: credentials stored for a provider (its ctx's
+//! `credentials`) or for a plugin (`makima.credentials.open`), and the shared,
 //! cross-process refresh transaction.
 
 use std::collections::HashMap;
@@ -108,7 +108,7 @@ async fn delete(lua: Lua, this: UserDataRef<Store>) -> LuaResult<Pair<bool>> {
 /// @return (table?, any?) The stored table after the refresh, or nil plus the error {fn} returned, unchanged.
 /// @example
 /// local tokens, err = ctx.credentials:refresh(function(current)
-///   if current and current.expires > maki.time.now().secs * 1000 + 60000 then return nil end
+///   if current and current.expires > makima.time.now().secs * 1000 + 60000 then return nil end
 ///   return exchange(current.refresh)
 /// end)
 #[lua_fn]
@@ -177,7 +177,7 @@ async fn refresh_in_load(lua: &Lua, name: Arc<str>, refresh: Function) -> Refres
     }
     // The refresh can finish within one poll when its file work is quick, so
     // yield once: callers started alongside this one, such as by
-    // `maki.async.gather`, then find the flight instead of running {refresh}.
+    // `makima.async.gather`, then find the flight instead of running {refresh}.
     yield_now().await;
     let result = run_refresh(lua, &name, refresh).await;
     if let Some(mut flights) = lua.app_data_mut::<RefreshFlights>() {
@@ -265,11 +265,11 @@ async fn run_refresh(lua: &Lua, name: &Arc<str>, refresh: Function) -> RefreshRe
 /// the ctxs it was narrowed from reach. A provider ctx opens its plugin
 /// ctx's stores.
 ///
-/// @param ctx maki.Ctx The plugin's ctx, or a provider ctx.
+/// @param ctx makima.Ctx The plugin's ctx, or a provider ctx.
 /// @param key string ASCII letters, digits, `-`, `_` or `.`, not starting with `.`.
-/// @return (maki.credentials.Store) The store.
+/// @return (makima.credentials.Store) The store.
 /// @example
-/// local account = maki.credentials.open(ctx, "account")
+/// local account = makima.credentials.open(ctx, "account")
 /// local saved = account:read()
 #[lua_fn]
 fn open(_lua: &Lua, ctx: UserDataRef<Ctx>, key: String) -> LuaResult<Store> {
@@ -281,7 +281,7 @@ fn open(_lua: &Lua, ctx: UserDataRef<Ctx>, key: String) -> LuaResult<Store> {
 
 lua_class! {
     /// A credentials file: a provider's (its ctx's `credentials`) or a
-    /// plugin's (`maki.credentials.open`). The value is whatever JSON table
+    /// plugin's (`makima.credentials.open`). The value is whatever JSON table
     /// is stored, such as `{ api_key }` or `{ access, refresh, expires }`.
     "maki.credentials.Store" => Store, STORE_DOCS [read, write, delete, refresh, lock]
 }

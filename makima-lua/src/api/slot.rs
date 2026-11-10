@@ -376,8 +376,8 @@ pub(crate) async fn invoke_slot_from_host(
 /// Throws if another plugin already owns a slot with the same {name}, or
 /// if {name} starts with `"tool."`, which the host fires itself.
 ///
-/// The chain is async: the default and every layer may park (`maki.fs.*`,
-/// `maki.fn.jobwait`, `maki.agent.call_tool`, ...), and so does the
+/// The chain is async: the default and every layer may park (`makima.fs.*`,
+/// `makima.fn.jobwait`, `makima.agent.call_tool`, ...), and so does the
 /// returned callable. Call it from a tool handler, a command, or an
 /// autocmd, rather than from a `header` or `restore` function, which
 /// cannot wait. The chain runs in your task, so cancelling the caller
@@ -387,7 +387,7 @@ pub(crate) async fn invoke_slot_from_host(
 /// @param default function Default implementation, called when no layers wrap it.
 /// @return (function) Callable that dispatches through all layers.
 /// @example
-/// local render = maki.api.declare_slot("myplugin.render", function(text)
+/// local render = makima.api.declare_slot("myplugin.render", function(text)
 ///   return text:upper()
 /// end)
 /// print(render("hello")) -- HELLO
@@ -434,7 +434,7 @@ fn declare_slot(
 /// Layers wrap in registration order, so the last one registered runs
 /// first and sees the value before the others do.
 ///
-/// Maki fires two slots per tool itself: `tool.<name>.input` before
+/// Makima fires two slots per tool itself: `tool.<name>.input` before
 /// permissions look at the call, and `tool.<name>.output` on the text it
 /// produced. Both take `function(prev, value, ctx)` and answer with a
 /// table to replace the value, nothing to leave it alone, or
@@ -446,7 +446,7 @@ fn declare_slot(
 /// @param wrapper function Layer: `function(prev, ...)`. Call `prev(...)` to continue.
 /// @return (boolean|nil, string|nil) true, or nil and an error. Returns nil and an error when called from a delegated tool handler.
 /// @example
-/// maki.api.set_slot("myplugin.render", function(prev, text)
+/// makima.api.set_slot("myplugin.render", function(prev, text)
 ///   return prev("[" .. text .. "]")
 /// end)
 #[lua_fn]

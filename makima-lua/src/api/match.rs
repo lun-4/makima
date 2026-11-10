@@ -31,7 +31,7 @@ fn string_arg(val: &LuaValue, what: &str) -> LuaResult<String> {
 /// @param text string Text to search in.
 /// @return (table|nil) nil when no word matches. On a match: {score = number, indices = {…}} where indices are the 1-based codepoint offsets of the matched characters, ascending.
 /// @example
-/// local m = maki.match.fuzzy("gh pr", "gh pr 441 review")
+/// local m = makima.match.fuzzy("gh pr", "gh pr 441 review")
 /// if m then
 ///   print(m.score) -- matched codepoint offsets in m.indices
 /// end
@@ -249,10 +249,10 @@ fn ranking_from_table(table: &Table, side: &str) -> LuaResult<CompletionRanking>
 /// when {right} sorts first. Source priority, provider order, list grouping,
 /// and other caller-owned policy are intentionally not compared. Use the
 /// result as a boolean predicate for `table.sort`:
-/// `function(a, b) return maki.match.compare(a, b) < 0 end`.
+/// `function(a, b) return makima.match.compare(a, b) < 0 end`.
 ///
-/// @param left table Match result returned by `maki.match.completion`.
-/// @param right table Match result returned by `maki.match.completion`.
+/// @param left table Match result returned by `makima.match.completion`.
+/// @param right table Match result returned by `makima.match.completion`.
 /// @return (integer) -1, 0, or 1.
 #[lua_fn]
 fn compare(_lua: &Lua, left: LuaValue, right: LuaValue) -> LuaResult<i32> {
@@ -287,7 +287,7 @@ lua_table! {
     /// Use it for type-ahead search over a plugin's own item list.
     ///
     /// ```lua
-    /// local m = maki.match.fuzzy("gh pr", "gh pr 441 review")
+    /// local m = makima.match.fuzzy("gh pr", "gh pr 441 review")
     /// if m then
     ///   print(m.score) -- matched codepoint offsets in m.indices
     /// end

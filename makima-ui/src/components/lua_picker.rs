@@ -1,5 +1,5 @@
 //! The host-side list-picker dialog a plugin opens via
-//! `maki.ui.open_list_picker`. It wraps [`ListPicker`] and talks back to the
+//! `makima.ui.open_list_picker`. It wraps [`ListPicker`] and talks back to the
 //! Lua thread by dialog `id` (the callbacks live in Lua app-data and cannot
 //! cross the `UiAction` channel), replying with a single [`PickerResult`] on
 //! the caller's channel. Filter edits keep the current row (native

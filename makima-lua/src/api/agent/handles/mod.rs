@@ -652,7 +652,7 @@ mod tests {
 
     /// Installs a managed root whose trusted context becomes the global `ctx`.
     /// Children spawned through it are real manager nodes, which is the only
-    /// way `maki.agent.spawn` authorises a parent.
+    /// way `makima.agent.spawn` authorises a parent.
     fn install_managed_root(lua: &Lua, context: &ToolContext) -> ManagedRoot {
         install_managed_root_with(lua, context, AgentLimits::default())
     }
@@ -742,7 +742,7 @@ mod tests {
             local child = assert(agent_api.spawn(ctx, {{
                 inherit_provider = true, tools = {{}}, name = "{CHILD_NAME}", show = {show},
             }}))
-            local id = child:_makima_session_id()
+            local id = child:_maki_session_id()
             assert(child:close(ctx))
             return id
         "#
@@ -804,7 +804,7 @@ mod tests {
                 inherit_provider = true, tools = {{}}, show = false,
             }}))
             assert(ui.post(ctx, "{POST_TEXT}", {{ level = "error", agent = child }}))
-            local id = child:_makima_session_id()
+            local id = child:_maki_session_id()
             assert(child:close(ctx))
             return id
         "#

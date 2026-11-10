@@ -1,4 +1,4 @@
-//! `maki.fs` — the plugin-facing file-system namespace.
+//! `makima.fs` — the plugin-facing file-system namespace.
 //!
 //! All I/O dispatches through the [`FsBackend`] trait: [`RealFs`] is the
 //! production backend (real disk, symlinks, gitignore, permissions);
@@ -143,9 +143,9 @@ fn path_to_string(p: &Path) -> LuaResult<String> {
 /// @param path string Absolute or relative file path. `~/` is expanded to the home directory.
 /// @return (string?, string?) File contents, or nil plus an error message.
 /// @example
-/// local text, err = maki.fs.read("config.toml")
+/// local text, err = makima.fs.read("config.toml")
 /// if err then
-///   maki.log.warn("could not read config: " .. err)
+///   makima.log.warn("could not read config: " .. err)
 ///   return
 /// end
 #[lua_fn(guard = FsRead)]
@@ -162,14 +162,14 @@ async fn read(lua: Lua, path: String) -> LuaResult<Pair<String>> {
 }
 
 /// Read the entire file at {path} as raw bytes, returned as a Luau buffer.
-/// Useful for binary files or when you need to pass the data to `maki.base64.encode`.
+/// Useful for binary files or when you need to pass the data to `makima.base64.encode`.
 ///
 /// @param path string Absolute or relative file path. `~/` is expanded to the home directory.
 /// @return (buffer?, string?) File bytes as a Luau buffer, or nil plus an error message.
 /// @example
-/// local buf, err = maki.fs.read_bytes("image.png")
+/// local buf, err = makima.fs.read_bytes("image.png")
 /// if err then return end
-/// local encoded = maki.base64.encode(buf)
+/// local encoded = makima.base64.encode(buf)
 #[lua_fn(guard = FsRead)]
 async fn read_bytes(lua: Lua, path: String) -> LuaResult<Pair<Buffer>> {
     let abs = make_absolute(&path)?;
@@ -187,7 +187,7 @@ async fn read_bytes(lua: Lua, path: String) -> LuaResult<Pair<Buffer>> {
 /// @param path string Absolute or relative path.
 /// @return (table?, string?) Metadata table, nil if missing, or nil plus an error message.
 /// @example
-/// local meta = maki.fs.metadata("src/main.rs")
+/// local meta = makima.fs.metadata("src/main.rs")
 /// if meta and meta.is_file then
 ///   print("size: " .. meta.size)
 /// end
@@ -218,7 +218,7 @@ async fn metadata(lua: Lua, path: String) -> LuaResult<Pair<Table>> {
 /// @param path string File path.
 /// @return (string?) Parent directory, or nil if {path} has no parent.
 /// @example
-/// maki.fs.dirname("/home/user/init.lua") -- "/home/user"
+/// makima.fs.dirname("/home/user/init.lua") -- "/home/user"
 #[lua_fn]
 fn dirname(_lua: &Lua, path: String) -> LuaResult<Option<String>> {
     Ok(Path::new(&path)
@@ -232,7 +232,7 @@ fn dirname(_lua: &Lua, path: String) -> LuaResult<Option<String>> {
 /// @param path string File path.
 /// @return (string?) File name, or nil for paths like `/`.
 /// @example
-/// maki.fs.basename("/home/user/init.lua") -- "init.lua"
+/// makima.fs.basename("/home/user/init.lua") -- "init.lua"
 #[lua_fn]
 fn basename(_lua: &Lua, path: String) -> LuaResult<Option<String>> {
     Ok(Path::new(&path)
@@ -246,7 +246,7 @@ fn basename(_lua: &Lua, path: String) -> LuaResult<Option<String>> {
 /// @param parts string One or more path segments to join.
 /// @return (string) The joined path.
 /// @example
-/// maki.fs.joinpath("src", "api", "fs.rs") -- "src/api/fs.rs"
+/// makima.fs.joinpath("src", "api", "fs.rs") -- "src/api/fs.rs"
 #[lua_fn]
 fn joinpath(_lua: &Lua, parts: mlua::Variadic<String>) -> LuaResult<String> {
     let mut buf = PathBuf::new();
@@ -262,7 +262,7 @@ fn joinpath(_lua: &Lua, parts: mlua::Variadic<String>) -> LuaResult<String> {
 /// @param path string Path to normalize. `~/` is expanded.
 /// @return (string) Normalized absolute path.
 /// @example
-/// maki.fs.normalize("src/../src/api") -- "/home/user/project/src/api"
+/// makima.fs.normalize("src/../src/api") -- "/home/user/project/src/api"
 #[lua_fn]
 fn normalize(_lua: &Lua, path: String) -> LuaResult<String> {
     let abs = make_absolute(&path)?;
@@ -286,7 +286,7 @@ fn normalize(_lua: &Lua, path: String) -> LuaResult<String> {
 /// @param path string Relative or absolute path. `~/` is expanded.
 /// @return (string) Absolute path.
 /// @example
-/// maki.fs.abspath("src/main.rs") -- "/home/user/project/src/main.rs"
+/// makima.fs.abspath("src/main.rs") -- "/home/user/project/src/main.rs"
 #[lua_fn]
 fn abspath(_lua: &Lua, path: String) -> LuaResult<String> {
     path_to_string(&make_absolute(&path)?)
@@ -298,7 +298,7 @@ fn abspath(_lua: &Lua, path: String) -> LuaResult<String> {
 /// @param path string File or directory path.
 /// @return (string[]) Array of ancestor directory paths.
 /// @example
-/// local dirs = maki.fs.parents("/home/user/project/src")
+/// local dirs = makima.fs.parents("/home/user/project/src")
 /// -- { "/home/user/project", "/home/user", "/home", "/" }
 #[lua_fn]
 fn parents(lua: &Lua, path: String) -> LuaResult<Table> {
@@ -324,7 +324,7 @@ fn parents(lua: &Lua, path: String) -> LuaResult<Table> {
 /// @param marker string|string[] Marker filename(s) to look for, e.g. `".git"` or `{"package.json", ".git"}`.
 /// @return (string?, string?) Root directory path, or nil when not found.
 /// @example
-/// local root = maki.fs.root("src/main.rs", { ".git", "Cargo.toml" })
+/// local root = makima.fs.root("src/main.rs", { ".git", "Cargo.toml" })
 /// if root then print("project root: " .. root) end
 #[lua_fn(guard = FsRead)]
 async fn root(lua: Lua, source: String, marker: Value) -> LuaResult<Option<String>> {
@@ -376,7 +376,7 @@ async fn root(lua: Lua, source: String, marker: Value) -> LuaResult<Option<Strin
 /// @param target string Target path.
 /// @return (string) Relative path from {base} to {target}.
 /// @example
-/// maki.fs.relpath("/home/user", "/home/user/project/src") -- "project/src"
+/// makima.fs.relpath("/home/user", "/home/user/project/src") -- "project/src"
 #[lua_fn]
 fn relpath(_lua: &Lua, base: String, target: String) -> LuaResult<String> {
     let base_comps: Vec<_> = Path::new(&base).components().collect();
@@ -403,8 +403,8 @@ fn relpath(_lua: &Lua, base: String, target: String) -> LuaResult<String> {
 /// @param path string File path.
 /// @return (string?) Extension, or nil if the path has no extension.
 /// @example
-/// maki.fs.ext("main.rs")   -- "rs"
-/// maki.fs.ext("Makefile")  -- nil
+/// makima.fs.ext("main.rs")   -- "rs"
+/// makima.fs.ext("Makefile")  -- nil
 #[lua_fn]
 fn ext(_lua: &Lua, path: String) -> LuaResult<Option<String>> {
     Ok(Path::new(&path)
@@ -421,7 +421,7 @@ fn ext(_lua: &Lua, path: String) -> LuaResult<Option<String>> {
 /// @param opts table? `depth` (integer, default 1): how many levels deep to recurse.
 /// @return (table?, string?) Array of `{name, type}` entries, or nil plus an error message.
 /// @example
-/// local entries, err = maki.fs.dir("src", { depth = 2 })
+/// local entries, err = makima.fs.dir("src", { depth = 2 })
 /// if err then return end
 /// for _, e in ipairs(entries) do
 ///   print(e[1], e[2]) -- "main.rs"  "file"
@@ -455,7 +455,7 @@ async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Tabl
 /// @param content string Text to write.
 /// @return (true?, string?) `true` on success, or nil plus an error message.
 /// @example
-/// local ok, err = maki.fs.write("out.txt", "hello world")
+/// local ok, err = makima.fs.write("out.txt", "hello world")
 /// if err then print("write failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
 async fn write(lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
@@ -472,7 +472,7 @@ async fn write(lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>>
 /// @param content string Text to write.
 /// @return (true?, string?) `true` on success, or nil plus an error message.
 /// @example
-/// local ok, err = maki.fs.atomic_write("state.json", encoded)
+/// local ok, err = makima.fs.atomic_write("state.json", encoded)
 /// if err then print("atomic write failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
 async fn atomic_write(lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
@@ -490,9 +490,9 @@ async fn atomic_write(lua: Lua, path: String, content: String) -> LuaResult<Pair
 /// @param opts table? `recursive` (boolean, default false): remove a directory and its contents recursively. `force` (boolean, default false): silently ignore a missing path.
 /// @return (true?, string?) `true` on success, or nil plus an error message.
 /// @example
-/// local ok, err = maki.fs.rm("temp.txt")
+/// local ok, err = makima.fs.rm("temp.txt")
 /// if err then print("rm failed: " .. err) end
-/// maki.fs.rm("stale_dir", { recursive = true, force = true })
+/// makima.fs.rm("stale_dir", { recursive = true, force = true })
 #[lua_fn(guard = FsWrite)]
 async fn rm(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
     let abs = make_absolute(&path)?;
@@ -516,7 +516,7 @@ async fn rm(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool>
 /// @param opts table? `parents` (boolean, default false): create intermediate parent directories.
 /// @return (true?, string?) `true` on success, or nil plus an error message.
 /// @example
-/// maki.fs.mkdir("a/b/c", { parents = true })
+/// makima.fs.mkdir("a/b/c", { parents = true })
 #[lua_fn(guard = FsWrite)]
 async fn mkdir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
     let abs = make_absolute(&path)?;
@@ -537,7 +537,7 @@ async fn mkdir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bo
 /// @param opts table? `path` (string): search root. `limit` (integer): max results. `gitignore` (boolean, default true): respect .gitignore. `sort` (string): `"mtime"` sorts newest first.
 /// @return (string[]?, string?) Array of absolute file paths, or nil plus an error message.
 /// @example
-/// local files, err = maki.fs.glob("**/*.lua", { path = "plugins", limit = 10 })
+/// local files, err = makima.fs.glob("**/*.lua", { path = "plugins", limit = 10 })
 /// if err then return end
 /// for _, f in ipairs(files) do print(f) end
 #[lua_fn(guard = FsRead)]
@@ -591,7 +591,7 @@ async fn glob(lua: Lua, pattern: Value, opts: Option<Table>) -> LuaResult<Pair<T
 /// @param opts table? `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`). `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `max_line_bytes` (integer): skip lines longer than this.
 /// @return (table?, string?) Array of `{path, groups}` tables, or nil plus an error message.
 /// @example
-/// local hits, err = maki.fs.grep("TODO", { path = "src", include = "*.rs", limit = 5 })
+/// local hits, err = makima.fs.grep("TODO", { path = "src", include = "*.rs", limit = 5 })
 /// if err then return end
 /// for _, file in ipairs(hits) do
 ///   for _, g in ipairs(file.groups) do
@@ -659,7 +659,7 @@ lua_table! {
     /// Paths support `~/` expansion. Relative paths resolve from the current working directory.
     ///
     /// ```lua
-    /// local text, err = maki.fs.read("init.lua")
+    /// local text, err = makima.fs.read("init.lua")
     /// if err then return end
     /// ```
     "maki.fs" => pub(crate) fn create_fs_table(perms: &PluginPermissions), DOCS [

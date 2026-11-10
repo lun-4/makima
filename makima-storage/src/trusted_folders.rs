@@ -134,7 +134,7 @@ pub enum TrustedFoldersError {
 
 /// A recorded yes, together with the kinds of gated file the user could see
 /// named in the question. Keeping the set means a yes about
-/// `.maki/permissions.toml` never quietly covers an `.maki/init.lua` that
+/// `.makima/permissions.toml` never quietly covers an `.makima/init.lua` that
 /// arrives in a later pull. It is a set of file names, never a hash of their
 /// contents, so editing a file the user already trusted asks nothing.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -238,8 +238,8 @@ impl TrustedFolders {
         Ok(Change::Changed)
     }
 
-    /// Adds a gated file Maki wrote itself to a folder that is already
-    /// trusted, so the next start does not read Maki's own write as something
+    /// Adds a gated file Makima wrote itself to a folder that is already
+    /// trusted, so the next start does not read Makima's own write as something
     /// the project added and ask about it.
     ///
     /// A folder with no answer keeps none: writing a file into a folder is not
@@ -369,7 +369,7 @@ impl TrustedFolders {
         // A malformed entry cannot grant anything, because `status` compares
         // against a canonical absolute path and nothing else. Refusing to load
         // over one would only turn a cosmetic typo into a store nobody can fix
-        // without a text editor, `maki trust remove` included.
+        // without a text editor, `makima trust remove` included.
         Ok(document)
     }
 
@@ -723,7 +723,7 @@ mod tests {
     }
 
     /// The reported way to brick the store: one trailing slash typed by hand
-    /// used to make every `maki trust` command fail.
+    /// used to make every `makima trust` command fail.
     #[test]
     fn remove_clears_an_entry_spelled_with_a_trailing_slash() {
         let dir = tempfile::tempdir().unwrap();

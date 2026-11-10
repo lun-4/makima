@@ -394,12 +394,12 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///   `pattern` (string|string[]) only fire when the pattern matches. `"*"` matches everything. Omit to match all.
 /// @return (integer|nil, string|nil) Autocmd id. Returns nil and an error when called from a delegated tool handler.
 /// @example
-/// maki.api.create_autocmd("TurnEnd", {
+/// makima.api.create_autocmd("TurnEnd", {
 ///   callback = function(ev, ctx)
 ///     if ev.data.parent_id then
 ///       return
 ///     end
-///     maki.log.info("root turn ended: " .. ev.data.status)
+///     makima.log.info("root turn ended: " .. ev.data.status)
 ///   end,
 /// })
 #[lua_fn]
@@ -454,7 +454,7 @@ fn create_autocmd(
 /// @param id integer Id returned by `create_autocmd`.
 /// @return
 /// @example
-/// maki.api.del_autocmd(id)
+/// makima.api.del_autocmd(id)
 #[lua_fn]
 fn del_autocmd(
     lua: &Lua,
@@ -482,7 +482,7 @@ fn del_autocmd(
 ///   `data` (any) arbitrary value passed as `ev.data`.
 /// @return
 /// @example
-/// maki.api.exec_autocmds("MyEvent", {
+/// makima.api.exec_autocmds("MyEvent", {
 ///   pattern = "init",
 ///   data = { msg = "hello" },
 /// })

@@ -57,7 +57,7 @@ fn agent_id(_lua: &Lua, this: &LuaAgent) -> mlua::Result<Pair<String>> {
 
 /// Read lifecycle, active turn, queue size, and cumulative usage.
 /// @param ctx LuaCtx Invocation context.
-/// @return (table?, string?) Fields: id (string), status ("idle", "working", or "closed", the vocabulary `maki.session` uses, which adds "needs_input"), queued (integer), active_turn (string or nil), input_tokens and output_tokens (cumulative integers). Authorized held managed handles retain a closed snapshot after graph removal.
+/// @return (table?, string?) Fields: id (string), status ("idle", "working", or "closed", the vocabulary `makima.session` uses, which adds "needs_input"), queued (integer), active_turn (string or nil), input_tokens and output_tokens (cumulative integers). Authorized held managed handles retain a closed snapshot after graph removal.
 #[lua_fn(name = "status")]
 fn agent_status(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<Table>> {
     try_pair!(observe(lua, &ctx, this));
@@ -598,25 +598,22 @@ fn agent_defer_close(
 // `_makima_can_control` checks plugin generation, host and parent branch, and whose
 // `_makima_retired` reports a closed child. The guard authorizes no effect.
 fn agent_internal_methods<M: UserDataMethods<LuaAgent>>(methods: &mut M) {
-    methods.add_method(
-        "_makima_task_owner",
-        |lua, this, ctx: UserDataRef<LuaCtx>| {
-            authorize(lua, &ctx, this).map_err(mlua::Error::runtime)?;
-            let (plugin, generation) =
-                current_plugin(lua).ok_or_else(|| mlua::Error::runtime(NO_PLUGIN_AUTHORITY))?;
-            Ok(LuaTaskOwner {
-                owner_id: this.state.as_ref().and_then(|state| state.parent_agent_id),
-                owner: plugin_authority(lua, plugin.clone()),
-                plugin,
-                generation,
-                target: this
-                    .manager
-                    .lookup(this.id)
-                    .map_err(mlua::Error::external)?,
-            })
-        },
-    );
-    methods.add_method("_makima_session_id", |_, this, ()| {
+    methods.add_method("_maki_task_owner", |lua, this, ctx: UserDataRef<LuaCtx>| {
+        authorize(lua, &ctx, this).map_err(mlua::Error::runtime)?;
+        let (plugin, generation) =
+            current_plugin(lua).ok_or_else(|| mlua::Error::runtime(NO_PLUGIN_AUTHORITY))?;
+        Ok(LuaTaskOwner {
+            owner_id: this.state.as_ref().and_then(|state| state.parent_agent_id),
+            owner: plugin_authority(lua, plugin.clone()),
+            plugin,
+            generation,
+            target: this
+                .manager
+                .lookup(this.id)
+                .map_err(mlua::Error::external)?,
+        })
+    });
+    methods.add_method("_maki_session_id", |_, this, ()| {
         Ok(this
             .state
             .as_ref()

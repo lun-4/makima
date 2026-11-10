@@ -1,4 +1,4 @@
-//! `maki.perf`: performance instrumentation for the interactive UI. The host
+//! `makima.perf`: performance instrumentation for the interactive UI. The host
 //! measures splash renders; plugins read the numbers and draw their own
 //! readouts (the bundled `perf` plugin turns one on from Lua).
 
@@ -16,7 +16,7 @@ use mlua::{Lua, Result as LuaResult, Table};
 ///
 /// @return (table) `{ render_ms = number, fps = number }`.
 /// @example
-/// local t = maki.perf.timings()
+/// local t = makima.perf.timings()
 #[lua_fn]
 fn timings(lua: &Lua) -> LuaResult<Table> {
     let perf = lua

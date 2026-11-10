@@ -144,7 +144,7 @@ const OPT_LEVEL_JIT: u8 = 2;
 const OPT_LEVEL_DEBUGGABLE: u8 = 1;
 const DEBUG_INFO_FULL: u8 = 2;
 pub(crate) const ASYNC_RUN_DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
-/// Upper bound for `maki.timer.set` seconds values: `f64::MAX` seconds
+/// Upper bound for `makima.timer.set` seconds values: `f64::MAX` seconds
 /// would panic in `Duration::from_secs_f64`.
 pub(crate) const MAX_LUA_SECONDS: f64 = 1e9;
 /// Async tasks spawned during restore may spawn further tasks; cap the rounds.
@@ -206,7 +206,7 @@ pub enum Request {
     /// last so it never interleaves with the loads themselves.
     WarmJit,
     /// Install a `SessionSnapshotSlot` on the Lua thread. Headless drivers send
-    /// one so `maki.session.read` works without a UI to ask.
+    /// one so `makima.session.read` works without a UI to ask.
     InstallSessionSnapshot {
         provider: crate::api::session::SessionSnapshotFn,
     },
@@ -580,7 +580,7 @@ pub(crate) struct TaskCell {
     publication_cancel: CancelToken,
     publication_trigger: Option<CancelTrigger>,
     pub(crate) delegated_tool: Option<DelegatedTool>,
-    /// Ids of the tasks whose `maki.async.run` spawned this one, outermost first.
+    /// Ids of the tasks whose `makima.async.run` spawned this one, outermost first.
     ancestors: Arc<[u64]>,
     /// How many event callbacks fired one another to start this task.
     pub(crate) event_depth: u8,
@@ -601,24 +601,24 @@ pub(crate) struct TaskCell {
     /// the first buf the task created (`bufs.live_buf()`).
     pub(crate) root_buf: Option<Arc<SharedBuf>>,
     /// Forwards live bufs and annotations to a parent
-    /// `maki.agent.call_tool(on_live_buf/on_annotation)`.
+    /// `makima.agent.call_tool(on_live_buf/on_annotation)`.
     pub(crate) live_sink: Option<flume::Sender<ToolLive>>,
-    /// When `Some`, `maki.async.run` tasks queue here instead of the global
+    /// When `Some`, `makima.async.run` tasks queue here instead of the global
     /// `SpawnQueue` so restore can run them inline before snapshotting.
     pub(crate) inline_spawn: Option<Vec<PendingAsyncTask>>,
     /// Cleared for delivery scopes: a job may not bind to a scope that dies
     /// with one event-delivery batch.
     owns_jobs: bool,
-    /// `maki.async.on_cancel` callbacks, fired once by [`ScopedFuture::poll`]
+    /// `makima.async.on_cancel` callbacks, fired once by [`ScopedFuture::poll`]
     /// and dropped, so a handler parked in an await still gets to paint the
     /// cancelled state before the host stops waiting for it.
     cancel_hooks: Vec<RegistryKey>,
     /// Set by [`TaskScope::new`]; `enqueue_async_task` upgrades it so queued
     /// tasks share ownership of `bufs`. See [`BufsClaim`].
     bufs_claim: Weak<BufsClaim>,
-    /// Slash-command hops that led to this task, so `maki.api.run_command`
+    /// Slash-command hops that led to this task, so `makima.api.run_command`
     /// can refuse to extend a chain that never ends. Inherited by
-    /// `maki.async.run` tasks, or a cycle could hop through one and reset it.
+    /// `makima.async.run` tasks, or a cycle could hop through one and reset it.
     pub(crate) command_depth: u8,
     pub(crate) command_invocation: Option<CommandTaskInvocation>,
     /// The agent a keymap or event callback was pinned to, so nested
@@ -796,7 +796,7 @@ pub(crate) fn lock_cell(handle: &TaskHandle) -> std::sync::MutexGuard<'_, TaskCe
     handle.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Backs `maki.async.on_cancel`. An already cancelled task has no
+/// Backs `makima.async.on_cancel`. An already cancelled task has no
 /// transition left for [`ScopedFuture::poll`] to ride, so it fires inline,
 /// and only after registering, so a raising hook is contained either way
 /// instead of blowing up whoever armed it.
@@ -864,7 +864,7 @@ fn install_compiler(lua: &Lua, jit: bool) -> Compiler {
 }
 
 /// Many plugins require the same bundled module, and each one needs a separate
-/// instance because the module closes over the plugin's `maki`. Only the
+/// instance because the module closes over the plugin's `makima`. Only the
 /// instantiation has to repeat, so the source is compiled to bytecode once per
 /// VM rather than once per plugin.
 #[derive(Clone)]
@@ -916,7 +916,7 @@ struct ModuleLoader {
 
 impl ModuleLoader {
     /// Bundled modules are tried first, so a plugin cannot shadow
-    /// `maki.truncate` and friends with a file of its own.
+    /// `makima.truncate` and friends with a file of its own.
     fn plugin_source(&self, rel_path: &str, modname: &str) -> Result<Option<String>, mlua::Error> {
         let Some(dir) = self.lua_dir.as_ref() else {
             return Ok(None);
@@ -1229,7 +1229,7 @@ async fn run_awaited<F: Future>(
 }
 
 /// [`run_detached`] for a slash-command handler, seeding the hop count that
-/// `maki.api.run_command` checks before extending the chain.
+/// `makima.api.run_command` checks before extending the chain.
 pub(crate) async fn run_command_scoped<F: Future>(
     lua: &Lua,
     invocation: CommandInvocation,
@@ -1512,7 +1512,7 @@ pub(crate) fn same_invocation(lua: &Lua, origin: &TaskHandle) -> bool {
 }
 
 /// Slash-command hops that led to the running task; 0 outside a command
-/// handler, so a keybind or tool calling `maki.api.run_command` starts fresh.
+/// handler, so a keybind or tool calling `makima.api.run_command` starts fresh.
 pub(crate) fn command_depth(lua: &Lua) -> u8 {
     lua.app_data_ref::<TaskHandle>()
         .map_or(0, |handle| lock_cell(&handle).command_depth)
@@ -1949,7 +1949,7 @@ pub(crate) enum TaskCall {
 }
 
 /// Shared ownership of a task's `bufs`: the scope holds one clone, each
-/// queued `maki.async.run` task holds one, so the `Arc` strong count is the
+/// queued `makima.async.run` task holds one, so the `Arc` strong count is the
 /// single source of truth for liveness. Dropping the last clone clears the
 /// store, breaking Lua GC watcher/click cycles. Root buf is resolved lazily
 /// because it may not exist at enqueue time.
@@ -1967,7 +1967,7 @@ impl Drop for BufsClaim {
     }
 }
 
-/// Channel of `maki.async.run` tasks. The dispatcher recvs the `rx` side as
+/// Channel of `makima.async.run` tasks. The dispatcher recvs the `rx` side as
 /// one arm of its biased select, so a send wakes the loop even while the
 /// enqueuing coroutine stays parked.
 pub(crate) struct SpawnQueue {
@@ -2237,7 +2237,7 @@ fn spawn_async_task(
     .detach();
 }
 
-/// Barrier for load/clear ops: drains queued `maki.async.run` tasks and
+/// Barrier for load/clear ops: drains queued `makima.async.run` tasks and
 /// waits for every in-flight task, looping until both are quiescent. A bare
 /// `gate.drain()` is not enough: a click handler that runs during the drain
 /// can enqueue an async job into the spawn queue, which only the dispatcher
@@ -3457,7 +3457,7 @@ impl LuaRuntime {
     }
 
     /// Bundled dirs go first so plugins can `require()` shared modules
-    /// (like `maki.truncate`) without touching the filesystem.
+    /// (like `makima.truncate`) without touching the filesystem.
     fn create_require_fn(
         &self,
         env: &mlua::Table,
@@ -3477,7 +3477,7 @@ impl LuaRuntime {
     }
 
     /// `plugins.<name>` options only reach a plugin through
-    /// `maki.api.register_options`; if the plugin never declared any, every
+    /// `makima.api.register_options`; if the plugin never declared any, every
     /// key the user set is a typo or unsupported, so fail the load loudly.
     fn check_opts_consumed(
         &self,
@@ -4284,7 +4284,7 @@ async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Opti
     Some(reply)
 }
 
-/// Runs `maki.async.run` tasks queued during restore inline, so their
+/// Runs `makima.async.run` tasks queued during restore inline, so their
 /// buf mutations land before the snapshot is extracted. Tasks may queue
 /// more tasks, hence the rounds.
 async fn run_inline_tasks(lua: &Lua, scope: &TaskScope) {
@@ -5082,7 +5082,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                     }
                     // Biased: user-initiated requests (commands, keybinds) jump
                     // ahead of bulk work like session restores so the UI stays
-                    // snappy, and queued `maki.async.run` tasks jump ahead of
+                    // snappy, and queued `makima.async.run` tasks jump ahead of
                     // plain requests. Timer fires lose to anything queued: a late
                     // fire is a refresh, not a request.
                     let timer_deadline = timer::next_deadline(&rt.lua);
@@ -6500,7 +6500,7 @@ mod tests {
         assert!(rx.is_empty());
     }
 
-    /// Without this a `run_command` cycle could hop through `maki.async.run`
+    /// Without this a `run_command` cycle could hop through `makima.async.run`
     /// and start over at depth 0, so the cap would never trip.
     #[test]
     fn enqueue_async_task_inherits_command_invocation() {
@@ -7137,7 +7137,7 @@ mod tests {
     const HOOK_ARM_FN: &str = "arm";
     const HOOK_PARK_FN: &str = "park";
 
-    /// A `maki.async.run` task gets its own cell but inherits the parent's
+    /// A `makima.async.run` task gets its own cell but inherits the parent's
     /// token, so a hook armed inside it fires on the parent's cancel even
     /// though nothing else polls that task. Only its own hooks: parent and
     /// siblings share that token, and reading the wrong cell would clean up

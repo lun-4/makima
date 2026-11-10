@@ -1,7 +1,7 @@
 //! One place that turns agent events into autocmds. Lifecycle events come
 //! from the graph itself ([`observe`]), tool and compaction events from the
 //! envelopes a frontend reads ([`dispatch`]), so a plugin sees the same events
-//! for every agent, children included, whichever way maki was started.
+//! for every agent, children included, whichever way makima was started.
 
 use std::collections::HashMap;
 

@@ -463,7 +463,7 @@ fn trusted_project_config(
         .and_then(|question| policy_grant(question, policy));
     if let Some(pattern) = matched {
         // ACP has no card, so policy is the only yes a cwd with no stored
-        // decision can get. Recorded like any other yes so `maki trust list`
+        // decision can get. Recorded like any other yes so `makima trust list`
         // shows what this server trusted on the client's behalf. `unanswered`
         // and not `question`: a recorded `Never` is a stored decision, and
         // granting over it would wipe the rejection out of the store.
@@ -6012,7 +6012,7 @@ mod tests {
                     permissions_config: Default::default(),
                     timeouts: Default::default(),
                     initial_wd: PathBuf::from("/project"),
-                    storage: StateDir::from_path(PathBuf::from("/tmp/makima-acp-test")),
+                    storage: StateDir::from_path(PathBuf::from("/tmp/maki-acp-test")),
                     prompt_slots: Default::default(),
                     yolo: false,
                     defaults: SessionDefaults::default(),

@@ -222,7 +222,7 @@ impl TaggedAnswer {
 }
 
 /// Permission rules declared by Lua plugins via
-/// `maki.api.register_permission_rule`, keyed by plugin name. Shared between
+/// `makima.api.register_permission_rule`, keyed by plugin name. Shared between
 /// the Lua runtime (writer, on plugin load/unload) and every
 /// [`PermissionManager`] (reader).
 #[derive(Default)]
@@ -564,9 +564,9 @@ impl PermissionManager {
     /// this session. An untrusted folder gets nothing, for a different reason
     /// on each side. An allow saved there is stripped on the next start, so it
     /// would only look forgotten. A deny would survive, because an untrusted
-    /// project still contributes its deny scopes, but saving it means Maki
-    /// writing `.maki/permissions.toml` into a checkout the user declined to
-    /// trust, and the next start would then ask them about a gated file Maki
+    /// project still contributes its deny scopes, but saving it means Makima
+    /// writing `.makima/permissions.toml` into a checkout the user declined to
+    /// trust, and the next start would then ask them about a gated file Makima
     /// created itself. The durable deny is the global one, which lands in the
     /// user's own config and no repository can touch.
     fn persist_target(&self, answer: &PermissionAnswer) -> Option<PermissionTarget> {

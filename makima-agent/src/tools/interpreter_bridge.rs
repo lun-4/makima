@@ -14,7 +14,7 @@ pub async fn dispatch(ctx: &ToolContext, name: &str, input: &Value) -> Result<St
 }
 
 /// The one place a `ToolDoneEvent` becomes text a caller can read.
-/// Both the interpreter and `maki.agent.call_tool` come through here,
+/// Both the interpreter and `makima.agent.call_tool` come through here,
 /// so the two can never drift apart.
 pub fn flatten(done: &crate::ToolDoneEvent) -> Result<String, String> {
     let text = match &done.output {

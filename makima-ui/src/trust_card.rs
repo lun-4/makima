@@ -29,7 +29,7 @@ const HINTS: &[(&str, &str)] = &[
     ("↑/↓", "Select"),
     ("Enter", "Confirm"),
 ];
-/// Ctrl-C at the old stderr prompt killed maki, and continuing into a
+/// Ctrl-C at the old stderr prompt killed makima, and continuing into a
 /// restricted UI would only make the user quit twice.
 const INTERRUPTED_EXIT_CODE: i32 = 130;
 const SELECTED_MARKER: &str = "> ";

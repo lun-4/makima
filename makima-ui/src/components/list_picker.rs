@@ -2185,7 +2185,7 @@ mod tests {
     fn filter_match_indices_are_codepoints_not_graphemes() {
         // \U0001F1FA\U0001F1FC (a flag) is one grapheme of two codepoints, so a
         // grapheme haystack (Utf32Str::new) would index "cd" at [3, 4]; the
-        // codepoint haystack indexes it at [4, 5], matching maki.match.fuzzy.
+        // codepoint haystack indexes it at [4, 5], matching makima.match.fuzzy.
         let mut p = ListPicker::new();
         p.open(vec![Entry::new("ab\u{1F1FA}\u{1F1FC}cd")], " Test ");
         set_query(&mut p, "cd");

@@ -1,7 +1,7 @@
-//! Top-level entries directly on the `maki` global: `defer_fn` (a
+//! Top-level entries directly on the `makima` global: `defer_fn` (a
 //! UI-scoped timer for "run this after N ms, not tied to my task") and
 //! `notify` (a one-line notice whose default any plugin can swap via
-//! `maki.set_notify_handler`).
+//! `makima.set_notify_handler`).
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -17,8 +17,8 @@ use crate::api::util::command::{UiAction, ui_send};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::runtime::{DeferQueue, DeferredCallback};
 
-/// The one `maki.notify` override for the whole process. `create_makima_global`
-/// runs per plugin load, so an override stored on the `maki` table itself would
+/// The one `makima.notify` override for the whole process. `create_makima_global`
+/// runs per plugin load, so an override stored on the `makima` table itself would
 /// only ever reach the plugin that installed it. The owner's name rides along
 /// so [`clear_notify_handler`] can hand the slot back when that plugin is
 /// unloaded, instead of leaving everyone calling into a dead env.
@@ -29,7 +29,7 @@ pub(crate) struct NotifyHandler(pub(crate) Mutex<Option<(Arc<str>, RegistryKey)>
 /// any task scope. The timer does not hang off the caller's cancel token
 /// or the 60 second `async.run` deadline, so the callback still fires
 /// once the tool call that scheduled it is over. That is what a toast
-/// needs to dismiss itself, and the difference from `maki.async.sleep`.
+/// needs to dismiss itself, and the difference from `makima.async.sleep`.
 ///
 /// You get back a handle. Its `:stop()` cancels a callback that has not
 /// fired yet, which is how you debounce: schedule, then stop and
@@ -39,14 +39,14 @@ pub(crate) struct NotifyHandler(pub(crate) Mutex<Option<(Arc<str>, RegistryKey)>
 ///
 /// @param callback function Called with no arguments.
 /// @param ms integer Delay in milliseconds. Zero fires on the next tick.
-/// @return maki.Timer|nil Handle with `:stop()` to cancel before it fires.
+/// @return makima.Timer|nil Handle with `:stop()` to cancel before it fires.
 /// @return string|nil Error on failure.
 /// @example
 /// -- A toast that dismisses itself 4 seconds later:
-/// local buf = maki.ui.buf({ scratch = true })
+/// local buf = makima.ui.buf({ scratch = true })
 /// buf:line("copied!")
-/// local win = maki.ui.open_win(buf, { split = "right", width = 20, height = 3 })
-/// maki.defer_fn(function() win:close() end, 4000)
+/// local win = makima.ui.open_win(buf, { split = "right", width = 20, height = 3 })
+/// makima.defer_fn(function() win:close() end, 4000)
 ///
 /// -- Repaint only after the user has stopped typing for half a second:
 /// local pending
@@ -54,7 +54,7 @@ pub(crate) struct NotifyHandler(pub(crate) Mutex<Option<(Arc<str>, RegistryKey)>
 ///   if pending then
 ///     pending:stop()
 ///   end
-///   pending = maki.defer_fn(repaint, 500)
+///   pending = makima.defer_fn(repaint, 500)
 /// end
 #[lua_fn]
 fn defer_fn(
@@ -83,7 +83,7 @@ fn defer_fn(
     Ok((Some(Timer { cancel }), None))
 }
 
-/// Handle returned by `maki.defer_fn`. The runtime reads the flag once the
+/// Handle returned by `makima.defer_fn`. The runtime reads the flag once the
 /// timer goes off, so flipping it before then skips the callback entirely.
 pub(crate) struct Timer {
     cancel: Arc<AtomicBool>,
@@ -94,7 +94,7 @@ pub(crate) struct Timer {
 ///
 /// @return
 /// @example
-/// local h = maki.defer_fn(function() rebuild() end, 300)
+/// local h = makima.defer_fn(function() rebuild() end, 300)
 /// h:stop()
 #[lua_fn]
 fn stop(_lua: &Lua, this: &Timer) -> LuaResult<()> {
@@ -103,18 +103,18 @@ fn stop(_lua: &Lua, this: &Timer) -> LuaResult<()> {
 }
 
 lua_class! {
-    /// Handle returned by `maki.defer_fn`. Its `:stop()` cancels the
+    /// Handle returned by `makima.defer_fn`. Its `:stop()` cancels the
     /// callback before it fires, which is what debouncing is built on.
     "maki.Timer" => Timer, TIMER_DOCS [stop]
 }
 
-/// Show a one line notice. By default it goes to `maki.ui.flash`, with
+/// Show a one line notice. By default it goes to `makima.ui.flash`, with
 /// `{opts.title}` in front of the message when you pass one. A run with
 /// no UI, such as `makima --print` or the sdk, logs the notice instead of
 /// dropping it.
 ///
 /// There is one handler for the whole process. Once a plugin calls
-/// `maki.set_notify_handler`, notices from every plugin go through it.
+/// `makima.set_notify_handler`, notices from every plugin go through it.
 /// That is how a UI plugin turns flashes into stacked toasts without
 /// any of the callers knowing about it.
 ///
@@ -125,8 +125,8 @@ lua_class! {
 /// @param opts table? Optional. `title` (string) labels the notice. Free form otherwise.
 /// @return
 /// @example
-/// maki.notify("saved!")
-/// maki.notify("build failed", "error", { title = "make" })
+/// makima.notify("saved!")
+/// makima.notify("build failed", "error", { title = "make" })
 #[lua_fn]
 fn notify(
     lua: &Lua,
@@ -172,21 +172,21 @@ fn notify(
     Ok(())
 }
 
-/// Install the handler that every `maki.notify` call in the process goes
+/// Install the handler that every `makima.notify` call in the process goes
 /// through, in place of the default flash. Pass `nil` to put the default
 /// back.
 ///
 /// The handler runs on the Lua thread, so keep it short and hand real
-/// work to `maki.async.run`. If it raises an error, the error is logged
-/// and the notice falls back to `maki.ui.flash`, so the user still sees
+/// work to `makima.async.run`. If it raises an error, the error is logged
+/// and the notice falls back to `makima.ui.flash`, so the user still sees
 /// it. Unloading the plugin that installed the handler also restores the
 /// default.
 ///
 /// @param handler function|nil Handler `function(msg, level?, opts?)`, or nil.
 /// @return (boolean|nil, string|nil) true, or nil and an error. Returns nil and an error when called from a delegated tool handler.
 /// @example
-/// local Toast = require("maki.toast")
-/// maki.set_notify_handler(function(msg, level, opts)
+/// local Toast = require("makima.toast")
+/// makima.set_notify_handler(function(msg, level, opts)
 ///   Toast.show(msg, { title = opts and opts.title, level = level })
 /// end)
 #[lua_fn]
@@ -199,8 +199,8 @@ fn set_notify_handler(lua: &Lua, #[ctx] plugin: Arc<str>, handler: Value) -> Lua
     Ok((Some(true), None))
 }
 
-/// Install a `maki.notify` override into the shared slot. Reached both by
-/// `set_notify_handler` and by the `maki.notify = fn` sugar that the `maki`
+/// Install a `makima.notify` override into the shared slot. Reached both by
+/// `set_notify_handler` and by the `makima.notify = fn` sugar that the `makima`
 /// global's `__newindex` routes here.
 /// The assignment form can only report errors by raising, so a delegated
 /// caller gets a raised error here rather than a `(nil, err)` pair.
@@ -259,9 +259,9 @@ mod tests {
     const BY_FUNCTION: &str = "maki.set_notify_handler(function(msg) seen = msg end)";
     const BY_ASSIGNMENT: &str = "maki.notify = function(msg) seen = msg end";
 
-    /// Builds one plugin's `maki` table under the global {plugin}, wired the
+    /// Builds one plugin's `makima` table under the global {plugin}, wired the
     /// way `create_makima_global` wires it: `notify` on the metatable's
-    /// `__index` so `maki.notify = fn` hits `__newindex` and lands in the
+    /// `__index` so `makima.notify = fn` hits `__newindex` and lands in the
     /// shared slot instead of shadowing it.
     fn install(lua: &Lua, tx: Option<flume::Sender<UiAction>>, plugin: &str) {
         if lua.app_data_ref::<NotifyHandler>().is_none() {
@@ -327,7 +327,7 @@ mod tests {
     }
 
     /// Both spellings of "override notify" have to reach notify calls made
-    /// through *any* plugin's `maki`, not just the installer's. That is the
+    /// through *any* plugin's `makima`, not just the installer's. That is the
     /// whole point of a shared slot.
     #[test_case(BY_FUNCTION ; "set_notify_handler")]
     #[test_case(BY_ASSIGNMENT ; "assignment")]

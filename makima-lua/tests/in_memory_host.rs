@@ -16,7 +16,7 @@ use makima_lua::{CommandArgumentContext, CommandArgumentItem, CommandArgumentLif
 const NOTE_PATH: &str = "note.md";
 const NOTE_BODY: &str = "hello-maki";
 const WROTE_PREFIX: &str = "wrote note.md";
-const PROJECTS_PREFIX: &str = "/makima-test-state/projects/";
+const PROJECTS_PREFIX: &str = "/maki-test-state/projects/";
 const SPLASH_DEADLINE: Duration = Duration::from_secs(30);
 const SPLASH_BACKOFF: Duration = Duration::from_millis(100);
 

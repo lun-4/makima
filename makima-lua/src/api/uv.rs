@@ -7,7 +7,7 @@ use crate::plugin_permissions::PluginPermissions;
 ///
 /// @return (string?) Current working directory, or nil if it cannot be determined.
 /// @example
-/// local cwd = maki.uv.cwd()
+/// local cwd = makima.uv.cwd()
 /// if cwd then print("working in: " .. cwd) end
 #[lua_fn(guard = Env)]
 fn cwd(_lua: &Lua) -> LuaResult<Option<String>> {
@@ -20,7 +20,7 @@ fn cwd(_lua: &Lua) -> LuaResult<Option<String>> {
 ///
 /// @return (string?) Home directory path, or nil if it cannot be determined.
 /// @example
-/// local home = maki.uv.os_homedir() -- e.g. "/home/user"
+/// local home = makima.uv.os_homedir() -- e.g. "/home/user"
 #[lua_fn(guard = Env)]
 fn os_homedir(_lua: &Lua) -> LuaResult<Option<String>> {
     Ok(makima_storage::paths::home().and_then(|p| p.to_str().map(String::from)))
@@ -32,7 +32,7 @@ fn os_homedir(_lua: &Lua) -> LuaResult<Option<String>> {
 /// @param name string Name of the environment variable.
 /// @return (string?) Variable value, or nil if not set.
 /// @example
-/// local editor = maki.uv.os_getenv("EDITOR") or "vi"
+/// local editor = makima.uv.os_getenv("EDITOR") or "vi"
 #[lua_fn(guard = Env)]
 fn os_getenv(_lua: &Lua, name: String) -> LuaResult<Option<String>> {
     Ok(std::env::var(&name).ok())
@@ -45,7 +45,7 @@ lua_table! {
     /// variables. None of these functions throw.
     ///
     /// ```lua
-    /// local home = maki.uv.os_homedir()
+    /// local home = makima.uv.os_homedir()
     /// ```
     "maki.uv" => pub(crate) fn create_uv_table(perms: &PluginPermissions), DOCS [
         cwd(perms), os_homedir(perms), os_getenv(perms),

@@ -814,7 +814,7 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 /// Job exit and cancellation hooks are synchronous callbacks and cannot yield, so pass the reply table with `output_limits` to `ctx:finish(reply)`. The host applies limits after receiving the reply and preserves `is_error`. With an output hook, dispatch filters the full output before limiting. Persistence retains its absolute deadline, including any per-tool timeout or deadline set with `ctx:set_deadline`. Cancellation or an expired deadline denies filtering without saving output. The body is saved without trailing newlines or the protected trailer. A started worker retains its owned text, options, and store even when its caller is dropped; session cleanup closes the store before removing its files.
 /// @return
 /// @example
-/// maki.api.register_tool({
+/// makima.api.register_tool({
 ///   name = "word_count",
 ///   description = "Count words in a file.",
 ///   kind = "read",
@@ -852,7 +852,7 @@ fn register_tool(lua: &Lua, #[ctx] pending: PendingTools, spec: Table) -> LuaRes
 ///   effect (string) Optional. "allow" (default) or "deny".
 /// @return
 /// @example
-/// maki.api.register_permission_rule({
+/// makima.api.register_permission_rule({
 ///   tool = "write",
 ///   scope = notes_dir .. "/**",
 /// })
@@ -1068,7 +1068,7 @@ fn allow_is_delegated(
 /// @example
 /// -- Documentation and test example. It is not bundled and never copies files.
 /// local recorded
-/// maki.api.register_command({
+/// makima.api.register_command({
 ///   name = "/copy",
 ///   description = "Record typed path arguments",
 ///   tui_only = false,
@@ -1084,7 +1084,7 @@ fn allow_is_delegated(
 /// -- `/copy "input file.txt" "build output" overwrite` records decoded values.
 ///
 /// -- Raw commands preserve the complete argument remainder:
-/// maki.api.register_command({
+/// makima.api.register_command({
 ///   name = "/hello",
 ///   description = "Say hello",
 ///   tui_only = false,
@@ -1117,7 +1117,7 @@ fn register_command(
 /// prompts, and commands other plugins registered.
 ///
 /// Use it to alias a command you like under a name you prefer, instead of
-/// reimplementing what it does. See `maki.ui.action` for the same idea
+/// reimplementing what it does. See `makima.ui.action` for the same idea
 /// applied to keybound UI actions.
 ///
 /// Pass the whole command line, arguments included: `"/cd ~/src"`. The
@@ -1145,14 +1145,14 @@ fn register_command(
 /// @return (boolean|nil, string|nil) `true` once the command ran, or nil and an error message if it is unknown, failed or cannot run here.
 /// @example
 /// -- /resume as an alias for the built-in session picker:
-/// maki.api.register_command({
+/// makima.api.register_command({
 ///   name = "/resume",
 ///   description = "Alias for /sessions",
 ///   tui_only = false,
 ///   handler = function(_, ctx)
-///     local ok, err = maki.api.run_command(ctx, "/sessions")
+///     local ok, err = makima.api.run_command(ctx, "/sessions")
 ///     if not ok then
-///       maki.ui.flash("could not run /sessions: " .. err)
+///       makima.ui.flash("could not run /sessions: " .. err)
 ///     end
 ///   end,
 /// })
@@ -1206,7 +1206,7 @@ async fn run_command(
 ///   prompt  (string|string[]) Optional. Restrict to specific prompt ids (e.g. "system").
 /// @return
 /// @example
-/// maki.api.register_prompt_hint({
+/// makima.api.register_prompt_hint({
 ///   slot = "tool_usage",
 ///   content = "- Prefer **grep** over reading entire files.",
 /// })
@@ -1260,7 +1260,7 @@ fn register_prompt_hint(
 ///   prompt  (string|string[]) Optional. Restrict to specific prompt ids.
 /// @return
 /// @example
-/// maki.api.set_prompt({
+/// makima.api.set_prompt({
 ///   slot = "tone",
 ///   content = "Be concise. No filler words.",
 /// })
@@ -1308,7 +1308,7 @@ fn set_prompt(
 ///   config (table) Optional config table with a `disabled_tools` string[] field used to compute the `enabled` flag on each entry.
 /// @return (table[]) Array of tool entries: { name, schema, audiences, kind?, enabled }.
 /// @example
-/// local tools = maki.api.get_tools()
+/// local tools = makima.api.get_tools()
 /// for _, t in ipairs(tools) do
 ///   print(t.name, t.enabled)
 /// end
@@ -1344,7 +1344,7 @@ fn get_tools(lua: &Lua, opts: Option<Table>) -> LuaResult<Table> {
 /// @param name string Exact tool name.
 /// @return (table|nil) Tool entry with fields { name, schema, audiences, kind?, header?, restore? }, or nil if not found.
 /// @example
-/// local t = maki.api.get_tool("bash")
+/// local t = makima.api.get_tool("bash")
 /// if t then
 ///   print("bash audiences:", table.concat(t.audiences, ", "))
 /// end
@@ -1377,8 +1377,8 @@ lua_table! {
     /// Call these at the top level of your plugin file (during load).
     ///
     /// ```lua
-    /// maki.api.register_tool({ name = "greet", ... })
-    /// maki.api.register_prompt_hint({ slot = "tool_usage", content = "..." })
+    /// makima.api.register_tool({ name = "greet", ... })
+    /// makima.api.register_prompt_hint({ slot = "tool_usage", content = "..." })
     /// ```
     extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, pending_commands: PendingCommandMap, pending_options: crate::api::options::PendingPluginOptionSpecs, pending_prompts: crate::runtime::PendingPromptHintCallbacks, plugin: Arc<str>, opts: PluginOpts), DOCS [
         register_tool(pending), register_permission_rule(pending_rules), register_command(pending_commands, plugin),

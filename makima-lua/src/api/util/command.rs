@@ -514,7 +514,7 @@ pub struct ProviderUsageAck {
 }
 
 /// Viewport of the focused chat transcript, zero-based like the rest of the
-/// UI; `maki.fn.winsaveview` is what puts it in Vim's 1-based shape.
+/// UI; `makima.fn.winsaveview` is what puts it in Vim's 1-based shape.
 /// `auto_scroll` is true while the transcript follows streaming output.
 pub struct WinView {
     pub scroll_top: u16,
@@ -523,7 +523,7 @@ pub struct WinView {
     pub auto_scroll: bool,
 }
 
-/// Lua sees these through `maki.ui.action` as the snake_case variant
+/// Lua sees these through `makima.ui.action` as the snake_case variant
 /// names, so renaming a variant breaks user configs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, VariantNames)]
 #[strum(serialize_all = "snake_case")]

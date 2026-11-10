@@ -21,7 +21,7 @@ fn file_path(dir: &Path, index: u32) -> PathBuf {
 }
 
 /// The one place that decides whether a file name belongs to us, so pruning
-/// and rotation cannot drift apart on what `maki.2.log` means.
+/// and rotation cannot drift apart on what `makima.2.log` means.
 fn rotated_index(name: &str) -> Option<u32> {
     if name == LOG_FILE_NAME {
         return Some(0);
@@ -60,7 +60,7 @@ fn is_unlinked(_meta: &Metadata) -> bool {
 /// everything above the new ceiling on disk forever.
 ///
 /// A file that will not go away is reported and skipped instead of failing the
-/// rotation. `shift_up` is what frees `maki.log`, so a leftover file costs disk
+/// rotation. `shift_up` is what frees `makima.log`, so a leftover file costs disk
 /// space while a refused rotation costs the log.
 fn prune_from(dir: &Path, first: u32) {
     let Ok(entries) = fs::read_dir(dir) else {
@@ -84,10 +84,10 @@ fn prune_from(dir: &Path, first: u32) {
 }
 
 /// Walk the chain downwards, so every file lands in the slot the one above it
-/// just left and `maki.log` moves last.
+/// just left and `makima.log` moves last.
 ///
 /// A refused rename comes back as an error, because the caller has to learn
-/// that `maki.log` is still the full file it was. Reporting it and carrying on
+/// that `makima.log` is still the full file it was. Reporting it and carrying on
 /// is what turned a log dir that will not accept renames into a directory scan
 /// and a line of stderr per log event.
 fn shift_up(dir: &Path, last: u32) -> io::Result<()> {
@@ -125,7 +125,7 @@ impl RotatingFileWriter {
     /// `max_files` is clamped rather than trusted: config validation rejects
     /// zero, but this is a public constructor, and zero used to underflow into
     /// four billion `exists` calls made while holding the rotation lock, which
-    /// wedged every other maki process on the machine along with this one.
+    /// wedged every other makima process on the machine along with this one.
     fn with_limits(dir: &Path, max_bytes: u64, max_files: u32) -> io::Result<Self> {
         let dir = dir.to_path_buf();
         let file = open_append(&file_path(&dir, 0))?;
@@ -140,7 +140,7 @@ impl RotatingFileWriter {
 
     /// Asks the open handle, not a counter.
     ///
-    /// A per-process byte count was both too small and too large: several maki
+    /// A per-process byte count was both too small and too large: several makima
     /// processes appending to one file each counted only their own bytes, so
     /// the file grew past `max_bytes` once per process, and a quiet process
     /// never reached its own limit at all, so it never looked at its handle
@@ -156,7 +156,7 @@ impl RotatingFileWriter {
         meta.len() >= self.retry_above && (is_unlinked(meta) || meta.len() >= self.max_bytes)
     }
 
-    /// Under the rotation lock, whether `maki.log` still names our handle. A
+    /// Under the rotation lock, whether `makima.log` still names our handle. A
     /// peer that rotated first already did the work and all we owe is a reopen.
     #[cfg(unix)]
     fn holds_primary(&self, primary: &Path) -> io::Result<bool> {
@@ -489,7 +489,7 @@ mod tests {
     ///
     /// The write after the slot is freed is the interesting one: a writer that
     /// kept retrying per line would have rotated there and left the tail alone
-    /// in a fresh `maki.log`.
+    /// in a fresh `makima.log`.
     #[test]
     fn failed_rotation_keeps_the_lines_and_stops_asking() {
         let tmp = tempfile::tempdir().unwrap();

@@ -70,8 +70,8 @@ impl UserData for LuaSchemaValidator {
 /// @param value any Lua value to encode.
 /// @return (string?, string?) JSON string, or nil plus an error.
 /// @example
-/// local s, err = maki.json.encode({ name = "maki", version = 1 })
-/// print(s) -- {"name":"maki","version":1}
+/// local s, err = makima.json.encode({ name = "makima", version = 1 })
+/// print(s) -- {"name":"makima","version":1}
 #[lua_fn]
 fn encode(_lua: &Lua, value: Value) -> LuaResult<Pair<String>> {
     Ok(pair(serde_json::to_string(
@@ -85,7 +85,7 @@ fn encode(_lua: &Lua, value: Value) -> LuaResult<Pair<String>> {
 /// @param str string JSON string to decode.
 /// @return (any?, string?) Decoded value, or nil plus an error.
 /// @example
-/// local t, err = maki.json.decode('{"x": 42}')
+/// local t, err = makima.json.decode('{"x": 42}')
 /// print(t.x) -- 42
 #[lua_fn]
 fn decode(lua: &Lua, str: String) -> LuaResult<Pair<Value>> {
@@ -98,14 +98,14 @@ fn decode(lua: &Lua, str: String) -> LuaResult<Pair<Value>> {
 /// you catch mistakes before doing any real work.
 ///
 /// @param schema table JSON Schema as a Lua table.
-/// @return (maki.json.SchemaValidator?, string?) Validator, or nil plus an error.
+/// @return (makima.json.SchemaValidator?, string?) Validator, or nil plus an error.
 /// @example
-/// local v, err = maki.json.schema_validator({
+/// local v, err = makima.json.schema_validator({
 ///   type = "object",
 ///   properties = { name = { type = "string" } },
 ///   required = { "name" },
 /// })
-/// local errs = v:validate({ name = "maki" })
+/// local errs = v:validate({ name = "makima" })
 /// assert(errs == nil)
 #[lua_fn]
 fn schema_validator(lua: &Lua, schema: Value) -> LuaResult<Pair<AnyUserData>> {
@@ -123,8 +123,8 @@ lua_table! {
     /// optionally validate data against a JSON Schema.
     ///
     /// ```lua
-    /// local s = maki.json.encode({ ok = true })
-    /// local t = maki.json.decode(s)
+    /// local s = makima.json.encode({ ok = true })
+    /// local t = makima.json.decode(s)
     /// ```
     "maki.json" => pub(crate) fn create_json_table(), DOCS [
         encode, decode, schema_validator,

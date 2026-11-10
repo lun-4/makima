@@ -214,9 +214,9 @@ pub(crate) fn parse_footer(tbl: &Table) -> LuaResult<Vec<(String, String)>> {
 /// @param opts table? Optional. `scratch` (boolean, default false): never claim the live pane.
 /// @return (Buf) Buffer handle.
 /// @example
-/// local buf = maki.ui.buf()
+/// local buf = makima.ui.buf()
 /// buf:line("hello world")
-/// local toast = maki.ui.buf({ scratch = true })
+/// local toast = makima.ui.buf({ scratch = true })
 /// toast:line("copied!")
 #[lua_fn]
 fn buf(lua: &Lua, opts: Option<Table>) -> LuaResult<buf::BufHandle> {
@@ -262,7 +262,7 @@ fn format_time(lua: &Lua, epoch_ms: u64, style: Option<String>) -> LuaResult<Str
 /// @param name string Semantic color name, e.g. "accent" or "background".
 /// @return (string|nil) "#rrggbb" hex color, or nil if the name is unknown.
 /// @example
-/// local accent = maki.ui.theme_color("accent")
+/// local accent = makima.ui.theme_color("accent")
 /// if accent then
 ///   buf:line({ { "note", { fg = accent, bold = true } } })
 /// end
@@ -287,7 +287,7 @@ fn theme_color(lua: &Lua, name: String) -> LuaResult<mlua::Value> {
 ///   - prefix (string): prepend to the source before highlighting (affects token context). Default "".
 /// @return (table) Lines: `{ { {text, style}, ... }, ... }`. Each style is `{fg, bold?, italic?, underline?}`.
 /// @example
-/// local lines = maki.ui.highlight("fn main() {}", "rust")
+/// local lines = makima.ui.highlight("fn main() {}", "rust")
 /// for _, spans in ipairs(lines) do
 ///   buf:line(spans)
 /// end
@@ -322,8 +322,8 @@ async fn highlight(lua: Lua, code: String, lang: String, opts: Option<Table>) ->
 /// @param width integer Wrap width in columns.
 /// @return (table) Lines: `{ { {text, style}, ... }, ... }`.
 /// @example
-/// local size = maki.ui.terminal_size()
-/// local lines = maki.ui.markdown("# Hello\n\nSome **bold** text.", size.cols)
+/// local size = makima.ui.terminal_size()
+/// local lines = makima.ui.markdown("# Hello\n\nSome **bold** text.", size.cols)
 /// for _, spans in ipairs(lines) do
 ///   buf:line(spans)
 /// end
@@ -342,8 +342,8 @@ async fn markdown(lua: Lua, text: String, width: u16) -> LuaResult<Table> {
 /// @param secs integer Duration in seconds.
 /// @return (string) Human-readable duration, e.g. "1m30s".
 /// @example
-/// maki.ui.humantime(90)   -- "1m30s"
-/// maki.ui.humantime(3661) -- "1h1m1s"
+/// makima.ui.humantime(90)   -- "1m30s"
+/// makima.ui.humantime(3661) -- "1h1m1s"
 #[lua_fn]
 fn humantime(_lua: &Lua, secs: u64) -> LuaResult<String> {
     Ok(format_duration(Duration::from_secs(secs))
@@ -356,7 +356,7 @@ fn humantime(_lua: &Lua, secs: u64) -> LuaResult<String> {
 ///
 /// @return (table) `{cols, rows}`, terminal width and height in characters.
 /// @example
-/// local size = maki.ui.terminal_size()
+/// local size = makima.ui.terminal_size()
 /// local half_width = math.floor(size.cols / 2)
 #[lua_fn]
 fn terminal_size(lua: &Lua) -> LuaResult<Table> {
@@ -389,7 +389,7 @@ fn tty_size() -> Option<(u16, u16)> {
 /// @param text string The text to measure.
 /// @return (integer) Number of display cells the text occupies.
 /// @example
-/// local w = maki.ui.display_width("hello")
+/// local w = makima.ui.display_width("hello")
 #[lua_fn]
 fn display_width(_lua: &Lua, text: String) -> LuaResult<usize> {
     use unicode_width::UnicodeWidthStr;
@@ -402,7 +402,7 @@ fn display_width(_lua: &Lua, text: String) -> LuaResult<usize> {
 /// @param max_width integer Maximum display cells for the head.
 /// @return (table) `{head = string, tail = string}`.
 /// @example
-/// local t = maki.ui.truncate_text("hello world", 5)
+/// local t = makima.ui.truncate_text("hello world", 5)
 /// -- t.head == "hello", t.tail == " world"
 #[lua_fn]
 fn truncate_text(lua: &Lua, text: String, max_width: usize) -> LuaResult<Table> {
@@ -430,7 +430,7 @@ fn truncate_text(lua: &Lua, text: String, max_width: usize) -> LuaResult<Table> 
 /// @param msg string Message text.
 /// @return
 /// @example
-/// maki.ui.flash("Copied to clipboard!")
+/// makima.ui.flash("Copied to clipboard!")
 #[lua_fn]
 fn flash(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, msg: String) -> LuaResult<()> {
     let _ = tx.try_send(UiAction::Flash(msg));
@@ -442,15 +442,15 @@ fn flash(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, msg: String) -> LuaResu
 ///
 /// The title passes through tmux, GNU screen, and zellij untouched, and
 /// control characters are stripped, so model text cannot inject escape
-/// sequences into the terminal. On exit maki hands the title back to the
+/// sequences into the terminal. On exit makima hands the title back to the
 /// shell, on terminals that support the title stack.
 ///
 /// @param title string New window title, e.g. `"● 3/5 tests"`.
 /// @return
 /// @example
-/// maki.ui.set_window_title("maki: " .. session_name)
+/// makima.ui.set_window_title("makima: " .. session_name)
 /// -- Give the title back to the shell:
-/// maki.ui.set_window_title("")
+/// makima.ui.set_window_title("")
 #[lua_fn]
 fn set_window_title(
     _lua: &Lua,
@@ -462,8 +462,8 @@ fn set_window_title(
 }
 
 /// Runs a built-in UI action by name, exactly as its default keybinding
-/// would. Handy when a default key never reaches maki because tmux or
-/// your terminal grabs it first: bind a new key with `maki.keymap.set`
+/// would. Handy when a default key never reaches makima because tmux or
+/// your terminal grabs it first: bind a new key with `makima.keymap.set`
 /// and call this from it.
 ///
 /// Valid names: `"file_picker"`, `"search"`, `"tasks"`, `"help"`,
@@ -471,14 +471,14 @@ fn set_window_title(
 /// `"pop_queue"`, `"prev_chat"`, `"next_chat"`.
 ///
 /// For slash commands rather than keybound actions, see
-/// `maki.api.run_command`.
+/// `makima.api.run_command`.
 ///
 /// @param name string Action name, e.g. `"file_picker"`.
 /// @return (boolean|nil, string|nil) `true` on success, or nil and an error message for an unknown name.
 /// @example
 /// -- Open the built-in file picker with Ctrl+Q instead of Ctrl+S:
-/// maki.keymap.set("n", "<C-q>", function()
-///   maki.ui.action("file_picker")
+/// makima.keymap.set("n", "<C-q>", function()
+///   makima.ui.action("file_picker")
 /// end)
 #[lua_fn]
 fn action(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, name: String) -> LuaResult<Pair<bool>> {
@@ -497,9 +497,9 @@ fn action(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, name: String) -> LuaRe
 /// @param path string File to open.
 /// @return (integer) Editor exit code, or -1 if the action could not be dispatched.
 /// @example
-/// local code = maki.ui.open_editor("/tmp/scratch.lua")
+/// local code = makima.ui.open_editor("/tmp/scratch.lua")
 /// if code == 0 then
-///   maki.ui.flash("File saved")
+///   makima.ui.flash("File saved")
 /// end
 #[lua_fn]
 async fn open_editor(lua: Lua, #[ctx] tx: flume::Sender<UiAction>, path: String) -> LuaResult<i32> {
@@ -549,8 +549,8 @@ async fn open_editor(lua: Lua, #[ctx] tx: flume::Sender<UiAction>, path: String)
 /// highlighted, exactly like the built-in pickers. Filter edits keep the
 /// current row instead of jumping to the best match.
 ///
-/// An item's optional `age` field is a timestamp from `maki.time.now` or
-/// `maki.time.at`, not an elapsed duration. The host renders it as a live
+/// An item's optional `age` field is a timestamp from `makima.time.now` or
+/// `makima.time.at`, not an elapsed duration. The host renders it as a live
 /// delta (for example `9s` or `4d 7h 23m 9s`) and refreshes it about once
 /// per second while the dialog is open. `detail` and `age` can coexist;
 /// age follows the detail.
@@ -567,9 +567,9 @@ async fn open_editor(lua: Lua, #[ctx] tx: flume::Sender<UiAction>, path: String)
 ///   - on_timeout (function): `on_timeout()` when the idle window elapses.
 /// @return (table) `{ type = "choice", index = n }` with the 1-based index of the chosen item, `{ type = "delete", index = n }` when the user presses Ctrl+D twice on an item (the first press flashes "Press Ctrl+D again to delete"), or `{ type = "close" }` when dismissed with Esc or Ctrl+C, or when the UI channel drops mid-pick.
 /// @example
-/// local result = maki.ui.open_list_picker({ "alpha", "beta" }, { title = "Pick" })
+/// local result = makima.ui.open_list_picker({ "alpha", "beta" }, { title = "Pick" })
 /// if result.type == "choice" then
-///   maki.ui.flash("Picked " .. result.index)
+///   makima.ui.flash("Picked " .. result.index)
 /// end
 #[lua_fn]
 async fn open_list_picker(
@@ -669,9 +669,9 @@ async fn open_list_picker(
 ///   - needs_input (boolean): whether the window means the session needs user input. Default false.
 /// @return (Win) Window handle.
 /// @example
-/// local buf = maki.ui.buf()
+/// local buf = makima.ui.buf()
 /// buf:line("Pick an option:")
-/// local win = maki.ui.open_win(buf, {
+/// local win = makima.ui.open_win(buf, {
 ///   title = "Menu",
 ///   width = "50%",
 ///   height = 10,
@@ -791,15 +791,15 @@ pub(crate) const set_status_hint__doc: FnDoc = FnDoc {
 };
 
 /// Resolve the agent that has UI focus now. Later focus changes do not
-/// retarget the returned reference. Pass it to `maki.agent.get(ctx, ref)` for
+/// retarget the returned reference. Pass it to `makima.agent.get(ctx, ref)` for
 /// control; this call grants no authority. Delegated tool handlers cannot read
 /// UI focus.
 ///
 /// @return (AgentRef?, string?) Visibility-only reference, or nil and an error when no agent has focus.
 /// @example
-/// local focused, err = maki.ui.focused_agent()
+/// local focused, err = makima.ui.focused_agent()
 /// if focused then
-///   local agent = assert(maki.agent.get(ctx, focused))
+///   local agent = assert(makima.agent.get(ctx, focused))
 ///   local model = assert(agent:config(ctx)).model
 /// end
 #[lua_fn]
@@ -813,7 +813,7 @@ fn focused_agent(lua: &Lua) -> LuaResult<Pair<LuaAgentRef>> {
 /// Trusted commands, keymaps and callbacks can post; delegated tool handlers
 /// cannot, since their tool row already speaks for them.
 ///
-/// `maki.agent.spawn` posts a row for each child it shows; see its `show`
+/// `makima.agent.spawn` posts a row for each child it shows; see its `show`
 /// option.
 ///
 /// @param ctx LuaCtx Trusted invocation context.
@@ -827,7 +827,7 @@ fn focused_agent(lua: &Lua) -> LuaResult<Pair<LuaAgentRef>> {
 /// Any other option key is an error.
 /// @return (boolean?, string?) True once sent, or nil and an error.
 /// @example
-/// local ok, err = maki.ui.post(ctx, "review found 3 issues", {
+/// local ok, err = makima.ui.post(ctx, "review found 3 issues", {
 ///   level = "warn",
 ///   agent = reviewer,
 /// })
@@ -879,9 +879,9 @@ lua_table! {
     /// code, render markdown, and show status hints.
     ///
     /// ```lua
-    /// local buf = maki.ui.buf()
+    /// local buf = makima.ui.buf()
     /// buf:line("hello from my plugin!")
-    /// local win = maki.ui.open_win(buf, { title = "Greeting", width = "50%", height = 5 })
+    /// local win = makima.ui.open_win(buf, { title = "Greeting", width = "50%", height = 5 })
     /// ```
     extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
         buf, theme_color, format_time, highlight, markdown, humantime, terminal_size,

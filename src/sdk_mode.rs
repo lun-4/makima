@@ -2436,7 +2436,7 @@ mod tests {
         }
     }
 
-    /// `echo prompt | maki` must work: the end of input waits for the turn
+    /// `echo prompt | makima` must work: the end of input waits for the turn
     /// in flight, reports it, then lets the session end. A permission ask
     /// left open is denied, since no answer can arrive any more.
     #[test]

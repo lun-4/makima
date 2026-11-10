@@ -3,7 +3,7 @@
 //! The plan_submit tool must refuse to run outside plan mode. The full
 //! render/accept/reject UI flow is covered by the `makima-ui` app tests; here we
 //! assert the plugin-level gate reads the executing agent's mode and errors
-//! before touching `maki.ui.action`.
+//! before touching `makima.ui.action`.
 
 use std::sync::Arc;
 

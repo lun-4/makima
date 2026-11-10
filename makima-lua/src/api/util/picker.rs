@@ -25,7 +25,7 @@ const TIMEOUT_MUST_BE_NON_NEGATIVE: &str = "open_list_picker: timeout_ms must be
 
 static NEXT_PICKER_ID: AtomicU64 = AtomicU64::new(1);
 
-/// One entry of `maki.ui.open_list_picker`, decoded from the Lua items array.
+/// One entry of `makima.ui.open_list_picker`, decoded from the Lua items array.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PickerItemSpec {
     pub label: String,
@@ -37,7 +37,7 @@ pub struct PickerItemSpec {
     pub age: Option<Duration>,
 }
 
-/// Decoded `maki.ui.open_list_picker` options. Indices are 0-based; the
+/// Decoded `makima.ui.open_list_picker` options. Indices are 0-based; the
 /// delete key is fixed by the host dialog (ctrl+d, old-Lua parity).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PickerConfig {

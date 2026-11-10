@@ -3,7 +3,7 @@
 //! `now()` returns a `{secs, nanosecs}` timestamp — the same wall clock the
 //! host and storage layer use for session `updated_at`, but subdivided so a
 //! plugin never hits Lua's double precision ceiling. Times are passed to the
-//! maki time APIs as opaque objects instead of raw numbers, so callers lean
+//! makima time APIs as opaque objects instead of raw numbers, so callers lean
 //! on `ago` (and `at` to wrap stored whole-second values) instead of hand
 //! rolling epoch arithmetic.
 
@@ -84,45 +84,45 @@ pub(crate) fn duration_from_table(t: &Table) -> LuaResult<Duration> {
 /// nanosecond precision — the same clock the host uses for session
 /// `updated_at`, just finer than its whole seconds.
 ///
-/// Treat the returned table as opaque; pass it to `maki.time.ago` rather than
+/// Treat the returned table as opaque; pass it to `makima.time.ago` rather than
 /// doing epoch math by hand. To wrap a stored whole-second value (like a
-/// session's `updated_at`) use `maki.time.at`.
+/// session's `updated_at`) use `makima.time.at`.
 ///
 /// @return (table) `{secs = integer, nanosecs = integer}` timestamp.
 /// @example
-/// local t0 = maki.time.now()
+/// local t0 = makima.time.now()
 /// -- ...work...
-/// print(maki.time.ago(t0))
+/// print(makima.time.ago(t0))
 #[lua_fn]
 fn now(lua: &Lua) -> LuaResult<Table> {
     ts_to_table(lua, now_timestamp())
 }
 
 /// Wrap a whole-second Unix timestamp (e.g. a session's `updated_at`) into a
-/// timestamp object readable by `maki.time.ago`.
+/// timestamp object readable by `makima.time.ago`.
 ///
 /// @param secs integer Whole seconds since the Unix epoch.
 /// @return (table) `{secs = secs, nanosecs = 0}` timestamp.
 /// @example
-/// print(maki.time.ago(maki.time.at(session.updated_at)))
+/// print(makima.time.ago(makima.time.at(session.updated_at)))
 #[lua_fn]
 fn at(lua: &Lua, secs: u64) -> LuaResult<Table> {
     ts_to_table(lua, Timestamp { secs, nanosecs: 0 })
 }
 
 /// Format {instant} as a live delta like `9s` or `4d 7h 23m 9s`.
-/// {instant} is a timestamp from `maki.time.now` (or `maki.time.at`). If
+/// {instant} is a timestamp from `makima.time.now` (or `makima.time.at`). If
 /// {reference} is given, age is measured from it instead of the current time.
 /// Fractions truncate to whole seconds, and higher zero units are omitted.
 /// A timestamp in the future renders as `0s`.
 ///
-/// @param instant table Timestamp from `maki.time.now`/`maki.time.at`.
-/// @param reference table? Timestamp to measure from; defaults to `maki.time.now`.
+/// @param instant table Timestamp from `makima.time.now`/`makima.time.at`.
+/// @param reference table? Timestamp to measure from; defaults to `makima.time.now`.
 /// @return (string) Elapsed delta, e.g. `2m 9s`.
 /// @example
-/// local t0 = maki.time.now()
+/// local t0 = makima.time.now()
 /// -- ...work...
-/// print(maki.time.ago(t0))
+/// print(makima.time.ago(t0))
 #[lua_fn]
 fn ago(_lua: &Lua, instant: Table, reference: Option<Table>) -> LuaResult<String> {
     let from = duration_from_table(&instant)?;
@@ -143,7 +143,7 @@ fn push_unit(out: &mut String, value: u64, unit: char) {
     let _ = write!(out, "{value}{unit}");
 }
 
-/// Shared elapsed-time formatter. Consumed by `maki.time.ago` for plugins and
+/// Shared elapsed-time formatter. Consumed by `makima.time.ago` for plugins and
 /// by makima's own pickers. Fractions truncate to whole seconds, and higher
 /// zero units stay omitted.
 pub fn format_ago(elapsed: Duration) -> String {
@@ -169,9 +169,9 @@ lua_table! {
     /// format instead of reimplementing epoch math per plugin.
     ///
     /// ```lua
-    /// local t0 = maki.time.now()
+    /// local t0 = makima.time.now()
     /// -- work...
-    /// print(maki.time.ago(t0))
+    /// print(makima.time.ago(t0))
     /// ```
     "maki.time" => pub(crate) fn create_time_table(), DOCS [
         now, at, ago,

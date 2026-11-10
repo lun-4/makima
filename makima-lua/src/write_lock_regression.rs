@@ -2,7 +2,7 @@
 //!
 //! Loads the real `batch`, `edit`, `write`, `memory`, and `skill` plugins
 //! onto an in-memory backend and routes every child through
-//! `makima-agent::tool_dispatch::run` via the real `maki.agent.call_tool`, so
+//! `makima-agent::tool_dispatch::run` via the real `makima.agent.call_tool`, so
 //! the keyed write lock surrounds the complete Lua read-modify-write
 //! handler. The bypass-lock reproducer below proves the green test would
 //! catch the old last-writer-wins interleaving: identical inputs, no lock,
@@ -342,7 +342,7 @@ fn skill_handler_uses_atomic_write() {
     let (registry, _host) = boot_with_watch(&watch, &["skill"]);
     let ctx = shared_ctx(&registry);
 
-    let done = dispatch(&ctx, "s1", "skill", json!({"name": "makima-plugin-dev"}));
+    let done = dispatch(&ctx, "s1", "skill", json!({"name": "maki-plugin-dev"}));
     assert!(!done.is_error, "skill failed: {}", done.output.as_text());
     assert!(
         watch.atomic.load(Ordering::SeqCst),

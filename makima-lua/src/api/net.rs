@@ -57,7 +57,7 @@ const CROSS_AUTHORITY_HEADERS: [&str; 5] = [
 
 /// Hosts the user marked as safe to reach on a private address, from
 /// `net.allowed_private_hosts`. Process-wide because the guard sits far below
-/// the config: every `maki.net` call, in any plugin, on any Lua thread, reads
+/// the config: every `makima.net` call, in any plugin, on any Lua thread, reads
 /// the same list, and `/reload` swaps it.
 static ALLOWED_PRIVATE_HOSTS: LazyLock<ArcSwap<HostAllowlist>> = LazyLock::new(ArcSwap::default);
 
@@ -226,7 +226,7 @@ struct ResponseData {
 /// @param opts table? Request options (see above).
 /// @return (table?, string?) Response table, or nil plus an error string.
 /// @example
-/// local res, err = maki.net.request("https://httpbin.org/get")
+/// local res, err = makima.net.request("https://httpbin.org/get")
 /// if err then
 ///   print("failed: " .. err)
 /// else
@@ -254,7 +254,7 @@ lua_table! {
     /// exempt from the block. `send` has none of these guards.
     ///
     /// ```lua
-    /// local res, err = maki.net.request("https://example.com")
+    /// local res, err = makima.net.request("https://example.com")
     /// if res then print(res.body) end
     /// ```
     "maki.net" => pub(crate) fn create_net_table(perms: &PluginPermissions), DOCS [

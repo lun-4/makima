@@ -83,7 +83,7 @@ async fn call_lua_tool(lua: Lua, f: Option<Function>, pc: &PendingCall) -> Resul
 ///     `(nil, err)`. Tool calls are batched and dispatched concurrently.
 /// @return (table, string?) Result table, plus an error string on failure.
 /// @example
-/// local result, err = maki.interpreter.run("print(2 + 2)", {
+/// local result, err = makima.interpreter.run("print(2 + 2)", {
 ///   timeout = 30,
 ///   max_memory_mb = 256,
 ///   on_output = function(line) print("py: " .. line) end,
@@ -219,7 +219,7 @@ lua_table! {
     /// Lua-defined tools, and stdout is streamed line by line.
     ///
     /// ```lua
-    /// local r, err = maki.interpreter.run("print('hello')", {
+    /// local r, err = makima.interpreter.run("print('hello')", {
     ///   timeout = 10,
     ///   max_memory_mb = 128,
     ///   on_output = function(line) print(line) end,

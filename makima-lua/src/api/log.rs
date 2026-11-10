@@ -18,7 +18,7 @@ fn log_emit(plugin: &str, level: &str, msg: &str) {
 ///
 /// @param msg string Message to log.
 /// @example
-/// maki.log.debug("loaded " .. #items .. " items")
+/// makima.log.debug("loaded " .. #items .. " items")
 #[lua_fn]
 fn debug(_lua: &Lua, #[ctx] plugin: Arc<str>, msg: String) -> mlua::Result<()> {
     log_emit(&plugin, "debug", &msg);
@@ -29,7 +29,7 @@ fn debug(_lua: &Lua, #[ctx] plugin: Arc<str>, msg: String) -> mlua::Result<()> {
 ///
 /// @param msg string Message to log.
 /// @example
-/// maki.log.info("plugin initialized")
+/// makima.log.info("plugin initialized")
 #[lua_fn]
 fn info(_lua: &Lua, #[ctx] plugin: Arc<str>, msg: String) -> mlua::Result<()> {
     log_emit(&plugin, "info", &msg);
@@ -40,7 +40,7 @@ fn info(_lua: &Lua, #[ctx] plugin: Arc<str>, msg: String) -> mlua::Result<()> {
 ///
 /// @param msg string Message to log.
 /// @example
-/// maki.log.warn("config file missing, using defaults")
+/// makima.log.warn("config file missing, using defaults")
 #[lua_fn]
 fn warn(_lua: &Lua, #[ctx] plugin: Arc<str>, msg: String) -> mlua::Result<()> {
     log_emit(&plugin, "warn", &msg);
@@ -51,7 +51,7 @@ fn warn(_lua: &Lua, #[ctx] plugin: Arc<str>, msg: String) -> mlua::Result<()> {
 ///
 /// @param msg string Message to log.
 /// @example
-/// maki.log.error("failed to connect to API")
+/// makima.log.error("failed to connect to API")
 #[lua_fn]
 fn error(_lua: &Lua, #[ctx] plugin: Arc<str>, msg: String) -> mlua::Result<()> {
     log_emit(&plugin, "error", &msg);
@@ -65,8 +65,8 @@ lua_table! {
     /// Messages show up in makima's log output, which you can view with `makima --log`.
     ///
     /// ```lua
-    /// maki.log.info("ready")
-    /// maki.log.warn("something looks off")
+    /// makima.log.info("ready")
+    /// makima.log.warn("something looks off")
     /// ```
     "maki.log" => pub(crate) fn create_log_table(plugin: Arc<str>), DOCS [
         debug(plugin), info(plugin), warn(plugin), error(plugin),

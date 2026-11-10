@@ -48,7 +48,7 @@ impl SplashFrame {
 }
 
 /// Version/update information the Rust host pushes to Lua and plugins read
-/// via `maki.version()`. Cached on the Lua thread (the request handler and
+/// via `makima.version()`. Cached on the Lua thread (the request handler and
 /// every plugin share it), so a plain struct in `app_data` suffices.
 #[derive(Debug, Clone, Default)]
 pub struct VersionInfo {
@@ -57,7 +57,7 @@ pub struct VersionInfo {
 }
 
 /// Splash render timings the host measures and plugins read via
-/// `maki.perf.timings()`. Cached on the Lua thread like [`VersionInfo`]: the
+/// `makima.perf.timings()`. Cached on the Lua thread like [`VersionInfo`]: the
 /// frame request handler records, plugins read, no locking needed.
 #[derive(Debug, Clone, Default)]
 pub struct PerfInfo {
@@ -187,7 +187,7 @@ pub(crate) fn frame_from_lua(value: Value, width: u16, height: u16) -> LuaResult
     })
 }
 
-/// Guard-free read-only `maki.version()` returning `{ current, latest,
+/// Guard-free read-only `makima.version()` returning `{ current, latest,
 /// update_available }`. The host owns the update check and pushes the result
 /// via [`Request::SetVersion`]; plugins only mirror it.
 pub(crate) fn register_version_api(lua: &Lua, maki: &Table) -> LuaResult<()> {
@@ -228,7 +228,7 @@ impl SplashPull {
     }
 }
 
-/// Documentation for `maki.version()`, which is registered by hand (see
+/// Documentation for `makima.version()`, which is registered by hand (see
 /// `register_version_api`) so it cannot carry a `#[lua_fn]` doc block.
 #[allow(non_upper_case_globals)]
 pub(crate) const version__doc: FnDoc = FnDoc {

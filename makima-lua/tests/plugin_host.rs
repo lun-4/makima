@@ -938,7 +938,7 @@ fn resolve_model_spec_takes_precedence_over_tier() {
     );
 }
 
-/// Restore used to lose anything drawn via `maki.async.run`: those tasks
+/// Restore used to lose anything drawn via `makima.async.run`: those tasks
 /// landed in the global spawn queue, which runs after the snapshot is
 /// taken. The runtime must run them inline, after the restore fn and after
 /// each replayed click.
@@ -2126,7 +2126,7 @@ fn warm_click_survives_post_completion_cancel() {
     assert_eq!(body.read()[0].spans[0].text, WARM_CLICK_LINE);
 }
 
-/// `maki.agent.call_tool` returns `(text, err)` and delivers live bufs,
+/// `makima.agent.call_tool` returns `(text, err)` and delivers live bufs,
 /// annotations (live and completion alike) and usage through the callbacks.
 #[test]
 fn call_tool_streams_live_buf_and_annotations() {
@@ -3853,7 +3853,7 @@ fn run_command_goes_to_the_frontend_runner(reply: Result<(), String>, expected_f
     assert!(matches!(action, makima_lua::UiAction::Flash(msg) if msg == expected_flash));
 }
 
-/// `/go` nests `maki.api.run_command(ctx, "/bogus")` from inside a real command
+/// `/go` nests `makima.api.run_command(ctx, "/bogus")` from inside a real command
 /// invocation (dispatched through the registry, so the handler runs with an
 /// invocation context): the nested dispatch rejects the unknown command
 /// without touching the UI.
@@ -4248,7 +4248,7 @@ fn parked_handler_reports_its_hook_finish_reply_on_deadline() {
 }
 
 const BASH_CANCEL_ID: &str = "bash-cancel-1";
-/// Mirrors the cancelled marker in `plugins/lib/maki/partial.lua`.
+/// Mirrors the cancelled marker in `plugins/lib/makima/partial.lua`.
 const BASH_PARTIAL_MARKER: &str = "[cancelled by user; output above is partial]";
 /// Assembled by printf so the probe never appears in the command header.
 const BASH_PARTIAL_PROBE: &str = "XY";
@@ -5448,7 +5448,7 @@ fn interpreter_bridge_flattens_image_with_visibility_note() {
 }
 
 /// The sessions picker parks its command handler in a `win:recv` loop while a
-/// `maki.async.run` task fetches the stored-session list. Queued async tasks
+/// `makima.async.run` task fetches the stored-session list. Queued async tasks
 /// must run while the spawning handler is still parked, not wait for the next
 /// unrelated lua-thread event.
 #[test]
@@ -5511,7 +5511,7 @@ fn job_callbacks_fire_while_command_handler_parked() {
     assert!(matches!(action, makima_lua::UiAction::Flash(msg) if msg == "job:hi"));
 }
 
-/// `maki.ui.open_list_picker` blocks the command handler until the host
+/// `makima.ui.open_list_picker` blocks the command handler until the host
 /// dialog replies; `on_change`/`on_timeout` fire from picker events sent by
 /// id, and the reply carries the 1-based original index.
 #[test]
@@ -7292,7 +7292,7 @@ fn partial_cut_memoizes_raw_reply_and_paints_marker_once() {
 fn bash_large_output_offloads_into_in_memory_store() {
     let (reg, host) = builtins_host();
     let fs = Arc::new(InMemoryFs::new());
-    let store_dir = PathBuf::from("/makima-test-state/sessions/offload/s");
+    let store_dir = PathBuf::from("/maki-test-state/sessions/offload/s");
     let store = Arc::new(OffloadStore::new(Box::new(InMemoryOffloadBackend::new(
         Arc::clone(&fs),
         store_dir.clone(),

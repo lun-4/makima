@@ -50,7 +50,7 @@ pub const DEFAULT_MAX_AGENT_DEPTH: usize = 4;
 pub const DEFAULT_MAX_CHILDREN_PER_AGENT: usize = 16;
 pub const DEFAULT_MAX_LIVE_AGENTS: usize = 64;
 pub const DEFAULT_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(20);
-/// What one turn asks to generate. A number of maki's own choosing rather than
+/// What one turn asks to generate. A number of makima's own choosing rather than
 /// "whatever the window can spare", because the latter ties the output cap to a
 /// prompt estimate, and an estimate that reads low buys a rejection from every
 /// server enforcing `prompt + max_tokens <= context_window`.
@@ -133,7 +133,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
 ];
 
 /// Bundled but not enabled by default. Users opt in with
-/// `plugins.<name> = { enabled = true }` in `maki.setup`.
+/// `plugins.<name> = { enabled = true }` in `makima.setup`.
 pub const OPT_IN_BUILTINS: &[&str] = &[];
 
 /// These used to be their own `tools.<name>` tables and are now edit plugin
@@ -144,7 +144,7 @@ pub const EDIT_SUB_TOOLS: &[&str] = &["edit_lines", "insert_lines", "multiedit"]
 pub const FILE_WRITE_TOOLS: &[&str] = &["write", "edit", "multiedit", "edit_lines", "insert_lines"];
 
 /// A capability a lua plugin can hold. Declared in `plugin.toml`, recorded in
-/// the package approval store, and named on every guarded `maki.*` function.
+/// the package approval store, and named on every guarded `makima.*` function.
 ///
 /// It lives here rather than in `makima-lua` so the tool layer can name the
 /// permission a tool exposes without pulling in the lua runtime.
@@ -536,7 +536,7 @@ impl RawConfig {
 pub struct PluginFileConfig {
     pub enabled: Option<bool>,
     /// Plugin-specific options passed through opaquely; each plugin declares
-    /// and validates its own via `maki.api.register_options`.
+    /// and validates its own via `makima.api.register_options`.
     #[serde(flatten)]
     pub opts: JsonMap<String, JsonValue>,
 }
@@ -1836,7 +1836,7 @@ impl StorageConfig {
     }
 }
 
-/// Escape hatches for the SSRF guard in `maki.net`, which every HTTP tool
+/// Escape hatches for the SSRF guard in `makima.net`, which every HTTP tool
 /// goes through. The model picks the URL, so private and metadata addresses
 /// are refused unless the user named the host here.
 #[derive(Debug, Clone, ConfigSection)]
@@ -1946,7 +1946,7 @@ pub struct PluginsConfig {
     pub enabled: bool,
     pub names: Vec<String>,
     /// Per-plugin option tables, without `enabled`. Each plugin validates its
-    /// own via `maki.api.register_options` at load time.
+    /// own via `makima.api.register_options` at load time.
     pub opts: HashMap<String, JsonMap<String, JsonValue>>,
 }
 

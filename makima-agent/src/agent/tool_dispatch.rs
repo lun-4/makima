@@ -77,7 +77,7 @@ impl RecentCalls {
     }
 }
 
-/// Every tool call in maki lands here (native, Lua, MCP, subagents, batch
+/// Every tool call in makima lands here (native, Lua, MCP, subagents, batch
 /// children), which makes it the one place telemetry has to wrap and the one
 /// place [hooks] fire.
 ///
@@ -1691,7 +1691,7 @@ mod tests {
         local_ctx(CLIENT_NAME, |_| Ok(String::new()))
     }
 
-    /// Hooking in dispatch is what reaches a route maki did not write the code
+    /// Hooking in dispatch is what reaches a route makima did not write the code
     /// behind, and each one has to answer for what that lends. Only a declared
     /// capability narrows the price; everything else prices at the maximum.
     /// The name stays the one the model called, not whatever dispatch routes

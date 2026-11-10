@@ -29,7 +29,7 @@ for _, alias in ipairs(aliases) do
 end
 ```
 
-Both names stay in the palette: aliasing adds a name, it does not rename or hide the original. It works for commands that finish in their handler, such as `/new`, `/sessions`, `/cd` and plugin commands. A command that starts a model turn (custom Markdown commands, MCP prompts), `/compact` and `/btw` report an error from inside another command's handler; bind those to a key with `maki.ui.action` instead. See [`maki.api.run_command`](/docs/lua-api/#makima-api-run_command) for matching and error handling, or [`maki.ui.action`](/docs/lua-api/#makima-ui-action) to bind a key instead of a name."#;
+Both names stay in the palette: aliasing adds a name, it does not rename or hide the original. It works for commands that finish in their handler, such as `/new`, `/sessions`, `/cd` and plugin commands. A command that starts a model turn (custom Markdown commands, MCP prompts), `/compact` and `/btw` report an error from inside another command's handler; bind those to a key with `maki.ui.action` instead. See [`maki.api.run_command`](/docs/lua-api/#maki-api-run_command) for matching and error handling, or [`maki.ui.action`](/docs/lua-api/#maki-ui-action) to bind a key instead of a name."#;
 
 fn markdown_cell(value: &str) -> String {
     value

@@ -1,4 +1,4 @@
-//! `maki.agent` exposes subagent primitives to Lua plugins. Policy (retries,
+//! `makima.agent` exposes subagent primitives to Lua plugins. Policy (retries,
 //! validation, concurrency) lives in the task plugin, not here.
 
 use std::collections::{HashMap, HashSet};
@@ -663,7 +663,7 @@ async fn relay_session_events(
 /// You might want a cheaper model for simple subtasks (summaries, classification)
 /// without hard-coding a model name.
 ///
-/// The returned table has the same fields as `maki.model.info`.
+/// The returned table has the same fields as `makima.model.info`.
 ///
 /// @param ctx LuaCtx Agent context.
 /// @param opts table? Optional fields:
@@ -673,7 +673,7 @@ async fn relay_session_events(
 ///     Takes precedence over `tier`.
 /// @return (table?, string?) Model table on success, or `(nil, err)` on failure.
 /// @example
-/// local model, err = maki.agent.resolve_model(ctx, { tier = "weak" })
+/// local model, err = makima.agent.resolve_model(ctx, { tier = "weak" })
 /// if err then error(err) end
 /// print(model.spec, model.tier)
 #[lua_fn]
@@ -710,7 +710,7 @@ async fn resolve_model(
 ///     `false` or nil omits them.
 /// @return (string?, string?) The assembled prompt string, or `(nil, err)` on failure.
 /// @example
-/// local prompt, err = maki.agent.system_prompt(ctx, {
+/// local prompt, err = makima.agent.system_prompt(ctx, {
 ///   prompt_id = "research",
 ///   instructions = true,
 /// })
@@ -753,7 +753,7 @@ async fn system_prompt(
 }
 
 /// Get the list of tool definitions for a given audience. Pass the result
-/// straight into `maki.agent.spawn()` or use it to inspect what tools are
+/// straight into `makima.agent.spawn()` or use it to inspect what tools are
 /// available.
 ///
 /// @param ctx LuaCtx Agent context.
@@ -767,7 +767,7 @@ async fn system_prompt(
 ///   `spec` (string?) - evaluate capability exclusions against this model spec.
 /// @return (table?, string?) Array of tool definition tables, or `(nil, err)` on failure.
 /// @example
-/// local defs, err = maki.agent.tools(ctx, {
+/// local defs, err = makima.agent.tools(ctx, {
 ///   audience = "general_sub",
 ///   except = { "bash", "write" },
 /// })
@@ -825,7 +825,7 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
 /// Every tool name this context can dispatch: registry tools, MCP tools
 /// (deferred ones included), host tools (ACP client tools, a subagent's
 /// `structured_output`) and `tool_search`. Reach for it when you expose tools
-/// inside a sandbox and need the names to bind. `maki.api.get_tools()` covers
+/// inside a sandbox and need the names to bind. `makima.api.get_tools()` covers
 /// the registry alone and has no view of the session.
 ///
 /// The list already accounts for this session's audience, the config's
@@ -843,7 +843,7 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
 ///   one (say `srv__get-docs`). Dispatch `name` in every case. `schema` comes
 ///   with registry tools only.
 /// @example
-/// local tools, err = maki.agent.callable_tools(ctx)
+/// local tools, err = makima.agent.callable_tools(ctx)
 /// if err then error(err) end
 /// for _, t in ipairs(tools) do
 ///   print(t.source, t.alias or t.name)
@@ -892,7 +892,7 @@ async fn callable_tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<P
 ///   failure. The third value is the tool's `state` (see `register_tool`),
 ///   for callers that hand it back to the tool's `restore` later.
 /// @example
-/// local out, err = maki.agent.call_tool(ctx, "bash", {
+/// local out, err = makima.agent.call_tool(ctx, "bash", {
 ///   command = "ls -la",
 ///   timeout = 10,
 /// })
@@ -984,7 +984,7 @@ async fn call_tool(
 /// @return (boolean?, string?) `true` when the call is allowed, or
 ///   `(nil, err)` with the permission-denied message when denied.
 /// @example
-/// local ok, err = maki.agent.permission_prompt(ctx, {
+/// local ok, err = makima.agent.permission_prompt(ctx, {
 ///   tool = "bash",
 ///   scopes = { "echo hello" },
 ///   force_prompt = false,
@@ -1871,8 +1871,8 @@ lua_table! {
     /// plugin, not here.
     ///
     /// ```lua
-    /// local tools = maki.agent.tools(ctx, { audience = "general_sub" })
-    /// local agent = assert(maki.agent.spawn(ctx, {
+    /// local tools = makima.agent.tools(ctx, { audience = "general_sub" })
+    /// local agent = assert(makima.agent.spawn(ctx, {
     ///   system = "You are a helpful assistant.",
     ///   tools = tools,
     /// }))
@@ -2046,10 +2046,10 @@ impl mlua::UserData for LuaTaskOwner {
     fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
         // A managed task whose child has closed, for instance because its owner
         // was closed, can be dropped without anyone's authority.
-        methods.add_method("_makima_retired", |_, this, ()| {
+        methods.add_method("_maki_retired", |_, this, ()| {
             Ok(this.target.validate_live().is_err())
         });
-        methods.add_method("_makima_can_control", |lua, this, ()| {
+        methods.add_method("_maki_can_control", |lua, this, ()| {
             if InvocationGuard::capture(lua).is_err()
                 || !crate::orchestration::holds_plugin_grant(
                     lua,

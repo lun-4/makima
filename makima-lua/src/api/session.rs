@@ -1,4 +1,4 @@
-//! `maki.session`: host session primitives. Session management round-trips to
+//! `makima.session`: host session primitives. Session management round-trips to
 //! the UI event loop, which owns live runtimes and storage. `notify` posts
 //! directly to the agent mailbox so synchronous callbacks can use it.
 
@@ -18,7 +18,7 @@ use crate::api::util::command::{SessionRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 
-/// Answers `maki.session.read` for a driver that has no UI to ask. Takes the
+/// Answers `makima.session.read` for a driver that has no UI to ask. Takes the
 /// session id from Lua and returns a serialized
 /// [`crate::session_snapshot::SessionSnapshot`].
 pub type SessionSnapshotFn =
@@ -65,7 +65,7 @@ fn required_session(opts: Option<&Table>) -> LuaResult<Result<MakimaId, String>>
 ///
 /// @return (table|nil, string|nil) Array of `{id, title, updated_at, cwd, message_count, open_elsewhere}`, or nil and an error.
 /// @example
-/// local stored, err = maki.session.list()
+/// local stored, err = makima.session.list()
 #[lua_fn]
 async fn list(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, SessionRequest::List).await
@@ -79,7 +79,7 @@ async fn list(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
 ///
 /// @return (table|nil, string|nil) Array of `{id, title, updated_at, cwd, message_count, open_elsewhere}`, or nil and an error.
 /// @example
-/// local stored, err = maki.session.list_all()
+/// local stored, err = makima.session.list_all()
 #[lua_fn]
 async fn list_all(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, SessionRequest::ListAll).await
@@ -93,7 +93,7 @@ async fn list_all(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaRe
 ///
 /// @return (table|nil, string|nil) Array of `{id, title, status, updated_at, message_count, focused}`, or nil and an error.
 /// @example
-/// local live, err = maki.session.live()
+/// local live, err = makima.session.live()
 #[lua_fn]
 async fn live(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, SessionRequest::Live).await
@@ -105,7 +105,7 @@ async fn live(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
 /// @param id string Session id, as returned by `list()` or `live()`.
 /// @return (boolean|nil, string|nil) true on success, or nil and an error.
 /// @example
-/// local _, err = maki.session.focus(id)
+/// local _, err = makima.session.focus(id)
 #[lua_fn]
 async fn focus(
     lua: Lua,
@@ -124,7 +124,7 @@ async fn focus(
 /// @param id string Session id to delete.
 /// @return (boolean|nil, string|nil) true on success, or nil and an error.
 /// @example
-/// local _, err = maki.session.delete(id)
+/// local _, err = makima.session.delete(id)
 #[lua_fn]
 async fn delete(
     lua: Lua,
@@ -163,8 +163,8 @@ async fn delete(
 /// @param opts table Required `session` (string) id.
 /// @return (table|nil, string|nil) Snapshot table, or nil and an error.
 /// @example
-/// local s = maki.session.read({ session = ctx:session_id() })
-/// maki.ui.notify("spent " .. tostring(s.usage.total.cost))
+/// local s = makima.session.read({ session = ctx:session_id() })
+/// makima.ui.notify("spent " .. tostring(s.usage.total.cost))
 #[lua_fn]
 async fn read(
     lua: Lua,
@@ -191,7 +191,7 @@ async fn read(
 ///   to submit right away; focus (boolean) switch the UI to the new session.
 /// @return (string|nil, string|nil) New session id, or nil and an error.
 /// @example
-/// local id, err = maki.session.new({ prompt = "fix the tests", focus = true })
+/// local id, err = makima.session.new({ prompt = "fix the tests", focus = true })
 #[lua_fn]
 async fn new(
     lua: Lua,
@@ -217,7 +217,7 @@ async fn new(
 ///   `wake` (boolean) start a TUI turn when it next becomes idle (default false).
 /// @return (boolean|nil, string|nil) true, or nil and an error.
 /// @example
-/// maki.session.notify("[monitor] deploy failed", { session = id, wake = true })
+/// makima.session.notify("[monitor] deploy failed", { session = id, wake = true })
 #[lua_fn]
 fn notify(_lua: &Lua, text: String, opts: Table) -> LuaResult<Pair<bool>> {
     if text.trim().is_empty() {
@@ -243,7 +243,7 @@ fn notify(_lua: &Lua, text: String, opts: Table) -> LuaResult<Pair<bool>> {
 ///   title (string) the new title.
 /// @return (boolean|nil, string|nil) true on success, or nil and an error.
 /// @example
-/// local _, err = maki.session.set_title({ id = id, title = "refactor" })
+/// local _, err = makima.session.set_title({ id = id, title = "refactor" })
 #[lua_fn]
 async fn set_title(
     lua: Lua,
@@ -271,7 +271,7 @@ async fn set_title(
 /// @param mode string The thinking setting.
 /// @return (table|nil, string|nil) `{mode}` with the normalized setting, or nil and an error.
 /// @example
-/// maki.session.set_default_thinking("medium")
+/// makima.session.set_default_thinking("medium")
 #[lua_fn]
 fn set_default_thinking(lua: &Lua, mode: String) -> LuaResult<Pair<Table>> {
     if crate::runtime::in_delegated_tool(lua) {

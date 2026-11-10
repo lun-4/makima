@@ -1,5 +1,5 @@
 //! Tests the batch plugin's policy end-to-end: real plugin source, real
-//! `maki.async.gather`, with tool dispatch replaced by a scriptable Lua stub.
+//! `makima.async.gather`, with tool dispatch replaced by a scriptable Lua stub.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -55,7 +55,7 @@ const SPINNER_STYLE: &str = "spinner";
 const ERROR_STYLE: &str = "tool_error";
 const SUCCESS_STYLE: &str = "tool_success";
 
-/// `maki.agent.call_tool` is stubbed; `maki.async.gather` and the semaphore
+/// `makima.agent.call_tool` is stubbed; `makima.async.gather` and the semaphore
 /// stay real, so the park/release pair proves children genuinely overlap.
 const STUB_PRELUDE: &str = r#"
 recorder = { calls = {} }
@@ -436,7 +436,7 @@ fn cancel_mid_flight_repaints_parked_children_and_spares_finished_ones() {
 }
 
 /// Esc pressed before the batch is even dispatched: the handler still runs
-/// (only `maki.async.run` spawns are skipped on a cancelled token) and
+/// (only `makima.async.run` spawns are skipped on a cancelled token) and
 /// `gather` runs every fun it was handed, so only the batch itself can stop a
 /// swept child from executing anyway. A child born terminal keeps its own
 /// error, so the two sweeps never settle the same child twice.

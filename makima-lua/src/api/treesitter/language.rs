@@ -18,7 +18,7 @@ struct LangRegistry {
 /// @param lang string Language name, e.g. `"rust"`.
 /// @param opts table? Options table (the `path` key is not yet supported).
 /// @example
-/// maki.treesitter.language.add("lua")
+/// makima.treesitter.language.add("lua")
 #[lua_fn]
 fn add(_lua: &Lua, lang: String, opts: Option<Table>) -> mlua::Result<()> {
     if let Some(ref opts) = opts
@@ -40,7 +40,7 @@ fn add(_lua: &Lua, lang: String, opts: Option<Table>) -> mlua::Result<()> {
 /// @param lang string Language name.
 /// @param filetype string|table A single filetype string or an array of filetype strings.
 /// @example
-/// maki.treesitter.language.register("typescript", { "ts", "tsx" })
+/// makima.treesitter.language.register("typescript", { "ts", "tsx" })
 #[lua_fn]
 fn register(
     _lua: &Lua,
@@ -86,7 +86,7 @@ fn register(
 /// @param filetype string Filetype to look up, e.g. `"ts"`.
 /// @return (string|nil) Language name, or nil.
 /// @example
-/// local lang = maki.treesitter.language.get_lang("tsx")
+/// local lang = makima.treesitter.language.get_lang("tsx")
 /// if lang then print(lang) end -- "typescript"
 #[lua_fn]
 fn get_lang(
@@ -112,7 +112,7 @@ fn get_lang(
 /// @param lang string Language name.
 /// @return (table) Array of filetype strings.
 /// @example
-/// local fts = maki.treesitter.language.get_filetypes("typescript")
+/// local fts = makima.treesitter.language.get_filetypes("typescript")
 /// -- { "ts", "tsx" }
 #[lua_fn]
 fn get_filetypes(
@@ -138,7 +138,7 @@ fn get_filetypes(
 /// @param lang string Language name.
 /// @return (table) Table with keys `abi_version` (integer), `node_types` (string[]), `fields` (string[]).
 /// @example
-/// local info = maki.treesitter.language.inspect("lua")
+/// local info = makima.treesitter.language.inspect("lua")
 /// print("ABI: " .. info.abi_version)
 /// for _, nt in ipairs(info.node_types) do print(nt) end
 #[lua_fn]
@@ -182,8 +182,8 @@ lua_table! {
     /// map filetypes to languages, and inspect available node types.
     ///
     /// ```lua
-    /// maki.treesitter.language.add("lua")
-    /// maki.treesitter.language.register("lua", "luau")
+    /// makima.treesitter.language.add("lua")
+    /// makima.treesitter.language.register("lua", "luau")
     /// ```
     extend "maki.treesitter.language" => fn language_fns(reg: Arc<Mutex<LangRegistry>>), DOCS [
         add, register(reg), get_lang(reg), get_filetypes(reg), inspect,

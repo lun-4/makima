@@ -176,11 +176,11 @@ fn destroy(_lua: &Lua, this: &mut LuaLanguageTree) -> LuaResult<()> {
 lua_class! {
     /// Manages parsing of a source string for a single language.
     ///
-    /// Obtained from `maki.treesitter.get_parser()` or `maki.treesitter.get_string_parser()`.
+    /// Obtained from `makima.treesitter.get_parser()` or `makima.treesitter.get_string_parser()`.
     /// Call `:parse()` to get the syntax tree, then use `:root()` on the tree to start walking nodes.
     ///
     /// ```lua
-    /// local parser, err = maki.treesitter.get_parser(source, "lua")
+    /// local parser, err = makima.treesitter.get_parser(source, "lua")
     /// if not err then
     ///   local trees = parser:parse()
     ///   local root = trees[1]:root()

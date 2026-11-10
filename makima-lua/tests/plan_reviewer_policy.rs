@@ -24,9 +24,9 @@ const TASK_SPAWN_TOOL: &str = "task_spawn";
 const TASK_WAIT_TOOL: &str = "task_wait";
 const TASK_FAMILY: [&str; 4] = [TASK_SPAWN_TOOL, TASK_WAIT_TOOL, "task_send", "task_despawn"];
 
-/// Wrap `maki.agent.spawn` to reuse the parent (canned) provider, and
+/// Wrap `makima.agent.spawn` to reuse the parent (canned) provider, and
 /// stub the model/system lookups so no real model resolution or file read is
-/// needed. `maki.agent.tools` is left real when `real_tools` is set (so the
+/// needed. `makima.agent.tools` is left real when `real_tools` is set (so the
 /// reviewer's tool set can be inspected); otherwise it is stubbed to empty.
 const SESSION_WRAPPER: &str = r#"
 local real_spawn = maki.agent.spawn
@@ -45,7 +45,7 @@ end
 const TOOLS_STUB: &str = "maki.agent.tools = function(ctx, opts) return nil end\n";
 
 /// A read tool visible to `research_sub` and a write tool visible only to
-/// `general_sub`, so the real `maki.agent.tools` can demonstrate the reviewer's
+/// `general_sub`, so the real `makima.agent.tools` can demonstrate the reviewer's
 /// audience-based read-only filtering: the reviewer (research_sub) gets `read`
 /// but not `write`.
 const FAKE_READ_WRITE_TOOLS: &str = r#"

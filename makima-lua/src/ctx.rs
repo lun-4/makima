@@ -1,4 +1,4 @@
-//! `maki.Ctx`: a plugin's authority. Each entry chunk receives its root ctx
+//! `makima.Ctx`: a plugin's authority. Each entry chunk receives its root ctx
 //! as `...` and passes it on by reference; plugins narrow it with
 //! `with_name`, and only the host extends it, as when it derives a provider
 //! ctx for a provider's callbacks.
@@ -38,7 +38,7 @@ const SEND_WITH_DEFAULTS: &str = r#"
 #[derive(Clone)]
 pub(crate) struct PluginCtx {
     namespace: Arc<[Arc<str>]>,
-    /// The owning plugin's `maki.net.send`, which the host wraps with the
+    /// The owning plugin's `makima.net.send`, which the host wraps with the
     /// defaults each derived `send` needs.
     net_send: Function,
     send: Function,
@@ -161,7 +161,7 @@ fn with_timeouts(
 /// child is a plain plugin ctx.
 ///
 /// @param name string ASCII letters, digits, `-`, `_` or `.`, not starting with `.`.
-/// @return (maki.Ctx) The child ctx.
+/// @return (makima.Ctx) The child ctx.
 /// @example
 /// local ctx = ...
 /// require("fountain.provider").setup(ctx:with_name("fountain"))
@@ -207,15 +207,15 @@ lua_class! {
     /// A plugin's authority. An entry chunk (a bundled plugin, or `init.lua`)
     /// receives its root ctx as `...`; pass it on by reference, such as to
     /// a module's `setup(ctx)`, and narrow it with `with_name`. APIs that
-    /// act for the plugin take it, such as `maki.credentials.open` and
-    /// `maki.api.register_provider`. Its fields cannot be assigned.
+    /// act for the plugin take it, such as `makima.credentials.open` and
+    /// `makima.api.register_provider`. Its fields cannot be assigned.
     ///
-    /// `send` is `maki.net.send` with default timeouts: from
+    /// `send` is `makima.net.send` with default timeouts: from
     /// `MAKIMA_NET_TIMEOUT_SECS` (default 30 seconds) on a plugin ctx, from
     /// `[provider]` on a provider ctx. A provider ctx, which a provider's
     /// callbacks receive, also has `id` (the provider id) and `credentials`
-    /// (the provider's `maki.credentials.Store`); a `stream` call's ctx also
-    /// has `mark_request_delivery`, described on `maki.api.register_provider`.
+    /// (the provider's `makima.credentials.Store`); a `stream` call's ctx also
+    /// has `mark_request_delivery`, described on `makima.api.register_provider`.
     "maki.Ctx" => Ctx, CTX_DOCS [with_name] fields ctx_fields
 }
 

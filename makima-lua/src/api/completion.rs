@@ -1,4 +1,4 @@
-//! `maki.api` completion sources and submit-time expanders.
+//! `makima.api` completion sources and submit-time expanders.
 //!
 //! Plugins own the non-file `@`-reference story end to end. A *completion
 //! source* feeds the popup (`@`-token candidates shown as the user types); an
@@ -96,7 +96,7 @@ fn install_store<T: Default + Send + Sync + 'static>(lua: &Lua) {
 /// @param spec table `{ get_items = function(ctx) -> { {label, kind, insertion, description?} } }`.
 /// @return (boolean|nil, string|nil) true, or nil and an error. Returns nil and an error when called from a delegated tool handler.
 /// @example
-/// maki.api.register_completion_source("skill", {
+/// makima.api.register_completion_source("skill", {
 ///   get_items = function(ctx)
 ///     return { { label = "skill:review", kind = "skill", insertion = "@skill:review" } }
 ///   end,
@@ -144,10 +144,10 @@ fn register_completion_source(
 /// @param f function `{ value = string } -> (string, string|nil)`.
 /// @return (boolean|nil, string|nil) true, or nil and an error. Returns nil and an error when called from a delegated tool handler.
 /// @example
-/// maki.api.register_expander("skill", function(ref)
+/// makima.api.register_expander("skill", function(ref)
 ///   return "<skill:" .. ref.value .. ">", nil
 /// end)
-/// maki.api.register_expander("s", function(ref)
+/// makima.api.register_expander("s", function(ref)
 ///   return "<skill:" .. ref.value .. ">", nil
 /// end)
 #[lua_fn]
@@ -485,7 +485,7 @@ fn pair_from_multivalue(mv: MultiValue) -> Pair<String> {
 /// returned string; unknown prefixes and file references (empty prefix) pass
 /// through verbatim. The first expander `Err` aborts and is surfaced to the
 /// user as a flash. Async because expanders may call yield-bridged FFI (e.g.
-/// `maki.fs`); callers must be a Lua task scope.
+/// `makima.fs`); callers must be a Lua task scope.
 pub(crate) async fn expand_references(lua: &Lua, text: &str) -> Result<String, String> {
     let tokens = parse_at_tokens(text);
     if tokens.is_empty() {
@@ -535,7 +535,7 @@ pub(crate) async fn expand_references(lua: &Lua, text: &str) -> Result<String, S
 /// Gather candidates from every registered source, passing `ctx` to each
 /// `get_items`. A source that errors is skipped with a warning rather than
 /// aborting the popup. Async because sources may call yield-bridged FFI
-/// (e.g. `maki.fs`); callers must be a Lua task scope.
+/// (e.g. `makima.fs`); callers must be a Lua task scope.
 pub(crate) async fn collect_completion_items(lua: &Lua, ctx: &CompletionCtx) -> Vec<ItemSpec> {
     // Resolve (clone) all sources up front: the app_data borrow must not
     // outlive the awaits, or the task-scope TaskHandle swap cannot mutably

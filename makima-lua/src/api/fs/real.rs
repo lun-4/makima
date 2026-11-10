@@ -12,7 +12,7 @@ use super::{
     TYPE_DIRECTORY, TYPE_FILE, TYPE_LINK, TYPE_UNKNOWN,
 };
 
-/// Production backend: the exact semantics `maki.fs` always had — symlinks,
+/// Production backend: the exact semantics `makima.fs` always had — symlinks,
 /// gitignore, permissions, real mtimes.
 pub struct RealFs;
 

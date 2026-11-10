@@ -178,7 +178,7 @@ fn redact_path(input: &str, target: &str, placeholder: &str) -> String {
 }
 
 /// Plugins bake env-specific values into their `description` at registration:
-/// `bash` interpolates `maki.uv.cwd()` and `websearch` interpolates
+/// `bash` interpolates `makima.uv.cwd()` and `websearch` interpolates
 /// `os.date("%Y-%m-%d")`. Scrub both so `gen-docs-check` is stable across
 /// machines and days. CWD is replaced before HOME so a cwd nested under ~
 /// doesn't get partially mangled.

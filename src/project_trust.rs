@@ -115,7 +115,7 @@ mod tests {
         ));
     }
 
-    /// A path anywhere in the checkout trusts the checkout, so `maki trust add
+    /// A path anywhere in the checkout trusts the checkout, so `makima trust add
     /// src/main.rs` does not quietly trust a subdirectory instead.
     #[test_case(false ; "the_checkout_itself")]
     #[test_case(true ; "a_file_inside_the_checkout")]

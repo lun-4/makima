@@ -2,7 +2,7 @@
 //!
 //! monty v0.0.21 checks `LIVE_MEMORY - BASELINE_MEMORY` at VM checkpoints,
 //! but something must feed those counters. Upstream feeds them with
-//! `monty-alloc` in a throwaway worker process that dies on a breach. maki
+//! `monty-alloc` in a throwaway worker process that dies on a breach. makima
 //! runs the interpreter in-process, so this allocator does the accounting
 //! instead: it charges allocations made by a thread holding a
 //! [`SandboxScope`], and monty's tracker turns a breach into a plain

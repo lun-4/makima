@@ -127,7 +127,7 @@ pub fn capability_exclusions(model: &Model) -> &'static [&'static str] {
 }
 
 /// A tool is enabled unless named in `disabled_tools` (config, or the raw
-/// list a Lua caller holds, e.g. `maki.api.get_tools`).
+/// list a Lua caller holds, e.g. `makima.api.get_tools`).
 pub fn is_tool_enabled(disabled_tools: &[String], name: &str) -> bool {
     !disabled_tools.iter().any(|s| s == name)
 }
@@ -439,7 +439,7 @@ where
     }
 }
 
-/// How the `question` tool gathers user input. The interactive maki TUI
+/// How the `question` tool gathers user input. The interactive makima TUI
 /// renders its own form; an ACP host renders an elicitation form; anything
 /// else must fail gracefully instead of blocking on a UI that is not there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -467,7 +467,7 @@ pub struct ToolContext {
     pub question_mode: QuestionMode,
     /// The session this run belongs to. A subagent inherits its parent's,
     /// so a tool can always tell which conversation it is serving. `None`
-    /// when there is no session at all, like the `maki index` one-shot.
+    /// when there is no session at all, like the `makima index` one-shot.
     pub session_id: Option<SessionRef>,
     pub cwd: PathBuf,
     pub tool_use_id: Option<String>,
@@ -496,7 +496,7 @@ pub struct ToolContext {
     pub local_tool_capture: Option<Arc<Mutex<Option<Value>>>>,
     pub turn_bindings: Arc<TurnToolBindings>,
     /// Streams a dispatched child's live bufs and annotations back to the
-    /// caller (`maki.agent.call_tool` with `on_live_buf`/`on_annotation`).
+    /// caller (`makima.agent.call_tool` with `on_live_buf`/`on_annotation`).
     /// Never inherited: `to_tool_context` clears it, and each caller sets
     /// it for its own call only.
     pub live_sink: Option<flume::Sender<ToolLive>>,
@@ -916,7 +916,7 @@ pub fn interpreter_ctx(
     }
 }
 
-/// Minimal ToolContext for CLI one-shot tool execution (e.g. `maki index`).
+/// Minimal ToolContext for CLI one-shot tool execution (e.g. `makima index`).
 /// Allows everything, sends events to a dummy channel, uses no model.
 pub fn cli_tool_ctx(cwd: PathBuf) -> ToolContext {
     let (tx, _rx) = flume::unbounded::<crate::Envelope>();

@@ -6,7 +6,7 @@ const INFINITE_LOOP_MSG: &str = "split: separator matched an empty string (infin
 
 /// Split {s} at each occurrence of {sep} and return the pieces as a
 /// list. Mirrors Neovim's `vim.split`, so code using it can be copied
-/// between Neovim and maki. {sep} is a Lua pattern unless `plain` is
+/// between Neovim and makima. {sep} is a Lua pattern unless `plain` is
 /// set; an empty {sep} splits into single characters.
 ///
 /// @param s string String to split.
@@ -16,9 +16,9 @@ const INFINITE_LOOP_MSG: &str = "split: separator matched an empty string (infin
 ///   `trimempty` (boolean?) drop empty pieces from the start and end of the result.
 /// @return (table) List of split pieces.
 /// @example
-/// maki.split("a,b,c", ",")                   -- { "a", "b", "c" }
-/// maki.split("x*y*z", "*", { plain = true }) -- { "x", "y", "z" }
-/// maki.split("\nhello\nworld\n", "\n", { trimempty = true }) -- { "hello", "world" }
+/// makima.split("a,b,c", ",")                   -- { "a", "b", "c" }
+/// makima.split("x*y*z", "*", { plain = true }) -- { "x", "y", "z" }
+/// makima.split("\nhello\nworld\n", "\n", { trimempty = true }) -- { "hello", "world" }
 #[lua_fn]
 fn split(lua: &Lua, s: mlua::String, sep: mlua::String, opts: Option<Value>) -> LuaResult<Table> {
     let (plain, trimempty) = parse_opts(opts)?;

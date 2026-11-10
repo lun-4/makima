@@ -12,7 +12,7 @@ use crate::api::base64::bytes_arg;
 /// @param data string|buffer Bytes to hash.
 /// @return (string) Raw 32-byte digest.
 /// @example
-/// local digest = maki.crypto.sha256("abc")
+/// local digest = makima.crypto.sha256("abc")
 #[lua_fn]
 fn sha256(lua: &Lua, data: LuaValue) -> LuaResult<LuaString> {
     let bytes = bytes_arg(&data, "crypto.sha256")?;
@@ -25,7 +25,7 @@ fn sha256(lua: &Lua, data: LuaValue) -> LuaResult<LuaString> {
 /// @param data string|buffer Message to authenticate.
 /// @return (string) Raw 32-byte MAC.
 /// @example
-/// local mac = maki.crypto.hmac_sha256("secret", "message")
+/// local mac = makima.crypto.hmac_sha256("secret", "message")
 #[lua_fn]
 fn hmac_sha256(lua: &Lua, key: LuaValue, data: LuaValue) -> LuaResult<LuaString> {
     let key = bytes_arg(&key, "crypto.hmac_sha256 key")?;
@@ -41,7 +41,7 @@ lua_table! {
     /// Both functions accept strings and Luau buffers.
     ///
     /// ```lua
-    /// local signature = maki.crypto.hmac_sha256(key, maki.crypto.sha256(body))
+    /// local signature = makima.crypto.hmac_sha256(key, makima.crypto.sha256(body))
     /// ```
     "maki.crypto" => pub(crate) fn create_crypto_table(), DOCS [
         sha256, hmac_sha256,

@@ -1,7 +1,7 @@
 // Real-VM splash bench: same CLI as scripts/bench.lua (lua5.1) but runs on
 // Luau through mlua with native codegen, configured like the plugin runtime:
 // O2 compiler, sandbox, memory limit, and safeenv-marked envs (runtime.rs
-// build_env), so the reported numbers are the ones maki actually renders with.
+// build_env), so the reported numbers are the ones makima actually renders with.
 // The Rust-side per-segment parse is not included; see
 // makima-lua/benches/splash_perf.rs (pull_roundtrip_200x79 group) for the full
 // host meter.
@@ -104,7 +104,7 @@ fn make_makima_stub(lua: &Lua) -> mlua::Result<Table> {
 }
 
 /// Mirrors runtime.rs build_env: fresh env table, safeenv set (unlocks native
-/// codegen), maki bound, require present, everything else via globals.
+/// codegen), makima bound, require present, everything else via globals.
 fn make_env(
     lua: &Lua,
     maki: &Table,

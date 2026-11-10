@@ -1,5 +1,5 @@
 //! Tests the task plugin's structured-output policy end-to-end: real plugin
-//! source, real `maki.json` / `maki.async`, with model I/O replaced by
+//! source, real `makima.json` / `makima.async`, with model I/O replaced by
 //! scriptable Lua stubs.
 
 use std::sync::{
@@ -100,8 +100,8 @@ const SCENARIO_NESTED_FAILED: &str = "nested_failed";
 const SCENARIO_PARTIAL_ERROR: &str = "partial_error";
 const SCENARIO_RAISE: &str = "raise";
 
-/// Stubs keyed by `opts.name` (the task's `description`). `maki.json` and
-/// `maki.async` stays real; structured-output validation uses the real-driver tests.
+/// Stubs keyed by `opts.name` (the task's `description`). `makima.json` and
+/// `makima.async` stays real; structured-output validation uses the real-driver tests.
 const STUB_PRELUDE: &str = r#"
 recorder = { prompts = {}, closed = 0, sessions = 0 }
 local register_tool = maki.api.register_tool
@@ -200,15 +200,15 @@ maki.agent.spawn = function(ctx, opts)
   function agent:latest_turn(call_ctx)
     return nil
   end
-  function agent:_makima_session_id()
+  function agent:_maki_session_id()
     return opts.name
   end
-  function agent:_makima_task_owner()
+  function agent:_maki_task_owner()
     return {
-      _makima_can_control = function()
+      _maki_can_control = function()
         return recorder.can_control ~= false
       end,
-      _makima_retired = function()
+      _maki_retired = function()
         return false
       end,
     }

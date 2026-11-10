@@ -24,7 +24,7 @@ pub(crate) fn refresh_syntax_theme() {
             _ => None,
         }
     };
-    // Seed the core UI colors so `maki.ui.theme_color` resolves them from the
+    // Seed the core UI colors so `makima.ui.theme_color` resolves them from the
     // fast map instead of the syntect settings (which only carry fg/bg and
     // would miss accent / todo_in_progress). Plugins that cache these at load
     // (e.g. the splash) read the real theme, not a fallback.

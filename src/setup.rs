@@ -137,11 +137,11 @@ impl<'a> MakeWriter<'a> for SharedWriter {
     }
 }
 
-/// `MAKI_LOG` is ours and is taken literally, `MAKI_LOG=off` included.
+/// `MAKIMA_LOG` is ours and is taken literally, `MAKIMA_LOG=off` included.
 ///
 /// `RUST_LOG` belongs to every Rust program on the machine, and `EnvFilter`
 /// drops any target no directive names, so a `RUST_LOG=other_crate=debug` left
-/// in a shell profile for an unrelated project silenced maki entirely. We still
+/// in a shell profile for an unrelated project silenced makima entirely. We still
 /// read it, and a value that names a level decides ours, but a value that only
 /// lists other people's targets gets our level added underneath, so a foreign
 /// variable can add to our logs and never take them away.

@@ -1,4 +1,4 @@
-//! `maki.api.mode`: define and override agent modes. Definitions land in the
+//! `makima.api.mode`: define and override agent modes. Definitions land in the
 //! shared `ModeRegistry` (built-ins `build`/`plan` included), so every
 //! frontend sees the same modes. `Agent:set_mode` switches an agent's mode.
 
@@ -70,7 +70,7 @@ fn spec_from_table(lua: &Lua, opts: Table) -> LuaResult<ModeDefSpec> {
 /// @param opts table { name = "audit", label = "[AUDIT]", system_prompt = string|fn(ctx)->string, restrict_write_to = string, tools = string[] }
 /// @return (boolean, string|nil) `true` on success, or nil and an error.
 /// @example
-/// maki.api.mode.define({ name = "plan", label = "[PLAN]", tools = { "read", "write" } })
+/// makima.api.mode.define({ name = "plan", label = "[PLAN]", tools = { "read", "write" } })
 #[lua_fn]
 fn define(lua: &Lua, opts: Table) -> LuaResult<Pair<bool>> {
     if crate::runtime::in_delegated_tool(lua) {
@@ -89,7 +89,7 @@ fn define(lua: &Lua, opts: Table) -> LuaResult<Pair<bool>> {
 ///
 /// @return (table|nil, string|nil) Array of `{name, label}`, or nil and an error.
 /// @example
-/// for _, m in ipairs(maki.api.mode.list()) do print(m.name) end
+/// for _, m in ipairs(makima.api.mode.list()) do print(m.name) end
 #[lua_fn]
 fn list(lua: &Lua) -> LuaResult<Pair<Table>> {
     let reg = registry(lua)?;
@@ -109,7 +109,7 @@ fn list(lua: &Lua) -> LuaResult<Pair<Table>> {
 /// @param name string|nil Mode id to reset ("build" or "plan").
 /// @return (boolean, string|nil) `true` on success, or nil and an error.
 /// @example
-/// maki.api.mode.reset("plan")
+/// makima.api.mode.reset("plan")
 #[lua_fn]
 fn reset(lua: &Lua, name: Option<String>) -> LuaResult<Pair<bool>> {
     if crate::runtime::in_delegated_tool(lua) {
@@ -128,7 +128,7 @@ fn reset(lua: &Lua, name: Option<String>) -> LuaResult<Pair<bool>> {
 }
 
 lua_table! {
-    /// `maki.api.mode`: define, override and list agent modes. Built-in
+    /// `makima.api.mode`: define, override and list agent modes. Built-in
     /// `build` and `plan` are pre-registered, so overrides use the same call
     /// as defining a custom mode. Switch an agent with `Agent:set_mode`.
     "maki.api.mode" => pub(crate) fn create_mode_table(),

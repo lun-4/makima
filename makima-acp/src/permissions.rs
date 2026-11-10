@@ -11,8 +11,8 @@ const REJECT_ALWAYS_LABEL: &str = "Reject always";
 const REJECT_SESSION_LABEL: &str = "Reject for this session";
 
 /// The reject label depends on folder trust, because that is what decides how
-/// long the answer lives. In an untrusted folder Maki keeps the rule in memory
-/// rather than writing `.maki/permissions.toml` into a checkout nobody trusted,
+/// long the answer lives. In an untrusted folder Makima keeps the rule in memory
+/// rather than writing `.makima/permissions.toml` into a checkout nobody trusted,
 /// and the option label is the only place an ACP client can be told.
 pub fn permission_options(project_trusted: bool) -> Vec<PermissionOption> {
     let reject_always = if project_trusted {

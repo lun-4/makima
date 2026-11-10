@@ -1,6 +1,6 @@
-//! Advisory locks between Maki processes.
+//! Advisory locks between Makima processes.
 //!
-//! Maki processes can share checkout directories and state files. Holding a
+//! Makima processes can share checkout directories and state files. Holding a
 //! kernel lock across a full read-modify-write keeps concurrent updates from
 //! replacing each other. The kernel releases the lock when the process exits.
 

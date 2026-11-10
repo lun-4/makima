@@ -1,7 +1,7 @@
 //! Allocation-free line wrap measuring.
 //!
 //! Replays ratatui's `WordWrapper` (`ratatui-widgets/src/reflow.rs`) for the
-//! `Wrap { trim: false }` case maki always uses, so row counts match what
+//! `Wrap { trim: false }` case makima always uses, so row counts match what
 //! `Paragraph` really draws without cloning a single line or span. With `trim`
 //! pinned to false the machine shrinks to a few scalars plus the queue of
 //! pending whitespace widths, the only scratch we keep.
@@ -22,7 +22,7 @@ pub(crate) enum Break {
 }
 
 /// Rows `lines` occupy at `width`. A zero width reports one row per line where
-/// ratatui reports nothing, because that is what maki's layout expects.
+/// ratatui reports nothing, because that is what makima's layout expects.
 ///
 /// Public so `benches/wrap.rs` can race it against `Paragraph::line_count`.
 pub fn total_rows(lines: &[Line<'_>], width: u16) -> u16 {

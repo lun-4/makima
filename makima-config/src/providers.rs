@@ -38,7 +38,7 @@ pub struct ProvidersConfig {
 impl ProvidersConfig {
     /// Read and parse `providers.toml`. Hard-exits on parse errors so a
     /// broken file surfaces immediately instead of silently dropping every
-    /// provider and starting maki with an empty registry.
+    /// provider and starting makima with an empty registry.
     pub fn load() -> Self {
         Self::try_load().unwrap_or_else(|e| {
             eprintln!("error: {e}");

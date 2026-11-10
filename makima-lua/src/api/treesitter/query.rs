@@ -109,11 +109,11 @@ fn query_methods<M: mlua::UserDataMethods<LuaQuery>>(methods: &mut M) {
 lua_class! {
     /// A compiled tree-sitter query.
     ///
-    /// Get one by calling `maki.treesitter.query.parse(lang, query_string)`.
+    /// Get one by calling `makima.treesitter.query.parse(lang, query_string)`.
     /// Then use `:iter_captures()` or `:iter_matches()` to run it against a syntax tree.
     ///
     /// ```lua
-    /// local q = maki.treesitter.query.parse("lua", "(identifier) @id")
+    /// local q = makima.treesitter.query.parse("lua", "(identifier) @id")
     /// for idx, node, meta in q:iter_captures(root, source) do
     ///   print(node:type())
     /// end
@@ -128,7 +128,7 @@ lua_class! {
 /// @param query string Tree-sitter S-expression query.
 /// @return (Query) Compiled query object.
 /// @example
-/// local q = maki.treesitter.query.parse("lua", "(identifier) @id")
+/// local q = makima.treesitter.query.parse("lua", "(identifier) @id")
 #[lua_fn]
 fn parse(_lua: &Lua, lang: String, query: String) -> mlua::Result<LuaQuery> {
     let ts_lang = Language::from_name(&lang)
@@ -157,7 +157,7 @@ lua_table! {
     /// query string into a `Query` object you can run against parsed trees.
     ///
     /// ```lua
-    /// local q = maki.treesitter.query.parse("lua", "(string) @str")
+    /// local q = makima.treesitter.query.parse("lua", "(string) @str")
     /// ```
     "maki.treesitter.query" => pub(crate) fn create_query_module(), DOCS [
         parse, get,

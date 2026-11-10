@@ -147,7 +147,7 @@ fn setup() -> (Arc<ToolRegistry>, PluginHost) {
     setup_with(Arc::new(ToolRegistry::new()))
 }
 
-/// `maki.agent.tools` describes the process-wide registry, so the fixtures have
+/// `makima.agent.tools` describes the process-wide registry, so the fixtures have
 /// to land there. Safe: nextest runs each test in its own process.
 fn setup_global() -> (Arc<ToolRegistry>, PluginHost) {
     setup_with(Arc::clone(ToolRegistry::global_arc()))

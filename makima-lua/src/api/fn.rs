@@ -454,7 +454,7 @@ fn parse_command(cmd: Value) -> LuaResult<JobCommand> {
 ///     or reloads.
 /// @return (integer) Job id.
 /// @example
-/// local id = maki.fn.jobstart("ls -la", {
+/// local id = makima.fn.jobstart("ls -la", {
 ///   cwd = "~/projects",
 ///   on_stdout = function(_, line) print(line) end,
 ///   on_exit = function(_, code) print("exit: " .. code) end,
@@ -523,7 +523,7 @@ fn jobstart(lua: &Lua, #[ctx] plugin: Arc<str>, cmd: Value, opts: Option<Table>)
 /// @param job_id integer Job id returned by `jobstart`.
 /// @return
 /// @example
-/// maki.fn.jobstop(id)
+/// makima.fn.jobstop(id)
 #[lua_fn(guard = Run)]
 fn jobstop(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<()> {
     let task_id = active_task_id(lua);
@@ -543,8 +543,8 @@ fn jobstop(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<()> {
 /// @param timeout_ms integer? Maximum wait in milliseconds (default 30000).
 /// @return (table?) `{ stdout, stderr, exit_code }`, or nil on timeout.
 /// @example
-/// local id = maki.fn.jobstart("echo hello")
-/// local result = maki.fn.jobwait(id, 5000)
+/// local id = makima.fn.jobstart("echo hello")
+/// local result = makima.fn.jobwait(id, 5000)
 /// if result then
 ///   print(result.stdout)
 /// end
@@ -624,7 +624,7 @@ pub(crate) fn deliver_job_event(lua: &Lua, job_id: u32, event: &JobEvent) -> Lua
 /// @param name string Program name (e.g. `"git"`) or path.
 /// @return (integer) `1` if found, `0` otherwise.
 /// @example
-/// if maki.fn.executable("rg") == 1 then
+/// if makima.fn.executable("rg") == 1 then
 ///   -- use ripgrep
 /// end
 #[lua_fn(guard = Env)]
@@ -651,7 +651,7 @@ fn is_executable(path: &Path) -> bool {
 
 /// Read the viewport of the focused chat transcript, like Neovim's
 /// `vim.fn.winsaveview()`. The transcript is the only scrollable window
-/// maki has, so there is no window argument.
+/// makima has, so there is no window argument.
 ///
 /// `topline` is the 1-based transcript line at the top of the viewport, so
 /// the last visible one is `math.min(topline + height - 1, line_count)`.
@@ -660,8 +660,8 @@ fn is_executable(path: &Path) -> bool {
 ///
 /// @return (table|nil, string|nil) `{topline, line_count, height, auto_scroll}`, or nil and an error.
 /// @example
-/// local view = maki.fn.winsaveview()
-/// maki.fn.winrestview({ topline = view.topline + 1 })
+/// local view = makima.fn.winsaveview()
+/// makima.fn.winrestview({ topline = view.topline + 1 })
 #[lua_fn]
 async fn winsaveview(
     lua: Lua,
@@ -688,7 +688,7 @@ async fn winsaveview(
 /// @param view table View to restore. Only `topline` (1-based) is read.
 /// @return (boolean|nil, string|nil) true on success, or nil and an error.
 /// @example
-/// maki.fn.winrestview({ topline = 1 })
+/// makima.fn.winrestview({ topline = 1 })
 #[lua_fn]
 fn winrestview(
     _lua: &Lua,
@@ -707,7 +707,7 @@ lua_table! {
     /// whether programs are installed.
     ///
     /// ```lua
-    /// local id = maki.fn.jobstart("git status", {
+    /// local id = makima.fn.jobstart("git status", {
     ///   on_exit = function(code) print("done: " .. code) end,
     /// })
     /// ```

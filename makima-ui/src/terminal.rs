@@ -366,7 +366,7 @@ pub(crate) fn edit_temp_content(
     terminal: &mut ratatui::DefaultTerminal,
 ) -> Result<String, String> {
     let tmp = tempfile::Builder::new()
-        .prefix("makima-input-")
+        .prefix("maki-input-")
         .suffix(".md")
         .tempfile()
         .map_err(|e| format!("Failed to create temp file: {e}"))?;

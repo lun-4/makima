@@ -2,7 +2,7 @@
 //! provider the same thing for the same scenario. Runs the real binary
 //! against a loopback OpenAI-compatible server and inspects the request
 //! bodies. The scenarios: session defaults (`always_thinking` from
-//! `maki.setup`, and the saved `/thinking` preference ahead of it), a model
+//! `makima.setup`, and the saved `/thinking` preference ahead of it), a model
 //! switch between turns through each frontend's own mechanism, a mode set by
 //! a Lua command, and a Lua command whose UI round-trip answers "no UI" at
 //! once. SDK and ACP must also finish a turn whose input ended right after

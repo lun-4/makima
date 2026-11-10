@@ -1,4 +1,4 @@
-//! `maki.model`: model catalog reads that address no agent. Reading or
+//! `makima.model`: model catalog reads that address no agent. Reading or
 //! changing an agent's model goes through its `Agent` handle.
 
 use makima_lua_macro::{lua_fn, lua_table};
@@ -20,7 +20,7 @@ const REGISTRY_UNAVAILABLE: &str = "provider registry unavailable";
 ///   error. `max_output_tokens` is nil when unknown. `pricing` is
 ///   `{input, output, cache_write, cache_read}` in USD per million tokens.
 /// @example
-/// local info = assert(maki.model.info("anthropic/claude-sonnet-4-20250514"))
+/// local info = assert(makima.model.info("anthropic/claude-sonnet-4-20250514"))
 #[lua_fn]
 fn info(lua: &Lua, spec: String) -> LuaResult<Pair<Table>> {
     let Some(providers) = lua.app_data_ref::<Arc<ProviderRegistry>>() else {
@@ -33,8 +33,8 @@ fn info(lua: &Lua, spec: String) -> LuaResult<Pair<Table>> {
     Ok((Some(model_table(lua, &model)?), None))
 }
 
-/// The one Lua shape of a model, shared by `maki.model.info` and
-/// `maki.agent.resolve_model`.
+/// The one Lua shape of a model, shared by `makima.model.info` and
+/// `makima.agent.resolve_model`.
 pub(crate) fn model_table(lua: &Lua, model: &Model) -> LuaResult<Table> {
     let table = lua.create_table()?;
     table.set("spec", model.spec())?;
@@ -62,7 +62,7 @@ pub(crate) fn model_table(lua: &Lua, model: &Model) -> LuaResult<Table> {
 ///
 /// @return table Array of thinking level names.
 /// @example
-/// local levels = maki.model.thinking_levels()
+/// local levels = makima.model.thinking_levels()
 #[lua_fn]
 fn thinking_levels(lua: &Lua) -> LuaResult<Table> {
     lua.create_sequence_from(ThinkingConfig::options().iter().copied())

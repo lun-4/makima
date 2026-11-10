@@ -420,7 +420,7 @@ impl UserData for LuaCtx {
         // The session that called this tool, which under concurrent
         // sessions is not always the focused one
         // reports. Nil without an error when the run has no session, as in
-        // the `maki index` one-shot.
+        // the `makima index` one-shot.
         methods.add_method("session_id", |lua, this, ()| {
             let Some(session_id) = this.session_id() else {
                 return Ok(this.cap_err_pair("session_id"));

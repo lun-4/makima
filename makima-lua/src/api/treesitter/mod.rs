@@ -28,7 +28,7 @@ fn parse_impl(lua: &Lua, source: String, lang_name: String) -> LuaResult<Pair<An
 /// @param lang string Language name, e.g. `"rust"` or `"lua"`.
 /// @return (LanguageTree|nil, string|nil) Parser, or nil and an error message.
 /// @example
-/// local parser, err = maki.treesitter.get_parser(src, "lua")
+/// local parser, err = makima.treesitter.get_parser(src, "lua")
 /// if err then print("error: " .. err) end
 #[lua_fn]
 fn get_parser(lua: &Lua, source: String, lang: String) -> LuaResult<Pair<AnyUserData>> {
@@ -52,7 +52,7 @@ fn get_string_parser(lua: &Lua, source: String, lang: String) -> LuaResult<Pair<
 /// @param source string Original source text the tree was parsed from.
 /// @return (string) Substring covered by the node.
 /// @example
-/// local text = maki.treesitter.get_node_text(node, source)
+/// local text = makima.treesitter.get_node_text(node, source)
 /// print(text)
 #[lua_fn]
 fn get_node_text(_lua: &Lua, node: AnyUserData, source: String) -> LuaResult<String> {
@@ -71,7 +71,7 @@ fn get_node_text(_lua: &Lua, node: AnyUserData, source: String) -> LuaResult<Str
 /// @param node Node The node to query.
 /// @return (integer, integer, integer, integer) start_row, start_col, end_row, end_col.
 /// @example
-/// local sr, sc, er, ec = maki.treesitter.get_node_range(node)
+/// local sr, sc, er, ec = makima.treesitter.get_node_range(node)
 #[lua_fn]
 fn get_node_range(_lua: &Lua, node: AnyUserData) -> LuaResult<(i64, i64, i64, i64)> {
     let n = node.borrow::<LuaNode>()?;
@@ -92,7 +92,7 @@ fn get_node_range(_lua: &Lua, node: AnyUserData) -> LuaResult<(i64, i64, i64, i6
 /// @param node Node The node to query.
 /// @return (table) Six-element array: start_row, start_col, start_byte, end_row, end_col, end_byte.
 /// @example
-/// local r = maki.treesitter.get_range(node)
+/// local r = makima.treesitter.get_range(node)
 /// print("bytes: " .. r[3] .. "-" .. r[6])
 #[lua_fn]
 fn get_range(lua: &Lua, node: AnyUserData) -> LuaResult<Table> {
@@ -185,7 +185,7 @@ lua_table! {
     /// the `query` sub-module to extract information from the syntax tree.
     ///
     /// ```lua
-    /// local parser, err = maki.treesitter.get_parser(source, "lua")
+    /// local parser, err = makima.treesitter.get_parser(source, "lua")
     /// local trees = parser:parse()
     /// local root = trees[1]:root()
     /// ```

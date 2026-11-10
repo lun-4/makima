@@ -24,9 +24,9 @@ struct LuaPermit {
 /// Wait for a permit from the semaphore. Your coroutine suspends until a slot
 /// opens up. If the owning task is cancelled, the acquire is cancelled too.
 ///
-/// @return (maki.async.Permit) A permit handle. Call `:release()` when done, or let it be garbage collected.
+/// @return (makima.async.Permit) A permit handle. Call `:release()` when done, or let it be garbage collected.
 /// @example
-/// local sem = maki.async.semaphore(3)
+/// local sem = makima.async.semaphore(3)
 /// local permit = sem:acquire()
 /// -- do work that needs the slot
 /// permit:release()
@@ -50,7 +50,7 @@ async fn acquire(lua: Lua, this: mlua::UserDataRef<LuaSemaphore>) -> LuaResult<L
 lua_class! {
     /// A counting semaphore for limiting how many tasks run at once.
     ///
-    /// Create one with `maki.async.semaphore(n)`, then call `:acquire()` to
+    /// Create one with `makima.async.semaphore(n)`, then call `:acquire()` to
     /// get a permit before doing work. If the task is cancelled, the acquire
     /// is cancelled too.
     "maki.async.Semaphore" => LuaSemaphore, SEMAPHORE_DOCS [acquire]
@@ -91,7 +91,7 @@ lua_class! {
 /// @param fn function Zero-argument function to execute.
 /// @param on_finish function? Optional callback `function(err, result)`. Called once {fn} completes.
 /// @example
-/// maki.async.run(function()
+/// makima.async.run(function()
 ///   local data = expensive_fetch()
 ///   process(data)
 /// end)
@@ -138,11 +138,11 @@ fn run(lua: &Lua, r#fn: Function, on_finish: Option<Function>) -> LuaResult<()> 
 ///
 /// @param fn function Function to run on cancel; receives the reason string.
 /// @example
-/// maki.async.on_cancel(function(reason)
+/// makima.async.on_cancel(function(reason)
 ///   view:append({ { reason, "tool_error" } })
 ///   ctx:finish({ llm_output = partial .. "\n[cancelled; output is partial]", is_error = true })
 /// end)
-/// maki.async.gather(children)
+/// makima.async.gather(children)
 #[lua_fn]
 fn on_cancel(lua: &Lua, r#fn: Function) -> LuaResult<()> {
     register_cancel_hook(lua, r#fn)
@@ -158,7 +158,7 @@ fn on_cancel(lua: &Lua, r#fn: Function) -> LuaResult<()> {
 /// @param fns table Array of zero-argument functions.
 /// @return (table) Array of result tables, one per function.
 /// @example
-/// local results = maki.async.gather({
+/// local results = makima.async.gather({
 ///   function() return fetch("a.txt") end,
 ///   function() return fetch("b.txt") end,
 /// })
@@ -203,9 +203,9 @@ async fn gather(lua: Lua, fns: Table) -> LuaResult<Table> {
 /// Use this to limit how many tasks hit a resource at the same time.
 ///
 /// @param n integer Maximum number of concurrent permits. Values below 1 are clamped to 1.
-/// @return (maki.async.Semaphore) A new semaphore.
+/// @return (makima.async.Semaphore) A new semaphore.
 /// @example
-/// local sem = maki.async.semaphore(5)
+/// local sem = makima.async.semaphore(5)
 /// -- each task acquires a permit before doing work
 /// local permit = sem:acquire()
 /// do_work()
@@ -300,7 +300,7 @@ lua_table! {
     /// coroutine-friendly calls.
     ///
     /// ```lua
-    /// local results = maki.async.gather({
+    /// local results = makima.async.gather({
     ///   function() return fetch("a.txt") end,
     ///   function() return fetch("b.txt") end,
     /// })
@@ -757,7 +757,7 @@ mod tests {
     /// runtime's own hook tests cannot show: the handler is parked deep inside
     /// a real `gather` whose child never finishes, so the hook runs on a VM
     /// whose coroutine is suspended. Waiting from there is a plugin bug, raw
-    /// or through `maki.async`, and neither may cost the hooks behind it nor
+    /// or through `makima.async`, and neither may cost the hooks behind it nor
     /// the task's own result.
     #[test_case(HOOK_RAW_YIELD ; "raw_yield")]
     #[test_case(HOOK_AWAIT ; "awaiting")]

@@ -1785,7 +1785,7 @@ fn trusted_command_controls_real_root_and_rejects_foreign_task_context() {
 }
 
 /// A trusted command handler carries the pinned template but no dispatch
-/// authority. `maki.agent.resolve_model` reads only that template, so a weaker
+/// authority. `makima.agent.resolve_model` reads only that template, so a weaker
 /// tier must resolve there instead of failing with a capability error.
 #[test]
 fn trusted_command_handler_resolves_weaker_model_tier() {

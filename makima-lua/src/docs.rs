@@ -4,13 +4,13 @@
 //! parameters at compile time) and assemble registration plus the `DOCS`
 //! consts with `makima_lua_macro::lua_table!` / `lua_class!`. The few functions
 //! that cannot fit (raw `MultiValue`, Lua chunks, conditional registration)
-//! and `maki.setup` keep hand-written `FnDoc`s. `api_docs()` aggregates
+//! and `makima.setup` keep hand-written `FnDoc`s. `api_docs()` aggregates
 //! everything for makima-docgen, and the drift test below asserts docs match
-//! the real `maki` global.
+//! the real `makima` global.
 
 pub struct ModuleDoc {
-    /// Dotted path, e.g. "maki.base64". Classes use a type name, e.g.
-    /// "maki.treesitter.Node".
+    /// Dotted path, e.g. "makima.base64". Classes use a type name, e.g.
+    /// "makima.treesitter.Node".
     pub name: &'static str,
     pub kind: DocKind,
     pub desc: &'static str,

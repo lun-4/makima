@@ -188,13 +188,13 @@ fn spec_error(message: impl fmt::Display) -> mlua::Error {
 ///   provider's `providers.toml` section as a table, read at each call.
 ///   `discover` (function) Optional. `discover(ctx, config, refresh)`
 ///   returns the descriptors the provider offers now. `refresh` is true when
-///   the user asked to bypass caches (`maki models --refresh`).
+///   the user asked to bypass caches (`makima models --refresh`).
 ///   `config` (table) Optional. `providers.toml` fields asked before login:
 ///   `{ key, prompt, default?, secret?, optional?, choices? }`, where
 ///   `choices` is a list of `{ id, label, detail? }`. Each answer is saved
 ///   as a text field of the provider's section, such as `base_url`.
 ///   `auth` (table) Login methods: `{ id, label, login }`.
-///   `login(ctx, ui, config)` gets a `maki.provider.LoginUi` and the
+///   `login(ctx, ui, config)` gets a `makima.provider.LoginUi` and the
 ///   provider's section with this login's answers applied, not yet saved.
 ///   It returns a truthy value, optionally a table with `model` to choose
 ///   the default model, or nil plus an error.
@@ -217,10 +217,10 @@ fn spec_error(message: impl fmt::Display) -> mlua::Error {
 /// Config is saved and the default model chosen only after `login`
 /// succeeds and `auth_status` no longer reports `missing`.
 ///
-/// Callbacks receive a provider `maki.Ctx` derived from {ctx}: `id`, `send`
-/// (`maki.net.send` with the `[provider]` connect, low-speed and stream
+/// Callbacks receive a provider `makima.Ctx` derived from {ctx}: `id`, `send`
+/// (`makima.net.send` with the `[provider]` connect, low-speed and stream
 /// timeouts as defaults) and `credentials` (the provider's
-/// `maki.credentials.Store`); `maki.credentials.open` reaches {ctx}'s plugin
+/// `makima.credentials.Store`); `makima.credentials.open` reaches {ctx}'s plugin
 /// stores through it. Only the registering plugin's callbacks receive it, so
 /// a provider id's credentials belong to the plugin that registered it. An instance has
 /// `stream(ctx, request, emit)` and optionally `fetch_usage(ctx)`,
@@ -250,7 +250,7 @@ fn spec_error(message: impl fmt::Display) -> mlua::Error {
 /// anything else is a transport error. An error is retried only when it
 /// names `retry`: `rate_limit`, `transient`, `connect`, `timeout` or `none`.
 /// The bundled `http.classify` names it from the status or the
-/// `maki.net.send` failure. A bare string and a raised error are not
+/// `makima.net.send` failure. A bare string and a raised error are not
 /// retried. Every callback that returns nil plus an error follows these
 /// rules.
 ///
@@ -269,11 +269,11 @@ fn spec_error(message: impl fmt::Display) -> mlua::Error {
 /// before it sends the model request, since a failure or cancel before the
 /// first event would otherwise leave that state behind.
 ///
-/// @param ctx maki.Ctx? The ctx to register under; omit it for the plugin's root ctx.
+/// @param ctx makima.Ctx? The ctx to register under; omit it for the plugin's root ctx.
 /// @param spec table Required. Provider definition (see above).
 /// @return
 /// @example
-/// maki.api.register_provider({
+/// makima.api.register_provider({
 ///   id = "echo",
 ///   display_name = "Echo",
 ///   models = { { id = "echo-1", tier = "strong" } },
@@ -422,8 +422,8 @@ fn register_provider(
 /// @param id string? Provider id.
 /// @return (table?) The section, nil when there is none, or every section.
 /// @example
-/// local opencode = maki.api.provider_config("opencode") or {}
-/// for id, section in pairs(maki.api.provider_config()) do print(id, section.protocol) end
+/// local opencode = makima.api.provider_config("opencode") or {}
+/// for id, section in pairs(makima.api.provider_config()) do print(id, section.protocol) end
 #[lua_fn(guard = Env)]
 fn provider_config(lua: &Lua, id: Option<String>) -> LuaResult<Value> {
     let config = ProvidersConfig::load_or_default();
@@ -455,7 +455,7 @@ fn startup_provider_config(lua: &Lua, #[ctx] plugin: Arc<str>) -> LuaResult<Valu
 /// @param section table Fields such as `protocol`, `base_url` and `api_key_env`.
 /// @return (boolean?, string?) true, or nil plus an error.
 /// @example
-/// maki.api.save_provider_config("my-llm", { protocol = "openai", base_url = "http://localhost:8000/v1" })
+/// makima.api.save_provider_config("my-llm", { protocol = "openai", base_url = "http://localhost:8000/v1" })
 #[lua_fn(guard = FsWrite)]
 fn save_provider_config(lua: &Lua, id: String, section: Value) -> LuaResult<Pair<bool>> {
     if !valid_id(&id) {

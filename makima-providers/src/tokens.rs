@@ -1,6 +1,6 @@
 //! Prompt size accounting.
 //!
-//! An estimate maki computes from message bytes, and the count the provider
+//! An estimate makima computes from message bytes, and the count the provider
 //! returns with a response. [`ContextGauge`] carries one session's running
 //! total, so a measurement is never re-derived from an estimate.
 

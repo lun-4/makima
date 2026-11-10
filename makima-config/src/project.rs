@@ -31,9 +31,9 @@ const HOW_TO_TRUST: &str =
 const CLEAR_THE_REJECTION: &str = "or `maki trust remove PATH` to clear the decision";
 const REJECTION_NOT_SAVED: &str = "folder rejection was not saved";
 
-/// A file under `.maki/` that only a trusted folder may hand to Maki.
+/// A file under `.makima/` that only a trusted folder may hand to Makima.
 ///
-/// `config.toml` is deliberately absent. Maki stopped reading it, so it can do
+/// `config.toml` is deliberately absent. Makima stopped reading it, so it can do
 /// nothing, and asking about a file that has no powers is a question with no
 /// honest answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, VariantArray)]
@@ -88,7 +88,7 @@ pub struct ProjectConfig {
     /// `--no-project`: nothing under the project's `.makima` directory loads,
     /// whatever the folder's trust.
     ignored: bool,
-    /// The store the trust answer came from, so a gated file Maki writes later
+    /// The store the trust answer came from, so a gated file Makima writes later
     /// can be added to that same answer. A config nobody resolved against a
     /// store has no answer to widen, so it records nothing, which also keeps
     /// tests off the real state directory.
@@ -138,7 +138,7 @@ impl ProjectConfig {
         self.trusted.then(|| self.project_file(file))
     }
 
-    /// Ungated, and private for that reason: `.maki/permissions.toml` is read
+    /// Ungated, and private for that reason: `.makima/permissions.toml` is read
     /// at any trust level so a repository can narrow the agent inside it, and
     /// [`crate::load_permissions`] is the only place that exception belongs.
     pub(crate) fn project_file(&self, file: GatedFile) -> PathBuf {
@@ -170,7 +170,7 @@ pub struct TrustQuestion {
 
 impl TrustQuestion {
     /// What a folder would be asked about right now, with no stored answer
-    /// consulted. `maki trust add` grants against this.
+    /// consulted. `makima trust add` grants against this.
     pub fn for_folder(folder: &CanonicalFolder) -> Self {
         Self {
             present: gated_files(folder.path()),
@@ -208,7 +208,7 @@ pub enum TrustState {
 impl TrustState {
     /// `Some` for both restricted variants, which is what the status-bar
     /// indicator and `/trust` key off. Deliberately not `!is_trusted()`: that
-    /// is true in every folder with no `.maki` at all.
+    /// is true in every folder with no `.makima` at all.
     pub fn question(&self) -> Option<&TrustQuestion> {
         match self {
             TrustState::Unanswered(question) | TrustState::Declined(question) => Some(question),
@@ -221,7 +221,7 @@ impl TrustState {
     /// permanent no is a stored decision, and [`grant`] replaces a rejection in
     /// the store, so a card or a `trust.paths` match keyed off `question` would
     /// erase the very answer the user gave on purpose. Only `/trust` and
-    /// `maki trust add`, where typing the command is the consent, overturn one.
+    /// `makima trust add`, where typing the command is the consent, overturn one.
     pub fn unanswered(&self) -> Option<&TrustQuestion> {
         match self {
             TrustState::Unanswered(question) => Some(question),
@@ -346,12 +346,12 @@ pub fn resolve_noninteractive(cwd: &Path, mode: TrustMode) -> ProjectDecision {
     }
 }
 
-/// `--trust` is the same grant as `maki trust add --yes .` before the run, with
+/// `--trust` is the same grant as `makima trust add --yes .` before the run, with
 /// the state directory taken out of it. Nothing is read, so a stored no does not
 /// override the flag the user just typed, and nothing is written, so a container
 /// that mounts a state directory keeps no record of a folder it trusted once.
 ///
-/// The config carries no store, so a gated file Maki writes during the run
+/// The config carries no store, so a gated file Makima writes during the run
 /// records nothing either, and the next start without the flag asks about it.
 fn session_grant(project_config: ProjectConfig) -> ProjectDecision {
     ProjectDecision::new(project_config, TrustState::Trusted, None)
@@ -408,7 +408,7 @@ fn resolve_recorded(storage: &StateDir, project_config: ProjectConfig) -> Projec
 }
 
 /// Records a yes. One of two writers of an interactive decision, shared by the
-/// card, the `trust.paths` auto-grant, `/trust` and `maki trust add`, so what
+/// card, the `trust.paths` auto-grant, `/trust` and `makima trust add`, so what
 /// gets recorded can never drift from what was shown.
 ///
 /// A failure is reported, not fatal: the folder stays trusted for this process,
@@ -425,7 +425,7 @@ pub fn grant(storage: &StateDir, question: &TrustQuestion) -> Result<(), String>
 /// restricted if it cannot.
 ///
 /// The answer is only half of it: a caller that gets a pattern back records it
-/// through [`grant`] like any other yes, so `maki trust list` stays the single
+/// through [`grant`] like any other yes, so `makima trust list` stays the single
 /// source of truth and no later start has to evaluate globs before it can read
 /// the store.
 pub fn policy_grant<'policy>(
@@ -477,10 +477,10 @@ pub fn apply_answer(
     }
 }
 
-/// Maki writing a gated file into a trusted project is not the project
+/// Makima writing a gated file into a trusted project is not the project
 /// shipping one, so the answer the user already gave has to learn about it at
 /// the same moment. Without this the next start finds a file that answer never
-/// named, and asks the user about a file Maki created for them.
+/// named, and asks the user about a file Makima created for them.
 pub fn record_written_file(project_config: &ProjectConfig, file: &str) {
     if let Some(storage) = project_config.trust_store.as_ref() {
         record_written_file_in(storage, project_config, file);
@@ -519,7 +519,7 @@ pub fn trust_question_lines(question: &TrustQuestion) -> Vec<String> {
     lines
 }
 
-/// The terminal form of the question, for `maki trust add` outside the UI.
+/// The terminal form of the question, for `makima trust add` outside the UI.
 pub fn confirm_trust(
     input: &mut impl BufRead,
     output: &mut impl Write,
@@ -541,7 +541,7 @@ pub fn confirm_trust(
 }
 
 /// Which gated files a project ships right now. This is the set a trust answer
-/// is recorded against, so `maki trust add` and `resolve` agree on what an
+/// is recorded against, so `makima trust add` and `resolve` agree on what an
 /// answer covers.
 pub fn gated_files(config_root: &Path) -> Vec<GatedFile> {
     let project_dir = config_root.join(PROJECT_DIR);
@@ -553,13 +553,13 @@ pub fn gated_files(config_root: &Path) -> Vec<GatedFile> {
 }
 
 /// The trust store keeps plain names on disk: it is a wire format, and a name
-/// written by a newer Maki must load and simply never match. Conversion happens
+/// written by a newer Makima must load and simply never match. Conversion happens
 /// here and nowhere else.
 fn store_names(files: &[GatedFile]) -> Vec<&'static str> {
     files.iter().copied().map(GatedFile::file_name).collect()
 }
 
-/// The other direction. A name a newer Maki wrote has no variant here and is
+/// The other direction. A name a newer Makima wrote has no variant here and is
 /// dropped, which is the same "never matches" the store already relies on.
 fn from_store_names(names: &[String]) -> Vec<GatedFile> {
     GatedFile::ALL
@@ -1100,7 +1100,7 @@ mod tests {
         assert!(again.asked.is_none(), "the widened answer must stick");
     }
 
-    /// Maki writes `.maki/permissions.toml` itself the first time somebody
+    /// Makima writes `.makima/permissions.toml` itself the first time somebody
     /// answers "allow always for this project", so the next start must not
     /// turn that write into a question about a file the project never added.
     #[test]
@@ -1122,7 +1122,7 @@ mod tests {
         assert!(answered.warning.is_empty(), "{:?}", answered.warning);
     }
 
-    /// The other side of the same rule: a file Maki wrote into a folder that
+    /// The other side of the same rule: a file Makima wrote into a folder that
     /// was never trusted must not hand that folder an answer nobody gave.
     #[test]
     fn recording_a_written_file_never_creates_trust() {

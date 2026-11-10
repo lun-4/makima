@@ -448,7 +448,7 @@ pub enum DisplayRole {
     Tool(Box<ToolRole>),
     Error,
     Done,
-    /// A plugin's display-only row; see `maki.ui.post`.
+    /// A plugin's display-only row; see `makima.ui.post`.
     Post(PostLevel),
 }
 

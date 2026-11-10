@@ -504,7 +504,7 @@ impl Parse for LuaTableInput {
     }
 }
 
-/// `lua_table! { /// desc … "maki.x" => pub(crate) fn create_x_table(perms: &PluginPermissions), DOCS [a(perms), b, manual c] }`
+/// `lua_table! { /// desc … "makima.x" => pub(crate) fn create_x_table(perms: &PluginPermissions), DOCS [a(perms), b, manual c] }`
 ///
 /// Generates the `ModuleDoc` const and the registration fn from one entry
 /// list. `manual` entries are documented but registered by hand. Prefix with
@@ -622,7 +622,7 @@ impl Parse for LuaClassInput {
     }
 }
 
-/// `lua_class! { /// desc … "maki.ui.Buf" => BufHandle, DOCS [a, b, manual c] fields f, extra g }`
+/// `lua_class! { /// desc … "makima.ui.Buf" => BufHandle, DOCS [a, b, manual c] fields f, extra g }`
 ///
 /// Generates the `DocKind::Class` `ModuleDoc` const and the `mlua::UserData`
 /// impl from one method list. `manual` entries are documented but registered

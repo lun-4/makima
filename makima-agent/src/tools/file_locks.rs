@@ -7,7 +7,7 @@
 //! run in non-overlapping order instead of losing updates. Different keys
 //! stay fully concurrent.
 //!
-//! The registry is process-local: it does not coordinate separate maki
+//! The registry is process-local: it does not coordinate separate makima
 //! processes, shell commands, editors, or anything outside a dispatched
 //! tool invocation. Keys are normalized display paths used only for
 //! synchronization identity; they are never passed to filesystem APIs.

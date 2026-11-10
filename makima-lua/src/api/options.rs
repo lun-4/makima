@@ -8,7 +8,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::api::util::convert::json_to_lua;
 
-/// The user's `plugins.<name>` table from `maki.setup`, passed through opaquely.
+/// The user's `plugins.<name>` table from `makima.setup`, passed through opaquely.
 pub(crate) type PluginOpts = Arc<JsonMap<String, JsonValue>>;
 
 /// Option specs declared via `register_options`, keyed by plugin name. Read
@@ -233,7 +233,7 @@ fn validate_user_opts(
 }
 
 /// Declare the options your plugin accepts under `plugins.<name>` in
-/// `maki.setup`, and get back what the user set merged with your defaults.
+/// `makima.setup`, and get back what the user set merged with your defaults.
 /// Call it once, at the top level of your plugin file.
 ///
 /// An unknown key, a wrong type, or a value below `min` fails the plugin
@@ -247,7 +247,7 @@ fn validate_user_opts(
 ///   desc    (string) Required. One line shown in the configuration docs.
 /// @return (table) Merged options: the user's value where set, otherwise the default, or nil when neither exists.
 /// @example
-/// local opts = maki.api.register_options({
+/// local opts = makima.api.register_options({
 ///   timeout_secs = { default = 120, min = 5, desc = "Kill the command after this many seconds." },
 ///   max_output_lines = { type = "integer", desc = "Override agent.max_output_lines for this tool." },
 /// })

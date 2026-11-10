@@ -215,9 +215,9 @@ pub(crate) fn require_trusted_authority(lua: &Lua) -> Result<(), String> {
 /// fs, ...) and fires exactly when due: no per-frame polling. Timer fires do
 /// not inherit managed agent authority from the task that registered them.
 /// The callback receives the timer's id as its first argument - use it with
-/// `maki.timer.del` to stop the timer. Do not capture the returned id in the
-/// callback instead: `local id = maki.timer.set(5, function()
-/// maki.timer.del(id) end)` captures nil (a Luau value-capture quirk), which
+/// `makima.timer.del` to stop the timer. Do not capture the returned id in the
+/// callback instead: `local id = makima.timer.set(5, function()
+/// makima.timer.del(id) end)` captures nil (a Luau value-capture quirk), which
 /// is why the id is passed as an argument. A fire still running when the
 /// next deadline arrives runs alongside it; every fire task carries the
 /// standard 60s async deadline. Deadlines missed while the runtime was busy
@@ -229,14 +229,14 @@ pub(crate) fn require_trusted_authority(lua: &Lua) -> Result<(), String> {
 ///
 /// @param seconds number Interval between fires, in seconds. Must be a finite number > 0 and < 1e9.
 /// @param callback function Called on each fire with the timer id. May be async.
-/// @return integer|nil Id. Pass to `maki.timer.del` to stop the timer.
+/// @return integer|nil Id. Pass to `makima.timer.del` to stop the timer.
 /// @return string|nil Error on failure.
 /// @example
 /// local runs = 0
-/// maki.timer.set(1, function(id)
+/// makima.timer.set(1, function(id)
 ///   runs = runs + 1
 ///   if runs == 10 then
-///     maki.timer.del(id)
+///     makima.timer.del(id)
 ///   end
 /// end)
 #[lua_fn]
@@ -275,11 +275,11 @@ fn set(
 /// Stop the timer {id}. Does nothing for an unknown id. A fire that already
 /// started keeps running out.
 ///
-/// @param id integer Id returned by `maki.timer.set`.
+/// @param id integer Id returned by `makima.timer.set`.
 /// @example
-/// local id = maki.timer.set(5, on_tick)
+/// local id = makima.timer.set(5, on_tick)
 /// -- later
-/// maki.timer.del(id)
+/// makima.timer.del(id)
 #[lua_fn]
 fn del(
     lua: &Lua,
@@ -313,7 +313,7 @@ lua_table! {
     /// plugin are dropped when the plugin is unloaded.
     ///
     /// ```lua
-    /// local id = maki.timer.set(5, function()
+    /// local id = makima.timer.set(5, function()
     ///   print("five seconds gone")
     /// end)
     /// ```

@@ -331,14 +331,14 @@ fn win_fields<F: mlua::UserDataFields<WinHandle>>(fields: &mut F) {
 
 lua_class! {
     /// Handle to a floating or split window. You get one from
-    /// `maki.ui.open_win()`. Use `recv()` in a loop to handle keyboard
+    /// `makima.ui.open_win()`. Use `recv()` in a loop to handle keyboard
     /// input, and call `close()` when done.
     ///
     /// Fields: `width`, `height` (initial content dimensions in columns/rows),
     /// `visible` (current visibility).
     ///
     /// ```lua
-    /// local win = maki.ui.open_win(buf, { title = "Demo" })
+    /// local win = makima.ui.open_win(buf, { title = "Demo" })
     /// while true do
     ///   local ev = win:recv()
     ///   if not ev or ev.key == "q" then break end

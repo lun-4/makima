@@ -10,10 +10,10 @@
 // Findings baked into this file:
 // - `raw_render_200x79`: luau native codegen makes code ~5x faster than the
 //   interpreter (aurora 32.5 -> 5.8 ms).
-// - `codegen_watchdog_200x79`: maki's 10ms watchdog interrupt does not disable
+// - `codegen_watchdog_200x79`: makima's 10ms watchdog interrupt does not disable
 //   codegen.
 // - `env_codegen_200x79`: codegen does NOT apply to chunks whose env table was
-//   never marked safe (`lua_setsafeenv`). maki's build_env now calls
+//   never marked safe (`lua_setsafeenv`). makima's build_env now calls
 //   `Table::set_safeenv(true)`; env'd + safeenv runs at native speed (4.1ms),
 //   the same as a global-env chunk (4.0ms).
 // - `pull_roundtrip_200x79`: full `EventHandle::splash_frame` meter (render +
@@ -99,8 +99,8 @@ fn codegen_compile(lua: &Lua, chunk: &Function) {
     }
 }
 
-/// Module-style env: a fresh table chaining to the real globals, like maki's
-/// build_env. The safeenv-marked twin is what maki now produces (runtime.rs
+/// Module-style env: a fresh table chaining to the real globals, like makima's
+/// build_env. The safeenv-marked twin is what makima now produces (runtime.rs
 /// build_env); proving it unlocks codegen for env'd chunks.
 fn env_table(lua: &Lua, safe: bool) -> Table {
     let env = lua.create_table().unwrap();

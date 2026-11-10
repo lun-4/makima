@@ -12,7 +12,7 @@ use crate::plugin_permissions::Permission;
 const SKILL_MODULE: &str = "plugin_dev";
 const REFERENCE_MODULE: &str = "plugin_dev_reference";
 
-const NAME: &str = "makima-plugin-dev";
+const NAME: &str = "maki-plugin-dev";
 const DESCRIPTION: &str = "Write or modify maki plugins or init.lua config in Lua: custom tools, slash commands, keymaps, UI. Authoring guide, real example, indexed maki Lua API reference. Load before any maki plugin work.";
 const REFERENCE_PLACEHOLDER: &str = "__MAKI_REFERENCE_PATH__";
 
@@ -367,7 +367,7 @@ pub fn guide_page() -> String {
         "{}\n## Full API reference\n\n\
          Every module, function, and method is in the [Lua API reference]({REFERENCE_URL}).\n\
          The agent gets the same document on disk through the builtin\n\
-         `makima-plugin-dev` skill, so asking it to write a plugin for you works\n\
+         `maki-plugin-dev` skill, so asking it to write a plugin for you works\n\
          without pasting any of this.\n",
         guide(&permissions, ""),
     )

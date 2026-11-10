@@ -1,4 +1,4 @@
-//! `maki.net.send`: the raw streaming HTTP primitive for trusted plugin code.
+//! `makima.net.send`: the raw streaming HTTP primitive for trusted plugin code.
 //! Everything transport specific stays private to this module, so isahc can be
 //! swapped out without touching the Lua API.
 
@@ -248,7 +248,7 @@ async fn open(params: SendParams) -> Result<LuaResponse, String> {
 /// private address blocking, no https upgrade, no retry, no size cap, and
 /// redirects are not followed (a 3xx comes back as is). Never pass it a URL
 /// that came from the model without checking it first; use
-/// `maki.net.request` for that.
+/// `makima.net.request` for that.
 ///
 /// The response arrives with the first body byte or when the transfer ends,
 /// not at the end of the headers. A server that sends headers and then stalls
@@ -262,7 +262,7 @@ async fn open(params: SendParams) -> Result<LuaResponse, String> {
 /// {request} fields:
 ///   `url` (string) Required, `http://` or `https://`.
 ///   `method` (string) HTTP verb (default `"GET"`).
-///   `headers` (table) Header name/value pairs. `User-Agent` defaults to `maki/<version>`.
+///   `headers` (table) Header name/value pairs. `User-Agent` defaults to `makima/<version>`.
 ///   `body` (string|buffer) Request body, binary safe.
 ///   `connect_timeout` (number) Seconds to connect (default 10).
 ///   `low_speed_timeout` (number) Seconds without any received byte before
@@ -272,13 +272,13 @@ async fn open(params: SendParams) -> Result<LuaResponse, String> {
 ///   TCP. `url` still supplies the path and the Host header. Unix only.
 ///
 /// @param request table Request description (see above).
-/// @return (maki.net.Response?, string?) Response handle, or nil plus an error string.
+/// @return (makima.net.Response?, string?) Response handle, or nil plus an error string.
 /// @example
-/// local res, err = maki.net.send({
+/// local res, err = makima.net.send({
 ///   url = "https://api.example.com/v1/stream",
 ///   method = "POST",
 ///   headers = { ["content-type"] = "application/json" },
-///   body = maki.json.encode({ stream = true }),
+///   body = makima.json.encode({ stream = true }),
 /// })
 /// if not res then return print(err) end
 /// local parts = {}
@@ -342,7 +342,7 @@ fn response_fields<F: UserDataFields<LuaResponse>>(fields: &mut F) {
 }
 
 lua_class! {
-    /// A streaming HTTP response from `maki.net.send`.
+    /// A streaming HTTP response from `makima.net.send`.
     ///
     /// `status` is the integer status code. `headers` is a table keyed by
     /// lowercase header name, with repeated headers joined by `", "`. Read

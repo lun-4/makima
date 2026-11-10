@@ -205,7 +205,7 @@ fn lines_remaining_after(total: usize, start_line: usize, shown: usize) -> usize
 
 impl ToolOutput {
     /// Short header suffix summarizing the output, e.g. `12 lines`.
-    /// The UI uses it on tool completion, and `maki.agent.call_tool` falls
+    /// The UI uses it on tool completion, and `makima.agent.call_tool` falls
     /// back to it when the tool's reply has no annotation of its own.
     pub fn annotation(&self) -> Option<String> {
         match self {
@@ -929,7 +929,7 @@ pub enum AgentEvent {
         scopes: Vec<String>,
     },
     /// The `question` tool needs structured input from the user through the
-    /// host (e.g. an ACP elicitation form) instead of the maki TUI.
+    /// host (e.g. an ACP elicitation form) instead of the makima TUI.
     Question {
         id: String,
         questions: serde_json::Value,

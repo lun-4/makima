@@ -330,7 +330,7 @@ fn register_session_option(
 ///
 /// @return table Array of `{id, name, description, category, values, owner, persistent}`, where `values` is an array of `{value, name}` and `owner` is "builtin" or the plugin name.
 /// @example
-/// for _, option in ipairs(maki.api.get_session_options()) do
+/// for _, option in ipairs(makima.api.get_session_options()) do
 ///   print(option.id, option.name)
 /// end
 #[lua_fn]

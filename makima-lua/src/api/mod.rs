@@ -71,7 +71,7 @@ pub(crate) struct PluginLoadContext {
     pub(crate) pending_providers: PendingProviders,
 }
 
-/// The plugin's `maki` table and its root ctx, whose stores live under
+/// The plugin's `makima` table and its root ctx, whose stores live under
 /// {root_name}.
 pub(crate) fn create_makima_global(
     lua: &Lua,
@@ -170,7 +170,7 @@ pub(crate) fn create_makima_global(
 
     // `notify` sits on the metatable's `__index` rather than on the table
     // itself, because Lua only fires `__newindex` for keys missing from the
-    // raw table. That is what gives `maki.notify = fn` somewhere to be caught
+    // raw table. That is what gives `makima.notify = fn` somewhere to be caught
     // and routed into the one shared slot, instead of quietly shadowing notify
     // for the assigning plugin alone.
     let index = lua.create_table()?;

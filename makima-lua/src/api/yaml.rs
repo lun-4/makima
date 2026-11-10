@@ -9,7 +9,7 @@ use super::util::pair::{Pair, pair, try_pair};
 /// @param value any Lua value to encode.
 /// @return (string?, string?) YAML string, or nil plus an error.
 /// @example
-/// local s, err = maki.yaml.encode({ name = "maki", tags = { "ai", "agent" } })
+/// local s, err = makima.yaml.encode({ name = "makima", tags = { "ai", "agent" } })
 /// print(s)
 #[lua_fn]
 fn encode(lua: &Lua, value: Value) -> LuaResult<Pair<String>> {
@@ -23,8 +23,8 @@ fn encode(lua: &Lua, value: Value) -> LuaResult<Pair<String>> {
 /// @param str string YAML string to decode.
 /// @return (any?, string?) Decoded value, or nil plus an error.
 /// @example
-/// local t, err = maki.yaml.decode("name: maki\nversion: 1")
-/// print(t.name) -- maki
+/// local t, err = makima.yaml.decode("name: makima\nversion: 1")
+/// print(t.name) -- makima
 #[lua_fn]
 fn decode(lua: &Lua, str: String) -> LuaResult<Pair<Value>> {
     let value = try_pair!(serde_yaml::from_str::<serde_yaml::Value>(&str));
@@ -32,11 +32,11 @@ fn decode(lua: &Lua, str: String) -> LuaResult<Pair<Value>> {
 }
 
 lua_table! {
-    /// YAML encoding and decoding. Works the same way as `maki.json`,
+    /// YAML encoding and decoding. Works the same way as `makima.json`,
     /// but for YAML formatted strings.
     ///
     /// ```lua
-    /// local t = maki.yaml.decode("greeting: hello")
+    /// local t = makima.yaml.decode("greeting: hello")
     /// print(t.greeting)
     /// ```
     "maki.yaml" => pub(crate) fn create_yaml_table(), DOCS [

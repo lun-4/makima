@@ -1,4 +1,4 @@
-//! The one shape `maki.session.read()` returns. The UI and the headless
+//! The one shape `makima.session.read()` returns. The UI and the headless
 //! drivers all serialize this struct, so a plugin sees the same keys wherever
 //! it runs and a new field is one edit instead of three `json!` blobs.
 
@@ -91,7 +91,7 @@ fn lock(totals: &Mutex<Totals>) -> MutexGuard<'_, Totals> {
 }
 
 /// What a headless driver (print, SDK, ACP) feeds every envelope of its one
-/// session to: the totals `maki.session.read` answers from and the Lua turn
+/// session to: the totals `makima.session.read` answers from and the Lua turn
 /// autocmds, so plugins see the same events and numbers as under the TUI. The
 /// driver writes while the Lua thread reads, hence the lock, though the two
 /// rarely meet.
@@ -139,7 +139,7 @@ impl HeadlessObserver {
         }
     }
 
-    /// Installs the provider `maki.session.read` answers from. There is no
+    /// Installs the provider `makima.session.read` answers from. There is no
     /// rename path under the headless drivers, so `title` stays nil rather
     /// than echoing the id back as a fake one, and usage has no per-model
     /// split.

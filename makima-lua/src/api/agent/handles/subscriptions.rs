@@ -116,7 +116,7 @@ fn on_close(
     subscribe(lua, this, &ctx, handler, AGENT_CLOSED_EVENT)
 }
 
-/// Same as `maki.api.del_autocmd` with this subscription's id: stops future
+/// Same as `makima.api.del_autocmd` with this subscription's id: stops future
 /// deliveries and cancels running callbacks.
 /// @return (boolean?, string?) Success.
 #[lua_fn(name = "close")]

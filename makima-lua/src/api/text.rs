@@ -10,12 +10,12 @@ use makima_agent::tools::{
 use super::util::pair::{Pair, pair};
 
 /// Convert an HTML string to Markdown.
-/// Useful for cleaning up web content fetched with `maki.webfetch`.
+/// Useful for cleaning up web content fetched with `makima.webfetch`.
 ///
 /// @param html string HTML source text.
 /// @return (string?, string?) Markdown text on success, or nil plus an error message.
 /// @example
-/// local md, err = maki.text.html_to_markdown("<h1>Hello</h1><p>world</p>")
+/// local md, err = makima.text.html_to_markdown("<h1>Hello</h1><p>world</p>")
 /// if err then return end
 /// print(md) -- "# Hello\n\nworld"
 #[lua_fn]
@@ -95,7 +95,7 @@ lua_table! {
     /// Helper functions for converting between text formats.
     ///
     /// ```lua
-    /// local md = maki.text.html_to_markdown(html)
+    /// local md = makima.text.html_to_markdown(html)
     /// ```
     "maki.text" => pub(crate) fn create_text_table(), DOCS [
         html_to_markdown,

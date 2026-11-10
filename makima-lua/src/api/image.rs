@@ -1,7 +1,7 @@
-//! `maki.image`: image primitives for plugins. Neovim has no image API to
+//! `makima.image`: image primitives for plugins. Neovim has no image API to
 //! mirror, so these are small blocks (probe, decode, resize, encode) that
 //! plugins compose; provider policy stays in Lua. Errors follow the
-//! `(nil, err)` convention of `maki.fs`.
+//! `(nil, err)` convention of `makima.fs`.
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -70,9 +70,9 @@ fn height(_lua: &Lua, this: &LuaImage) -> LuaResult<u32> {
 ///
 /// @param max_w integer Maximum width in pixels. Must be positive.
 /// @param max_h integer Maximum height in pixels. Must be positive.
-/// @return (maki.image.Image) A new image handle (or the same one if no resize was needed).
+/// @return (makima.image.Image) A new image handle (or the same one if no resize was needed).
 /// @example
-/// local img = maki.image.decode(raw_bytes)
+/// local img = makima.image.decode(raw_bytes)
 /// local small = img:resize(800, 600)
 /// local encoded = small:encode("jpeg")
 #[lua_fn]
@@ -134,7 +134,7 @@ async fn encode(
 lua_class! {
     /// A decoded image you can inspect, resize, and re-encode.
     ///
-    /// Get one from `maki.image.decode()`. The image data lives in memory
+    /// Get one from `makima.image.decode()`. The image data lives in memory
     /// until the handle is garbage collected.
     "maki.image.Image" => LuaImage, IMAGE_DOCS [width, height, resize, encode]
 }
@@ -149,7 +149,7 @@ lua_class! {
 /// @param data string|buffer Raw image bytes.
 /// @return (table?, string?) Info table, or `(nil, err)` on failure.
 /// @example
-/// local info, err = maki.image.probe(raw_bytes)
+/// local info, err = makima.image.probe(raw_bytes)
 /// if err then error(err) end
 /// print(info.format, info.width, info.height)
 #[lua_fn]
@@ -167,9 +167,9 @@ fn probe(lua: &Lua, data: LuaValue) -> LuaResult<Pair<Table>> {
 /// Images larger than 50 megapixels are rejected to prevent memory bombs.
 ///
 /// @param data string|buffer Raw image bytes.
-/// @return (maki.image.Image?, string?) Decoded image, or `(nil, err)` on failure.
+/// @return (makima.image.Image?, string?) Decoded image, or `(nil, err)` on failure.
 /// @example
-/// local img, err = maki.image.decode(raw_bytes)
+/// local img, err = makima.image.decode(raw_bytes)
 /// if err then error(err) end
 /// print(img:width() .. "x" .. img:height())
 #[lua_fn]
@@ -186,7 +186,7 @@ lua_table! {
     /// Decoding is guarded against pixel-bomb attacks (50 MP limit).
     ///
     /// ```lua
-    /// local img = maki.image.decode(raw_bytes)
+    /// local img = makima.image.decode(raw_bytes)
     /// local small = img:resize(1024, 768)
     /// local png = small:encode("png")
     /// ```

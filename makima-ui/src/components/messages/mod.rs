@@ -1213,7 +1213,7 @@ impl MessagesPanel {
         self.last_total_lines
     }
 
-    /// Backs `maki.fn.winsaveview`. The clamp matters: a pinned or restored
+    /// Backs `makima.fn.winsaveview`. The clamp matters: a pinned or restored
     /// `scroll_top` can sit past the end until the next `view` resolves it
     /// against the current line count.
     pub fn win_view(&self) -> WinView {

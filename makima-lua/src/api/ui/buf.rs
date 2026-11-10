@@ -256,7 +256,7 @@ fn get_lines(lua: &Lua, this: &BufHandle) -> LuaResult<Table> {
 /// @return
 /// @example
 /// buf:on("click", function(ev)
-///   maki.ui.flash("Clicked row " .. ev.row)
+///   makima.ui.flash("Clicked row " .. ev.row)
 /// end)
 #[lua_fn]
 fn on(lua: &Lua, this: &BufHandle, event: String, callback: Function) -> LuaResult<()> {
@@ -367,11 +367,11 @@ fn blit(
 
 lua_class! {
     /// A content buffer that holds styled lines of text. Create one with
-    /// `maki.ui.buf()` and pass it to `maki.ui.open_win()` to show it in
+    /// `makima.ui.buf()` and pass it to `makima.ui.open_win()` to show it in
     /// a floating or split window.
     ///
     /// ```lua
-    /// local buf = maki.ui.buf()
+    /// local buf = makima.ui.buf()
     /// buf:line("hello")
     /// buf:line({ { "world", "bold" } })
     /// ```

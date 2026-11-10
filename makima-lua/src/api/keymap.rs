@@ -360,7 +360,7 @@ fn loading(lua: &Lua, plugin: &str) -> bool {
 ///   `desc` (string) short description shown in the keymap list.
 /// @return (boolean|nil, string|nil) true, or nil and an error. Returns nil and an error when called from a delegated tool handler.
 /// @example
-/// maki.keymap.set("n", "<C-t>", function()
+/// makima.keymap.set("n", "<C-t>", function()
 ///   print("toggle!")
 /// end, { desc = "Toggle panel" })
 #[lua_fn]
@@ -419,7 +419,7 @@ fn set(
 /// @param lhs string Key to unmap, in Vim notation.
 /// @return (boolean|nil, string|nil) true, or nil and an error. Returns nil and an error when called from a delegated tool handler.
 /// @example
-/// maki.keymap.del("n", "<C-t>")
+/// makima.keymap.del("n", "<C-t>")
 #[lua_fn]
 fn del(
     lua: &Lua,
@@ -461,7 +461,7 @@ lua_table! {
     /// Neovim keymap plugin before, this will feel familiar.
     ///
     /// ```lua
-    /// maki.keymap.set("n", "<C-t>", function()
+    /// makima.keymap.set("n", "<C-t>", function()
     ///   print("hello")
     /// end, { desc = "Say hello" })
     /// ```

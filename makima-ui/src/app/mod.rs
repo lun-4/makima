@@ -2104,7 +2104,7 @@ impl App {
     }
 
     /// Single implementation behind both the default keybindings and
-    /// `maki.ui.action`, so a Lua rebind can never drift from the
+    /// `makima.ui.action`, so a Lua rebind can never drift from the
     /// original key's behavior.
     pub(crate) fn run_builtin(&mut self, action: BuiltinAction) -> Vec<Action> {
         match action {
@@ -2484,7 +2484,7 @@ impl App {
         self.quit_with(ExitRequest::Success)
     }
 
-    /// `maki trust` lives outside the TUI, so without this a "not now" or a
+    /// `makima trust` lives outside the TUI, so without this a "not now" or a
     /// `.makima/` created mid-session is unrecoverable without quitting.
     fn trust_folder(&mut self) -> Vec<Action> {
         let Some(question) = self.trust_question.clone() else {

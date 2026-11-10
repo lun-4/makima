@@ -1,4 +1,4 @@
-//! Actions on the machine running maki, outside the terminal.
+//! Actions on the machine running makima, outside the terminal.
 
 use keyring::{Entry, Error as KeyringError};
 use makima_lua_macro::{lua_fn, lua_table};
@@ -15,7 +15,7 @@ use crate::plugin_permissions::PluginPermissions;
 /// @param url string URL to open.
 /// @return (boolean?, string?) true, or nil plus an error string.
 /// @example
-/// local ok, err = maki.host.open("https://example.com/login")
+/// local ok, err = makima.host.open("https://example.com/login")
 #[lua_fn(guard = Run)]
 async fn open(_lua: Lua, url: String) -> LuaResult<Pair<bool>> {
     try_pair!(open_url(&url).await);
@@ -29,7 +29,7 @@ async fn open(_lua: Lua, url: String) -> LuaResult<Pair<bool>> {
 /// @param account string Account name within the service; may be empty.
 /// @return (string?, string?) The secret, nil when there is no such entry, or nil plus an error when the keyring cannot be read.
 /// @example
-/// local token, err = maki.host.keyring_get("gh:github.com", "octocat")
+/// local token, err = makima.host.keyring_get("gh:github.com", "octocat")
 #[lua_fn(guard = Env)]
 async fn keyring_get(_lua: Lua, service: String, account: String) -> LuaResult<Pair<String>> {
     let Ok(entry) = Entry::new(&service, &account) else {
@@ -53,7 +53,7 @@ lua_table! {
     /// Actions on the host machine: opening a browser, reading the keyring.
     ///
     /// ```lua
-    /// maki.host.open("https://example.com")
+    /// makima.host.open("https://example.com")
     /// ```
     "maki.host" => pub(crate) fn create_host_table(perms: &PluginPermissions), DOCS [
         open(perms),

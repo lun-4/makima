@@ -362,7 +362,7 @@ impl PluginHost {
         Arc::clone(&self.registry)
     }
 
-    /// The store that `maki.api.register_permission_rule` writes into. Hand
+    /// The store that `makima.api.register_permission_rule` writes into. Hand
     /// it to every [`makima_agent::permissions::PermissionManager`] so plugin
     /// rules apply to all sessions.
     pub fn plugin_rules(&self) -> Arc<PluginRuleStore> {
@@ -650,7 +650,7 @@ impl PluginHost {
         reply_rx.recv().expect("Lua worker reached test barrier");
     }
 
-    /// Option specs declared by loaded plugins via `maki.api.register_options`,
+    /// Option specs declared by loaded plugins via `makima.api.register_options`,
     /// keyed by plugin name. Used by docgen.
     pub fn plugin_options(&self) -> Result<PluginOptionSpecs, PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
@@ -662,7 +662,7 @@ impl PluginHost {
     }
 
     /// Builds the provider registry from what the loaded plugins registered
-    /// and makes it the one `maki.model` reads. `timeouts` are the defaults
+    /// and makes it the one `makima.model` reads. `timeouts` are the defaults
     /// for every request a provider sends through `ctx.send`.
     pub fn provider_registry(
         &self,
@@ -776,7 +776,7 @@ impl PluginHost {
         )
     }
 
-    /// The names the plugin registered that maki's own permission defaults are
+    /// The names the plugin registered that makima's own permission defaults are
     /// keyed on. Taking such a name is allowed, and a drop-in replacement may
     /// want the builtin's rules, but the user has to be told which rules the
     /// plugin just inherited. One warning lists them all, because the TUI
@@ -1141,7 +1141,7 @@ impl EventHandle {
         ));
     }
 
-    /// Makes `maki.session.set_default_thinking` refuse, for print, which
+    /// Makes `makima.session.set_default_thinking` refuse, for print, which
     /// saves nothing.
     pub fn save_no_preferences(&self) {
         let _ = self.tx.try_send(Request::SaveNoPreferences);

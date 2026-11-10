@@ -1,5 +1,5 @@
 //! Fuzzy matching backed by nucleo, the same matcher makima's built-in
-//! pickers use. Shared by command-argument resolution and the `maki.match`
+//! pickers use. Shared by command-argument resolution and the `makima.match`
 //! Lua API.
 
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};

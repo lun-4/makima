@@ -14,7 +14,7 @@ const SKILL_SRC: &str = include_str!("../../plugins/skill/init.lua");
 const TASK_SRC: &str = include_str!("../../plugins/task/init.lua");
 const MODEL_SRC: &str = include_str!("../../plugins/model/init.lua");
 
-const BUILTIN_SKILL: &str = "makima-plugin-dev";
+const BUILTIN_SKILL: &str = "maki-plugin-dev";
 const PROJECT_SKILL: &str = "proj-skill";
 const PROJECT_SKILL_SOURCE: &str =
     "---\nname: proj-skill\ndescription: project scoped\n---\n\nDo the project thing.\n";
@@ -159,11 +159,11 @@ fn project_skill_from_cwd_is_offered_and_expands() {
 fn expands_all_three_token_kinds_in_place() {
     let (_host, eh) = host_with_real_plugins();
     let out = eh
-        .expand_references("go @subagent:research @skill:makima-plugin-dev @model:zai/glm-5 now")
+        .expand_references("go @subagent:research @skill:maki-plugin-dev @model:zai/glm-5 now")
         .unwrap_or_else(|e| panic!("expand failed: {e}"));
     assert_eq!(
         out,
-        "go <subagent:research> <skill:makima-plugin-dev> <model:zai/glm-5> now"
+        "go <subagent:research> <skill:maki-plugin-dev> <model:zai/glm-5> now"
     );
 }
 
@@ -171,11 +171,11 @@ fn expands_all_three_token_kinds_in_place() {
 fn expands_short_form_aliases() {
     let (_host, eh) = host_with_real_plugins();
     let out = eh
-        .expand_references("@a:general @s:makima-plugin-dev @m:zai/glm-5")
+        .expand_references("@a:general @s:maki-plugin-dev @m:zai/glm-5")
         .unwrap_or_else(|e| panic!("expand failed: {e}"));
     assert_eq!(
         out,
-        "<subagent:general> <skill:makima-plugin-dev> <model:zai/glm-5>"
+        "<subagent:general> <skill:maki-plugin-dev> <model:zai/glm-5>"
     );
 }
 
