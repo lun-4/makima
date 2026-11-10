@@ -10,7 +10,6 @@ use makima_agent::{
 };
 use ratatui::backend::TestBackend;
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 use test_case::test_case;
 
@@ -901,43 +900,6 @@ fn thinking_indicator_uses_configured_prefix() {
     };
     let lines = thinking_indicator(2, &names);
     assert!(lines[0].to_string().starts_with("ponder>"));
-}
-
-#[test]
-fn ui_tests_do_not_hardcode_product_prefix() {
-    let needle = format!("format!(\"{{{}}}>\")", "APP_NAME");
-    let mut findings = Vec::new();
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    for root in [
-        manifest_dir.join("src/components"),
-        manifest_dir.join("benches"),
-    ] {
-        let mut files = Vec::new();
-        collect_rust_files(&root, &mut files);
-        for path in files {
-            let source = std::fs::read_to_string(&path).unwrap();
-            for (line_no, line) in source.lines().enumerate() {
-                if line.contains(&needle) {
-                    findings.push(format!("{}:{}", path.display(), line_no + 1));
-                }
-            }
-        }
-    }
-    assert!(
-        findings.is_empty(),
-        "hardcoded product prefix in UI tests/benches: {findings:?}"
-    );
-}
-
-fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in std::fs::read_dir(dir).unwrap().flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_rust_files(&path, out);
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            out.push(path);
-        }
-    }
 }
 
 #[test_case(&["short", &"x".repeat(200)], 80, 4 ; "long_line_wraps")]

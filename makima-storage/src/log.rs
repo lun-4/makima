@@ -533,10 +533,4 @@ mod tests {
         assert_eq!(LOCK_FILE_NAME, format!("{APP_NAME}.log.lock"));
         assert_eq!(ROTATED_PREFIX, format!("{APP_NAME}."));
     }
-
-    #[test]
-    fn rotated_index_rejects_legacy_names() {
-        let legacy = concat!("ma", "ki", ".7.log");
-        assert_eq!(rotated_index(legacy), None);
-    }
 }

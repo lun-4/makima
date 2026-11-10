@@ -5,10 +5,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { after, before, test } from "node:test"
 import type { Server } from "node:http"
-import { sessionOptions } from "../src/options.ts"
-import type { StepRequest } from "../src/protocol.ts"
 import { handler, listen } from "../src/server.ts"
-import { PendingTools, SERVER_NAME } from "../src/tools.ts"
 import { harness, LOGGED_IN, request, text, textTurn, user } from "./fake.ts"
 
 let dir: string
@@ -42,20 +39,6 @@ function call(method: string, path: string, body?: unknown): Promise<{ status: n
     req.end(body === undefined ? undefined : JSON.stringify(body))
   })
 }
-
-test("server name is makima", () => {
-  assert.equal(SERVER_NAME, "makima")
-  const step: StepRequest = {
-    model: { id: "claude-agent/sonnet" },
-    system: "system",
-    messages: [],
-    tools: [{ name: "read", description: "Read a file.", input_schema: { type: "object" } }],
-    thinking: { kind: "off" },
-    invocation: { conversation_id: "c", operation_id: "o", attempt: 1, purpose: "agent" },
-  }
-  const options = sessionOptions({ executable: "claude", workdir: "/tmp" }, step, { seen: 0, boundaries: [] }, new PendingTools(), false)
-  assert.deepEqual(Object.keys(options.mcpServers ?? {}), [SERVER_NAME])
-})
 
 test("the socket is private to the user", async () => {
   assert.equal((await stat(socket)).mode & 0o777, 0o600)

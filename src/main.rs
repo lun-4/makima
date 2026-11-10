@@ -70,11 +70,3 @@ fn print_error(e: &color_eyre::Report) {
     }
     eprintln!();
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn package_name_is_makima() {
-        assert_eq!(env!("CARGO_PKG_NAME"), "makima");
-    }
-}

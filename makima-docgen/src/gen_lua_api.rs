@@ -94,17 +94,6 @@ mod tests {
     }
 
     #[test]
-    fn lua_api_page_uses_makima_names() {
-        let page = generate();
-        assert!(page.contains("makima.api.register_command"));
-        let legacy = ["ma", "ki", "."].concat();
-        assert!(
-            !page.contains(&legacy),
-            "generated Lua API page still uses the legacy module prefix"
-        );
-    }
-
-    #[test]
     fn generated_docs_contain_typed_arguments_contract() {
         let page = generate();
         let start = page

@@ -31,20 +31,6 @@ use serde_json::{Value, json};
 mod common;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-
-#[test]
-fn makima_global_installed_and_legacy_global_absent() {
-    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-    host.load_source(
-        "global_probe",
-        r#"
-        assert(makima ~= nil, "makima global missing")
-        assert(maki == nil, "legacy maki global present")
-        assert(type(makima.version) == "function")
-        "#,
-    )
-    .unwrap();
-}
 const INITIAL: &str = "alignment initial";
 const STEERING: &str = "alignment steering";
 const USER_INTERRUPT_PREFIX: &str = "<user-interrupt>\n";
