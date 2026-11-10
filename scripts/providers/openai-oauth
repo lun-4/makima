@@ -2,12 +2,12 @@
 """
 OpenAI OAuth dynamic provider for makima (device code flow).
 
-Install: cp scripts/providers/openai-oauth ~/.makima/providers/openai-oauth && chmod +x ~/.makima/providers/openai-oauth
+Install: cp scripts/providers/openai-oauth ~/.config/makima/providers/openai-oauth && chmod +x ~/.config/makima/providers/openai-oauth
 Usage:   makima auth login openai-oauth
          makima -m openai-oauth/gpt-4.1
 
 Requires Python 3.8+ with no external dependencies.
-Stores tokens at ~/.makima/auth/openai.json
+Stores tokens at ~/.local/state/makima/auth/openai.json
 """
 
 import json
@@ -26,7 +26,7 @@ REDIRECT_URI = "https://auth.openai.com/deviceauth/callback"
 REFRESH_BUFFER_SECS = 60
 POLL_TIMEOUT = 300
 
-TOKEN_FILE = os.path.expanduser("~/.makima/auth/openai.json")
+TOKEN_FILE = os.path.expanduser("~/.local/state/makima/auth/openai.json")
 
 
 def load_tokens():

@@ -7,12 +7,12 @@ Setup:
     harbor dataset download terminal-bench/terminal-bench-2
 
 Run a single task:
-    MOUNTS='["/usr/local/bin/makima:/mnt/makima:ro", "~/.makima/auth:/mnt/makima-auth:ro", "~/.makima/providers:/mnt/makima-providers:ro"]'
+    MOUNTS='["/usr/local/bin/makima:/mnt/makima:ro", "~/.local/state/makima/auth:/mnt/makima-auth:ro", "~/.config/makima/providers:/mnt/makima-providers:ro"]'
 
     harbor run \
       -t terminal-bench/fix-git \
       -m anthropic/claude-sonnet-4-6 \
-      --agent-import-path tbench_maki_agent:MakiAgent \
+      --agent-import-path tbench_makima_agent:MakimaAgent \
       --mounts-json "$MOUNTS" \
       -n 1 -y
 
@@ -20,7 +20,7 @@ Run the full suite:
     harbor run \
       -d terminal-bench/terminal-bench-2 \
       -m anthropic/claude-sonnet-4-6 \
-      --agent-import-path tbench_maki_agent:MakiAgent \
+      --agent-import-path tbench_makima_agent:MakimaAgent \
       --mounts-json "$MOUNTS" \
       -n 4 -y
 
@@ -125,7 +125,7 @@ def parse_stream_json(log_text: str) -> tuple[dict, dict[int, dict], list[dict]]
     return result, turn_usage, tool_calls
 
 
-class MakiAgent(BaseInstalledAgent):
+class MakimaAgent(BaseInstalledAgent):
     _last_instruction: str = ""
 
     @staticmethod
@@ -142,11 +142,11 @@ class MakiAgent(BaseInstalledAgent):
         )
         await self.exec_as_root(
             environment,
-            command="if [ -d /mnt/makima-auth ]; then mkdir -p /root/.makima/auth && cp /mnt/makima-auth/* /root/.makima/auth/; fi",
+            command="if [ -d /mnt/makima-auth ]; then mkdir -p /root/.local/state/makima/auth && cp /mnt/makima-auth/* /root/.local/state/makima/auth/; fi",
         )
         await self.exec_as_root(
             environment,
-            command="if [ -d /mnt/makima-providers ]; then mkdir -p /root/.makima/providers && cp /mnt/makima-providers/* /root/.makima/providers/ && chmod +x /root/.makima/providers/*; fi",
+            command="if [ -d /mnt/makima-providers ]; then mkdir -p /root/.config/makima/providers && cp /mnt/makima-providers/* /root/.config/makima/providers/ && chmod +x /root/.config/makima/providers/*; fi",
         )
 
     @with_prompt_template
