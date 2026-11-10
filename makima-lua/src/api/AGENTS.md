@@ -1,5 +1,5 @@
-Mirror Neovim's Lua API namespaces (maki.uv = vim.uv, maki.fs = vim.fs, maki.treesitter = vim.treesitter).
-Keep function signatures identical so plugins can be copy-pasted between Neovim and maki.
+Mirror Neovim's Lua API namespaces (makima.uv = vim.uv, makima.fs = vim.fs, makima.treesitter = vim.treesitter).
+Keep function signatures identical so plugins can be copy-pasted between Neovim and makima.
 Only exception is the UI API, neovim's has baggage.
 
 ## Design
@@ -15,13 +15,13 @@ A call with nothing to return still answers `(true, nil)` on success, so `if not
 
 Tool handlers fail with `{ llm_output = msg, is_error = true }`; a plain string is always success (only `is_error` flags the result as an error to the provider).
 
-## maki.fs backends
+## makima.fs backends
 
-All `maki.fs` I/O dispatches through the `FsBackend` trait (`api/fs/mod.rs`), async and object-safe via boxed futures (`BoxFuture<'_, T>`). Backends that perform blocking I/O hop to the smol thread pool themselves (`RealFs` wraps each call in `smol::unblock`); unit tests drive the methods with `smol::block_on`. Two backends:
+All `makima.fs` I/O dispatches through the `FsBackend` trait (`api/fs/mod.rs`), async and object-safe via boxed futures (`BoxFuture<'_, T>`). Backends that perform blocking I/O hop to the smol thread pool themselves (`RealFs` wraps each call in `smol::unblock`); unit tests drive the methods with `smol::block_on`. Two backends:
 
-- `RealFs` (`api/fs/real.rs`): production. The exact semantics `maki.fs` always had — symlinks, gitignore, permissions, real mtimes. Keep it behavior-preserving; the `api::fs::tests` suite in `mod.rs` is the regression proof.
+- `RealFs` (`api/fs/real.rs`): production. The exact semantics `makima.fs` always had — symlinks, gitignore, permissions, real mtimes. Keep it behavior-preserving; the `api::fs::tests` suite in `mod.rs` is the regression proof.
 - `InMemoryFs` (`api/fs/in_memory.rs`): hermetic tests. Deliberately dumb — no symlinks, no gitignore, no permissions, file mtime is an insertion counter. Behavior tests must not rely on real-filesystem vagaries (project roots derived from `.git`, gitignore filtering); those belong in the real-backend suite.
-- The test-only surface (`InMemoryFs`, `test_support`, the `*_for_test` helpers) is behind the `test-support` cargo feature, so production builds drop it and its `globset` dependency. A self dev-dep in maki-lua and a dev-dep in maki-ui enable the feature for all test builds, so scoped `cargo nextest run -p maki-lua` needs no flags.
+- The test-only surface (`InMemoryFs`, `test_support`, the `*_for_test` helpers) is behind the `test-support` cargo feature, so production builds drop it and its `globset` dependency. A self dev-dep in makima-lua and a dev-dep in makima-ui enable the feature for all test builds, so scoped `cargo nextest run -p makima-lua` needs no flags.
 
 The backend is resolved per Lua state via app_data (`FsBackendHandle`); a state that carries none falls back to a static `RealFs`, so bare `Lua::new()` unit tests still hit the disk. Test hosts boot disk-free: `test_support::spawn_host_for_tests` runs on `InMemoryFs` with the synthetic `TEST_STATE_DIR` (never created on the real disk), and `PluginHostGuard::backend()` exposes the backend for assertions (see `tests/in_memory_host.rs`).
 
@@ -32,7 +32,7 @@ Two click channels share one event name and one 1-based `row` convention:
 - Float windows deliver `{type = "click", row, col}` from `win:recv()`. `row = 0` means the click landed on chrome or outside the content; `col` is the 1-based content column. Rows in the pinned top and bottom bands carry their real content row.
 - Transcript tool buffers deliver `{row}` through `buf:on("click")`; `row = 0` is the same chrome/outside sentinel.
 
-`maki.ui.set_status_content` entries accept an optional third element, a click callback. The runtime keeps one registry key per (plugin, entry index), replaces it on re-register, and frees it on plugin unload, so click callbacks do not leak.
+`makima.ui.set_status_content` entries accept an optional third element, a click callback. The runtime keeps one registry key per (plugin, entry index), replaces it on re-register, and frees it on plugin unload, so click callbacks do not leak.
 
 ## Callback seams
 

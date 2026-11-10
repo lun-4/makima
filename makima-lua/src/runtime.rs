@@ -4541,7 +4541,7 @@ fn layer_delegation<'a>(
 /// `nil, reason` stops the call with a reason the model reads.
 ///
 /// Every failure below is a pass-through, because a layer is an opinion about a
-/// call and never a precondition for makimang it.
+/// call and never a precondition for making it.
 ///
 /// [`run_awaited`] is what makes the chain answerable to the call waiting on
 /// it, down to a layer that never comes back ending at the window dispatch

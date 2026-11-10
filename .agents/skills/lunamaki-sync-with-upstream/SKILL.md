@@ -15,9 +15,9 @@ edges so a future iteration does not re-derive them.
 
 ## Repo and remotes
 
-- Working branch is a sync branch (e.g. `luna.sync-maki-048-v2`), created on
+- Working branch is a sync branch (e.g. `luna.sync-makima-048-v2`), created on
   top of the fork's line of work.
-- `upstream` is `tontinton/maki`. `origin` is `lun-4/maki` (this repo).
+- `upstream` is `tontinton/maki`. `origin` is `lun-4/makima` (this repo).
 - `git fetch upstream` first.
 
 NOTE: confirm those origins are valid before continuing, as different clones
@@ -36,9 +36,9 @@ absolute:
 2. **Always defer to fork on identity:**
    - `Cargo.toml` `[workspace.package] version` matches the upstream version with
      a `-luna` suffix. Sub-crates use `version.workspace = true`.
-   - `install.sh` and `install.ps1`: `REPO="lun-4/maki"`.
-   - `maki-storage/src/version.rs`: `RELEASES_URL` points at `lun-4`.
-   - `README.md`, `banner.png`, `splash.rs` branding (`LOGO="luna-maki"`).
+   - `install.sh` and `install.ps1`: `REPO="lun-4/makima"`.
+   - `makima-storage/src/version.rs`: `RELEASES_URL` points at `lun-4`.
+   - `README.md`, `banner.png`, `splash.rs` branding (`LOGO="makima"`).
 
 ## Process
 
@@ -63,7 +63,7 @@ cargo nextest run --workspace
 ```
 
 `-D warnings` makes every warning fail. Clippy and the Lua tests catch most
-sync mistakes. Do targeted suites (`-p maki-lua --test <name>`) to iterate.
+sync mistakes. Do targeted suites (`-p makima-lua --test <name>`) to iterate.
 
 ## Sharp edges found the hard way (do not rediscover these)
 
@@ -79,7 +79,7 @@ for f in $(find plugins -name '*.lua'); do luac -p "$f" || echo "BROKE $f"; done
 ```
 
 ### A subagent's cancel must NOT derive from the parent run's cancel
-If `maki.agent.session` uses `agent_ctx.cancel.child()`, then at the end of a
+If `makima.agent.session` uses `agent_ctx.cancel.child()`, then at the end of a
 normal run the UI drops the run's `CancelTrigger`, and `CancelTrigger::drop`
 **fires** it — closing every in-flight subagent (`task_get` reports
 `closed`, never appears in `/tasks`). Fix: create an independent
@@ -110,8 +110,8 @@ a production-like `ToolContext` from `stub_ctx` then override `cancel`,
 
 ### Rust API sharp edges
 - `Role` has no `PartialEq`; use `matches!(m.role, Role::Assistant)`.
-- `ToolOutput` is at `maki_agent::ToolOutput` (root), not `tools::`.
-- `SessionRef` is `maki_storage::id::SessionRef`.
+- `ToolOutput` is at `makima_agent::ToolOutput` (root), not `tools::`.
+- `SessionRef` is `makima_storage::id::SessionRef`.
 - Upstream signature drifts you must reconcile: `run_lua_command(name, args,
   depth)`, `methods::new_session_response(id, &modes)`,
   `load_session_response(&modes)`, and the `Server` struct's `modes` field.

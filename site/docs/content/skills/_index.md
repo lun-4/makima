@@ -9,13 +9,13 @@ group = "Guides"
 
 A skill is a short Markdown how-to that the agent loads only when it needs it. The `skill` tool shows the agent what is available, and when it picks one, the file drops into the conversation and the agent follows it.
 
-Write one for anything you keep explaining: how you cut a release, how you write a maki plugin, how a PR should look in this repo. `AGENTS.md` is always in context and always costs tokens. A skill costs nothing until it is loaded, only its name and description sit in the tool list. So big skills are fine.
+Write one for anything you keep explaining: how you cut a release, how you write a makima plugin, how a PR should look in this repo. `AGENTS.md` is always in context and always costs tokens. A skill costs nothing until it is loaded, only its name and description sit in the tool list. So big skills are fine.
 
 ## Where skills live
 
 A skill is a directory with a `SKILL.md` inside. Makima looks for them every time the `skill` tool runs (and once at startup, to build the list). When two skills share a name, the one found last wins:
 
-1. The builtin `maki-plugin-dev` (if enabled)
+1. The builtin `makima-plugin-dev` (if enabled)
 2. `~/.config/makima/skills/` (Windows: `%APPDATA%\makima\skills\`)
 3. `~/.claude/skills/`, `~/.config/opencode/skills/`, `~/.agents/skills/`
 4. In your project, walking from the current directory up to the `.git` root, at each step: `.makima/skills/`, `.claude/skills/`, `.opencode/skills/`, `.agents/skills/`
@@ -53,13 +53,13 @@ The `skill` tool lists every skill it found, the agent calls it with a name and 
 
 Skills are not slash commands: typing `/git-release` does nothing unless you also add a [custom command](/docs/commands/#custom-commands). Ask the agent to use a skill, or let it pick one on its own.
 
-## The builtin: maki-plugin-dev
+## The builtin: makima-plugin-dev
 
-Makima ships one skill, `maki-plugin-dev`. It teaches the agent how to write maki Lua plugins, and on load it writes the full Lua API reference to a file in the state dir, so the agent can read it in pieces instead of swallowing it whole. It carries the same guide you can read in [Plugins](/docs/plugins/), so "write me a plugin that ..." is usually enough. Turn it off if you never write plugins:
+Makima ships one skill, `makima-plugin-dev`. It teaches the agent how to write makima Lua plugins, and on load it writes the full Lua API reference to a file in the state dir, so the agent can read it in pieces instead of swallowing it whole. It carries the same guide you can read in [Plugins](/docs/plugins/), so "write me a plugin that ..." is usually enough. Turn it off if you never write plugins:
 
 ```lua
 -- ~/.config/makima/init.lua
-maki.setup({
+makima.setup({
     plugins = {
         skill = { plugin_dev = false },
     },

@@ -1299,7 +1299,7 @@ impl EventHandle {
 
     /// Blocks until every restore item queued so far has finished; restores
     /// run as spawned tasks, and the `RestoreComplete` flag flips only once
-    /// the whole batch has landed, makimang it the batch barrier.
+    /// the whole batch has landed, making it the batch barrier.
     #[doc(hidden)]
     pub fn wait_restore_complete_for_test(&self) {
         const DEADLINE: Duration = runtime::RESTORE_ITEM_TIMEOUT.saturating_mul(2);

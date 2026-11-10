@@ -32,7 +32,7 @@ history.
 Set `ui.notifications` in `~/.config/makima/init.lua`:
 
 ```lua
-maki.setup({
+makima.setup({
   ui = {
     notifications = "auto",
   },

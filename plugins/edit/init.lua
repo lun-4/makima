@@ -26,7 +26,7 @@ local EDIT_DESCRIPTION = [[Replace an exact string match in a file.
 ]]
 
 local MULTIEDIT_DESCRIPTION = [[Make multiple find-and-replace edits to a single file atomically.
-Prefer this over edit when makimang multiple changes to the same file.
+Prefer this over edit when making multiple changes to the same file.
 
 - Read the file first to get exact content.
 - old_string must match the file contents exactly, including all whitespace and indentation.

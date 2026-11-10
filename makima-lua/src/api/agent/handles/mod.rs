@@ -38,7 +38,7 @@ pub(crate) struct LuaAgent {
 }
 
 impl LuaAgent {
-    /// The autocmd filter for this agent's events, makimang sure its graph
+    /// The autocmd filter for this agent's events, making sure its graph
     /// feeds this host.
     pub(crate) fn listen(&self, lua: &Lua) -> crate::api::autocmd::AgentFilter {
         crate::agent_autocmd::observe(lua, &self.manager);

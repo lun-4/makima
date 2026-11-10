@@ -1,10 +1,10 @@
 #!/usr/bin/env lua5.1
 -- Render one splash frame as plain text (glyphs only) to eyeball composition
--- without starting maki. Colors are invisible here; for background-color
+-- without starting makima. Colors are invisible here; for background-color
 -- effects (fire) this looks blank by design.
 --
 -- Usage: lua5.1 dump_frame.lua <splash.lua|name> [w] [h] [t] [fade]
---   name (no .lua suffix) is resolved in ~/.config/maki/lua.
+--   name (no .lua suffix) is resolved in ~/.config/makima/lua.
 
 local target = arg[1]
 if not target then
@@ -16,9 +16,9 @@ local h = tonumber(arg[3]) or 24
 local t = tonumber(arg[4]) or 2.0
 local fade = tonumber(arg[5]) or 1.0
 
-package.path = os.getenv("HOME") .. "/.config/maki/lua/?.lua;" .. package.path
+package.path = os.getenv("HOME") .. "/.config/makima/lua/?.lua;" .. package.path
 
-_G.maki = {
+_G.makima = {
   ui = { theme_color = function() return nil end },
   version = function() return { current = "0.0.0-test" } end,
   api = {

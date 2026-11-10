@@ -1,13 +1,13 @@
 ---
 name: aesthetic-splash-screens
-description: Design and build visually striking maki splash screens (the animated home screen behind the prompt) as self-contained Lua splashes. Covers the splash.render slot contract, the shared splash template, glyph-ramp shading, WGSL/GLSL shader porting, state management, perf budgets, and smoke testing without building maki. Use whenever someone wants a new splash, wants to polish an existing splash, mentions the maki home screen animation, asks to port a shader to a splash, wants to promote/bundle a splash into the maki distribution (the bundled splashes), or is exploring terminal eye-candy for maki, even if they don't say the word "splash".
+description: Design and build visually striking makima splash screens (the animated home screen behind the prompt) as self-contained Lua splashes. Covers the splash.render slot contract, the shared splash template, glyph-ramp shading, WGSL/GLSL shader porting, state management, perf budgets, and smoke testing without building makima. Use whenever someone wants a new splash, wants to polish an existing splash, mentions the makima home screen animation, asks to port a shader to a splash, wants to promote/bundle a splash into the makima distribution (the bundled splashes), or is exploring terminal eye-candy for makima, even if they don't say the word "splash".
 ---
 
-# Aesthetic splash screens for maki
+# Aesthetic splash screens for makima
 
-Maki's home screen is a pull-driven canvas of terminal cells. A splash is
+Makima's home screen is a pull-driven canvas of terminal cells. A splash is
 a single Lua file that, given `(w, h, t, fade)`, returns `h` rows of styled
-glyph segments covering exactly `w` cells each. This skill is about making
+glyph segments covering exactly `w` cells each. This skill is about makimang
 those frames beautiful, not just correct.
 
 ## What makes a splash look good
@@ -27,7 +27,7 @@ These come from building 17 splashes and watching what worked:
 - **Depth cues.** Dim far things, brighten near things, cluster detail toward
   the horizon. Non-linear spacing (tunnel's `r^0.55` rings) reads as 3D almost
   for free.
-- **Theme-aware color.** Pull colors from `maki.ui.theme_color` so the splash
+- **Theme-aware color.** Pull colors from `makima.ui.theme_color` so the splash
   belongs to the user's theme. Reserve hardcoded palettes (fire, caustics
   deep-water blues) for effects that ARE their palette. When a concept
   mandates a fixed palette (synthwave purple-orange), the intended split is:
@@ -46,7 +46,7 @@ These come from building 17 splashes and watching what worked:
 Full reference: `site/docs/content/splash/_index.md`. The essentials:
 
 ```lua
-maki.api.set_slot("splash.render", function(prev, w, h, t, fade)
+makima.api.set_slot("splash.render", function(prev, w, h, t, fade)
   -- return h rows; each row is a list of { glyphs = string, style = ... };
   -- per row, all seg.glyphs concatenated are exactly w terminal cells wide.
 end)
@@ -61,10 +61,10 @@ end)
   reuse them by identity: the renderer coalesces runs of the *same table* into
   one segment, so fresh tables per cell explode the segment count.
 - Rendering is pull-driven: be pure in `t`, never block, never sleep.
-  `maki.ui.theme_color` and `maki.version()` are fine to call.
+  `makima.ui.theme_color` and `makima.version()` are fine to call.
 - Stateful effects (cellular automata) keep per-size buffers, step by
   accumulated `dt` from `t`, and reset on
-  `maki.api.create_autocmd("SplashShown", { callback = ... })`. See
+  `makima.api.create_autocmd("SplashShown", { callback = ... })`. See
   `fire.lua`/`life.lua` in the live config for the pattern.
 - Every file also returns `M` with `M.render(w, h, t, fade)`, so a cycler in
   `init.lua` can call splashes directly. Keep the `set_slot` call too; the
@@ -86,11 +86,11 @@ end)
 2. **Pick the idea and the genre** (see the sparks list below). Decide early
    whether the splash is *sparse* (glyphs on background, most splashes) or *full*
    (every cell shaded, shader ports).
-3. **Smoke test after every change** with the bundled script (no maki build
-   needed; it runs under stock lua5.1 with a stubbed `maki`):
+3. **Smoke test after every change** with the bundled script (no makima build
+   needed; it runs under stock lua5.1 with a stubbed `makima`):
 
    ```bash
-   lua5.1 scripts/smoke_test.lua --dir ~/.config/maki/lua kaleidoscope voronoi
+   lua5.1 scripts/smoke_test.lua --dir ~/.config/makima/lua kaleidoscope voronoi
    ```
 
    It asserts `rows == h`, exact per-row cell width (UTF-8 aware), no blank
@@ -102,21 +102,21 @@ end)
    native codegen (same CLI, safeenv envs like runtime.rs `build_env`):
 
    ```bash
-   cargo run -p maki-lua --example splash_bench -- --dir <dir> <name>...
+   cargo run -p makima-lua --example splash_bench -- --dir <dir> <name>...
    ```
 
-   Real maki renders compile to native (plugin envs are marked safe via
+   Real makima renders compile to native (plugin envs are marked safe via
    `lua_setsafeenv`, so luau codegen applies) and pay a Rust-side parse that
    scales with segment count; the example measures the compiled Lua but not
    that parse. For the full-host meter (render + parse, per splash at 200x79)
    run the criterion bench:
 
    ```bash
-   cargo bench -p maki-lua --bench splash_perf -- pull_roundtrip
+   cargo bench -p makima-lua --bench splash_perf -- pull_roundtrip
    ```
 
    `splash_perf` also holds the raw-interp-vs-codegen and safeenv codegen
-   regression meters (`cargo bench -p maki-lua --bench splash_perf`). The per-cell output
+   regression meters (`cargo bench -p makima-lua --bench splash_perf`). The per-cell output
    path (quantize + ramp + segment coalescing) is the common floor;
    sampled-grid bilinear rendering (caustics-style, `SAMPLE_STEP`) cuts
    shade cost ~4x for smooth fields but smears steep gradients (metaballs
@@ -125,16 +125,16 @@ end)
    segment — but keep it at 0 for high-frequency fields (kaleidoscope:
    tolerance merging flattened the fractal's color grain and read as bad
    quality).
-5. **Look at it as text** before running maki:
+5. **Look at it as text** before running makima:
 
    ```bash
-   lua5.1 scripts/dump_frame.lua ~/.config/maki/lua/voronoi.lua 60 20 2.0
+   lua5.1 scripts/dump_frame.lua ~/.config/makima/lua/voronoi.lua 60 20 2.0
    ```
 
    Glyph-only dumps catch structural problems (asymmetry, clipping, label
    collisions) that unit checks miss. Background-color effects (fire) look
    blank in text dumps; inspect `seg.style.fg` values instead.
-5. **Run maki and watch the cycle.** Color balance, quantization banding, and
+5. **Run makima and watch the cycle.** Color balance, quantization banding, and
    pacing are only judgeable live. Iterate on the one effect until it's
    unmistakable.
 
@@ -153,14 +153,14 @@ Checklist (using `mysplash` as the example):
    `M.render` and does not activate itself. Copy an existing splash's header.
 2. Add `"mysplash"` to the `SPLASHES` list in `plugins/splashes_default/init.lua`.
    **No Rust change needed for the splash itself.** `splashes_default` is
-   already a `BundledPlugin` entry in `maki-lua/src/loader.rs`; any `.lua`
+   already a `BundledPlugin` entry in `makima-lua/src/loader.rs`; any `.lua`
    dropped under its `splash/` subdir becomes `require("splash.<name>")` on
    the next build. The namespace is reserved (`splash.*` resolves
    bundled-first), so never give a config splash a `splash.` name.
 3. Add the splash to the table in `site/docs/content/splash/_index.md`.
 4. Verify in order:
    - `lua5.1 .agents/skills/aesthetic-splash-screens/scripts/smoke_test.lua plugins/splashes_default/splash/mysplash.lua`
-   - `cargo test -p maki-lua --test plugin_host` (runs the real VM: boots the
+   - `cargo test -p makima-lua --test plugin_host` (runs the real VM: boots the
      bundled renderers, checks the slot default, overrides, and error paths).
    `just ci` covers all of it on a full run.
 
@@ -169,9 +169,9 @@ libssl-dev exists; the vendored build fails), and if `include_dir!` claims a
 file that exists does not, the 9p dentry cache is stale —
 `sync && echo 3 > /proc/sys/vm/drop_caches` and retry.
 
-## Making frame tests non-flaky
+## Makimang frame tests non-flaky
 
-Frame-asserting tests (the splash tests in `maki-lua/tests/plugin_host.rs`)
+Frame-asserting tests (the splash tests in `makima-lua/tests/plugin_host.rs`)
 assert things about frames, and stateful or RNG-driven splashes make naive
 thresholds flaky. Rules learned the expensive way:
 
@@ -206,7 +206,7 @@ thresholds flaky. Rules learned the expensive way:
   frequency ratio, wavebanner phase) should move with slow sines of `t`,
   period >= ~8 s, so the viewer sees evolution, not flicker.
 - **Performance budget.** Established full-cell splashes run 2-3 ms/frame at
-  80x24 on stock lua5.1 (slower than maki's luau-jit by ~5x). Up to ~20 ms on
+  80x24 on stock lua5.1 (slower than makima's luau-jit by ~5x). Up to ~20 ms on
   lua5.1 is acceptable. If a shader port is too slow, hoist terms that depend
   on only one axis into per-column or per-row precomputes (aurora went from
   33 ms to 9 ms this way), and memoize hashes.
