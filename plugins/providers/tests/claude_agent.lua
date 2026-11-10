@@ -196,6 +196,23 @@ t.case("discovery_is_cached_for_the_next_start", function()
   t.rmtree(dir)
 end)
 
+t.case("discovery_keeps_the_cached_models_when_the_bridge_does_not_answer", function()
+  local dir = t.mktmpdir("claude-agent")
+  local cache = maki.fs.joinpath(dir, claude_agent.CACHE_FILE)
+  local provider = claude_agent.provider(cache)
+  provider.discover(
+    t.provider_ctx({ json({ models = { { value = "opus", resolved_model = "claude-opus-5-5" } } }) }),
+    CONFIG
+  )
+  local down = provider.discover(failing_ctx(CONNECT_FAILED), CONFIG)
+  t.eq(#down, 1)
+  t.eq(down[1].id, "claude-opus-5-5")
+  local failed = provider.discover(t.provider_ctx({ json({ message = "not logged in" }, 500) }), CONFIG)
+  t.eq(#failed, 1)
+  t.eq(failed[1].id, "claude-opus-5-5")
+  t.rmtree(dir)
+end)
+
 t.case("aliases_can_think_before_any_discovery", function()
   for _, model in ipairs(claude_agent.MODELS) do
     t.eq(model.supports_thinking, true)
