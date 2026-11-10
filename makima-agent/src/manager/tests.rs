@@ -2763,31 +2763,33 @@ fn dropping_pending_managed_execution_closes_lease_and_releases_permit() {
 #[test]
 fn child_spawn_inherits_running_turn_cwd_not_later_config() {
     smol::block_on(async {
-        const ORIGINAL: &str = "/original";
-        const CHANGED: &str = "/changed";
+        let original = std::env::temp_dir().join("original");
+        let changed = std::env::temp_dir().join("changed");
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let (tx, rx) = flume::bounded(1);
         let gate = Gate::new();
         let initial = config("anthropic/claude-sonnet-4-20250514", false)
-            .with_context(crate::actor::AgentContextSnapshot::new(ORIGINAL.into()));
+            .with_context(crate::actor::AgentContextSnapshot::new(original.clone()));
         let root = manager
             .create_root_with_config(Some(initial), Vec::new(), None, |_| {
                 Ok::<_, String>(TestBackend::reporting(tx, Some(Arc::clone(&gate))))
             })
             .unwrap();
         let actor = root.actor().unwrap();
-        actor.admit_turn(input(), None, ORIGINAL.into()).unwrap();
+        actor
+            .admit_turn(input(), None, original.display().to_string())
+            .unwrap();
         let current = rx.recv_async().await.unwrap();
         let update = actor.reserve_prepared_operation(None).unwrap();
         update
             .commit_when_ready(Some(crate::actor::ConfigChange::WorkingDirectory(
-                CHANGED.into(),
+                changed.clone(),
             )))
             .await
             .unwrap();
         assert_eq!(
             actor.effective_config().unwrap().context.cwd(),
-            std::path::Path::new(CHANGED)
+            changed.as_path()
         );
         let child = current
             .spawn_child(
@@ -2799,7 +2801,7 @@ fn child_spawn_inherits_running_turn_cwd_not_later_config() {
             .unwrap();
         assert_eq!(
             child.effective_config().unwrap().unwrap().context.cwd(),
-            std::path::Path::new(ORIGINAL)
+            original.as_path()
         );
         gate.release(1);
         assert!(
