@@ -41,6 +41,10 @@ gen-docs:
 gen-docs-check:
     cargo run -p makima-docgen -- --check
 
+site-check:
+    (cd site && ./build.sh)
+    MAKIMA_SITE_CHECK=1 cargo test -p makima site_build_is_clean
+
 machete:
     cargo-machete
 
