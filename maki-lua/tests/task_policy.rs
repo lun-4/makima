@@ -1402,6 +1402,8 @@ fn assert_task_input(message: &Message, original: &str, interrupted: bool) {
 #[test]
 fn repeated_busy_sends_retain_one_ticket() {
     smol::block_on(async {
+        let t0 = std::time::Instant::now();
+        let mark = |step: &str| eprintln!("DIAG {:>8.3}s {step}", t0.elapsed().as_secs_f64());
         let (started_tx, started_rx) = flume::unbounded();
         let (release_tx, release_rx) = flume::unbounded();
         let provider = Arc::new(GatedProvider {
@@ -1413,12 +1415,17 @@ fn repeated_busy_sends_retain_one_ticket() {
         let spawned =
             exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("first", None));
         let task_id = spawned["task_id"].as_str().unwrap();
+        mark("spawned");
         assert_task_input(
             &common::bounded(started_rx.recv_async()).await.unwrap(),
             TASK_PROMPT,
             false,
         );
-        for _ in 0..RETAINED_TURN_LIMIT {
+        mark("first request started");
+        for i in 0..RETAINED_TURN_LIMIT {
+            if i % 16 == 0 {
+                mark(&format!("send {i}"));
+            }
             let admitted = exec_tool_json_with_ctx(
                 &reg,
                 &ctx,
@@ -1435,12 +1442,15 @@ fn repeated_busy_sends_retain_one_ticket() {
         )
         .unwrap_err();
         assert!(!error.is_empty());
+        mark("overflow send rejected");
         release_tx.send(()).unwrap();
+        mark("released first request");
         assert_task_input(
             &common::bounded(started_rx.recv_async()).await.unwrap(),
             TASK_PROMPT,
             true,
         );
+        mark("merged request started");
         release_tx.send(()).unwrap();
         let settled = exec_tool_json_with_ctx(
             &reg,
@@ -1450,6 +1460,7 @@ fn repeated_busy_sends_retain_one_ticket() {
         );
         assert_eq!(settled["result"]["turn_id"], spawned["turn_id"]);
         assert_eq!(settled["result"]["status"], "completed");
+        mark("first turn settled");
         let successor = exec_tool_json_with_ctx(
             &reg,
             &ctx,
@@ -1457,6 +1468,7 @@ fn repeated_busy_sends_retain_one_ticket() {
             json!({"task_id": task_id, "message": TASK_PROMPT}),
         );
         assert_ne!(successor["turn_id"], spawned["turn_id"]);
+        mark("successor admitted");
         assert_task_input(
             &common::bounded(started_rx.recv_async()).await.unwrap(),
             TASK_PROMPT,
