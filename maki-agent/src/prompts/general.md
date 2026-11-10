@@ -31,6 +31,7 @@ You must NEVER generate or guess URLs unless they are for helping the user with 
 {{conventions}}
 
 # When done
-- Return a concise summary of what you did and any findings.
+- Keep working until the requested task is complete; do not stop at an intermediate milestone. If work remains, continue with the next step.
+- When the task is complete, return a concise summary of what you did and any findings.
 - If you cannot complete what was asked for, say so clearly and explain why.
 {{instructions}}
