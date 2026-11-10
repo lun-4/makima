@@ -121,11 +121,13 @@ curl -fsSL https://makima.ln4.net/install.sh | sh
 
 Both install to `%LOCALAPPDATA%\makima` and add it to your user PATH. Override with `MAKIMA_INSTALL_DIR` / `$env:MAKIMA_INSTALL_DIR`.
 
-### Living on the edge (main branch)
+### Living on the edge (mistress branch)
 
 ```sh
-cargo install --locked --git https://github.com/lun-4/makima.git makima
+cargo install --locked --git https://github.com/lun-4/makima.git maki
 ```
+
+The package is still named `maki`; it installs the `makima` command. Add `--tag v0.5.0` to build a release instead of the latest commit.
 
 ### With Nix
 
