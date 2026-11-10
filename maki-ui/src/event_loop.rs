@@ -8492,7 +8492,7 @@ mod tests {
             let config = target.actor().unwrap().effective_config().unwrap();
             assert_eq!(
                 items.iter().any(|spec| spec == "thinking=high"),
-                config.model.supports_thinking()
+                config.model.supports_thinking() == Some(true)
             );
             assert_eq!(
                 items.iter().any(|spec| spec == "fast=true"),

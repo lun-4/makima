@@ -269,7 +269,8 @@ pub struct Model {
     pub provider: Arc<str>,
     pub tier: ModelTier,
     pub tool_examples: Option<bool>,
-    /// `None` when the descriptor does not say, which reads as no thinking.
+    /// `None` when the descriptor does not say, which only rules thinking out
+    /// for a request; a saved level waits for discovery.
     pub thinking_support: Option<ThinkingSupport>,
     pub vision: Option<bool>,
     pub fast_support: Option<FastSupport>,
@@ -306,9 +307,11 @@ impl Model {
         }
     }
 
-    pub fn supports_thinking(&self) -> bool {
+    /// `None` while the descriptor has not answered, which happens before a
+    /// provider's discovery or prepare says whether the model thinks.
+    pub fn supports_thinking(&self) -> Option<bool> {
         self.thinking_support
-            .is_some_and(|thinking| thinking != ThinkingSupport::No)
+            .map(|thinking| thinking != ThinkingSupport::No)
     }
 
     pub fn requires_thinking(&self) -> bool {
@@ -851,5 +854,15 @@ mod tests {
             }
         );
         assert_eq!(COUNTERS.billed(None).cost, None);
+    }
+
+    #[test]
+    fn thinking_support_is_unknown_until_the_descriptor_answers() {
+        let mut model = Model::from_spec("anthropic/claude-opus-5").unwrap();
+        assert_eq!(model.supports_thinking(), Some(true));
+        model.thinking_support = None;
+        assert_eq!(model.supports_thinking(), None);
+        model.thinking_support = Some(ThinkingSupport::No);
+        assert_eq!(model.supports_thinking(), Some(false));
     }
 }

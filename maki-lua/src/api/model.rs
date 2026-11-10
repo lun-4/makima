@@ -41,7 +41,10 @@ pub(crate) fn model_table(lua: &Lua, model: &Model) -> LuaResult<Table> {
     table.set("provider", model.provider.to_string())?;
     table.set("id", model.id.clone())?;
     table.set("tier", model.tier.to_string())?;
-    table.set("supports_thinking", model.supports_thinking())?;
+    table.set(
+        "supports_thinking",
+        model.supports_thinking().unwrap_or(false),
+    )?;
     table.set("supports_fast", model.supports_fast())?;
     table.set("context_window", model.context_window)?;
     table.set("max_output_tokens", model.max_output_tokens)?;

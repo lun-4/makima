@@ -567,7 +567,7 @@ impl RequestOptions {
     /// down to `Off` when unsupported, up to minimal effort when required.
     pub fn clamped(self, model: &crate::model::Model) -> Self {
         Self {
-            thinking: if !model.supports_thinking() {
+            thinking: if model.supports_thinking() != Some(true) {
                 ThinkingConfig::Off
             } else if model.requires_thinking() && !self.thinking.enabled() {
                 ThinkingConfig::Effort(Effort::Minimal)

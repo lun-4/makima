@@ -1,5 +1,5 @@
 use maki_config::SessionDefaults;
-use maki_providers::{Model, ThinkingSupport};
+use maki_providers::Model;
 use maki_storage::sessions::{Prefs, SessionMeta};
 
 /// The toggles a session starts on, for every frontend. A session that has
@@ -25,7 +25,7 @@ pub fn resolve(
     SessionDefaults {
         fast: (meta.fast || blank && config.fast) && model.supports_fast(),
         workflow: meta.workflow || blank && config.workflow,
-        thinking: thinking.filter(|_| model.thinking_support != Some(ThinkingSupport::No)),
+        thinking: thinking.filter(|_| model.supports_thinking() != Some(false)),
     }
 }
 
