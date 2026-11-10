@@ -16,6 +16,11 @@ local UNKNOWN_TASK_ERR = "unknown task_id"
 local TASK_ACCESS_ERR = "task is owned by another agent branch"
 local TURN_WAIT_TIMEOUT = "agent turn wait timed out"
 local TASK_CLOSED_ERR = "task was despawned before its message was admitted"
+local QUOTE_BAR = "│ "
+local SEND_FAILED_PREFIX = "Send failed: "
+local SPAWN_FAILED_PREFIX = "Spawn failed: "
+local DESPAWN_FAILED_PREFIX = "Despawn failed: "
+local DETAILS_HINT = "Details (click to expand)"
 local BODY_INDENT_COLS = 4
 local MIN_MD_WIDTH = 20
 local DEFAULT_OUTPUT_LINES = 5
@@ -372,21 +377,17 @@ local function spawn(spec, input, ctx)
   return { task_id = task_id, turn_id = admitted }, nil
 end
 
--- task_spawn -----------------------------------------------------------------
+local function rendered_reply(rendered, output, is_error, state)
+  rendered.llm_output = output
+  rendered.is_error = is_error
+  rendered.state = state
+  return rendered
+end
 
-local function spawn_handler(input, ctx)
-  local spec, err = prepare(input, ctx)
-  if err then
-    return err
-  end
-  local ok, task_id, spawn_err = pcall(spawn, spec, input, ctx)
-  if not ok then
-    return { llm_output = tostring(task_id), is_error = true }
-  end
-  if spawn_err then
-    return { llm_output = spawn_err, is_error = true }
-  end
-  return { llm_output = maki.json.encode(task_id) }
+local function label_buf(text)
+  local buf = maki.ui.buf()
+  buf:line(text)
+  return buf
 end
 
 local function resolve_task(task_id)
@@ -400,40 +401,6 @@ local function resolve_task(task_id)
   return task, nil
 end
 
--- task_send ------------------------------------------------------------------
-
-local send_schema = {
-  type = "object",
-  required = { "task_id", "message" },
-  additionalProperties = false,
-  properties = {
-    task_id = { type = "string", description = "Task id returned by task_spawn." },
-    message = {
-      type = "string",
-      description = "Follow-up instructions for the subagent.",
-    },
-  },
-}
-
-local function send_handler(input, ctx)
-  local task, access_err = resolve_task(input.task_id)
-  if not task then
-    return { llm_output = access_err, is_error = true }
-  end
-  local mode, mode_err = current_mode(ctx)
-  if mode_err then
-    return { llm_output = mode_err, is_error = true }
-  end
-  if task.writes and mode == "plan" then
-    return { llm_output = GENERAL_SEND_IN_PLAN_ERR, is_error = true }
-  end
-  local ok, err = enqueue(task, input.message, ctx)
-  if not ok then
-    return { llm_output = err, is_error = true }
-  end
-  return { llm_output = maki.json.encode({ queued = true, turn_id = ok }) }
-end
-
 -- task_despawn ---------------------------------------------------------------
 
 local despawn_schema = {
@@ -444,22 +411,6 @@ local despawn_schema = {
     task_id = { type = "string", description = "Task id returned by task_spawn." },
   },
 }
-
-local function despawn_handler(input, ctx)
-  local task, access_err = resolve_task(input.task_id)
-  if not task then
-    return { llm_output = access_err, is_error = true }
-  end
-  fail_task(task, TASK_CLOSED_ERR, ctx)
-  tasks[input.task_id] = nil
-  for i, id in ipairs(task_order) do
-    if id == input.task_id then
-      table.remove(task_order, i)
-      break
-    end
-  end
-  return { llm_output = maki.json.encode({ ok = true }) }
-end
 
 local wait_schema = {
   type = "object",
@@ -482,10 +433,74 @@ local function wait_label(input, state)
   return input.task_id:sub(-8)
 end
 
-local function wait_header(input, state)
+-- Shows {text} as plain lines at once and swaps in its Markdown rendering
+-- from a background task, then calls {on_rendered} so the caller redraws.
+-- Rendering hops to the highlight thread, which a busy machine can make slow,
+-- so a tool call must never wait on it. Unfinished so callers can append a
+-- fallback line before `view:finish()`. A `prefix` span starts every line,
+-- narrowing the wrap width to fit it.
+local function markdown_preview(text, ctx, prefix, on_rendered)
+  local tol = ctx and ctx:tool_output_lines()
+  local preview = maki.ui.buf()
+  local view = ToolView.new(preview, {
+    max_lines = (tol and tol.task_spawn) or DEFAULT_OUTPUT_LINES,
+    keep = "head",
+    max_line_bytes = output_limits.DEFAULT_MAX_LINE_BYTES,
+  })
+  if type(text) ~= "string" or text == "" then
+    return preview, view
+  end
+  local function append_lines(lines)
+    for _, line in ipairs(lines) do
+      if prefix then
+        table.insert(line, 1, { prefix, "dim" })
+      end
+      view:append(line)
+    end
+  end
+  local plain = {}
+  for _, line in ipairs(maki.split(text, "\n")) do
+    plain[#plain + 1] = { { line } }
+  end
+  append_lines(plain)
+  local prefix_cols = prefix and utf8.len(prefix) or 0
+  local width = math.max(maki.ui.terminal_size().cols - BODY_INDENT_COLS - prefix_cols, MIN_MD_WIDTH)
+  maki.async.run(function()
+    local ok, lines = pcall(maki.ui.markdown, text, width)
+    if not ok then
+      return
+    end
+    view:clear()
+    append_lines(lines)
+    view:finish()
+    on_rendered()
+  end)
+  return preview, view
+end
+
+local function details_view(status, style, preview, view, details)
   local buf = maki.ui.buf()
-  buf:line(wait_label(input, state))
-  return buf
+  local function render()
+    buf:set_lines({ { { status, style } } })
+    if preview:len() > 0 then
+      buf:line("")
+      buf:lines(preview:get_lines())
+    end
+    if view.expanded then
+      buf:line("")
+      for _, detail in ipairs(details) do
+        buf:line({ { detail, "dim" } })
+      end
+    elseif view.skipped < 2 then
+      buf:line({ { DETAILS_HINT, "dim" } })
+    end
+  end
+  render()
+  buf:on("click", function()
+    view:toggle()
+    render()
+  end)
+  return buf, render
 end
 
 local function wait_view(input, output, is_error, ctx, state)
@@ -515,86 +530,173 @@ local function wait_view(input, output, is_error, ctx, state)
     status = status .. " · " .. maki.ui.humantime(result.duration_ms / 1000)
   end
 
-  local tol = ctx:tool_output_lines()
-  local preview = maki.ui.buf()
-  local view = ToolView.new(preview, {
-    max_lines = (tol and tol.task_spawn) or DEFAULT_OUTPUT_LINES,
-    keep = "head",
-    max_line_bytes = output_limits.DEFAULT_MAX_LINE_BYTES,
-  })
-  if type(report) == "string" and report ~= "" then
-    local ok, lines =
-      pcall(maki.ui.markdown, report, math.max(maki.ui.terminal_size().cols - BODY_INDENT_COLS, MIN_MD_WIDTH))
-    if ok then
-      for _, line in ipairs(lines) do
-        view:append(line)
-      end
-    else
-      view:append_text(report)
-    end
-  elseif envelope.status == "done" and style ~= "error" then
+  local redraw
+  local preview, view = markdown_preview(report, ctx, nil, function()
+    redraw()
+  end)
+  if (type(report) ~= "string" or report == "") and envelope.status == "done" and style ~= "error" then
     view:append({
       { result.captured ~= nil and "Structured result available in details." or "No report returned.", "dim" },
     })
   end
   view:finish()
 
-  local buf = maki.ui.buf()
+  local details = { "Task: " .. input.task_id }
+  local turn_id = result.turn_id or input.turn_id
+  if turn_id then
+    details[#details + 1] = "Turn: " .. turn_id
+  end
+  if result.input_tokens or result.output_tokens then
+    details[#details + 1] = "Tokens: "
+      .. tostring(result.input_tokens or 0)
+      .. " input, "
+      .. tostring(result.output_tokens or 0)
+      .. " output"
+  end
+  if result.captured ~= nil then
+    details[#details + 1] = "Captured: "
+      .. maki.text.truncate_line(maki.json.encode(result.captured), output_limits.DEFAULT_MAX_LINE_BYTES)
+  end
+  local body
+  body, redraw = details_view(status, style, preview, view, details)
+  return { body = body, header = label_buf(wait_label(input, state)) }
+end
+
+local function send_label(input, state)
+  if state and state.description then
+    return 'To "' .. state.description .. '"'
+  end
+  return "To " .. input.task_id:sub(-8)
+end
+
+-- Builds the quoted message before the handler admits any work and returns a
+-- finisher for the result. A child that runs while its parent is still busy
+-- can finish and have its result delivered ahead of the parent's next
+-- request. The Markdown may land while the handler waits on admission, so
+-- the body exists from the start. Clicks toggle the truncated view, and a
+-- failure line follows the quote so the user still sees what was sent.
+local function quote_view(text, ctx, failed_prefix, header_text)
+  local body = maki.ui.buf()
+  local quote, view, failure
   local function render()
-    buf:set_lines({ { { status, style } } })
-    if preview:len() > 0 then
-      buf:line("")
-      buf:lines(preview:get_lines())
-    end
-    if view.expanded then
-      buf:line("")
-      buf:line({ { "Task: " .. input.task_id, "dim" } })
-      local turn_id = result.turn_id or input.turn_id
-      if turn_id then
-        buf:line({ { "Turn: " .. turn_id, "dim" } })
-      end
-      if result.input_tokens or result.output_tokens then
-        buf:line({
-          {
-            "Tokens: "
-              .. tostring(result.input_tokens or 0)
-              .. " input, "
-              .. tostring(result.output_tokens or 0)
-              .. " output",
-            "dim",
-          },
-        })
-      end
-      if result.captured ~= nil then
-        buf:line({
-          {
-            "Captured: "
-              .. maki.text.truncate_line(maki.json.encode(result.captured), output_limits.DEFAULT_MAX_LINE_BYTES),
-            "dim",
-          },
-        })
-      end
-    elseif view.skipped < 2 then
-      buf:line({ { "Details (click to expand)", "dim" } })
+    body:set_lines(quote:get_lines())
+    if failure then
+      body:line({ { failure, "error" } })
     end
   end
+  quote, view = markdown_preview(text, ctx, QUOTE_BAR, render)
+  view:finish()
   render()
-  buf:on("click", function()
+  body:on("click", function()
     view:toggle()
     render()
   end)
-  return { body = buf, header = wait_header(input, state) }
+  return function(output, is_error)
+    failure = is_error and failed_prefix .. output or nil
+    render()
+    return { body = body, header = label_buf(header_text) }
+  end
+end
+
+local function send_view(input, ctx, state)
+  return quote_view(input.message, ctx, SEND_FAILED_PREFIX, send_label(input, state))
+end
+
+local function spawn_view(input, ctx)
+  return quote_view(input.prompt, ctx, SPAWN_FAILED_PREFIX, input.description)
+end
+
+local function despawn_view(input, output, is_error, state)
+  local body = maki.ui.buf()
+  if is_error then
+    body:line({ { DESPAWN_FAILED_PREFIX .. output, "error" } })
+  end
+  return { body = body, header = label_buf(wait_label(input, state)) }
+end
+
+-- task_send ------------------------------------------------------------------
+
+local send_schema = {
+  type = "object",
+  required = { "task_id", "message" },
+  additionalProperties = false,
+  properties = {
+    task_id = { type = "string", description = "Task id returned by task_spawn." },
+    message = {
+      type = "string",
+      description = "Follow-up instructions for the subagent.",
+    },
+  },
+}
+
+local function send_handler(input, ctx)
+  local task, access_err = resolve_task(input.task_id)
+  local state = task and { description = task.description } or nil
+  local finish_view = send_view(input, ctx, state)
+  local function reply(output, is_error)
+    return rendered_reply(finish_view(output, is_error), output, is_error, state)
+  end
+  if not task then
+    return reply(access_err, true)
+  end
+  local mode, mode_err = current_mode(ctx)
+  if mode_err then
+    return reply(mode_err, true)
+  end
+  if task.writes and mode == "plan" then
+    return reply(GENERAL_SEND_IN_PLAN_ERR, true)
+  end
+  local ok, err = enqueue(task, input.message, ctx)
+  if not ok then
+    return reply(err, true)
+  end
+  return reply(maki.json.encode({ queued = true, turn_id = ok }))
+end
+
+local function spawn_handler(input, ctx)
+  local finish_view = spawn_view(input, ctx)
+  local function reply(output, is_error)
+    return rendered_reply(finish_view(output, is_error), output, is_error)
+  end
+  local spec, err = prepare(input, ctx)
+  if err then
+    return reply(err.llm_output, true)
+  end
+  local ok, task_id, spawn_err = pcall(spawn, spec, input, ctx)
+  if not ok then
+    return reply(tostring(task_id), true)
+  end
+  if spawn_err then
+    return reply(spawn_err, true)
+  end
+  return reply(maki.json.encode(task_id))
+end
+
+local function despawn_handler(input, ctx)
+  local task, access_err = resolve_task(input.task_id)
+  local state = task and { description = task.description } or nil
+  local function reply(output, is_error)
+    return rendered_reply(despawn_view(input, output, is_error, state), output, is_error, state)
+  end
+  if not task then
+    return reply(access_err, true)
+  end
+  fail_task(task, TASK_CLOSED_ERR, ctx)
+  tasks[input.task_id] = nil
+  for i, id in ipairs(task_order) do
+    if id == input.task_id then
+      table.remove(task_order, i)
+      break
+    end
+  end
+  return reply(maki.json.encode({ ok = true }))
 end
 
 local function wait_handler(input, ctx)
   local task, access_err = resolve_task(input.task_id)
   local state = task and { description = task.description } or nil
   local function reply(output, is_error)
-    local rendered = wait_view(input, output, is_error, ctx, state)
-    rendered.llm_output = output
-    rendered.is_error = is_error
-    rendered.state = state
-    return rendered
+    return rendered_reply(wait_view(input, output, is_error, ctx, state), output, is_error, state)
   end
   if not task then
     return reply(access_err, true)
@@ -623,20 +725,24 @@ end
 local function restore_wait(input, output, is_error, ctx)
   return wait_view(input, output, is_error, ctx, ctx:state())
 end
+
+local function restore_send(input, output, is_error, ctx)
+  return send_view(input, ctx, ctx:state())(output, is_error)
+end
+
+local function restore_spawn(input, output, is_error, ctx)
+  return spawn_view(input, ctx)(output, is_error)
+end
+
+local function task_header(input)
+  return wait_label(input, resolve_task(input.task_id))
+end
 local function header(input)
   return input.description
 end
 
--- Standalone runs render markdown on the Rust side (format = "markdown");
--- this mirrors that for restore and batch children, which build the body here.
-local function restore(_input, output, is_error, ctx)
-  local tol = ctx:tool_output_lines()
-  return ToolView.restore_markdown(output, is_error, {
-    max_lines = (tol and tol.task_spawn) or DEFAULT_OUTPUT_LINES,
-    keep = "head",
-    max_line_bytes = output_limits.DEFAULT_MAX_LINE_BYTES,
-    width = math.max(maki.ui.terminal_size().cols - BODY_INDENT_COLS, MIN_MD_WIDTH),
-  })
+local function restore_despawn(input, output, is_error, ctx)
+  return despawn_view(input, output, is_error, ctx:state())
 end
 
 maki.api.register_tool({
@@ -649,7 +755,7 @@ maki.api.register_tool({
   schema = spawn_schema,
   handler = spawn_handler,
   header = header,
-  restore = restore,
+  restore = restore_spawn,
 })
 
 maki.api.register_tool({
@@ -659,10 +765,7 @@ maki.api.register_tool({
   audiences = { "main", "general_sub", "interpreter", "workflow" },
   schema = wait_schema,
   handler = wait_handler,
-  header = function(input)
-    local task = resolve_task(input.task_id)
-    return wait_label(input, task)
-  end,
+  header = task_header,
   restore = restore_wait,
 })
 
@@ -675,9 +778,9 @@ maki.api.register_tool({
   schema = send_schema,
   handler = send_handler,
   header = function(input)
-    return "task_send → " .. input.task_id
+    return send_label(input, resolve_task(input.task_id))
   end,
-  restore = restore,
+  restore = restore_send,
 })
 
 maki.api.register_tool({
@@ -688,10 +791,8 @@ maki.api.register_tool({
   examples = {},
   schema = despawn_schema,
   handler = despawn_handler,
-  header = function(input)
-    return "task_despawn → " .. input.task_id
-  end,
-  restore = restore,
+  header = task_header,
+  restore = restore_despawn,
 })
 
 local SUBAGENT_TYPES = {
