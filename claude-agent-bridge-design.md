@@ -4,22 +4,22 @@ Status: first version implemented on the #44 branch, in `claude-agent-bridge/` a
 
 ## Goal
 
-Add a Claude Agent provider to Maki using Anthropic's unmodified TypeScript Agent SDK and the user's installed Claude Code executable. Maki keeps its agent loop, tools, permissions, user interface and canonical conversation history. A separate TypeScript bridge owns SDK sessions and translates between the SDK and a local HTTP API that a Lua provider calls.
+Add a Claude Agent provider to Makima using Anthropic's unmodified TypeScript Agent SDK and the user's installed Claude Code executable. Makima keeps its agent loop, tools, permissions, user interface and canonical conversation history. A separate TypeScript bridge owns SDK sessions and translates between the SDK and a local HTTP API that a Lua provider calls.
 
 The integration follows OpenCode's Claude Agent provider ([PR #58782](https://github.com/anomalyco/opencode/pull/58782)). It does not change or reimplement the Agent SDK. The bridge is application code against the SDK's public API.
 
-The bridge is also the smoke test for the provider API: it is the most stateful provider Maki would have, so anything the API is missing shows up here first.
+The bridge is also the smoke test for the provider API: it is the most stateful provider Makima would have, so anything the API is missing shows up here first.
 
 ## Compliance
 
-The OpenCode PR author [states](https://github.com/anomalyco/opencode/pull/58782#issuecomment-6527771235) that OpenCode received Anthropic's permission, which shows that FOSS coding agents such as Maki and OpenCode can use the Agent SDK for coding agent purposes. The SDK's [branding guidelines](https://code.claude.com/docs/en/agent-sdk/overview#branding-guidelines) allow the name "Claude Agent" and not "Claude Code", so the provider id is `claude-agent`.
+The OpenCode PR author [states](https://github.com/anomalyco/opencode/pull/58782#issuecomment-6527771235) that OpenCode received Anthropic's permission, which shows that FOSS coding agents such as Makima and OpenCode can use the Agent SDK for coding agent purposes. The SDK's [branding guidelines](https://code.claude.com/docs/en/agent-sdk/overview#branding-guidelines) allow the name "Claude Agent" and not "Claude Code", so the provider id is `claude-agent`.
 
 ## Architecture
 
 ```text
-Maki agent loop and tool dispatcher
+Makima agent loop and tool dispatcher
         |
-        | provider request, events and response (maki-providers)
+        | provider request, events and response (makima-providers)
         v
 Lua provider `claude-agent` (plugins/providers)
         |
@@ -32,23 +32,23 @@ TypeScript Agent Bridge
 Claude Agent SDK -> Claude Code executable
 ```
 
-Maki sends a model request to the Lua provider. The provider forwards it to the bridge and turns the bridge's SSE events into Maki provider events. The bridge starts or resumes a Claude SDK session and offers Maki's tools to Claude through an SDK MCP server.
+Makima sends a model request to the Lua provider. The provider forwards it to the bridge and turns the bridge's SSE events into Makima provider events. The bridge starts or resumes a Claude SDK session and offers Makima's tools to Claude through an SDK MCP server.
 
-When Claude calls a tool, the MCP handler waits. The bridge ends the step with a normal assistant response holding the tool call. Maki applies its permissions and runs the tool, and its next request carries the result. The bridge hands the result to the waiting handler, and the same SDK turn continues.
+When Claude calls a tool, the MCP handler waits. The bridge ends the step with a normal assistant response holding the tool call. Makima applies its permissions and runs the tool, and its next request carries the result. The bridge hands the result to the waiting handler, and the same SDK turn continues.
 
-The bridge never runs Maki tools. Claude Code's built-in tools are off. If the bridge cannot offer Maki's tools, the request fails; it never falls back to Claude Code's tools.
+The bridge never runs Makima tools. Claude Code's built-in tools are off. If the bridge cannot offer Makima's tools, the request fails; it never falls back to Claude Code's tools.
 
 ### Ownership
 
 | Concern | Owner |
 | --- | --- |
-| User interface, agent loop, tool dispatch and permissions | Maki |
-| Canonical history, model selection and compaction | Maki |
-| Translation between Maki provider calls and the bridge API | Lua provider |
+| User interface, agent loop, tool dispatch and permissions | Makima |
+| Canonical history, model selection and compaction | Makima |
+| Translation between Makima provider calls and the bridge API | Lua provider |
 | SDK sessions, MCP handlers, history synchronization | Bridge |
 | Claude runtime and model communication | Claude Agent SDK and Claude Code |
 
-The bridge holds conversation data and can start SDK sessions, but cannot run Maki tools. Every tool call it returns still goes through Maki's dispatch and permission checks.
+The bridge holds conversation data and can start SDK sessions, but cannot run Makima tools. Every tool call it returns still goes through Makima's dispatch and permission checks.
 
 ## What OpenCode does
 
@@ -64,22 +64,22 @@ OpenCode's provider lives in `packages/core/src/plugin/provider/claude-agent` (a
 - **Usage.** Claude Code reports one response's usage several times while streaming and again as a turn total. OpenCode keeps the highest count per response id and takes context size from the last response's input (`language-model/usage.ts`).
 - **Retries.** Claude Code retries failed requests itself, so OpenCode does not retry this provider.
 
-OpenCode gets the identity it needs from its own chat session id and a fork header. Maki's provider API gives the bridge the same through `invocation` and `invocation.previous`.
+OpenCode gets the identity it needs from its own chat session id and a fork header. Makima's provider API gives the bridge the same through `invocation` and `invocation.previous`.
 
 ## The provider API the bridge uses
 
 All of this exists on the #44 branch.
 
-- **Registration.** `maki.api.register_provider` with `models`, `discover` (forwards to the bridge's model list), `auth` (a login method that runs `claude auth login` through `ui:run`, which only `maki auth login` supports), `auth_status` (the bridge's status) and `prepare`. Documented on `register_provider` in `maki-lua/src/api/provider.rs`.
-- **Request.** `stream(ctx, request, emit)` gets `model` (`id`, `max_output_tokens`, `context_window`), `system`, `messages`, `tools`, `thinking` (`{ kind = "off" | "adaptive" }`, `{ kind = "effort", level }` or `{ kind = "budget", tokens }`), `fast`, `session_id` and `invocation` (`conversation_id`, `operation_id`, `attempt`, `purpose` of `agent`, `compaction` or `isolated`, and `agent_id`). `(operation_id, attempt)` names one stream attempt. Messages use Maki's content blocks: `text`, `thinking`, `redacted_thinking`, `tool_use`, `tool_result` (string `content`, optional `is_error`) and `image`.
+- **Registration.** `makima.api.register_provider` with `models`, `discover` (forwards to the bridge's model list), `auth` (a login method that runs `claude auth login` through `ui:run`, which only `makima auth login` supports), `auth_status` (the bridge's status) and `prepare`. Documented on `register_provider` in `makima-lua/src/api/provider.rs`.
+- **Request.** `stream(ctx, request, emit)` gets `model` (`id`, `max_output_tokens`, `context_window`), `system`, `messages`, `tools`, `thinking` (`{ kind = "off" | "adaptive" }`, `{ kind = "effort", level }` or `{ kind = "budget", tokens }`), `fast`, `session_id` and `invocation` (`conversation_id`, `operation_id`, `attempt`, `purpose` of `agent`, `compaction` or `isolated`, and `agent_id`). `(operation_id, attempt)` names one stream attempt. Messages use Makima's content blocks: `text`, `thinking`, `redacted_thinking`, `tool_use`, `tool_result` (string `content`, optional `is_error`) and `image`.
 - **`invocation.previous`** (`id`, `relation` of `continues` or `branches`, `shared`) on every request of a conversation started from another one. See [conversation lineage](.agents/makima-plans/44-providers-lua.md#conversation-lineage).
 - **Events.** `emit` takes `text_delta`, `thinking_delta`, `thinking_block_end`, `tool_use_start` (`id`, `name`) and `prompt_progress`, and returns false once the call is over. Tool arguments arrive only in the final message.
 - **Response.** `stream` returns `{ message, usage, stop_reason }`, with usage as `input_tokens`, `output_tokens`, `cache_creation_input_tokens` and `cache_read_input_tokens`.
 - **Errors.** nil plus an error table: `kind = "config"` for what only the user can fix, `status` and `message` (optional `retry_after`) for an API error, `overflow = true` when the request does not fit the context.
 - **`retry`** on the error table (`rate_limit`, `transient`, `connect`, `timeout`, `none`). An error without it is not retried. See [retry classes](.agents/makima-plans/44-providers-lua.md#retry-classes).
-- **Conversation end.** The optional instance method `end_conversation(ctx, conversation_id, reason)`, with `cancelled`, `closed`, `compacted` or `rewound`. The host calls it detached after every stream for that id is dropped, including when a turn is cancelled while Maki waits on a tool after a tool-use response.
-- **Transport.** `ctx.send` is `maki.net.send` with the `[provider]` timeouts as defaults. It takes `unix_socket`, has no byte cap on streamed bodies, no private-address guard and follows no redirects. The shared `sse` module in `plugins/providers/providers/` parses the step stream.
-- **Process.** `maki.fn.jobstart` can start the bridge, as executable providers start their scripts.
+- **Conversation end.** The optional instance method `end_conversation(ctx, conversation_id, reason)`, with `cancelled`, `closed`, `compacted` or `rewound`. The host calls it detached after every stream for that id is dropped, including when a turn is cancelled while Makima waits on a tool after a tool-use response.
+- **Transport.** `ctx.send` is `makima.net.send` with the `[provider]` timeouts as defaults. It takes `unix_socket`, has no byte cap on streamed bodies, no private-address guard and follows no redirects. The shared `sse` module in `plugins/providers/providers/` parses the step stream.
+- **Process.** `makima.fn.jobstart` can start the bridge, as executable providers start their scripts.
 
 ## Conversation identity and lineage
 
@@ -96,19 +96,19 @@ The bridge keys its state by `conversation_id`. Each conversation has its own SD
 
 Child agents have their own conversation ids and start fresh. Isolated turns and compaction summaries branch from the conversation they copy. Today compaction rewrites old messages, so its `shared` is small and the fork rarely pays off; a compaction that only appends its request (a non-goal of #44, tracked separately) would make it pay off for native providers too. Isolated turns send no tools while the main conversation does, and a different tool set needs a new process, so they also start fresh until they keep the main conversation's tools.
 
-To find fork points, the bridge records for each conversation the SDK session id, how many Maki messages the SDK has seen, and the Claude message uuid that ends each Maki message it wrote or received. Because the host says exactly how many messages are shared, the bridge does not hash histories the way OpenCode does.
+To find fork points, the bridge records for each conversation the SDK session id, how many Makima messages the SDK has seen, and the Claude message uuid that ends each Makima message it wrote or received. Because the host says exactly how many messages are shared, the bridge does not hash histories the way OpenCode does.
 
-The SDK session id stays inside the bridge. It is never interchangeable with any Maki id.
+The SDK session id stays inside the bridge. It is never interchangeable with any Makima id.
 
 ## Concurrency
 
 The bridge serves many conversations at once. A waiting tool or permission prompt in one does not block another. Steps within one conversation are serialized; a second concurrent step for the same conversation gets a conflict. Tool correlation is serial, as in OpenCode.
 
-The bridge limits running processes, queued requests, message sizes and kept state. A conversation whose tools are waiting for Maki is never idle. Abandoned conversations are cleaned up by a bounded orphan policy.
+The bridge limits running processes, queued requests, message sizes and kept state. A conversation whose tools are waiting for Makima is never idle. Abandoned conversations are cleaned up by a bounded orphan policy.
 
 ## HTTP API
 
-The bridge listens on a Unix socket in Maki's state directory, created with user-only permissions. The socket's file permissions authenticate the client, so there is no bearer token and no TCP listener. All requests and responses are JSON except the SSE step stream.
+The bridge listens on a Unix socket in Makima's state directory, created with user-only permissions. The socket's file permissions authenticate the client, so there is no bearer token and no TCP listener. All requests and responses are JSON except the SSE step stream.
 
 | Endpoint | Purpose |
 | --- | --- |
@@ -128,12 +128,12 @@ The Lua provider posts the request it received, unchanged apart from encoding:
   "protocol_version": 1,
   "request": {
     "model": { "id": "claude-sonnet-4-5", "max_output_tokens": 64000, "context_window": 200000 },
-    "system": "Maki system instructions",
+    "system": "Makima system instructions",
     "messages": [{ "role": "user", "content": [{ "type": "text", "text": "Inspect the project." }] }],
     "tools": [{ "name": "read", "description": "Read a file.", "input_schema": { "type": "object" } }],
     "thinking": { "kind": "adaptive" },
     "fast": false,
-    "session_id": "maki-session-1",
+    "session_id": "makima-session-1",
     "invocation": {
       "conversation_id": "c-1",
       "operation_id": "o-1",
@@ -150,7 +150,7 @@ The bridge validates tool names, schemas and model settings and rejects what it 
 
 ### Step response
 
-`text/event-stream`. Each `event` frame holds one Maki provider event. Exactly one terminal frame ends the stream: `done` with the full `{ message, usage, stop_reason }`, or `error` with a Maki error table. EOF without a terminal frame is a failure. SSE comments carry heartbeats while Claude Code is slow or retrying, so the stream stays inside the provider idle timeout.
+`text/event-stream`. Each `event` frame holds one Makima provider event. Exactly one terminal frame ends the stream: `done` with the full `{ message, usage, stop_reason }`, or `error` with a Makima error table. EOF without a terminal frame is a failure. SSE comments carry heartbeats while Claude Code is slow or retrying, so the stream stays inside the provider idle timeout.
 
 ```text
 event: event
@@ -167,9 +167,9 @@ A tool-use response leaves its handlers waiting after the stream closes. Usage f
 
 ### Tool-result continuation
 
-The next request carries Maki's full history. The bridge takes the `tool_result` blocks after the last assistant message, matches each to a waiting call by `tool_use_id`, and rejects missing, duplicate or unknown results before resolving any handler. Image blocks that follow a `tool_result` in the same user message are folded into that call's MCP result. A handler is resolved once.
+The next request carries Makima's full history. The bridge takes the `tool_result` blocks after the last assistant message, matches each to a waiting call by `tool_use_id`, and rejects missing, duplicate or unknown results before resolving any handler. Image blocks that follow a `tool_result` in the same user message are folded into that call's MCP result. A handler is resolved once.
 
-Tool names are encoded MCP-safe with a reversible mapping, and only offered names are routed back to Maki.
+Tool names are encoded MCP-safe with a reversible mapping, and only offered names are routed back to Makima.
 
 A continuation the bridge refuses fails that step with `retry = "none"`, and the bridge stops the conversation's process. The next step starts again from the last reply Claude finished, so one bad request does not leave the conversation stuck.
 
@@ -193,17 +193,17 @@ A disconnect before the terminal frame interrupts the SDK turn. The bridge waits
 | `rewound` | Keep the session for a grace period; a successor continues or forks it at `shared`. |
 | `compacted`, `closed` | Stop the process and discard the session. |
 
-The host does not end conversations at exit and resumes them later, so a conversation's SDK session survives a bridge restart: the bridge saves a record per conversation and resumes the SDK's transcript. Waiting handlers do not survive a restart. Claude's transcript then ends at a tool call nothing will answer, so the bridge forks it at the last reply Claude finished and sends the rest of Maki's history as a checkpoint. Processes stop after 5 minutes idle; a conversation with waiting tools stops after an hour without an answer.
+The host does not end conversations at exit and resumes them later, so a conversation's SDK session survives a bridge restart: the bridge saves a record per conversation and resumes the SDK's transcript. Waiting handlers do not survive a restart. Claude's transcript then ends at a tool call nothing will answer, so the bridge forks it at the last reply Claude finished and sends the rest of Makima's history as a checkpoint. Processes stop after 5 minutes idle; a conversation with waiting tools stops after an hour without an answer.
 
 Forks use `resume` with `forkSession` and `resumeSessionAt`. Each saved fork point names the SDK session it is in, so a fork of a fork can still go back to a point in the first session.
 
 ### Bridge process
 
-The first version is started by hand and found at its socket path. A managed bridge, started by the provider with `maki.fn.jobstart` on first use, follows once the protocol is stable.
+The first version is started by hand and found at its socket path. A managed bridge, started by the provider with `makima.fn.jobstart` on first use, follows once the protocol is stable.
 
 ## Claude Code settings
 
-The bridge passes every setting explicitly and reads none of the user's Claude configuration, following OpenCode's list above: no settings files, hooks, MCP servers, skills, CLAUDE.md, auto memory, auto compaction, away summaries, tool search, advisor tool, non-streaming or refusal fallback, and the three user variables cleared. Maki's own compaction, subagents and plan mode apply. Disabling these is not a sandbox; the executable is the one the user chose, by path or `PATH`.
+The bridge passes every setting explicitly and reads none of the user's Claude configuration, following OpenCode's list above: no settings files, hooks, MCP servers, skills, CLAUDE.md, auto memory, auto compaction, away summaries, tool search, advisor tool, non-streaming or refusal fallback, and the three user variables cleared. Makima's own compaction, subagents and plan mode apply. Disabling these is not a sandbox; the executable is the one the user chose, by path or `PATH`.
 
 ## Lua provider sketch
 
@@ -228,9 +228,9 @@ instance.fetch_usage(ctx):
 
 Tests cover:
 
-- Two agents sharing a Maki session without sharing SDK state.
+- Two agents sharing a Makima session without sharing SDK state.
 - Isolated turns and compaction running while the main conversation waits on a tool.
-- A tool call, Maki's permission decision, the result and the resumed SDK turn.
+- A tool call, Makima's permission decision, the result and the resumed SDK turn.
 - Several tool calls in sequence, unknown tools, missing and duplicate results.
 - Failed tool registration with no fallback to Claude Code's tools.
 - Interrupting a stream, cancelling while a tool waits, late events and a bridge restart.
@@ -246,17 +246,17 @@ The bridge's tests (`npm test`, `just bridge-check`) stand a scripted `Session` 
 - Lineage: `invocation.previous` with `continues` or `branches` and an exact `shared` count from the host, rather than a second stable id, keeping ids across cancels, or the bridge hashing histories.
 - Compaction summaries and isolated turns branch through the same field.
 - Retries: the provider names the retry class on each error; the host only applies budgets.
-- Rich tool results: the bridge folds image blocks into MCP results; Maki's `tool_result` stays a string.
+- Rich tool results: the bridge folds image blocks into MCP results; Makima's `tool_result` stays a string.
 - Transport: a Unix socket with user-only permissions instead of a loopback port and token.
 - Cancellation: the stream's disconnect and `end_conversation`; no cancel endpoint.
-- System prompt: Maki's `request.system` alone, replacing Claude Code's. Every SDK session runs in one bridge directory (`<state>/workdir`), since Maki's tools resolve paths themselves.
+- System prompt: Makima's `request.system` alone, replacing Claude Code's. Every SDK session runs in one bridge directory (`<state>/workdir`), since Makima's tools resolve paths themselves.
 - A bridge that is not running is a config error with the command to start it, not a transport failure to retry.
 
 ## Open
 
-1. A managed bridge process: when to start it, how to find a stale socket, and how Maki checks the bridge's version.
+1. A managed bridge process: when to start it, how to find a stale socket, and how Makima checks the bridge's version.
 2. How long to keep a `cancelled` or `rewound` session for a successor.
-3. Which SDK settings Maki exposes as provider config (base URL, API key, headers, output limit), following OpenCode's mapping.
+3. Which SDK settings Makima exposes as provider config (base URL, API key, headers, output limit), following OpenCode's mapping.
 4. Cost: subscription logins report $0; API key and cloud logins need pricing for the model Claude resolves.
 5. Keeping the main conversation's tools in isolated turns, so they can fork instead of starting fresh.
 6. `fetch_usage`: the rate-limit information Claude Code reports is not passed on yet.

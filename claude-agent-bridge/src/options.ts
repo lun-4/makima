@@ -3,10 +3,10 @@ import type { Options } from "@anthropic-ai/claude-agent-sdk"
 import type { StepRequest } from "./protocol.ts"
 import type { Record } from "./records.ts"
 import type { Effort } from "./session.ts"
-import { hooks, PREFIX, PendingTools, server } from "./tools.ts"
+import { hooks, PREFIX, PendingTools, SERVER_NAME, server } from "./tools.ts"
 
-// Claude Code features Maki has its own version of, or that would let the
-// user's Claude configuration leak into Maki's requests.
+// Claude Code features Makima has its own version of, or that would let the
+// user's Claude configuration leak into Makima's requests.
 const ISOLATION_ENV: { [name: string]: string | undefined } = {
   CLAUDE_CODE_DISABLE_CLAUDE_MDS: "1",
   CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
@@ -14,13 +14,13 @@ const ISOLATION_ENV: { [name: string]: string | undefined } = {
   CLAUDE_CODE_ENABLE_AWAY_SUMMARY: "0",
   ENABLE_TOOL_SEARCH: "false",
   CLAUDE_CODE_DISABLE_ADVISOR_TOOL: "1",
-  // Raised so Maki's own output limits apply instead.
+  // Raised so Makima's own output limits apply instead.
   MAX_MCP_OUTPUT_TOKENS: "200000",
   // Skips OAuth, so a subscription login would not be used.
   CLAUDE_CODE_SIMPLE: undefined,
-  // Would override the effort Maki asks for.
+  // Would override the effort Makima asks for.
   CLAUDE_CODE_EFFORT_LEVEL: undefined,
-  // Would cut off Maki tools that wait on the user, such as a permission prompt.
+  // Would cut off Makima tools that wait on the user, such as a permission prompt.
   MCP_TOOL_TIMEOUT: undefined,
 }
 
@@ -42,7 +42,7 @@ function thinking(request: StepRequest): Options["thinking"] {
     case "budget":
       return { type: "enabled", budgetTokens: request.thinking.tokens, display: "summarized" }
     default:
-      // Without summaries Maki would have no reasoning to show.
+      // Without summaries Makima would have no reasoning to show.
       return { type: "adaptive", display: "summarized" }
   }
 }
@@ -56,7 +56,7 @@ export function launchKey(request: StepRequest): string {
 }
 
 // Settings for one step's process, with every Claude Code feature that
-// duplicates Maki's turned off and no configuration read from the user.
+// duplicates Makima's turned off and no configuration read from the user.
 export function base(environment: Environment): Options {
   return {
     pathToClaudeCodeExecutable: environment.executable,
@@ -89,7 +89,7 @@ export function sessionOptions(
     includePartialMessages: true,
     persistSession: persist,
     hooks: hooks(pending),
-    mcpServers: request.tools.length > 0 ? { maki: server(request.tools, pending) } : {},
+    mcpServers: request.tools.length > 0 ? { [SERVER_NAME]: server(request.tools, pending) } : {},
   }
   if (record.session) {
     options.resume = record.session

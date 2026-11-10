@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { BridgeError } from "../src/protocol.ts"
+import { SERVER_NAME } from "../src/tools.ts"
 import type { StepRequest } from "../src/protocol.ts"
 import { assistant, harness, READ, request, result, sdk, SESSION, text, textTurn, toolTurn, user } from "./fake.ts"
 
@@ -89,7 +90,7 @@ test("a successor that continues takes over the process", async () => {
   assert.equal(h.records.saved.get("c2")!.seen, 4)
 })
 
-test("after a cancel, Claude keeps its partial reply and Maki's copy is left out", async () => {
+test("after a cancel, Claude keeps its partial reply and Makima's copy is left out", async () => {
   const h = harness([[[sdk.start("m")], textTurn("ok")]])
   const abort = new AbortController()
   const running = h.step(request("c1", [GO]), abort.signal)
@@ -160,7 +161,7 @@ test("a logged-out Claude Code is a config error", async () => {
 
 test("a tool server that did not connect fails the step", async () => {
   const turn = toolTurn("t1")
-  turn[0] = sdk.init([{ name: "maki", status: "failed" }])
+  turn[0] = sdk.init([{ name: SERVER_NAME, status: "failed" }])
   const h = harness([[turn]])
   await rejects(h.step(request("c", [GO], {}, [READ])), (error) => assert.equal(error.table.retry, "none"))
   assert.equal(h.opened(), 1)

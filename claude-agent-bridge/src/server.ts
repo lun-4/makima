@@ -11,7 +11,7 @@ import { BridgeError } from "./protocol.ts"
 import type { Probe } from "./session.ts"
 
 const MAX_BODY_BYTES = 64 * 1024 * 1024
-// Inside Maki's provider idle timeout while Claude Code is slow or retrying.
+// Inside Makima's provider idle timeout while Claude Code is slow or retrying.
 const HEARTBEAT_MS = 15_000
 const PROBE_TTL_MS = 60_000
 const END_PATH = /^\/v1\/conversations\/([^/]+)\/end$/
@@ -99,7 +99,7 @@ export function handler(conversations: Conversations, probeClaude: ProbeClaude) 
     let finished = false
     let heartbeat: NodeJS.Timeout | undefined
     response.on("close", () => {
-      if (!finished) abort.abort(new Error("Maki closed the step"))
+      if (!finished) abort.abort(new Error("Makima closed the step"))
     })
     const sink = {
       open() {

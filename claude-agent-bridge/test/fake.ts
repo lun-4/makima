@@ -5,7 +5,7 @@ import type { Limits } from "../src/conversations.ts"
 import type { Block, Message, StepRequest, Tool } from "../src/protocol.ts"
 import { memoryRecords } from "../src/records.ts"
 import type { Effort, Probe, ResultMessage, Session } from "../src/session.ts"
-import { PREFIX } from "../src/tools.ts"
+import { PREFIX, SERVER_NAME } from "../src/tools.ts"
 
 export const SESSION = "11111111-1111-4111-8111-111111111111"
 export const READ: Tool = { name: "read", description: "Read a file.", input_schema: { type: "object" } }
@@ -19,7 +19,7 @@ function message(value: object): SDKMessage {
 }
 
 export const sdk = {
-  init: (servers: { name: string; status: string }[] = [{ name: "maki", status: "connected" }]) =>
+  init: (servers: { name: string; status: string }[] = [{ name: SERVER_NAME, status: "connected" }]) =>
     message({ type: "system", subtype: "init", mcp_servers: servers }),
   start: (id: string, usage = { input_tokens: 10, output_tokens: 1 }) =>
     message({ type: "stream_event", event: { type: "message_start", message: { id, usage } } }),
@@ -55,7 +55,7 @@ export function textTurn(text: string, id = "msg-text"): SDKMessage[] {
   ]
 }
 
-// A reply that calls Maki's `read`, up to the end of that response.
+// A reply that calls Makima's `read`, up to the end of that response.
 export function toolTurn(callId: string, id = "msg-tool"): SDKMessage[] {
   return [
     sdk.init(),

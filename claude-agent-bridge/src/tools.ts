@@ -5,7 +5,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
 import type { HookCallback, McpSdkServerConfigWithInstance, Options } from "@anthropic-ai/claude-agent-sdk"
 import type { Tool } from "./protocol.ts"
 
-export const SERVER_NAME = "maki"
+export const SERVER_NAME = "makima"
 export const PREFIX = `mcp__${SERVER_NAME}__`
 const NAME_LIMIT = 64
 const HASH_LENGTH = 10
@@ -23,7 +23,7 @@ export function shortName(name: string): string {
   return `${name.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, limit - HASH_LENGTH - 1)}_${hash}`
 }
 
-// The Maki name of a tool Claude called, or undefined for one Maki did not offer.
+// The Makima name of a tool Claude called, or undefined for one Makima did not offer.
 export function originalName(claudeName: string, tools: readonly Tool[]): string | undefined {
   return tools.find((tool) => PREFIX + shortName(tool.name) === claudeName)?.name
 }
@@ -34,7 +34,7 @@ interface Call {
   resolved: boolean
 }
 
-// MCP handlers waiting for Maki's results. The handler cannot see Claude's
+// MCP handlers waiting for Makima's results. The handler cannot see Claude's
 // tool-use id, so the PreToolUse hook names it just before the call. Tools
 // are marked not read-only, so Claude Code runs them one at a time and the
 // hook and handler always pair up.
@@ -61,7 +61,7 @@ export class PendingTools {
   async call(name: string): Promise<CallToolResult> {
     const id = this.next
     this.next = undefined
-    if (!id) throw new Error("Claude called a Maki tool without a PreToolUse id")
+    if (!id) throw new Error("Claude called a Makima tool without a PreToolUse id")
     const result = await this.expect(id, name).result.promise
     this.calls.delete(id)
     return result
@@ -107,7 +107,7 @@ export function server(tools: readonly Tool[], pending: PendingTools): McpSdkSer
   mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: definitions }))
   mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     const name = PREFIX + request.params.name
-    if (!originalName(name, tools)) throw new Error(`Claude called a tool Maki did not offer: ${name}`)
+    if (!originalName(name, tools)) throw new Error(`Claude called a tool Makima did not offer: ${name}`)
     return pending.call(name)
   })
   // The SDK only calls `connect` on the instance, which the low-level server

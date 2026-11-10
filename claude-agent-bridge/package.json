@@ -1,13 +1,13 @@
 {
-  "name": "maki-claude-agent-bridge",
+  "name": "makima-claude-agent-bridge",
   "private": true,
   "type": "module",
-  "description": "Serves Maki's claude-agent provider through the Claude Agent SDK",
+  "description": "Serves Makima's claude-agent provider through the Claude Agent SDK",
   "engines": {
     "node": ">=24"
   },
   "bin": {
-    "maki-claude-agent-bridge": "src/main.ts"
+    "makima-claude-agent-bridge": "src/main.ts"
   },
   "scripts": {
     "start": "node src/main.ts",

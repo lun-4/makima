@@ -90,7 +90,7 @@ function run(messages: SDKMessage[]) {
   return { translator, events }
 }
 
-test("stream events become Maki events", () => {
+test("stream events become Makima events", () => {
   const { events } = run([
     sdk.start("m"),
     sdk.blockStart(0, { type: "thinking", thinking: "" }),
@@ -163,7 +163,7 @@ for (const [name, setup, final, expected] of [
   ["rate limit", [sdk.assistant("m", [], { error: "rate_limit" })], { is_error: true, result: "" }, { status: 429, retry: "none" }],
   ["server", [], { is_error: true, result: "", api_error_status: 529 }, { status: 529, retry: "none" }],
 ] as const) {
-  test(`a failed turn maps to a Maki error: ${name}`, () => {
+  test(`a failed turn maps to a Makima error: ${name}`, () => {
     const { translator } = run([...setup])
     const end = sdk.result(final) as Extract<SDKMessage, { type: "result" }>
     assert.throws(

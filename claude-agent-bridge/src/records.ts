@@ -2,7 +2,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 
 // A point in an SDK session where Claude's transcript holds exactly the
-// first {count} Maki messages, ending with a finished reply. A fork from it
+// first {count} Makima messages, ending with a finished reply. A fork from it
 // needs only the messages after {count}.
 export interface Boundary {
   readonly count: number
@@ -15,7 +15,7 @@ export interface Record {
   session?: string
   // Where a new session starts from instead of empty.
   fork?: { session: string; at: string }
-  // How many Maki messages Claude has seen.
+  // How many Makima messages Claude has seen.
   seen: number
   boundaries: Boundary[]
   // Hash of what the last step's process could not change, so a fork only
@@ -54,7 +54,7 @@ export function memoryRecords(): Records & { readonly saved: Map<string, Record>
 }
 
 // One JSON file per conversation, so an SDK session can be resumed after a
-// bridge restart. Maki ids are base62, but the name is encoded anyway.
+// bridge restart. Makima ids are base62, but the name is encoded anyway.
 export function fileRecords(dir: string): Records {
   const path = (id: string) => join(dir, `${encodeURIComponent(id)}.json`)
   return {
