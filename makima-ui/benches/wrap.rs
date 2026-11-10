@@ -23,7 +23,7 @@ fn corpus() -> Vec<Line<'static>> {
     (0..LINE_COUNT)
         .map(|i| match i % 4 {
             0 => Line::from(vec![
-                Span::styled("maki> ", Style::default()),
+                Span::styled("assistant> ", Style::default()),
                 Span::raw(PROSE[i % PROSE.len()].to_string()),
                 Span::styled(" [done]", Style::default()),
             ]),

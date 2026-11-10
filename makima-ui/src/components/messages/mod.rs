@@ -8,10 +8,10 @@ use self::render::RenderCursor;
 use self::segment::{Segment, SegmentCache};
 
 use super::tool_display::{
-    RenderCtx, RoleStyle, ToolLines, append_annotation, append_right_info, assistant_style,
-    build_instructions_lines, build_tool_lines, done_style, error_style, format_timestamp_now,
-    instructions_search_text, post_style, search_text_for, thinking_indicator, thinking_style,
-    truncate_to_header, user_style,
+    RenderCtx, RoleNames, RoleStyle, ToolLines, append_annotation, append_right_info,
+    assistant_style, build_instructions_lines, build_tool_lines, done_style, error_style,
+    format_timestamp_now, instructions_search_text, post_style, search_text_for,
+    thinking_indicator, thinking_style, truncate_to_header, user_style,
 };
 use super::{
     DisplayMessage, DisplayRole, IMAGE_PLACEHOLDER, ToolRole, ToolStatus, apply_scroll_delta,
@@ -97,6 +97,7 @@ pub struct MessagesPanel {
     /// warm cache.
     watched_bufs: VecDeque<(String, Arc<SharedBuf>)>,
     tool_output_lines: ToolOutputLines,
+    role_names: RoleNames,
     lua_event_handle: EventHandle,
     restore_event_tx: Option<EventSender>,
     show_thinking: bool,
@@ -133,8 +134,9 @@ impl MessagesPanel {
         lua_event_handle: EventHandle,
         provider: Arc<dyn ThemesProvider>,
     ) -> Self {
-        let thinking = thinking_style();
-        let assistant = assistant_style();
+        let role_names = RoleNames::default();
+        let thinking = thinking_style(&role_names);
+        let assistant = assistant_style(&role_names);
         let ms = ui_config.typewriter_ms_per_char;
         let theme_generation = provider.generation();
         Self {
@@ -173,6 +175,7 @@ impl MessagesPanel {
             live_bufs: HashMap::new(),
             watched_bufs: VecDeque::new(),
             tool_output_lines: ui_config.tool_output_lines,
+            role_names,
             lua_event_handle,
             restore_event_tx: None,
             show_thinking: ui_config.show_thinking,
@@ -600,6 +603,24 @@ impl MessagesPanel {
         self.prompt_progress = None;
     }
 
+    #[allow(dead_code)] // Lua will drive this once the role-prefix API lands.
+    pub fn set_role_names(&mut self, names: RoleNames) {
+        self.role_names = names;
+        let thinking = thinking_style(&self.role_names);
+        let assistant = assistant_style(&self.role_names);
+        self.streaming_thinking.set_style(
+            thinking.prefix,
+            thinking.text_style,
+            thinking.prefix_style,
+        );
+        self.streaming_text.set_style(
+            assistant.prefix,
+            assistant.text_style,
+            assistant.prefix_style,
+        );
+        self.cache.clear();
+    }
+
     pub fn flush(&mut self) {
         self.flush_thinking();
         self.prompt_progress = None;
@@ -642,7 +663,7 @@ impl MessagesPanel {
             && !msg.result_expanded
         {
             msg.result_expanded = true;
-            let lines = build_message_lines(msg, width);
+            let lines = build_message_lines(msg, width, &self.role_names);
             if let Some(seg) = self.cache.get_mut(segment_index) {
                 seg.set_lines(lines);
             }
@@ -726,7 +747,7 @@ impl MessagesPanel {
                 let old_height = seg.height(width);
                 let expanding = !msg.result_expanded;
                 msg.result_expanded = expanding;
-                let lines = build_message_lines(msg, width);
+                let lines = build_message_lines(msg, width, &self.role_names);
                 let anchor = self.cache.anchor_at(u32::from(self.scroll_top), width);
                 let Some(seg) = self.cache.get_mut(seg_idx) else {
                     return false;
@@ -1046,8 +1067,8 @@ impl MessagesPanel {
 
         if width_changed {
             self.cache.mark_all_width_stale();
-            let thinking = thinking_style();
-            let assistant = assistant_style();
+            let thinking = thinking_style(&self.role_names);
+            let assistant = assistant_style(&self.role_names);
             self.streaming_thinking.set_style(
                 thinking.prefix,
                 thinking.text_style,
@@ -1265,7 +1286,7 @@ impl MessagesPanel {
                     None => seg
                         .msg_index
                         .and_then(|i| self.messages.get(i))
-                        .map(message_search_text),
+                        .map(|msg| message_search_text(msg, &self.role_names)),
                 }
                 .unwrap_or_default()
             })
@@ -1487,11 +1508,11 @@ impl MessagesPanel {
     }
 
     fn build_streaming_collapsed_lines(&self) -> Vec<Line<'static>> {
-        thinking_indicator(self.streaming_thinking.line_count())
+        thinking_indicator(self.streaming_thinking.line_count(), &self.role_names)
     }
 
     fn build_cached_thinking_indicator(&self, text: &str) -> Vec<Line<'static>> {
-        thinking_indicator(logical_line_count(text))
+        thinking_indicator(logical_line_count(text), &self.role_names)
     }
 
     fn try_toggle_collapsed_thinking(&mut self, doc_row: u32, width: u16) -> bool {
@@ -1536,10 +1557,10 @@ impl MessagesPanel {
         let lines = if collapsed {
             self.build_cached_thinking_indicator(&text)
         } else {
-            let style = thinking_style();
+            let style = thinking_style(&self.role_names);
             text_to_lines(
                 &text,
-                style.prefix,
+                style.prefix.as_ref(),
                 style.text_style,
                 style.prefix_style,
                 width,
@@ -1655,7 +1676,7 @@ impl MessagesPanel {
                     self.cache.push(Segment::with_lines(lines, Some(i)));
                     continue;
                 }
-                let lines = build_message_lines(msg, self.viewport_width);
+                let lines = build_message_lines(msg, self.viewport_width, &self.role_names);
                 self.cache.push_spacer_if_needed();
                 let mut seg = Segment::with_lines(lines, Some(i));
                 seg.set_images(message_images(msg));
@@ -1793,7 +1814,7 @@ impl MessagesPanel {
         let Some(msg) = self.messages.get(msg_idx) else {
             return;
         };
-        let lines = build_message_lines(msg, width);
+        let lines = build_message_lines(msg, width, &self.role_names);
         let Some(seg) = self.cache.get_mut(seg_idx) else {
             return;
         };
@@ -1801,11 +1822,11 @@ impl MessagesPanel {
     }
 }
 
-fn message_style(role: &DisplayRole) -> RoleStyle {
+fn message_style(role: &DisplayRole, names: &RoleNames) -> RoleStyle {
     match role {
-        DisplayRole::User => user_style(),
-        DisplayRole::Assistant => assistant_style(),
-        DisplayRole::Thinking => thinking_style(),
+        DisplayRole::User => user_style(names),
+        DisplayRole::Assistant => assistant_style(names),
+        DisplayRole::Thinking => thinking_style(names),
         DisplayRole::Error => error_style(),
         DisplayRole::Done => done_style(),
         DisplayRole::Post(level) => post_style(*level),
@@ -1814,19 +1835,19 @@ fn message_style(role: &DisplayRole) -> RoleStyle {
 }
 
 /// A plan message draws its own rule and path instead of the role prefix.
-fn message_prefix(msg: &DisplayMessage, style: &RoleStyle) -> &'static str {
+fn message_prefix<'a>(msg: &DisplayMessage, style: &'a RoleStyle) -> &'a str {
     if msg.plan_path.is_some() {
         ""
     } else {
-        style.prefix
+        style.prefix.as_ref()
     }
 }
 
 /// Carries the role prefix so a query can hit either the prose or the "you>"
 /// and "thinking>" markers the reader sees. Collapsed thinking needs no case of
 /// its own: its indicator is drawn from the same prefix.
-fn message_search_text(msg: &DisplayMessage) -> String {
-    let style = message_style(&msg.role);
+fn message_search_text(msg: &DisplayMessage, names: &RoleNames) -> String {
+    let style = message_style(&msg.role, names);
     format!("{}{}", message_prefix(msg, &style), msg.text)
 }
 
@@ -1896,8 +1917,8 @@ fn logical_line_count(text: &str) -> usize {
 /// given width. Shared by `rebuild_line_cache` (new messages) and
 /// `reflow_text_segment` (stale-on-resize messages) so both paths produce
 /// identical segments.
-fn build_message_lines(msg: &DisplayMessage, width: u16) -> Vec<Line<'static>> {
-    let style = message_style(&msg.role);
+fn build_message_lines(msg: &DisplayMessage, width: u16, names: &RoleNames) -> Vec<Line<'static>> {
+    let style = message_style(&msg.role, names);
     let prefix = message_prefix(msg, &style);
     let text = if !msg.images.is_empty() && msg.text == IMAGE_PLACEHOLDER {
         ""

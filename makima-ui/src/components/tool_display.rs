@@ -6,6 +6,7 @@ use crate::theme;
 use code_view::RenderLimits;
 use code_view::SectionFlags;
 use makima_config::{ClockFormat, ToolOutputLines};
+use makima_storage::paths::APP_NAME;
 
 use std::borrow::Cow;
 use std::fmt::Write;
@@ -42,20 +43,36 @@ const CODE_OUTPUT_DIVIDER: &str = "  ────────────";
 const INSTRUCTIONS_TOOL: &str = "load";
 /// Stands in for a tool message whose role carries no name.
 const UNNAMED_TOOL: &str = "?";
-const THINKING_HIDDEN_HEADER: &str = "thinking> ...";
 const THINKING_EXPAND_HINT: &str = " (click to expand)";
 
+#[derive(Clone)]
+pub struct RoleNames {
+    pub assistant: Arc<str>,
+    pub user: Arc<str>,
+    pub thinking: Arc<str>,
+}
+
+impl Default for RoleNames {
+    fn default() -> Self {
+        Self {
+            assistant: Arc::from(format!("{APP_NAME}> ")),
+            user: Arc::from("you> "),
+            thinking: Arc::from("thinking> "),
+        }
+    }
+}
+
 pub struct RoleStyle {
-    pub prefix: &'static str,
+    pub prefix: Arc<str>,
     pub text_style: Style,
     pub prefix_style: Style,
     pub use_markdown: bool,
     pub max_line_bytes: Option<usize>,
 }
 
-pub fn assistant_style() -> RoleStyle {
+pub fn assistant_style(names: &RoleNames) -> RoleStyle {
     RoleStyle {
-        prefix: "maki> ",
+        prefix: Arc::clone(&names.assistant),
         text_style: theme::current().assistant,
         prefix_style: theme::current().assistant_prefix,
         use_markdown: true,
@@ -63,9 +80,9 @@ pub fn assistant_style() -> RoleStyle {
     }
 }
 
-pub fn user_style() -> RoleStyle {
+pub fn user_style(names: &RoleNames) -> RoleStyle {
     RoleStyle {
-        prefix: "you> ",
+        prefix: Arc::clone(&names.user),
         text_style: theme::current().assistant,
         prefix_style: theme::current().user,
         use_markdown: true,
@@ -73,9 +90,9 @@ pub fn user_style() -> RoleStyle {
     }
 }
 
-pub fn thinking_style() -> RoleStyle {
+pub fn thinking_style(names: &RoleNames) -> RoleStyle {
     RoleStyle {
-        prefix: "thinking> ",
+        prefix: Arc::clone(&names.thinking),
         text_style: theme::current().thinking,
         prefix_style: theme::current().thinking,
         use_markdown: true,
@@ -86,10 +103,13 @@ pub fn thinking_style() -> RoleStyle {
 /// Two-line thinking indicator: a header (`thinking> ...`) followed by a
 /// `(N lines) (click to expand)` footer. Shared by the streaming and cached
 /// views when `show_thinking` is off.
-pub fn thinking_indicator(line_count: usize) -> Vec<Line<'static>> {
+pub fn thinking_indicator(line_count: usize, names: &RoleNames) -> Vec<Line<'static>> {
     let theme = theme::current();
     vec![
-        Line::from(Span::styled(THINKING_HIDDEN_HEADER, theme.thinking)),
+        Line::from(Span::styled(
+            format!("{}...", names.thinking),
+            theme.thinking,
+        )),
         Line::from(vec![
             Span::styled(format!("({line_count} lines) "), theme.tool_dim),
             Span::styled(THINKING_EXPAND_HINT, theme.thinking),
@@ -99,7 +119,7 @@ pub fn thinking_indicator(line_count: usize) -> Vec<Line<'static>> {
 
 pub fn error_style() -> RoleStyle {
     RoleStyle {
-        prefix: "",
+        prefix: Arc::from(""),
         text_style: theme::current().error,
         prefix_style: theme::current().tool_error,
         use_markdown: false,
@@ -115,7 +135,7 @@ pub fn post_style(level: PostLevel) -> RoleStyle {
         PostLevel::Error => (theme.error, theme.tool_error),
     };
     RoleStyle {
-        prefix: TOOL_INDICATOR,
+        prefix: Arc::from(TOOL_INDICATOR),
         text_style,
         prefix_style,
         use_markdown: false,
@@ -125,7 +145,7 @@ pub fn post_style(level: PostLevel) -> RoleStyle {
 
 pub fn done_style() -> RoleStyle {
     RoleStyle {
-        prefix: "",
+        prefix: Arc::from(""),
         text_style: theme::current()
             .tool_success
             .add_modifier(ratatui::style::Modifier::BOLD),

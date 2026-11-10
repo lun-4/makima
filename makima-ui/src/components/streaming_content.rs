@@ -5,6 +5,7 @@ use makima_markdown::render::Renderer;
 use ratatui::style::Style;
 use ratatui::text::Line;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::Arc;
 
 const STREAMING_MAX_LINE_BYTES: usize = 5_000;
 
@@ -81,14 +82,14 @@ pub(crate) struct StreamingContent {
     typewriter: Typewriter,
     cache: StreamingCache,
     renderer: Renderer,
-    prefix: &'static str,
+    prefix: Arc<str>,
     text_style: Style,
     prefix_style: Style,
 }
 
 impl StreamingContent {
     pub fn new(
-        prefix: &'static str,
+        prefix: impl Into<Arc<str>>,
         text_style: Style,
         prefix_style: Style,
         ms_per_char: u64,
@@ -97,7 +98,7 @@ impl StreamingContent {
             typewriter: Typewriter::with_speed(ms_per_char),
             cache: StreamingCache::default(),
             renderer: Renderer::streaming(),
-            prefix,
+            prefix: prefix.into(),
             text_style,
             prefix_style,
         }
@@ -131,8 +132,13 @@ impl StreamingContent {
         self.typewriter.is_animating()
     }
 
-    pub fn set_style(&mut self, prefix: &'static str, text_style: Style, prefix_style: Style) {
-        self.prefix = prefix;
+    pub fn set_style(
+        &mut self,
+        prefix: impl Into<Arc<str>>,
+        text_style: Style,
+        prefix_style: Style,
+    ) {
+        self.prefix = prefix.into();
         self.text_style = text_style;
         self.prefix_style = prefix_style;
         self.cache.invalidate();
@@ -143,7 +149,7 @@ impl StreamingContent {
         self.cache.get_or_update(
             &mut self.renderer,
             self.typewriter.visible(),
-            self.prefix,
+            self.prefix.as_ref(),
             self.text_style,
             self.prefix_style,
             width,

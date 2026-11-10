@@ -10,8 +10,17 @@ use makima_agent::{
 };
 use ratatui::backend::TestBackend;
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use test_case::test_case;
+
+fn test_role_names() -> RoleNames {
+    RoleNames {
+        assistant: Arc::from("assistant> "),
+        user: Arc::from("user> "),
+        thinking: Arc::from("thinking> "),
+    }
+}
 
 fn snap_line(text: &str) -> SnapshotLine {
     SnapshotLine {
@@ -838,19 +847,97 @@ fn search_text_bash_with_code_input() {
 #[test]
 fn search_text_includes_role_prefix() {
     let md = "# Heading\n\nSome **bold** text";
+    let names = test_role_names();
     let mut panel = MessagesPanel::new(
         UiConfig::default(),
         EventHandle::disconnected_for_test(),
         Arc::new(InMemoryThemesProvider::bundled()),
     );
+    panel.set_role_names(names.clone());
     panel.push(DisplayMessage::new(DisplayRole::User, "hello".into()));
     panel.push(DisplayMessage::new(DisplayRole::Assistant, md.into()));
     panel.push(DisplayMessage::new(DisplayRole::Thinking, "hmm".into()));
     rebuild(&mut panel);
     let texts = panel.segment_search_texts();
-    assert_eq!(texts[0], "you> hello");
-    assert_eq!(texts[2], format!("maki> {md}"));
-    assert_eq!(texts[4], "thinking> hmm");
+    assert_eq!(texts[0], format!("{}hello", names.user));
+    assert_eq!(texts[2], format!("{}{md}", names.assistant));
+    assert_eq!(texts[4], format!("{}hmm", names.thinking));
+}
+
+#[test]
+fn default_assistant_prefix_comes_from_app_name() {
+    assert_eq!(
+        RoleNames::default().assistant.as_ref(),
+        format!("{}> ", makima_storage::paths::APP_NAME)
+    );
+}
+
+#[test]
+fn assistant_prefix_is_configurable() {
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        EventHandle::disconnected_for_test(),
+        Arc::new(InMemoryThemesProvider::bundled()),
+    );
+    panel.set_role_names(test_role_names());
+    panel.push(DisplayMessage::new(DisplayRole::Assistant, "hello".into()));
+    let terminal = render(&mut panel, 80, 10);
+    assert!(buffer_text(&terminal).contains("assistant> hello"));
+
+    let other = RoleNames {
+        assistant: Arc::from("other> "),
+        ..test_role_names()
+    };
+    panel.set_role_names(other);
+    let terminal = render(&mut panel, 80, 10);
+    assert!(buffer_text(&terminal).contains("other> hello"));
+}
+
+#[test]
+fn thinking_indicator_uses_configured_prefix() {
+    let names = RoleNames {
+        thinking: Arc::from("ponder> "),
+        ..test_role_names()
+    };
+    let lines = thinking_indicator(2, &names);
+    assert!(lines[0].to_string().starts_with("ponder>"));
+}
+
+#[test]
+fn ui_tests_do_not_hardcode_product_prefix() {
+    let needle = format!("format!(\"{{{}}}>\")", "APP_NAME");
+    let mut findings = Vec::new();
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for root in [
+        manifest_dir.join("src/components"),
+        manifest_dir.join("benches"),
+    ] {
+        let mut files = Vec::new();
+        collect_rust_files(&root, &mut files);
+        for path in files {
+            let source = std::fs::read_to_string(&path).unwrap();
+            for (line_no, line) in source.lines().enumerate() {
+                if line.contains(&needle) {
+                    findings.push(format!("{}:{}", path.display(), line_no + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        findings.is_empty(),
+        "hardcoded product prefix in UI tests/benches: {findings:?}"
+    );
+}
+
+fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rust_files(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
 }
 
 #[test_case(&["short", &"x".repeat(200)], 80, 4 ; "long_line_wraps")]
@@ -985,7 +1072,9 @@ fn stream_reset_clears_streaming_and_fails_tools() {
     assert_eq!(msg_status(&panel, "t1"), ToolStatus::Error);
 }
 
-const MAKI_PREFIX_LEN: u16 = 6;
+fn assistant_prefix_len() -> u16 {
+    test_role_names().assistant.len() as u16
+}
 
 fn make_sel(area: Rect, anchor: (u32, u16), cursor: (u32, u16)) -> Selection {
     let mut sel = Selection::start(
@@ -1005,6 +1094,7 @@ fn panel_with_msgs(texts: &[&str], width: u16, height: u16) -> MessagesPanel {
         EventHandle::disconnected_for_test(),
         Arc::new(InMemoryThemesProvider::bundled()),
     );
+    panel.set_role_names(test_role_names());
     for &text in texts {
         panel.push(DisplayMessage::new(DisplayRole::Assistant, text.into()));
     }
@@ -1016,7 +1106,7 @@ fn panel_with_msgs(texts: &[&str], width: u16, height: u16) -> MessagesPanel {
 fn extract_partial_column_selection() {
     let panel = panel_with_msgs(&["Hello world"], 80, 24);
     let area = Rect::new(0, 0, 80, 24);
-    let world_start = MAKI_PREFIX_LEN + "Hello ".len() as u16;
+    let world_start = assistant_prefix_len() + "Hello ".len() as u16;
     let sel = make_sel(area, (0, world_start), (0, world_start + 4));
     let text = panel.extract_selection_text(&sel, area);
     assert_eq!(text, "world");
@@ -1066,7 +1156,11 @@ fn extract_mixed_fully_enclosed_and_partial() {
     let heights = panel.segment_heights().to_vec();
     let area = Rect::new(0, 0, 80, 24);
     let seg1_start = heights[0] + heights[1];
-    let sel = make_sel(area, (0, 0), (seg1_start as u32, MAKI_PREFIX_LEN + 6));
+    let sel = make_sel(
+        area,
+        (0, 0),
+        (seg1_start as u32, assistant_prefix_len() + 6),
+    );
     let text = panel.extract_selection_text(&sel, area);
     assert!(text.contains("full segment"));
     assert!(text.contains("partial"));
@@ -1080,14 +1174,16 @@ fn extract_partial_col_symmetric(msgs: &[&str], expect_start: &str, expect_end: 
         EventHandle::disconnected_for_test(),
         Arc::new(InMemoryThemesProvider::bundled()),
     );
+    panel.set_role_names(test_role_names());
     for &text in msgs {
         panel.push(DisplayMessage::new(DisplayRole::Assistant, text.into()));
     }
     render(&mut panel, 80, 24);
     let total: u16 = panel.segment_heights().iter().sum();
     let area = Rect::new(0, 0, 80, 24);
-    let down = make_sel(area, (0, MAKI_PREFIX_LEN), ((total - 1) as u32, 79));
-    let up = make_sel(area, ((total - 1) as u32, 79), (0, MAKI_PREFIX_LEN));
+    let prefix_len = assistant_prefix_len();
+    let down = make_sel(area, (0, prefix_len), ((total - 1) as u32, 79));
+    let up = make_sel(area, ((total - 1) as u32, 79), (0, prefix_len));
     let text_down = panel.extract_selection_text(&down, area);
     let text_up = panel.extract_selection_text(&up, area);
     assert!(text_down.contains(expect_start));
@@ -1223,7 +1319,7 @@ fn child_result_uses_distinct_styles_and_separate_action() {
     let agent = AgentId::generate();
     let text = "x".repeat(crate::chat::COMPLETION_PREVIEW_CHARS + 1);
     let notice = crate::chat::format_child_result_notice("reviewer", &text, &[], Some(agent));
-    let lines = build_message_lines(&notice, 80);
+    let lines = build_message_lines(&notice, 80, &test_role_names());
     let theme = theme::current();
     assert_eq!(lines[0].spans[0].style, theme.accent);
     assert_eq!(lines[2].spans[0].style, theme.assistant);

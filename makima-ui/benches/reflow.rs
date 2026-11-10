@@ -83,7 +83,17 @@ fn transcript() -> Vec<String> {
 fn rebuild(texts: &[String], width: u16) -> usize {
     texts
         .iter()
-        .map(|t| text_to_lines(t, "maki> ", Style::default(), Style::default(), width, None).len())
+        .map(|t| {
+            text_to_lines(
+                t,
+                "assistant> ",
+                Style::default(),
+                Style::default(),
+                width,
+                None,
+            )
+            .len()
+        })
         .sum()
 }
 
@@ -138,7 +148,16 @@ fn bench_reflow(c: &mut Criterion) {
     let texts = transcript();
     let lines: Vec<Line<'static>> = texts
         .iter()
-        .flat_map(|t| text_to_lines(t, "maki> ", Style::default(), Style::default(), WIDE, None))
+        .flat_map(|t| {
+            text_to_lines(
+                t,
+                "assistant> ",
+                Style::default(),
+                Style::default(),
+                WIDE,
+                None,
+            )
+        })
         .collect();
     println!("corpus: {MESSAGE_COUNT} messages, {} lines", lines.len());
 
