@@ -61,7 +61,6 @@ const UPSTREAM_ALLOWLIST: &[(&str, usize, &str)] = &[
         "makima is a fork of <a href=\"https://github.com/tontinton/maki\"",
     ),
 ];
-const SYNC_SKILL: &str = ".agents/skills/lunamaki-sync-with-upstream/SKILL.md";
 const NEGATIVE_FIXTURE: &str = "makima-lua/tests/runtime_alignment.rs";
 const NEGATIVE_FIXTURE_LINE: &str = "assert(maki == nil, \"legacy maki global present\")";
 
@@ -114,13 +113,6 @@ fn is_skipped(path: &str) -> bool {
 
 fn is_allowed(path: &str, line_number: usize, line: &str) -> bool {
     if path == NEGATIVE_FIXTURE && line.contains(NEGATIVE_FIXTURE_LINE) {
-        return true;
-    }
-    if path == SYNC_SKILL
-        && (line.contains("upstream maki")
-            || line.contains("a fork of maki")
-            || line.contains("tontinton/maki"))
-    {
         return true;
     }
     UPSTREAM_ALLOWLIST
