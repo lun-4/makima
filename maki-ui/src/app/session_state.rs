@@ -290,7 +290,8 @@ mod tests {
     use super::*;
     use crate::components::{test_model, test_pricing};
     use maki_providers::model::FastSupport;
-    use maki_providers::{FastPricing, ModelPricing};
+    use maki_providers::{FastPricing, ModelPricing, ThinkingConfig};
+    use maki_storage::sessions::{Effort, Prefs, StoredThinking, write_prefs};
     use test_case::test_case;
 
     const RECORDED_COST: f64 = 0.42;
@@ -451,6 +452,36 @@ mod tests {
         );
         state.adopt(&config);
         (state, config)
+    }
+
+    /// A catalog provider registers no models until discovery answers, so
+    /// startup seeds a model that cannot say yet whether it thinks. That must
+    /// not throw away the saved default.
+    #[test]
+    fn undiscovered_model_keeps_the_saved_thinking_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        write_prefs(
+            &storage,
+            &Prefs {
+                default_thinking: Some(StoredThinking::Effort {
+                    level: Effort::High,
+                }),
+            },
+        )
+        .unwrap();
+        let mut model = test_model();
+        model.thinking_support = None;
+        let state = resumed(AppSession::new("test-model", "/tmp"), &model);
+        let config = state.starting_config(
+            maki_agent::tools::cli_tool_ctx(std::env::temp_dir()).provider,
+            &model,
+            std::env::temp_dir(),
+            &ModeRegistry::builtin(),
+            &storage,
+            SessionDefaults::default(),
+        );
+        assert_eq!(config.thinking, ThinkingConfig::Effort(Effort::High));
     }
 
     #[test]
