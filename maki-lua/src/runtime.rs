@@ -6696,6 +6696,17 @@ mod tests {
         Arc::new(Mutex::new(TaskCell::new(cancelled_token(), None, None)))
     }
 
+    /// A cancelled task whose cleanup grace has already run out, so the next
+    /// poke would kill it as cancelled unless shutdown is checked first.
+    fn expired_cancelled_handle() -> TaskHandle {
+        let handle = cancelled_handle();
+        let expired = Instant::now()
+            .checked_sub(KILL_GRACE)
+            .unwrap_or_else(Instant::now);
+        lock_cell(&handle).kill_at.set(Some(expired));
+        handle
+    }
+
     /// Killing at the first armed safepoint is what froze batch's children
     /// as in-progress after esc; never killing at all would leave a core
     /// spinning, which [`WATCHDOG_TEST_TIMEOUT`] catches.
@@ -7443,20 +7454,19 @@ mod tests {
         assert!(err.to_string().contains(INTERRUPT_SHUTDOWN_MSG));
     }
 
-    /// Shutdown is checked before the task cell, so a reload or a quit
-    /// never queues behind the cleanup grace of every cancelled runaway.
+    /// Shutdown is checked before the task cell, so a reload or a quit never
+    /// queues behind the cleanup grace of every cancelled runaway. The grace
+    /// has already run out, so a cell-first check would kill the loop as
+    /// cancelled; only the shutdown message proves shutdown was consulted
+    /// first, with no wall-clock bound.
     #[test]
     fn shutdown_outranks_the_cleanup_grace() {
         let (lua, _watchdog) = watchdog_lua(true);
-        lua.set_app_data::<TaskHandle>(cancelled_handle());
+        lua.set_app_data::<TaskHandle>(expired_cancelled_handle());
 
-        let (err, elapsed) = hot_loop_expecting_kill(&lua);
+        let (err, _) = hot_loop_expecting_kill(&lua);
 
         assert!(err.to_string().contains(INTERRUPT_SHUTDOWN_MSG));
-        assert!(
-            elapsed < KILL_GRACE,
-            "shutdown waited out the cleanup grace"
-        );
     }
 
     /// JIT-compiled code must still hit the interrupt, and the timeout
