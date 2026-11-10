@@ -23,7 +23,7 @@ local TOKEN_ENVS = { "GH_COPILOT_TOKEN", "COPILOT_GITHUB_TOKEN" }
 local GRAPHQL_QUERY = "query { viewer { copilotEndpoints { api } } }"
 local API_VERSION = "2025-10-01"
 local ANTHROPIC_VERSION = "2023-06-01"
-local EDITOR = "Maki/"
+local EDITOR = "Makima/"
 local INTERACTION = "conversation-agent"
 local INITIATOR = "agent"
 local CHAT_PATH = "/chat/completions"
@@ -136,7 +136,7 @@ end
 -- saved one. Nil when there is none, or nil plus a read error.
 function M.token(ctx)
   for _, name in ipairs(TOKEN_ENVS) do
-    local token = trim(maki.uv.os_getenv(name) or "")
+    local token = trim(makima.uv.os_getenv(name) or "")
     if token ~= "" then
       return { token = token, host = DEFAULT_HOST, env = name }
     end
@@ -156,29 +156,29 @@ function M.decode_go_keyring(raw)
   if raw:sub(1, #GO_KEYRING_PREFIX) ~= GO_KEYRING_PREFIX then
     return raw
   end
-  local ok, decoded = pcall(maki.base64.decode, raw:sub(#GO_KEYRING_PREFIX + 1))
+  local ok, decoded = pcall(makima.base64.decode, raw:sub(#GO_KEYRING_PREFIX + 1))
   return ok and utf8.len(decoded) and decoded or raw
 end
 
 -- The Copilot client's `hosts.json` and `apps.json`, then the gh CLI's
 -- `hosts.yml`, decoded. YAML is a superset of JSON, so one parser reads all.
 function M.config_files()
-  local base = maki.uv.os_getenv("XDG_CONFIG_HOME")
+  local base = makima.uv.os_getenv("XDG_CONFIG_HOME")
   if not base or base == "" then
-    local home = maki.uv.os_homedir()
+    local home = makima.uv.os_homedir()
     if not home then
       return {}
     end
-    base = maki.fs.joinpath(home, ".config")
+    base = makima.fs.joinpath(home, ".config")
   end
   local files = {}
   for _, path in ipairs({
-    maki.fs.joinpath(base, "github-copilot", "hosts.json"),
-    maki.fs.joinpath(base, "github-copilot", "apps.json"),
-    maki.fs.joinpath(base, "gh", "hosts.yml"),
+    makima.fs.joinpath(base, "github-copilot", "hosts.json"),
+    makima.fs.joinpath(base, "github-copilot", "apps.json"),
+    makima.fs.joinpath(base, "gh", "hosts.yml"),
   }) do
-    local contents = maki.fs.read(path)
-    local value = contents and maki.yaml.decode(contents)
+    local contents = makima.fs.read(path)
+    local value = contents and makima.yaml.decode(contents)
     if type(value) == "table" then
       files[#files + 1] = value
     end
@@ -224,7 +224,7 @@ function M.import(files, hints)
   end
   for _, host in ipairs(hosts) do
     for _, account in ipairs(keyring_accounts(files, host)) do
-      local raw, err = maki.host.keyring_get(KEYRING_SERVICE_PREFIX .. host, account)
+      local raw, err = makima.host.keyring_get(KEYRING_SERVICE_PREFIX .. host, account)
       if raw then
         return { token = M.decode_go_keyring(raw), host = host }
       elseif err then
@@ -274,7 +274,7 @@ end
 local function headers(state, auth, interaction, extra)
   local out = table.clone(extra or {})
   out.Authorization = "Bearer " .. auth.token
-  out["Editor-Version"] = EDITOR .. maki.version().current
+  out["Editor-Version"] = EDITOR .. makima.version().current
   out["X-GitHub-Api-Version"] = API_VERSION
   if interaction then
     out["X-Initiator"] = INITIATOR
@@ -294,7 +294,7 @@ local function discover_endpoint(ctx, auth)
     url = M.graphql_url(auth.host),
     method = "POST",
     headers = { Authorization = "Bearer " .. auth.token, ["Content-Type"] = "application/json" },
-    body = assert(maki.json.encode({ query = GRAPHQL_QUERY })),
+    body = assert(makima.json.encode({ query = GRAPHQL_QUERY })),
   })
   local body = response and http.read_json(response)
   local data = type(body) == "table" and type(body.data) == "table" and body.data or {}

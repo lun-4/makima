@@ -2,14 +2,14 @@
 -- Lists entries, filters instruction files, sorts dirs before files, and
 -- renders the listing so every caller shows a directory the same way.
 
-local ToolView = require("maki.tool_view")
+local ToolView = require("makima.tool_view")
 
 local DEFAULT_MAX_LINES = 10
 
 local M = {}
 
 function M.list(path, ctx)
-  local entries, err = maki.fs.dir(path)
+  local entries, err = makima.fs.dir(path)
   if not entries then
     return nil, err
   end
@@ -45,7 +45,7 @@ end
 
 function M.view(text, ctx)
   local tol = ctx:tool_output_lines()
-  local buf = maki.ui.buf()
+  local buf = makima.ui.buf()
   local view = ToolView.new(buf, { max_lines = (tol and tol.read) or DEFAULT_MAX_LINES, keep = "head" })
   view:append_text(text)
   view:finish()

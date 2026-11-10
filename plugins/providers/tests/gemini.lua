@@ -1,10 +1,10 @@
 local gemini = require("providers.gemini")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local function sse(chunks)
   local frames = {}
   for _, chunk in ipairs(chunks) do
-    frames[#frames + 1] = "data: " .. assert(maki.json.encode(chunk)) .. "\r\n\r\n"
+    frames[#frames + 1] = "data: " .. assert(makima.json.encode(chunk)) .. "\r\n\r\n"
   end
   return t.response({ table.concat(frames) })
 end

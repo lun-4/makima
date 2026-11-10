@@ -14,7 +14,7 @@ fn os_getenv_reads_existing_var() {
     host.load_source(
         "getenv_existing",
         r#"
-        local home = maki.uv.os_getenv("HOME")
+        local home = makima.uv.os_getenv("HOME")
         assert(home ~= nil, "HOME should be set")
         assert(type(home) == "string", "HOME should be a string")
         "#,
@@ -28,7 +28,7 @@ fn os_getenv_returns_nil_for_missing_var() {
     host.load_source(
         "getenv_missing",
         r#"
-        local val = maki.uv.os_getenv("MAKIMA_TEST_VAR_DOES_NOT_EXIST_12345")
+        local val = makima.uv.os_getenv("MAKIMA_TEST_VAR_DOES_NOT_EXIST_12345")
         assert(val == nil, "unset var should return nil, got: " .. tostring(val))
         "#,
     )
@@ -42,7 +42,7 @@ fn os_getenv_denied_without_env_permission() {
         "getenv_denied",
         r#"
         local ok, err = pcall(function()
-            return maki.uv.os_getenv("HOME")
+            return makima.uv.os_getenv("HOME")
         end)
         assert(not ok, "should fail without env permission")
         assert(

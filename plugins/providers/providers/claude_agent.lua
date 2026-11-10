@@ -1,8 +1,8 @@
 -- Claude Agent: Claude through the user's own Claude Code login. The
 -- TypeScript bridge in `claude-agent-bridge/` runs the Claude Agent SDK and
 -- listens on a Unix socket; this provider forwards each request to it
--- unchanged and turns its event stream back into provider events. Maki keeps
--- the agent loop, tools and permissions: the bridge offers Maki's tools to
+-- unchanged and turns its event stream back into provider events. Makima keeps
+-- the agent loop, tools and permissions: the bridge offers Makima's tools to
 -- Claude and ends a step when Claude calls one.
 
 local http = require("providers.http")
@@ -25,12 +25,12 @@ local STEPS_PATH = "/v1/steps"
 local END_PATH = "/v1/conversations/%s/end"
 local CONTENT_TYPE = { ["Content-Type"] = "application/json" }
 local LONG_CONTEXT_SUFFIX = "[1m]"
--- Claude Code's own pick, which changes under the user; Maki names a model.
+-- Claude Code's own pick, which changes under the user; Makima names a model.
 local CLAUDE_DEFAULT = "default"
 local TIERS = { { "opus", "strong" }, { "sonnet", "medium" }, { "haiku", "weak" } }
 local NO_SOCKET = "no state directory for the Claude Agent bridge socket; set `socket` in providers.toml"
 local BRIDGE_DOWN = "the Claude Agent bridge is not running at %s; start it with `node claude-agent-bridge/src/main.ts`"
-local NOT_LOGGED_IN = "Claude Code is not logged in; run `maki auth login claude-agent`"
+local NOT_LOGGED_IN = "Claude Code is not logged in; run `makima auth login claude-agent`"
 local NO_RESULT = "the Claude Agent bridge closed the step without a result"
 local CANCELLED = "cancelled"
 local CONNECT_FAILED = "could not connect"
@@ -45,16 +45,16 @@ M.MODELS = { alias("opus", "strong"), alias("sonnet", "medium"), alias("haiku", 
 
 -- Where discovery is cached, or nil where the host has no cache directory.
 function M.cache_path()
-  local dir = maki.env.cache_dir()
-  return dir and maki.fs.joinpath(dir, M.CACHE_FILE)
+  local dir = makima.env.cache_dir()
+  return dir and makima.fs.joinpath(dir, M.CACHE_FILE)
 end
 
 -- The models the last discovery cached at {path}, else `M.MODELS`. The host
 -- resolves a saved model, and checks its `/thinking` level, against these
 -- before discovery answers.
 function M.cached_models(path)
-  local text = path and maki.fs.metadata(path) and maki.fs.read(path)
-  local models = text and maki.json.decode(text)
+  local text = path and makima.fs.metadata(path) and makima.fs.read(path)
+  local models = text and makima.json.decode(text)
   if type(models) == "table" and #models > 0 then
     return models
   end
@@ -62,14 +62,14 @@ function M.cached_models(path)
 end
 
 -- `socket` from providers.toml, else `bridge.sock` in the bridge's
--- directory under Maki's state directory, where the bridge listens by
+-- directory under Makima's state directory, where the bridge listens by
 -- default.
 function M.socket(config)
   if type(config.socket) == "string" and config.socket ~= "" then
     return config.socket
   end
-  local state = maki.env.state_dir()
-  return state and maki.fs.joinpath(state, M.STATE_DIR, M.SOCKET_FILE)
+  local state = makima.env.state_dir()
+  return state and makima.fs.joinpath(state, M.STATE_DIR, M.SOCKET_FILE)
 end
 
 local function send(ctx, socket, method, path, body)
@@ -78,7 +78,7 @@ local function send(ctx, socket, method, path, body)
     unix_socket = socket,
     method = method,
     headers = body and CONTENT_TYPE or nil,
-    body = body and assert(maki.json.encode(body)) or nil,
+    body = body and assert(makima.json.encode(body)) or nil,
   })
 end
 
@@ -158,7 +158,7 @@ function M.read_step(response, emit)
       response:close()
       return nil, { message = read_err or NO_RESULT, retry = "none" }
     end
-    local data, decode_err = maki.json.decode(event.data)
+    local data, decode_err = makima.json.decode(event.data)
     if decode_err then
       response:close()
       return nil, { message = "invalid bridge frame: " .. decode_err, retry = "none" }
@@ -195,7 +195,7 @@ function M.provider(cache)
     },
     docs = {
       endpoint = "unix:<state dir>/claude-agent/bridge.sock",
-      notes = "Uses your Claude Code login through the Claude Agent SDK. Start the bridge first: `npm install --omit=optional` and then `node src/main.ts` in `claude-agent-bridge/` (Node 24 or later). It runs your installed `claude` with its own tools, settings, hooks, MCP servers and CLAUDE.md files turned off, and offers Claude Maki's tools instead, so Maki's permissions apply to every call. `socket` in the `[claude-agent]` section of `providers.toml` points at a bridge listening elsewhere. Claude Code retries failed requests itself, so Maki does not retry this provider.",
+      notes = "Uses your Claude Code login through the Claude Agent SDK. Start the bridge first: `npm install --omit=optional` and then `node src/main.ts` in `claude-agent-bridge/` (Node 24 or later). It runs your installed `claude` with its own tools, settings, hooks, MCP servers and CLAUDE.md files turned off, and offers Claude Makima's tools instead, so Makima's permissions apply to every call. `socket` in the `[claude-agent]` section of `providers.toml` points at a bridge listening elsewhere. Claude Code retries failed requests itself, so Makima does not retry this provider.",
     },
   }
 
@@ -227,7 +227,7 @@ function M.provider(cache)
       -- that is not logged in, only matters to a step. `prepare` reports it
       -- then, and `auth_status` reports it from the login picker, so the
       -- cached models stay listed without a warning at startup.
-      maki.log.debug("claude-agent: model discovery failed: " .. http.message(err))
+      makima.log.debug("claude-agent: model discovery failed: " .. http.message(err))
       return M.cached_models(cache)
     end
     local models, seen = {}, {}
@@ -239,9 +239,9 @@ function M.provider(cache)
       end
     end
     if cache and #models > 0 then
-      local _, write_err = maki.fs.atomic_write(cache, assert(maki.json.encode(models)))
+      local _, write_err = makima.fs.atomic_write(cache, assert(makima.json.encode(models)))
       if write_err then
-        maki.log.warn("claude-agent: model cache not written: " .. write_err)
+        makima.log.warn("claude-agent: model cache not written: " .. write_err)
       end
     end
     return models
@@ -276,7 +276,7 @@ function M.provider(cache)
       local path = END_PATH:format(http.urlencode(conversation_id))
       local response, err = send(ctx, socket, "POST", path, { reason = reason })
       if not response then
-        maki.log.warn(string.format("claude-agent: ending %s failed: %s", conversation_id, http.message(err)))
+        makima.log.warn(string.format("claude-agent: ending %s failed: %s", conversation_id, http.message(err)))
         return
       end
       response:close()

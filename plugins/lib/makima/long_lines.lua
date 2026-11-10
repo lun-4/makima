@@ -24,7 +24,7 @@ M.TRUNCATED_MARKER_ADDED = {
 }
 
 local function lines_of(text)
-  local lines = maki.split(text, "\n")
+  local lines = makima.split(text, "\n")
   for i, line in ipairs(lines) do
     if line:sub(-1) == "\r" then
       lines[i] = line:sub(1, -2)
@@ -88,7 +88,7 @@ end
 function M.check_markers(before, after)
   local available = occurrences(lines_of(before))
   for i, line in ipairs(lines_of(after)) do
-    local kind = maki.text.truncation_marker(line)
+    local kind = makima.text.truncation_marker(line)
     if kind then
       local left = available[line] or 0
       if left == 0 then

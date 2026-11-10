@@ -59,10 +59,10 @@ const SUCCESS_STYLE: &str = "tool_success";
 /// stay real, so the park/release pair proves children genuinely overlap.
 const STUB_PRELUDE: &str = r#"
 recorder = { calls = {} }
-local sem = maki.async.semaphore(1)
+local sem = makima.async.semaphore(1)
 local held = sem:acquire()
 
-maki.agent.call_tool = function(ctx, name, input, opts)
+makima.agent.call_tool = function(ctx, name, input, opts)
   recorder.calls[#recorder.calls + 1] = { tool = name, params = input }
   if name == "ok" then
     return "ok:" .. tostring(input.tag or "?")
@@ -94,11 +94,11 @@ maki.agent.call_tool = function(ctx, name, input, opts)
     -- Parks in an await that ignores the token, like a real child tool
     -- waiting on a request. Any `parkjob*` name parks, so a test can give
     -- one of them its own restore.
-    maki.fn.jobwait(maki.fn.jobstart("sleep @PARK_SECS@"))
+    makima.fn.jobwait(makima.fn.jobstart("sleep @PARK_SECS@"))
     return "parkjob_done"
   elseif name == "partial" then
     -- Parks past the sweep, then comes back with more than "cancelled".
-    maki.fn.jobwait(maki.fn.jobstart("sleep @PARK_SECS@"))
+    makima.fn.jobwait(makima.fn.jobstart("sleep @PARK_SECS@"))
     return nil, "@PARTIAL_ERR@"
   elseif name == "spin" then
     -- Never yields, so nothing but the watchdog can end it.
@@ -107,17 +107,17 @@ maki.agent.call_tool = function(ctx, name, input, opts)
   return nil, "unknown tool: " .. name
 end
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "probe",
   description = "recorder snapshot",
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "main" },
   handler = function(input, ctx)
-    return (maki.json.encode(recorder))
+    return (makima.json.encode(recorder))
   end,
 })
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "hdrtool",
   description = "child with custom header",
   schema = { type = "object", properties = {} },
@@ -128,7 +128,7 @@ maki.api.register_tool({
   handler = function() return "unused" end,
 })
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "badhdr",
   description = "child whose header throws",
   schema = { type = "object", properties = {} },
@@ -139,7 +139,7 @@ maki.api.register_tool({
   handler = function() return "unused" end,
 })
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "badrestore",
   description = "child whose restore throws",
   schema = { type = "object", properties = {} },
@@ -148,8 +148,8 @@ maki.api.register_tool({
   handler = function() return "unused" end,
 })
 
-local ToolView = require("maki.tool_view")
-maki.api.register_tool({
+local ToolView = require("makima.tool_view")
+makima.api.register_tool({
   name = "viewer",
   description = "child with a truncating ToolView restore",
   schema = { type = "object", properties = {} },
@@ -1134,19 +1134,19 @@ fn child_restore_awaiting_async_api_keeps_its_body() {
 const BATCH_ID: &str = "batch_id";
 
 const HL_CHILD_SRC: &str = r#"
-local ToolView = require("maki.tool_view")
-maki.api.register_tool({
+local ToolView = require("makima.tool_view")
+makima.api.register_tool({
   name = "hl",
   description = "styled header + async-highlight restore",
   schema = { type = "object", properties = {} },
   audiences = { "main" },
   header = function(input)
-    local b = maki.ui.buf()
+    local b = makima.ui.buf()
     b:set_lines({ { { "hl-header", "tool" } } })
     return b
   end,
   restore = function(input, output, is_error, rctx)
-    local buf = maki.ui.buf()
+    local buf = makima.ui.buf()
     local view = ToolView.new(buf, { max_lines = 10, keep = "head" })
     view:set_highlight(output, "lua")
     view:finish()
@@ -1160,16 +1160,16 @@ maki.api.register_tool({
 /// its header. Registered under `@TOOL@` so the same source can stand in for
 /// whichever child a test needs.
 const SYNC_HL_CHILD_SRC: &str = r#"
-local ToolView = require("maki.tool_view")
-maki.api.register_tool({
+local ToolView = require("makima.tool_view")
+makima.api.register_tool({
   name = "@TOOL@",
-  description = "restore awaits maki.ui.highlight inline",
+  description = "restore awaits makima.ui.highlight inline",
   schema = { type = "object", properties = {} },
   audiences = { "main" },
   restore = function(input, output, is_error, rctx)
-    local buf = maki.ui.buf()
+    local buf = makima.ui.buf()
     local view = ToolView.new(buf, { max_lines = 10, keep = "tail" })
-    local header = maki.ui.highlight("echo header-marker", "bash") or { { { "echo header-marker" } } }
+    local header = makima.ui.highlight("echo header-marker", "bash") or { { { "echo header-marker" } } }
     view:set_header(header)
     view:append(output)
     view:finish()

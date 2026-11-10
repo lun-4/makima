@@ -204,7 +204,7 @@ fn admitted_slot_request_precedes_plugin_replacement() {
     let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
     let source = |content| {
         format!(
-            "maki.api.register_prompt_hint({{ slot = 'after_instructions', content = '{content}' }})"
+            "makima.api.register_prompt_hint({{ slot = 'after_instructions', content = '{content}' }})"
         )
     };
     host.load_source("pinned_slots", &source(FIRST)).unwrap();

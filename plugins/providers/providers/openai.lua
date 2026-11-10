@@ -156,13 +156,13 @@ M.def = {
 
 -- Waits {seconds} without blocking the Lua thread. Specs replace it.
 function M.sleep(seconds)
-  maki.async.await(1, function(done)
-    maki.defer_fn(done, math.ceil(seconds * MILLIS))
+  makima.async.await(1, function(done)
+    makima.defer_fn(done, math.ceil(seconds * MILLIS))
   end)
 end
 
 local function now_ms()
-  local now = maki.time.now()
+  local now = makima.time.now()
   return now.secs * MILLIS + math.floor(now.nanosecs / NANOS_PER_MILLI)
 end
 
@@ -197,8 +197,8 @@ function M.account_id(token)
     return nil
   end
   payload = payload:gsub("%-", "+"):gsub("_", "/")
-  local ok, decoded = pcall(maki.base64.decode, payload .. string.rep("=", -#payload % 4))
-  local claims = ok and maki.json.decode(decoded)
+  local ok, decoded = pcall(makima.base64.decode, payload .. string.rep("=", -#payload % 4))
+  local claims = ok and makima.json.decode(decoded)
   if type(claims) ~= "table" then
     return nil
   end
@@ -281,7 +281,7 @@ end
 -- at the server's interval. Nothing is stored until the tokens arrive, so a
 -- cancelled login leaves the credentials as they were.
 local function chatgpt_login(ctx, ui)
-  local device, err = post(ctx, M.DEVICE_CODE_URL, JSON_TYPE, assert(maki.json.encode({ client_id = CLIENT_ID })))
+  local device, err = post(ctx, M.DEVICE_CODE_URL, JSON_TYPE, assert(makima.json.encode({ client_id = CLIENT_ID })))
   if err then
     return nil, err
   end
@@ -297,7 +297,7 @@ local function chatgpt_login(ctx, ui)
   if not shown then
     return nil, show_err
   end
-  local body = assert(maki.json.encode({ device_auth_id = device.device_auth_id, user_code = device.user_code }))
+  local body = assert(makima.json.encode({ device_auth_id = device.device_auth_id, user_code = device.user_code }))
   local deadline = now_ms() + POLL_TIMEOUT * MILLIS
   while now_ms() < deadline do
     M.sleep(interval)

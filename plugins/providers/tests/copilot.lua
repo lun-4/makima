@@ -1,6 +1,6 @@
 local copilot = require("providers.copilot")
 local http = require("providers.http")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local TOKEN_ENV = "GH_COPILOT_TOKEN"
 local ENTERPRISE = "https://copilot-api.myco.ghe.com"
@@ -9,7 +9,7 @@ local DONE = "data: [DONE]\n\n"
 local spec = copilot.provider()
 
 local function json(value, status)
-  return t.response({ assert(maki.json.encode(value)) }, { status = status })
+  return t.response({ assert(makima.json.encode(value)) }, { status = status })
 end
 
 local function graphql(api)
@@ -38,7 +38,7 @@ local function messages_sse(text)
     { type = "message_delta", delta = { stop_reason = "end_turn" }, usage = { output_tokens = 1 } },
     { type = "message_stop" },
   }) do
-    frames[#frames + 1] = "event: " .. event.type .. "\ndata: " .. assert(maki.json.encode(event)) .. "\n\n"
+    frames[#frames + 1] = "event: " .. event.type .. "\ndata: " .. assert(makima.json.encode(event)) .. "\n\n"
   end
   return t.response({ table.concat(frames) })
 end
@@ -67,7 +67,7 @@ local function header(headers, name)
 end
 
 local function body(sent)
-  return maki.json.decode(sent.body)
+  return makima.json.decode(sent.body)
 end
 
 local function stream(env, info, responses, extra, config, saved)
@@ -220,7 +220,7 @@ t.case("enterprise_endpoint_discovery_and_headers", function()
   t.eq(sent.url, ENTERPRISE .. "/chat/completions")
   t.eq(header(sent.headers, "authorization"), "Bearer ghu_token")
   t.eq(header(sent.headers, "x-github-api-version"), "2025-10-01")
-  t.has(header(sent.headers, "editor-version"), "Maki/")
+  t.has(header(sent.headers, "editor-version"), "Makima/")
   t.eq(header(sent.headers, "x-initiator"), "agent")
   t.eq(header(sent.headers, "x-interaction-type"), "conversation-agent")
   t.eq(header(sent.headers, "openai-intent"), "conversation-agent")
@@ -342,9 +342,9 @@ t.case("import_reads_config_files_then_the_keyring", function()
     { token = "ghe", host = "myco.ghe.com" }
   )
   t.eq(copilot.github_host("evil-ghe.com"), false)
-  local keyring_get = maki.host.keyring_get
+  local keyring_get = makima.host.keyring_get
   local asked = {}
-  maki.host.keyring_get = function(service, account)
+  makima.host.keyring_get = function(service, account)
     asked[#asked + 1] = service .. "/" .. account
     if account == "janesmith" then
       return nil, "access denied"
@@ -353,9 +353,9 @@ t.case("import_reads_config_files_then_the_keyring", function()
     end
   end
   local hints = {}
-  local gh = assert(maki.yaml.decode("myco.ghe.com:\n  user: janedoe\n  users:\n    janedoe:\n    janesmith:\n"))
+  local gh = assert(makima.yaml.decode("myco.ghe.com:\n  user: janedoe\n  users:\n    janedoe:\n    janesmith:\n"))
   local found = copilot.import({ gh }, hints)
-  maki.host.keyring_get = keyring_get
+  makima.host.keyring_get = keyring_get
   t.same(found, { token = "gho_token", host = "myco.ghe.com" })
   t.same(asked, { "gh:github.com/", "gh:myco.ghe.com/janedoe", "gh:myco.ghe.com/janesmith", "gh:myco.ghe.com/" })
   t.eq(#hints, 1)
@@ -366,10 +366,10 @@ end)
 
 t.case("config_files_follow_xdg_config_home", function()
   local dir = t.mktmpdir("copilot")
-  maki.fs.mkdir(dir .. "/github-copilot", { parents = true })
-  maki.fs.mkdir(dir .. "/gh", { parents = true })
-  maki.fs.write(dir .. "/github-copilot/hosts.json", '{"github.com": {"oauth_token": "from-json"}}')
-  maki.fs.write(dir .. "/gh/hosts.yml", "myco.ghe.com:\n  oauth_token: from-yaml\n  user: octocat\n")
+  makima.fs.mkdir(dir .. "/github-copilot", { parents = true })
+  makima.fs.mkdir(dir .. "/gh", { parents = true })
+  makima.fs.write(dir .. "/github-copilot/hosts.json", '{"github.com": {"oauth_token": "from-json"}}')
+  makima.fs.write(dir .. "/gh/hosts.yml", "myco.ghe.com:\n  oauth_token: from-yaml\n  user: octocat\n")
   local files
   t.with_env({ XDG_CONFIG_HOME = dir }, function()
     files = copilot.config_files()
@@ -396,7 +396,7 @@ t.case("login_imports_once_and_status_reports_the_source", function()
     t.same(spec.auth_status(ctx, {}), { state = "env", detail = "via " .. TOKEN_ENV })
   end)
   t.eq(notes[1], copilot.ALREADY_AUTHENTICATED)
-  local config_files, keyring_get = copilot.config_files, maki.host.keyring_get
+  local config_files, keyring_get = copilot.config_files, makima.host.keyring_get
   copilot.config_files = function()
     return { { ["myco.ghe.com"] = { oauth_token = "ghe" } } }
   end
@@ -409,14 +409,14 @@ t.case("login_imports_once_and_status_reports_the_source", function()
   copilot.config_files = function()
     return {}
   end
-  maki.host.keyring_get = function() end
+  makima.host.keyring_get = function() end
   local empty = t.provider_ctx({})
   local ok, err
   t.with_env({}, function()
     ok, err = login(empty, ui, {})
     t.same(spec.auth_status(empty, {}), { state = "missing" })
   end)
-  copilot.config_files, maki.host.keyring_get = config_files, keyring_get
+  copilot.config_files, makima.host.keyring_get = config_files, keyring_get
   t.eq(ok, nil)
   t.eq(err, copilot.NOT_FOUND)
   t.eq(empty.saved, nil)

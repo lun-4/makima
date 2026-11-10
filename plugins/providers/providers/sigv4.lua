@@ -13,7 +13,7 @@ local function hex(bytes)
 end
 
 local function hex_sha256(bytes)
-  return hex(maki.crypto.sha256(bytes))
+  return hex(makima.crypto.sha256(bytes))
 end
 
 -- Bedrock model ids hold ':', which URLs already spell as '%3A'. SigV4 wants
@@ -59,11 +59,11 @@ function M.sign(input)
   local date = input.timestamp:sub(1, 8)
   local scope = table.concat({ date, input.region, input.service, "aws4_request" }, "/")
   local string_to_sign = table.concat({ ALGORITHM, input.timestamp, scope, hex_sha256(canonical_request) }, "\n")
-  local key = maki.crypto.hmac_sha256("AWS4" .. input.secret_key, date)
-  key = maki.crypto.hmac_sha256(key, input.region)
-  key = maki.crypto.hmac_sha256(key, input.service)
-  key = maki.crypto.hmac_sha256(key, "aws4_request")
-  local signature = hex(maki.crypto.hmac_sha256(key, string_to_sign))
+  local key = makima.crypto.hmac_sha256("AWS4" .. input.secret_key, date)
+  key = makima.crypto.hmac_sha256(key, input.region)
+  key = makima.crypto.hmac_sha256(key, input.service)
+  key = makima.crypto.hmac_sha256(key, "aws4_request")
+  local signature = hex(makima.crypto.hmac_sha256(key, string_to_sign))
   local result = {
     {
       "Authorization",

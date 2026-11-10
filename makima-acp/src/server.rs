@@ -2716,21 +2716,21 @@ mod tests {
             "acp_options",
             &format!(
                 r#"
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "/acp_fast", tui_only = false,
                 handler = function(_, ctx)
                     local root = assert(ctx:agent())
                     assert(assert(root:set_model(ctx, {{ fast = true }})).fast)
                     assert(assert(root:config(ctx)).model.fast)
                     local config = assert(root:config(ctx))
-                    assert(config.model.fast and config.model.spec == "{FAST_SPEC}", maki.json.encode(config))
-                    local view, view_err = maki.fn.winsaveview()
+                    assert(config.model.fast and config.model.spec == "{FAST_SPEC}", makima.json.encode(config))
+                    local view, view_err = makima.fn.winsaveview()
                     assert(view == nil and view_err == "{no_ui}", view_err)
                 end,
             }})
-            maki.api.create_autocmd("TurnEnd", {{
+            makima.api.create_autocmd("TurnEnd", {{
                 callback = function(ev)
-                    maki.ui.flash("{ACP_TURN_END}" .. ev.data.session_id)
+                    makima.ui.flash("{ACP_TURN_END}" .. ev.data.session_id)
                 end,
             }})
         "#,
@@ -2740,7 +2740,7 @@ mod tests {
         .unwrap();
         if permission {
             host.load_source("acp_child_permission", r#"
-                maki.api.register_tool({
+                makima.api.register_tool({
                     name = "acp_child_permission", description = "request a child permission",
                     schema = { type = "object", properties = {} }, audiences = { "main", "general_sub" },
                     permission = "run", permission_scopes = function() return { scopes = { "ACP child permission" }, force_prompt = true } end,
@@ -3830,7 +3830,7 @@ mod tests {
         const OPTION_ID: &str = "choice.value";
         const REJECTED_VALUE: &str = "rejected";
         const SOURCE: &str = r#"
-            maki.api.register_session_option({
+            makima.api.register_session_option({
                 id = "choice.value",
                 name = "Choice",
                 description = "Test choice",

@@ -6,7 +6,7 @@
 -- reaches the same toggle. Expansion is never stored: the UI records
 -- clicked rows and replays them through `restore` in order, so `toggle`
 -- stays a pure flag flip + re-render, deterministic across replays.
--- Async highlighting goes through `maki.async.run`; during restore the
+-- Async highlighting goes through `makima.async.run`; during restore the
 -- runtime runs those tasks inline before snapshotting.
 local ToolView = {}
 ToolView.__index = ToolView
@@ -176,7 +176,7 @@ function ToolView:append(line)
 end
 
 function ToolView:append_text(text)
-  for _, line in ipairs(maki.split(text, "\n")) do
+  for _, line in ipairs(makima.split(text, "\n")) do
     self:append(line)
   end
 end
@@ -191,15 +191,15 @@ function ToolView:set_highlight(content, ext)
   if content == "" then
     return false
   end
-  local lines = maki.split(content, "\n")
+  local lines = makima.split(content, "\n")
 
   local fmt = ToolView.line_nr_fmt(#lines) .. " "
   for idx, line in ipairs(lines) do
     self:append({ format_line_nr(fmt, idx), { line } })
   end
 
-  maki.async.run(function()
-    local highlighted = maki.ui.highlight(content, ext)
+  makima.async.run(function()
+    local highlighted = makima.ui.highlight(content, ext)
     if not highlighted then
       return
     end
@@ -292,7 +292,7 @@ function ToolView:finish()
 end
 
 function ToolView.restore_lines(lines, opts)
-  local buf = maki.ui.buf()
+  local buf = makima.ui.buf()
   local view = ToolView.new(buf, opts)
   for _, line in ipairs(lines) do
     view:append(line)
@@ -307,7 +307,7 @@ end
 -- Rebuild a collapsed view from a tool's saved llm_output, click-to-toggle
 -- wired. For `restore` hooks.
 function ToolView.restore(output, opts)
-  return ToolView.restore_lines(maki.split(output, "\n"), opts)
+  return ToolView.restore_lines(makima.split(output, "\n"), opts)
 end
 
 -- Same, for tools whose live output goes through markdown (`format =
@@ -315,7 +315,7 @@ end
 -- live.
 function ToolView.restore_markdown(output, is_error, opts)
   if not is_error then
-    local ok, md_lines = pcall(maki.ui.markdown, output, opts.width)
+    local ok, md_lines = pcall(makima.ui.markdown, output, opts.width)
     if ok then
       return ToolView.restore_lines(md_lines, opts)
     end

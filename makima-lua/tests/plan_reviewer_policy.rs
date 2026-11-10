@@ -29,27 +29,27 @@ const TASK_FAMILY: [&str; 4] = [TASK_SPAWN_TOOL, TASK_WAIT_TOOL, "task_send", "t
 /// needed. `makima.agent.tools` is left real when `real_tools` is set (so the
 /// reviewer's tool set can be inspected); otherwise it is stubbed to empty.
 const SESSION_WRAPPER: &str = r#"
-local real_spawn = maki.agent.spawn
-maki.agent.spawn = function(ctx, opts)
+local real_spawn = makima.agent.spawn
+makima.agent.spawn = function(ctx, opts)
   opts.inherit_provider = true
   return real_spawn(ctx, opts)
 end
-maki.agent.resolve_model = function(ctx, opts)
+makima.agent.resolve_model = function(ctx, opts)
   return { spec = "anthropic/claude-sonnet-4-20250514" }
 end
-maki.agent.system_prompt = function(ctx, opts)
+makima.agent.system_prompt = function(ctx, opts)
   return "sys"
 end
 "#;
 
-const TOOLS_STUB: &str = "maki.agent.tools = function(ctx, opts) return nil end\n";
+const TOOLS_STUB: &str = "makima.agent.tools = function(ctx, opts) return nil end\n";
 
 /// A read tool visible to `research_sub` and a write tool visible only to
 /// `general_sub`, so the real `makima.agent.tools` can demonstrate the reviewer's
 /// audience-based read-only filtering: the reviewer (research_sub) gets `read`
 /// but not `write`.
 const FAKE_READ_WRITE_TOOLS: &str = r#"
-maki.api.register_tool({
+makima.api.register_tool({
   name = "read",
   description = "fake read",
   kind = "execute",
@@ -57,7 +57,7 @@ maki.api.register_tool({
   audiences = { "main", "research_sub" },
   handler = function() return "read-only" end,
 })
-maki.api.register_tool({
+makima.api.register_tool({
   name = "write",
   description = "fake write",
   kind = "execute",

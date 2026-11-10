@@ -593,27 +593,30 @@ fn agent_defer_close(
     Ok((Some(true), None))
 }
 
-// Bundled task plugin internals, not public API. `_maki_session_id` reads the
-// task/UI identity. `_maki_task_owner` returns a host-stamped guard whose
-// `_maki_can_control` checks plugin generation, host and parent branch, and whose
-// `_maki_retired` reports a closed child. The guard authorizes no effect.
+// Bundled task plugin internals, not public API. `_makima_session_id` reads the
+// task/UI identity. `_makima_task_owner` returns a host-stamped guard whose
+// `_makima_can_control` checks plugin generation, host and parent branch, and whose
+// `_makima_retired` reports a closed child. The guard authorizes no effect.
 fn agent_internal_methods<M: UserDataMethods<LuaAgent>>(methods: &mut M) {
-    methods.add_method("_maki_task_owner", |lua, this, ctx: UserDataRef<LuaCtx>| {
-        authorize(lua, &ctx, this).map_err(mlua::Error::runtime)?;
-        let (plugin, generation) =
-            current_plugin(lua).ok_or_else(|| mlua::Error::runtime(NO_PLUGIN_AUTHORITY))?;
-        Ok(LuaTaskOwner {
-            owner_id: this.state.as_ref().and_then(|state| state.parent_agent_id),
-            owner: plugin_authority(lua, plugin.clone()),
-            plugin,
-            generation,
-            target: this
-                .manager
-                .lookup(this.id)
-                .map_err(mlua::Error::external)?,
-        })
-    });
-    methods.add_method("_maki_session_id", |_, this, ()| {
+    methods.add_method(
+        "_makima_task_owner",
+        |lua, this, ctx: UserDataRef<LuaCtx>| {
+            authorize(lua, &ctx, this).map_err(mlua::Error::runtime)?;
+            let (plugin, generation) =
+                current_plugin(lua).ok_or_else(|| mlua::Error::runtime(NO_PLUGIN_AUTHORITY))?;
+            Ok(LuaTaskOwner {
+                owner_id: this.state.as_ref().and_then(|state| state.parent_agent_id),
+                owner: plugin_authority(lua, plugin.clone()),
+                plugin,
+                generation,
+                target: this
+                    .manager
+                    .lookup(this.id)
+                    .map_err(mlua::Error::external)?,
+            })
+        },
+    );
+    methods.add_method("_makima_session_id", |_, this, ()| {
         Ok(this
             .state
             .as_ref()

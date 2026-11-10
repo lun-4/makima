@@ -77,7 +77,7 @@ const SCRIPTS: &str = r#"
             return tostring(ctx.credentials:write({ access = ACCESS, refresh = REFRESH, expires = EXPIRES }))
         end,
         read = function(ctx)
-            return maki.json.encode(ctx.credentials:read())
+            return makima.json.encode(ctx.credentials:read())
         end,
         delete = function(ctx)
             return tostring(ctx.credentials:delete()) .. "," .. tostring(ctx.credentials:delete())
@@ -97,12 +97,12 @@ const SCRIPTS: &str = r#"
                     return { access = REFRESHED .. calls, refresh = REFRESH, expires = EXPIRES }
                 end))
             end
-            local results = maki.async.gather({ refresh, refresh })
+            local results = makima.async.gather({ refresh, refresh })
             return calls .. "," .. results[1].value .. "," .. results[2].value
         end,
         rotate = function(ctx)
             return token(ctx.credentials:refresh(function()
-                return maki.json.decode(body(assert(ctx.send({ url = SERVER }))))
+                return makima.json.decode(body(assert(ctx.send({ url = SERVER }))))
             end))
         end,
         stored = function(ctx)
@@ -128,12 +128,12 @@ const SCRIPTS: &str = r#"
             end)
         end,
         plugin_store = function(ctx)
-            local store = maki.credentials.open(ctx, STORE_KEY)
+            local store = makima.credentials.open(ctx, STORE_KEY)
             store:write({ api_key = API_KEY })
             return store:read().api_key
         end,
         not_a_ctx = function()
-            local _, err = pcall(maki.credentials.open, {}, STORE_KEY)
+            local _, err = pcall(makima.credentials.open, {}, STORE_KEY)
             return tostring(err)
         end,
         assign = function(ctx)
@@ -226,7 +226,7 @@ fn source(server: &str) -> String {
         r#"
         {constants}
         {SCRIPTS}
-        maki.api.register_provider(root:with_name("{NAMESPACE}"), {{
+        makima.api.register_provider(root:with_name("{NAMESPACE}"), {{
             id = "{PROVIDER}",
             display_name = "Fake",
             models = {{ {{ id = "fake-1", tier = "strong" }} }},
@@ -488,9 +488,9 @@ fn named_children_of_the_root_ctx_open_separate_stores() {
         r#"
         local root = ...
         local child = root:with_name("{NAMESPACE}")
-        assert(maki.credentials.open(root, "{STORE_KEY}"):write({{ at = "root" }}))
-        assert(maki.credentials.open(child, "{STORE_KEY}"):write({{ at = "child" }}))
-        assert(maki.credentials.open(child:with_name("deeper"), "{STORE_KEY}"):write({{ at = "deeper" }}))
+        assert(makima.credentials.open(root, "{STORE_KEY}"):write({{ at = "root" }}))
+        assert(makima.credentials.open(child, "{STORE_KEY}"):write({{ at = "child" }}))
+        assert(makima.credentials.open(child:with_name("deeper"), "{STORE_KEY}"):write({{ at = "deeper" }}))
         "#
     );
 
@@ -512,8 +512,8 @@ fn child_ctx_cannot_read_a_parent_only_store() {
     let source = format!(
         r#"
         local root = ...
-        assert(maki.credentials.open(root, "{STORE_KEY}"):write({{ at = "root" }}))
-        local seen = maki.credentials.open(root:with_name("{NAMESPACE}"), "{STORE_KEY}"):read()
+        assert(makima.credentials.open(root, "{STORE_KEY}"):write({{ at = "root" }}))
+        local seen = makima.credentials.open(root:with_name("{NAMESPACE}"), "{STORE_KEY}"):read()
         assert(seen == nil, "a child ctx read its parent's store")
         "#
     );
@@ -531,7 +531,7 @@ fn send_and_store_refresh_work_during_load() {
         r#"
         {constants}
         local ctx = root:with_name("{NAMESPACE}")
-        local account = maki.credentials.open(ctx, STORE_KEY)
+        local account = makima.credentials.open(ctx, STORE_KEY)
         assert(account:write({{ access = STALE, refresh = REFRESH, expires = EXPIRES }}))
         local refreshed, err = account:refresh(function(current)
             assert(current.access == STALE)
@@ -543,7 +543,7 @@ fn send_and_store_refresh_work_during_load() {
                 table.insert(parts, chunk)
             end
             response:close()
-            return maki.json.decode(table.concat(parts))
+            return makima.json.decode(table.concat(parts))
         end)
         assert(refreshed and refreshed.access == ROTATED, tostring(err))
         "#,
@@ -565,7 +565,7 @@ fn concurrent_refreshes_during_load_share_one_call() {
     let source = format!(
         r#"
         {constants}
-        local store = maki.credentials.open(root, STORE_KEY)
+        local store = makima.credentials.open(root, STORE_KEY)
         local calls = 0
         local function refresh()
             local tokens = store:refresh(function()
@@ -574,7 +574,7 @@ fn concurrent_refreshes_during_load_share_one_call() {
             end)
             return tokens.access
         end
-        local results = maki.async.gather({{ refresh, refresh }})
+        local results = makima.async.gather({{ refresh, refresh }})
         local seen = calls .. "," .. results[1].value .. "," .. results[2].value
         assert(seen == "1," .. REFRESHED .. "1," .. REFRESHED .. "1", seen)
         "#,
@@ -612,8 +612,8 @@ fn plugin_ctx_send_gives_up_after_the_net_timeout() {
 #[test_case(r#"root:with_name("")"#, BAD_NAME_ERR ; "empty_name")]
 #[test_case(r#"root:with_name(".hidden")"#, BAD_NAME_ERR ; "dot_name")]
 #[test_case(r#"root:with_name("a/b")"#, BAD_NAME_ERR ; "slash_name")]
-#[test_case(r#"maki.credentials.open(root, "../up")"#, BAD_NAME_ERR ; "parent_key")]
-#[test_case(r#"maki.api.register_provider(root)"#, BAD_ARGS_ERR ; "ctx_without_spec")]
+#[test_case(r#"makima.credentials.open(root, "../up")"#, BAD_NAME_ERR ; "parent_key")]
+#[test_case(r#"makima.api.register_provider(root)"#, BAD_ARGS_ERR ; "ctx_without_spec")]
 fn invalid_ctx_use_fails_the_load(call: &str, expected: &str) {
     let state = TempDir::new().unwrap();
 
@@ -631,7 +631,7 @@ fn global_and_project_init_share_one_root() {
         ("project", "project/init.lua"),
     ] {
         let source = format!(
-            r#"assert(maki.credentials.open((...), "{name}"):write({{ from = "{init}" }}))"#
+            r#"assert(makima.credentials.open((...), "{name}"):write({{ from = "{init}" }}))"#
         );
         host.send_run_init_lua(source, init.to_owned(), None)
             .unwrap();

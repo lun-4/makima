@@ -1,6 +1,6 @@
 local llama_cpp = require("providers.llama_cpp")
 local local_server = require("providers.local_server")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local HOST = "http://box:8080"
 local DEFAULT = llama_cpp.DEFAULT_CONTEXT
@@ -8,7 +8,7 @@ local DEFAULT = llama_cpp.DEFAULT_CONTEXT
 local spec = local_server.provider(llama_cpp.def)
 
 local function json(value)
-  return t.response({ assert(maki.json.encode(value)) })
+  return t.response({ assert(makima.json.encode(value)) })
 end
 
 local function window(row, mode, props_n_ctx)

@@ -71,7 +71,7 @@ const AUTO_DETECT_ORDER: &[&str] = &[
 ];
 
 const SOURCE: &str = r#"
-    maki.api.register_provider({
+    makima.api.register_provider({
         id = "fake",
         display_name = "Fake",
         models = { { id = "fake-1", tier = "strong" } },
@@ -93,7 +93,7 @@ const SOURCE: &str = r#"
         },
         aliases = { { id = "fake-swallow", label = "Fake (ignores errors)", method = "swallow" } },
     })
-    maki.api.register_provider({
+    makima.api.register_provider({
         id = "other",
         display_name = "Other",
         prepare = function() return {} end,

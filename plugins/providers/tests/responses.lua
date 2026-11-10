@@ -1,10 +1,10 @@
 local responses = require("providers.responses")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local function sse(events)
   local frames = {}
   for _, event in ipairs(events) do
-    frames[#frames + 1] = "event: " .. event.type .. "\ndata: " .. assert(maki.json.encode(event)) .. "\n\n"
+    frames[#frames + 1] = "event: " .. event.type .. "\ndata: " .. assert(makima.json.encode(event)) .. "\n\n"
   end
   return t.response({ table.concat(frames) })
 end
@@ -56,7 +56,7 @@ t.case("build_request", function()
     },
     tools = { { type = "function", name = "f", description = "d", parameters = { type = "object" }, strict = false } },
   })
-  t.eq(assert(maki.json.encode(responses.build_request({ model = { id = "m" }, messages = {} }).input)), "[]")
+  t.eq(assert(makima.json.encode(responses.build_request({ model = { id = "m" }, messages = {} }).input)), "[]")
 end)
 
 t.case("stream_reasoning_text_and_tools", function()

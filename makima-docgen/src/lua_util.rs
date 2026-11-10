@@ -80,10 +80,7 @@ fn is_register_command(node: Node<'_>, source: &str) -> bool {
         return false;
     };
     expression_path(name, source).is_some_and(|path| {
-        path.len() == 3
-            && (path[0] == "makima" || path[0] == "maki")
-            && path[1] == "api"
-            && path[2] == "register_command"
+        path.len() == 3 && path[0] == "makima" && path[1] == "api" && path[2] == "register_command"
     })
 }
 

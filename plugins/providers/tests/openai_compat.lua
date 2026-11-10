@@ -1,6 +1,6 @@
 local compat = require("providers.openai_compat")
 local http = require("providers.http")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local KEY_ENV = "TEST_API_KEY"
 local BASE = "https://api.example.invalid/v1"
@@ -177,7 +177,7 @@ t.case("stream_rotates_keys_and_reclassifies_errors", function()
     t.eq(ctx.requests[2].headers.Authorization, "Bearer b")
     t.eq(ctx.requests[2].url, BASE .. "/chat/completions")
     t.eq(ctx.requests[2].method, "POST")
-    t.eq(maki.json.decode(ctx.requests[2].body).max_tokens, 512)
+    t.eq(makima.json.decode(ctx.requests[2].body).max_tokens, 512)
   end)
 end)
 

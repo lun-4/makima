@@ -468,8 +468,8 @@ fn skeleton(src: &str) -> String {
 
 fn helpers() -> Vec<(String, &'static str)> {
     let makima = lib_dir()
-        .get_dir("maki")
-        .expect("plugins/lib/maki embedded");
+        .get_dir("makima")
+        .expect("plugins/lib/makima embedded");
     let mut helpers: Vec<(String, &'static str)> = makima
         .files()
         .filter_map(|file| {

@@ -1,5 +1,5 @@
 local anthropic = require("providers.anthropic")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local EPHEMERAL = { type = "ephemeral" }
 local UNPARSED_ERROR = "upstream exploded"
@@ -9,7 +9,7 @@ local FALLBACK_HIGH_BUDGET = 19660
 local function sse(events)
   local frames = {}
   for _, event in ipairs(events) do
-    frames[#frames + 1] = "event: " .. event.type .. "\ndata: " .. assert(maki.json.encode(event)) .. "\n\n"
+    frames[#frames + 1] = "event: " .. event.type .. "\ndata: " .. assert(makima.json.encode(event)) .. "\n\n"
   end
   return t.response({ table.concat(frames) })
 end

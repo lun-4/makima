@@ -1,7 +1,7 @@
 -- Spans: styled slices of a label for fuzzy-match highlighting.
 --
 -- `match_spans` takes 1-based CODEPOINT indices (as returned by
--- `maki.match.fuzzy`) and slices the label by bytes, so multi-byte titles
+-- `makima.match.fuzzy`) and slices the label by bytes, so multi-byte titles
 -- (CJK, emoji) get whole-codepoint spans. Adjacent indices merge into one
 -- span.
 

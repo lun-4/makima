@@ -7098,7 +7098,7 @@ Sets styled status content for your plugin. Each span is {text, style_name} or {
 ```lua
 makima.ui.set_status_content({ {"connected", "success"}, {" readonly", "muted"} })
 -- clickable entry:
-maki.ui.set_status_content({ {"refresh", "accent", function() makima.ui.flash("refreshing") end} })
+makima.ui.set_status_content({ {"refresh", "accent", function() makima.ui.flash("refreshing") end} })
 ```
 
 ---
@@ -7120,7 +7120,7 @@ Shows key hints in the status bar for your plugin. Each hint is a {key, label} p
 ```lua
 makima.ui.set_status_hint({ {"q", "quit"}, {"j", "down"} })
 -- later, clear them:
-maki.ui.set_status_hint(nil)
+makima.ui.set_status_hint(nil)
 ```
 
 ---
@@ -7740,7 +7740,7 @@ function M.lerp(from, to, t)
 end
 
 function M.dim(color, factor)
-  local background = maki.ui.theme_color("background")
+  local background = makima.ui.theme_color("background")
   if not background then
     return color
   end
@@ -7786,7 +7786,7 @@ function ListPicker.render_header(win, lines, input, prefix, inner)
 
 -- Open a fuzzy-filter picker in a floating window and block until the user
 -- decides. {items} is a list of strings or { label, detail?, age? } tables,
--- where `age` is a timestamp from `maki.time.now` or `maki.time.at` and
+-- where `age` is a timestamp from `makima.time.now` or `makima.time.at` and
 -- refreshes once per displayed second while the dialog is open.
 -- {opts}:
 -- title, footer, cursor (initial index), submit_keys (extra submit keys
@@ -7888,14 +7888,14 @@ function M.cut(view, out, reason, timeout_secs, limits)
 ### `require("makima.scroll")`
 
 ```lua
--- Relative scrolling on top of maki.fn.winsaveview / winrestview.
+-- Relative scrolling on top of makima.fn.winsaveview / winrestview.
 -- Positive {delta} scrolls down, negative up. Returns (true, nil) or (nil, err).
 local function scroll(delta)
-  local view, err = maki.fn.winsaveview()
+  local view, err = makima.fn.winsaveview()
   if not view then
     return nil, err
   end
-  return maki.fn.winrestview({ topline = view.topline + delta })
+  return makima.fn.winrestview({ topline = view.topline + delta })
 end
 
 return scroll
@@ -7910,7 +7910,7 @@ end
 
 local function shorten_path(path)
   local p = normalize_sep(path)
-  local cwd = maki.uv.cwd()
+  local cwd = makima.uv.cwd()
   if cwd then
     cwd = normalize_sep(cwd)
     if p:sub(1, #cwd + 1) == cwd .. "/" then
@@ -7918,7 +7918,7 @@ local function shorten_path(path)
       return rel == "" and "." or rel
     end
   end
-  local home = maki.uv.os_homedir()
+  local home = makima.uv.os_homedir()
   if home then
     home = normalize_sep(home)
     if p:sub(1, #home + 1) == home .. "/" then
@@ -7938,7 +7938,7 @@ return shorten_path
 -- Spans: styled slices of a label for fuzzy-match highlighting.
 --
 -- `match_spans` takes 1-based CODEPOINT indices (as returned by
--- `maki.match.fuzzy`) and slices the label by bytes, so multi-byte titles
+-- `makima.match.fuzzy`) and slices the label by bytes, so multi-byte titles
 -- (CJK, emoji) get whole-codepoint spans. Adjacent indices merge into one
 -- span.
 
@@ -7961,7 +7961,7 @@ function M.has(s, substr, msg)
 function M.mktmpdir(prefix)
 function M.rmtree(dir)
 
--- A scripted `maki.net.send` response that yields {chunks} in order. A
+-- A scripted `makima.net.send` response that yields {chunks} in order. A
 -- `read_error` is returned once the chunks run out instead of the end.
 function M.response(chunks, opts)
 
@@ -7973,7 +7973,7 @@ function M.provider_ctx(responses, saved)
 -- An `emit` for provider streams, plus the list it records into.
 function M.recorder()
 
--- Runs {fn} with `maki.uv.os_getenv` reading from {env} instead.
+-- Runs {fn} with `makima.uv.os_getenv` reading from {env} instead.
 function M.with_env(env, fn)
 
 -- Compares JSON-like values structurally.
@@ -8045,7 +8045,7 @@ function TextInput:click(rendered, row, col)
 ### `require("makima.toast")`
 
 ```lua
--- Corner toast notifications built on floating windows. `maki.ui.flash` gives
+-- Corner toast notifications built on floating windows. `makima.ui.flash` gives
 -- you one line in the status area. A toast stays up long enough to read, can
 -- carry a title, and stacks under the toasts already on screen.
 
@@ -8066,7 +8066,7 @@ function Toast.show(text, opts)
 -- reaches the same toggle. Expansion is never stored: the UI records
 -- clicked rows and replays them through `restore` in order, so `toggle`
 -- stays a pure flag flip + re-render, deterministic across replays.
--- Async highlighting goes through `maki.async.run`; during restore the
+-- Async highlighting goes through `makima.async.run`; during restore the
 -- runtime runs those tasks inline before snapshotting.
 
 -- Right aligned, so the content column stays put when a number gains a digit.

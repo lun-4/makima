@@ -7991,24 +7991,24 @@ mod tests {
                 "closed_task_command",
                 &format!(
                     r#"
-                    maki.api.register_command({{
+                    makima.api.register_command({{
                         name = "/spawn-command-task", tui_only = false,
                         handler = function(_, ctx)
-                            assert(maki.agent.spawn(ctx, {{
+                            assert(makima.agent.spawn(ctx, {{
                                 inherit_provider = true, silent = true,
                             }}))
-                            maki.ui.flash("{SPAWNED}")
+                            makima.ui.flash("{SPAWNED}")
                         end,
                     }})
-                    maki.api.register_command({{
+                    makima.api.register_command({{
                         name = "/ordinary-command", tui_only = false,
                         handler = function(_, ctx)
                             assert(ctx == nil)
-                            local ok, child = pcall(maki.agent.spawn, ctx, {{
+                            local ok, child = pcall(makima.agent.spawn, ctx, {{
                                 inherit_provider = true, silent = true,
                             }})
                             assert(not ok or child == nil)
-                            maki.ui.flash("{OBSERVED}")
+                            makima.ui.flash("{OBSERVED}")
                         end,
                     }})
                     "#
@@ -8363,11 +8363,11 @@ mod tests {
             host.load_source(
                 "rewind_child",
                 r#"
-                maki.api.register_command({
+                makima.api.register_command({
                     name = "/rewind-child", tui_only = false,
                     handler = function(_, ctx)
-                        assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true }))
-                        maki.ui.flash("rewind child ready")
+                        assert(makima.agent.spawn(ctx, { inherit_provider = true, silent = true }))
+                        makima.ui.flash("rewind child ready")
                     end,
                 })
             "#,
@@ -8585,11 +8585,11 @@ mod tests {
                 "tasks_child_input",
                 &format!(
                     r#"
-                    maki.api.register_command({{
+                    makima.api.register_command({{
                         name = "/spawn-tasks-child", tui_only = false,
                         handler = function(_, ctx)
-                            assert(maki.agent.spawn(ctx, {{ inherit_provider = true, show = false }}))
-                            maki.ui.flash("{SPAWNED}")
+                            assert(makima.agent.spawn(ctx, {{ inherit_provider = true, show = false }}))
+                            makima.ui.flash("{SPAWNED}")
                         end,
                     }})
                     "#
@@ -8780,11 +8780,11 @@ mod tests {
                 "model_picker_child",
                 &format!(
                     r#"
-                    maki.api.register_command({{
+                    makima.api.register_command({{
                         name = "/spawn-picker-child", tui_only = false,
                         handler = function(_, ctx)
-                            assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true }}))
-                            maki.ui.flash("{SPAWNED}")
+                            assert(makima.agent.spawn(ctx, {{ inherit_provider = true, silent = true }}))
+                            makima.ui.flash("{SPAWNED}")
                         end,
                     }})
                     "#
@@ -8955,23 +8955,23 @@ mod tests {
                 "keymap_pin_command",
                 &format!(
                     r#"
-                    maki.api.register_command({{
+                    makima.api.register_command({{
                         name = "/spawn-keymap-child", tui_only = false,
                         handler = function(_, ctx)
-                            assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true }}))
-                            maki.ui.flash("{SPAWNED}")
+                            assert(makima.agent.spawn(ctx, {{ inherit_provider = true, silent = true }}))
+                            makima.ui.flash("{SPAWNED}")
                         end,
                     }})
-                    maki.api.register_command({{
+                    makima.api.register_command({{
                         name = "/keymap-inner", tui_only = false,
                         handler = function(_, ctx)
                             local target = assert(ctx:agent())
                             assert(target:set_model(ctx, {{ thinking = "{PINNED_THINKING}" }}))
-                            maki.ui.flash("{INNER_DONE}")
+                            makima.ui.flash("{INNER_DONE}")
                         end,
                     }})
-                    maki.keymap.set("n", "<C-y>", function(_, ctx)
-                        assert(maki.api.run_command(ctx, "/keymap-inner"))
+                    makima.keymap.set("n", "<C-y>", function(_, ctx)
+                        assert(makima.api.run_command(ctx, "/keymap-inner"))
                     end)
                     "#
                 ),
@@ -9045,26 +9045,26 @@ mod tests {
                 "nested_pin_command",
                 &format!(
                     r#"
-                    maki.api.register_command({{
+                    makima.api.register_command({{
                         name = "/spawn-pin-child", tui_only = false,
                         handler = function(_, ctx)
-                            assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true }}))
-                            maki.ui.flash("{SPAWNED}")
+                            assert(makima.agent.spawn(ctx, {{ inherit_provider = true, silent = true }}))
+                            makima.ui.flash("{SPAWNED}")
                         end,
                     }})
-                    maki.api.register_command({{
+                    makima.api.register_command({{
                         name = "/pin-outer", tui_only = false,
                         handler = function(_, ctx)
-                            assert(maki.fn.winsaveview())
-                            assert(maki.api.run_command(ctx, "/pin-inner"))
+                            assert(makima.fn.winsaveview())
+                            assert(makima.api.run_command(ctx, "/pin-inner"))
                         end,
                     }})
-                    maki.api.register_command({{
+                    makima.api.register_command({{
                         name = "/pin-inner", tui_only = false,
                         handler = function(_, ctx)
                             local target = assert(ctx:agent())
                             assert(target:set_model(ctx, {{ thinking = "{PINNED_THINKING}" }}))
-                            maki.ui.flash("{INNER_DONE}")
+                            makima.ui.flash("{INNER_DONE}")
                         end,
                     }})
                     "#

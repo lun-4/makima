@@ -521,7 +521,7 @@ mod tests {
     const BROWSER_KEY: &str = "sk-from-browser";
 
     const SOURCE: &str = r#"
-        maki.api.register_provider({
+        makima.api.register_provider({
             id = "deepseek",
             display_name = "Fake DeepSeek",
             models = { { id = "fake-1", tier = "strong" } },
@@ -538,7 +538,7 @@ mod tests {
                 end },
             },
         })
-        maki.api.register_provider({
+        makima.api.register_provider({
             id = "browser-login",
             display_name = "Browser Login",
             prepare = function() return {} end,

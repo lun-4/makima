@@ -37,8 +37,8 @@ local _tmpdir_counter = 0
 -- time + clock + counter keeps dirs unique even across parallel test runs
 local function mktmpdir()
   _tmpdir_counter = _tmpdir_counter + 1
-  local name = "/tmp/maki_spec_" .. os.time() .. "_" .. tostring(os.clock()):gsub("%.", "") .. "_" .. _tmpdir_counter
-  maki.fs.mkdir(name)
+  local name = "/tmp/makima_spec_" .. os.time() .. "_" .. tostring(os.clock()):gsub("%.", "") .. "_" .. _tmpdir_counter
+  makima.fs.mkdir(name)
   return name
 end
 
@@ -47,7 +47,7 @@ local function case_tmp(name, fn)
   case(name, function()
     local dir = mktmpdir()
     local ok, err = pcall(fn, dir)
-    maki.fs.rm(dir, { recursive = true })
+    makima.fs.rm(dir, { recursive = true })
     if not ok then
       error(err, 0)
     end
@@ -55,7 +55,7 @@ local function case_tmp(name, fn)
 end
 
 local function write_mem(dir, name, tags, body)
-  maki.fs.write(maki.fs.joinpath(dir, name), encode_frontmatter(tags) .. body)
+  makima.fs.write(makima.fs.joinpath(dir, name), encode_frontmatter(tags) .. body)
 end
 
 case("fnv1a_known_vectors", function()
@@ -140,7 +140,7 @@ case_tmp("format_list_groups_sorted_by_freq_no_bodies", function(dir)
 end)
 
 case_tmp("format_list_stem_pseudo_tag", function(dir)
-  maki.fs.write(maki.fs.joinpath(dir, "notes.md"), "no frontmatter")
+  makima.fs.write(makima.fs.joinpath(dir, "notes.md"), "no frontmatter")
   assert(format_list(dir):find("notes %(1%)"), "untagged file grouped under its stem")
   local filtered, err = format_list(dir, { "notes" })
   eq(err, nil)
@@ -186,7 +186,7 @@ end)
 case_tmp("format_list_caps_oversized_output", function(dir)
   local stem = string.rep("a", 180)
   for i = 1, 130 do
-    maki.fs.write(maki.fs.joinpath(dir, stem .. i .. ".md"), "x")
+    makima.fs.write(makima.fs.joinpath(dir, stem .. i .. ".md"), "x")
   end
   local result = format_list(dir)
   assert(#result <= h.MAX_FILE_BYTES + 200, "list output stays near the cap")
@@ -349,7 +349,7 @@ case_tmp("format_tag_line_sorted_by_freq", function(dir)
   write_mem(dir, "b.md", { "common" }, "B")
   write_mem(dir, "c.md", { "common" }, "C")
   write_mem(dir, "d.md", { "common" }, "D")
-  maki.fs.write(maki.fs.joinpath(dir, "untagged.md"), "no tags")
+  makima.fs.write(makima.fs.joinpath(dir, "untagged.md"), "no tags")
 
   local line = format_tag_line(dir, 50)
   local common_pos = line:find("common", 1, true)
@@ -368,10 +368,10 @@ case_tmp("format_tag_line_truncates_above_cap", function(dir)
 end)
 
 local function with_read_stub(stub, fn)
-  local orig = maki.fs.read
-  maki.fs.read = stub
+  local orig = makima.fs.read
+  makima.fs.read = stub
   local ok, err = pcall(fn)
-  maki.fs.read = orig
+  makima.fs.read = orig
   if not ok then
     error(err, 0)
   end
@@ -516,7 +516,7 @@ end)
 
 case_tmp("format_read_normalizes_request_and_stem", function(dir)
   write_mem(dir, "a.md", { "auth_flow" }, "A")
-  maki.fs.write(maki.fs.joinpath(dir, "notes.md"), "no frontmatter")
+  makima.fs.write(makima.fs.joinpath(dir, "notes.md"), "no frontmatter")
 
   assert(format_read(dir, { "Auth-Flow", "AUTH FLOW" }):find("a%.md"), "request tags normalized before matching")
 
@@ -539,10 +539,10 @@ end)
 
 case_tmp("format_read_oversized_picks_hint_by_match_count", function(dir)
   local max = h.MAX_FILE_BYTES
-  local one = maki.fs.joinpath(dir, "one")
-  local many = maki.fs.joinpath(dir, "many")
-  maki.fs.mkdir(one)
-  maki.fs.mkdir(many)
+  local one = makima.fs.joinpath(dir, "one")
+  local many = makima.fs.joinpath(dir, "many")
+  makima.fs.mkdir(one)
+  makima.fs.mkdir(many)
   write_mem(one, "big.md", { "bulk" }, string.rep("x", max + 50))
   local half = math.floor(max / 2) + 100
   write_mem(many, "a.md", { "bulk" }, string.rep("a", half))

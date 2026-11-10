@@ -1,5 +1,5 @@
 local bh = require("bash_helpers")
-local th = require("maki.test_helpers")
+local th = require("makima.test_helpers")
 
 local case = th.case
 local eq = th.eq
@@ -210,7 +210,7 @@ end)
 
 case("spawn_opts_inherits_session_model_when_unset", function()
   local o = bh.spawn_opts({})
-  eq(o.model, nil, "an omitted model makes maki.agent.spawn inherit the parent model")
+  eq(o.model, nil, "an omitted model makes makima.agent.spawn inherit the parent model")
   eq(o.system, CLASSIFIER_SYSTEM)
   eq(o.silent, true)
 end)

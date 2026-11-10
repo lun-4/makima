@@ -50,11 +50,11 @@ local function describe(ctx, client, id)
     url = client.root .. SHOW_PATH,
     method = "POST",
     headers = { ["Content-Type"] = "application/json" },
-    body = assert(maki.json.encode({ model = id })),
+    body = assert(makima.json.encode({ model = id })),
   })
   local row = { id = id, pricing = local_server.PRICING_FREE }
   if type(show) ~= "table" then
-    maki.log.warn(SHOW_FAILED:format(id, tostring(err)))
+    makima.log.warn(SHOW_FAILED:format(id, tostring(err)))
     return row
   end
   row.context_window = M.context_window(show)
@@ -79,7 +79,7 @@ function M.list_models(ctx, client)
     end
   end
   local out = {}
-  for i, result in ipairs(maki.async.gather(tasks)) do
+  for i, result in ipairs(makima.async.gather(tasks)) do
     out[i] = result.ok and result.value or { id = ids[i].id, pricing = local_server.PRICING_FREE }
   end
   return out

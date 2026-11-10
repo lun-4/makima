@@ -31,6 +31,20 @@ use serde_json::{Value, json};
 mod common;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[test]
+fn makima_global_installed_and_legacy_global_absent() {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source(
+        "global_probe",
+        r#"
+        assert(makima ~= nil, "makima global missing")
+        assert(maki == nil, "legacy maki global present")
+        assert(type(makima.version) == "function")
+        "#,
+    )
+    .unwrap();
+}
 const INITIAL: &str = "alignment initial";
 const STEERING: &str = "alignment steering";
 const USER_INTERRUPT_PREFIX: &str = "<user-interrupt>\n";
@@ -60,8 +74,8 @@ const TRUSTED_MESSAGE: &str = "alignment trusted sender";
 const DELEGATED_MESSAGE: &str = "alignment delegated sender";
 const PRELUDE: &str = r#"
 local handlers = {}
-local register_tool = maki.api.register_tool
-maki.api.register_tool = function(spec)
+local register_tool = makima.api.register_tool
+makima.api.register_tool = function(spec)
     if spec.name == "task_wait" then
         local handler = spec.handler
         spec.handler = function(input, ctx)
@@ -72,31 +86,31 @@ maki.api.register_tool = function(spec)
     handlers[spec.name] = spec.handler
     return register_tool(spec)
 end
-maki.api.register_command({
+makima.api.register_command({
     name = "/alignment", tui_only = false,
     arguments = { raw = true, required = true },
     handler = function(opts, ctx)
-        local call = maki.json.decode(opts.args)
+        local call = makima.json.decode(opts.args)
         local output = handlers[call.name](call.input, ctx)
         assert(not output.is_error, output.llm_output)
         alignment_result = output.llm_output
     end,
 })
-maki.api.register_command({
+makima.api.register_command({
     name = "/alignment_submit", tui_only = false,
     arguments = { raw = true, required = true },
     handler = function(opts, ctx)
-        local input = maki.json.decode(opts.args)
+        local input = makima.json.decode(opts.args)
         alignment_ancestor = assert(ctx:agent())
-        local target = assert(maki.agent.get(ctx, assert(maki.agent.root(ctx))))
-        for _, reference in ipairs(assert(maki.agent.list(ctx))) do
-            if reference:id() == input.agent_id then target = assert(maki.agent.get(ctx, reference)) end
+        local target = assert(makima.agent.get(ctx, assert(makima.agent.root(ctx))))
+        for _, reference in ipairs(assert(makima.agent.list(ctx))) do
+            if reference:id() == input.agent_id then target = assert(makima.agent.get(ctx, reference)) end
         end
         assert(target:id() == input.agent_id)
         alignment_trusted = assert(target:send(ctx, input.message, { when = "join" }))
     end,
 })
-maki.api.register_tool({
+makima.api.register_tool({
     name = "alignment_authority", description = "check mixed sender authority",
     schema = { type = "object", properties = {} },
     audiences = { "main", "general_sub" },
@@ -106,55 +120,55 @@ maki.api.register_tool({
         assert(changed == nil and err ~= nil)
         local closed, close_err = alignment_ancestor:close(ctx)
         assert(closed == nil and close_err ~= nil)
-        return maki.json.encode({ agent_id = current:id(), mode = assert(ctx:mode()), denied = err })
+        return makima.json.encode({ agent_id = current:id(), mode = assert(ctx:mode()), denied = err })
     end,
 })
-maki.api.register_tool({
+makima.api.register_tool({
     name = "alignment_context", description = "read admitted cwd and inherit it",
     schema = { type = "object", properties = { spawn_child = { type = "boolean" } } },
     audiences = { "main", "general_sub" },
     handler = function(input, ctx)
         local cwd = assert(ctx:resolve_path("."))
-        local job = maki.fn.jobstart({ "sh", "-c", "pwd; printf '%s\\n' \"$PWD\"" }, { cwd = cwd })
-        local process = assert(maki.fn.jobwait(job))
+        local job = makima.fn.jobstart({ "sh", "-c", "pwd; printf '%s\\n' \"$PWD\"" }, { cwd = cwd })
+        local process = assert(makima.fn.jobwait(job))
         assert(process.exit_code == 0)
         local output = {}
         for line in process.stdout:gmatch("[^\n]+") do output[#output + 1] = line end
         local child_reply
         if input.spawn_child then
-            local child = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
+            local child = assert(makima.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
             child_reply = assert(assert(child:send(ctx, "alignment inherited cwd", { when = "idle" })):wait(ctx)).text
             assert(child:close(ctx))
         end
-        return maki.json.encode({ cwd = cwd, output = output, child = child_reply })
+        return makima.json.encode({ cwd = cwd, output = output, child = child_reply })
     end,
 })
-maki.api.register_tool({
+makima.api.register_tool({
     name = "alignment_wait_entered", description = "read task wait checkpoint",
     schema = { type = "object", properties = {} },
-    handler = function() return maki.json.encode(alignment_wait_entered == true) end,
+    handler = function() return makima.json.encode(alignment_wait_entered == true) end,
 })
-maki.api.register_tool({
+makima.api.register_tool({
     name = "alignment_result", description = "read command result",
     schema = { type = "object", properties = {} },
     handler = function() return alignment_result end,
 })
-maki.api.register_tool({
+makima.api.register_tool({
     name = "alignment_echo", description = "complete an alignment tool group",
     schema = { type = "object", properties = {} },
     audiences = { "main", "general_sub" },
     handler = function() return "alignment tool complete" end,
 })
-local real_spawn = maki.agent.spawn
-maki.agent.spawn = function(ctx, opts)
+local real_spawn = makima.agent.spawn
+makima.agent.spawn = function(ctx, opts)
     opts.inherit_provider = true
     return real_spawn(ctx, opts)
 end
-maki.agent.resolve_model = function()
+makima.agent.resolve_model = function()
     return { spec = "anthropic/claude-sonnet-4-20250514" }
 end
-maki.agent.system_prompt = function() return "alignment system" end
-maki.agent.tools = function()
+makima.agent.system_prompt = function() return "alignment system" end
+makima.agent.tools = function()
     return {
         { name = "task_spawn", description = "spawn", input_schema = { type = "object" } },
         { name = "task_wait", description = "wait", input_schema = { type = "object" } },

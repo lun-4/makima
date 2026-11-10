@@ -32,7 +32,7 @@ const DISPATCH_ID: &str = "output-limit-dispatch";
 const CANCELLED_ERROR: &str = "cancelled";
 
 const SOURCE: &str = r#"
-maki.api.register_tool({
+makima.api.register_tool({
     name = "limited", description = "limits output", schema = {
         type = "object", properties = {
             mode = { type = "string" }, body = { type = "string" },
@@ -42,7 +42,7 @@ maki.api.register_tool({
     },
     handler = function(input, ctx)
         if input.deadline then ctx:set_deadline(input.deadline) end
-        maki.ui.flash(input.mode .. ":ready")
+        makima.ui.flash(input.mode .. ":ready")
         local reply = {
             llm_output = input.body,
             output_limits = { max_lines = 0, trailer = input.trailer },
@@ -53,18 +53,18 @@ maki.api.register_tool({
             return nil
         end
         if input.mode == "cancel_finish" then
-            maki.async.on_cancel(function()
+            makima.async.on_cancel(function()
                 ctx:finish({ llm_output = input.body,
                     output_limits = { max_lines = 0, trailer = input.trailer }, is_error = true })
-                maki.ui.flash("cancel:finished")
+                makima.ui.flash("cancel:finished")
             end)
-            maki.async.await(1, function(callback) end)
+            makima.async.await(1, function(callback) end)
             return nil
         end
         return reply
     end,
 })
-maki.api.register_tool({
+makima.api.register_tool({
     name = "sibling", description = "responds without offloading",
     schema = { type = "object", properties = {}, additionalProperties = false },
     handler = function() return "sibling completed" end,
@@ -455,11 +455,11 @@ fn malformed_limits_and_unfilterable_sidecars_are_rejected(fields: Value) {
     host.load_source(
         "invalid_limits",
         r#"
-        maki.api.register_tool({
+        makima.api.register_tool({
             name = "invalid_limits", description = "returns a reply",
             schema = { type = "object", properties = { reply = { type = "string" } } },
             handler = function(input)
-                local reply = maki.json.decode(input.reply)
+                local reply = makima.json.decode(input.reply)
                 if reply.llm_output == nil then reply.llm_output = "body" end
                 return reply
             end,

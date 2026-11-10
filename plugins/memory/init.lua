@@ -1,37 +1,37 @@
-local ToolView = require("maki.tool_view")
+local ToolView = require("makima.tool_view")
 local helpers = require("memory_helpers")
 
 local WRITE_TOOLS = { "write", "edit", "multiedit", "edit_lines", "insert_lines" }
 
 local function memories_path_suffix(cwd)
-  local root = maki.fs.root(cwd, ".git") or cwd
+  local root = makima.fs.root(cwd, ".git") or cwd
   return "projects/" .. helpers.project_id(root) .. "/memories"
 end
 
 -- Notes live outside cwd, where file-write tools normally prompt; pre-allow
 -- them here so the agent can edit notes directly.
 local function register_write_rules()
-  local state = maki.env.state_dir()
+  local state = makima.env.state_dir()
   if not state then
     return
   end
-  local dir = maki.fs.joinpath(state, memories_path_suffix(maki.uv.cwd()))
+  local dir = makima.fs.joinpath(state, memories_path_suffix(makima.uv.cwd()))
   for _, tool in ipairs(WRITE_TOOLS) do
-    maki.api.register_permission_rule({ tool = tool, scope = dir .. "/**" })
+    makima.api.register_permission_rule({ tool = tool, scope = dir .. "/**" })
   end
 end
 register_write_rules()
 
 local function resolve_dir(cwd)
-  local suffix = memories_path_suffix(cwd or maki.uv.cwd())
-  local state = maki.env.state_dir()
+  local suffix = memories_path_suffix(cwd or makima.uv.cwd())
+  local state = makima.env.state_dir()
   if not state then
     return nil, "cannot resolve state dir"
   end
-  return maki.fs.joinpath(state, suffix)
+  return makima.fs.joinpath(state, suffix)
 end
 
-maki.api.register_prompt_hint({
+makima.api.register_prompt_hint({
   prompt = "system",
   slot = "after_instructions",
   content = function()
@@ -47,13 +47,13 @@ maki.api.register_prompt_hint({
   end,
 })
 
-maki.api.register_prompt_hint({
+makima.api.register_prompt_hint({
   slot = "tool_usage",
   content = "- Proactively save non-obvious project gotchas and architecture decisions to **memory**.",
 })
 
 local function render_content(content, path, ctx)
-  local buf = maki.ui.buf()
+  local buf = makima.ui.buf()
   local tol = ctx:tool_output_lines()
   local view = ToolView.new(buf, {
     max_lines = (tol and tol.other) or 20,
@@ -76,7 +76,7 @@ local function cmd_read(path, dir, ctx)
   if not file_path then
     return nil, err
   end
-  local content, err = maki.fs.read(file_path)
+  local content, err = makima.fs.read(file_path)
   if not content then
     return nil, "read error: " .. err
   end
@@ -103,8 +103,8 @@ local function cmd_write(path, content, tags, dir, ctx)
     return nil, tag_err
   end
   local full = helpers.encode_frontmatter(normalized) .. content
-  maki.fs.mkdir(dir, { parents = true })
-  local ok, write_err = maki.fs.atomic_write(file_path, full)
+  makima.fs.mkdir(dir, { parents = true })
+  local ok, write_err = makima.fs.atomic_write(file_path, full)
   if not ok then
     return nil, "write error: " .. tostring(write_err)
   end
@@ -124,10 +124,10 @@ local function cmd_delete(path, dir)
   if not file_path then
     return nil, err
   end
-  if not maki.fs.metadata(file_path) then
+  if not makima.fs.metadata(file_path) then
     return nil, "'" .. path .. "' does not exist"
   end
-  local ok, rm_err = maki.fs.rm(file_path)
+  local ok, rm_err = makima.fs.rm(file_path)
   if not ok then
     return nil, "delete error: " .. tostring(rm_err)
   end
@@ -143,7 +143,7 @@ local function with_dir(res, dir)
   return res
 end
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "memory",
   description = "Persistent, project-scoped scratchpad for learnings, patterns, decisions, and gotchas across sessions.\n\n"
     .. "- Notes are retrieved by tag; reuse the tags from your system prompt when they fit.\n"
@@ -260,31 +260,31 @@ local function popup_build_items(dir)
   return items, warnings
 end
 
-maki.api.register_command({
+makima.api.register_command({
   name = "/memory",
   description = "View, edit, and delete memory files",
   tui_only = true,
   handler = function()
     local dir = resolve_dir()
     if not dir then
-      maki.ui.flash("Cannot resolve memory directory")
+      makima.ui.flash("Cannot resolve memory directory")
       return
     end
 
     local items, warnings = popup_build_items(dir)
     if #items == 0 then
-      maki.ui.flash("No memories yet")
+      makima.ui.flash("No memories yet")
       return
     end
     if #warnings > 0 then
-      maki.ui.flash(#warnings .. " unreadable memory file(s)")
+      makima.ui.flash(#warnings .. " unreadable memory file(s)")
     end
     local last_cursor = 1
     while true do
       if last_cursor > #items then
         last_cursor = math.max(1, #items)
       end
-      local event = maki.ui.open_list_picker(items, {
+      local event = makima.ui.open_list_picker(items, {
         title = " Memory Files ",
         cursor = last_cursor,
         submit_keys = { "ctrl+o" },
@@ -303,23 +303,23 @@ maki.api.register_command({
       if event.type == "choice" then
         local item = items[event.index]
         if item then
-          local path = maki.fs.joinpath(dir, item.label)
-          local code = maki.ui.open_editor(path)
+          local path = makima.fs.joinpath(dir, item.label)
+          local code = makima.ui.open_editor(path)
           if code == 0 then
             items = popup_build_items(dir)
           end
         end
       elseif event.type == "delete" then
         local item = items[event.index]
-        local ok, err = maki.fs.rm(maki.fs.joinpath(dir, item.label))
+        local ok, err = makima.fs.rm(makima.fs.joinpath(dir, item.label))
         if ok then
-          maki.ui.flash("Deleted " .. item.label)
+          makima.ui.flash("Deleted " .. item.label)
           items = popup_build_items(dir)
           if #items == 0 then
             break
           end
         else
-          maki.ui.flash("Delete failed: " .. tostring(err))
+          makima.ui.flash("Delete failed: " .. tostring(err))
         end
       else
         break

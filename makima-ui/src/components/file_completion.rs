@@ -1911,7 +1911,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn discover_one_level_follows_symlinks() {
-        let unique = format!("maki-file-completion-{}", std::process::id());
+        let unique = format!("makima-file-completion-{}", std::process::id());
         let tmp = std::env::temp_dir().join(unique);
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("real_dir")).unwrap();

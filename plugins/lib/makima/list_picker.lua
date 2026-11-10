@@ -1,4 +1,4 @@
-local TextInput = require("maki.text_input")
+local TextInput = require("makima.text_input")
 
 local ListPicker = {}
 ListPicker.__index = ListPicker
@@ -13,7 +13,7 @@ local NANOS_PER_SEC = 1000000000
 local TICK_MS = 1000
 
 local function dispw(s)
-  return maki.ui.display_width(s)
+  return makima.ui.display_width(s)
 end
 
 local function split_words(query)
@@ -176,7 +176,7 @@ end
 
 local function render_lines(items, selected, width, query, reference)
   width = width or 80
-  reference = reference or maki.time.now()
+  reference = reference or makima.time.now()
   local words = split_words(query)
   local lines = {}
   local item_lines = {}
@@ -205,7 +205,7 @@ local function render_lines(items, selected, width, query, reference)
 
     item_lines[i] = #lines + 1
 
-    local age = type(item) == "table" and item.age and maki.time.ago(item.age, reference) or nil
+    local age = type(item) == "table" and item.age and makima.time.ago(item.age, reference) or nil
     if age then
       local title_min = math.min(TITLE_MIN_WIDTH, math.max(width - 2 - DETAIL_RIGHT_PAD, 0))
       local right_room = math.max(width - 2 - title_min - DETAIL_RIGHT_PAD - COLUMN_SEPARATOR_WIDTH, 0)
@@ -267,7 +267,7 @@ end
 -- makes the header taller than a picker would guess, and a reserved_top guessed
 -- elsewhere then mis-scrolls the list.
 function ListPicker.render_header(win, lines, input, prefix, inner)
-  for _, ln in ipairs(input:render(prefix, maki.ui.display_width(prefix), inner).lines) do
+  for _, ln in ipairs(input:render(prefix, makima.ui.display_width(prefix), inner).lines) do
     lines[#lines + 1] = ln
   end
   lines[#lines + 1] = {}
@@ -277,7 +277,7 @@ end
 
 -- Open a fuzzy-filter picker in a floating window and block until the user
 -- decides. {items} is a list of strings or { label, detail?, age? } tables,
--- where `age` is a timestamp from `maki.time.now` or `maki.time.at` and
+-- where `age` is a timestamp from `makima.time.now` or `makima.time.at` and
 -- refreshes once per displayed second while the dialog is open.
 -- {opts}:
 -- title, footer, cursor (initial index), submit_keys (extra submit keys
@@ -310,11 +310,11 @@ function ListPicker.open(items, opts)
   end
 
   local function age_bucket_changed()
-    return age_secs ~= maki.time.now().secs
+    return age_secs ~= makima.time.now().secs
   end
 
   local function age_timeout_ms()
-    local now = maki.time.now()
+    local now = makima.time.now()
     local remaining = NANOS_PER_SEC - now.nanosecs
     return math.max(1, math.min(math.ceil(remaining / NANOS_PER_MS), TICK_MS))
   end
@@ -325,7 +325,7 @@ function ListPicker.open(items, opts)
   local win
 
   local function build_lines()
-    local reference = maki.time.now()
+    local reference = makima.time.now()
     record_age_bucket(reference)
     age_visible = false
     for _, item in ipairs(filtered) do
@@ -350,13 +350,13 @@ function ListPicker.open(items, opts)
     return content
   end
 
-  local buf = maki.ui.buf()
+  local buf = makima.ui.buf()
 
   local border_chrome = 2
   local content_h = #items + section_rows(items) + 1
   local total_h = content_h + border_chrome
 
-  win = maki.ui.open_win(buf, {
+  win = makima.ui.open_win(buf, {
     title = opts.title,
     footer = opts.footer,
     height = total_h,
@@ -447,7 +447,7 @@ function ListPicker.open(items, opts)
             return { type = "delete", index = original_indices[cursor] }
           else
             confirming = cursor
-            maki.ui.flash("Press Ctrl+D again to delete")
+            makima.ui.flash("Press Ctrl+D again to delete")
           end
         end
       elseif submit_keys[ev.key] then

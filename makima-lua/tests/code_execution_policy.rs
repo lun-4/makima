@@ -50,9 +50,9 @@ const DIVIDER_LINE: &str = "──────";
 // Bulk syntax highlighting can exceed the restore deadline on loaded CI runners.
 // Boundary tests retain the real script cap and view with deterministic styles.
 const SCRIPT_HIGHLIGHT_STUB: &str = r##"
-maki.ui.highlight = function(code)
+makima.ui.highlight = function(code)
     local lines = {}
-    for _, line in ipairs(maki.split(code, "\n")) do
+    for _, line in ipairs(makima.split(code, "\n")) do
         lines[#lines + 1] = { { line, { fg = "#ff8000" } } }
     end
     return lines
@@ -62,7 +62,7 @@ end
 fn fixture_plugin() -> String {
     format!(
         r#"
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "wf_task",
     description = "workflow-only fixture",
     audiences = {{ "main", "workflow" }},
@@ -76,7 +76,7 @@ maki.api.register_tool({{
     }},
     handler = function(input) return "{TASK_PREFIX}" .. input.prompt end,
 }})
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "interp_echo",
     description = "interpreter fixture",
     audiences = {{ "main", "interpreter" }},
@@ -93,14 +93,14 @@ maki.api.register_tool({{
     }},
     handler = function(input) return "{ECHO_PREFIX}" .. input.msg end,
 }})
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "interp_fail",
     description = "failing interpreter fixture",
     audiences = {{ "main", "interpreter" }},
     schema = {{ type = "object", properties = {{}}, additionalProperties = false }},
     handler = function() return {{ llm_output = "{FAIL_MSG}", is_error = true }} end,
 }})
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "{TOOLS_MCP_PROBE}",
     description = "returns the code_execution description agent.tools built",
     audiences = {{ "main" }},
@@ -111,7 +111,7 @@ maki.api.register_tool({{
         additionalProperties = false,
     }},
     handler = function(input, ctx)
-        local defs, err = maki.agent.tools(ctx, {{ audience = "main", mcp = input.mcp }})
+        local defs, err = makima.agent.tools(ctx, {{ audience = "main", mcp = input.mcp }})
         if err then return {{ llm_output = err, is_error = true }} end
         for _, d in ipairs(defs) do
             if d.name == "{CODE_EXECUTION}" then return d.description end
@@ -119,7 +119,7 @@ maki.api.register_tool({{
         return {{ llm_output = "{CODE_EXECUTION} missing", is_error = true }}
     end,
 }})
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "sub_tool",
     description = "subagent fixture",
     audiences = {{ "general_sub", "interpreter" }},

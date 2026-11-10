@@ -3443,8 +3443,7 @@ impl LuaRuntime {
         // with this env. Without it WarmJit compiles chunks that never run
         // natively; see makima-lua/benches/splash_perf.rs env_codegen_200x79.
         env.set_safeenv(true);
-        env.set("makima", makima.clone())?;
-        env.set("maki", makima)?;
+        env.set("makima", makima)?;
 
         if require_root.is_some() || !self.bundled.dirs.is_empty() {
             let require_fn = self.create_require_fn(&env, require_root)?;

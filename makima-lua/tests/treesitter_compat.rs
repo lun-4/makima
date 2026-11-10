@@ -41,7 +41,7 @@ fn parse_and_walk_nodes() {
     let src = format!(
         r#"
 local source = [==[{RUST_SOURCE}]==]
-local parser = maki.treesitter.get_parser(source, "rust")
+local parser = makima.treesitter.get_parser(source, "rust")
 local trees = parser:parse()
 local tree = trees[1]
 local root = tree:root()
@@ -90,10 +90,10 @@ fn query_iter_captures() {
     let src = format!(
         r#"
 local source = [==[{RUST_SOURCE}]==]
-local parser = maki.treesitter.get_parser(source, "rust")
+local parser = makima.treesitter.get_parser(source, "rust")
 local root = parser:parse()[1]:root()
 
-local query = maki.treesitter.query.parse("rust", [[
+local query = makima.treesitter.query.parse("rust", [[
   (function_item name: (identifier) @fn_name)
   (struct_item name: (type_identifier) @struct_name)
 ]])
@@ -105,7 +105,7 @@ assert(query.captures[2] == "struct_name")
 local names = {{}}
 for id, node, metadata in query:iter_captures(root, source) do
     local name = query.captures[id]
-    local text = maki.treesitter.get_node_text(node, source)
+    local text = makima.treesitter.get_node_text(node, source)
     names[name .. ":" .. text] = true
 end
 
@@ -122,10 +122,10 @@ fn query_iter_matches() {
     let src = format!(
         r#"
 local source = [==[{RUST_SOURCE}]==]
-local parser = maki.treesitter.get_parser(source, "rust")
+local parser = makima.treesitter.get_parser(source, "rust")
 local root = parser:parse()[1]:root()
 
-local query = maki.treesitter.query.parse("rust", [[
+local query = makima.treesitter.query.parse("rust", [[
   (function_item
     name: (identifier) @fn_name
     parameters: (parameters) @fn_params)
@@ -149,7 +149,7 @@ fn node_navigation() {
     let src = format!(
         r#"
 local source = [==[{RUST_SOURCE}]==]
-local parser = maki.treesitter.get_parser(source, "rust")
+local parser = makima.treesitter.get_parser(source, "rust")
 local root = parser:parse()[1]:root()
 
 local first = root:child(0)
@@ -174,14 +174,14 @@ local named_desc = root:named_descendant_for_range(0, 0, 0, 3)
 assert(named_desc ~= nil)
 assert(named_desc:named() == true)
 
-local query = maki.treesitter.query.parse("rust", "(function_item) @fn")
+local query = makima.treesitter.query.parse("rust", "(function_item) @fn")
 for _, node in query:iter_captures(root, source) do
     local name_nodes = node:field("name")
     assert(#name_nodes > 0, "function should have a name field")
     break
 end
 
-local id_query = maki.treesitter.query.parse("rust", "(identifier) @id")
+local id_query = makima.treesitter.query.parse("rust", "(identifier) @id")
 for _, node in id_query:iter_captures(root, source) do
     if node:parent() and node:parent():parent() then
         local child = root:child_with_descendant(node)
@@ -201,7 +201,7 @@ fn module_functions() {
     let src = format!(
         r#"
 local source = [==[{RUST_SOURCE}]==]
-local parser = maki.treesitter.get_parser(source, "rust")
+local parser = makima.treesitter.get_parser(source, "rust")
 local root = parser:parse()[1]:root()
 
 local sr, sc, er, ec = root:range()
@@ -212,22 +212,22 @@ local sr2, sc2, sb, er2, ec2, eb = root:range(true)
 assert(sb == 0 and eb > 0)
 assert(root:byte_length() == eb - sb)
 
-local gnr_sr, gnr_sc, gnr_er, gnr_ec = maki.treesitter.get_node_range(root)
+local gnr_sr, gnr_sc, gnr_er, gnr_ec = makima.treesitter.get_node_range(root)
 assert(gnr_sr == sr and gnr_sc == sc)
 
-local range6 = maki.treesitter.get_range(root)
+local range6 = makima.treesitter.get_range(root)
 assert(range6[1] == sr and range6[3] == sb)
 
-assert(maki.treesitter.is_in_node_range(root, 1, 0) == true)
+assert(makima.treesitter.is_in_node_range(root, 1, 0) == true)
 
-assert(maki.treesitter.node_contains(root, {{1, 0, 2, 0}}) == true)
+assert(makima.treesitter.node_contains(root, {{1, 0, 2, 0}}) == true)
 
 local child = root:named_child(0)
 assert(child ~= nil)
-assert(maki.treesitter.is_ancestor(root, child) == true)
-assert(maki.treesitter.is_ancestor(child, root) == false)
+assert(makima.treesitter.is_ancestor(root, child) == true)
+assert(makima.treesitter.is_ancestor(child, root) == false)
 
-local text = maki.treesitter.get_node_text(child, source)
+local text = makima.treesitter.get_node_text(child, source)
 assert(type(text) == "string" and #text > 0)
 "#
     );
@@ -240,7 +240,7 @@ fn language_tree_methods() {
     let src = format!(
         r#"
 local source = [==[{RUST_SOURCE}]==]
-local parser = maki.treesitter.get_parser(source, "rust")
+local parser = makima.treesitter.get_parser(source, "rust")
 
 assert(parser:lang() == "rust")
 assert(parser:source() == source)
@@ -280,21 +280,21 @@ fn language_module() {
         &host,
         "language_mod",
         r#"
-maki.treesitter.language.add("rust")
+makima.treesitter.language.add("rust")
 
-maki.treesitter.language.register("rust", "rs")
-assert(maki.treesitter.language.get_lang("rs") == "rust")
+makima.treesitter.language.register("rust", "rs")
+assert(makima.treesitter.language.get_lang("rs") == "rust")
 
-maki.treesitter.language.register("python", {"py", "pyi"})
-assert(maki.treesitter.language.get_lang("py") == "python")
-assert(maki.treesitter.language.get_lang("pyi") == "python")
+makima.treesitter.language.register("python", {"py", "pyi"})
+assert(makima.treesitter.language.get_lang("py") == "python")
+assert(makima.treesitter.language.get_lang("pyi") == "python")
 
-local fts = maki.treesitter.language.get_filetypes("python")
+local fts = makima.treesitter.language.get_filetypes("python")
 assert(#fts == 2, "expected 2 filetypes for python")
 
-assert(maki.treesitter.language.get_lang("unknown_ext_xyz") == nil)
+assert(makima.treesitter.language.get_lang("unknown_ext_xyz") == nil)
 
-local info = maki.treesitter.language.inspect("rust")
+local info = makima.treesitter.language.inspect("rust")
 assert(type(info.abi_version) == "number")
 assert(#info.node_types > 0)
 assert(#info.fields > 0)
@@ -318,11 +318,11 @@ class Greeter:
         self.prefix = prefix
 ]]
 
-local parser = maki.treesitter.get_parser(source, "python")
+local parser = makima.treesitter.get_parser(source, "python")
 local root = parser:parse()[1]:root()
 assert(root:type() == "module")
 
-local query = maki.treesitter.query.parse("python", [[
+local query = makima.treesitter.query.parse("python", [[
   (function_definition name: (identifier) @fn_name)
   (class_definition name: (identifier) @class_name)
 ]])
@@ -330,7 +330,7 @@ local query = maki.treesitter.query.parse("python", [[
 local names = {}
 for id, node in query:iter_captures(root, source) do
     local name = query.captures[id]
-    local text = maki.treesitter.get_node_text(node, source)
+    local text = makima.treesitter.get_node_text(node, source)
     names[name .. ":" .. text] = true
 end
 
@@ -360,18 +360,18 @@ function processConfig(config: Config): string {
 export const DEFAULT: Config = { name: "default", value: 0 };
 ]]
 
-local parser = maki.treesitter.get_parser(source, "typescript")
+local parser = makima.treesitter.get_parser(source, "typescript")
 local root = parser:parse()[1]:root()
 assert(root:type() == "program")
 
-local query = maki.treesitter.query.parse("typescript", [[
+local query = makima.treesitter.query.parse("typescript", [[
   (interface_declaration name: (type_identifier) @iface_name)
   (function_declaration name: (identifier) @fn_name)
 ]])
 
 local found = {}
 for id, node in query:iter_captures(root, source) do
-    local text = maki.treesitter.get_node_text(node, source)
+    local text = makima.treesitter.get_node_text(node, source)
     found[query.captures[id] .. ":" .. text] = true
 end
 

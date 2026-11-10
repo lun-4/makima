@@ -1,4 +1,4 @@
--- Corner toast notifications built on floating windows. `maki.ui.flash` gives
+-- Corner toast notifications built on floating windows. `makima.ui.flash` gives
 -- you one line in the status area. A toast stays up long enough to read, can
 -- carry a title, and stacks under the toasts already on screen.
 
@@ -24,7 +24,7 @@ function Toast.show(text, opts)
       break
     end
     lines[#lines + 1] = { { line, "item" } }
-    width = math.max(width, maki.ui.display_width(line) + 2)
+    width = math.max(width, makima.ui.display_width(line) + 2)
   end
   if #lines == 0 then
     return
@@ -32,9 +32,9 @@ function Toast.show(text, opts)
   width = math.min(width, MAX_WIDTH)
 
   -- A live buffer would steal the output pane of whatever tool raised us.
-  local buf = maki.ui.buf({ scratch = true })
+  local buf = makima.ui.buf({ scratch = true })
   buf:set_lines(lines)
-  local win = maki.ui.open_win(buf, {
+  local win = makima.ui.open_win(buf, {
     title = opts.title,
     anchor = "NE",
     stack = true,
@@ -48,7 +48,7 @@ function Toast.show(text, opts)
   -- defer_fn and not async.sleep: the toast outlives the tool call that
   -- raised it, so the timer must not hang off that call's cancel token.
   local timeout_secs = math.max(0, tonumber(opts.timeout_secs) or DEFAULT_TIMEOUT_SECS)
-  maki.defer_fn(function()
+  makima.defer_fn(function()
     win:close()
   end, math.floor(timeout_secs * 1000))
 end

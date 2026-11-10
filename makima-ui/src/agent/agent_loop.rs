@@ -1788,8 +1788,8 @@ mod tests {
                 "turn_start_count",
                 r#"
                 local starts = 0
-                maki.api.create_autocmd("TurnStart", { callback = function() starts += 1 end })
-                maki.api.register_command({ name = "/assert_single_start", tui_only = false, handler = function() assert(starts == 1, "TurnStart count: " .. starts) end })
+                makima.api.create_autocmd("TurnStart", { callback = function() starts += 1 end })
+                makima.api.register_command({ name = "/assert_single_start", tui_only = false, handler = function() assert(starts == 1, "TurnStart count: " .. starts) end })
                 "#,
             )
             .unwrap();
@@ -2032,20 +2032,20 @@ mod tests {
                 "ui_mcp_spawn",
                 &format!(
                     r#"
-                maki.api.register_command({{
+                makima.api.register_command({{
                     name = "{COMMAND}", tui_only = false,
                     handler = function(_, ctx)
                         local ok, err = pcall(function()
                             assert(ctx ~= nil)
-                            local child = assert(maki.agent.spawn(ctx, {{
+                            local child = assert(makima.agent.spawn(ctx, {{
                                 inherit_provider = true, silent = true, mcp = {enabled},
                             }}))
                             local result = assert(assert(child:send(ctx, "invoke MCP", {{ when = "idle" }})):wait(ctx))
-                            assert(result.text == "{expected}", maki.json.encode(result))
+                            assert(result.text == "{expected}", makima.json.encode(result))
                             assert(child:close(ctx))
-                            maki.ui.flash(result.text)
+                            makima.ui.flash(result.text)
                         end)
-                        if not ok then maki.ui.flash(tostring(err)) end
+                        if not ok then makima.ui.flash(tostring(err)) end
                     end,
                 }})
             "#,

@@ -57,7 +57,7 @@ end
 -- `[opencode]`.
 function M.free_models(config, member)
   if member ~= M.ZEN then
-    config = maki.api.provider_config(M.ZEN.id) or {}
+    config = makima.api.provider_config(M.ZEN.id) or {}
   end
   return config.enable_free_models == true
 end

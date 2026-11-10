@@ -156,12 +156,12 @@ fn child_tool(auto_deliver: bool) -> String {
     format!(
         r#"
     local sessions = {{}}
-    maki.api.register_tool({{
+    makima.api.register_tool({{
         name = "{CHILD_TOOL_NAME}", description = "start test child", kind = "read",
         schema = {{ type = "object", properties = {{}} }},
         audiences = {{ "main" }},
         handler = function(_, ctx)
-            local child, err = maki.agent.spawn(ctx, {{ name = "approval child", system = "child", tools = maki.json.decode('[]'), auto_deliver = {auto_deliver} }})
+            local child, err = makima.agent.spawn(ctx, {{ name = "approval child", system = "child", tools = makima.json.decode('[]'), auto_deliver = {auto_deliver} }})
             if err then return {{ llm_output = err, is_error = true }} end
             sessions[#sessions + 1] = child
             local ticket, send_err = assert(child:send(ctx, "{CHILD_PROMPT}", {{ when = "idle" }})):wait(ctx)
@@ -177,21 +177,21 @@ fn observer() -> String {
     format!(
         r#"
     local starts = 0
-    maki.api.create_autocmd("TurnStart", {{ callback = function()
+    makima.api.create_autocmd("TurnStart", {{ callback = function()
         starts = starts + 1
-        maki.api.register_command({{ name = "{START_COMMAND_PREFIX}" .. tostring(starts), description = "observed", tui_only = false, handler = function() end }})
+        makima.api.register_command({{ name = "{START_COMMAND_PREFIX}" .. tostring(starts), description = "observed", tui_only = false, handler = function() end }})
     end }})
     local modes, mode = 0, "plan"
-    maki.api.create_autocmd("ConfigChanged", {{ callback = function(ev)
+    makima.api.create_autocmd("ConfigChanged", {{ callback = function(ev)
         if ev.data.parent_id or ev.data.mode == mode then
             return
         end
         mode = ev.data.mode
         modes = modes + 1
-        maki.api.register_command({{ name = "{MODE_COMMAND_PREFIX}" .. tostring(modes), description = "observed", tui_only = false, handler = function() end }})
+        makima.api.register_command({{ name = "{MODE_COMMAND_PREFIX}" .. tostring(modes), description = "observed", tui_only = false, handler = function() end }})
     end }})
-    maki.api.create_autocmd("SessionReset", {{ callback = function(ev)
-        maki.api.register_command({{ name = "{RESET_COMMAND}", description = ev.data.session_id, tui_only = false, handler = function() end }})
+    makima.api.create_autocmd("SessionReset", {{ callback = function(ev)
+        makima.api.register_command({{ name = "{RESET_COMMAND}", description = ev.data.session_id, tui_only = false, handler = function() end }})
     end }})
 "#
     )
@@ -306,12 +306,12 @@ fn rejects_active_managed_child_without_cancelling_it(drop_preparation: Option<b
             &format!(
                 r#"
             local sessions = {{}}
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "{CHILD_COMMAND}", tui_only = false,
                 handler = function(_, ctx)
-                    local child, err = maki.agent.spawn(ctx, {{
+                    local child, err = makima.agent.spawn(ctx, {{
                         name = "approval child", system = "child",
-                        tools = maki.json.decode('[]'), inherit_provider = true,
+                        tools = makima.json.decode('[]'), inherit_provider = true,
                         auto_deliver = {auto_deliver},
                     }})
                     assert(child, err)

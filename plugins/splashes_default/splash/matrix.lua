@@ -5,7 +5,7 @@
 -- Matrix rain splash. Green falling code with per-column state stepped by
 -- frame dt; resets when the home screen shows again (SplashShown). The
 -- renderer is pull-driven: Rust pulls a frame each tick while the splash
--- animates, so it must not call blocking maki APIs.
+-- animates, so it must not call blocking makima APIs.
 
 local GLYPHS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 local TRAIL = 6
@@ -25,7 +25,7 @@ local function reset(w)
   state.cols[w] = cols
 end
 
-maki.api.create_autocmd("SplashShown", {
+makima.api.create_autocmd("SplashShown", {
   callback = function()
     state.cols = {}
     state.last_t = nil
@@ -92,7 +92,7 @@ function M.render(w, h, t, fade)
     end
   end
 
-  local ver = "v" .. maki.version().current
+  local ver = "v" .. makima.version().current
   if h >= 1 and w - #ver >= 1 then
     local vx = w - #ver + 1
     for i = 1, #ver do

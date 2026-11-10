@@ -46,8 +46,8 @@ fn install_expanders(event_loop: &mut EventLoop<'_>) -> makima_lua::PluginHost {
         EXPANDER_PLUGIN,
         &format!(
             r#"
-        maki.api.register_expander("ok", function(_) return "{EXPANDED_PROMPT}", nil end)
-        maki.api.register_expander("reject", function(_) return nil, "{EXPANDER_FAILURE}" end)
+        makima.api.register_expander("ok", function(_) return "{EXPANDED_PROMPT}", nil end)
+        makima.api.register_expander("reject", function(_) return nil, "{EXPANDER_FAILURE}" end)
     "#
         ),
     )
@@ -358,14 +358,14 @@ fn registered_lua_mode_set_uses_its_invocation_agent(restored: bool) {
             "public_mode_command",
             &format!(
                 r#"
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "/spawn-mode-child", tui_only = false,
                 handler = function(_, ctx)
-                    assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true }}))
-                    maki.ui.flash("{SPAWNED}")
+                    assert(makima.agent.spawn(ctx, {{ inherit_provider = true, silent = true }}))
+                    makima.ui.flash("{SPAWNED}")
                 end,
             }})
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "/set-public-mode", tui_only = false,
                 handler = function(_, ctx)
                     assert((ctx ~= nil) == {live})
@@ -373,7 +373,7 @@ fn registered_lua_mode_set_uses_its_invocation_agent(restored: bool) {
                         local agent = assert(ctx:agent())
                         assert(agent:set_mode(ctx, "plan"))
                     end
-                    maki.ui.flash("{DONE}")
+                    makima.ui.flash("{DONE}")
                 end,
             }})
         "#,
@@ -653,7 +653,7 @@ fn lua_mode_command_reaches_the_provider() {
         host.load_source(
             PLAN_COMMAND_PLUGIN,
             r#"
-            maki.api.register_command({
+            makima.api.register_command({
                 name = "/plan-now", tui_only = false,
                 handler = function(_, ctx)
                     assert(assert(ctx:agent()):set_mode(ctx, "plan"))

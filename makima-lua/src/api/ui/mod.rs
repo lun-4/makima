@@ -772,7 +772,7 @@ pub(crate) const set_status_content__doc: FnDoc = FnDoc {
     }],
     returns: "",
     guard: None,
-    example: "makima.ui.set_status_content({ {\"connected\", \"success\"}, {\" readonly\", \"muted\"} })\n-- clickable entry:\nmaki.ui.set_status_content({ {\"refresh\", \"accent\", function() makima.ui.flash(\"refreshing\") end} })",
+    example: "makima.ui.set_status_content({ {\"connected\", \"success\"}, {\" readonly\", \"muted\"} })\n-- clickable entry:\nmakima.ui.set_status_content({ {\"refresh\", \"accent\", function() makima.ui.flash(\"refreshing\") end} })",
 };
 
 #[allow(non_upper_case_globals)]
@@ -787,7 +787,7 @@ pub(crate) const set_status_hint__doc: FnDoc = FnDoc {
     }],
     returns: "",
     guard: None,
-    example: "makima.ui.set_status_hint({ {\"q\", \"quit\"}, {\"j\", \"down\"} })\n-- later, clear them:\nmaki.ui.set_status_hint(nil)",
+    example: "makima.ui.set_status_hint({ {\"q\", \"quit\"}, {\"j\", \"down\"} })\n-- later, clear them:\nmakima.ui.set_status_hint(nil)",
 };
 
 /// Resolve the agent that has UI focus now. Later focus changes do not

@@ -5,7 +5,7 @@ use test_case::test_case;
 
 const MODE_OVERRIDE_SRC: &str = include_str!("../../plugins/mode_plan_override/init.lua");
 const TASK_SRC: &str = include_str!("../../plugins/task/init.lua");
-const PLAN_SPEC_SRC: &str = include_str!("../../plugins/lib/maki/plan_spec.lua");
+const PLAN_SPEC_SRC: &str = include_str!("../../plugins/lib/makima/plan_spec.lua");
 const MODE_OVERRIDE_PLUGIN: &str = "mode_plan_override";
 const MODE_SWITCH_FAILED: &str = "cannot switch to";
 const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -69,7 +69,7 @@ fn directive_preserves_planning_workflow() {
     // The directive splices the shared spec.
     must_contain(
         MODE_OVERRIDE_SRC,
-        "require(\"maki.plan_spec\")",
+        "require(\"makima.plan_spec\")",
         "plan-mode directive",
     );
 }
@@ -121,7 +121,7 @@ fn reviewer_is_verbatim_clone() {
     );
     must_contain(
         TASK_SRC,
-        "require(\"maki.plan_spec\")",
+        "require(\"makima.plan_spec\")",
         "plan-reviewer prompt",
     );
 }
@@ -132,12 +132,12 @@ fn plan_spec_is_single_shared_source() {
     // documents cannot drift apart.
     must_contain(
         MODE_OVERRIDE_SRC,
-        "require(\"maki.plan_spec\")",
+        "require(\"makima.plan_spec\")",
         "plan-mode directive",
     );
     must_contain(
         TASK_SRC,
-        "require(\"maki.plan_spec\")",
+        "require(\"makima.plan_spec\")",
         "plan-reviewer prompt",
     );
 

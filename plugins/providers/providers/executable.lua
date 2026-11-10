@@ -1,5 +1,5 @@
 -- Executable providers: every executable file in `<config dir>/providers/`
--- is a provider named after the file. maki runs it with one subcommand and
+-- is a provider named after the file. makima runs it with one subcommand and
 -- reads JSON from its output:
 --   info      `{ display_name, base, system_prefix?, has_auth }`
 --   models    optional list of models; without it the base's curated
@@ -100,19 +100,19 @@ Script models are `<file name>/<model id>`. The name starts with a letter or dig
 end
 
 -- Runs `{path} {command}` without a terminal and returns its output, or nil
--- plus a config error. {owner} is the job owner `maki.fn.jobstart` takes.
+-- plus a config error. {owner} is the job owner `makima.fn.jobstart` takes.
 function M.run(path, command, timeout_ms, owner)
   local label = path .. " " .. command
-  local started, id = pcall(maki.fn.jobstart, { path, command }, { owner = owner })
+  local started, id = pcall(makima.fn.jobstart, { path, command }, { owner = owner })
   if not started then
     return nil, failure("failed to run " .. label .. ": " .. tostring(id))
   end
-  local waited, result = pcall(maki.fn.jobwait, id, timeout_ms)
+  local waited, result = pcall(makima.fn.jobwait, id, timeout_ms)
   if not waited then
     return nil, failure("failed to wait on " .. label .. ": " .. tostring(result))
   end
   if not result then
-    maki.fn.jobstop(id)
+    makima.fn.jobstop(id)
     return nil, failure(string.format("%s timed out after %ds", label, math.floor(timeout_ms / 1000)))
   end
   if result.exit_code ~= 0 then
@@ -123,7 +123,7 @@ function M.run(path, command, timeout_ms, owner)
 end
 
 local function decode(path, command, stdout)
-  local value, err = maki.json.decode(stdout)
+  local value, err = makima.json.decode(stdout)
   if type(value) ~= "table" then
     return nil, failure(string.format("%s %s: invalid JSON: %s", path, command, err or "not an object"))
   end
@@ -221,21 +221,23 @@ function M.parse_models(slug, stdout, base)
   if not stdout then
     return {}
   end
-  local list, err = maki.json.decode(stdout)
+  local list, err = makima.json.decode(stdout)
   if type(list) ~= "table" then
-    maki.log.warn(string.format("%s: invalid models JSON, using the base's models: %s", slug, err or "not a list"))
+    makima.log.warn(string.format("%s: invalid models JSON, using the base's models: %s", slug, err or "not a list"))
     return {}
   end
   local models = {}
   for _, entry in ipairs(list) do
     local model, dropped = M.model(entry)
     if not model then
-      maki.log.warn(slug .. ": invalid model entry, skipping")
+      makima.log.warn(slug .. ": invalid model entry, skipping")
     else
       if dropped then
-        maki.log.warn(string.format("%s: invalid thinking_fields on %s, dropping them", slug, model.id))
+        makima.log.warn(string.format("%s: invalid thinking_fields on %s, dropping them", slug, model.id))
       elseif model.provider_data and base ~= LOCAL_THINKING_BASE then
-        maki.log.warn(string.format("%s: thinking_fields only apply to %s models, ignoring", slug, LOCAL_THINKING_BASE))
+        makima.log.warn(
+          string.format("%s: thinking_fields only apply to %s models, ignoring", slug, LOCAL_THINKING_BASE)
+        )
       end
       models[#models + 1] = model
     end
@@ -244,15 +246,15 @@ function M.parse_models(slug, stdout, base)
 end
 
 local function read_cache(path)
-  local text = path and maki.fs.read(path)
-  local cache = text and maki.json.decode(text)
+  local text = path and makima.fs.read(path)
+  local cache = text and makima.json.decode(text)
   return type(cache) == "table" and cache or {}
 end
 
 -- The cached description of the script at {path}, or a fresh one while the
 -- file changed. A failing `info` is not cached; `models` is optional.
 local function describe(path, cached, run)
-  local meta = maki.fs.metadata(path)
+  local meta = makima.fs.metadata(path)
   if cached and meta and cached.mtime == meta.mtime and cached.size == meta.size then
     return cached, false
   end
@@ -275,18 +277,18 @@ function M.scan(dir, cache_path, bases, run)
   run = run or M.run
   local cache, next_cache, changed = read_cache(cache_path), {}, false
   local scripts = {}
-  for _, entry in ipairs(maki.fs.dir(dir) or {}) do
-    local path = maki.fs.joinpath(dir, entry[1])
+  for _, entry in ipairs(makima.fs.dir(dir) or {}) do
+    local path = makima.fs.joinpath(dir, entry[1])
     local slug = slug_of(entry[1])
-    if entry[2] ~= "file" or maki.fn.executable(path) ~= 1 then
-      maki.log.debug("skipping non-executable " .. path)
+    if entry[2] ~= "file" or makima.fn.executable(path) ~= 1 then
+      makima.log.debug("skipping non-executable " .. path)
     elseif not slug:match(VALID_SLUG) then
-      maki.log.warn(string.format("invalid provider slug %q, skipping", slug))
+      makima.log.warn(string.format("invalid provider slug %q, skipping", slug))
     else
       local described, fresh, err = describe(path, cache[slug], run)
       changed = changed or fresh
       if not described then
-        maki.log.warn(string.format("%s: no provider info, skipping: %s", slug, http.message(err)))
+        makima.log.warn(string.format("%s: no provider info, skipping: %s", slug, http.message(err)))
       else
         -- Kept even when rejected, so a refused script is not run again.
         next_cache[slug] = described
@@ -295,7 +297,7 @@ function M.scan(dir, cache_path, bases, run)
           local models = M.parse_models(slug, described.models, info.base)
           scripts[#scripts + 1] = { slug = slug, path = path, info = info, models = models }
         else
-          maki.log.warn(string.format("%s: skipping: %s", slug, http.message(info_err)))
+          makima.log.warn(string.format("%s: skipping: %s", slug, http.message(info_err)))
         end
       end
     end
@@ -304,9 +306,9 @@ function M.scan(dir, cache_path, bases, run)
     changed = changed or next_cache[slug] == nil
   end
   if changed and cache_path then
-    local _, err = maki.fs.atomic_write(cache_path, assert(maki.json.encode(next_cache)))
+    local _, err = makima.fs.atomic_write(cache_path, assert(makima.json.encode(next_cache)))
     if err then
-      maki.log.debug("provider script cache not written: " .. err)
+      makima.log.debug("provider script cache not written: " .. err)
     end
   end
   table.sort(scripts, function(a, b)
@@ -496,7 +498,7 @@ function M.provider(script, route, run)
         end
         local _, refresh_err = locked(call_ctx, "refresh")
         if refresh_err then
-          maki.log.warn(slug .. ": silent refresh failed: " .. http.message(refresh_err))
+          makima.log.warn(slug .. ": silent refresh failed: " .. http.message(refresh_err))
           return nil, stream_err
         end
         return attempt(call_ctx, request, emit)

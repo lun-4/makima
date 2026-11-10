@@ -60,27 +60,27 @@ local function object(value)
 end
 
 local function now()
-  local time = maki.time.now()
+  local time = makima.time.now()
   return time.secs + time.nanosecs / NANOS
 end
 
 local function read_json(path)
-  local meta = maki.fs.metadata(path)
-  local text = meta and maki.fs.read(path)
-  return text and object(maki.json.decode(text)), meta
+  local meta = makima.fs.metadata(path)
+  local text = meta and makima.fs.read(path)
+  return text and object(makima.json.decode(text)), meta
 end
 
 local function write(path, value)
-  local _, err = maki.fs.atomic_write(path, assert(maki.json.encode(value)))
+  local _, err = makima.fs.atomic_write(path, assert(makima.json.encode(value)))
   if err then
-    maki.log.warn("models.dev cache not written: " .. err)
+    makima.log.warn("models.dev cache not written: " .. err)
   end
 end
 
 -- The cache directory, or nil where the host has none.
 function M.cache_dir()
-  local dir = maki.env.cache_dir()
-  return dir and maki.fs.joinpath(dir, M.CACHE_DIR)
+  local dir = makima.env.cache_dir()
+  return dir and makima.fs.joinpath(dir, M.CACHE_DIR)
 end
 
 local Cache = {}
@@ -88,11 +88,11 @@ Cache.__index = Cache
 
 -- A catalog cached in {dir}; nil keeps it in memory only.
 function M.new(dir)
-  return setmetatable({ dir = dir, lock = maki.async.semaphore(1) }, Cache)
+  return setmetatable({ dir = dir, lock = makima.async.semaphore(1) }, Cache)
 end
 
 function Cache:file(id)
-  return maki.fs.joinpath(self.dir, id .. JSON_SUFFIX)
+  return makima.fs.joinpath(self.dir, id .. JSON_SUFFIX)
 end
 
 -- Keeps the whole {catalog} and splits it into the cache, the index last so
@@ -102,7 +102,7 @@ function Cache:store(catalog)
   if not self.dir then
     return
   end
-  maki.fs.mkdir(self.dir, { parents = true })
+  makima.fs.mkdir(self.dir, { parents = true })
   local index = {}
   for id, entry in pairs(catalog) do
     if object(entry) and id:match(VALID_ID) then
@@ -113,14 +113,14 @@ function Cache:store(catalog)
       end
     end
   end
-  write(maki.fs.joinpath(self.dir, M.INDEX_FILE), index)
+  write(makima.fs.joinpath(self.dir, M.INDEX_FILE), index)
 end
 
 -- Reads the index, whatever its age. Never touches the network.
 function Cache:load()
   local index, meta
   if self.dir then
-    index, meta = read_json(maki.fs.joinpath(self.dir, M.INDEX_FILE))
+    index, meta = read_json(makima.fs.joinpath(self.dir, M.INDEX_FILE))
   end
   if index then
     self.index, self.mtime = index, meta.mtime
@@ -138,7 +138,7 @@ local function fetch(ctx)
   if not body then
     return nil, read_err
   end
-  local catalog = object(maki.json.decode(body))
+  local catalog = object(makima.json.decode(body))
   if not catalog then
     return nil, "invalid models.dev catalog"
   end
@@ -272,7 +272,7 @@ end
 -- The first of {names} that is set, else the first: where a key comes from.
 function M.env_name(names)
   for _, name in ipairs(names) do
-    if (maki.uv.os_getenv(name) or "") ~= "" then
+    if (makima.uv.os_getenv(name) or "") ~= "" then
       return name
     end
   end

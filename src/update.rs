@@ -133,7 +133,7 @@ fn restore_backup(backup_path: &Path, exe_path: &Path) -> Result<(), UpdateError
                 "sh",
                 "-c",
                 r#"cp -- "$1" "$2" && mv -- "$2" "$3""#,
-                "maki-restore",
+                "makima-restore",
             ])
             .arg(backup_path)
             .arg(&tmp)

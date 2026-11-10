@@ -1,13 +1,13 @@
-local ToolView = require("maki.tool_view")
-local shorten_path = require("maki.shorten_path")
-local color = require("maki.color")
-local output_limits = require("maki.output_limits")
+local ToolView = require("makima.tool_view")
+local shorten_path = require("makima.shorten_path")
+local color = require("makima.color")
+local output_limits = require("makima.output_limits")
 
 local NO_MATCHES = "No files found"
 local MAX_PER_CALL_LIMIT = 1000
 local DIM_FACTOR = 0.3
 
-local opts = maki.api.register_options(output_limits.extend({
+local opts = makima.api.register_options(output_limits.extend({
   search_result_limit = {
     default = 100,
     min = 10,
@@ -85,7 +85,7 @@ local function apply_grep_highlights(hl_tasks, view)
       texts[#texts + 1] = fl.text
     end
 
-    local highlighted = maki.ui.highlight(table.concat(texts, "\n"), task.ext, { independent = true })
+    local highlighted = makima.ui.highlight(table.concat(texts, "\n"), task.ext, { independent = true })
     if highlighted then
       for i, fl in ipairs(task.lines) do
         local hl_spans = highlighted[i]
@@ -102,7 +102,7 @@ end
 -- {trailer} is whatever followed the entries in the output (the host's
 -- truncation marker), shown as-is so the view ends where the model's did.
 local function build_grep_view(entries, ctx, trailer)
-  local buf = maki.ui.buf()
+  local buf = makima.ui.buf()
   local view = ToolView.new(buf, grep_view_opts(ctx))
 
   local max_nr = 0
@@ -167,7 +167,7 @@ local function parse_llm_output(text)
   local entries = {}
   local trailer = {}
   local current
-  for _, line in ipairs(maki.split(text, "\n")) do
+  for _, line in ipairs(makima.split(text, "\n")) do
     local path = line:match("^(%S.*):$")
     if path then
       current = { path = path, groups = { { lines = {} } } }
@@ -194,12 +194,12 @@ local function parse_llm_output(text)
   return entries, trailer
 end
 
-maki.api.register_prompt_hint({
+makima.api.register_prompt_hint({
   slot = "tool_usage",
   content = "- Use the **grep** tool when searching for specific content across files.",
 })
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "grep",
   kind = "search",
   description = [[Search file contents using regex.
@@ -227,7 +227,7 @@ maki.api.register_tool({
   },
 
   header = function(input)
-    local buf = maki.ui.buf()
+    local buf = makima.ui.buf()
     local pattern = (input.pattern or ""):gsub('"$', "")
     local spans = { { pattern, "tool" } }
     if input.include then
@@ -244,7 +244,7 @@ maki.api.register_tool({
     local entries, trailer = parse_llm_output(output)
     if #entries == 0 then
       for _, line in ipairs(trailer) do
-        if maki.text.is_offload_notice(line) then
+        if makima.text.is_offload_notice(line) then
           return build_grep_view(entries, ctx, trailer)
         end
       end
@@ -270,7 +270,7 @@ maki.api.register_tool({
       return { llm_output = "error: " .. tostring(path_err), is_error = true }
     end
 
-    local entries, err = maki.fs.grep(pattern, {
+    local entries, err = makima.fs.grep(pattern, {
       path = path,
       include = input.include,
       context_before = input.context_before or 0,

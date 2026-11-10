@@ -1,6 +1,6 @@
 local deepseek = require("providers.deepseek")
 local compat = require("providers.openai_compat")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local FLASH = "deepseek-v4-flash"
 local REASONER = "deepseek-reasoner"

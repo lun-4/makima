@@ -43,18 +43,18 @@ local session_holder = { sess = nil }
 local results = {}
 
 local function register_probe(spec)
-  maki.api.register_command({
+  makima.api.register_command({
     name = "/" .. spec.name,
     tui_only = false,
     arguments = { raw = true, required = true },
     handler = function(opts, ctx)
-      local input = assert(maki.json.decode(opts.args))
+      local input = assert(makima.json.decode(opts.args))
       results[input.request_id] = spec.handler(input, ctx)
     end,
   })
 end
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "probe_result",
   description = "read a completed probe command result",
   schema = { type = "object", properties = { request_id = { type = "string" } }, required = { "request_id" } },
@@ -68,19 +68,19 @@ maki.api.register_tool({
 register_probe({
   name = "probe_spawn",
   handler = function(input, ctx)
-    local sess, err = maki.agent.spawn(ctx, { name = "probe", inherit_provider = true })
+    local sess, err = makima.agent.spawn(ctx, { name = "probe", inherit_provider = true })
     if not sess then
       return { llm_output = "spawn failed: " .. err, is_error = true }
     end
     session_holder.sess = sess
-    return maki.json.encode({ task_id = assert(sess:id()) })
+    return makima.json.encode({ task_id = assert(sess:id()) })
   end,
 })
 
 register_probe({
   name = "probe_status",
   handler = function(input, ctx)
-    return maki.json.encode(assert(session_holder.sess:status(ctx)))
+    return makima.json.encode(assert(session_holder.sess:status(ctx)))
   end,
 })
 
@@ -91,7 +91,7 @@ register_probe({
     if err then
       return { llm_output = "send failed: " .. err, is_error = true }
     end
-    return maki.json.encode({ ok = true })
+    return makima.json.encode({ ok = true })
   end,
 })
 
@@ -101,7 +101,7 @@ register_probe({
     local opts = input.timeout and { timeout = input.timeout } or nil
     local ticket, admission_err = session_holder.sess:send(ctx, input.message, { when = "queue" })
     if not ticket then
-      return maki.json.encode({ error = admission_err })
+      return makima.json.encode({ error = admission_err })
     end
     local result, err = ticket:wait(ctx, opts)
     if not result and err == "@TURN_WAIT_TIMEOUT@" then
@@ -109,9 +109,9 @@ register_probe({
       assert(cancelled, cancel_err)
       local settled, wait_err = ticket:wait(ctx)
       assert(settled, wait_err)
-      return maki.json.encode({ result = settled, error = err, timed_out = true })
+      return makima.json.encode({ result = settled, error = err, timed_out = true })
     end
-    return maki.json.encode({ result = result, error = err })
+    return makima.json.encode({ result = result, error = err })
   end,
 })
 "#;

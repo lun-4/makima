@@ -1,12 +1,12 @@
 local chat = require("providers.chat_completions")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local OVERLOADED = "server overloaded"
 
 local function sse(chunks)
   local frames = {}
   for _, chunk in ipairs(chunks) do
-    frames[#frames + 1] = "data: " .. (type(chunk) == "string" and chunk or assert(maki.json.encode(chunk))) .. "\n\n"
+    frames[#frames + 1] = "data: " .. (type(chunk) == "string" and chunk or assert(makima.json.encode(chunk))) .. "\n\n"
   end
   return t.response({ table.concat(frames) })
 end
@@ -35,7 +35,7 @@ t.case("build_request", function()
       },
     },
     tools = {
-      { name = "search", description = "find", input_schema = maki.json.decode('["x"]') },
+      { name = "search", description = "find", input_schema = makima.json.decode('["x"]') },
       { name = "empty", description = "", input_schema = { type = "object" } },
       { input_schema = { type = "object" } },
     },

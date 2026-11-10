@@ -1,5 +1,5 @@
 local http = require("providers.http")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 local vertex = require("providers.vertex")
 
 local PROJECT = "proj"
@@ -18,11 +18,11 @@ local spec = vertex.provider()
 
 local function sse(text)
   local chunk = { candidates = { { content = { parts = { { text = text } } }, finishReason = "STOP" } } }
-  return t.response({ "data: " .. assert(maki.json.encode(chunk)) .. "\n\n" })
+  return t.response({ "data: " .. assert(makima.json.encode(chunk)) .. "\n\n" })
 end
 
 local function token(value, expires_in)
-  return t.response({ assert(maki.json.encode({ access_token = value, expires_in = expires_in or 3600 })) })
+  return t.response({ assert(makima.json.encode({ access_token = value, expires_in = expires_in or 3600 })) })
 end
 
 local function request(id, tools)
@@ -35,14 +35,14 @@ local function request(id, tools)
   }
 end
 
--- Runs {fn} with {env} and `maki.time.now()` at {secs}.
+-- Runs {fn} with {env} and `makima.time.now()` at {secs}.
 local function at(secs, env, fn)
-  local now = maki.time.now
-  maki.time.now = function()
+  local now = makima.time.now
+  makima.time.now = function()
     return { secs = secs, nanosecs = 0 }
   end
   local ok, err = pcall(t.with_env, env, fn)
-  maki.time.now = now
+  makima.time.now = now
   if not ok then
     error(err, 0)
   end
@@ -50,7 +50,7 @@ end
 
 local function adc_file(content)
   local dir = t.mktmpdir("vertex_adc")
-  maki.fs.write(dir .. "/adc.json", content)
+  makima.fs.write(dir .. "/adc.json", content)
   return dir .. "/adc.json"
 end
 
@@ -96,8 +96,8 @@ t.case("source_precedence", function()
     t.eq(assert(vertex.source()).client_id, "client")
   end)
   local home = t.mktmpdir("vertex_home")
-  maki.fs.mkdir(home .. "/.config/gcloud", { parents = true })
-  maki.fs.write(home .. "/.config/gcloud/application_default_credentials.json", ADC)
+  makima.fs.mkdir(home .. "/.config/gcloud", { parents = true })
+  makima.fs.write(home .. "/.config/gcloud/application_default_credentials.json", ADC)
   t.with_env({ HOME = home }, function()
     t.eq(assert(vertex.source()).refresh_token, "refresh")
   end)

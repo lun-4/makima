@@ -950,7 +950,7 @@ fn write_config(home: &Path, base_url: &str, setup: Setup) {
         .unwrap_or_default();
     std::fs::write(
         config.join("init.lua"),
-        format!("maki.setup({{ {always} }})\n{}", parity_commands()),
+        format!("makima.setup({{ {always} }})\n{}", parity_commands()),
     )
     .unwrap();
 
@@ -976,7 +976,7 @@ local function prompt(ctx, text)
   local _, err = assert(assert(ctx:agent()):send(ctx, text, {{ when = "idle" }})):wait(ctx)
   assert(err == nil, tostring(err))
 end
-maki.api.register_command({{
+makima.api.register_command({{
   name = "{SWITCH_COMMAND}", tui_only = false,
   handler = function(_, ctx)
     prompt(ctx, "{FIRST}")
@@ -984,44 +984,44 @@ maki.api.register_command({{
     prompt(ctx, "{SECOND}")
   end,
 }})
-maki.api.register_command({{
+makima.api.register_command({{
   name = "{PLAN_COMMAND}", tui_only = false, arguments = {{ raw = true }},
   handler = function(opts, ctx)
     assert(assert(ctx:agent()):set_mode(ctx, "plan"))
     if opts.args ~= "" then prompt(ctx, opts.args) end
   end,
 }})
-maki.api.register_command({{
+makima.api.register_command({{
   name = "{ASK_COMMAND}", tui_only = false,
   handler = function(_, ctx) prompt(ctx, "{ASK_PROMPT}") end,
 }})
-maki.api.register_command({{
+makima.api.register_command({{
   name = "{CHILD_ASK_COMMAND}", tui_only = false,
   handler = function(_, ctx)
-    local child = assert(maki.agent.spawn(ctx, {{ auto_deliver = false }}))
+    local child = assert(makima.agent.spawn(ctx, {{ auto_deliver = false }}))
     local _, err = assert(child:send(ctx, "{ASK_PROMPT}", {{ when = "idle" }})):wait(ctx)
     assert(err == nil, tostring(err))
     child:close(ctx)
   end,
 }})
-maki.api.register_command({{
+makima.api.register_command({{
   name = "{BACKGROUND_COMMAND}", tui_only = false,
   handler = function(_, ctx)
-    local child = assert(maki.agent.spawn(ctx, {{}}))
+    local child = assert(makima.agent.spawn(ctx, {{}}))
     assert(child:send(ctx, "{BACKGROUND_PROMPT}", {{ when = "join" }}))
   end,
 }})
-maki.api.register_command({{
+makima.api.register_command({{
   name = "{PARITY_THINKING_COMMAND}", tui_only = false,
   handler = function(_, ctx)
-    assert(maki.api.run_command(ctx, "{THINKING_COMMAND}"))
+    assert(makima.api.run_command(ctx, "{THINKING_COMMAND}"))
     prompt(ctx, "{PROMPT}")
   end,
 }})
-maki.api.register_command({{
+makima.api.register_command({{
   name = "{UI_COMMAND}", tui_only = false,
   handler = function(_, ctx)
-    local _, err = maki.fn.winsaveview()
+    local _, err = makima.fn.winsaveview()
     prompt(ctx, "{UI_ANSWER}" .. tostring(err))
   end,
 }})

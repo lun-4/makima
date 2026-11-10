@@ -31,21 +31,21 @@ local _tmpdir_counter = 0
 
 function M.mktmpdir(prefix)
   _tmpdir_counter = _tmpdir_counter + 1
-  local name = "/tmp/maki_"
+  local name = "/tmp/makima_"
     .. (prefix or "test")
     .. "_"
     .. tostring(os.clock()):gsub("%.", "")
     .. "_"
     .. _tmpdir_counter
-  maki.fs.mkdir(name)
+  makima.fs.mkdir(name)
   return name
 end
 
 function M.rmtree(dir)
-  maki.fs.rm(dir, { recursive = true })
+  makima.fs.rm(dir, { recursive = true })
 end
 
--- A scripted `maki.net.send` response that yields {chunks} in order. A
+-- A scripted `makima.net.send` response that yields {chunks} in order. A
 -- `read_error` is returned once the chunks run out instead of the end.
 function M.response(chunks, opts)
   opts = opts or {}
@@ -121,14 +121,14 @@ function M.recorder()
   end, events
 end
 
--- Runs {fn} with `maki.uv.os_getenv` reading from {env} instead.
+-- Runs {fn} with `makima.uv.os_getenv` reading from {env} instead.
 function M.with_env(env, fn)
-  local getenv = maki.uv.os_getenv
-  maki.uv.os_getenv = function(name)
+  local getenv = makima.uv.os_getenv
+  makima.uv.os_getenv = function(name)
     return env[name]
   end
   local ok, err = pcall(fn)
-  maki.uv.os_getenv = getenv
+  makima.uv.os_getenv = getenv
   if not ok then
     error(err, 0)
   end

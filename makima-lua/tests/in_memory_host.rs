@@ -121,7 +121,7 @@ const SELECTION_MATRIX: &str = "matrix";
 const SELECTION_VORTEX: &str = "vortex";
 
 const WRAPPER_SOURCE: &str = r##"
-maki.api.set_slot("splash.render", function(prev, w, h, t, fade)
+makima.api.set_slot("splash.render", function(prev, w, h, t, fade)
   local rows = {}
   for i = 1, h do
     rows[i] = { { glyphs = string.rep("w", w), style = "#00ff41" } }
@@ -140,7 +140,7 @@ function M.render(w, h, t, fade)
   return rows
 end
 
-maki.store.register("splash", "vortex", {
+makima.store.register("splash", "vortex", {
   label = "vortex",
   description = "test splash",
   renderer = M.render,
@@ -425,7 +425,7 @@ fn splash_picker_command_switches_to_default() {
 fn splash_picker_keeps_selection_when_render_is_killed_at_deadline() {
     const SOURCE: &str = r##"
 local killed = false
-maki.store.register("splash", "vortex", {
+makima.store.register("splash", "vortex", {
   renderer = function(w, h, t)
     if t > 0 and not killed then
       killed = true
@@ -461,9 +461,9 @@ local function render_default(w, h)
   assert(calls ~= 1, "transient default render failure")
   return { { { glyphs = "makima", style = "field" } } }
 end
-maki.api.declare_slot("splash.render", render_default)
-maki.store.register("splash", "default", { renderer = render_default })
-maki.store.register("splash", "matrix", {
+makima.api.declare_slot("splash.render", render_default)
+makima.store.register("splash", "default", { renderer = render_default })
+makima.store.register("splash", "matrix", {
   renderer = function()
     return { { { glyphs = "matrix", style = "field" } } }
   end,
@@ -509,7 +509,7 @@ function M.render(w, h, t, fade)
   return rows
 end
 
-maki.store.register("splash", "other", {
+makima.store.register("splash", "other", {
   label = "other",
   description = "test splash",
   renderer = M.render,
@@ -526,7 +526,7 @@ function M.render(w, h, t, fade)
   return rows
 end
 
-maki.store.register("splash", "vortex", {
+makima.store.register("splash", "vortex", {
   label = "vortex",
   description = "test splash",
   renderer = M.render,
@@ -583,7 +583,7 @@ function M.render(w, h, t, fade)
   return rows
 end
 
-maki.store.register("splash", "late", {
+makima.store.register("splash", "late", {
   label = "late",
   description = "test splash",
   renderer = M.render,
@@ -767,44 +767,44 @@ const TIMER_FOREVER_REL: &str = "timer_forever";
 const TIMER_QUIESCENCE: Duration = Duration::from_millis(300);
 
 const TIMER_SELF_STOP_SOURCE: &str = r##"
-local base = maki.env.state_dir()
+local base = makima.env.state_dir()
 assert(base, "state dir missing in test host")
-local ok, err = maki.fs.mkdir(base, { parents = true })
+local ok, err = makima.fs.mkdir(base, { parents = true })
 assert(ok, "mkdir failed: " .. tostring(err))
-local path = maki.fs.joinpath(base, "timer_ticks")
+local path = makima.fs.joinpath(base, "timer_ticks")
 local n = 0
-maki.timer.set(0.05, function(id)
+makima.timer.set(0.05, function(id)
   n = n + 1
   if n >= 3 then
-    maki.timer.del(id)
+    makima.timer.del(id)
   end
-  local ok, err = maki.fs.atomic_write(path, tostring(n))
+  local ok, err = makima.fs.atomic_write(path, tostring(n))
   assert(ok, "timer tick write failed: " .. tostring(err))
 end)
 "##;
 
 const TIMER_FOREVER_SOURCE: &str = r##"
-local base = maki.env.state_dir()
-local ok, err = maki.fs.mkdir(base, { parents = true })
+local base = makima.env.state_dir()
+local ok, err = makima.fs.mkdir(base, { parents = true })
 assert(ok, "mkdir failed: " .. tostring(err))
-local path = maki.fs.joinpath(base, "timer_forever")
+local path = makima.fs.joinpath(base, "timer_forever")
 local n = 0
-maki.timer.set(0.05, function()
+makima.timer.set(0.05, function()
   n = n + 1
-  local ok, err = maki.fs.atomic_write(path, tostring(n))
+  local ok, err = makima.fs.atomic_write(path, tostring(n))
   assert(ok, "timer tick write failed: " .. tostring(err))
 end)
 "##;
 
 const TIMER_CONFIG_SOURCE: &str = r##"
-local base = maki.env.state_dir()
-local ok, err = maki.fs.mkdir(base, { parents = true })
+local base = makima.env.state_dir()
+local ok, err = makima.fs.mkdir(base, { parents = true })
 assert(ok, "mkdir failed: " .. tostring(err))
-local path = maki.fs.joinpath(base, "timer_ticks")
+local path = makima.fs.joinpath(base, "timer_ticks")
 local n = 0
-maki.timer.set(0.05, function()
+makima.timer.set(0.05, function()
   n = n + 1
-  local ok, err = maki.fs.atomic_write(path, tostring(n))
+  local ok, err = makima.fs.atomic_write(path, tostring(n))
   assert(ok, "timer tick write failed: " .. tostring(err))
 end)
 "##;
@@ -931,7 +931,7 @@ fn splash_fps_overlay_toggles_through_store_and_readout() {
         .host()
         .load_source(
             "perf-probe",
-            r#"local t = maki.perf.timings()
+            r#"local t = makima.perf.timings()
                assert(t.render_ms > 0, "host records splash render timings")"#,
         )
         .expect("timings reflect real renders");
@@ -947,7 +947,7 @@ fn splash_fps_overlay_toggles_through_store_and_readout() {
 
     let store_state = guard.host().load_source(
         "perf-probe-flag",
-        r#"assert(maki.store.collect("perf").fps_overlay == true, "store flag not set")"#,
+        r#"assert(makima.store.collect("perf").fps_overlay == true, "store flag not set")"#,
     );
     store_state.expect("enable flag lands in the store");
 
@@ -957,7 +957,7 @@ fn splash_fps_overlay_toggles_through_store_and_readout() {
         .host()
         .load_source(
             "perf-probe-clear",
-            r#"assert(maki.store.collect("perf").fps_overlay == false, "store flag not cleared")"#,
+            r#"assert(makima.store.collect("perf").fps_overlay == false, "store flag not cleared")"#,
         )
         .expect("disable flag lands in the store");
 }

@@ -6484,7 +6484,7 @@ const COPY_TYPED_PLUGIN: &str = r#"
         }
     end
 
-    maki.api.register_command({
+    makima.api.register_command({
         name = "/copy",
         tui_only = false,
         arguments = {
@@ -6497,11 +6497,11 @@ const COPY_TYPED_PLUGIN: &str = r#"
         },
         handler = function(opts)
             local policy = opts.values.policy or ""
-            maki.ui.flash(opts.values.source .. "|" .. opts.values.destination .. "|" .. policy)
+            makima.ui.flash(opts.values.source .. "|" .. opts.values.destination .. "|" .. policy)
         end,
     })
 
-    maki.api.register_command({
+    makima.api.register_command({
         name = "/copy-default",
         tui_only = false,
         arguments = {
@@ -6509,11 +6509,11 @@ const COPY_TYPED_PLUGIN: &str = r#"
             { name = "destination", type = "directory" },
         },
         handler = function(opts)
-            maki.ui.flash("default|" .. opts.values.source .. "|" .. opts.values.destination)
+            makima.ui.flash("default|" .. opts.values.source .. "|" .. opts.values.destination)
         end,
     })
 
-    maki.api.register_command({
+    makima.api.register_command({
         name = "/copy-disabled",
         tui_only = false,
         arguments = {
@@ -6521,11 +6521,11 @@ const COPY_TYPED_PLUGIN: &str = r#"
             { name = "destination", type = "directory", completion = false },
         },
         handler = function(opts)
-            maki.ui.flash("disabled|" .. opts.values.source .. "|" .. opts.values.destination)
+            makima.ui.flash("disabled|" .. opts.values.source .. "|" .. opts.values.destination)
         end,
     })
 
-    maki.api.register_command({
+    makima.api.register_command({
         name = "/copy-replace",
         tui_only = false,
         arguments = {
@@ -6536,11 +6536,11 @@ const COPY_TYPED_PLUGIN: &str = r#"
             } },
         },
         handler = function(opts)
-            maki.ui.flash("replace|" .. opts.values.source .. "|" .. opts.values.destination)
+            makima.ui.flash("replace|" .. opts.values.source .. "|" .. opts.values.destination)
         end,
     })
 
-    maki.api.register_command({
+    makima.api.register_command({
         name = "/copy-extend",
         tui_only = false,
         arguments = {
@@ -6551,7 +6551,7 @@ const COPY_TYPED_PLUGIN: &str = r#"
             } },
         },
         handler = function(opts)
-            maki.ui.flash("extend|" .. opts.values.source .. "|" .. opts.values.destination)
+            makima.ui.flash("extend|" .. opts.values.source .. "|" .. opts.values.destination)
         end,
     })
     "#;
@@ -13184,7 +13184,7 @@ fn slow_splash_renderer_does_not_block_tick_or_input() {
             "slow_splash",
             &format!(
                 r##"
-maki.api.set_slot("splash.render", function(prev, w, h, t, fade)
+makima.api.set_slot("splash.render", function(prev, w, h, t, fade)
   local deadline = os.time() + {RENDER_WALL_SECS}
   while os.time() < deadline do end
   return {{ {{ {{ glyphs = string.rep("x", w), style = "#ffffff" }} }} }}

@@ -63,7 +63,7 @@ fn exec_tool(reg: &ToolRegistry, name: &str) -> String {
 fn probe_tool(name: &str, body: &str) -> String {
     format!(
         r#"
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "{name}",
     description = "probe",
     schema = {PROBE_SCHEMA},
@@ -101,11 +101,11 @@ fn exec_autocmds_pattern_routing_and_ev_shape() {
         "ev_shape",
         r#"
 local got, unfiltered = {}, 0
-maki.api.create_autocmd("User", { callback = function() unfiltered = unfiltered + 1 end })
-maki.api.create_autocmd("User", { pattern = "deploy", callback = function(ev, ctx)
+makima.api.create_autocmd("User", { callback = function() unfiltered = unfiltered + 1 end })
+makima.api.create_autocmd("User", { pattern = "deploy", callback = function(ev, ctx)
     got[#got + 1] = { ev = ev, ctx = ctx }
 end })
-maki.api.create_autocmd("Check", { callback = function()
+makima.api.create_autocmd("Check", { callback = function()
     assert(#got == 1, "only the matching pattern fires the filtered listener: " .. #got)
     assert(unfiltered == 3, "unfiltered listener fires always: " .. unfiltered)
     local ev = got[1].ev
@@ -116,13 +116,13 @@ maki.api.create_autocmd("Check", { callback = function()
     assert(ev.agent == nil and got[1].ctx == nil, "a plugin event has no agent")
     result = "ok"
 end })
-maki.api.exec_autocmds("User", { pattern = "other", data = { n = 1 } })
-maki.api.exec_autocmds("User")
-maki.api.exec_autocmds("User", { pattern = "deploy", data = { n = 2 } })
-maki.api.create_autocmd("Ready", { once = true, callback = function()
-    maki.api.exec_autocmds("Check")
+makima.api.exec_autocmds("User", { pattern = "other", data = { n = 1 } })
+makima.api.exec_autocmds("User")
+makima.api.exec_autocmds("User", { pattern = "deploy", data = { n = 2 } })
+makima.api.create_autocmd("Ready", { once = true, callback = function()
+    makima.api.exec_autocmds("Check")
 end })
-maki.api.exec_autocmds("Ready")
+makima.api.exec_autocmds("Ready")
 "#,
     );
     assert_eq!(result, "ok");
@@ -134,8 +134,8 @@ fn exec_autocmds_returns_before_callbacks_run() {
         "ev_detached",
         r#"
 local ran = false
-maki.api.create_autocmd("Later", { callback = function() ran = true end })
-maki.api.exec_autocmds("Later")
+makima.api.create_autocmd("Later", { callback = function() ran = true end })
+makima.api.exec_autocmds("Later")
 result = tostring(ran)
 "#,
     );
@@ -147,9 +147,9 @@ fn autocmd_error_isolation() {
     let result = settled(
         "ev_isolation",
         r#"
-maki.api.create_autocmd("Err", { callback = function() error("boom") end })
-maki.api.create_autocmd("Err", { callback = function() result = "ran" end })
-maki.api.exec_autocmds("Err")
+makima.api.create_autocmd("Err", { callback = function() error("boom") end })
+makima.api.create_autocmd("Err", { callback = function() result = "ran" end })
+makima.api.exec_autocmds("Err")
 "#,
     );
     assert_eq!(result, "ran");
@@ -161,20 +161,20 @@ fn once_callback_semantics() {
         "ev_once",
         r#"
 local n, filtered = 0, 0
-maki.api.create_autocmd("Once", { once = true, callback = function()
+makima.api.create_autocmd("Once", { once = true, callback = function()
     n = n + 1
-    maki.api.exec_autocmds("Once")
+    makima.api.exec_autocmds("Once")
 end })
-maki.api.create_autocmd("Once", { once = true, pattern = "p", callback = function()
+makima.api.create_autocmd("Once", { once = true, pattern = "p", callback = function()
     filtered = filtered + 1
 end })
-maki.api.create_autocmd("Count", { callback = function()
+makima.api.create_autocmd("Count", { callback = function()
     result = n .. "/" .. filtered
 end })
-maki.api.exec_autocmds("Once")
-maki.api.exec_autocmds("Once", { pattern = "p" })
-maki.api.exec_autocmds("Once", { pattern = "p" })
-maki.api.exec_autocmds("Count")
+makima.api.exec_autocmds("Once")
+makima.api.exec_autocmds("Once", { pattern = "p" })
+makima.api.exec_autocmds("Once", { pattern = "p" })
+makima.api.exec_autocmds("Count")
 "#,
     );
     assert_eq!(result, "1/1");
@@ -186,17 +186,17 @@ fn mutual_recursion_stops_at_depth_guard() {
         "ev_mutual",
         r#"
 local x, y = 0, 0
-maki.api.create_autocmd("X", { callback = function()
+makima.api.create_autocmd("X", { callback = function()
     x = x + 1
     result = x .. "/" .. y
-    maki.api.exec_autocmds("Y")
+    makima.api.exec_autocmds("Y")
 end })
-maki.api.create_autocmd("Y", { callback = function()
+makima.api.create_autocmd("Y", { callback = function()
     y = y + 1
     result = x .. "/" .. y
-    maki.api.exec_autocmds("X")
+    makima.api.exec_autocmds("X")
 end })
-maki.api.exec_autocmds("X")
+makima.api.exec_autocmds("X")
 "#,
     );
     assert_eq!(result, "4/4");
@@ -208,16 +208,16 @@ fn ev_table_fresh_per_callback() {
         "ev_fresh",
         r#"
 local first_saw, second_saw
-maki.api.create_autocmd("Fresh", { callback = function(ev)
+makima.api.create_autocmd("Fresh", { callback = function(ev)
     ev.injected = true
     first_saw = ev.injected
 end })
-maki.api.create_autocmd("Fresh", { callback = function(ev) second_saw = ev.injected end })
-maki.api.create_autocmd("Done", { callback = function()
+makima.api.create_autocmd("Fresh", { callback = function(ev) second_saw = ev.injected end })
+makima.api.create_autocmd("Done", { callback = function()
     result = tostring(first_saw) .. "/" .. tostring(second_saw)
 end })
-maki.api.exec_autocmds("Fresh")
-maki.api.exec_autocmds("Done")
+makima.api.exec_autocmds("Fresh")
+makima.api.exec_autocmds("Done")
 "#,
     );
     assert_eq!(result, "true/nil");
@@ -229,11 +229,11 @@ fn del_autocmd_stops_delivery() {
         "ev_del",
         r#"
 local n = 0
-local id = maki.api.create_autocmd("Del", { callback = function() n = n + 1 end })
-maki.api.del_autocmd(id)
-maki.api.exec_autocmds("Del")
-maki.api.create_autocmd("Count", { callback = function() result = tostring(n) end })
-maki.api.exec_autocmds("Count")
+local id = makima.api.create_autocmd("Del", { callback = function() n = n + 1 end })
+makima.api.del_autocmd(id)
+makima.api.exec_autocmds("Del")
+makima.api.create_autocmd("Count", { callback = function() result = tostring(n) end })
+makima.api.exec_autocmds("Count")
 "#,
     );
     assert_eq!(result, "0");
@@ -246,9 +246,9 @@ fn exec_autocmds_throws_on_bad_arg_types() {
         &host,
         "ev_bad_args",
         r#"
-assert(not pcall(maki.api.exec_autocmds, 42), "event must be string or string[]")
-assert(not pcall(maki.api.exec_autocmds, "E", { pattern = 42 }), "pattern must be a string")
-assert(not pcall(maki.api.create_autocmd, "E", { callback = function() end, pattern = 42 }))
+assert(not pcall(makima.api.exec_autocmds, 42), "event must be string or string[]")
+assert(not pcall(makima.api.exec_autocmds, "E", { pattern = 42 }), "pattern must be a string")
+assert(not pcall(makima.api.create_autocmd, "E", { callback = function() end, pattern = 42 }))
 "#,
     );
 }
@@ -259,7 +259,7 @@ fn cross_plugin_event_delivery() {
     let listener = format!(
         r#"
 local log = {{}}
-maki.api.create_autocmd("User", {{ pattern = "deploy", callback = function(ev)
+makima.api.create_autocmd("User", {{ pattern = "deploy", callback = function(ev)
     log[#log + 1] = string.format("%s|%s|%s", ev.event, tostring(ev.match), tostring(ev.data and ev.data.msg))
 end }})
 {}
@@ -271,8 +271,8 @@ end }})
         &host,
         "firer",
         r#"
-maki.api.exec_autocmds("User", { pattern = "deploy", data = { msg = "hi" } })
-maki.api.exec_autocmds("User", { pattern = "nope", data = { msg = "skipped" } })
+makima.api.exec_autocmds("User", { pattern = "deploy", data = { msg = "hi" } })
+makima.api.exec_autocmds("User", { pattern = "nope", data = { msg = "skipped" } })
 "#,
     );
     host.drain_tasks_for_test();
@@ -285,7 +285,7 @@ fn host_fired_event_has_new_ev_shape() {
     let listener = format!(
         r#"
 local log = {{}}
-maki.api.create_autocmd("TurnEnd", {{ callback = function(ev)
+makima.api.create_autocmd("TurnEnd", {{ callback = function(ev)
     log[#log + 1] = string.format("%s|%s|%s", ev.event, tostring(ev.match), tostring(ev.data and ev.data.k))
 end }})
 {}
@@ -306,7 +306,7 @@ fn unload_clears_autocmds_but_keeps_others() {
         format!(
             r#"
 local n = 0
-maki.api.create_autocmd("Shared", {{ callback = function() n = n + 1 end }})
+makima.api.create_autocmd("Shared", {{ callback = function() n = n + 1 end }})
 {}
 "#,
             probe_tool(tool, "return tostring(n)")
@@ -315,7 +315,7 @@ maki.api.create_autocmd("Shared", {{ callback = function() n = n + 1 end }})
     load(&host, "keep", &listener("probe_keep"));
     load(&host, "gone", &listener("probe_gone"));
     host.unload("gone").unwrap();
-    load(&host, "firer", r#"maki.api.exec_autocmds("Shared")"#);
+    load(&host, "firer", r#"makima.api.exec_autocmds("Shared")"#);
     host.drain_tasks_for_test();
     assert_eq!(exec_tool(&reg, "probe_keep"), "1");
 }
@@ -350,7 +350,7 @@ fn slotted_tool(host: &PluginHost) {
         host,
         "slotted_owner",
         r#"
-maki.api.register_tool({
+makima.api.register_tool({
     name = "slotted",
     description = "probe",
     schema = { type = "object", properties = { command = { type = "string" } } },
@@ -482,7 +482,7 @@ fn custom_restricted_mode_dispatches_plugin_and_checks_hook_target(mutation: boo
         TOOL,
         &format!(
             r#"
-        maki.api.register_tool({{
+        makima.api.register_tool({{
             name = "{TOOL}", description = "probe",
             schema = {{ type = "object", properties = {{ path = {{ type = "string" }} }} }},
             mutable_path = {},
@@ -523,7 +523,7 @@ fn custom_restricted_mode_dispatches_plugin_and_checks_hook_target(mutation: boo
         "rewrite_target",
         &format!(
             r#"
-        maki.api.set_slot("tool.{TOOL}.input", function(prev, input, ctx)
+        makima.api.set_slot("tool.{TOOL}.input", function(prev, input, ctx)
             input.path = "other.md"
             return prev(input, ctx)
         end)
@@ -556,7 +556,7 @@ fn tool_input_slot_rewrites_denies_and_passes_through() {
         &host,
         "policy",
         r#"
-maki.api.set_slot("tool.slotted.input", function(prev, input, ctx)
+makima.api.set_slot("tool.slotted.input", function(prev, input, ctx)
     assert(ctx.tool == "slotted", ctx.tool)
     assert(ctx.origin == "model", ctx.origin)
     if input.command == "denied" then
@@ -592,7 +592,7 @@ fn guarded_tool(host: &PluginHost) {
         host,
         "guarded_owner",
         r#"
-maki.api.register_tool({
+makima.api.register_tool({
     name = "guarded",
     description = "probe",
     schema = { type = "object", properties = { command = { type = "string" } } },
@@ -628,7 +628,7 @@ fn all_but_run() -> PluginPermissions {
 /// A layer on one host slot whose body is the whole contract under test.
 fn layer(tool: &str, stage: HookStage, body: &str) -> String {
     format!(
-        r#"maki.api.set_slot("tool.{tool}.{}", function(prev, value, ctx) {body} end)"#,
+        r#"makima.api.set_slot("tool.{tool}.{}", function(prev, value, ctx) {body} end)"#,
         stage.as_str()
     )
 }
@@ -696,8 +696,8 @@ fn tool_input_layer_may_run_a_job() {
         &host,
         "job_policy",
         r#"
-maki.api.set_slot("tool.slotted.input", function(prev, input, ctx)
-    local result = maki.fn.jobwait(maki.fn.jobstart({ "echo", "from-job" }))
+makima.api.set_slot("tool.slotted.input", function(prev, input, ctx)
+    local result = makima.fn.jobwait(makima.fn.jobstart({ "echo", "from-job" }))
     input.command = result.stdout
     return prev(input, ctx)
 end)
@@ -718,7 +718,7 @@ fn tool_output_slot_rewrites_text_and_error_flag() {
         &host,
         "trimmer",
         r#"
-maki.api.set_slot("tool.slotted.output", function(prev, out, ctx)
+makima.api.set_slot("tool.slotted.output", function(prev, out, ctx)
     out.text = out.text:sub(1, 3)
     out.is_error = true
     return prev(out, ctx)
@@ -742,21 +742,21 @@ fn lua_mcp_output_slot_redacts_saved_artifact(origin: CallOrigin, expected_origi
         &format!(
             r#"
 local calls, seen, seen_origin = 0, "", ""
-maki.api.set_slot("tool.{MCP_WIRE_TOOL}.output", function(prev, out, ctx)
+makima.api.set_slot("tool.{MCP_WIRE_TOOL}.output", function(prev, out, ctx)
     calls = calls + 1
     seen = out.text
     seen_origin = ctx.origin
     out.text = out.text:gsub("{MCP_SENTINEL}", "{MCP_REDACTED}")
     return prev(out, ctx)
 end)
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "{MCP_ARTIFACT_PROBE}",
     description = "inspect output slot and saved artifact",
     schema = {{ type = "object", properties = {{ path = {{ type = "string" }} }}, required = {{ "path" }} }},
     handler = function(input)
-        local artifact, err = maki.fs.read(input.path)
+        local artifact, err = makima.fs.read(input.path)
         if not artifact then error(err) end
-        return (maki.json.encode({{
+        return (makima.json.encode({{
             calls = calls, seen = seen, origin = seen_origin, artifact = artifact,
         }}))
     end,
@@ -856,8 +856,8 @@ fn overlapping_chains_all_run() {
         "parking_policy",
         &format!(
             r#"
-maki.api.set_slot("tool.slotted.input", function(prev, input, ctx)
-    maki.fs.read("/nope")
+makima.api.set_slot("tool.slotted.input", function(prev, input, ctx)
+    makima.fs.read("/nope")
     input.{COMMAND_FIELD} = input.{COMMAND_FIELD} .. "{INNER_MARK}"
     return prev(input, ctx)
 end)
@@ -955,7 +955,7 @@ fn a_parked_layer_ends_at_the_window_it_was_given() {
             SLOT_TOOL,
             HookStage::Input,
             &format!(
-                r#"maki.fn.jobwait(maki.fn.jobstart({{ "sleep", "{}" }}), {})
+                r#"makima.fn.jobwait(makima.fn.jobstart({{ "sleep", "{}" }}), {})
                 value.{COMMAND_FIELD} = "{HIJACKED}"
                 return prev(value, ctx)"#,
                 PARKED_FOR.as_secs(),
@@ -997,7 +997,7 @@ fn effective_deadline_denies_a_parked_output_hook(registered_timeout: bool) {
         &format!(
             r#"
 local body = {body:?}
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "{SLOT_TOOL}", description = "deadline probe", schema = {PROBE_SCHEMA},
     audiences = {{ "main" }}, timeout = {timeout},
     handler = function(_, ctx)
@@ -1005,9 +1005,9 @@ maki.api.register_tool({{
         return {{ llm_output = body, output_limits = {{ max_lines = 0 }} }}
     end,
 }})
-maki.api.set_slot("tool.{SLOT_TOOL}.output", function(prev, value, ctx)
+makima.api.set_slot("tool.{SLOT_TOOL}.output", function(prev, value, ctx)
     assert(value.text == body, "output hook must see the unfinalized body")
-    maki.ui.open_editor("parked-output-hook")
+    makima.ui.open_editor("parked-output-hook")
     value.text = "{HIJACKED}"
     return prev(value, ctx)
 end)
@@ -1057,7 +1057,7 @@ fn host_slot_names_are_reserved() {
     let err = host
         .load_source(
             "squatter",
-            r#"maki.api.declare_slot("tool.bash.input", function(i) return i end)"#,
+            r#"makima.api.declare_slot("tool.bash.input", function(i) return i end)"#,
         )
         .expect_err("declaring a host slot must fail");
     assert!(format!("{err}").contains("host owned"), "{err}");
@@ -1269,7 +1269,7 @@ fn a_tool_slot_that_names_no_stage_never_fires() {
         &host,
         LAYER_PLUGIN,
         &format!(
-            r#"maki.api.set_slot("tool.{SLOT_TOOL}.header", function(prev, value, ctx)
+            r#"makima.api.set_slot("tool.{SLOT_TOOL}.header", function(prev, value, ctx)
                 value.{COMMAND_FIELD} = "{HIJACKED}"
                 return prev(value, ctx)
             end)"#
@@ -1321,13 +1321,13 @@ fn slot_layering_wraps_and_overrides() {
         &host,
         "slot_order",
         r#"
-local greet = maki.api.declare_slot("greet", function(name) return "hello " .. name end)
-maki.api.set_slot("greet", function(prev, name) return prev(name) .. "!" end)
-maki.api.set_slot("greet", function(prev, name) return "<" .. prev(name) .. ">" end)
+local greet = makima.api.declare_slot("greet", function(name) return "hello " .. name end)
+makima.api.set_slot("greet", function(prev, name) return prev(name) .. "!" end)
+makima.api.set_slot("greet", function(prev, name) return "<" .. prev(name) .. ">" end)
 assert(greet("bob") == "<hello bob!>", greet("bob"))
 
-local ov = maki.api.declare_slot("ov", function() return "default" end)
-maki.api.set_slot("ov", function(prev) return "override" end)
+local ov = makima.api.declare_slot("ov", function() return "default" end)
+makima.api.set_slot("ov", function(prev) return "override" end)
 assert(ov() == "override", "layer may replace without calling prev")
 "#,
     );
@@ -1341,8 +1341,8 @@ fn slot_error_after_prev_returns_prev_result_exactly_once() {
         "slot_late_error",
         r#"
 local runs = 0
-local s = maki.api.declare_slot("eo", function() runs = runs + 1; return "base" end)
-maki.api.set_slot("eo", function(prev)
+local s = makima.api.declare_slot("eo", function() runs = runs + 1; return "base" end)
+makima.api.set_slot("eo", function(prev)
     local r = prev()
     error("late boom")
 end)
@@ -1361,8 +1361,8 @@ fn slot_error_before_prev_passes_through_once() {
         "slot_early_error",
         r#"
 local runs = 0
-local s = maki.api.declare_slot("pb", function(x) runs = runs + 1; return x end)
-maki.api.set_slot("pb", function(prev, x) error("early boom") end)
+local s = makima.api.declare_slot("pb", function(x) runs = runs + 1; return x end)
+makima.api.set_slot("pb", function(prev, x) error("early boom") end)
 assert(s("v") == "v", "pass-through degradation keeps the chain working")
 assert(runs == 1, "rest of chain ran exactly once: " .. runs)
 "#,
@@ -1379,15 +1379,15 @@ fn slot_chain_may_suspend() {
         &host,
         "slot_suspends",
         r#"
-local d = maki.api.declare_slot("sd", function()
-    local _, err = maki.fs.read("/nope")
+local d = makima.api.declare_slot("sd", function()
+    local _, err = makima.fs.read("/nope")
     return err ~= nil
 end)
 assert(d() == true, "a parking default reaches the filesystem and comes back")
 
-local l = maki.api.declare_slot("sl", function(x) return x end)
-maki.api.set_slot("sl", function(prev, x)
-    local _, err = maki.fs.read("/nope")
+local l = makima.api.declare_slot("sl", function(x) return x end)
+makima.api.set_slot("sl", function(prev, x)
+    local _, err = makima.fs.read("/nope")
     return prev(x .. tostring(err ~= nil))
 end)
 assert(l("v") == "vtrue", l("v"))
@@ -1402,8 +1402,8 @@ fn slot_prev_called_twice_errors() {
         &host,
         "slot_prev_twice",
         r#"
-local s = maki.api.declare_slot("tw", function() return 1 end)
-maki.api.set_slot("tw", function(prev)
+local s = makima.api.declare_slot("tw", function() return 1 end)
+makima.api.set_slot("tw", function(prev)
     prev()
     local ok, err = pcall(prev)
     assert(not ok and tostring(err):find("already consumed"), tostring(err))
@@ -1422,8 +1422,8 @@ fn slot_stashed_prev_expires_after_chain_returns() {
         "slot_stashed_prev",
         r#"
 local stash
-local s = maki.api.declare_slot("st", function() return 1 end)
-maki.api.set_slot("st", function(prev)
+local s = makima.api.declare_slot("st", function() return 1 end)
+makima.api.set_slot("st", function(prev)
     stash = prev
     return prev()
 end)
@@ -1441,13 +1441,13 @@ fn slot_default_error_propagates_through_layers() {
         &host,
         "slot_default_error",
         r#"
-local s = maki.api.declare_slot("de", function() error("default boom") end)
-maki.api.set_slot("de", function(prev) return prev() end)
+local s = makima.api.declare_slot("de", function() error("default boom") end)
+makima.api.set_slot("de", function(prev) return prev() end)
 local ok, err = pcall(s)
 assert(not ok and tostring(err):find("default boom"), tostring(err))
 
-local r = maki.api.declare_slot("rc", function() error("db") end)
-maki.api.set_slot("rc", function(prev)
+local r = makima.api.declare_slot("rc", function() error("db") end)
+makima.api.set_slot("rc", function(prev)
     local ok2 = pcall(prev)
     assert(not ok2)
     return "recovered"
@@ -1465,13 +1465,13 @@ fn slot_recursion_bounded_by_depth_guard() {
         "slot_recursion",
         r#"
 local rd
-rd = maki.api.declare_slot("recd", function() return rd() end)
+rd = makima.api.declare_slot("recd", function() return rd() end)
 local ok, err = pcall(rd)
 assert(not ok and tostring(err):find("exceeded max depth"), tostring(err))
 
 local rf
-rf = maki.api.declare_slot("recf", function() return "base" end)
-maki.api.set_slot("recf", function(prev) return rf() end)
+rf = makima.api.declare_slot("recf", function() return "base" end)
+makima.api.set_slot("recf", function(prev) return rf() end)
 assert(rf() == "base", "recursive filler degrades to pass-through instead of hanging")
 "#,
     );
@@ -1484,8 +1484,8 @@ fn slot_orphan_filler_attaches_on_declare() {
         &host,
         "slot_orphan",
         r#"
-maki.api.set_slot("oa", function(prev, x) return prev(x) .. "+f" end)
-local s = maki.api.declare_slot("oa", function(x) return x end)
+makima.api.set_slot("oa", function(prev, x) return prev(x) .. "+f" end)
+local s = makima.api.declare_slot("oa", function(x) return x end)
 assert(s("v") == "v+f", s("v"))
 "#,
     );
@@ -1498,15 +1498,15 @@ fn slot_redeclare_errors_including_self() {
         &host,
         "slot_dup_self",
         r#"
-maki.api.declare_slot("dup", function() end)
-local ok, err = pcall(maki.api.declare_slot, "dup", function() end)
+makima.api.declare_slot("dup", function() end)
+local ok, err = pcall(makima.api.declare_slot, "dup", function() end)
 assert(not ok and tostring(err):find("already declared"), tostring(err))
 "#,
     );
     let err = host
         .load_source(
             "slot_dup_other",
-            r#"maki.api.declare_slot("dup", function() end)"#,
+            r#"makima.api.declare_slot("dup", function() end)"#,
         )
         .unwrap_err()
         .to_string();
@@ -1523,10 +1523,10 @@ fn get_slots_reports_owner_fillers_and_orphans() {
         &host,
         "slots_introspect",
         r#"
-maki.api.set_slot("orphan_slot", function(prev) return prev() end)
-maki.api.declare_slot("gs", function() return 1 end)
-maki.api.set_slot("gs", function(prev) return prev() end)
-local slots = maki.api.get_slots()
+makima.api.set_slot("orphan_slot", function(prev) return prev() end)
+makima.api.declare_slot("gs", function() return 1 end)
+makima.api.set_slot("gs", function(prev) return prev() end)
+local slots = makima.api.get_slots()
 local gs = slots["gs"]
 assert(gs.declared == true and gs.owner == "slots_introspect", tostring(gs.owner))
 assert(#gs.fillers == 1 and gs.fillers[1] == "slots_introspect")
@@ -1539,8 +1539,8 @@ assert(orphan.fillers[1] == "slots_introspect")
 
 const SLOT_CALLER: &str = r#"
 local stash
-maki.api.create_autocmd("SlotShare", { callback = function(ev) stash = ev.data.callable end })
-maki.api.register_tool({
+makima.api.create_autocmd("SlotShare", { callback = function(ev) stash = ev.data.callable end })
+makima.api.register_tool({
     name = "call_slot",
     description = "probe",
     schema = { type = "object", properties = {}, additionalProperties = false },
@@ -1554,14 +1554,14 @@ maki.api.register_tool({
 "#;
 
 const SLOT_OWNER: &str = r#"
-local greet = maki.api.declare_slot("greet", function(name) return "hello " .. name end)
-maki.api.exec_autocmds("SlotShare", { data = { callable = greet } })
+local greet = makima.api.declare_slot("greet", function(name) return "hello " .. name end)
+makima.api.exec_autocmds("SlotShare", { data = { callable = greet } })
 "#;
 
 const FILLER_EXCLAIM: &str =
-    r#"maki.api.set_slot("greet", function(prev, name) return prev(name) .. "!" end)"#;
+    r#"makima.api.set_slot("greet", function(prev, name) return prev(name) .. "!" end)"#;
 const FILLER_WRAP: &str =
-    r#"maki.api.set_slot("greet", function(prev, name) return "<" .. prev(name) .. ">" end)"#;
+    r#"makima.api.set_slot("greet", function(prev, name) return "<" .. prev(name) .. ">" end)"#;
 
 #[test]
 fn slot_reload_semantics() {

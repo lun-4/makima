@@ -260,7 +260,7 @@ fn exec_output_in(
 }
 
 const ECHO_PLUGIN: &str = r#"
-maki.api.register_tool({
+makima.api.register_tool({
     name = "echo_",
     description = "echo",
     schema = {
@@ -276,7 +276,7 @@ maki.api.register_tool({
 "#;
 
 const SESSION_PLUGIN: &str = r#"
-maki.api.register_tool({
+makima.api.register_tool({
     name = "whoami",
     description = "reports the calling session",
     schema = { type = "object", properties = {}, additionalProperties = false },
@@ -460,11 +460,11 @@ fn unload_round_trip() {
 }
 
 const PERMISSION_RULE_SRC: &str =
-    r#"maki.api.register_permission_rule({ tool = "edit", scope = "/tmp/x/**" })"#;
+    r#"makima.api.register_permission_rule({ tool = "edit", scope = "/tmp/x/**" })"#;
 const NO_RULE_SRC: &str = "local _ = 1";
 /// A rule can only name a registered tool, and it reads the permission it needs
 /// off that tool, so the rule tests have to provide one.
-const EDIT_TOOL_SRC: &str = r#"maki.api.register_tool({
+const EDIT_TOOL_SRC: &str = r#"makima.api.register_tool({
     name = "edit",
     description = "test edit tool",
     schema = { type = "object", properties = { path = { type = "string" } }, required = { "path" } },
@@ -515,7 +515,7 @@ fn reload_clears_stale_rules_of_that_plugin_only() {
     host.load_source("perm_a", PERMISSION_RULE_SRC).unwrap();
     host.load_source(
         "perm_b",
-        r#"maki.api.register_permission_rule({ tool = "write", scope = "/tmp/y/**", effect = "deny" })"#,
+        r#"makima.api.register_permission_rule({ tool = "write", scope = "/tmp/y/**", effect = "deny" })"#,
     )
     .unwrap();
     assert_eq!(host.plugin_rules().snapshot().len(), 2);
@@ -561,7 +561,7 @@ fn permission_rule_validation_rejects(spec: &str, expected_err: &str) {
     let err = host
         .load_source(
             "perm_invalid",
-            &format!("maki.api.register_permission_rule({spec})"),
+            &format!("makima.api.register_permission_rule({spec})"),
         )
         .expect_err("expected validation error");
     assert!(matches!(err, PluginError::Lua { .. }));
@@ -582,7 +582,7 @@ fn registration_validation_rejects(fields: &str, schema: &str, expected_err: &st
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             {fields},
             schema = {schema},
             handler = function(input, ctx) return "" end
@@ -601,7 +601,7 @@ fn permission_scopes_valid_string_field_accepted() {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "ok_scope",
             description = "test",
             schema = {STRING_FIELD_SCHEMA},
@@ -619,7 +619,7 @@ fn tool_kind_flows_to_trait() {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "my_fetcher",
             description = "fetches things",
             schema = {MINIMAL_SCHEMA},
@@ -642,7 +642,7 @@ fn get_tool_returns_normalized_header_and_restore_handles() {
 
     let src = format!(
         r#"
-        maki.api.register_tool({{
+        makima.api.register_tool({{
             name = "styled_tool",
             description = "t",
             schema = {STRING_FIELD_SCHEMA},
@@ -650,14 +650,14 @@ fn get_tool_returns_normalized_header_and_restore_handles() {
             header = function(input) return "H:" .. input.url end,
             restore = function(input)
                 if input.with_body then
-                    local b = maki.ui.buf()
+                    local b = makima.ui.buf()
                     b:line("body")
                     return {{ body = b }}
                 end
                 return {{}}
             end,
         }})
-        maki.api.register_tool({{
+        makima.api.register_tool({{
             name = "throwing_tool",
             description = "t",
             schema = {MINIMAL_SCHEMA},
@@ -665,14 +665,14 @@ fn get_tool_returns_normalized_header_and_restore_handles() {
             header = function() error("kaboom") end,
             restore = function() error("kaboom") end,
         }})
-        maki.api.register_tool({{
+        makima.api.register_tool({{
             name = "handle_probe",
             description = "p",
             schema = {MINIMAL_SCHEMA},
             handler = function()
-                local t = maki.api.get_tool("styled_tool")
+                local t = makima.api.get_tool("styled_tool")
                 if not t then return nil, "not found" end
-                local thrower = maki.api.get_tool("throwing_tool")
+                local thrower = makima.api.get_tool("throwing_tool")
                 local h = t.header({{ url = "abc" }})
                 return table.concat({{
                     t.name,
@@ -681,8 +681,8 @@ fn get_tool_returns_normalized_header_and_restore_handles() {
                     type(t.restore({{ with_body = true }}, "", false, nil)),
                     tostring(thrower.header({{}}) == nil),
                     tostring(thrower.restore({{}}, "", false, nil) == nil),
-                    tostring(maki.api.get_tool("nope_tool") == nil),
-                    type(maki.api.get_tool("handle_probe").header),
+                    tostring(makima.api.get_tool("nope_tool") == nil),
+                    type(makima.api.get_tool("handle_probe").header),
                 }}, "|")
             end
         }})
@@ -702,7 +702,7 @@ fn handler_state_flows_to_tool_output_and_serde() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "stateful",
             description = "t",
             schema = {MINIMAL_SCHEMA},
@@ -773,13 +773,13 @@ fn restore_snapshot_text(
 fn restore_reads_persisted_state(with_state: bool, expected: &str) {
     let state = with_state.then(|| serde_json::json!({ "n": 3, "tag": "hi" }));
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "state_restore",
             description = "t",
             schema = {MINIMAL_SCHEMA},
             handler = function() return "ok" end,
             restore = function(input, output, is_error, rctx)
-                local buf = maki.ui.buf()
+                local buf = makima.ui.buf()
                 local s = rctx:state()
                 if s == nil then
                     buf:line("no state")
@@ -797,7 +797,7 @@ fn restore_reads_persisted_state(with_state: bool, expected: &str) {
 #[test]
 fn restore_ctx_is_userdata_with_gated_capabilities() {
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "ctx_restore",
             description = "t",
             schema = {MINIMAL_SCHEMA},
@@ -814,7 +814,7 @@ fn restore_ctx_is_userdata_with_gated_capabilities() {
                     dl_err ~= nil and "deadline_err" or "deadline_ok",
                     rctx:cancelled() == false and "cancelled_ok" or "cancelled_bad",
                 }}
-                local buf = maki.ui.buf()
+                local buf = makima.ui.buf()
                 buf:line(table.concat(parts, " "))
                 return buf
             end
@@ -838,25 +838,25 @@ fn get_tool_restore_accepts_table_or_userdata_ctx() {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
         r#"local probe
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "child_r",
     description = "t",
     schema = {MINIMAL_SCHEMA},
     handler = function() return "ok" end,
     restore = function(input, output, is_error, rctx)
         probe = {{ state = rctx:state(), tol = rctx:tool_output_lines() }}
-        local buf = maki.ui.buf()
+        local buf = makima.ui.buf()
         buf:line("body")
         return buf
     end
 }})
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "restore_driver",
     description = "t",
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function(input, ctx)
-        local t = maki.api.get_tool("child_r")
+        local t = makima.api.get_tool("child_r")
         local parts = {{}}
         local buf = t.restore({{}}, "out", false, {{ tool_output_lines = {{ bash = 42 }}, state = {{ tag = "T" }} }})
         parts[1] = buf ~= nil and "buf_ok" or "buf_nil"
@@ -886,7 +886,7 @@ fn agent_api_value_failures_return_err_pairs() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "agent_pairs_probe",
             description = "t",
             schema = {MINIMAL_SCHEMA},
@@ -896,9 +896,9 @@ fn agent_api_value_failures_return_err_pairs() {
                     return v == nil and type(e) == "string"
                 end
                 local parts = {{}}
-                parts[1] = pair_err(maki.agent.system_prompt(ctx, {{ prompt_id = "nope" }})) and "prompt_err" or "prompt_ok"
-                parts[2] = pair_err(maki.agent.tools(ctx, {{ audience = "nope" }})) and "tools_err" or "tools_ok"
-                parts[3] = pair_err(maki.agent.resolve_model(ctx, {{ spec = "not-a-spec" }})) and "model_err" or "model_ok"
+                parts[1] = pair_err(makima.agent.system_prompt(ctx, {{ prompt_id = "nope" }})) and "prompt_err" or "prompt_ok"
+                parts[2] = pair_err(makima.agent.tools(ctx, {{ audience = "nope" }})) and "tools_err" or "tools_ok"
+                parts[3] = pair_err(makima.agent.resolve_model(ctx, {{ spec = "not-a-spec" }})) and "model_err" or "model_ok"
                 return table.concat(parts, " ")
             end
         }})"#
@@ -915,13 +915,13 @@ fn resolve_model_spec_takes_precedence_over_tier() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "spec_precedence_probe",
             description = "t",
             schema = {MINIMAL_SCHEMA},
             audiences = {{ "main" }},
             handler = function(input, ctx)
-                local m, err = maki.agent.resolve_model(ctx, {{
+                local m, err = makima.agent.resolve_model(ctx, {{
                     tier = "weak",
                     spec = "anthropic/claude-opus-4-8",
                 }})
@@ -946,19 +946,19 @@ fn resolve_model_spec_takes_precedence_over_tier() {
 #[test_case::test_case(vec![0], "click async line" ; "click_replay_async_task_runs_inline")]
 fn restore_snapshot_contains_async_run_content(clicks: Vec<usize>, expected: &str) {
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "async_restore",
             description = "t",
             schema = {MINIMAL_SCHEMA},
             handler = function() return "ok" end,
             restore = function(input, output, is_error, rctx)
-                local buf = maki.ui.buf()
+                local buf = makima.ui.buf()
                 buf:line("sync line")
-                maki.async.run(function()
+                makima.async.run(function()
                     buf:line("restore async line")
                 end)
                 buf:on("click", function()
-                    maki.async.run(function()
+                    makima.async.run(function()
                         buf:line("click async line")
                     end)
                 end)
@@ -980,7 +980,7 @@ fn examples_table_flows_to_trait() {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "with_examples",
             description = "test",
             schema = {STRING_FIELD_SCHEMA},
@@ -1003,14 +1003,14 @@ fn interrupt_kills_infinite_loop_and_vm_recovers() {
 
     let src = format!(
         r#"
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "infinite_loop_",
     description = "loops forever",
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function(input, ctx) while true do end end
 }})
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "noop_after_loop",
     description = "returns ok",
     schema = {MINIMAL_SCHEMA},
@@ -1041,14 +1041,14 @@ fn failed_load_leaves_no_tools_or_commands() {
 
     let src = format!(
         r#"
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "doomed",
     description = "never registered",
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function() return "" end
 }})
-maki.api.register_command({{
+makima.api.register_command({{
     name = "/doomed",
     tui_only = false,
     handler = function() end,
@@ -1074,7 +1074,7 @@ fn is_error_propagated_as_error() {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "returns_error",
             description = "returns is_error=true",
             schema = {MINIMAL_SCHEMA},
@@ -1095,7 +1095,7 @@ fn handler_bad_return_type_is_error() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "bad_ret_num",
             description = "bad return",
             schema = {MINIMAL_SCHEMA},
@@ -1113,7 +1113,7 @@ fn handler_bad_return_type_is_error() {
 fn handler_nil_without_jobs_is_error() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let src = r#"maki.api.register_tool({
+    let src = r#"makima.api.register_tool({
         name = "nil_no_jobs",
         description = "returns nil without starting jobs",
         schema = { type = "object", properties = {} },
@@ -1131,7 +1131,7 @@ fn handler_lua_error_surfaces_as_tool_error() {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "thrower",
             description = "throws on call",
             schema = {MINIMAL_SCHEMA},
@@ -1151,7 +1151,7 @@ fn lua_tool_schema_rejects_bad_input() {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
     let src = r#"
-maki.api.register_tool({
+makima.api.register_tool({
     name = "needs_name",
     description = "requires a name field",
     schema = {
@@ -1306,7 +1306,7 @@ fn init_lua_with_require_registers_tools() {
         r#"
 local M = {}
 function M.setup()
-    maki.api.register_tool({
+    makima.api.register_tool({
         name = "greet",
         description = "says hi",
         schema = { type = "object", properties = {}, additionalProperties = false },
@@ -1477,13 +1477,13 @@ fn multi_tool_plugin_registers_and_unloads_all() {
 
     let src = format!(
         r#"
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "multi_alpha",
     description = "first tool",
     schema = {MINIMAL_SCHEMA},
     handler = function() return "alpha" end
 }})
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "multi_beta",
     description = "second tool",
     schema = {MINIMAL_SCHEMA},
@@ -1507,7 +1507,7 @@ fn conflict_from_different_plugin_preserves_original() {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "evolving",
             description = "version 1",
             schema = {MINIMAL_SCHEMA},
@@ -1531,7 +1531,7 @@ fn ctx_finish_called_twice_is_error() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "double_finish",
             description = "calls finish twice",
             schema = {MINIMAL_SCHEMA},
@@ -1552,7 +1552,7 @@ fn ctx_finish_with_is_error_propagates() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "finish_err",
             description = "finishes with error",
             schema = {MINIMAL_SCHEMA},
@@ -1572,13 +1572,13 @@ fn async_job_on_exit_receives_exit_code() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "job_exit_code",
             description = "reports exit code",
             schema = {MINIMAL_SCHEMA},
             audiences = {{ "main" }},
             handler = function(input, ctx)
-                maki.fn.jobstart("exit 42", {{
+                makima.fn.jobstart("exit 42", {{
                     on_exit = function(job_id, code)
                         ctx:finish("code=" .. tostring(code))
                     end
@@ -1596,7 +1596,7 @@ fn jobwait_fires_callbacks_while_waiting() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "job_stream",
             description = "streams lines during jobwait",
             schema = {MINIMAL_SCHEMA},
@@ -1604,11 +1604,11 @@ fn jobwait_fires_callbacks_while_waiting() {
             handler = function(input, ctx)
                 local seen = {{}}
                 local exit_code
-                local id = maki.fn.jobstart("echo a; echo b; exit 7", {{
+                local id = makima.fn.jobstart("echo a; echo b; exit 7", {{
                     on_stdout = function(_, line) seen[#seen + 1] = line end,
                     on_exit = function(_, code) exit_code = code end,
                 }})
-                local res = maki.fn.jobwait(id)
+                local res = makima.fn.jobwait(id)
                 return table.concat(seen, ",")
                     .. " exit=" .. tostring(exit_code)
                     .. " stdout=" .. (res.stdout:gsub("\n", ","))
@@ -1625,13 +1625,13 @@ fn jobstart_invalid_cwd_errors_with_expanded_path() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "job_bad_cwd",
             description = "jobstart with missing tilde cwd",
             schema = {MINIMAL_SCHEMA},
             audiences = {{ "main" }},
             handler = function(input, ctx)
-                local _, err = pcall(maki.fn.jobstart, "pwd", {{ cwd = "{JOB_BAD_CWD}" }})
+                local _, err = pcall(makima.fn.jobstart, "pwd", {{ cwd = "{JOB_BAD_CWD}" }})
                 return tostring(err)
             end
         }})"#,
@@ -1650,13 +1650,13 @@ fn async_job_exits_without_finish_is_error() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "job_no_finish",
             description = "job exits but never calls finish",
             schema = {MINIMAL_SCHEMA},
             audiences = {{ "main" }},
             handler = function(input, ctx)
-                maki.fn.jobstart("echo oops", {{
+                makima.fn.jobstart("echo oops", {{
                     on_exit = function(job_id, code) end
                 }})
             end
@@ -1672,13 +1672,13 @@ fn async_job_callback_error_surfaces() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "job_cb_err",
             description = "callback throws",
             schema = {MINIMAL_SCHEMA},
             audiences = {{ "main" }},
             handler = function(input, ctx)
-                maki.fn.jobstart("echo trigger", {{
+                makima.fn.jobstart("echo trigger", {{
                     on_exit = function(job_id, code)
                         error("callback exploded")
                     end
@@ -1733,17 +1733,17 @@ fn live_click_reaches_running_tool() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "live_click",
             description = "finishes when clicked while running",
             schema = {MINIMAL_SCHEMA},
             audiences = {{ "main" }},
             handler = function(input, ctx)
-                local buf = maki.ui.buf()
+                local buf = makima.ui.buf()
                 buf:on("click", function()
                     ctx:finish("{CLICKED_MSG}")
                 end)
-                maki.fn.jobstart("sleep 30", {{}})
+                makima.fn.jobstart("sleep 30", {{}})
             end
         }})"#,
     );
@@ -1764,18 +1764,18 @@ fn live_click_routes_to_root_buf_among_many() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "root_click",
             description = "decoy buf registers a click first",
             schema = {MINIMAL_SCHEMA},
             audiences = {{ "main" }},
             handler = function(input, ctx)
-                local decoy = maki.ui.buf()
+                local decoy = makima.ui.buf()
                 decoy:on("click", function() ctx:finish("decoy_clicked") end)
-                local root = maki.ui.buf()
+                local root = makima.ui.buf()
                 root:on("click", function() ctx:finish("{ROOT_MSG}") end)
                 ctx:live_buf(root)
-                maki.fn.jobstart("sleep 30", {{}})
+                makima.fn.jobstart("sleep 30", {{}})
             end
         }})"#,
     );
@@ -1812,20 +1812,20 @@ fn warm_host(is_error: bool, live_click: bool) -> (Arc<ToolRegistry>, PluginHost
         String::new()
     };
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "{WARM_TOOL_NAME}",
             description = "warm click probe",
             schema = {MINIMAL_SCHEMA},
             audiences = {{ "main" }},
             handler = function(input, ctx)
-                local buf = maki.ui.buf()
+                local buf = makima.ui.buf()
                 buf:set_lines({{ "{WARM_INITIAL_LINE}" }})
                 {on_click}
                 ctx:live_buf(buf)
                 return {ret}
             end,
             restore = function(input, output, is_error, rctx)
-                local buf = maki.ui.buf()
+                local buf = makima.ui.buf()
                 buf:set_lines({{ "{WARM_RESTORED_LINE}" }})
                 buf:on("click", function()
                     buf:set_lines({{ "{WARM_RESTORE_CLICK_LINE}" }})
@@ -2074,16 +2074,16 @@ fn warm_click_runs_async_jobs() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "warm_async",
             description = "appends a line from an async job on click",
             schema = {MINIMAL_SCHEMA},
             audiences = {{ "main" }},
             handler = function(input, ctx)
-                local buf = maki.ui.buf()
+                local buf = makima.ui.buf()
                 buf:set_lines({{ "{WARM_INITIAL_LINE}" }})
                 buf:on("click", function()
-                    maki.async.run(function()
+                    makima.async.run(function()
                         buf:line("{ASYNC_LINE}")
                     end)
                 end)
@@ -2141,7 +2141,7 @@ fn call_tool_streams_live_buf_and_annotations() {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
         r#"
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "annotated_child",
     description = "returns an annotation",
     schema = {MINIMAL_SCHEMA},
@@ -2150,19 +2150,19 @@ maki.api.register_tool({{
         return {{ llm_output = "child_done", annotation = "5 items" }}
     end
 }})
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "streaming_child",
     description = "publishes a live buf then finishes",
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function(input, ctx)
-        local buf = maki.ui.buf()
+        local buf = makima.ui.buf()
         buf:line("streamed line")
         ctx:live_buf(buf)
         return "stream_done"
     end
 }})
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "failing_child",
     description = "always errors",
     schema = {MINIMAL_SCHEMA},
@@ -2171,19 +2171,19 @@ maki.api.register_tool({{
         return {{ llm_output = "boom", is_error = true }}
     end
 }})
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "driver",
-    description = "dispatches children via maki.agent.call_tool",
+    description = "dispatches children via makima.agent.call_tool",
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function(input, ctx)
         local ann = "nil"
-        local text, err = maki.agent.call_tool(ctx, "annotated_child", {{}}, {{
+        local text, err = makima.agent.call_tool(ctx, "annotated_child", {{}}, {{
             on_annotation = function(a) ann = a end,
         }})
         local live_text = "none"
         local ann2 = "nil"
-        local text2 = maki.agent.call_tool(ctx, "streaming_child", {{}}, {{
+        local text2 = makima.agent.call_tool(ctx, "streaming_child", {{}}, {{
             on_live_buf = function(b)
                 local lines = b:get_lines()
                 live_text = lines[1] and lines[1][1] and lines[1][1][1] or "empty"
@@ -2191,11 +2191,11 @@ maki.api.register_tool({{
             on_annotation = function(a) ann2 = a end,
         }})
         local usage = "nil"
-        local text3 = maki.agent.call_tool(ctx, "{USAGE_TOOL_NAME}", {{}}, {{
+        local text3 = makima.agent.call_tool(ctx, "{USAGE_TOOL_NAME}", {{}}, {{
             on_usage = function(value) usage = value end,
         }})
         local ann3 = "nil"
-        local _, err3 = maki.agent.call_tool(ctx, "failing_child", {{}}, {{
+        local _, err3 = makima.agent.call_tool(ctx, "failing_child", {{}}, {{
             on_annotation = function(a) ann3 = a end,
         }})
         return tostring(text) .. "/" .. ann
@@ -2228,18 +2228,18 @@ fn jobstop_kills_running_job() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "job_stop",
             description = "starts and immediately stops a job",
             schema = {MINIMAL_SCHEMA},
             audiences = {{ "main" }},
             handler = function(input, ctx)
-                local id = maki.fn.jobstart("sleep 60", {{
+                local id = makima.fn.jobstart("sleep 60", {{
                     on_exit = function(job_id, code)
                         ctx:finish("killed=" .. tostring(code ~= 0))
                     end
                 }})
-                maki.fn.jobstop(id)
+                makima.fn.jobstop(id)
             end
         }})"#,
     );
@@ -2256,21 +2256,21 @@ fn plugin_owned_job_outlives_its_starting_tool() {
         r#"
 local output = "pending"
 local exit_code = "pending"
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "start_plugin_job",
     description = "starts a plugin-owned job",
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function()
-        local id = maki.fn.jobstart("sleep 0.1; printf plugin-output; exit 7", {{
+        local id = makima.fn.jobstart("sleep 0.1; printf plugin-output; exit 7", {{
             owner = "plugin",
             on_stdout = function(_, line) output = line end,
             on_exit = function(_, code) exit_code = tostring(code) end,
         }})
-        return maki.fn.jobwait(id, 1) == nil and "started" or "did not time out"
+        return makima.fn.jobwait(id, 1) == nil and "started" or "did not time out"
     end,
 }})
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "plugin_job_state",
     description = "reports plugin-owned job callbacks",
     schema = {MINIMAL_SCHEMA},
@@ -2308,7 +2308,7 @@ fn unloading_plugin_kills_its_jobs() {
     let dir = tempfile::tempdir().unwrap();
     let pid_path = dir.path().join("job.pid");
     let src = format!(
-        r#"maki.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{
+        r#"makima.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{
             owner = "plugin",
         }})"#,
         pid_path.display()
@@ -2375,7 +2375,7 @@ fn failed_plugin_reload_preserves_old_job_and_kills_candidate() {
     host.load_source(
         "transactional_jobs",
         &format!(
-            r#"maki.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{ owner = "plugin" }})"#,
+            r#"makima.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{ owner = "plugin" }})"#,
             old_path.display()
         ),
     )
@@ -2386,8 +2386,8 @@ fn failed_plugin_reload_preserves_old_job_and_kills_candidate() {
         "transactional_jobs",
         &format!(
             r#"
-            assert(maki.async.await(1, function(ready)
-                maki.fn.jobstart("printf %s $$ > '{}' && printf 'ready\\n'; exec sleep 30", {{
+            assert(makima.async.await(1, function(ready)
+                makima.fn.jobstart("printf %s $$ > '{}' && printf 'ready\\n'; exec sleep 30", {{
                     owner = "plugin",
                     on_stdout = function(_, line) if line == "ready" then ready(true) end end,
                 }})
@@ -2419,7 +2419,7 @@ fn successful_plugin_reload_kills_old_job_and_keeps_candidate() {
     host.load_source(
         "transactional_jobs",
         &format!(
-            r#"maki.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{ owner = "plugin" }})"#,
+            r#"makima.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{ owner = "plugin" }})"#,
             old_path.display()
         ),
     )
@@ -2430,15 +2430,15 @@ fn successful_plugin_reload_kills_old_job_and_keeps_candidate() {
         "transactional_jobs",
         &format!(
             r#"
-            local id = maki.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{ owner = "plugin" }})
-            maki.fn.jobwait(id, 100)
-            maki.api.register_tool({{
+            local id = makima.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{ owner = "plugin" }})
+            makima.fn.jobwait(id, 100)
+            makima.api.register_tool({{
                 name = "stop_candidate_job",
                 description = "stops the candidate job",
                 schema = {MINIMAL_SCHEMA},
                 audiences = {{ "main" }},
                 handler = function()
-                    maki.fn.jobstop(id)
+                    makima.fn.jobstop(id)
                     return "stopped"
                 end,
             }})
@@ -2469,7 +2469,7 @@ fn unloading_promoted_plugin_job_kills_candidate() {
     host.load_source(
         "transactional_jobs",
         &format!(
-            r#"maki.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{ owner = "plugin" }})"#,
+            r#"makima.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{ owner = "plugin" }})"#,
             old_path.display()
         ),
     )
@@ -2479,8 +2479,8 @@ fn unloading_promoted_plugin_job_kills_candidate() {
         "transactional_jobs",
         &format!(
             r#"
-            local id = maki.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{ owner = "plugin" }})
-            maki.fn.jobwait(id, 100)
+            local id = makima.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{ owner = "plugin" }})
+            makima.fn.jobwait(id, 100)
             "#,
             candidate_path.display()
         ),
@@ -2498,18 +2498,18 @@ fn vm_recovers_after_async_job_tool() {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
         r#"
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "async_first",
     description = "async tool",
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function(input, ctx)
-        maki.fn.jobstart("echo hi", {{
+        makima.fn.jobstart("echo hi", {{
             on_exit = function(job_id, code) ctx:finish("ok1") end
         }})
     end
 }})
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "sync_after",
     description = "sync tool",
     schema = {MINIMAL_SCHEMA},
@@ -2531,7 +2531,7 @@ fn setup_happy_path() {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let raw = host
         .send_run_init_lua(
-            "maki.setup({ agent = { max_output_lines = 3000 } })".to_owned(),
+            "makima.setup({ agent = { max_output_lines = 3000 } })".to_owned(),
             "test_init.lua".to_owned(),
             None,
         )
@@ -2547,7 +2547,7 @@ fn lua_setup_accepts_autocomplete_height() {
     let raw = host
         .send_run_init_lua(
             format!(
-                "maki.setup({{ ui = {{ autocomplete_height = {DEFAULT_AUTOCOMPLETE_HEIGHT} }} }})"
+                "makima.setup({{ ui = {{ autocomplete_height = {DEFAULT_AUTOCOMPLETE_HEIGHT} }} }})"
             ),
             "test_init.lua".to_owned(),
             None,
@@ -2561,12 +2561,12 @@ fn lua_setup_accepts_autocomplete_height() {
 }
 
 #[test_case::test_case(
-    r#"maki.setup({ agent = { compaction_buffer = 10000 } })"#,
+    r#"makima.setup({ agent = { compaction_buffer = 10000 } })"#,
     makima_config::CompactionBuffer::Tokens(10_000)
     ; "compaction_buffer_tokens"
 )]
 #[test_case::test_case(
-    r#"maki.setup({ agent = { compaction_buffer = "15%" } })"#,
+    r#"makima.setup({ agent = { compaction_buffer = "15%" } })"#,
     makima_config::CompactionBuffer::Percent(15)
     ; "compaction_buffer_percent"
 )]
@@ -2581,22 +2581,22 @@ fn setup_compaction_buffer(lua_src: &str, expected: makima_config::CompactionBuf
 }
 
 #[test_case::test_case(
-    "maki.setup({ ui = { splash_animaton = false } })",
+    "makima.setup({ ui = { splash_animaton = false } })",
     UNKNOWN_FIELD_ERR
     ; "unknown_field"
 )]
 #[test_case::test_case(
-    r#"maki.setup({ agent = { max_output_lines = "not a number" } })"#,
+    r#"makima.setup({ agent = { max_output_lines = "not a number" } })"#,
     ""
     ; "wrong_type"
 )]
 #[test_case::test_case(
-    "maki.setup({ agent = { bash_timeout_secs = 120 } })",
+    "makima.setup({ agent = { bash_timeout_secs = 120 } })",
     UNKNOWN_FIELD_ERR
     ; "moved_plugin_option"
 )]
 #[test_case::test_case(
-    r#"maki.setup({ provider = { allowed_models = "anthropic/*" } })"#,
+    r#"makima.setup({ provider = { allowed_models = "anthropic/*" } })"#,
     ""
     ; "model_policy_wrong_type"
 )]
@@ -2618,7 +2618,7 @@ fn setup_model_policy_lists() {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let raw = host
         .send_run_init_lua(
-            r#"maki.setup({ provider = {
+            r#"makima.setup({ provider = {
                 allowed_models = { "anthropic/*", "openai/gpt-5" },
                 excluded_models = { "*/*-preview" },
             } })"#
@@ -2644,7 +2644,7 @@ fn setup_double_call_error() {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let err = host
         .send_run_init_lua(
-            "maki.setup({})\nmaki.setup({})".to_owned(),
+            "makima.setup({})\nmakima.setup({})".to_owned(),
             "test_init.lua".to_owned(),
             None,
         )
@@ -2672,7 +2672,7 @@ fn setup_all_sections_at_once() {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let raw = host
         .send_run_init_lua(
-            r#"maki.setup({
+            r#"makima.setup({
                 always_yolo = true,
                 always_fast = true,
                 always_thinking = "adaptive",
@@ -2727,13 +2727,13 @@ local opts = makima.api.register_options({
     timeout_secs = { default = 120, min = 5, desc = "Timeout." },
     label = { type = "string", desc = "Label." },
 })
-maki.api.register_tool({
+makima.api.register_tool({
     name = "opts_probe",
     description = "returns merged opts",
     schema = { type = "object", properties = {}, additionalProperties = false },
     audiences = { "main" },
     handler = function(input, ctx)
-        return (maki.json.encode({
+        return (makima.json.encode({
             timeout_secs = opts.timeout_secs,
             label = opts.label,
         }))
@@ -2864,7 +2864,7 @@ fn builtin_opts_flow_from_setup_plugins() {
     let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let raw = host
         .send_run_init_lua(
-            "maki.setup({ plugins = { grep = { search_result_limit = 42 } } })".to_owned(),
+            "makima.setup({ plugins = { grep = { search_result_limit = 42 } } })".to_owned(),
             "test_init.lua".to_owned(),
             None,
         )
@@ -2992,7 +2992,7 @@ fn websearch_unknown_provider_fails_the_load() {
 
 fn shadow_src() -> String {
     format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "{SHADOWED_TOOL}",
             description = "{REPLACEMENT_DESC}",
             schema = {MINIMAL_SCHEMA},
@@ -3012,7 +3012,7 @@ fn disabled_builtin_hands_its_tool_name_to_a_user_plugin() {
     let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let raw = host
         .send_run_init_lua(
-            format!("maki.setup({{ plugins = {{ {SHADOWED_TOOL} = {{ enabled = false }} }} }})"),
+            format!("makima.setup({{ plugins = {{ {SHADOWED_TOOL} = {{ enabled = false }} }} }})"),
             "test_init.lua".to_owned(),
             None,
         )
@@ -3064,7 +3064,7 @@ fn setup_always_thinking_variants(lua_val: &str, expected: AlwaysThinking) {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let raw = host
         .send_run_init_lua(
-            format!("maki.setup({{ always_thinking = {lua_val} }})"),
+            format!("makima.setup({{ always_thinking = {lua_val} }})"),
             "test_init.lua".to_owned(),
             None,
         )
@@ -3079,7 +3079,7 @@ fn setup_no_tool_registration_in_init_env() {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let err = host
         .send_run_init_lua(
-            r#"maki.register_tool({
+            r#"makima.register_tool({
                 name = "sneaky",
                 description = "should fail",
                 audiences = { "main" },
@@ -3103,7 +3103,7 @@ fn register_command_happy_path() {
     host.load_source(
         "cmd_plugin",
         r#"
-        maki.api.register_command({
+        makima.api.register_command({
             name = "/hello",
             description = "says hello",
             argument_hint = "[name]",
@@ -3140,7 +3140,7 @@ fn register_command_typed_arguments_projects_schema() {
     host.load_source(
         "typed_commands",
         r#"
-        maki.api.register_command({
+        makima.api.register_command({
             name = "/typed",
             tui_only = false,
             arguments = {
@@ -3175,7 +3175,7 @@ fn register_command_typed_arguments_registers_descriptor_completion_and_context(
     host.load_source(
         "typed_completion",
         r#"
-        maki.api.register_command({
+        makima.api.register_command({
             name = "/typed",
             tui_only = false,
             arguments = {
@@ -3187,7 +3187,7 @@ fn register_command_typed_arguments_registers_descriptor_completion_and_context(
                     get_items = function(ctx)
                         return {{ label = ctx.argument .. ":" .. ctx.type .. ":" .. ctx.values.mode, insertion = "2" }}
                     end,
-                    on_cancel = function(ctx) maki.ui.flash("cancel:" .. ctx.argument) end,
+                    on_cancel = function(ctx) makima.ui.flash("cancel:" .. ctx.argument) end,
                 } },
             },
             handler = function() end,
@@ -3282,7 +3282,7 @@ fn register_command_removed_fields_include_migration_hint(field: &str, expected:
         .load_source(
             "typed_commands",
             &format!(
-                r#"maki.api.register_command({{
+                r#"makima.api.register_command({{
                     name = "/typed", tui_only = false, {field},
                     arguments = {{{{ name = "value", type = "string" }}}},
                     handler = function() end,
@@ -3306,7 +3306,7 @@ fn register_command_rejects_unknown_typed_argument_fields(descriptor: &str, expe
         .load_source(
             "typed_commands",
             &format!(
-                r#"maki.api.register_command({{
+                r#"makima.api.register_command({{
                     name = "/typed", tui_only = false,
                     arguments = {{ {descriptor} }},
                     handler = function() end,
@@ -3323,7 +3323,7 @@ fn command_completion_static_dynamic_and_lifecycle_hooks() {
     host.load_source(
         "completion_plugin",
         r#"
-        maki.api.register_command({
+        makima.api.register_command({
             name = "/deploy",
             tui_only = false,
             arguments = {
@@ -3335,16 +3335,16 @@ fn command_completion_static_dynamic_and_lifecycle_hooks() {
                             return { { label = ctx.arg .. ":dynamic", insertion = "staging" } }
                         end,
                         on_highlight = function(ctx, item)
-                            maki.ui.flash("highlight:" .. ctx.session .. ":" .. ctx.generation .. ":" .. item.insertion)
+                            makima.ui.flash("highlight:" .. ctx.session .. ":" .. ctx.generation .. ":" .. item.insertion)
                         end,
-                        on_accept = function(_, item) maki.ui.flash("accept:" .. item.insertion) end,
-                        on_cancel = function(ctx) maki.ui.flash("cancel:" .. ctx.command) end,
+                        on_accept = function(_, item) makima.ui.flash("accept:" .. item.insertion) end,
+                        on_cancel = function(ctx) makima.ui.flash("cancel:" .. ctx.command) end,
                     },
                 },
             },
             handler = function() end,
         })
-        maki.api.register_command({
+        makima.api.register_command({
             name = "/static",
             tui_only = false,
             arguments = {
@@ -3443,12 +3443,12 @@ fn dropping_command_completion_session_runs_lua_cancel_hook() {
     host.load_source(
         "completion_drop_plugin",
         r#"
-        maki.api.register_command({
+        makima.api.register_command({
             name = "/deploy",
             tui_only = false,
             arguments = { { name = "value", type = "string", completion = {
                 get_items = function() return {{ label = "stage", insertion = "staging" }} end,
-                on_cancel = function(ctx) maki.ui.flash("cancelled:" .. ctx.command) end,
+                on_cancel = function(ctx) makima.ui.flash("cancelled:" .. ctx.command) end,
             } } },
             handler = function() end,
         })
@@ -3484,7 +3484,7 @@ fn reloaded_command_does_not_receive_old_completion_cancel() {
     host.load_source(
         "completion_reload_plugin",
         r#"
-        maki.api.register_command({
+        makima.api.register_command({
             name = "/deploy",
             tui_only = false,
             arguments = {{ name = "value", type = "string", completion = { items = {{ label = "stage", insertion = "staging" }} } }},
@@ -3512,12 +3512,12 @@ fn reloaded_command_does_not_receive_old_completion_cancel() {
     host.load_source(
         "completion_reload_plugin",
         r#"
-        maki.api.register_command({
+        makima.api.register_command({
             name = "/deploy",
             tui_only = false,
             arguments = {{ name = "value", type = "string", completion = {
                 items = {{ label = "stage", insertion = "staging" }},
-                on_cancel = function() maki.ui.flash("new-generation") end,
+                on_cancel = function() makima.ui.flash("new-generation") end,
             }}},
             handler = function() end,
         })
@@ -3535,7 +3535,7 @@ fn command_completion_timeout_returns_empty_and_keeps_host_live() {
     host.load_source(
         "slow_completion",
         r#"
-        maki.api.register_command({
+        makima.api.register_command({
             name = "/slow",
             tui_only = false,
             arguments = { { name = "value", type = "string", optional = true, completion = {
@@ -3543,7 +3543,7 @@ fn command_completion_timeout_returns_empty_and_keeps_host_live() {
                     while true do end
                 end,
             } } },
-            handler = function() maki.ui.flash("recovered") end,
+            handler = function() makima.ui.flash("recovered") end,
         })
         "#,
     )
@@ -3595,7 +3595,7 @@ fn omitted_arguments_publish_empty_typed_schema() {
     let host = PluginHost::new(fresh_registry()).unwrap();
     host.load_source(
         "empty_arguments",
-        r#"maki.api.register_command({ name = "/test", tui_only = false, handler = function() end })"#,
+        r#"makima.api.register_command({ name = "/test", tui_only = false, handler = function() end })"#,
     )
     .unwrap();
 
@@ -3611,7 +3611,7 @@ fn required_raw_arguments_reject_empty_dispatch() {
     let host = PluginHost::new(Arc::clone(&registry)).unwrap();
     host.load_source(
         "required_raw",
-        r#"maki.api.register_command({ name = "/required", tui_only = false, arguments = { raw = true, required = true }, handler = function() end })"#,
+        r#"makima.api.register_command({ name = "/required", tui_only = false, arguments = { raw = true, required = true }, handler = function() end })"#,
     )
     .unwrap();
     let commands = host.command_registry();
@@ -3646,12 +3646,12 @@ fn command_handler_receives_raw_args_without_typed_fields(args: &str, expected_f
     host.load_source(
         "p",
         r#"
-        maki.api.register_command({
+        makima.api.register_command({
             name = "/echo",
             tui_only = false,
             arguments = { raw = true },
             handler = function(opts)
-                maki.ui.flash(opts.args .. "|" .. tostring(opts.fargs) .. "|" .. tostring(opts.values))
+                makima.ui.flash(opts.args .. "|" .. tostring(opts.fargs) .. "|" .. tostring(opts.values))
             end,
         })
         "#,
@@ -3668,7 +3668,7 @@ fn command_handler_receives_raw_args_without_typed_fields(args: &str, expected_f
 }
 
 const COPY_COMMAND_PLUGIN: &str = r#"
-    maki.api.register_command({
+    makima.api.register_command({
         name = "/copy",
         tui_only = false,
         arguments = {
@@ -3681,7 +3681,7 @@ const COPY_COMMAND_PLUGIN: &str = r#"
             if type(policy) == "table" then
                 policy = table.concat(policy, ",")
             end
-            maki.ui.flash(opts.values.source .. "|" .. opts.values.destination .. "|" .. (policy or ""))
+            makima.ui.flash(opts.values.source .. "|" .. opts.values.destination .. "|" .. (policy or ""))
         end,
     })
     "#;
@@ -3716,7 +3716,7 @@ fn typed_copy_command_dispatches_through_registry_and_decodes_values() {
 }
 
 const COPY_DESTINATION_PLUGIN: &str = r#"
-    maki.api.register_command({
+    makima.api.register_command({
         name = "/copy",
         tui_only = false,
         arguments = {
@@ -3730,7 +3730,7 @@ const COPY_DESTINATION_PLUGIN: &str = r#"
             { name = "policy", type = "enum", choices = { "overwrite", "skip" }, optional = true },
         },
         handler = function(opts)
-            maki.ui.flash("ran")
+            makima.ui.flash("ran")
         end,
     })
     "#;
@@ -3831,9 +3831,9 @@ fn run_command_goes_to_the_frontend_runner(reply: Result<(), String>, expected_f
         "p",
         &format!(
             r#"
-            maki.api.create_autocmd("{RUN_COMMAND_EVENT}", {{ callback = function(_, ctx)
-                local ok, err = maki.api.run_command(ctx, "  //cd ~/src  ")
-                maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
+            makima.api.create_autocmd("{RUN_COMMAND_EVENT}", {{ callback = function(_, ctx)
+                local ok, err = makima.api.run_command(ctx, "  //cd ~/src  ")
+                makima.ui.flash(tostring(ok) .. "|" .. tostring(err))
             end }})
             "#
         ),
@@ -3863,20 +3863,20 @@ fn nested_run_command_strips_extra_leading_slashes() {
     host.load_source(
         "p",
         r#"
-        maki.api.register_command({
+        makima.api.register_command({
             name = "/target",
             tui_only = false,
             arguments = { raw = true, required = true },
             handler = function(opts)
-                maki.ui.flash("target|" .. opts.args)
+                makima.ui.flash("target|" .. opts.args)
             end,
         })
-        maki.api.register_command({
+        makima.api.register_command({
             name = "/go",
             tui_only = false,
             handler = function(_, ctx)
-                local ok, err = maki.api.run_command(ctx, "  //target value  ")
-                maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
+                local ok, err = makima.api.run_command(ctx, "  //target value  ")
+                makima.ui.flash(tostring(ok) .. "|" .. tostring(err))
             end,
         })
         "#,
@@ -3912,13 +3912,13 @@ fn nested_run_command_reports_recursion_limit() {
     host.load_source(
         "p",
         r#"
-        maki.api.register_command({
+        makima.api.register_command({
             name = "/cycle",
             tui_only = false,
             handler = function(_, ctx)
-                local ok, err = maki.api.run_command(ctx, "/cycle")
+                local ok, err = makima.api.run_command(ctx, "/cycle")
                 if not ok then
-                    maki.ui.flash(err)
+                    makima.ui.flash(err)
                 end
             end,
         })
@@ -3948,12 +3948,12 @@ fn nested_run_command_rejects_unknown_command() {
     host.load_source(
         "p",
         r#"
-        maki.api.register_command({
+        makima.api.register_command({
             name = "/go",
             tui_only = false,
             handler = function(_, ctx)
-                local ok, err = maki.api.run_command(ctx, "/bogus")
-                maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
+                local ok, err = makima.api.run_command(ctx, "/bogus")
+                makima.ui.flash(tostring(ok) .. "|" .. tostring(err))
             end,
         })
         "#,
@@ -3974,51 +3974,51 @@ fn nested_run_command_rejects_unknown_command() {
     assert!(matches!(action, makima_lua::UiAction::Flash(msg) if msg == "nil|unknown command"));
 }
 #[test_case::test_case(
-    r#"maki.api.register_command({ name = "", handler = function() end })"#,
+    r#"makima.api.register_command({ name = "", handler = function() end })"#,
     "non-empty" ; "empty_name"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_command({ name = "/test", tui_only = false, description = "no handler" })"#,
+    r#"makima.api.register_command({ name = "/test", tui_only = false, description = "no handler" })"#,
     "handler" ; "missing_handler"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_command({ name = "/test", tui_only = false, nargs = -1, handler = function() end })"#,
+    r#"makima.api.register_command({ name = "/test", tui_only = false, nargs = -1, handler = function() end })"#,
     "unsupported field 'nargs'" ; "negative_nargs"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_command({ name = "/test", tui_only = false, nargs = 2, handler = function() end })"#,
+    r#"makima.api.register_command({ name = "/test", tui_only = false, nargs = 2, handler = function() end })"#,
     "unsupported field 'nargs'" ; "nargs_two"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_command({ name = "/test", tui_only = false, nargs = "!", handler = function() end })"#,
+    r#"makima.api.register_command({ name = "/test", tui_only = false, nargs = "!", handler = function() end })"#,
     "unsupported field 'nargs'" ; "unknown_string_nargs"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_command({ name = "/test", handler = function() end })"#,
+    r#"makima.api.register_command({ name = "/test", handler = function() end })"#,
     "tui_only" ; "missing_tui_only"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_command({ name = "/test", tui_only = "yes", handler = function() end })"#,
+    r#"makima.api.register_command({ name = "/test", tui_only = "yes", handler = function() end })"#,
     "tui_only" ; "invalid_tui_only"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_command({ name = "/test", argument_hint = true, handler = function() end })"#,
+    r#"makima.api.register_command({ name = "/test", argument_hint = true, handler = function() end })"#,
     "argument_hint" ; "invalid_argument_hint"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_command({ name = "/test", tui_only = false, arguments = { [2] = { name = "value", type = "string" } }, handler = function() end })"#,
+    r#"makima.api.register_command({ name = "/test", tui_only = false, arguments = { [2] = { name = "value", type = "string" } }, handler = function() end })"#,
     "array of argument tables" ; "sparse_arguments"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_command({ name = "/test", tui_only = false, arguments = { { name = "mode", type = "enum", choices = { [1] = "fast", extra = "safe" } } }, handler = function() end })"#,
+    r#"makima.api.register_command({ name = "/test", tui_only = false, arguments = { { name = "mode", type = "enum", choices = { [1] = "fast", extra = "safe" } } }, handler = function() end })"#,
     "array of strings" ; "keyed_enum_choices"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_command({ name = "/test", tui_only = false, arguments = { { name = "value", type = "string" } }, argument_completion = { [2] = {} }, handler = function() end })"#,
+    r#"makima.api.register_command({ name = "/test", tui_only = false, arguments = { { name = "value", type = "string" } }, argument_completion = { [2] = {} }, handler = function() end })"#,
     "unsupported field 'argument_completion'" ; "sparse_argument_completion"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_command({ name = "/test", tui_only = false, arguments = { { name = "value", type = "string", completion = { items = {} } } }, argument_completion = { {} }, handler = function() end })"#,
+    r#"makima.api.register_command({ name = "/test", tui_only = false, arguments = { { name = "value", type = "string", completion = { items = {} } } }, argument_completion = { {} }, handler = function() end })"#,
     "unsupported field 'argument_completion'" ; "completion_sources_conflict"
 )]
 fn register_command_validation_rejects(src: &str, expected_err: &str) {
@@ -4038,12 +4038,12 @@ fn failed_command_reregistration_preserves_previous_generation() {
     host.load_source(
         "stable_cmd",
         r#"
-        maki.api.register_command({
+        makima.api.register_command({
             name = "/stable",
             tui_only = false,
-            handler = function() maki.ui.flash("stable") end,
+            handler = function() makima.ui.flash("stable") end,
         })
-        local ok = pcall(maki.api.register_command, {
+        local ok = pcall(makima.api.register_command, {
             name = "/stable",
             tui_only = false,
             arguments = {
@@ -4052,7 +4052,7 @@ fn failed_command_reregistration_preserves_previous_generation() {
                     on_accept = true,
                 } },
             },
-            handler = function() maki.ui.flash("replacement") end,
+            handler = function() makima.ui.flash("replacement") end,
         })
         assert(not ok)
         "#,
@@ -4079,13 +4079,13 @@ fn reload_replaces_commands() {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source(
         "reload_cmd",
-        r#"maki.api.register_command({ name = "/v1", tui_only = false, handler = function() end })"#,
+        r#"makima.api.register_command({ name = "/v1", tui_only = false, handler = function() end })"#,
     )
     .unwrap();
 
     host.load_source(
         "reload_cmd",
-        r#"maki.api.register_command({ name = "/v2", tui_only = false, handler = function() end })"#,
+        r#"makima.api.register_command({ name = "/v2", tui_only = false, handler = function() end })"#,
     )
     .unwrap();
     let snapshot = command_snapshot(&host);
@@ -4099,7 +4099,7 @@ fn unload_clears_commands() {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source(
         "cmd_only",
-        r#"maki.api.register_command({ name = "/bye", tui_only = false, handler = function() end })"#,
+        r#"makima.api.register_command({ name = "/bye", tui_only = false, handler = function() end })"#,
     )
     .unwrap();
     assert_eq!(command_snapshot(&host).commands().len(), 1);
@@ -4129,13 +4129,13 @@ fn job_callback_finishes_after_handler_returns_nil() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "job_after_return",
             description = "on_exit finishes after handler returns nil",
             schema = {MINIMAL_SCHEMA},
             audiences = {{ "main" }},
             handler = function(input, ctx)
-                maki.fn.jobstart("true", {{
+                makima.fn.jobstart("true", {{
                     on_exit = function(_, code)
                         ctx:finish("exit=" .. tostring(code))
                     end,
@@ -4154,14 +4154,14 @@ fn ctx_set_deadline_times_out() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "deadline_test",
             description = "uses ctx:set_deadline",
             schema = {MINIMAL_SCHEMA},
             audiences = {{ "main" }},
             handler = function(input, ctx)
                 ctx:set_deadline(2)
-                maki.fn.jobstart("sleep 30", {{
+                makima.fn.jobstart("sleep 30", {{
                     on_exit = function(_, _) ctx:finish("should-not-reach") end,
                 }})
                 return nil
@@ -4178,7 +4178,7 @@ fn ctx_set_deadline_twice_errors() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "deadline_twice",
             description = "calls set_deadline twice",
             schema = {MINIMAL_SCHEMA},
@@ -4213,17 +4213,17 @@ fn poll_until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
 
 const PARKED_DEADLINE_REPLY: &str = "partial: timeout";
 const PARKED_DEADLINE_PLUGIN: &str = r#"
-maki.api.register_tool({
+makima.api.register_tool({
     name = "parked_deadline",
     description = "parks past its deadline, finishing from its cancel hook",
     schema = { type = "object", properties = {}, additionalProperties = false },
     audiences = { "main" },
     handler = function(input, ctx)
         ctx:set_deadline(1)
-        maki.async.on_cancel(function(reason)
+        makima.async.on_cancel(function(reason)
             ctx:finish({ llm_output = "partial: " .. reason, is_error = true })
         end)
-        maki.fn.jobwait(maki.fn.jobstart("sleep 30"))
+        makima.fn.jobwait(makima.fn.jobstart("sleep 30"))
         return "unreachable"
     end,
 })
@@ -4519,7 +4519,7 @@ fn exec_tool_with_perms(
 
 fn perm_tool_src(name: &str, handler_body: &str) -> String {
     format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "{name}",
             description = "d",
             schema = {{ type = "object", properties = {{}}, additionalProperties = false }},
@@ -4532,21 +4532,21 @@ fn perm_tool_src(name: &str, handler_body: &str) -> String {
 
 #[test_case::test_case(
     "read_deny",
-    r#"local ok, err = pcall(function() maki.fs.read("/etc/hostname") end)
+    r#"local ok, err = pcall(function() makima.fs.read("/etc/hostname") end)
                 return tostring(err)"#,
     "fs_read"
     ; "fs_read_denied"
 )]
 #[test_case::test_case(
     "write_deny",
-    r#"local ok, err = pcall(function() maki.fs.write("/tmp/test", "x") end)
+    r#"local ok, err = pcall(function() makima.fs.write("/tmp/test", "x") end)
                 return tostring(err)"#,
     "fs_write"
     ; "fs_write_denied"
 )]
 #[test_case::test_case(
     "run_deny",
-    r#"local ok, err = pcall(function() maki.fn.jobstart("echo hi") end)
+    r#"local ok, err = pcall(function() makima.fn.jobstart("echo hi") end)
                 return tostring(err)"#,
     "run"
     ; "run_denied"
@@ -4568,8 +4568,8 @@ fn denied_permission_blocks_api(tool_name: &str, handler_body: &str, expected_pe
 fn user_plugin_with_fs_read_can_read_but_not_write() {
     let src = perm_tool_src(
         "rw_test",
-        r#"local read_ok = pcall(function() maki.fs.read("/dev/null") end)
-                local write_ok = pcall(function() maki.fs.write("/tmp/test", "x") end)
+        r#"local read_ok = pcall(function() makima.fs.read("/dev/null") end)
+                local write_ok = pcall(function() makima.fs.write("/tmp/test", "x") end)
                 return "read=" .. tostring(read_ok) .. ",write=" .. tostring(write_ok)"#,
     );
     let mut perms = makima_lua::PluginPermissions::denied();
@@ -4583,8 +4583,8 @@ fn user_plugin_with_fs_read_can_read_but_not_write() {
 fn builtin_plugin_has_all_permissions() {
     let src = perm_tool_src(
         "trusted_test",
-        r#"local cwd_ok = pcall(function() maki.uv.cwd() end)
-                local env_ok = pcall(function() maki.env.state_dir() end)
+        r#"local cwd_ok = pcall(function() makima.uv.cwd() end)
+                local env_ok = pcall(function() makima.env.state_dir() end)
                 return "cwd=" .. tostring(cwd_ok) .. ",env=" .. tostring(env_ok)"#,
     );
     let result = exec_tool_with_perms(
@@ -4602,10 +4602,10 @@ fn builtin_plugin_has_all_permissions() {
 fn env_permission_guards_uv_and_env() {
     let src = perm_tool_src(
         "env_guard_test",
-        r#"local cwd_ok = pcall(function() maki.uv.cwd() end)
-                local home_ok = pcall(function() maki.uv.os_homedir() end)
-                local env_ok = pcall(function() maki.env.state_dir() end)
-                local exec_ok = pcall(function() maki.fn.executable("ls") end)
+        r#"local cwd_ok = pcall(function() makima.uv.cwd() end)
+                local home_ok = pcall(function() makima.uv.os_homedir() end)
+                local env_ok = pcall(function() makima.env.state_dir() end)
+                local exec_ok = pcall(function() makima.fn.executable("ls") end)
                 return "cwd=" .. tostring(cwd_ok) .. ",home=" .. tostring(home_ok) .. ",env=" .. tostring(env_ok) .. ",exec=" .. tostring(exec_ok)"#,
     );
     let result = exec_tool_with_perms(
@@ -4634,7 +4634,7 @@ fn mutable_path_invalid_rejected(schema: &str, scope_field: &str) {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "bad_mpath",
             description = "test",
             schema = {schema},
@@ -4660,7 +4660,7 @@ fn mutable_path_returns_path_from_input() {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "mp_read",
             description = "test",
             schema = {PATH_FIELD_SCHEMA},
@@ -4684,7 +4684,7 @@ fn registration_rejects_fs_write_without_mutable_path() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
-    let src = r#"maki.api.register_tool({
+    let src = r#"makima.api.register_tool({
         name = "bad_write_tool",
         description = "test write tool without mutable_path",
         schema = {
@@ -4709,9 +4709,9 @@ fn registration_rejects_fs_write_without_mutable_path() {
 fn pure_functions_not_guarded() {
     let src = perm_tool_src(
         "pure_test",
-        r#"local dirname_ok = pcall(function() maki.fs.dirname("/foo/bar") end)
-                local basename_ok = pcall(function() maki.fs.basename("/foo/bar") end)
-                local json_ok = pcall(function() maki.json.encode({a=1}) end)
+        r#"local dirname_ok = pcall(function() makima.fs.dirname("/foo/bar") end)
+                local basename_ok = pcall(function() makima.fs.basename("/foo/bar") end)
+                local json_ok = pcall(function() makima.json.encode({a=1}) end)
                 return "dirname=" .. tostring(dirname_ok) .. ",basename=" .. tostring(basename_ok) .. ",json=" .. tostring(json_ok)"#,
     );
     let result = exec_tool_with_perms(
@@ -4796,31 +4796,31 @@ fn start_hook_fixture() -> (Arc<ToolRegistry>, PluginHost) {
     let src = format!(
         r#"
 local function preview(input, ctx)
-    local buf = maki.ui.buf()
+    local buf = makima.ui.buf()
     buf:set_lines({{ input.code }})
     ctx:live_buf(buf)
 end
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "st_tool",
     description = "test",
     schema = {CODE_SCHEMA},
     start = preview,
     handler = function(input, ctx) return "handled" end,
 }})
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "st_boom",
     description = "test",
     schema = {CODE_SCHEMA},
     start = function(input, ctx) error("boom") end,
     handler = function(input, ctx) return "handled" end,
 }})
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "st_plain",
     description = "test",
     schema = {CODE_SCHEMA},
     handler = function(input, ctx) return "handled" end,
 }})
-maki.api.register_tool({{
+makima.api.register_tool({{
     name = "st_probe",
     description = "test",
     schema = {CODE_SCHEMA},
@@ -4829,7 +4829,7 @@ maki.api.register_tool({{
         local function pair_err(v, e)
             return v == nil and type(e) == "string"
         end
-        parts[1] = pair_err(maki.agent.call_tool(ctx, "st_plain", {{ code = "x" }})) and "call_tool_err"
+        parts[1] = pair_err(makima.agent.call_tool(ctx, "st_plain", {{ code = "x" }})) and "call_tool_err"
             or "call_tool_ok"
         parts[2] = pair_err(ctx:finish("x")) and "finish_err" or "finish_ok"
         parts[3] = pair_err(ctx:set_deadline(5)) and "deadline_err" or "deadline_ok"
@@ -4838,7 +4838,7 @@ maki.api.register_tool({{
         parts[6] = type(ctx:workflow()) == "boolean" and "workflow_ok" or "workflow_bad"
         parts[7] = type(ctx:audience()) == "string" and "audience_ok" or "audience_bad"
         parts[8] = type(ctx:tool_output_lines()) == "table" and "tol_ok" or "tol_bad"
-        local buf = maki.ui.buf()
+        local buf = makima.ui.buf()
         buf:set_lines({{ table.concat(parts, " ") }})
         ctx:live_buf(buf)
     end,
@@ -4867,7 +4867,7 @@ fn start_annotation_timeout_happy_path() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "sa_to",
             description = "test",
             schema = {TIMEOUT_SCHEMA},
@@ -4921,7 +4921,7 @@ fn start_annotation_count_happy_path() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "sa_ct",
             description = "test",
             schema = {ARRAY_SCHEMA},
@@ -4943,7 +4943,7 @@ fn registration_with_schema_rejects(fields: &str, schema: &str, expected_err: &s
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             {fields},
             schema = {schema},
             handler = function(input, ctx) return "" end
@@ -4961,14 +4961,14 @@ fn interpreter_on_output_streams_lines() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "interp_stream",
             description = "streams interpreter output",
             schema = {MINIMAL_SCHEMA},
             audiences = {{ "main" }},
             handler = function(input, ctx)
                 local lines = {{}}
-                local result, err = maki.interpreter.run("print('a')\nprint('b')", {{
+                local result, err = makima.interpreter.run("print('a')\nprint('b')", {{
                     timeout = 10,
                     max_memory_mb = 50,
                     on_output = function(line)
@@ -4987,14 +4987,14 @@ fn interpreter_on_output_streams_lines() {
 
 fn interp_tool_plugin(name: &str, python: &str, tools_lua: &str) -> String {
     format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "{name}",
             description = "test",
             schema = {MINIMAL_SCHEMA},
             audiences = {{ "main" }},
             handler = function(input, ctx)
                 local lines = {{}}
-                local result, err = maki.interpreter.run("{python}", {{
+                local result, err = makima.interpreter.run("{python}", {{
                     timeout = 10,
                     max_memory_mb = 50,
                     on_output = function(line) table.insert(lines, line) end,
@@ -5055,7 +5055,7 @@ const NESTED_DEPTH_BOTTOM: &str = "bottom";
 const NESTED_DEPTH_WEDGED: &str =
     "nested call chain never replied: the in-flight gate charged a slot per level";
 const NESTED_DEPTH_PLUGIN: &str = r#"
-maki.api.register_tool({
+makima.api.register_tool({
     name = "nested_depth",
     description = "dispatches itself one level deeper",
     schema = {
@@ -5066,7 +5066,7 @@ maki.api.register_tool({
     audiences = { "main" },
     handler = function(input, ctx)
         if input.depth == 0 then return "bottom" end
-        local out, err = maki.agent.call_tool(ctx, "nested_depth", { depth = input.depth - 1 })
+        local out, err = makima.agent.call_tool(ctx, "nested_depth", { depth = input.depth - 1 })
         if err then return { llm_output = err, is_error = true } end
         return out
     end,
@@ -5107,15 +5107,15 @@ fn call_tool_resolves_lua_tool_and_reports_unknown() {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source("echo_plugin", ECHO_PLUGIN).unwrap();
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "call_tool_probe",
             description = "test",
             schema = {MINIMAL_SCHEMA},
             audiences = {{ "main" }},
             handler = function(input, ctx)
-                local out, err = maki.agent.call_tool(ctx, "echo_", {{ msg = "hello" }})
+                local out, err = makima.agent.call_tool(ctx, "echo_", {{ msg = "hello" }})
                 if err ~= nil then return "unexpected err: " .. err end
-                local out2, err2 = maki.agent.call_tool(ctx, "no_such_tool_xyz", {{}})
+                local out2, err2 = makima.agent.call_tool(ctx, "no_such_tool_xyz", {{}})
                 if out2 ~= nil then return "unexpected output: " .. out2 end
                 if err2 == nil then return "expected err for unknown tool" end
                 return out
@@ -5207,7 +5207,7 @@ fn question_tool_fails_gracefully_without_a_host() {
 
 fn load_img_tool(host: &PluginHost) {
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "img_probe",
             description = "test",
             schema = {MINIMAL_SCHEMA},
@@ -5245,13 +5245,13 @@ fn call_tool_flattens_image_output_with_not_visible_note() {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     load_img_tool(&host);
     let src = format!(
-        r#"maki.api.register_tool({{
+        r#"makima.api.register_tool({{
             name = "img_caller",
             description = "test",
             schema = {MINIMAL_SCHEMA},
             audiences = {{ "main" }},
             handler = function(input, ctx)
-                local out, err = maki.agent.call_tool(ctx, "img_probe", {{}})
+                local out, err = makima.agent.call_tool(ctx, "img_probe", {{}})
                 return err or out
             end
         }})"#
@@ -5457,15 +5457,15 @@ fn async_run_from_parked_command_handler_runs_promptly() {
     host.load_source(
         "p",
         r#"
-        maki.api.register_command({
+        makima.api.register_command({
             name = "/park",
             description = "parks forever",
             tui_only = false,
             handler = function()
-                maki.async.run(function()
-                    maki.ui.flash("task-ran")
+                makima.async.run(function()
+                    makima.ui.flash("task-ran")
                 end)
-                maki.async.await(1, function(_cb) end)
+                makima.async.await(1, function(_cb) end)
             end,
         })
         "#,
@@ -5488,15 +5488,15 @@ fn job_callbacks_fire_while_command_handler_parked() {
     host.load_source(
         "p",
         r#"
-        maki.api.register_command({
+        makima.api.register_command({
             name = "/stream",
             description = "streams job output while parked",
             tui_only = false,
             handler = function()
-                maki.fn.jobstart("echo hi", {
-                    on_stdout = function(_, line) maki.ui.flash("job:" .. line) end,
+                makima.fn.jobstart("echo hi", {
+                    on_stdout = function(_, line) makima.ui.flash("job:" .. line) end,
                 })
-                maki.async.await(1, function(_cb) end)
+                makima.async.await(1, function(_cb) end)
             end,
         })
         "#,
@@ -5524,13 +5524,13 @@ fn host_list_picker_roundtrip_with_age() {
     host.load_source(
         "p",
         r#"
-        maki.api.register_command({
+        makima.api.register_command({
             name = "/pick",
             description = "host list picker roundtrip",
             tui_only = false,
             handler = function()
-                local result = maki.ui.open_list_picker(
-                    { "alpha", { label = "beta", detail = "b-d", section = "s", age = maki.time.at(1700000000) } },
+                local result = makima.ui.open_list_picker(
+                    { "alpha", { label = "beta", detail = "b-d", section = "s", age = makima.time.at(1700000000) } },
                     {
                         title = "Pick",
                         cursor = 2,
@@ -5538,12 +5538,12 @@ fn host_list_picker_roundtrip_with_age() {
                         timeout_ms = 5000,
                         footer = { { "Enter", "open" }, { "Ctrl+O", "edit" } },
                         on_change = function(item, index)
-                            maki.ui.flash("change:" .. tostring(item.label or item) .. ":" .. index)
+                            makima.ui.flash("change:" .. tostring(item.label or item) .. ":" .. index)
                         end,
-                        on_timeout = function() maki.ui.flash("timeout") end,
+                        on_timeout = function() makima.ui.flash("timeout") end,
                     }
                 )
-                maki.ui.flash("result:" .. result.type .. ":" .. tostring(result.index))
+                makima.ui.flash("result:" .. result.type .. ":" .. tostring(result.index))
             end,
         })
         "#,
@@ -5641,17 +5641,17 @@ fn host_list_picker_ui_drop_drains_callbacks() {
     host.load_source(
         "p",
         r#"
-        maki.api.register_command({
+        makima.api.register_command({
             name = "/pick",
             description = "host list picker drop path",
             tui_only = false,
             handler = function()
-                local result = maki.ui.open_list_picker({ "alpha" }, {
+                local result = makima.ui.open_list_picker({ "alpha" }, {
                     on_change = function(item, index)
-                        maki.ui.flash("change:" .. index)
+                        makima.ui.flash("change:" .. index)
                     end,
                 })
-                maki.ui.flash("result:" .. result.type)
+                makima.ui.flash("result:" .. result.type)
             end,
         })
         "#,
@@ -5963,7 +5963,7 @@ fn test_splash_slot_override() {
         .load_source(
             "matrix",
             r##"
-maki.api.set_slot("splash.render", function(prev, w, h, t, fade)
+makima.api.set_slot("splash.render", function(prev, w, h, t, fade)
   local rows = {}
   for i = 1, h do
     rows[i] = { { glyphs = string.rep("x", w), style = "#00ff41" } }
@@ -6003,7 +6003,7 @@ fn test_splash_renderer_error_suppresses() {
         .load_source(
             "broken_splash",
             r#"
-maki.api.set_slot("splash.render", function(prev, w, h, t, fade)
+makima.api.set_slot("splash.render", function(prev, w, h, t, fade)
   return "not a table"
 end)
 "#,
@@ -6023,12 +6023,12 @@ fn test_version_api() {
     host.load_source(
         "vprobe",
         r#"
-maki.api.register_tool({
+makima.api.register_tool({
   name = "vprobe",
-  description = "probe maki.version",
+  description = "probe makima.version",
   schema = { type = "object", properties = {}, additionalProperties = false },
   handler = function()
-    local v = maki.version()
+    local v = makima.version()
     return string.format("%s|%s|%s", v.current, v.latest or "nil", tostring(v.update_available))
   end,
 })
@@ -6051,12 +6051,12 @@ fn test_color_dim_is_identity_without_theme_colors() {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let source = format!(
         r#"
-maki.api.register_tool({{
+makima.api.register_tool({{
   name = "dimprobe",
-  description = "probe maki.color.dim",
+  description = "probe makima.color.dim",
   schema = {{ type = "object", properties = {{}}, additionalProperties = false }},
   handler = function()
-    return require("maki.color").dim("{color}", {factor})
+    return require("makima.color").dim("{color}", {factor})
   end,
 }})
 "#,
@@ -6105,7 +6105,7 @@ fn session_picker_requested_autocmd_does_not_wedge_host() {
     let (_handle, guard) = makima_lua::test_support::spawn_host_for_tests(&["sessions"]);
     // Firing the event must return promptly instead of suspending the dispatch.
     let guard = host_roundtrip_bounded(guard, |host| {
-        host.load_source("fire", "maki.api.exec_autocmds('SessionPickerRequested')")
+        host.load_source("fire", "makima.api.exec_autocmds('SessionPickerRequested')")
     });
     // The host request loop must still serve work right after the fire.
     let _guard = host_roundtrip_bounded(guard, |host| {
@@ -6318,9 +6318,9 @@ fn sessions_keybind_initializes_and_closes(close_key: &str) {
 }
 
 const SESSION_MUTATION_PLUGIN: &str = r#"
-maki.api.register_tool({
+makima.api.register_tool({
     name = "mutate_session",
-    description = "calls one maki.session function",
+    description = "calls one makima.session function",
     schema = {
         type = "object",
         properties = { call = { type = "string" }, session = { type = "string" } },
@@ -6328,11 +6328,11 @@ maki.api.register_tool({
     },
     handler = function(input)
         local calls = {
-            set_title = function() return maki.session.set_title({ id = input.session, title = "t" }) end,
-            new = function() return maki.session.new() end,
-            focus = function() return maki.session.focus(input.session) end,
-            delete = function() return maki.session.delete(input.session) end,
-            read = function() return maki.session.read({}) end,
+            set_title = function() return makima.session.set_title({ id = input.session, title = "t" }) end,
+            new = function() return makima.session.new() end,
+            focus = function() return makima.session.focus(input.session) end,
+            delete = function() return makima.session.delete(input.session) end,
+            read = function() return makima.session.read({}) end,
         }
         local _, err = calls[input.call]()
         return tostring(err)
@@ -6802,7 +6802,7 @@ fn cancelled_output_hook_does_not_offload_raw_output() {
         CANCEL_OFFLOAD_TOOL,
         &format!(
             r#"
-        maki.api.register_tool({{
+        makima.api.register_tool({{
             name = "{CANCEL_OFFLOAD_TOOL}", description = "cancellation output probe",
             schema = {{ type = "object", properties = {{}} }},
             handler = function()
@@ -6891,7 +6891,7 @@ fn timed_out_bash_keeps_hooked_partial_output_offloaded() {
         "timeout_redactor",
         &format!(
             r#"
-            maki.api.set_slot("tool.bash.output", function(prev, out, ctx)
+            makima.api.set_slot("tool.bash.output", function(prev, out, ctx)
                 assert(out.text:find("{BASH_TIMEOUT_SENTINEL}", 1, true))
                 local sentinel = ("{BASH_TIMEOUT_SENTINEL}"):gsub("%-", "%%-")
                 out.text = out.text:gsub(sentinel, "{BASH_TIMEOUT_REDACTED}")
@@ -7189,13 +7189,13 @@ fn code_execution_cancel_deferred_output_offloads() {
 const DEFERRED_CALLBACK_BODY: &str = "first\nsecond\nthird\nfourth";
 const DEFERRED_CALLBACK_TRAILER: &str = "Exit code: 3";
 const DEFERRED_CALLBACK_PLUGIN: &str = r#"
-maki.api.register_tool({
+makima.api.register_tool({
     name = "deferred_exit", description = "finishes from a job callback",
     schema = { type = "object", properties = {
         body = { type = "string" }, is_error = { type = "boolean" }, trailer = { type = "string" },
     } },
     handler = function(input, ctx)
-        maki.fn.jobstart("true", {
+        makima.fn.jobstart("true", {
             on_exit = function()
                 ctx:finish({
                     llm_output = input.body, is_error = input.is_error,
@@ -7206,11 +7206,11 @@ maki.api.register_tool({
         return nil
     end,
 })
-maki.api.register_tool({
+makima.api.register_tool({
     name = "memoized_partial", description = "closes partial output once",
     schema = { type = "object", properties = { body = { type = "string" } } },
     handler = function(input)
-        local partial = require("maki.partial")
+        local partial = require("makima.partial")
         local paints, closes = 0, 0
         local view = {
             append = function() paints = paints + 1 end,
@@ -7292,7 +7292,7 @@ fn partial_cut_memoizes_raw_reply_and_paints_marker_once() {
 fn bash_large_output_offloads_into_in_memory_store() {
     let (reg, host) = builtins_host();
     let fs = Arc::new(InMemoryFs::new());
-    let store_dir = PathBuf::from("/maki-test-state/sessions/offload/s");
+    let store_dir = PathBuf::from("/makima-test-state/sessions/offload/s");
     let store = Arc::new(OffloadStore::new(Box::new(InMemoryOffloadBackend::new(
         Arc::clone(&fs),
         store_dir.clone(),

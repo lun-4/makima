@@ -148,13 +148,13 @@ handling, LLM output truncation, collapsible UI view. It is a bundled plugin,
 so it opens with `register_options`, which your own plugin skips:
 
 ```lua
-local ToolView = require("maki.tool_view")
-local shorten_path = require("maki.shorten_path")
-local output_limits = require("maki.output_limits")
+local ToolView = require("makima.tool_view")
+local shorten_path = require("makima.shorten_path")
+local output_limits = require("makima.output_limits")
 
 local NO_FILES_FOUND = "No files found"
 
-local opts = maki.api.register_options(output_limits.extend({
+local opts = makima.api.register_options(output_limits.extend({
   search_result_limit = { default = 100, min = 10, desc = "Max files returned per search." },
 }))
 
@@ -163,7 +163,7 @@ local function glob_view_opts(ctx)
   return { max_lines = (tol and tol.other) or 3, keep = "head" }
 end
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "glob",
   kind = "search",
   description = [[Find files by glob pattern.
@@ -181,7 +181,7 @@ maki.api.register_tool({
   },
 
   header = function(input)
-    local buf = maki.ui.buf()
+    local buf = makima.ui.buf()
     local spans = { { shorten_path(input.pattern or ""), "tool" } }
     if input.path then
       spans[#spans + 1] = { " in ", "dim" }
@@ -208,7 +208,7 @@ maki.api.register_tool({
       return { llm_output = "error: " .. tostring(path_err), is_error = true }
     end
 
-    local files, err = maki.fs.glob(pattern, {
+    local files, err = makima.fs.glob(pattern, {
       path = path,
       gitignore = true,
       sort = "mtime",
@@ -230,7 +230,7 @@ maki.api.register_tool({
     local text = table.concat(lines, "\n")
     local llm_output = text
 
-    local buf = maki.ui.buf()
+    local buf = makima.ui.buf()
     local view = ToolView.new(buf, glob_view_opts(ctx))
     for _, line in ipairs(lines) do
       view:append(line)

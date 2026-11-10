@@ -126,7 +126,7 @@ end)
 case("builtin_index_line_numbers_match_reference", function()
   local builtin = require("plugin_dev")
   local ref = require("plugin_dev_reference")
-  local lines = maki.split(ref.content, "\n")
+  local lines = makima.split(ref.content, "\n")
   local checked = 0
   for ln, sig in builtin.content:gmatch("\n%- L(%d+) `([^`]+)`") do
     local target = lines[tonumber(ln)]

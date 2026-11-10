@@ -1,6 +1,6 @@
 -- Gemini through Vertex AI, authenticated with Application Default
 -- Credentials: an `authorized_user` file from `gcloud auth
--- application-default login`, or the metadata server of the machine maki
+-- application-default login`, or the metadata server of the machine makima
 -- runs on. Service-account and other credential files are rejected.
 
 local compat = require("providers.openai_compat")
@@ -86,7 +86,7 @@ M.def = {
 }
 
 local function env(name)
-  return maki.uv.os_getenv(name)
+  return makima.uv.os_getenv(name)
 end
 
 local function nonempty(value)
@@ -95,7 +95,7 @@ end
 
 -- The credentials of an `authorized_user` ADC file, or nil plus an error.
 function M.parse_adc(content)
-  local file = maki.json.decode(content)
+  local file = makima.json.decode(content)
   if type(file) ~= "table" or type(file.type) ~= "string" then
     return nil, M.INVALID_ADC
   end
@@ -132,19 +132,19 @@ end
 function M.source()
   local path = env("GOOGLE_APPLICATION_CREDENTIALS")
   if path then
-    if not maki.fs.metadata(path) then
+    if not makima.fs.metadata(path) then
       return nil, http.config_error("GOOGLE_APPLICATION_CREDENTIALS does not exist: " .. path)
     end
   else
     path = default_adc_path()
-    if path and not maki.fs.metadata(path) then
+    if path and not makima.fs.metadata(path) then
       path = nil
     end
   end
   if not path then
     return { metadata = true }
   end
-  local content, err = maki.fs.read(path)
+  local content, err = makima.fs.read(path)
   if not content then
     return nil, string.format("read %s: %s", path, tostring(err))
   end
@@ -236,7 +236,7 @@ local function fetch_token(ctx, source)
   if type(body) ~= "table" or type(body.access_token) ~= "string" or type(body.expires_in) ~= "number" then
     return nil, M.INVALID_TOKEN
   end
-  return { value = body.access_token, expires_at = maki.time.now().secs + body.expires_in }
+  return { value = body.access_token, expires_at = makima.time.now().secs + body.expires_in }
 end
 
 local function prepare(_, info, config)
@@ -248,7 +248,7 @@ local function prepare(_, info, config)
 
   -- Sends with the cached token while it has a minute left, else a new one.
   local function send(ctx, url, body, force_refresh)
-    if force_refresh or not cached or cached.expires_at <= maki.time.now().secs + REFRESH_MARGIN_SECS then
+    if force_refresh or not cached or cached.expires_at <= makima.time.now().secs + REFRESH_MARGIN_SECS then
       local token, token_err = fetch_token(ctx, settings.source)
       if not token then
         return nil, token_err
@@ -274,7 +274,7 @@ local function prepare(_, info, config)
     -- A 401 before the stream starts retries once with a new token.
     stream = function(ctx, request, emit)
       local url = M.stream_url(settings, request.model.id)
-      local body = assert(maki.json.encode(M.build_request(request)))
+      local body = assert(makima.json.encode(M.build_request(request)))
       local response, send_err = send(ctx, url, body, false)
       if response and response.status == UNAUTHORIZED then
         response:close()

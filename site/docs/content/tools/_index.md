@@ -64,7 +64,7 @@ Replace an exact string match in a file.
 ### `multiedit` {#multiedit}
 
 Make multiple find-and-replace edits to a single file atomically.
-Prefer this over edit when making multiple changes to the same file.
+Prefer this over edit when makimang multiple changes to the same file.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

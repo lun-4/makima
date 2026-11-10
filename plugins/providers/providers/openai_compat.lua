@@ -62,7 +62,7 @@ end
 -- `<ID>_BASE_URL`, then `base_url` and the plan's from `providers.toml`,
 -- then the default.
 function M.base_url(def, config)
-  local override = maki.uv.os_getenv(M.base_url_env(def))
+  local override = makima.uv.os_getenv(M.base_url_env(def))
   if override and override ~= "" then
     return override
   end
@@ -255,7 +255,7 @@ function M.stream(def, client, model, ctx, request, emit)
     url = client.base .. CHAT_PATH,
     method = "POST",
     headers = client.headers(extra),
-    body = assert(maki.json.encode(body)),
+    body = assert(makima.json.encode(body)),
   })
   if not response then
     return nil, reclassify(def, err)

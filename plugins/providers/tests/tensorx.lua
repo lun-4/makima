@@ -1,6 +1,6 @@
 local tensorx = require("providers.tensorx")
 local compat = require("providers.openai_compat")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local function encode(knobs, kind, id)
   local body = {}
@@ -27,7 +27,7 @@ end)
 
 t.case("model_info_listing", function()
   local models = compat.parse_listing(
-    maki.json.decode([[{"data":[
+    makima.json.decode([[{"data":[
       {"model_name": "z-ai/glm-5.2", "model_info": {"mode": "chat", "max_tokens": 200000, "max_output_tokens": 128000,
        "input_cost_per_token": 1e-06, "output_cost_per_token": 3e-06, "cache_read_input_token_cost": 2e-07,
        "supports_vision": false, "supports_reasoning": true,

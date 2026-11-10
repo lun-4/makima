@@ -1,7 +1,7 @@
 local anthropic = require("providers.anthropic_provider")
 local aperture = require("providers.aperture")
 local http = require("providers.http")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local HOST = "https://aperture.example.invalid"
 local DONE = "data: [DONE]\n\n"
@@ -122,7 +122,7 @@ t.case("anthropic_route_keeps_bare_host_and_vendor_id", function()
   t.eq(req.url, HOST .. "/v1/messages")
   t.eq(req.headers["anthropic-version"], anthropic.API_VERSION)
   t.eq(req.headers["x-api-key"], nil)
-  t.eq(maki.json.decode(req.body).model, "anthropic/" .. ROUTED_MODEL)
+  t.eq(makima.json.decode(req.body).model, "anthropic/" .. ROUTED_MODEL)
 end)
 
 t.case("google_route_uses_v1beta_and_bare_id", function()
@@ -134,19 +134,19 @@ end)
 t.case("compat_routes_keep_vendor_ids_and_native_paths", function()
   local zai = sent("zai/glm-5.2")
   t.eq(zai.url, HOST .. "/chat/completions")
-  t.eq(maki.json.decode(zai.body).model, "zai/glm-5.2")
+  t.eq(makima.json.decode(zai.body).model, "zai/glm-5.2")
   local deepseek = sent("deepseek/deepseek-chat")
   t.eq(deepseek.url, HOST .. "/v1/chat/completions")
   local ollama = sent("ollama/glm-5.2")
   t.eq(ollama.url, HOST .. "/v1/chat/completions")
-  t.eq(maki.json.decode(ollama.body).model, "ollama/glm-5.2")
+  t.eq(makima.json.decode(ollama.body).model, "ollama/glm-5.2")
   t.eq(ollama.headers.Authorization, nil)
 end)
 
 t.case("generic_route_streams_chat_completions", function()
   local req = sent("ikora-openai/gemma4")
   t.eq(req.url, HOST .. "/v1/chat/completions")
-  local decoded = maki.json.decode(req.body)
+  local decoded = makima.json.decode(req.body)
   t.eq(decoded.model, "ikora-openai/gemma4")
   t.eq(decoded.max_tokens, 16384)
   t.eq(decoded.stream_options.include_usage, true)
@@ -213,7 +213,7 @@ t.case("discovery_prefixes_upstreams_and_prices_per_million", function()
       { id = "raw-model" },
     },
   }
-  local ctx = t.provider_ctx({ t.response({ assert(maki.json.encode(listing)) }) })
+  local ctx = t.provider_ctx({ t.response({ assert(makima.json.encode(listing)) }) })
   local config = overrides("ollama", { models = { ["qwen3.6"] = { context_window = 65536, supports_vision = true } } })
   config.headers = { ["X-Gateway"] = "gw" }
   local models

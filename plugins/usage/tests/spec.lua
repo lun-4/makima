@@ -1,5 +1,5 @@
 local h = require("usage_helpers")
-local th = require("maki.test_helpers")
+local th = require("makima.test_helpers")
 
 local case = th.case
 local eq = th.eq
@@ -78,9 +78,9 @@ case("status_gradient_has_exact_low_mid_high_colors", function()
 end)
 
 case("reset_text_routes_absolute_dates_by_style", function()
-  local original = maki.ui.format_time
+  local original = makima.ui.format_time
   local calls = {}
-  maki.ui.format_time = function(epoch_ms, style)
+  makima.ui.format_time = function(epoch_ms, style)
     calls[#calls + 1] = { epoch_ms, style }
     return style
   end
@@ -89,7 +89,7 @@ case("reset_text_routes_absolute_dates_by_style", function()
     local date = h.reset_text(8 * 24 * 60 * 60 * 1000, 0)
     return { weekday, date }
   end)
-  maki.ui.format_time = original
+  makima.ui.format_time = original
   if not ok then
     error(result)
   end
@@ -100,14 +100,14 @@ case("reset_text_routes_absolute_dates_by_style", function()
 end)
 
 case("reset_text_falls_back_to_raw_epoch_for_invalid_timestamp", function()
-  local original = maki.ui.format_time
-  maki.ui.format_time = function()
+  local original = makima.ui.format_time
+  makima.ui.format_time = function()
     error("timestamp out of range")
   end
   local ok, result = pcall(function()
     return h.reset_text(9223372036854775807, 0)
   end)
-  maki.ui.format_time = original
+  makima.ui.format_time = original
   if not ok then
     error(result)
   end

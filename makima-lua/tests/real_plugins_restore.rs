@@ -673,19 +673,19 @@ fn restore_header_fn_may_await_async_apis() {
     let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
     host.load_source(
         "hdr",
-        r#"maki.api.register_tool({
+        r#"makima.api.register_tool({
             name = "hdr_await",
             description = "t",
             schema = { type = "object", properties = {} },
             handler = function() return "ok" end,
             header = function(input)
-                local hl = maki.ui.highlight("echo marker", "bash") or { { { "echo marker" } } }
-                local buf = maki.ui.buf()
+                local hl = makima.ui.highlight("echo marker", "bash") or { { { "echo marker" } } }
+                local buf = makima.ui.buf()
                 buf:set_lines(hl)
                 return buf
             end,
             restore = function(input, output)
-                local buf = maki.ui.buf()
+                local buf = makima.ui.buf()
                 buf:line("body")
                 return buf
             end,

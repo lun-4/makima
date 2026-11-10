@@ -20,13 +20,13 @@ use common::{CannedProvider, canned_reply, ctx_with_provider, with_request_tools
 const TURN_TIMEOUT: Duration = Duration::from_secs(5);
 
 const PROBE_SRC: &str = r#"
-maki.api.register_command({
+makima.api.register_command({
   name = "/probe_thinking",
   tui_only = false,
   arguments = { raw = true, required = true },
   handler = function(opts, ctx)
-    local input = assert(maki.json.decode(opts.args))
-    local child, err = maki.agent.spawn(ctx, {
+    local input = assert(makima.json.decode(opts.args))
+    local child, err = makima.agent.spawn(ctx, {
       name = "probe",
       inherit_provider = true,
       model = { thinking = input.thinking },

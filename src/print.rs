@@ -1419,14 +1419,14 @@ mod tests {
             "print_models",
             &format!(
                 r#"
-                maki.api.register_command({{
+                makima.api.register_command({{
                     name = "{MODELS_COMMAND}", tui_only = false,
                     handler = function(_, ctx)
                         local found = false
                         for _, model in ipairs(assert(assert(ctx:agent()):available_models(ctx))) do
                             found = found or model == "{spec}"
                         end
-                        maki.ui.flash(tostring(found))
+                        makima.ui.flash(tostring(found))
                     end,
                 }})
             "#
@@ -1567,33 +1567,33 @@ mod tests {
             )
             .unwrap();
             host.load_source(PRINT_NESTED_TOOL, &format!(r#"
-                maki.api.register_tool({{
+                makima.api.register_tool({{
                     name = "{PRINT_NESTED_TOOL}", description = "Exercise nested print tasks",
                     schema = {{ type = "object", properties = {{ child = {{ type = "boolean" }} }} }},
                     audiences = {{ "main", "general_sub" }},
                     handler = function(input, ctx)
                         local agent = assert(ctx:agent())
                         local selection = assert(agent:config(ctx)).model
-                        local root_ref = assert(maki.agent.root(ctx))
+                        local root_ref = assert(makima.agent.root(ctx))
                         if input.child then
                             assert(selection.spec == "{PRINT_MODEL}" and selection.fast)
                         else
-                            local root = assert(maki.agent.get(ctx, root_ref))
+                            local root = assert(makima.agent.get(ctx, root_ref))
                             assert(root:id() == agent:id())
                         end
                         local prompt = input.child and "{GRANDCHILD_PROMPT}" or "{CHILD_PROMPT}"
-                        local spawned, err = maki.agent.call_tool(ctx, "task_spawn", {{
+                        local spawned, err = makima.agent.call_tool(ctx, "task_spawn", {{
                             description = prompt, prompt = prompt, subagent_type = "general",
                         }})
                         assert(not err, err)
-                        local task = maki.json.decode(spawned)
+                        local task = makima.json.decode(spawned)
                         if input.child then
                             local changed = assert(agent:set_model(ctx, {{ fast = false }}))
                             assert(not changed.fast)
                         end
-                        local joined, wait_err = maki.agent.call_tool(ctx, "task_wait", {{ task_id = task.task_id, turn_id = task.turn_id }})
+                        local joined, wait_err = makima.agent.call_tool(ctx, "task_wait", {{ task_id = task.task_id, turn_id = task.turn_id }})
                         assert(not wait_err, wait_err)
-                        local result = maki.json.decode(joined)
+                        local result = makima.json.decode(joined)
                         local expected = input.child and "{GRANDCHILD_RESPONSE}" or "{CHILD_RESPONSE}"
                         assert(result.result.text == expected, joined)
                         return result.result.text
@@ -1605,10 +1605,10 @@ mod tests {
             PRINT_RUNNER_AUTOCMD,
             &format!(
                 r#"
-                maki.api.create_autocmd("{PRINT_RUNNER_AUTOCMD}", {{
+                makima.api.create_autocmd("{PRINT_RUNNER_AUTOCMD}", {{
                     callback = function(_, ctx)
-                        local ok, err = maki.api.run_command(ctx, "/cd {cwd}")
-                        maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
+                        local ok, err = makima.api.run_command(ctx, "/cd {cwd}")
+                        makima.ui.flash(tostring(ok) .. "|" .. tostring(err))
                     end,
                 }})
             "#,
@@ -1620,11 +1620,11 @@ mod tests {
             MODE_AUTOCMD,
             &format!(
                 r#"
-                maki.api.create_autocmd("{MODE_AUTOCMD}", {{
+                makima.api.create_autocmd("{MODE_AUTOCMD}", {{
                     callback = function(ev, ctx)
                         local plan, plan_err = ev.agent:set_mode(ctx, "plan")
                         local build, build_err = ev.agent:set_mode(ctx, "build")
-                        maki.ui.flash(tostring(plan or plan_err) .. "|" .. tostring(build or build_err))
+                        makima.ui.flash(tostring(plan or plan_err) .. "|" .. tostring(build or build_err))
                     end,
                 }})
             "#
@@ -1634,17 +1634,17 @@ mod tests {
         host.load_source(
             "print_initialized_command",
             &format!(r#"
-                maki.api.register_command({{
+                makima.api.register_command({{
                     name = "{COMMAND}", tui_only = false,
                     handler = function(_, ctx)
                         local root = assert(ctx:agent())
-                        assert(root:id() == assert(maki.agent.root(ctx)):id())
+                        assert(root:id() == assert(makima.agent.root(ctx)):id())
                         local selection = assert(root:config(ctx)).model
                         assert(selection.spec == "{PRINT_MODEL}" and selection.fast)
                         local slow = assert(root:set_model(ctx, {{ fast = false }}))
                         assert(not slow.fast and not assert(root:config(ctx)).model.fast)
                         assert(assert(root:set_model(ctx, {{ fast = true }})).fast)
-                        local view, view_err = maki.fn.winsaveview()
+                        local view, view_err = makima.fn.winsaveview()
                         assert(view == nil and view_err == "{no_ui}", view_err)
                         assert(root:set_mode(ctx, "plan"))
                         assert(assert(root:config(ctx)).mode == "plan", assert(root:config(ctx)).mode)
@@ -1653,7 +1653,7 @@ mod tests {
                         assert(set == nil and set_err == "{typed_setter}", set_err)
                         assert(root:set_option(ctx, "workflow", "enabled"))
                         assert(assert(root:config(ctx)).options.workflow == "enabled")
-                        local child = assert(maki.agent.spawn(ctx, {{
+                        local child = assert(makima.agent.spawn(ctx, {{
                             inherit_provider = true, silent = true, tools = {{}},
                         }}))
                         local refused, refused_err = child:set_option(ctx, "yolo", "enabled")
@@ -1661,11 +1661,11 @@ mod tests {
                         assert(child:set_option(ctx, "workflow", "disabled"))
                         assert(assert(child:config(ctx)).options.workflow == "disabled")
                         assert(assert(root:config(ctx)).options.workflow == "enabled")
-                        local gate = maki.async.semaphore(1)
+                        local gate = makima.async.semaphore(1)
                         local held = gate:acquire()
                         local pinned, pinned_err
                         assert(child:on_turn_end(ctx, function(_, child_ctx)
-                            pinned, pinned_err = maki.api.run_command(child_ctx, "/workflow")
+                            pinned, pinned_err = makima.api.run_command(child_ctx, "/workflow")
                             held:release()
                         end))
                         assert(assert(assert(child:send(ctx, "{COMMAND_CHILD_PROMPT}", {{ when = "idle" }})):wait(ctx)).text == "{PRINT_RESPONSE}")
@@ -1674,7 +1674,7 @@ mod tests {
                         assert(assert(child:config(ctx)).options.workflow == "enabled")
                         assert(assert(root:config(ctx)).options.workflow == "enabled")
                         assert(child:close(ctx))
-                        maki.ui.flash("{COMMAND_FINISHED}")
+                        makima.ui.flash("{COMMAND_FINISHED}")
                     end,
                 }})
             "#,

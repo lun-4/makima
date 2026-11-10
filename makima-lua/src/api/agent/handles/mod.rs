@@ -742,7 +742,7 @@ mod tests {
             local child = assert(agent_api.spawn(ctx, {{
                 inherit_provider = true, tools = {{}}, name = "{CHILD_NAME}", show = {show},
             }}))
-            local id = child:_maki_session_id()
+            local id = child:_makima_session_id()
             assert(child:close(ctx))
             return id
         "#
@@ -804,7 +804,7 @@ mod tests {
                 inherit_provider = true, tools = {{}}, show = false,
             }}))
             assert(ui.post(ctx, "{POST_TEXT}", {{ level = "error", agent = child }}))
-            local id = child:_maki_session_id()
+            local id = child:_makima_session_id()
             assert(child:close(ctx))
             return id
         "#

@@ -673,23 +673,23 @@ impl Fixture {
                 r#"
             {plugin_source}
             if {audience_ceiling} then
-                maki.api.register_tool({{
+                makima.api.register_tool({{
                     name = "{tool}_sub", description = "subagent-only registry tool",
                     schema = {{ type = "object", properties = {{}} }}, audiences = {{ "general_sub" }},
                     handler = function() error("audience capability escalated") end,
                 }})
-                maki.api.register_tool({{
+                makima.api.register_tool({{
                     name = "{tool}_unpublished", description = "unadvertised registry tool",
                     schema = {{ type = "object", properties = {{}} }}, audiences = {{ "main", "general_sub" }},
                     handler = function() error("request capability escalated") end,
                 }})
             end
             if {nested_capture} then
-                maki.api.register_tool({{
+                makima.api.register_tool({{
                     name = "pr6_spawn_grandchild", description = "exercise inherited capture",
                     schema = {{ type = "object", properties = {{}} }}, audiences = {{ "main", "general_sub" }},
                     handler = function(_, child_ctx)
-                        local grandchild = assert(maki.agent.spawn(child_ctx, {{ inherit_provider = true, silent = true }}))
+                        local grandchild = assert(makima.agent.spawn(child_ctx, {{ inherit_provider = true, silent = true }}))
                         local first = assert(grandchild:send(child_ctx, "grandchild capture", {{ when = "idle" }}))
                         local result = assert(first:wait(child_ctx))
                         assert(#result.output == 1 and result.output[1].answer == 42 and result.captured.answer == 42)
@@ -706,19 +706,19 @@ impl Fixture {
                 }})
             end
             if {schema_inheritance} then
-                maki.api.register_tool({{
+                makima.api.register_tool({{
                     name = "pr5_spawn_schema_children", description = "spawn children from a schema-enabled parent",
                     schema = {{ type = "object", properties = {{}} }}, audiences = {{ "main", "general_sub" }},
                     handler = function(input, ctx) return pr5_schema_children_handler(input, ctx) end,
                 }})
             end
             if {authority_probes} then
-            maki.api.register_tool({{
+            makima.api.register_tool({{
                 name = "{tool}_probe", description = "probe executing authority",
                 schema = {{ type = "object", properties = {{}} }}, audiences = {{ "main", "general_sub" }},
                 handler = function(input, ctx) return pr5_child_authority_handler(input, ctx) end,
             }})
-            maki.api.register_tool({{
+            makima.api.register_tool({{
                 name = "{tool}_write", description = "nested write restriction probe",
                 schema = {{ type = "object", properties = {{ path = {{ type = "string" }} }} }},
                 audiences = {{ "main", "general_sub" }},
@@ -729,7 +729,7 @@ impl Fixture {
                 end,
             }})
             end
-            maki.api.register_tool({{
+            makima.api.register_tool({{
                 name = "{tool}", description = "exercise public agent handles",
                 schema = {{ type = "object", properties = {{}} }},
                 handler = function(_, ctx)
@@ -973,7 +973,7 @@ fn child_checkpoint_failure_fails_the_child_result() {
             },
             &format!(
                 r#"
-            local child = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
+            local child = assert(makima.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
             local result = assert(assert(child:send(ctx, "persist me", {{ when = "idle" }})):wait(ctx))
             assert(result.status == "failed", result.status)
             assert(result.error:find("{CHECKPOINT_ERROR}", 1, true), result.error)
@@ -1009,7 +1009,7 @@ fn turn_wait_timeout_keeps_the_ticket_recoverable(timeout: u64) {
             tool,
             &format!(
                 r#"
-            local child = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
+            local child = assert(makima.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
             assert(not pcall(child.send, child, ctx, "missing when", {{}}))
             local untouched = assert(child:status(ctx))
             assert(untouched.queued == 0 and untouched.active_turn == nil)
@@ -1018,7 +1018,7 @@ fn turn_wait_timeout_keeps_the_ticket_recoverable(timeout: u64) {
             assert(result == nil and err == {expected_err})
             assert(ticket:agent_id() == child:id())
             assert(ticket:result(ctx) == nil)
-            local checkpoint = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
+            local checkpoint = assert(makima.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
             assert(assert(assert(checkpoint:send(ctx, "timeout observed", {{ when = "idle" }})):wait(ctx)).text == "{SECOND_REPLY}")
             local recovered = assert(ticket:wait(ctx))
             assert(recovered.text == "{FIRST_REPLY}" and recovered.status == "completed")
@@ -1083,14 +1083,14 @@ fn trusted_model_catalog_filters_destination_policy_and_preserves_error_pair() {
         ));
         let handle = fixture._host.event_handle();
         fixture._host.load_source("pr7_catalog", &format!(r#"
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "/pr7_catalog_error", tui_only = false,
                 handler = function(_, ctx)
                     local models, err = assert(ctx:agent()):available_models(ctx)
                     assert(models == nil and err == "{MODEL_CATALOG_UNAVAILABLE}")
                 end,
             }})
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "/pr7_catalog_filtered", tui_only = false,
                 handler = function(_, ctx)
                     local root = assert(ctx:agent())
@@ -1168,7 +1168,7 @@ fn trusted_config_callback_survives_subscription_gc_and_revocation(shutdown: boo
             TurnOutcome::Completed { .. }
         ));
         fixture._host.load_source("pr7_gc_config", &format!(r#"
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "/pr7_gc_config", tui_only = false,
                 handler = function(_, ctx)
                     local root = assert(ctx:agent())
@@ -1186,28 +1186,28 @@ fn trusted_config_callback_survives_subscription_gc_and_revocation(shutdown: boo
                         assert(event.data.agent_id == root:id() and event.data.mode == "plan" and event.data.generation > 0)
                         for _, key in ipairs({{ "spec", "thinking", "fast" }}) do assert(event.data.selection[key] == selection[key]) end
                         assert(assert(root:config(callback_ctx)).mode == "plan")
-                        local child = assert(maki.agent.spawn(callback_ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
+                        local child = assert(makima.agent.spawn(callback_ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
                         assert(child:defer_close(callback_ctx))
                         assert(assert(child:send(callback_ctx, "callback delivered after GC", {{ when = "idle" }})):wait(callback_ctx))
                     end))
                     subscription = nil
                 end,
             }})
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "/pr7_gc_deliver", tui_only = false,
                 handler = function(_, ctx)
                     local root = assert(ctx:agent())
                     local selection = assert(root:config(ctx)).model
                     local listed_root
-                    for _, reference in ipairs(assert(maki.agent.list(ctx))) do
-                        if reference:id() == root:id() then listed_root = assert(maki.agent.get(ctx, reference)) end
+                    for _, reference in ipairs(assert(makima.agent.list(ctx))) do
+                        if reference:id() == root:id() then listed_root = assert(makima.agent.get(ctx, reference)) end
                     end
                     assert(listed_root:set_mode(ctx, "plan") == "plan")
                     assert(assert(root:config(ctx)).mode == "plan")
-                    local visible = assert(maki.agent.list(ctx))
+                    local visible = assert(makima.agent.list(ctx))
                     local found = false
                     for _, reference in ipairs(visible) do
-                        local agent = assert(maki.agent.get(ctx, reference))
+                        local agent = assert(makima.agent.get(ctx, reference))
                         if agent:id() == root:id() then
                             found = true
                             assert(assert(agent:config(ctx)).mode == "plan")
@@ -1263,11 +1263,11 @@ fn public_agent_tickets_retain_exact_results_across_queued_turns() {
             "pr5_ticket_roundtrip",
             &format!(
                 r#"
-            local child = assert(maki.agent.spawn(ctx, {{
+            local child = assert(makima.agent.spawn(ctx, {{
                 inherit_provider = true, system = "{SYSTEM}", model = {{ thinking = "off" }}, silent = true, tools = {{}},
             }}))
             local id = assert(child:id())
-            assert(assert(maki.agent.get(ctx, assert(child:ref()))):id() == id)
+            assert(assert(makima.agent.get(ctx, assert(child:ref()))):id() == id)
             local first = assert(child:send(ctx, "first prompt", {{ when = "idle" }}))
             local busy, busy_err = child:send(ctx, "must not run", {{ when = "idle" }})
             assert(busy == nil and busy_err == {busy_error:?}, busy_err)
@@ -1278,7 +1278,7 @@ fn public_agent_tickets_retain_exact_results_across_queued_turns() {
             assert(pending == nil and pending_err == nil)
             local invalid, invalid_err = first:wait(ctx, {{ timeout = 0 }})
             assert(invalid == nil and invalid_err == nil)
-            local checkpoint = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
+            local checkpoint = assert(makima.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
             assert(assert(assert(checkpoint:send(ctx, "checks complete", {{ when = "idle" }})):wait(ctx)).text == "checks complete")
             assert(checkpoint:close(ctx))
             assert(assert(first:wait(ctx)).text == "{FIRST_REPLY}")
@@ -1348,7 +1348,7 @@ fn public_agent_model_change_controls_next_request_without_losing_history() {
             "pr5_model_change",
             &format!(
                 r#"
-            local child = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
+            local child = assert(makima.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
             local first = assert(child:send(ctx, "before model change", {{ when = "idle" }}))
             assert(assert(first:wait(ctx)).text == "{FIRST_REPLY}")
             assert(child:set_model(ctx, "{UPDATED_MODEL}"))
@@ -1427,10 +1427,10 @@ fn public_child_mode_changes_provider_system_after_queued_turns(custom: Option<&
             .map(|system| format!("system = {system:?},"))
             .unwrap_or_default();
         fixture._host.load_source(OWNER, &format!(r#"
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "{COMMAND}", tui_only = false,
                 handler = function(_, ctx)
-                    local child = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}}, {system_option} }}))
+                    local child = assert(makima.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}}, {system_option} }}))
                     local first = assert(child:send(ctx, "old mode first", {{ when = "idle" }}))
                     local queued = assert(child:send(ctx, "old mode queued", {{ when = "queue" }}))
                     assert(child:set_mode(ctx, "{NEW_MODE}") == "{NEW_MODE}")
@@ -1507,21 +1507,21 @@ fn required_output_schema_rejects_excluded_mode_without_allocating_and_preserves
         );
         bounded(fixture.root_ticket.wait(), "schema root settlement").await;
         fixture._host.load_source(OWNER, &format!(r#"
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "{COMMAND}", tui_only = false,
                 handler = function(_, ctx)
                     local opts = {{ inherit_provider = true, silent = true, output_schema = {{ type = "object", properties = {{ answer = {{ type = "integer" }} }}, required = {{ "answer" }} }} }}
-                    local before = #assert(maki.agent.list(ctx))
-                    local rejected, policy_err = maki.agent.spawn(ctx, opts)
+                    local before = #assert(makima.agent.list(ctx))
+                    local rejected, policy_err = makima.agent.spawn(ctx, opts)
                     assert(rejected == nil and policy_err == {POLICY_ERROR:?}, policy_err)
-                    assert(#assert(maki.agent.list(ctx)) == before)
+                    assert(#assert(makima.agent.list(ctx)) == before)
                     local root = assert(ctx:agent())
                     assert(root:set_mode(ctx, "{ALLOWED_MODE}") == "{ALLOWED_MODE}")
-                    local child = assert(maki.agent.spawn(ctx, opts))
+                    local child = assert(makima.agent.spawn(ctx, opts))
                     local mode, err = child:set_mode(ctx, "{DENIED_MODE}")
                     assert(mode == nil and err == {POLICY_ERROR:?}, err)
                     assert(assert(child:config(ctx)).mode == "{ALLOWED_MODE}")
-                    local controlled = assert(maki.agent.get(ctx, assert(child:ref())))
+                    local controlled = assert(makima.agent.get(ctx, assert(child:ref())))
                     local changed, change_err = controlled:set_mode(ctx, "{DENIED_MODE}")
                     assert(changed == nil and change_err == {POLICY_ERROR:?}, change_err)
                     assert(assert(controlled:config(ctx)).mode == "{ALLOWED_MODE}")
@@ -1604,7 +1604,7 @@ fn executing_child_tool_cannot_control_ancestor_or_sibling(
                 r#"
             local parent = assert(ctx:agent())
             local parent_id = assert(parent:id())
-            local sibling = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
+            local sibling = assert(makima.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
             local sibling_ref = assert(sibling:ref())
             pr5_child_authority_handler = function(_, child_ctx)
                     local current = assert(child_ctx:agent())
@@ -1618,7 +1618,7 @@ fn executing_child_tool_cannot_control_ancestor_or_sibling(
                         assert(changed == nil and mode_err == {RESTRICTED_MODE_CHANGE:?}, mode_err)
                     end
                     if {write_restricted} then
-                        local written, write_err = maki.agent.call_tool(child_ctx, "{tool}_write", {{ path = "/test/forbidden.txt" }})
+                        local written, write_err = makima.agent.call_tool(child_ctx, "{tool}_write", {{ path = "/test/forbidden.txt" }})
                         assert(written == nil and write_err == {PLAN_WRITE_RESTRICTED:?}, write_err)
                         assert(not pr5_nested_write_entered)
                     end
@@ -1638,26 +1638,26 @@ fn executing_child_tool_cannot_control_ancestor_or_sibling(
                         assert(updated == nil and model_err == denied, model_err)
                     end
                     local visible = {{}}
-                    for _, reference in ipairs(assert(maki.agent.list(child_ctx))) do
+                    for _, reference in ipairs(assert(makima.agent.list(child_ctx))) do
                         visible[reference:id()] = reference
                     end
                     assert(visible[parent_id] ~= nil and visible[current:id()] ~= nil)
                     assert(visible[sibling:id()] == nil)
-                    assert(assert(maki.agent.get(child_ctx, visible[current:id()])):id() == current:id())
-                    local listed_parent, listed_err = maki.agent.get(child_ctx, visible[parent_id])
+                    assert(assert(makima.agent.get(child_ctx, visible[current:id()])):id() == current:id())
+                    local listed_parent, listed_err = makima.agent.get(child_ctx, visible[parent_id])
                     assert(listed_parent == nil and listed_err == not_descendant(parent), listed_err)
-                    local foreign, foreign_err = maki.agent.get(child_ctx, sibling_ref)
+                    local foreign, foreign_err = makima.agent.get(child_ctx, sibling_ref)
                     assert(foreign == nil and foreign_err == not_descendant(sibling), foreign_err)
-                    local root_ref = assert(maki.agent.root(child_ctx))
-                    local ancestor, ancestor_err = maki.agent.get(child_ctx, root_ref)
+                    local root_ref = assert(makima.agent.root(child_ctx))
+                    local ancestor, ancestor_err = makima.agent.get(child_ctx, root_ref)
                     assert(ancestor == nil and ancestor_err == not_descendant(parent), ancestor_err)
                     return "scope enforced"
                 end
-            local callable = assert(maki.agent.callable_tools(ctx))
+            local callable = assert(makima.agent.callable_tools(ctx))
             local found = false
             for _, entry in ipairs(callable) do if entry.name == "{probe}" then found = true end end
             assert(found, "parent callable probe missing before child preparation")
-            local child = assert(maki.agent.spawn(ctx, {{
+            local child = assert(makima.agent.spawn(ctx, {{
                 inherit_provider = true, silent = true,
                 tools = {{
                     {{ name = "{probe}", description = "check scope", input_schema = {{ type = "object", properties = {{}} }} }},
@@ -1732,18 +1732,18 @@ fn trusted_command_controls_real_root_and_rejects_foreign_task_context() {
         ])));
         fixture._host.load_source("pr5_trusted_command", &format!(r#"
             local retained
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "/pr5_capture", description = "retain an invocation-bound context", tui_only = false,
                 handler = function(_, ctx)
                     assert(ctx ~= nil)
                     local root = assert(ctx:agent())
-                    assert(root:id() == assert(maki.agent.root(ctx)):id())
-                    assert(root:id() == assert(maki.agent.get(ctx, assert(root:ref()))):id())
+                    assert(root:id() == assert(makima.agent.root(ctx)):id())
+                    assert(root:id() == assert(makima.agent.get(ctx, assert(root:ref()))):id())
                     assert(root:set_mode(ctx, "plan") == "plan")
                     retained = {{ ctx = ctx, root = root }}
                 end,
             }})
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "/pr5_verify", description = "reject expired authority and use fresh authority", tui_only = false,
                 handler = function(_, ctx)
                     local rejected, err = retained.root:status(retained.ctx)
@@ -1802,10 +1802,10 @@ fn trusted_command_handler_resolves_weaker_model_tier() {
             .load_source(
                 "resolve_model_tier_command",
                 r#"
-            maki.api.register_command({
+            makima.api.register_command({
                 name = "/resolve_model_tier", description = "resolve the weak tier", tui_only = false,
                 handler = function(_, ctx)
-                    local model, err = maki.agent.resolve_model(ctx, { tier = "weak" })
+                    local model, err = makima.agent.resolve_model(ctx, { tier = "weak" })
                     assert(model ~= nil, err)
                     assert(model.tier == "weak", "expected weak tier, got " .. model.tier)
                 end,
@@ -1856,7 +1856,7 @@ fn tool_spawn_preserves_executing_turn_configuration_after_committed_change() {
             local parent = assert(ctx:agent())
             assert(parent:set_model(ctx, {{ spec = "{FAST_MODEL}", thinking = "low", fast = true }}))
             assert(parent:set_mode(ctx, "plan") == "plan")
-            local child = assert(maki.agent.spawn(ctx, {{ silent = true, tools = {{}} }}))
+            local child = assert(makima.agent.spawn(ctx, {{ silent = true, tools = {{}} }}))
             assert(assert(assert(child:send(ctx, "turn snapshot", {{ when = "idle" }})):wait(ctx)).text == "{FIRST_REPLY}")
             assert(child:close(ctx))
         "#
@@ -1963,13 +1963,13 @@ fn trusted_spawn_inherits_configuration_committed_in_same_invocation() {
         );
         bounded(fixture.root_ticket.wait(), "root settlement").await;
         fixture._host.load_source("pr5_spawn_config", &format!(r#"
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "/pr5_spawn_config", tui_only = false,
                 handler = function(_, ctx)
                     local parent = assert(ctx:agent())
                     assert(parent:set_model(ctx, {{ spec = "{FAST_MODEL}", thinking = "low", fast = true }}))
                     assert(parent:set_mode(ctx, "plan") == "plan")
-                    local child = assert(maki.agent.spawn(ctx, {{ silent = true, tools = {{}} }}))
+                    local child = assert(makima.agent.spawn(ctx, {{ silent = true, tools = {{}} }}))
                     local selection = assert(child:config(ctx)).model
                     assert(selection.spec == "{FAST_MODEL}")
                     assert(selection.thinking == "low" and selection.fast == true)
@@ -2064,18 +2064,18 @@ fn trusted_context_controls_another_registered_graph_with_fresh_authority() {
         first._host.load_source("pr5_registered_graphs", r#"
             local other
             local other_ref
-            maki.api.register_command({
+            makima.api.register_command({
                 name = "/pr5_register_capture", description = "capture the second graph", tui_only = false,
                 handler = function(_, ctx)
                     other = assert(ctx:agent())
                     other_ref = assert(other:ref())
                 end,
             })
-            maki.api.register_command({
+            makima.api.register_command({
                 name = "/pr5_register_control", description = "control a registered graph from another target", tui_only = false,
                 handler = function(_, ctx)
                     local current = assert(ctx:agent())
-                    local resolved = assert(maki.agent.get(ctx, other_ref))
+                    local resolved = assert(makima.agent.get(ctx, other_ref))
                     assert(resolved:id() == other:id())
                     assert(resolved:id() ~= current:id())
                     assert(other:set_mode(ctx, "plan") == "plan")
@@ -2156,7 +2156,7 @@ fn tool_context_rejects_foreign_manager_handles_captured_by_trusted_command(rest
         owner._host.load_source("pr5_foreign_scope", &format!(r#"
             local foreign
             local foreign_ref
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "/pr5_foreign_capture", description = "capture a host-registered second runtime", tui_only = false,
                 handler = function(_, ctx)
                     foreign = assert(ctx:agent())
@@ -2164,11 +2164,11 @@ fn tool_context_rejects_foreign_manager_handles_captured_by_trusted_command(rest
                     assert(foreign:set_mode(ctx, "plan") == "plan")
                 end,
             }})
-            maki.api.register_tool({{
+            makima.api.register_tool({{
                 name = "pr5_reject_foreign", description = "reject handles from another manager",
                 schema = {{ type = "object", properties = {{}} }},
                 handler = function(_, ctx)
-                    local target, lookup_err = maki.agent.get(ctx, foreign_ref)
+                    local target, lookup_err = makima.agent.get(ctx, foreign_ref)
                     assert(target == nil and lookup_err == {FOREIGN_AGENT_REFERENCE:?}, lookup_err)
                     for _, operation in ipairs({{ "status", "cancel", "close" }}) do
                         local result, err = foreign[operation](foreign, ctx)
@@ -2327,11 +2327,11 @@ fn trusted_mode_changes_preserve_registered_target_model_policy() {
                 &format!(
                     r#"
             local target
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "/pr5_destination_capture", tui_only = false,
                 handler = function(_, ctx) target = assert(ctx:agent()) end,
             }})
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "/pr5_destination_attack", tui_only = false,
                 handler = function(_, ctx)
                     assert(assert(ctx:agent()):id() ~= target:id())
@@ -2416,18 +2416,18 @@ fn focus_reads_and_keybind_targets_ignore_later_focus_changes() {
                 &format!(
                     r#"
             local captured
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "/pr5_focus_capture", tui_only = false,
-                handler = function() captured = assert(maki.ui.focused_agent()) end,
+                handler = function() captured = assert(makima.ui.focused_agent()) end,
             }})
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "/pr5_focus_check", tui_only = false,
                 handler = function(_, ctx)
-                    assert(assert(maki.ui.focused_agent()):id() ~= captured:id())
-                    assert(assert(maki.agent.get(ctx, captured)):id() == captured:id())
+                    assert(assert(makima.ui.focused_agent()):id() ~= captured:id())
+                    assert(assert(makima.agent.get(ctx, captured)):id() == captured:id())
                 end,
             }})
-            maki.keymap.set("n", "{KEY}", function(_, ctx)
+            makima.keymap.set("n", "{KEY}", function(_, ctx)
                 assert(assert(ctx:agent()):set_model(ctx, {{ thinking = "low" }}))
             end)
         "#
@@ -2516,7 +2516,7 @@ fn tool_ctx_reads_the_admitted_model_after_the_agent_commits_a_change(
             local agent = assert(ctx:agent())
             local admitted = assert(ctx:model())
             assert(admitted.thinking == "off", tostring(admitted.thinking))
-            local sentinel = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
+            local sentinel = assert(makima.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
             local changed, err = agent:set_model(ctx, {{ spec = "{FAST_MODEL}", thinking = "high", fast = true }})
             assert(changed, err)
             if {keep_authority} then
@@ -2678,7 +2678,7 @@ fn turn_waits_and_focus_reads_refuse_without_a_valid_subject() {
             local own = assert(assert(ctx:agent()):latest_turn(ctx))
             local waited, wait_err = own:wait(ctx)
             assert(waited == nil and wait_err == {SELF_TURN_WAIT:?}, wait_err)
-            local focused, focus_err = maki.ui.focused_agent()
+            local focused, focus_err = makima.ui.focused_agent()
             assert(focused == nil and focus_err == {DELEGATED_FOCUS:?}, focus_err)
         "#
             ),
@@ -2701,10 +2701,10 @@ fn turn_waits_and_focus_reads_refuse_without_a_valid_subject() {
                 PLUGIN,
                 &format!(
                     r#"
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "/pr5_no_focus", tui_only = false,
                 handler = function()
-                    local focused, focus_err = maki.ui.focused_agent()
+                    local focused, focus_err = makima.ui.focused_agent()
                     assert(focused == nil and focus_err == {NO_FOCUSED_AGENT:?}, focus_err)
                 end,
             }})
@@ -2752,27 +2752,27 @@ fn trusted_ctx_keeps_authority_after_its_pinned_target_closes() {
                 &format!(
                     r#"
             local outcome = "keymap did not run"
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "/pr5_closed_pin_spawn", tui_only = false,
                 handler = function(_, ctx)
-                    assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
+                    assert(makima.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
                 end,
             }})
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "/pr5_closed_pin_check", tui_only = false,
                 handler = function() assert(outcome == "ok", outcome) end,
             }})
-            maki.keymap.set("n", "{KEY}", function(_, ctx)
+            makima.keymap.set("n", "{KEY}", function(_, ctx)
                 local ok, err = pcall(function()
                     local pinned = assert(ctx:agent())
                     assert(pinned:close(ctx))
                     local current, current_err = ctx:agent()
                     assert(current == nil and current_err ~= nil, "closed target stayed current")
-                    local spawned, spawn_err = maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }})
+                    local spawned, spawn_err = makima.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }})
                     assert(spawned == nil and spawn_err ~= nil, "spawned under a closed target")
-                    local root = assert(maki.agent.root(ctx))
+                    local root = assert(makima.agent.root(ctx))
                     local listed = false
-                    for _, reference in ipairs(assert(maki.agent.list(ctx))) do
+                    for _, reference in ipairs(assert(makima.agent.list(ctx))) do
                         listed = listed or reference:id() == root:id()
                     end
                     assert(listed, "root missing from list")
@@ -2900,29 +2900,29 @@ fn trusted_ticket_reads_survive_close_from_fresh_command_context() {
         ])));
         fixture._host.load_source("pr5_retained_ticket", r#"
             local child, first, second
-            maki.api.register_command({
+            makima.api.register_command({
                 name = "/pr5_retained_begin", tui_only = false,
                 handler = function(_, ctx)
-                    child = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
+                    child = assert(makima.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
                     first = assert(child:send(ctx, "terminal history", { when = "idle" }))
                     assert(assert(first:wait(ctx)).text == "terminal reply")
                     second = assert(child:send(ctx, "active history", { when = "idle" }))
                 end,
             })
-            maki.api.register_command({
+            makima.api.register_command({
                 name = "/pr5_retained_inspect", tui_only = false,
                 handler = function(_, ctx)
                     local transcript = assert(child:transcript(ctx, { last_messages = 100, max_bytes = 65536 }))
                     assert(#transcript.messages == 2)
                     assert(transcript.through_turn == first:id())
-                    local checkpoint = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
+                    local checkpoint = assert(makima.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
                     assert(assert(assert(checkpoint:send(ctx, "transcript inspected", { when = "idle" })):wait(ctx)).text == "inspected")
                     assert(checkpoint:close(ctx))
                     assert(assert(second:wait(ctx)).text == "active reply")
                     assert(child:close(ctx))
                 end,
             })
-            maki.api.register_command({
+            makima.api.register_command({
                 name = "/pr5_retained_verify", tui_only = false,
                 handler = function(_, ctx)
                     for _ = 1, 3 do
@@ -3016,8 +3016,8 @@ fn trusted_turn_callbacks_overlap_and_revocation_cancels_deferred_children() {
                     if not ok then callback_errors[#callback_errors + 1] = kind .. ": " .. tostring(err) end
                 end
             end
-            maki.api.register_command({ name = "/pr5_event_diagnostics", tui_only = false,
-                handler = function() error("callback states: " .. maki.json.encode(callback_states) .. "; errors: " .. table.concat(callback_errors, "\n")) end,
+            makima.api.register_command({ name = "/pr5_event_diagnostics", tui_only = false,
+                handler = function() error("callback states: " .. makima.json.encode(callback_states) .. "; errors: " .. table.concat(callback_errors, "\n")) end,
             })
             local observed
             local start_subscription
@@ -3025,15 +3025,15 @@ fn trusted_turn_callbacks_overlap_and_revocation_cancels_deferred_children() {
             local close_subscription
             local close_probe
             local function hold(ctx, message)
-                local child = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
+                local child = assert(makima.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
                 assert(child:defer_close(ctx))
                 assert(assert(child:send(ctx, message, { when = "idle" })):wait(ctx))
             end
-            maki.api.register_command({
+            makima.api.register_command({
                 name = "/pr5_event_begin", description = "subscribe and run an observed turn", tui_only = false,
                 handler = function(_, ctx)
-                    observed = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
-                    close_probe = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
+                    observed = assert(makima.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
+                    close_probe = assert(makima.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
                     start_subscription = assert(observed:on_turn_start(ctx, guard("start", function(event, callback_ctx)
                         assert(event.data.agent_id == observed:id())
                         assert(event.data.origin.kind == "plugin" and event.data.origin.plugin == "pr5_event_callbacks")
@@ -3054,7 +3054,7 @@ fn trusted_turn_callbacks_overlap_and_revocation_cancels_deferred_children() {
                     assert(assert(turn:wait(ctx)).text == "observed reply")
                 end,
             })
-            maki.api.register_command({
+            makima.api.register_command({
                 name = "/pr5_event_revoke", description = "cancel an active subscription and close the actor", tui_only = false,
                 handler = function(_, ctx)
                     assert(start_subscription:close())
@@ -3159,23 +3159,23 @@ fn delegated_tools_cannot_reach_trusted_entry_points() {
                     local effects = 0
                     function pr5_timer_escape()
                         effects = effects + 1
-                        assert(maki.api.run_command(nil, "/pr5_timer_effect"))
+                        assert(makima.api.run_command(nil, "/pr5_timer_effect"))
                     end
-                    maki.api.register_command({ name = "/pr5_timer_effect", tui_only = false,
+                    makima.api.register_command({ name = "/pr5_timer_effect", tui_only = false,
                         handler = function() effects = effects + 1 end,
                     })
-                    maki.api.create_autocmd("User", { pattern = "pr5_escape", callback = function(_, callback_ctx)
-                        local ran, err = maki.api.run_command(callback_ctx, "/pr5_timer_effect")
+                    makima.api.create_autocmd("User", { pattern = "pr5_escape", callback = function(_, callback_ctx)
+                        local ran, err = makima.api.run_command(callback_ctx, "/pr5_timer_effect")
                         pr5_autocmd_escape = { ran = ran, err = err }
                     end })
-                    maki.api.register_command({ name = "/pr5_timer_check", tui_only = false,
+                    makima.api.register_command({ name = "/pr5_timer_check", tui_only = false,
                         handler = function()
                             assert(effects == 0, "scheduled callback or command escaped")
                             assert(pr5_autocmd_escape.ran == nil and pr5_autocmd_escape.err == pr5_command_error,
                                 tostring(pr5_autocmd_escape.err))
-                            local id, err = maki.timer.set(3600, function() end)
+                            local id, err = makima.timer.set(3600, function() end)
                             assert(id == 0 and err == nil, "denied timer mutated the store")
-                            maki.timer.del(id)
+                            makima.timer.del(id)
                         end,
                     })
                 "#
@@ -3189,7 +3189,7 @@ fn delegated_tools_cannot_reach_trusted_entry_points() {
                  local registration_error = {DELEGATED_REGISTRATION:?}\n\
                  local host_mutation_error = {DELEGATED_HOST_MUTATION:?}\n{}",
                 r#"
-            local child = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
+            local child = assert(makima.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
             local function callback(_, callback_ctx)
                 assert(assert(child:send(callback_ctx, "forbidden callback", { when = "idle" })):wait(callback_ctx))
             end
@@ -3197,44 +3197,44 @@ fn delegated_tools_cannot_reach_trusted_entry_points() {
                 local subscription, err = child[kind](child, ctx, callback)
                 assert(subscription == nil and err == subscription_error, kind .. ": " .. tostring(err))
             end
-            local ran, err = maki.api.run_command(ctx, "/pr5_timer_effect")
+            local ran, err = makima.api.run_command(ctx, "/pr5_timer_effect")
             assert(ran == nil and err == command_error)
             local function deny_timers()
-                local id, timer_err = maki.timer.set(0.001, pr5_timer_escape)
+                local id, timer_err = makima.timer.set(0.001, pr5_timer_escape)
                 assert(id == nil and timer_err == timer_error, tostring(timer_err))
-                local handle, defer_err = maki.defer_fn(pr5_timer_escape, 0)
+                local handle, defer_err = makima.defer_fn(pr5_timer_escape, 0)
                 assert(handle == nil and defer_err == timer_error, tostring(defer_err))
             end
             deny_timers()
             local registrations = {
                 register_command = function()
-                    return maki.api.register_command({ name = "/pr5_escape", tui_only = false, handler = pr5_timer_escape })
+                    return makima.api.register_command({ name = "/pr5_escape", tui_only = false, handler = pr5_timer_escape })
                 end,
-                keymap_set = function() return maki.keymap.set("n", "<C-y>", pr5_timer_escape) end,
-                keymap_del = function() return maki.keymap.del("n", "<C-y>") end,
-                usage_on_change = function() return maki.usage.on_change(pr5_timer_escape) end,
-                set_notify_handler = function() return maki.set_notify_handler(pr5_timer_escape) end,
-                set_slot = function() return maki.api.set_slot("pr5.escape", pr5_timer_escape) end,
-                create_autocmd = function() return maki.api.create_autocmd("User", { callback = pr5_timer_escape }) end,
-                register_expander = function() return maki.api.register_expander("pr5", pr5_timer_escape) end,
+                keymap_set = function() return makima.keymap.set("n", "<C-y>", pr5_timer_escape) end,
+                keymap_del = function() return makima.keymap.del("n", "<C-y>") end,
+                usage_on_change = function() return makima.usage.on_change(pr5_timer_escape) end,
+                set_notify_handler = function() return makima.set_notify_handler(pr5_timer_escape) end,
+                set_slot = function() return makima.api.set_slot("pr5.escape", pr5_timer_escape) end,
+                create_autocmd = function() return makima.api.create_autocmd("User", { callback = pr5_timer_escape }) end,
+                register_expander = function() return makima.api.register_expander("pr5", pr5_timer_escape) end,
             }
             for name, register in pairs(registrations) do
                 local registered, register_err = register()
                 assert(registered == nil and register_err == registration_error, name .. ": " .. tostring(register_err))
             end
-            local assigned, assignment_err = pcall(function() maki.notify = pr5_timer_escape end)
+            local assigned, assignment_err = pcall(function() makima.notify = pr5_timer_escape end)
             assert(not assigned and tostring(assignment_err):find(registration_error, 1, true), tostring(assignment_err))
             pr5_command_error = command_error
-            maki.api.exec_autocmds("User", { pattern = "pr5_escape" })
+            makima.api.exec_autocmds("User", { pattern = "pr5_escape" })
             for name, mutate in pairs({
-                mode_reset = function() return maki.api.mode.reset() end,
-                session_set_default_thinking = function() return maki.session.set_default_thinking("max") end,
+                mode_reset = function() return makima.api.mode.reset() end,
+                session_set_default_thinking = function() return makima.session.set_default_thinking("max") end,
             }) do
                 local changed, mutate_err = mutate()
                 assert(changed == nil and mutate_err == host_mutation_error, name .. ": " .. tostring(mutate_err))
             end
-            local async_err = maki.async.await(1, function(done)
-                maki.async.run(deny_timers, function(err) done(err or false) end)
+            local async_err = makima.async.await(1, function(done)
+                makima.async.run(deny_timers, function(err) done(err or false) end)
             end)
             assert(async_err == false, tostring(async_err))
             assert(child:set_model(ctx, { thinking = "low" }))
@@ -3330,10 +3330,10 @@ fn trusted_spawn_restores_host_bindings_without_expanding_capabilities(explicit:
             ""
         };
         fixture._host.load_source("pr5_trusted_bindings", &format!(r#"
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "/pr5_trusted_bindings", tui_only = false,
                 handler = function(_, ctx)
-                    local child = assert(maki.agent.spawn(ctx, {{
+                    local child = assert(makima.agent.spawn(ctx, {{
                         inherit_provider = true, silent = true, audience = "main", {selection}
                     }}))
                     assert(assert(assert(child:send(ctx, "trusted bindings", {{ when = "idle" }})):wait(ctx)).text == "{SECOND_REPLY}")
@@ -3394,12 +3394,12 @@ fn child_audience_cannot_expand_parent_capabilities(explicit: bool) {
             },
             &format!(
                 r#"
-                local callable = assert(maki.agent.callable_tools(ctx))
+                local callable = assert(makima.agent.callable_tools(ctx))
                 for _, tool in ipairs(callable) do
                     assert(tool.name ~= "pr5_audience_ceiling_sub")
                     assert(tool.name ~= "pr5_audience_ceiling_unpublished")
                 end
-                local child = assert(maki.agent.spawn(ctx, {{
+                local child = assert(makima.agent.spawn(ctx, {{
                     inherit_provider = true, silent = true, audience = "general_sub", {tools}
                     local_tools = {{ fresh = {{
                         description = "new local tool remains available",
@@ -3451,7 +3451,7 @@ fn inherited_tools_do_not_leak_parent_structured_output_into_children() {
             r#"
             local schema = { type = "object", properties = { answer = { type = "integer" } }, required = { "answer" } }
             pr5_schema_children_handler = function(_, parent_ctx)
-                local plain, spawn_err = maki.agent.spawn(parent_ctx, { inherit_provider = true, silent = true })
+                local plain, spawn_err = makima.agent.spawn(parent_ctx, { inherit_provider = true, silent = true })
                 assert(plain, "plain child spawn failed: " .. tostring(spawn_err))
                 local plain_ticket, send_err = plain:send(parent_ctx, "plain inherited child", { when = "idle" })
                 assert(plain_ticket, "plain child send failed: " .. tostring(send_err))
@@ -3459,7 +3459,7 @@ fn inherited_tools_do_not_leak_parent_structured_output_into_children() {
                 assert(plain_result, "plain child wait failed: " .. tostring(wait_err))
                 assert(plain_result.status == "completed" and #plain_result.output == 0 and plain_result.captured == nil)
                 assert(plain:close(parent_ctx))
-                local own, own_err = maki.agent.spawn(parent_ctx, { inherit_provider = true, silent = true, output_schema = schema })
+                local own, own_err = makima.agent.spawn(parent_ctx, { inherit_provider = true, silent = true, output_schema = schema })
                 assert(own, "own-schema child spawn failed: " .. tostring(own_err))
                 local own_result = assert(assert(own:send(parent_ctx, "own schema inherited child", { when = "idle" })):wait(parent_ctx))
                 assert(own_result.status == "completed" and #own_result.output == 1 and own_result.output[1].answer == 7)
@@ -3467,7 +3467,7 @@ fn inherited_tools_do_not_leak_parent_structured_output_into_children() {
                 assert(own:close(parent_ctx))
                 return "children isolated"
             end
-            local parent = assert(maki.agent.spawn(ctx, {
+            local parent = assert(makima.agent.spawn(ctx, {
                 inherit_provider = true, silent = true, output_schema = schema,
                 tools = {{ name = "pr5_spawn_schema_children", description = "spawn schema children", input_schema = { type = "object", properties = {} } }},
                 local_tools = { inherited_ordinary = {
@@ -3616,7 +3616,7 @@ fn public_output_schema_retries_invalid_reports_and_resets_each_turn() {
         let fixture = Fixture::start(
             "pr5_schema_retry",
             r#"
-            local child = assert(maki.agent.spawn(ctx, {
+            local child = assert(makima.agent.spawn(ctx, {
                 inherit_provider = true, silent = true,
                 output_schema = { type = "object", properties = { answer = { type = "integer" } }, required = { "answer" } },
                 local_tools = { ordinary = {
@@ -3717,7 +3717,7 @@ fn managed_sibling_tool_call_cannot_use_another_calls_ctx() {
         let fixture = Fixture::start_with_options(
             TOOL,
             FixtureOptions {
-                plugin_source: "local gate, held, shared = maki.async.semaphore(1)".into(),
+                plugin_source: "local gate, held, shared = makima.async.semaphore(1)".into(),
                 sibling: Some(sibling),
                 ..Default::default()
             },
@@ -3728,9 +3728,9 @@ fn managed_sibling_tool_call_cannot_use_another_calls_ctx() {
                     held = gate:acquire()
                     gate:acquire():release()
                 else
-                    local listed, err = maki.agent.list(shared)
+                    local listed, err = makima.agent.list(shared)
                     assert(listed == nil and err == "{FOREIGN_CONTEXT}", err)
-                    assert(maki.agent.list(ctx))
+                    assert(makima.agent.list(ctx))
                     held:release()
                 end
             "#
@@ -3763,11 +3763,11 @@ fn retained_tool_context_cannot_authorize_another_invocation() {
                 if retained == nil then
                     retained = ctx
                 else
-                    local before = #assert(maki.agent.list(ctx))
-                    local stale, stale_err = maki.agent.spawn(retained, {{ inherit_provider = true, tools = {{}} }})
+                    local before = #assert(makima.agent.list(ctx))
+                    local stale, stale_err = makima.agent.spawn(retained, {{ inherit_provider = true, tools = {{}} }})
                     assert(stale == nil and stale_err == {INVOCATION_EXPIRED:?}, stale_err)
-                    assert(#assert(maki.agent.list(ctx)) == before)
-                    local fresh = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
+                    assert(#assert(makima.agent.list(ctx)) == before)
+                    local fresh = assert(makima.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
                     local ticket = assert(fresh:send(ctx, "{PROMPT}", {{ when = "idle" }}))
                     assert(assert(ticket:wait(ctx)).text == "{REPLY}")
                     assert(fresh:close(ctx))
@@ -3821,7 +3821,7 @@ fn retained_tool_context_cannot_authorize_another_invocation() {
 
 #[test_case::test_case("error('reject candidate')"; "execution_failure")]
 #[test_case::test_case(r#"
-    maki.api.register_tool({
+    makima.api.register_tool({
         name = "pr5_reload_root", description = "conflicting candidate",
         schema = { type = "object", properties = {} }, handler = function() end,
     })
@@ -3841,11 +3841,11 @@ fn rejected_reload_preserves_agents_and_subscriptions(candidate: &str) {
         );
         fixture._host.load_source(OWNER, r#"
             local child, observer, subscription, ticket, observer_ticket
-            maki.api.register_command({
+            makima.api.register_command({
                 name = "/pr5_reload_begin", tui_only = false,
                 handler = function(_, ctx)
-                    child = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
-                    observer = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
+                    child = assert(makima.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
+                    observer = assert(makima.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
                     subscription = assert(child:on_turn_start(ctx, function(_, callback_ctx)
                         observer_ticket = assert(observer:send(callback_ctx, "subscription after rejected reload", { when = "idle" }))
                         assert(observer_ticket:wait(callback_ctx))
@@ -3853,7 +3853,7 @@ fn rejected_reload_preserves_agents_and_subscriptions(candidate: &str) {
                     ticket = assert(child:send(ctx, "work across rejected reload", { when = "idle" }))
                 end,
             })
-            maki.api.register_command({
+            makima.api.register_command({
                 name = "/pr5_reload_exercise", tui_only = false,
                 handler = function(_, ctx)
                     assert(assert(ticket:wait(ctx)).text == "resources survived")
@@ -3975,13 +3975,13 @@ fn repeated_deferred_subtrees_close_and_release_provider_gates() {
             },
         ])));
         fixture._host.load_source("pr5_resource_cycles", r#"
-            maki.api.register_command({
+            makima.api.register_command({
                 name = "/pr5_resource_cycle", tui_only = false,
                 handler = function(_, ctx)
-                    local parent = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
+                    local parent = assert(makima.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
                     assert(parent:defer_close(ctx))
                     local subscription = assert(parent:on_turn_start(ctx, function(_, callback_ctx)
-                        local child = assert(maki.agent.spawn(callback_ctx, { inherit_provider = true, silent = true, tools = {} }))
+                        local child = assert(makima.agent.spawn(callback_ctx, { inherit_provider = true, silent = true, tools = {} }))
                         assert(child:defer_close(callback_ctx))
                         assert(assert(child:send(callback_ctx, "cycle descendant", { when = "idle" })):wait(callback_ctx))
                     end))
@@ -4034,7 +4034,7 @@ fn public_output_schema_exhaustion_falls_back_bounded(invalid: bool) {
             Fixture::start(
                 "pr5_schema_invalid_exhaustion",
                 r#"
-            local child = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {},
+            local child = assert(makima.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {},
                 output_schema = { type = "object", properties = { answer = { type = "integer" } }, required = { "answer" } },
             }))
             local ticket = assert(child:send(ctx, "never correct report", { when = "idle" }))
@@ -4049,7 +4049,7 @@ fn public_output_schema_exhaustion_falls_back_bounded(invalid: bool) {
             Fixture::start(
                 "pr5_schema_missing",
                 r#"
-            local child = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true,
+            local child = assert(makima.agent.spawn(ctx, { inherit_provider = true, silent = true,
                 output_schema = { type = "object", properties = {}, additionalProperties = false },
             }))
             local result, err = assert(child:send(ctx, "never report", { when = "idle" })):wait(ctx)
@@ -4121,25 +4121,25 @@ fn saturated_event_callbacks_can_dispatch_a_child_lua_tool() {
             local entered = 0
             local errors = {{}}
             local tool_entered = 0
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "/pr5_saturation_diagnostic", tui_only = false,
                 handler = function()
                     error("entered=" .. entered .. " tool_entered=" .. tool_entered .. " errors=" .. table.concat(errors, " | "))
                 end,
             }})
-            maki.api.register_tool({{
+            makima.api.register_tool({{
                 name = "{TOOL}", description = "saturation child tool", audiences = {{ "main", "general_sub" }},
                 schema = {{ type = "object", properties = {{}} }},
                 handler = function() tool_entered = tool_entered + 1; return "child tool reached" end,
             }})
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "/pr5_saturation_begin", tui_only = false,
                 handler = function(_, ctx)
-                    observed = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
-                    worker = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, audience = "general_sub",
+                    observed = assert(makima.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
+                    worker = assert(makima.agent.spawn(ctx, {{ inherit_provider = true, silent = true, audience = "general_sub",
                         tools = {{{{ name = "{TOOL}", description = "saturation child tool",
                             input_schema = {{ type = "object", properties = {{}} }} }}}} }}))
-                    checkpoint = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
+                    checkpoint = assert(makima.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
                     worker_turn = assert(worker:send(ctx, "worker callback", {{ when = "idle" }}))
                     for i = 1, {CALLBACKS} do
                         subscriptions[i] = assert(observed:on_turn_start(ctx, function(_, callback_ctx)
@@ -4156,7 +4156,7 @@ fn saturated_event_callbacks_can_dispatch_a_child_lua_tool() {
                     assert(assert(observed:send(ctx, "observed callback trigger", {{ when = "idle" }})):wait(ctx))
                 end,
             }})
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "/pr5_saturation_close", tui_only = false,
                 handler = function(_, ctx)
                     for _, subscription in ipairs(subscriptions) do assert(subscription:close()) end
@@ -4327,21 +4327,21 @@ fn public_agent_ticket_cancel_stops_gated_request_and_keeps_actor_reusable() {
             "pr5_ticket_cancel",
             &format!(
                 r#"
-            local invalid, schema_err = maki.agent.spawn(ctx, {{ inherit_provider = true, tools = {{}}, output_schema = {{ type = "string" }} }})
+            local invalid, schema_err = makima.agent.spawn(ctx, {{ inherit_provider = true, tools = {{}}, output_schema = {{ type = "string" }} }})
             assert(invalid == nil and schema_err == {OUTPUT_SCHEMA_NOT_OBJECT:?}, schema_err)
-            local collision, collision_err = maki.agent.spawn(ctx, {{ inherit_provider = true,
+            local collision, collision_err = makima.agent.spawn(ctx, {{ inherit_provider = true,
                 tools = {{{{ name = "structured_output", description = "conflict", input_schema = {{ type = "object" }} }}}},
                 output_schema = {{ type = "object", properties = {{}} }},
             }})
             assert(collision == nil and collision_err == {STRUCTURED_OUTPUT_CONFLICT:?}, collision_err)
-            local local_collision, local_err = maki.agent.spawn(ctx, {{ inherit_provider = true, tools = {{}},
+            local local_collision, local_err = makima.agent.spawn(ctx, {{ inherit_provider = true, tools = {{}},
                 output_schema = {{ type = "object", properties = {{}} }},
                 local_tools = {{ structured_output = {{ description = "conflict", input_schema = {{ type = "object" }}, handler = function() return "never" end }} }},
             }})
             assert(local_collision == nil and local_err == {STRUCTURED_OUTPUT_CONFLICT:?}, local_err)
-            local child = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}}, output_schema = {{ type = "object", properties = {{ answer = {{ type = "integer" }} }}, required = {{ "answer" }} }} }}))
+            local child = assert(makima.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}}, output_schema = {{ type = "object", properties = {{ answer = {{ type = "integer" }} }}, required = {{ "answer" }} }} }}))
             local cancelled = assert(child:send(ctx, "cancel gated request", {{ when = "idle" }}))
-            local checkpoint = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
+            local checkpoint = assert(makima.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
             assert(assert(assert(checkpoint:send(ctx, "ready to cancel", {{ when = "idle" }})):wait(ctx)).text == "ready to cancel")
             assert(cancelled:cancel(ctx))
             local result, err = cancelled:wait(ctx)
@@ -4406,7 +4406,7 @@ fn inherited_local_capture_belongs_to_executing_grandchild() {
                 ..Default::default()
             },
             r#"
-            local child = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true,
+            local child = assert(makima.agent.spawn(ctx, { inherit_provider = true, silent = true,
                 tools = { { name = "pr6_spawn_grandchild", description = "spawn grandchild", input_schema = { type = "object" } } },
                 local_tools = { inherited_capture = {
                     description = "capture answer", input_schema = { type = "object" },
@@ -4475,18 +4475,18 @@ fn bundled_task_gates_new_work_on_admitted_mode_across_configuration_changes() {
                 ..Default::default()
             },
             r#"
-            local text = assert(maki.agent.call_tool(ctx, "task_spawn", {
+            local text = assert(makima.agent.call_tool(ctx, "task_spawn", {
                 description = "writer", prompt = "edit things", subagent_type = "general",
             }))
-            local task = maki.json.decode(text)
+            local task = makima.json.decode(text)
             local parent = assert(ctx:agent())
             assert(parent:set_mode(ctx, "plan") == "plan")
             assert(ctx:mode() == "build" and assert(parent:config(ctx)).mode == "plan")
-            local sent, err = maki.agent.call_tool(ctx, "task_send", {
+            local sent, err = makima.agent.call_tool(ctx, "task_send", {
                 task_id = task.task_id, message = "keep editing",
             })
             assert(sent ~= nil and err == nil, tostring(err))
-            assert(maki.agent.call_tool(ctx, "task_despawn", { task_id = task.task_id }))
+            assert(makima.agent.call_tool(ctx, "task_despawn", { task_id = task.task_id }))
         "#,
         );
         assert_eq!(
@@ -4508,7 +4508,7 @@ fn spawn_takes_the_shared_selection_and_rejects_other_options() {
                 r#"
             local parent = assert(ctx:agent())
             local selection = assert(parent:config(ctx)).model
-            local child = assert(maki.agent.spawn(ctx, {{
+            local child = assert(makima.agent.spawn(ctx, {{
                 inherit_provider = true, silent = true, tools = {{}}, model = selection,
             }}))
             local copied = assert(child:config(ctx)).model
@@ -4519,10 +4519,10 @@ fn spawn_takes_the_shared_selection_and_rejects_other_options() {
                 thinking = {{ thinking = "high" }},
                 fast = {{ fast = true }},
             }}) do
-                local spawned, err = maki.agent.spawn(ctx, opts)
+                local spawned, err = makima.agent.spawn(ctx, opts)
                 assert(spawned == nil and err == "{UNKNOWN_SPAWN_OPTION}: " .. key, tostring(err))
             end
-            local spawned, err = maki.agent.spawn(ctx, {{ model = {{ spec = selection.spec, fast = "maybe" }} }})
+            local spawned, err = makima.agent.spawn(ctx, {{ model = {{ spec = selection.spec, fast = "maybe" }} }})
             assert(spawned == nil and err == "{FAST_INVALID}", tostring(err))
         "#,
                 FAST_INVALID = makima_providers::ModelSelectionError::InvalidFast,
@@ -4547,16 +4547,16 @@ fn managed_capacity_one_delivers_child_once_unless_waited(bundled_tasks: bool, w
         const TOOL: &str = "managed_capacity_one_delivery";
         let spawn = if bundled_tasks {
             r#"
-            local text, err = maki.agent.call_tool(ctx, "task_spawn", {
+            local text, err = makima.agent.call_tool(ctx, "task_spawn", {
                 description = "automatic delivery", prompt = "report answer", subagent_type = "general",
                 output_schema = schema,
             })
             assert(text ~= nil and err == nil, err)
-            local task = maki.json.decode(text)
+            local task = makima.json.decode(text)
             "#
         } else {
             r#"
-            local child = assert(maki.agent.spawn(ctx, {
+            local child = assert(makima.agent.spawn(ctx, {
                 inherit_provider = true, tools = {}, output_schema = schema,
             }))
             local ticket = assert(child:send(ctx, "report answer", { when = "idle" }))
@@ -4566,16 +4566,16 @@ fn managed_capacity_one_delivers_child_once_unless_waited(bundled_tasks: bool, w
             ""
         } else if bundled_tasks {
             r#"
-            local text, err = maki.agent.call_tool(ctx, "task_wait", {
+            local text, err = makima.agent.call_tool(ctx, "task_wait", {
                 task_id = task.task_id, turn_id = task.turn_id,
             })
             assert(text ~= nil and err == nil, err)
-            local result = maki.json.decode(text)
+            local result = makima.json.decode(text)
             assert(result.status == "done" and result.result.captured.answer == 42)
-            local again = assert(maki.agent.call_tool(ctx, "task_wait", {
+            local again = assert(makima.agent.call_tool(ctx, "task_wait", {
                 task_id = task.task_id, turn_id = task.turn_id,
             }))
-            assert(maki.json.decode(again).result.captured.answer == 42)
+            assert(makima.json.decode(again).result.captured.answer == 42)
             "#
         } else {
             r#"
@@ -4794,7 +4794,7 @@ fn managed_task_spawn_survives_origin_invocation_completion() {
                 ..Default::default()
             },
             r#"
-            local text, err = maki.agent.call_tool(ctx, "task_spawn", {
+            local text, err = makima.agent.call_tool(ctx, "task_spawn", {
                 description = "persistent child", prompt = "wait forever", subagent_type = "general",
             })
             assert(text ~= nil and err == nil, err)
@@ -4825,7 +4825,7 @@ fn public_agent_ticket_surfaces_captured_local_tool_output() {
             "pr5_captured_output",
             &format!(
                 r#"
-            local child = assert(maki.agent.spawn(ctx, {{
+            local child = assert(makima.agent.spawn(ctx, {{
                 inherit_provider = true, silent = true, tools = {{}},
                 local_tools = {{
                     {CAPTURE_TOOL} = {{
@@ -4932,8 +4932,8 @@ fn settled_turn_withdraws_delivery_only_when_waited(wait_settled: bool) {
             &format!(
                 r#"
             local spawn = {{ inherit_provider = true, tools = {{}} }}
-            local first = assert(assert(maki.agent.spawn(ctx, spawn)):send(ctx, {FIRST_PROMPT:?}, {{ when = "idle" }}))
-            local second = assert(assert(maki.agent.spawn(ctx, spawn)):send(ctx, {SECOND_PROMPT:?}, {{ when = "idle" }}))
+            local first = assert(assert(makima.agent.spawn(ctx, spawn)):send(ctx, {FIRST_PROMPT:?}, {{ when = "idle" }}))
+            local second = assert(assert(makima.agent.spawn(ctx, spawn)):send(ctx, {SECOND_PROMPT:?}, {{ when = "idle" }}))
             assert(assert(second:wait(ctx)).text == {SECOND_REPLY:?})
             assert(assert(first:result(ctx)).text == {FIRST_REPLY:?})
             if {wait_settled} then
@@ -5039,10 +5039,10 @@ fn trusted_command_wait_keeps_child_delivery() {
                 PLUGIN,
                 &format!(
                     r#"
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "{COMMAND}", tui_only = false,
                 handler = function(_, ctx)
-                    local child = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, tools = {{}} }}))
+                    local child = assert(makima.agent.spawn(ctx, {{ inherit_provider = true, tools = {{}} }}))
                     local ticket = assert(child:send(ctx, "trusted", {{ when = "idle" }}))
                     assert(assert(ticket:wait(ctx)).text == {FIRST_REPLY:?})
                 end,

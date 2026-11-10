@@ -76,7 +76,7 @@ end
 
 -- `APERTURE_HOST`, then `base_url`, without a trailing slash.
 function M.host(config)
-  local host = trim(maki.uv.os_getenv(M.HOST_ENV))
+  local host = trim(makima.uv.os_getenv(M.HOST_ENV))
   if host == "" then
     host = trim(config.base_url)
   end
@@ -234,7 +234,7 @@ end
 function M.instance(info, config, api_for)
   local model, route, model_id, overrides = M.describe(info, config)
   if overrides.base and not M.ROUTES[overrides.base] then
-    maki.log.warn(string.format("aperture: base %q is not a provider it routes to, ignoring", overrides.base))
+    makima.log.warn(string.format("aperture: base %q is not a provider it routes to, ignoring", overrides.base))
   end
   local api, err = api_for(M.prefix(route, overrides))
   if not api then
@@ -266,7 +266,7 @@ function M.provider()
   }
 
   function spec.auth_status(_, config)
-    if trim(maki.uv.os_getenv(M.HOST_ENV)) ~= "" then
+    if trim(makima.uv.os_getenv(M.HOST_ENV)) ~= "" then
       return { state = "env", detail = "via " .. M.HOST_ENV }
     end
     return { state = M.host(config) and "configured" or "missing" }

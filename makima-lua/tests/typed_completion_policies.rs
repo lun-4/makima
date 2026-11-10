@@ -13,7 +13,7 @@ fn typed_completion_policies_accept_documented_forms() {
         "policies",
         r#"
         local function handler() end
-        maki.api.register_command({
+        makima.api.register_command({
             name = "/policies",
             tui_only = false,
             arguments = {
@@ -60,7 +60,7 @@ fn typed_completion_policy_rejects_conflicting_mode_and_policy() {
         .load_source(
             "conflicting_policy",
             r#"
-            maki.api.register_command({
+            makima.api.register_command({
                 name = "/conflict",
                 tui_only = false,
                 arguments = {

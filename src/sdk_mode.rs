@@ -3067,15 +3067,15 @@ mod tests {
             "sdk_command_spawn",
             &format!(
                 r#"
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "/sdk_spawn", tui_only = false,
                 handler = function(_, ctx)
                     local root = assert(ctx:agent())
-                    local child = assert(maki.agent.spawn(ctx, {{ name = "SDK command child" }}))
+                    local child = assert(makima.agent.spawn(ctx, {{ name = "SDK command child" }}))
                     assert(child:close(ctx))
-                    local view, view_err = maki.fn.winsaveview()
+                    local view, view_err = makima.fn.winsaveview()
                     assert(view == nil and view_err == "{no_ui}", view_err)
-                    maki.ui.flash("{SDK_COMMAND_DONE}")
+                    makima.ui.flash("{SDK_COMMAND_DONE}")
                 end,
             }})
         "#,
@@ -3084,7 +3084,7 @@ mod tests {
         )
         .unwrap();
         host.load_source(SDK_NESTED_TOOL, &format!(r#"
-            maki.api.register_tool({{
+            makima.api.register_tool({{
                 name = "{SDK_NESTED_TOOL}", description = "Exercise nested SDK tasks",
                 schema = {{ type = "object", properties = {{ child = {{ type = "boolean" }} }} }},
                 audiences = {{ "main", "general_sub" }},
@@ -3101,18 +3101,18 @@ mod tests {
                         assert(assert(child:config(ctx)).model.spec == "{STARTUP_MODEL}")
                         local captured = assert(ctx:model())
                         assert(captured.spec == inherited.spec)
-                        assert(maki.json.encode(captured.thinking) == maki.json.encode(inherited.thinking))
+                        assert(makima.json.encode(captured.thinking) == makima.json.encode(inherited.thinking))
                         assert(captured.fast == inherited.fast)
                     end
                     local prompt = input.child and "{SDK_GRANDCHILD_PROMPT}" or "{SDK_CHILD_PROMPT}"
-                    local spawned, err = maki.agent.call_tool(ctx, "task_spawn", {{
+                    local spawned, err = makima.agent.call_tool(ctx, "task_spawn", {{
                         description = prompt, prompt = prompt, subagent_type = "general",
                     }})
                     assert(not err, err)
-                    local task = maki.json.decode(spawned)
-                    local joined, wait_err = maki.agent.call_tool(ctx, "task_wait", {{ task_id = task.task_id, turn_id = task.turn_id }})
+                    local task = makima.json.decode(spawned)
+                    local joined, wait_err = makima.agent.call_tool(ctx, "task_wait", {{ task_id = task.task_id, turn_id = task.turn_id }})
                     assert(not wait_err, wait_err)
-                    local result = maki.json.decode(joined)
+                    local result = makima.json.decode(joined)
                     local expected = input.child and "{SDK_GRANDCHILD_RESPONSE}" or "{SDK_CHILD_RESPONSE}"
                     assert(result.result.text == expected, joined)
                     return result.result.text

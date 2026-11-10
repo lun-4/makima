@@ -12,8 +12,8 @@ fn test_opt_bool_truthiness_visible_window() {
         .load_source(
             "test_win_default_visible",
             r#"
-            local buf = maki.ui.buf()
-            maki.ui.open_win(buf, { title = "DefaultVisible" })
+            local buf = makima.ui.buf()
+            makima.ui.open_win(buf, { title = "DefaultVisible" })
             "#,
         )
         .unwrap();
@@ -34,8 +34,8 @@ fn test_opt_bool_truthiness_visible_window() {
         .load_source(
             "test_win_explicit_hidden",
             r#"
-            local buf = maki.ui.buf()
-            maki.ui.open_win(buf, { title = "ExplicitHidden", visible = false })
+            local buf = makima.ui.buf()
+            makima.ui.open_win(buf, { title = "ExplicitHidden", visible = false })
             "#,
         )
         .unwrap();

@@ -81,7 +81,7 @@ const KEEP_CTX_THEN_FAIL: &str = r#"if kept_ctx then
 const MARKED_TWICE: &str = "truetrue";
 const RETIRED_MARK: &str = "false";
 const CONFIG_SOURCE: &str = r#"
-    maki.api.register_provider({
+    makima.api.register_provider({
         id = "fake",
         display_name = "Fake Provider",
         discover = function(ctx, config)
@@ -94,7 +94,7 @@ const CONFIG_SOURCE: &str = r#"
 "#;
 
 const REFRESH_SOURCE: &str = r#"
-    maki.api.register_provider({
+    makima.api.register_provider({
         id = "fake",
         display_name = "Fake Provider",
         discover = function(ctx, config, refresh)
@@ -113,7 +113,7 @@ fn host() -> PluginHost {
 fn spec_source(id: &str, extra: &str, instance: &str) -> String {
     format!(
         r#"
-        maki.api.register_provider({{
+        makima.api.register_provider({{
             id = "{id}",
             display_name = "{DISPLAY_NAME}",
             models = {{ {{ id = "{MODEL}", context_window = {CONTEXT_WINDOW}, tier = "strong" }} }},
@@ -317,11 +317,11 @@ fn invalid_spec_fields_are_rejected(extra: &str, expected: &str) {
     assert!(error.to_string().contains(expected), "{error}");
 }
 
-#[test_case(r#"maki.api.register_provider({ id = "x", display_name = "X" })"#, PREPARE_REQUIRED_ERR ; "missing prepare")]
-#[test_case(r#"maki.api.register_provider({ id = 1, display_name = "X", prepare = print })"#, INVALID_TYPE_ERR ; "id of wrong type")]
-#[test_case(r#"maki.api.register_provider({ id = "x/y", display_name = "X", prepare = print })"#, BAD_ID_ERR ; "id with slash")]
-#[test_case(r#"maki.api.register_provider({ id = "..", display_name = "X", prepare = print })"#, BAD_ID_ERR ; "id with leading dot")]
-#[test_case(r#"maki.async.run(function() maki.api.register_provider({ id = "x", display_name = "X", prepare = print }) end)"#, TOP_LEVEL_ERR ; "outside plugin load")]
+#[test_case(r#"makima.api.register_provider({ id = "x", display_name = "X" })"#, PREPARE_REQUIRED_ERR ; "missing prepare")]
+#[test_case(r#"makima.api.register_provider({ id = 1, display_name = "X", prepare = print })"#, INVALID_TYPE_ERR ; "id of wrong type")]
+#[test_case(r#"makima.api.register_provider({ id = "x/y", display_name = "X", prepare = print })"#, BAD_ID_ERR ; "id with slash")]
+#[test_case(r#"makima.api.register_provider({ id = "..", display_name = "X", prepare = print })"#, BAD_ID_ERR ; "id with leading dot")]
+#[test_case(r#"makima.async.run(function() makima.api.register_provider({ id = "x", display_name = "X", prepare = print }) end)"#, TOP_LEVEL_ERR ; "outside plugin load")]
 fn invalid_registrations_are_rejected(source: &str, expected: &str) {
     let host = host();
     let result = host.load_source(PLUGIN, source);
@@ -340,7 +340,7 @@ fn unknown_model_descriptor_fields_are_ignored() {
     let host = host();
     host.load_source(
         PLUGIN,
-        r#"maki.api.register_provider({
+        r#"makima.api.register_provider({
             id = "x", display_name = "X",
             models = { { id = "m", future_capability = true } },
             prepare = function() return { stream = function() end } end,
@@ -384,7 +384,7 @@ fn duplicate_id_in_one_plugin_names_the_plugin_once() {
 #[test]
 fn aliases_cannot_collide_globally() {
     let host = host();
-    let first = r#"maki.api.register_provider({
+    let first = r#"makima.api.register_provider({
         id = "first", display_name = "First",
         auth = { { id = "key", label = "Key", login = print } },
         aliases = { { id = "shared", label = "Shared", method = "key" } },
@@ -602,9 +602,9 @@ fn dropping_the_stream_cancels_the_call_and_closes_the_emitter() {
         local parked, cancelled = false, false
         return {
             stream = function(ctx, request, emit)
-                maki.async.on_cancel(function() cancelled = true end)
+                makima.async.on_cancel(function() cancelled = true end)
                 emit({ type = "text_delta", text = "hi" })
-                local gate = maki.async.semaphore(1)
+                local gate = makima.async.semaphore(1)
                 local held = gate:acquire()
                 parked = true
                 gate:acquire()
@@ -705,7 +705,7 @@ fn provider_config_is_nonfatal_after_startup() {
         PLUGIN,
         &spec_source(
             PROVIDER,
-            "discover = function() local config = maki.api.provider_config('fake') or {}; return config.models or {} end,",
+            "discover = function() local config = makima.api.provider_config('fake') or {}; return config.models or {} end,",
             "return {}",
         ),
     )

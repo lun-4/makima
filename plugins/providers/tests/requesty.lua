@@ -1,6 +1,6 @@
 local requesty = require("providers.requesty")
 local compat = require("providers.openai_compat")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local SONNET = "anthropic/claude-sonnet-4-5"
 local BASE = "https://router.requesty.ai/v1"

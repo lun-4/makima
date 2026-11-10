@@ -1,5 +1,5 @@
 local sigv4 = require("providers.sigv4")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local HOST = "bedrock-runtime.us-east-1.amazonaws.com"
 local MODEL_URL = "https://" .. HOST .. "/model/anthropic.claude-3-5-sonnet-20241022-v2%3A0/invoke-with-response-stream"

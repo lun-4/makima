@@ -4,7 +4,7 @@ end
 
 local function shorten_path(path)
   local p = normalize_sep(path)
-  local cwd = maki.uv.cwd()
+  local cwd = makima.uv.cwd()
   if cwd then
     cwd = normalize_sep(cwd)
     if p:sub(1, #cwd + 1) == cwd .. "/" then
@@ -12,7 +12,7 @@ local function shorten_path(path)
       return rel == "" and "." or rel
     end
   end
-  local home = maki.uv.os_homedir()
+  local home = makima.uv.os_homedir()
   if home then
     home = normalize_sep(home)
     if p:sub(1, #home + 1) == home .. "/" then

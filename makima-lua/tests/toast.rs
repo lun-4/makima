@@ -11,7 +11,7 @@ fn test_toast_stacking_and_dismissal() {
         .load_source(
             "test_toast",
             r#"
-            local Toast = require("maki.toast")
+            local Toast = require("makima.toast")
             Toast.show("First toast message", { title = "First" })
             Toast.show("Second toast message\nLine two", { title = "Second" })
             "#,

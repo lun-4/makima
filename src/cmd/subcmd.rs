@@ -530,7 +530,7 @@ mod tests {
     const PROMPT: &str = "Pick";
     const DEFAULT: &str = "http://localhost:8080";
     const SOURCE: &str = r#"
-        maki.api.register_provider({
+        makima.api.register_provider({
             id = "fake",
             display_name = "Fake",
             prepare = function() return {} end,

@@ -69,28 +69,28 @@ const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 const TASK_PLUGIN_SRC: &str = include_str!("../../plugins/task/init.lua");
 const TASK_PRELUDE: &str = r#"
 test_task_handlers = {}
-local real_register_tool = maki.api.register_tool
-maki.api.register_tool = function(spec)
+local real_register_tool = makima.api.register_tool
+makima.api.register_tool = function(spec)
   test_task_handlers[spec.name] = spec.handler
   return real_register_tool(spec)
 end
 
-local real_spawn = maki.agent.spawn
-maki.agent.spawn = function(ctx, opts)
+local real_spawn = makima.agent.spawn
+makima.agent.spawn = function(ctx, opts)
   opts.inherit_provider = true
   opts.auto_deliver = false
   return real_spawn(ctx, opts)
 end
 
-maki.agent.resolve_model = function()
+makima.agent.resolve_model = function()
   return { spec = "anthropic/claude-sonnet-4-20250514" }
 end
 
-maki.agent.system_prompt = function()
+makima.agent.system_prompt = function()
   return "sys"
 end
 
-maki.agent.tools = function()
+makima.agent.tools = function()
   return {}
 end
 "#;
@@ -104,7 +104,7 @@ local release_async_worker
 local finish_async_wait
 local retained_ctx
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "capture_unmanaged_ctx",
   description = "retain a managed invocation context",
   schema = { type = "object", properties = {}, additionalProperties = false },
@@ -115,13 +115,13 @@ maki.api.register_tool({
   end,
 })
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "reject_foreign_unmanaged_ctx",
   description = "reject a context from another managed invocation",
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "main" },
   handler = function()
-    local session, err = maki.agent.spawn(retained_ctx, {
+    local session, err = makima.agent.spawn(retained_ctx, {
       audience = {},
       model = { spec = "not/a/model" },
     })
@@ -132,19 +132,19 @@ maki.api.register_tool({
   end,
 })
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "managed_session_join",
   description = "prompt an existing child from a joined worker",
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "main" },
   handler = function(_, ctx)
-    local session = assert(maki.agent.spawn(ctx, {
+    local session = assert(makima.agent.spawn(ctx, {
       name = "managed-joined-child",
       inherit_provider = true,
       auto_deliver = false,
     }))
     local result, prompt_err
-    maki.async.join(1, {
+    makima.async.join(1, {
       function()
         result, prompt_err = assert(session:send(ctx, "reply", { when = "idle" })):wait(ctx)
       end,
@@ -157,7 +157,7 @@ maki.api.register_tool({
   end,
 })
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "managed_session_retain_async",
   description = "retain task authority past a managed invocation",
   schema = { type = "object", properties = {}, additionalProperties = false },
@@ -183,10 +183,10 @@ maki.api.register_tool({
     if spawned.is_error then
       return spawned
     end
-    retained_task_id = maki.json.decode(spawned.llm_output).task_id
-    maki.async.await(1, function(worker_started)
-      maki.async.run(function()
-        maki.async.await(1, function(done)
+    retained_task_id = makima.json.decode(spawned.llm_output).task_id
+    makima.async.await(1, function(worker_started)
+      makima.async.run(function()
+        makima.async.await(1, function(done)
           release_async_worker = done
           worker_started()
         end)
@@ -202,13 +202,13 @@ maki.api.register_tool({
   end,
 })
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "managed_session_release_async",
   description = "release and await retained stale task authority",
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "main" },
   handler = function()
-    local send_err, send_is_error, despawn_err, despawn_is_error = maki.async.await(1, function(done)
+    local send_err, send_is_error, despawn_err, despawn_is_error = makima.async.await(1, function(done)
       finish_async_wait = done
       release_async_worker()
     end)
@@ -222,13 +222,13 @@ maki.api.register_tool({
   end,
 })
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "managed_session_retain",
   description = "retain a managed child",
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "main" },
   handler = function(_, ctx)
-    retained_session = assert(maki.agent.spawn(ctx, {
+    retained_session = assert(makima.agent.spawn(ctx, {
       name = "managed-retained-child",
       inherit_provider = true,
       auto_deliver = false,
@@ -238,7 +238,7 @@ maki.api.register_tool({
   end,
 })
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "managed_session_outside_timeout",
   description = "reject a retained managed child outside its turn",
   schema = { type = "object", properties = {}, additionalProperties = false },
@@ -252,13 +252,13 @@ maki.api.register_tool({
   end,
 })
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "managed_session_retain_nested",
   description = "retain a nested managed child after its first prompt",
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "general_sub" },
   handler = function(_, ctx)
-    retained_session = assert(maki.agent.spawn(ctx, {
+    retained_session = assert(makima.agent.spawn(ctx, {
       name = "managed-retained-nested-child",
       inherit_provider = true,
       auto_deliver = false,
@@ -272,7 +272,7 @@ maki.api.register_tool({
   end,
 })
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "managed_session_retry_nested",
   description = "verify a retained nested child is permanently closed",
   schema = { type = "object", properties = {}, additionalProperties = false },
@@ -286,13 +286,13 @@ maki.api.register_tool({
   end,
 })
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "managed_session_timeout",
   description = "time out a managed child prompt",
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "main" },
   handler = function(_, ctx)
-    local session, err = maki.agent.spawn(ctx, {
+    local session, err = makima.agent.spawn(ctx, {
       name = "managed-timeout-child",
       inherit_provider = true,
       auto_deliver = false,
@@ -312,13 +312,13 @@ maki.api.register_tool({
   end,
 })
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "managed_session",
   description = "create and close a managed child",
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "main" },
   handler = function(_, ctx)
-    local session, err = maki.agent.spawn(ctx, {
+    local session, err = makima.agent.spawn(ctx, {
       name = "managed-child",
       inherit_provider = true,
       auto_deliver = false,
@@ -335,13 +335,13 @@ maki.api.register_tool({
   end,
 })
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "managed_session_silent",
   description = "create and close a silent managed child",
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "main" },
   handler = function(_, ctx)
-    local session, err = maki.agent.spawn(ctx, {
+    local session, err = makima.agent.spawn(ctx, {
       name = "managed-silent-child",
       inherit_provider = true,
       auto_deliver = false,
@@ -367,27 +367,27 @@ maki.api.register_tool({
 /// child's result from the runtime instead of a `task_wait`.
 const AUTO_DELIVERY_PRELUDE: &str = r#"
 test_task_handlers = {}
-local real_register_tool = maki.api.register_tool
-maki.api.register_tool = function(spec)
+local real_register_tool = makima.api.register_tool
+makima.api.register_tool = function(spec)
   test_task_handlers[spec.name] = spec.handler
   return real_register_tool(spec)
 end
 
-local real_spawn = maki.agent.spawn
-maki.agent.spawn = function(ctx, opts)
+local real_spawn = makima.agent.spawn
+makima.agent.spawn = function(ctx, opts)
   opts.inherit_provider = true
   return real_spawn(ctx, opts)
 end
 
-maki.agent.resolve_model = function()
+makima.agent.resolve_model = function()
   return { spec = "anthropic/claude-sonnet-4-20250514" }
 end
 
-maki.agent.system_prompt = function()
+makima.agent.system_prompt = function()
   return "sys"
 end
 
-maki.agent.tools = function(_, opts)
+makima.agent.tools = function(_, opts)
   if opts.audience ~= "general_sub" then
     return nil
   end
@@ -399,7 +399,7 @@ maki.agent.tools = function(_, opts)
   }
 end
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "$PROBE_TOOL",
   description = "no-op tool between the parent's requests",
   schema = { type = "object", properties = {} },
@@ -411,7 +411,7 @@ maki.api.register_tool({
 "#;
 
 const AUTO_DELIVERY_DRIVER: &str = r#"
-maki.api.register_tool({
+makima.api.register_tool({
   name = "$DRIVER_TOOL",
   description = "spawn a model-driven parent and wait for its turn",
   schema = { type = "object", properties = {} },
@@ -422,12 +422,12 @@ maki.api.register_tool({
       subagent_type = "general",
     }, ctx)
     if spawned.is_error then return spawned end
-    local ids = maki.json.decode(spawned.llm_output)
+    local ids = makima.json.decode(spawned.llm_output)
     local waited = test_task_handlers.task_wait({
       task_id = ids.task_id, turn_id = ids.turn_id,
     }, ctx)
     if waited.is_error then return waited end
-    local result = maki.json.decode(waited.llm_output)
+    local result = makima.json.decode(waited.llm_output)
     local closed = test_task_handlers.task_despawn({ task_id = ids.task_id }, ctx)
     if closed.is_error then return closed end
     return result.result.text
@@ -697,7 +697,7 @@ fn load_task_host() -> (Arc<ToolRegistry>, PluginHost) {
         &format!(
             "{TASK_PRELUDE}\n{TASK_PLUGIN_SRC}\n{}",
             r#"
-            maki.api.register_tool({
+            makima.api.register_tool({
                 name = "nested_async_task",
                 description = "spawn and wait for a managed descendant",
                 schema = { type = "object", properties = {} },
@@ -708,13 +708,13 @@ fn load_task_host() -> (Arc<ToolRegistry>, PluginHost) {
                         subagent_type = "general",
                     }, ctx)
                     if spawned.is_error then return spawned end
-                    local ids = maki.json.decode(spawned.llm_output)
+                    local ids = makima.json.decode(spawned.llm_output)
                     assert(ids.task_id and ids.turn_id)
                     local waited = test_task_handlers.task_wait({
                         task_id = ids.task_id, turn_id = ids.turn_id,
                     }, ctx)
                     if waited.is_error then return waited end
-                    local result = maki.json.decode(waited.llm_output)
+                    local result = makima.json.decode(waited.llm_output)
                     assert(result.status == "done")
                     assert(result.result.turn_id == ids.turn_id)
                     local closed = test_task_handlers.task_despawn({ task_id = ids.task_id }, ctx)
@@ -852,14 +852,14 @@ fn managed_lua_requests_follow_resolved_and_updated_configuration() {
             "managed-config",
             &r#"
             local child
-            maki.api.register_tool({
+            makima.api.register_tool({
                 name = "spawn_nested",
                 description = "spawn a child from the executing configuration",
                 schema = { type = "object", properties = {} },
                 audiences = { "main", "general_sub" },
                 handler = function(_, ctx)
                     if ctx:workflow() ~= true then error("nested handler saw stale workflow config") end
-                    local nested, spawn_err = maki.agent.spawn(ctx, { inherit_provider = true, auto_deliver = false })
+                    local nested, spawn_err = makima.agent.spawn(ctx, { inherit_provider = true, auto_deliver = false })
                     if not nested then error("nested spawn failed: " .. tostring(spawn_err)) end
                     local result, prompt_err = assert(nested:send(ctx, "nested", { when = "idle" })):wait(ctx)
                     if not result then error("nested prompt failed: " .. tostring(prompt_err)) end
@@ -868,16 +868,16 @@ fn managed_lua_requests_follow_resolved_and_updated_configuration() {
                     return result.text
                 end,
             })
-            maki.api.register_tool({
+            makima.api.register_tool({
                 name = "managed_session",
                 description = "create and retain a configured child",
                 schema = { type = "object", properties = {} },
                 handler = function(_, ctx)
-                    local rejected, policy_err = maki.agent.spawn(ctx, { model = { spec = "openai/gpt-4.1" } })
+                    local rejected, policy_err = makima.agent.spawn(ctx, { model = { spec = "openai/gpt-4.1" } })
                     assert(rejected == nil and policy_err ~= nil)
-                    local failed, preparation_err = maki.agent.spawn(ctx, { model = { spec = "anthropic/claude-opus-5" } })
+                    local failed, preparation_err = makima.agent.spawn(ctx, { model = { spec = "anthropic/claude-opus-5" } })
                     assert(failed == nil and preparation_err == "$PREPARATION_ERROR")
-                    child = assert(maki.agent.spawn(ctx, {
+                    child = assert(makima.agent.spawn(ctx, {
                         model = { spec = "anthropic/claude-opus-4-20250514", fast = true, thinking = "off" }, auto_deliver = false,
                         audience = "general_sub",
                         tools = {{ name = "spawn_nested", description = "spawn nested", input_schema = { type = "object", properties = {} } }},

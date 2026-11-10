@@ -7,7 +7,7 @@ use makima_commands::{
 use makima_lua::{EventHandle, PluginHost, UiAction};
 
 const COMMAND_PLUGIN: &str = r#"
-    maki.api.register_command({
+    makima.api.register_command({
         name = "/typed",
         tui_only = false,
         arguments = {
@@ -21,7 +21,7 @@ const COMMAND_PLUGIN: &str = r#"
         handler = function(opts)
             local values = opts.values
             local tag = values.tag == nil and "<nil>" or values.tag
-            maki.ui.flash(table.concat({
+            makima.ui.flash(table.concat({
                 opts.args,
                 table.concat(opts.fargs, ","),
                 values.label,
@@ -36,20 +36,20 @@ const COMMAND_PLUGIN: &str = r#"
 "#;
 
 const GENERATION_A_PLUGIN: &str = r#"
-    maki.api.register_command({
+    makima.api.register_command({
         name = "/typed",
         tui_only = false,
         arguments = { { name = "value", type = "string" } },
-        handler = function(opts) maki.ui.flash("A:" .. opts.values.value) end,
+        handler = function(opts) makima.ui.flash("A:" .. opts.values.value) end,
     })
 "#;
 
 const GENERATION_B_PLUGIN: &str = r#"
-    maki.api.register_command({
+    makima.api.register_command({
         name = "/typed",
         tui_only = false,
         arguments = { { name = "value", type = "string" } },
-        handler = function(opts) maki.ui.flash("B:" .. opts.values.value) end,
+        handler = function(opts) makima.ui.flash("B:" .. opts.values.value) end,
     })
 "#;
 
@@ -193,12 +193,12 @@ fn callbacks_none_lifecycle_rejects_retired_generation() {
     host.load_source(
         "lifecycle_generation",
         r#"
-        maki.api.register_command({
+        makima.api.register_command({
             name = "/deploy",
             tui_only = false,
             arguments = { { name = "value", type = "string", completion = {
                 items = {},
-                on_cancel = function() maki.ui.flash("old-generation") end,
+                on_cancel = function() makima.ui.flash("old-generation") end,
             } } },
             handler = function() end,
         })
@@ -232,12 +232,12 @@ fn callbacks_none_lifecycle_rejects_retired_generation() {
     host.load_source(
         "lifecycle_generation",
         r#"
-        maki.api.register_command({
+        makima.api.register_command({
             name = "/deploy",
             tui_only = false,
             arguments = { { name = "value", type = "string", completion = {
                 items = {},
-                on_cancel = function() maki.ui.flash("new-generation") end,
+                on_cancel = function() makima.ui.flash("new-generation") end,
             } } },
             handler = function() end,
         })

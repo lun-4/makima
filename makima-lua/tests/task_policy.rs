@@ -104,8 +104,8 @@ const SCENARIO_RAISE: &str = "raise";
 /// `makima.async` stays real; structured-output validation uses the real-driver tests.
 const STUB_PRELUDE: &str = r#"
 recorder = { prompts = {}, closed = 0, sessions = 0 }
-local register_tool = maki.api.register_tool
-maki.api.register_tool = function(spec)
+local register_tool = makima.api.register_tool
+makima.api.register_tool = function(spec)
   if spec.name == "task_wait" or spec.name == "task_send" then
     local handler = spec.handler
     spec.handler = function(input, ctx)
@@ -117,16 +117,16 @@ maki.api.register_tool = function(spec)
   return register_tool(spec)
 end
 
-maki.agent.resolve_model = function(ctx, opts)
+makima.agent.resolve_model = function(ctx, opts)
   recorder.resolve_opts = opts
   return { spec = "test/model" }
 end
 
-maki.agent.system_prompt = function(ctx, opts)
+makima.agent.system_prompt = function(ctx, opts)
   return "sys"
 end
 
-maki.agent.tools = function(ctx, opts)
+makima.agent.tools = function(ctx, opts)
   return {}
 end
 
@@ -157,7 +157,7 @@ behaviors.raise = function(agent, msg)
   error("@RAISE_MSG@")
 end
 
-maki.agent.spawn = function(ctx, opts)
+makima.agent.spawn = function(ctx, opts)
   recorder.sessions = recorder.sessions + 1
   recorder.has_local_tools = opts.local_tools ~= nil
   recorder.output_schema = opts.output_schema
@@ -200,15 +200,15 @@ maki.agent.spawn = function(ctx, opts)
   function agent:latest_turn(call_ctx)
     return nil
   end
-  function agent:_maki_session_id()
+  function agent:_makima_session_id()
     return opts.name
   end
-  function agent:_maki_task_owner()
+  function agent:_makima_task_owner()
     return {
-      _maki_can_control = function()
+      _makima_can_control = function()
         return recorder.can_control ~= false
       end,
-      _maki_retired = function()
+      _makima_retired = function()
         return false
       end,
     }
@@ -261,7 +261,7 @@ maki.agent.spawn = function(ctx, opts)
   return agent
 end
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "advance_runtime_turn",
   description = "control runtime-created tickets",
   schema = {
@@ -278,7 +278,7 @@ maki.api.register_tool({
   end,
 })
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "set_task_access",
   description = "set task access",
   schema = {
@@ -294,7 +294,7 @@ maki.api.register_tool({
   end,
 })
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "probe",
   description = "recorder snapshot",
   schema = { type = "object", properties = {}, additionalProperties = false },
@@ -315,7 +315,7 @@ maki.api.register_tool({
     if #recorder.prompts > 0 then
       snap.prompts = recorder.prompts
     end
-    return (maki.json.encode(snap))
+    return (makima.json.encode(snap))
   end,
 })
 "#;
@@ -359,8 +359,8 @@ fn load_task_host_in_mode(mode: &str) -> (Arc<ToolRegistry>, PluginHost) {
         .replace("@TICKET_LIMIT_BUSY_ERR@", TICKET_LIMIT_BUSY_ERR);
     let mode_stub = format!(
         r#"
-        local register_tool = maki.api.register_tool
-        maki.api.register_tool = function(spec)
+        local register_tool = makima.api.register_tool
+        makima.api.register_tool = function(spec)
             local handler = spec.handler
             spec.handler = function(input, ctx)
                 return handler(input, {{
@@ -1285,8 +1285,8 @@ fn unknown_task_errors_across_lifecycle_tools() {
 /// The real agent reuses the canned provider; model lookup and tool discovery stay stubbed.
 const REAL_DRIVER_PRELUDE: &str = r#"
 recorder = { sessions = 0 }
-local real_register_tool = maki.api.register_tool
-maki.api.register_tool = function(spec)
+local real_register_tool = makima.api.register_tool
+makima.api.register_tool = function(spec)
   if spec.name == "task_wait" then
     local handler = spec.handler
     spec.handler = function(input, ctx)
@@ -1297,32 +1297,32 @@ maki.api.register_tool = function(spec)
   return real_register_tool(spec)
 end
 
-local real_spawn = maki.agent.spawn
-maki.agent.spawn = function(ctx, opts)
+local real_spawn = makima.agent.spawn
+makima.agent.spawn = function(ctx, opts)
   recorder.sessions = recorder.sessions + 1
   opts.inherit_provider = true
   return real_spawn(ctx, opts)
 end
 
-maki.agent.resolve_model = function(ctx, opts)
+makima.agent.resolve_model = function(ctx, opts)
   return { spec = "anthropic/claude-sonnet-4-20250514" }
 end
 
-maki.agent.system_prompt = function(ctx, opts)
+makima.agent.system_prompt = function(ctx, opts)
   return "sys"
 end
 
-maki.agent.tools = function(ctx, opts)
+makima.agent.tools = function(ctx, opts)
   return nil
 end
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "probe",
   description = "recorder snapshot",
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "main" },
   handler = function()
-    return maki.json.encode({ sessions = recorder.sessions, wait_entered = recorder.wait_entered })
+    return makima.json.encode({ sessions = recorder.sessions, wait_entered = recorder.wait_entered })
   end,
 })
 "#;
@@ -2098,7 +2098,7 @@ fn real_schema_missing_report_fails_boundedly() {
 /// General subagents see the lifecycle tools, so a real child can spawn and
 /// wait on a grandchild of its own.
 const NESTED_LIFECYCLE_TOOLS_PRELUDE: &str = r#"
-maki.agent.tools = function(ctx, opts)
+makima.agent.tools = function(ctx, opts)
   if opts.audience ~= "general_sub" then
     return nil
   end

@@ -1,6 +1,6 @@
 local local_server = require("providers.local_server")
 local ollama = require("providers.ollama")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local HOST = "http://box:11434"
 local CLOUD_ROOT = "https://ollama.com"
@@ -9,7 +9,7 @@ local CONTEXT_LENGTH = 128000
 local spec = local_server.provider(ollama.def)
 
 local function json(value, opts)
-  return t.response({ assert(maki.json.encode(value)) }, opts)
+  return t.response({ assert(makima.json.encode(value)) }, opts)
 end
 
 -- Shaped like a real `POST /api/show` body.
@@ -71,8 +71,8 @@ t.case("discovery_shows_each_model", function()
   t.eq(ctx.requests[2].method, "POST")
   t.eq(ctx.requests[2].headers.Authorization, "Bearer k")
   t.eq(ctx.requests[2].headers["Content-Type"], "application/json")
-  t.eq(maki.json.decode(ctx.requests[2].body).model, "alpha")
-  t.eq(maki.json.decode(ctx.requests[3].body).model, "zeta")
+  t.eq(makima.json.decode(ctx.requests[2].body).model, "alpha")
+  t.eq(makima.json.decode(ctx.requests[3].body).model, "zeta")
   t.same(models, {
     {
       id = "alpha",

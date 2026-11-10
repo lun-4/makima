@@ -283,7 +283,7 @@ local function create(ui)
     return nil, http.config_error(M.EMPTY_URL)
   end
   local env = M.key_env(id)
-  local _, save_err = maki.api.save_provider_config(id, {
+  local _, save_err = makima.api.save_provider_config(id, {
     display_name = "Custom (" .. id .. ")",
     protocol = protocol,
     base_url = base_url,
