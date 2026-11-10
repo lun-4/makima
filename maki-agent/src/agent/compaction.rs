@@ -17,7 +17,7 @@ use super::streaming::{
 use crate::cancel::CancelToken;
 use crate::{AgentError, AgentEvent, EventSender, TurnCompleteEvent};
 
-const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
+const CONTINUE_AFTER_COMPACT: &str = "Continue with the next step; do not stop just because the turn ended, and only ask for clarification if you are genuinely blocked. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
 
 const MAX_RESERVED_PERCENT: u32 = 50;
 
