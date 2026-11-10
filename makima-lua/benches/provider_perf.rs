@@ -35,7 +35,7 @@ const SOURCE: &str = r#"
         usage = { input_tokens = 1, output_tokens = 1 },
         stop_reason = "end_turn",
     }
-    maki.api.register_provider({
+    makima.api.register_provider({
         id = "bench",
         display_name = "Bench",
         models = { { id = "bench-1", context_window = 1000000, tier = "strong" } },
@@ -44,7 +44,7 @@ const SOURCE: &str = r#"
                 stream = function(ctx, request, emit)
                     if request.system == "encode" then
                         for _, message in ipairs(request.messages) do
-                            maki.json.encode(message)
+                            makima.json.encode(message)
                         end
                     end
                     return DONE

@@ -342,7 +342,7 @@ fn skill_handler_uses_atomic_write() {
     let (registry, _host) = boot_with_watch(&watch, &["skill"]);
     let ctx = shared_ctx(&registry);
 
-    let done = dispatch(&ctx, "s1", "skill", json!({"name": "maki-plugin-dev"}));
+    let done = dispatch(&ctx, "s1", "skill", json!({"name": "makima-plugin-dev"}));
     assert!(!done.is_error, "skill failed: {}", done.output.as_text());
     assert!(
         watch.atomic.load(Ordering::SeqCst),

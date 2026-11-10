@@ -156,8 +156,8 @@ mod tests {
     use crate::api::create_makima_global;
     use crate::plugin_permissions::PluginPermissions;
 
-    fn resolve_table(maki: &Table, path: &str) -> Table {
-        let mut table = maki.clone();
+    fn resolve_table(makima: &Table, path: &str) -> Table {
+        let mut table = makima.clone();
         for seg in path.split('.').skip(1) {
             table = table
                 .get(seg)
@@ -179,7 +179,7 @@ mod tests {
     fn docs_match_registered_api() {
         let lua = Lua::new();
         let (ui_tx, _ui_rx) = flume::unbounded();
-        let maki = create_makima_global(
+        let makima = create_makima_global(
             &lua,
             crate::api::PluginLoadContext {
                 pending: Arc::default(),
@@ -243,8 +243,8 @@ mod tests {
         }
 
         for (name, mut expected) in documented {
-            let actual = table_keys(&resolve_table(&maki, name));
-            if name == "maki" {
+            let actual = table_keys(&resolve_table(&makima, name));
+            if name == "makima" {
                 // Documented here, but injected later by the runtime.
                 expected.remove("setup");
                 // Handled via metatable __index for __newindex assignment interception.

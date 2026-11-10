@@ -528,7 +528,7 @@ fn exec_autocmds(
 }
 
 lua_table! {
-    extend "maki.api" => pub(crate) fn add_autocmd_methods(pending: PendingAutocmdStore, plugin: Arc<str>), DOCS [
+    extend "makima.api" => pub(crate) fn add_autocmd_methods(pending: PendingAutocmdStore, plugin: Arc<str>), DOCS [
         create_autocmd(pending, plugin), del_autocmd(pending, plugin), exec_autocmds(pending, plugin),
     ]
 }

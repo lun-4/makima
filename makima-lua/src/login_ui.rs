@@ -141,5 +141,5 @@ lua_class! {
     ///
     /// The CLI or the TUI shows it. `input` and `choice` wait for the user. The notices `instructions`,
     /// `device_code` and `open_browser` return at once. `run` waits for a program on the terminal.
-    "maki.provider.LoginUi" => LoginUi, LOGIN_UI_DOCS [input, choice, instructions, device_code, open_browser, run]
+    "makima.provider.LoginUi" => LoginUi, LOGIN_UI_DOCS [input, choice, instructions, device_code, open_browser, run]
 }

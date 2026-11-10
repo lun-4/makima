@@ -173,7 +173,7 @@ lua_table! {
     /// -- work...
     /// print(makima.time.ago(t0))
     /// ```
-    "maki.time" => pub(crate) fn create_time_table(), DOCS [
+    "makima.time" => pub(crate) fn create_time_table(), DOCS [
         now, at, ago,
     ]
 }

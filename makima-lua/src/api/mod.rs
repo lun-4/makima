@@ -82,7 +82,7 @@ pub(crate) fn create_makima_global(
     permissions: &PluginPermissions,
     opts: PluginOpts,
 ) -> LuaResult<(Table, PluginCtx)> {
-    let maki = lua.create_table()?;
+    let makima = lua.create_table()?;
     lua.set_app_data(context.pending_prompts.clone());
     lua.set_app_data(context.pending_hint.clone());
 
@@ -96,16 +96,16 @@ pub(crate) fn create_makima_global(
     lua.set_app_data(context.pending_slots.clone());
     slot::add_slot_methods(&api, lua, Arc::clone(&plugin))?;
     api.set("mode", mode::create_mode_table(lua)?)?;
-    maki.set("api", &api)?;
-    maki.set("env", env::create_env_table(lua, permissions)?)?;
-    maki.set("fs", fs::create_fs_table(lua, permissions)?)?;
-    maki.set("log", log::create_log_table(lua, Arc::clone(&plugin))?)?;
-    maki.set("treesitter", treesitter::create_treesitter_table(lua)?)?;
-    maki.set("uv", uv::create_uv_table(lua, permissions)?)?;
-    maki.set("base64", base64::create_base64_table(lua)?)?;
-    maki.set("image", image::create_image_table(lua)?)?;
-    maki.set("json", json::create_json_table(lua)?)?;
-    maki.set("yaml", yaml::create_yaml_table(lua)?)?;
+    makima.set("api", &api)?;
+    makima.set("env", env::create_env_table(lua, permissions)?)?;
+    makima.set("fs", fs::create_fs_table(lua, permissions)?)?;
+    makima.set("log", log::create_log_table(lua, Arc::clone(&plugin))?)?;
+    makima.set("treesitter", treesitter::create_treesitter_table(lua)?)?;
+    makima.set("uv", uv::create_uv_table(lua, permissions)?)?;
+    makima.set("base64", base64::create_base64_table(lua)?)?;
+    makima.set("image", image::create_image_table(lua)?)?;
+    makima.set("json", json::create_json_table(lua)?)?;
+    makima.set("yaml", yaml::create_yaml_table(lua)?)?;
     let net = net::create_net_table(lua, permissions)?;
     let root = PluginCtx::root(lua, root_name, net.get("send")?)?;
     provider::add_provider_fn(
@@ -116,26 +116,26 @@ pub(crate) fn create_makima_global(
         root.clone(),
         permissions,
     )?;
-    maki.set("net", net)?;
-    maki.set("credentials", create_credentials_table(lua)?)?;
-    maki.set("crypto", crypto::create_crypto_table(lua)?)?;
-    maki.set("host", host::create_host_table(lua, permissions)?)?;
-    maki.set("text", text::create_text_table(lua)?)?;
-    maki.set("match", r#match::create_match_table(lua)?)?;
-    maki.set(
+    makima.set("net", net)?;
+    makima.set("credentials", create_credentials_table(lua)?)?;
+    makima.set("crypto", crypto::create_crypto_table(lua)?)?;
+    makima.set("host", host::create_host_table(lua, permissions)?)?;
+    makima.set("text", text::create_text_table(lua)?)?;
+    makima.set("match", r#match::create_match_table(lua)?)?;
+    makima.set(
         "store",
         store::create_store_table(lua, context.pending_store.clone(), Arc::clone(&plugin))?,
     )?;
-    maki.set(
+    makima.set(
         "session",
         session::create_session_table(lua, ui_action_tx.clone())?,
     )?;
-    maki.set("model", model::create_model_table(lua)?)?;
-    maki.set(
+    makima.set("model", model::create_model_table(lua)?)?;
+    makima.set(
         "usage",
         usage::create_usage_table(lua, ui_action_tx.clone(), Arc::clone(&plugin))?,
     )?;
-    maki.set(
+    makima.set(
         "ui",
         ui::create_ui_table(
             lua,
@@ -144,29 +144,29 @@ pub(crate) fn create_makima_global(
             Some(context.pending_hint.clone()),
         )?,
     )?;
-    maki.set(
+    makima.set(
         "fn",
         r#fn::create_fn_table(lua, Arc::clone(&plugin), permissions, ui_action_tx.clone())?,
     )?;
-    split::split__register(&maki, lua)?;
-    maki.set("async", r#async::create_async_table(lua)?)?;
-    maki.set(
+    split::split__register(&makima, lua)?;
+    makima.set("async", r#async::create_async_table(lua)?)?;
+    makima.set(
         "interpreter",
         interpreter::create_interpreter_table(lua, permissions)?,
     )?;
-    maki.set("agent", agent::create_agent_table(lua)?)?;
-    maki.set(
+    makima.set("agent", agent::create_agent_table(lua)?)?;
+    makima.set(
         "keymap",
         keymap::create_keymap_table(lua, context.pending_keymaps.clone(), Arc::clone(&plugin))?,
     )?;
-    maki.set(
+    makima.set(
         "timer",
         timer::create_timer_table(lua, context.pending_timers.clone(), Arc::clone(&plugin))?,
     )?;
-    maki.set("time", time::create_time_table(lua)?)?;
-    maki.set("perf", perf::create_perf_table(lua)?)?;
-    crate::splash::register_version_api(lua, &maki)?;
-    top::add_top_methods(&maki, lua, Arc::clone(&plugin))?;
+    makima.set("time", time::create_time_table(lua)?)?;
+    makima.set("perf", perf::create_perf_table(lua)?)?;
+    crate::splash::register_version_api(lua, &makima)?;
+    top::add_top_methods(&makima, lua, Arc::clone(&plugin))?;
 
     // `notify` sits on the metatable's `__index` rather than on the table
     // itself, because Lua only fires `__newindex` for keys missing from the
@@ -184,7 +184,7 @@ pub(crate) fn create_makima_global(
     let meta = lua.create_table()?;
     meta.set("__index", index)?;
     meta.set("__newindex", notify_router)?;
-    maki.set_metatable(Some(meta))?;
+    makima.set_metatable(Some(meta))?;
 
-    Ok((maki, root))
+    Ok((makima, root))
 }

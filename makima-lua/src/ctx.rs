@@ -216,7 +216,7 @@ lua_class! {
     /// callbacks receive, also has `id` (the provider id) and `credentials`
     /// (the provider's `makima.credentials.Store`); a `stream` call's ctx also
     /// has `mark_request_delivery`, described on `makima.api.register_provider`.
-    "maki.Ctx" => Ctx, CTX_DOCS [with_name] fields ctx_fields
+    "makima.Ctx" => Ctx, CTX_DOCS [with_name] fields ctx_fields
 }
 
 #[cfg(test)]

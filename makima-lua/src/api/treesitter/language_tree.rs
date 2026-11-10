@@ -186,5 +186,5 @@ lua_class! {
     ///   local root = trees[1]:root()
     /// end
     /// ```
-    "maki.treesitter.LanguageTree" => LuaLanguageTree, DOCS [parse, lang, children, trees, source, is_valid, for_each_tree, included_regions, contains, destroy]
+    "makima.treesitter.LanguageTree" => LuaLanguageTree, DOCS [parse, lang, children, trees, source, is_valid, for_each_tree, included_regions, contains, destroy]
 }

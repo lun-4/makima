@@ -10,7 +10,7 @@ use crate::api::util::convert::json_to_lua;
 use crate::api::util::dispatch::call_isolated;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 
-const CALLBACK_SEAM: &str = "maki.usage.on_change";
+const CALLBACK_SEAM: &str = "makima.usage.on_change";
 
 #[derive(Default)]
 pub(crate) struct UsageMirror {
@@ -145,7 +145,7 @@ lua_table! {
     /// `fetch` asks the interactive UI to refresh it, and `on_change` observes
     /// canonical publications. Without an interactive UI `get` stays nil,
     /// `fetch` returns `nil, "no interactive UI attached"`, and callbacks are idle.
-    "maki.usage" => pub(crate) fn create_usage_table(
+    "makima.usage" => pub(crate) fn create_usage_table(
         tx: Option<flume::Sender<UiAction>>,
         plugin: Arc<str>,
     ), DOCS [get, fetch(tx), on_change(plugin)]

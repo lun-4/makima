@@ -205,7 +205,7 @@ mod tests {
                 Box::pin(async { BackendResult::CompactDone })
             }
         }
-        // The actor exposes ticket settlement without making the helper depend on ticket internals.
+        // The actor exposes ticket settlement without makimang the helper depend on ticket internals.
         let (actor, task) =
             AgentActorHandle::spawn(AgentId::generate(), Vec::new(), None, Box::new(Backend));
         let ticket = actor

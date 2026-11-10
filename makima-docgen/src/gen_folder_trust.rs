@@ -85,7 +85,7 @@ Answer in advance for paths you already trust:"#;
 
 /// The configuration page prints this same block, so the two cannot drift.
 pub const POLICY_EXAMPLE: &str = r#"```lua
-maki.setup({
+makima.setup({
     trust = {
         paths = { "~/src/me/*", "/workspace" },
         prompt = false,
@@ -134,7 +134,7 @@ In an image you build yourself, a [trust policy](#trust-policy) in the global
 `init.lua` covers every run without a flag on each command:
 
 ```lua
-maki.setup({
+makima.setup({
     trust = { paths = { "/workspace/**" } },
 })
 ```

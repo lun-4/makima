@@ -67,7 +67,7 @@ local function find_project_ancestors(cwd)
 end
 
 local opts = maki.api.register_options({
-  plugin_dev = { default = true, desc = "Offer the builtin maki-plugin-dev skill for writing maki plugins." },
+  plugin_dev = { default = true, desc = "Offer the builtin makima-plugin-dev skill for writing makima plugins." },
 })
 
 local ok, builtin, reference = pcall(function()

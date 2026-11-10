@@ -127,7 +127,7 @@ fn write_mouse_binds(out: &mut String) {
 
 fn write_plugin_binds(out: &mut String) {
     out.push_str("\n## Plugins\n\n");
-    out.push_str("Built-in plugins register these themselves, and your own plugins can add more with `maki.keymap.set`:\n\n");
+    out.push_str("Built-in plugins register these themselves, and your own plugins can add more with `makima.keymap.set`:\n\n");
     out.push_str("| Key | Action |\n|-----|--------|\n");
     for (key, desc) in PLUGIN_BINDS {
         out.push_str(&format!("| {key} | {desc} |\n"));
@@ -187,7 +187,7 @@ fn write_overrides(out: &mut String) {
     out.push_str("\n## Overriding Keybindings\n\n");
     out.push_str(
         "Plugins and `init.lua` can rebind keys at runtime with \
-         `maki.keymap.set` and `maki.keymap.del`. The tables above are the \
+         `makima.keymap.set` and `makima.keymap.del`. The tables above are the \
          built-in defaults. An override on the same key wins, unless a \
          modal or overlay is open (help, plan form, permission prompt).\n\n",
     );
@@ -196,10 +196,10 @@ fn write_overrides(out: &mut String) {
         "1. **Suspend** (`Ctrl+Z`, Unix). Always wins, non-remappable.\n\
          2. **Modal and overlay keys.** An open modal or picker consumes \
          its keys first, so they cannot be shadowed while open.\n\
-         3. **Lua overrides** from `maki.keymap.set`. Last set wins; \
+         3. **Lua overrides** from `makima.keymap.set`. Last set wins; \
          binding the same key twice warns.\n\
          4. **Built-in defaults.** An override on the same key shadows \
-         them; `maki.keymap.del` lifts the override so the default returns. \
+         them; `makima.keymap.del` lifts the override so the default returns. \
          Suspend is the only binding outside this layer, so every key is \
          remappable except `Ctrl+Z`.\n\n",
     );

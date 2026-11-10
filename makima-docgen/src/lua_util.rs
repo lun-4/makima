@@ -79,7 +79,12 @@ fn is_register_command(node: Node<'_>, source: &str) -> bool {
     let Some(name) = node.child_by_field_name("name") else {
         return false;
     };
-    expression_path(name, source).is_some_and(|path| path == ["maki", "api", "register_command"])
+    expression_path(name, source).is_some_and(|path| {
+        path.len() == 3
+            && (path[0] == "makima" || path[0] == "maki")
+            && path[1] == "api"
+            && path[2] == "register_command"
+    })
 }
 
 fn expression_path(node: Node<'_>, source: &str) -> Option<Vec<String>> {
@@ -821,14 +826,14 @@ mod tests {
     #[test]
     fn parses_static_command_forms() {
         let source = r#"
-            (maki["api"].register_command) {
+            (makima["api"].register_command) {
                 ["name"] = "/one",
                 description = [[first\nsecond]],
                 tui_only = false,
                 arguments = {},
                 handler = function() end,
             }
-            maki.api.register_command({
+            makima.api.register_command({
                 name = "/two", description = "Two", tui_only = true, arguments = { raw = true },
             })
         "#;
@@ -850,7 +855,7 @@ mod tests {
     #[test]
     fn parses_typed_and_raw_arguments() {
         let source = r#"
-            maki.api.register_command({
+            makima.api.register_command({
                 name = "/typed",
                 description = "Typed",
                 tui_only = false,
@@ -871,7 +876,7 @@ mod tests {
                     { name = "paths", type = "directory", variadic = true },
                 },
             })
-            maki.api.register_command({
+            makima.api.register_command({
                 name = "/raw",
                 description = "Raw",
                 tui_only = false,
@@ -915,7 +920,7 @@ mod tests {
     )]
     fn rejects_unknown_typed_argument_fields(descriptor: &str, expected: &str) {
         let source = format!(
-            r#"maki.api.register_command({{
+            r#"makima.api.register_command({{
                 name = "/typed",
                 description = "Typed",
                 tui_only = false,
@@ -928,7 +933,7 @@ mod tests {
 
     #[test]
     fn accepts_completion_field_in_typed_argument_docs() {
-        let source = r#"maki.api.register_command({
+        let source = r#"makima.api.register_command({
             name = "/typed",
             description = "Typed",
             tui_only = false,
@@ -942,8 +947,8 @@ mod tests {
     #[test]
     fn ignores_non_registration_syntax() {
         let source = r#"
-            -- maki.api.register_command({ name = "/comment" })
-            local text = "maki.api.register_command({ name = '/string' })"
+            -- makima.api.register_command({ name = "/comment" })
+            local text = "makima.api.register_command({ name = '/string' })"
             other.api.register_command({ name = "/other", description = "x", tui_only = true })
         "#;
         assert!(parse_lua_commands(source).expect("source").is_empty());
@@ -952,9 +957,9 @@ mod tests {
     #[test]
     fn rejects_missing_outer_metadata() {
         let source = r#"
-            maki.api.register_command({
+            makima.api.register_command({
                 handler = function()
-                    maki.api.register_command({ name = "/inner", description = "inner", tui_only = true })
+                    makima.api.register_command({ name = "/inner", description = "inner", tui_only = true })
                 end,
             })
         "#;
@@ -964,17 +969,18 @@ mod tests {
 
     #[test]
     fn rejects_invalid_source() {
-        let error = parse_lua_commands("maki.api.register_command({").expect_err("invalid source");
+        let error =
+            parse_lua_commands("makima.api.register_command({").expect_err("invalid source");
         assert!(error.to_string().contains("line 1 column"));
         assert!(error.to_string().contains("malformed Lua syntax"));
     }
 
-    #[test_case("maki.api.register_command(command)"; "variable argument")]
-    #[test_case("maki.api.register_command({ name = name, description = \"x\", tui_only = true })"; "computed string")]
-    #[test_case("maki.api.register_command({ name = \"x\", description = \"x\", tui_only = enabled })"; "computed boolean")]
-    #[test_case("maki.api.register_command({ [key] = \"x\", name = \"x\", description = \"x\", tui_only = true })"; "computed key")]
-    #[test_case("maki.api.register_command({ name = \"x\", name = \"y\", description = \"x\", tui_only = true })"; "duplicate field")]
-    #[test_case("maki.api.register_command({ name = \"x\", description = \"x\" })"; "missing field")]
+    #[test_case("makima.api.register_command(command)"; "variable argument")]
+    #[test_case("makima.api.register_command({ name = name, description = \"x\", tui_only = true })"; "computed string")]
+    #[test_case("makima.api.register_command({ name = \"x\", description = \"x\", tui_only = enabled })"; "computed boolean")]
+    #[test_case("makima.api.register_command({ [key] = \"x\", name = \"x\", description = \"x\", tui_only = true })"; "computed key")]
+    #[test_case("makima.api.register_command({ name = \"x\", name = \"y\", description = \"x\", tui_only = true })"; "duplicate field")]
+    #[test_case("makima.api.register_command({ name = \"x\", description = \"x\" })"; "missing field")]
     fn rejects_unsupported_command_metadata(source: &str) {
         let error = parse_lua_commands(source).expect_err("unsupported declaration");
         assert!(error.to_string().contains("line 1 column"));
@@ -988,12 +994,12 @@ mod tests {
         fs::create_dir(root.path().join("empty")).expect("empty");
         fs::write(
             root.path().join("first/init.lua"),
-            "maki.api.register_command({name=\"/z\",description=\"z\",tui_only=false,arguments={}})",
+            "makima.api.register_command({name=\"/z\",description=\"z\",tui_only=false,arguments={}})",
         )
         .expect("first source");
         fs::write(
             root.path().join("second/init.lua"),
-            "maki.api.register_command({name=\"/a\",description=\"a\",tui_only=true,arguments={raw=true}})",
+            "makima.api.register_command({name=\"/a\",description=\"a\",tui_only=true,arguments={raw=true}})",
         )
         .expect("second source");
         let commands = load_plugin_commands(root.path()).expect("commands");
@@ -1011,7 +1017,7 @@ mod tests {
         let root = tempdir().expect("tempdir");
         let plugin = root.path().join("broken");
         fs::create_dir(&plugin).expect("plugin");
-        fs::write(plugin.join("init.lua"), "maki.api.register_command({").expect("source");
+        fs::write(plugin.join("init.lua"), "makima.api.register_command({").expect("source");
         let error = load_plugin_commands(root.path()).expect_err("invalid source");
         assert!(error.to_string().contains("broken/init.lua"));
     }

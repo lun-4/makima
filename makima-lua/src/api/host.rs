@@ -55,7 +55,7 @@ lua_table! {
     /// ```lua
     /// makima.host.open("https://example.com")
     /// ```
-    "maki.host" => pub(crate) fn create_host_table(perms: &PluginPermissions), DOCS [
+    "makima.host" => pub(crate) fn create_host_table(perms: &PluginPermissions), DOCS [
         open(perms),
         keyring_get(perms),
     ]

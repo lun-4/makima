@@ -53,7 +53,7 @@ lua_class! {
     /// Create one with `makima.async.semaphore(n)`, then call `:acquire()` to
     /// get a permit before doing work. If the task is cancelled, the acquire
     /// is cancelled too.
-    "maki.async.Semaphore" => LuaSemaphore, SEMAPHORE_DOCS [acquire]
+    "makima.async.Semaphore" => LuaSemaphore, SEMAPHORE_DOCS [acquire]
 }
 
 /// Give the permit back to the semaphore so another task can acquire it.
@@ -77,7 +77,7 @@ lua_class! {
     ///
     /// The slot is held until you call `:release()` or until the permit is
     /// garbage collected. Releasing early lets other tasks acquire sooner.
-    "maki.async.Permit" => LuaPermit, PERMIT_DOCS [release]
+    "makima.async.Permit" => LuaPermit, PERMIT_DOCS [release]
 }
 
 /// Fire off a function as a new async task. It runs in the background and
@@ -244,19 +244,19 @@ const await__doc: FnDoc = FnDoc {
     ],
     returns: "(...) Values passed by the caller to the injected callback.",
     guard: None,
-    example: "local result = maki.async.await(2, http.get, url)",
+    example: "local result = makima.async.await(2, http.get, url)",
 };
 
 #[allow(non_upper_case_globals)]
 const wrap__doc: FnDoc = FnDoc {
     name: "wrap",
     args: "{argc}, {fn}",
-    desc: "Create a coroutine-friendly wrapper around a callback-based function. The wrapper calls `maki.async.await` for you, so you can use the result like a normal function call.",
+    desc: "Create a coroutine-friendly wrapper around a callback-based function. The wrapper calls `makima.async.await` for you, so you can use the result like a normal function call.",
     params: &[
         ParamDoc {
             name: "{argc}",
             ty: "integer",
-            desc: "Callback position, forwarded to `maki.async.await`.",
+            desc: "Callback position, forwarded to `makima.async.await`.",
         },
         ParamDoc {
             name: "{fn}",
@@ -266,7 +266,7 @@ const wrap__doc: FnDoc = FnDoc {
     ],
     returns: "(function) Wrapped function you can call like a normal function.",
     guard: None,
-    example: "local get = maki.async.wrap(2, http.get)\nlocal body = get(url)",
+    example: "local get = makima.async.wrap(2, http.get)\nlocal body = get(url)",
 };
 
 #[allow(non_upper_case_globals)]
@@ -288,7 +288,7 @@ const join__doc: FnDoc = FnDoc {
     ],
     returns: "",
     guard: None,
-    example: "maki.async.join(4, {\n  function() process(files[1]) end,\n  function() process(files[2]) end,\n  function() process(files[3]) end,\n})",
+    example: "makima.async.join(4, {\n  function() process(files[1]) end,\n  function() process(files[2]) end,\n  function() process(files[3]) end,\n})",
 };
 
 lua_table! {
@@ -305,7 +305,7 @@ lua_table! {
     ///   function() return fetch("b.txt") end,
     /// })
     /// ```
-    extend "maki.async" => pub(crate) fn add_async_fns(), DOCS [
+    extend "makima.async" => pub(crate) fn add_async_fns(), DOCS [
         run, manual r#await, manual wrap, manual join, gather, semaphore, on_cancel,
     ]
 }
@@ -320,7 +320,7 @@ pub(crate) fn create_async_table(lua: &Lua) -> LuaResult<Table> {
             let mut args_vec: Vec<Value> = args.into_vec();
             if args_vec.len() < AWAIT_MIN_ARGS {
                 return Err(mlua::Error::runtime(
-                    "maki.async.await requires at least 2 arguments: argc, fun, ...",
+                    "makima.async.await requires at least 2 arguments: argc, fun, ...",
                 ));
             }
             let argc = match &args_vec[0] {
@@ -419,7 +419,8 @@ mod tests {
     use super::*;
     use crate::runtime::{CANCELLED_MSG, TaskCell, TaskScope, block_on_or_fail};
 
-    const ERR_TOO_FEW_ARGS: &str = "maki.async.await requires at least 2 arguments: argc, fun, ...";
+    const ERR_TOO_FEW_ARGS: &str =
+        "makima.async.await requires at least 2 arguments: argc, fun, ...";
     const ERR_ARGC_GE_1: &str = "argc must be >= 1";
     const ERR_ARGC_INTEGER: &str = "argc must be an integer";
     const ERR_SECOND_ARG_FN: &str = "second argument must be a function";

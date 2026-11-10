@@ -662,7 +662,7 @@ lua_table! {
     /// local text, err = makima.fs.read("init.lua")
     /// if err then return end
     /// ```
-    "maki.fs" => pub(crate) fn create_fs_table(perms: &PluginPermissions), DOCS [
+    "makima.fs" => pub(crate) fn create_fs_table(perms: &PluginPermissions), DOCS [
         read(perms), read_bytes(perms), metadata(perms), dirname, basename,
         joinpath, normalize, abspath, parents, root(perms), relpath, ext,
         dir(perms), write(perms), atomic_write(perms), rm(perms), mkdir(perms),

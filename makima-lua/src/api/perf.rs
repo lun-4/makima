@@ -34,7 +34,7 @@ lua_table! {
     /// Performance instrumentation for splashes and the UI. The host
     /// measures splash renders; plugins read the timings and draw their own
     /// readouts.
-    "maki.perf" => pub(crate) fn create_perf_table(), DOCS [timings]
+    "makima.perf" => pub(crate) fn create_perf_table(), DOCS [timings]
 }
 
 #[cfg(test)]

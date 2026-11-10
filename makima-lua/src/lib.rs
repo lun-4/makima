@@ -379,7 +379,7 @@ pub mod test_support {
 
     /// Synthetic state dir for hosts booted by [`spawn_host_for_tests`].
     /// Never created on the real disk; hosts run on the in-memory backend.
-    pub const TEST_STATE_DIR: &str = "/maki-test-state";
+    pub const TEST_STATE_DIR: &str = "/makima-test-state";
 
     pub use crate::api::fs::{InMemoryFs, InMemoryOffloadBackend};
 

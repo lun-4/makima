@@ -136,7 +136,7 @@ lua_class! {
     ///
     /// Get one from `makima.image.decode()`. The image data lives in memory
     /// until the handle is garbage collected.
-    "maki.image.Image" => LuaImage, IMAGE_DOCS [width, height, resize, encode]
+    "makima.image.Image" => LuaImage, IMAGE_DOCS [width, height, resize, encode]
 }
 
 /// Read image metadata (format, dimensions) from raw bytes without fully
@@ -190,7 +190,7 @@ lua_table! {
     /// local small = img:resize(1024, 768)
     /// local png = small:encode("png")
     /// ```
-    "maki.image" => pub(crate) fn create_image_table(), DOCS [
+    "makima.image" => pub(crate) fn create_image_table(), DOCS [
         probe, decode,
     ]
 }

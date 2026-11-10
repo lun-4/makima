@@ -467,5 +467,5 @@ lua_class! {
     ///   print(child:type(), field)
     /// end
     /// ```
-    "maki.treesitter.Node" => LuaNode, DOCS [r#type, symbol, id, range, start, end_, byte_length, child, named_child, child_count, named_child_count, children, named_children, iter_children, field, parent, next_sibling, prev_sibling, next_named_sibling, prev_named_sibling, child_with_descendant, descendant_for_range, named_descendant_for_range, named, extra, missing, has_error, has_changes, equal, sexpr, tree]
+    "makima.treesitter.Node" => LuaNode, DOCS [r#type, symbol, id, range, start, end_, byte_length, child, named_child, child_count, named_child_count, children, named_children, iter_children, field, parent, next_sibling, prev_sibling, next_named_sibling, prev_named_sibling, child_with_descendant, descendant_for_range, named_descendant_for_range, named, extra, missing, has_error, has_changes, equal, sexpr, tree]
 }

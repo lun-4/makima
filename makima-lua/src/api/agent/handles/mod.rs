@@ -38,7 +38,7 @@ pub(crate) struct LuaAgent {
 }
 
 impl LuaAgent {
-    /// The autocmd filter for this agent's events, making sure its graph
+    /// The autocmd filter for this agent's events, makimang sure its graph
     /// feeds this host.
     pub(crate) fn listen(&self, lua: &Lua) -> crate::api::autocmd::AgentFilter {
         crate::agent_autocmd::observe(lua, &self.manager);
@@ -171,7 +171,7 @@ fn reference_id(_lua: &Lua, this: &LuaAgentRef) -> mlua::Result<Pair<String>> {
 
 lua_class! {
     /// Visibility-only identity. Resolve with get(ctx, reference) to request control.
-    "maki.agent.AgentRef" => LuaAgentRef, REF_DOCS [reference_id]
+    "makima.agent.AgentRef" => LuaAgentRef, REF_DOCS [reference_id]
 }
 
 #[cfg(test)]
@@ -560,17 +560,17 @@ mod tests {
                 .load_source(
                     PLUGIN,
                     r#"
-                    maki.api.register_command({
+                    makima.api.register_command({
                         name = "/editor", tui_only = false,
                         handler = function(_, ctx)
                             local agent = assert(ctx:agent())
-                            local code = maki.ui.open_editor("plan.md")
-                            maki.ui.flash(agent:id() .. "|" .. tostring(code))
+                            local code = makima.ui.open_editor("plan.md")
+                            makima.ui.flash(agent:id() .. "|" .. tostring(code))
                         end,
                     })
-                    maki.api.register_command({
+                    makima.api.register_command({
                         name = "/edit", tui_only = false,
-                        handler = function(_, ctx) assert(maki.api.run_command(ctx, "/editor")) end,
+                        handler = function(_, ctx) assert(makima.api.run_command(ctx, "/editor")) end,
                     })
                     "#,
                 )

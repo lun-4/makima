@@ -185,7 +185,7 @@ lua_table! {
     /// makima.treesitter.language.add("lua")
     /// makima.treesitter.language.register("lua", "luau")
     /// ```
-    extend "maki.treesitter.language" => fn language_fns(reg: Arc<Mutex<LangRegistry>>), DOCS [
+    extend "makima.treesitter.language" => fn language_fns(reg: Arc<Mutex<LangRegistry>>), DOCS [
         add, register(reg), get_lang(reg), get_filetypes(reg), inspect,
     ]
 }

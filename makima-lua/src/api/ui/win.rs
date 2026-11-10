@@ -345,7 +345,7 @@ lua_class! {
     /// end
     /// win:close()
     /// ```
-    "maki.ui.Win" => WinHandle, DOCS [manual recv, set_config, set_cursor, close, is_open, show, hide, is_visible] fields win_fields, extra win_extra
+    "makima.ui.Win" => WinHandle, DOCS [manual recv, set_config, set_cursor, close, is_open, show, hide, is_visible] fields win_fields, extra win_extra
 }
 
 #[cfg(test)]

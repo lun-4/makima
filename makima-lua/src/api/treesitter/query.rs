@@ -41,7 +41,7 @@ const iter_captures__doc: FnDoc = FnDoc {
     ],
     returns: "(function) Iterator yielding (integer, Node, table, table, integer).",
     guard: None,
-    example: "local q = maki.treesitter.query.parse(\"lua\", \"(identifier) @id\")\nfor idx, node, meta in q:iter_captures(root, source) do\n  print(idx, node:type())\nend",
+    example: "local q = makima.treesitter.query.parse(\"lua\", \"(identifier) @id\")\nfor idx, node, meta in q:iter_captures(root, source) do\n  print(idx, node:type())\nend",
 };
 
 #[allow(non_upper_case_globals)]
@@ -73,7 +73,7 @@ const iter_matches__doc: FnDoc = FnDoc {
     ],
     returns: "(function) Iterator yielding (integer, table, table, integer).",
     guard: None,
-    example: "local q = maki.treesitter.query.parse(\"lua\", \"(function_declaration name: (identifier) @name)\"\n)\nfor pat, captures, meta in q:iter_matches(root, source) do\n  for cap_idx, nodes in pairs(captures) do\n    print(nodes[1]:type())\n  end\nend",
+    example: "local q = makima.treesitter.query.parse(\"lua\", \"(function_declaration name: (identifier) @name)\"\n)\nfor pat, captures, meta in q:iter_matches(root, source) do\n  for cap_idx, nodes in pairs(captures) do\n    print(nodes[1]:type())\n  end\nend",
 };
 
 pub(crate) struct LuaQuery {
@@ -118,7 +118,7 @@ lua_class! {
     ///   print(node:type())
     /// end
     /// ```
-    "maki.treesitter.Query" => LuaQuery, QUERY_DOCS [manual iter_captures, manual iter_matches] fields query_fields, extra query_methods
+    "makima.treesitter.Query" => LuaQuery, QUERY_DOCS [manual iter_captures, manual iter_matches] fields query_fields, extra query_methods
 }
 
 /// Compiles a tree-sitter query string for {lang}.
@@ -159,7 +159,7 @@ lua_table! {
     /// ```lua
     /// local q = makima.treesitter.query.parse("lua", "(string) @str")
     /// ```
-    "maki.treesitter.query" => pub(crate) fn create_query_module(), DOCS [
+    "makima.treesitter.query" => pub(crate) fn create_query_module(), DOCS [
         parse, get,
     ]
 }

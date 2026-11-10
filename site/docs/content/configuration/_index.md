@@ -7,7 +7,7 @@ group = "Getting Started"
 
 # Configuration
 
-Settings go in `init.lua`, a Lua script that calls `maki.setup()`. Same language as plugins.
+Settings go in `init.lua`, a Lua script that calls `makima.setup()`. Same language as plugins.
 
 Two places, both optional:
 
@@ -19,7 +19,7 @@ When both exist, project settings override global ones. Neither file is required
 ## Example
 
 ```lua
-maki.setup({
+makima.setup({
     ui = {
         splash_animation = true,
         mouse_scroll_lines = 5,
@@ -53,7 +53,7 @@ All fields are optional. Typos in field names cause an error right away.
 
 `provider.allowed_models` is a list of glob patterns for qualified `provider/model-id` specs. `*` also matches `/`, so `provider/*` includes nested model IDs. When the list is empty or omitted, every model is allowed. `provider.excluded_models` removes matching models after that, so exclusions always win. A project list replaces the matching global list; omit it to inherit or use `{}` to clear it. The policy applies to selectors, CLI and API model changes, delegation, and `makima models`.
 
-`maki.setup()` can only be called once per init.lua.
+`makima.setup()` can only be called once per init.lua.
 
 ## Full Reference
 
@@ -93,7 +93,7 @@ You can add your own themes too. Drop a `<name>.toml` file into `themes/` inside
 
 Themes use 24-bit colors, but not every terminal can show them. Makima checks the environment, terminfo, and the terminal itself, and when truecolor is missing it quietly falls back to the closest of the 256 classic terminal colors. If detection gets it wrong, set `MAKIMA_TRUECOLOR=1` to force truecolor or `MAKIMA_TRUECOLOR=0` to force the fallback.
 
-A theme TOML file can define optional `italic` and `bold_italic` keys inside its `[ui]` table. These are theme styles, not fields in the `ui` table passed to `maki.setup()`. Without `[ui].italic`, Markdown italics use the foreground from the `markup.italic` syntax scope. An explicit `[ui].italic` takes precedence. Makima adds the italic modifier in either case.
+A theme TOML file can define optional `italic` and `bold_italic` keys inside its `[ui]` table. These are theme styles, not fields in the `ui` table passed to `makima.setup()`. Without `[ui].italic`, Markdown italics use the foreground from the `markup.italic` syntax scope. An explicit `[ui].italic` takes precedence. Makima adds the italic modifier in either case.
 
 Without `[ui].bold_italic`, bold italics preserve the resolved bold style, including its colors and modifiers, and add italic. An explicit `[ui].bold_italic` takes precedence and receives both bold and italic modifiers, even when it only specifies a color.
 
@@ -112,7 +112,7 @@ Theme files can also carry an optional `[completion]` table that recolors the `@
 | `subagent` | Subagent references | `accent` |
 | `model` | Model references | `accent` |
 
-Kinds registered by your own completion sources (via `maki.api.register_completion_source`) fall back to the plain item style until your theme defines them.
+Kinds registered by your own completion sources (via `makima.api.register_completion_source`) fall back to the plain item style until your theme defines them.
 
 ### `ui.tool_output_lines`
 
@@ -188,10 +188,10 @@ Ring the terminal bell (`\x07`) on these events. All values are `bool`, defaulti
 |-------|------|---------|-------------|
 | `allowed_private_hosts` | string[] | `[]` | Hosts allowed to resolve to a private or loopback address, as `host`, `host:port`, or a CIDR range. Plain `http://` is kept for them instead of being upgraded to `https://` |
 
-`maki.net.request` refuses private, loopback and metadata addresses, because the model picks the URLs. List a host here to let it through. Providers use `maki.net.send`, which has no such guard, so a local model server needs no entry:
+`makima.net.request` refuses private, loopback and metadata addresses, because the model picks the URLs. List a host here to let it through. Providers use `makima.net.send`, which has no such guard, so a local model server needs no entry:
 
 ```lua
-maki.setup({
+makima.setup({
     net = {
         allowed_private_hosts = { "localhost:8080", "nas.lan", "10.0.0.0/8" },
     },
@@ -205,7 +205,7 @@ An entry with no port covers every port. A name you list is allowed whatever it 
 Answers the folder trust question in advance. Read from the global `~/.config/makima/init.lua` only, since a project file that could set it would be trusting itself:
 
 ```lua
-maki.setup({
+makima.setup({
     trust = {
         paths = { "~/src/me/*", "/workspace" },
         prompt = false,
@@ -219,7 +219,7 @@ maki.setup({
 
 The `plugins` table turns plugins on or off and passes options to them. All bundled plugins are on by default. Set `enabled = false` to turn one off.
 
-A plugin that is off never loads, so its tool name is free for one of your own plugins to take. Permission rules are keyed by the tool name alone, and names such as `bash`, `write`, and `task_spawn` already have rules in maki. A plugin that takes one of them inherits those rules, together with any "always allow" you saved. Maki warns you at load when this happens.
+A plugin that is off never loads, so its tool name is free for one of your own plugins to take. Permission rules are keyed by the tool name alone, and names such as `bash`, `write`, and `task_spawn` already have rules in makima. A plugin that takes one of them inherits those rules, together with any "always allow" you saved. Makima warns you at load when this happens.
 
 Each plugin checks its own options at startup. A typo, a wrong type, or an unknown plugin name gives you a clear error right away.
 
@@ -228,7 +228,7 @@ The edit plugin's extra tools are options too: `plugins.edit = { multiedit = fal
 This table is for bundled plugins only. Your own plugins go in `~/.config/makima/lua/`, see [Plugins](/docs/plugins/).
 
 ```lua
-maki.setup({
+makima.setup({
     plugins = {
         bash = { timeout_secs = 180 },
         websearch = { enabled = false },
@@ -297,7 +297,7 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `plugin_dev` | boolean | `true` | - | Offer the builtin maki-plugin-dev skill for writing maki plugins. |
+| `plugin_dev` | boolean | `true` | - | Offer the builtin makima-plugin-dev skill for writing makima plugins. |
 
 ### `plugins.splashes`
 

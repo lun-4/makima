@@ -5,10 +5,10 @@ use super::util::convert::{json_to_lua, lua_to_json};
 use super::util::pair::{Pair, pair, try_pair};
 
 pub(crate) const VALIDATOR_DOCS: crate::docs::ModuleDoc = crate::docs::ModuleDoc {
-    name: "maki.json.SchemaValidator",
+    name: "makima.json.SchemaValidator",
     kind: crate::docs::DocKind::Class,
     desc: "A compiled JSON Schema validator. Create one with \
-`maki.json.schema_validator()` and reuse it to validate many values \
+`makima.json.schema_validator()` and reuse it to validate many values \
 without recompiling the schema each time.",
     fns: &[crate::docs::FnDoc {
         name: "validate",
@@ -126,7 +126,7 @@ lua_table! {
     /// local s = makima.json.encode({ ok = true })
     /// local t = makima.json.decode(s)
     /// ```
-    "maki.json" => pub(crate) fn create_json_table(), DOCS [
+    "makima.json" => pub(crate) fn create_json_table(), DOCS [
         encode, decode, schema_validator,
     ]
 }

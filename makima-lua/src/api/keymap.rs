@@ -465,7 +465,7 @@ lua_table! {
     ///   print("hello")
     /// end, { desc = "Say hello" })
     /// ```
-    "maki.keymap" => pub(crate) fn create_keymap_table(pending: PendingKeymapStore, plugin: Arc<str>), DOCS [
+    "makima.keymap" => pub(crate) fn create_keymap_table(pending: PendingKeymapStore, plugin: Arc<str>), DOCS [
         set(pending, plugin), del(pending, plugin),
     ]
 }

@@ -311,7 +311,7 @@ lua_table! {
     /// only the session its own turn belongs to. Every function that reads or
     /// changes one session takes it explicitly; `ctx:session_id()` names the
     /// invocation's session.
-    "maki.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
+    "makima.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
     DOCS [list(tx), list_all(tx), live(tx), read(tx), focus(tx), delete(tx), new(tx), notify(), set_title(tx), set_default_thinking]
 }
 

@@ -469,7 +469,7 @@ fn save_provider_config(lua: &Lua, id: String, section: Value) -> LuaResult<Pair
 }
 
 lua_table! {
-    extend "maki.api" => pub(crate) fn add_provider_fn(
+    extend "makima.api" => pub(crate) fn add_provider_fn(
         pending: PendingProviders,
         plugin: Arc<str>,
         root: PluginCtx,

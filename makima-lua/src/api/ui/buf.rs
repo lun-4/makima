@@ -375,7 +375,7 @@ lua_class! {
     /// buf:line("hello")
     /// buf:line({ { "world", "bold" } })
     /// ```
-    "maki.ui.Buf" => BufHandle, DOCS [line, lines, set_lines, len, get_lines, on, click, blit]
+    "makima.ui.Buf" => BufHandle, DOCS [line, lines, set_lines, len, get_lines, on, click, blit]
 }
 
 pub(crate) fn parse_line(arg: &LuaValue) -> LuaResult<SnapshotLine> {

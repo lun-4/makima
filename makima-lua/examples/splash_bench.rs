@@ -77,16 +77,16 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
 }
 
 fn make_makima_stub(lua: &Lua) -> mlua::Result<Table> {
-    let maki = lua.create_table()?;
+    let makima = lua.create_table()?;
     let ui = lua.create_table()?;
     ui.set(
         "theme_color",
         lua.create_function(|_, _: ()| Ok(None::<String>))?,
     )?;
-    maki.set("ui", ui)?;
+    makima.set("ui", ui)?;
     let version = lua.create_table()?;
     version.set("current", "0.0.0-bench")?;
-    maki.set(
+    makima.set(
         "version",
         lua.create_function(move |_, _: ()| Ok(version.clone()))?,
     )?;
@@ -99,25 +99,25 @@ fn make_makima_stub(lua: &Lua) -> mlua::Result<Table> {
         "create_autocmd",
         lua.create_function(|_, _: mlua::MultiValue| Ok(()))?,
     )?;
-    maki.set("api", api)?;
-    Ok(maki)
+    makima.set("api", api)?;
+    Ok(makima)
 }
 
 /// Mirrors runtime.rs build_env: fresh env table, safeenv set (unlocks native
 /// codegen), makima bound, require present, everything else via globals.
 fn make_env(
     lua: &Lua,
-    maki: &Table,
+    makima: &Table,
     dir: &str,
     with_require: bool,
     depth: u32,
 ) -> mlua::Result<Table> {
     let env = lua.create_table()?;
     env.set_safeenv(true);
-    env.set("maki", maki.clone())?;
+    env.set("makima", makima.clone())?;
     if with_require {
         let dir = dir.to_string();
-        let maki = maki.clone();
+        let makima = makima.clone();
         let require = lua.create_function(move |lua, modname: String| {
             if depth >= MAX_REQUIRE_DEPTH {
                 return Err(mlua::Error::RuntimeError(format!(
@@ -129,7 +129,7 @@ fn make_env(
                 format!("{dir}/splash/{modname}.lua"),
             ] {
                 if let Ok(src) = std::fs::read_to_string(&cand) {
-                    let env = make_env(lua, &maki, &dir, true, depth + 1)?;
+                    let env = make_env(lua, &makima, &dir, true, depth + 1)?;
                     return load_module(lua, &env, &src, &cand);
                 }
             }
@@ -200,9 +200,11 @@ fn main() -> ExitCode {
     lua.sandbox(true).expect("sandbox");
     lua.enable_jit(false);
 
-    let maki = make_makima_stub(&lua).expect("maki stub");
-    lua.globals().set("maki", maki.clone()).expect("globals");
-    let env = make_env(&lua, &maki, &args.dir, true, 0).expect("env");
+    let makima = make_makima_stub(&lua).expect("makima stub");
+    lua.globals()
+        .set("makima", makima.clone())
+        .expect("globals");
+    let env = make_env(&lua, &makima, &args.dir, true, 0).expect("env");
 
     let header = format!(
         "{:<16} {:>8} {:>10} {:>10} {:>8}",

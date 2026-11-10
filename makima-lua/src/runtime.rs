@@ -3433,7 +3433,7 @@ impl LuaRuntime {
 
     fn build_env(
         &self,
-        maki: mlua::Table,
+        makima: mlua::Table,
         require_root: Option<PathBuf>,
     ) -> Result<mlua::Table, mlua::Error> {
         let env = self.lua.create_table()?;
@@ -3443,7 +3443,8 @@ impl LuaRuntime {
         // with this env. Without it WarmJit compiles chunks that never run
         // natively; see makima-lua/benches/splash_perf.rs env_codegen_200x79.
         env.set_safeenv(true);
-        env.set("maki", maki)?;
+        env.set("makima", makima.clone())?;
+        env.set("maki", makima)?;
 
         if require_root.is_some() || !self.bundled.dirs.is_empty() {
             let require_fn = self.create_require_fn(&env, require_root)?;
@@ -3495,7 +3496,7 @@ impl LuaRuntime {
         }
         let keys: Vec<&str> = opts.keys().map(String::as_str).collect();
         Err(mlua::Error::runtime(format!(
-            "unknown options in plugins.{name}: {} (this plugin declares no options via maki.api.register_options)",
+            "unknown options in plugins.{name}: {} (this plugin declares no options via makima.api.register_options)",
             keys.join(", ")
         )))
     }
@@ -3584,7 +3585,7 @@ impl LuaRuntime {
         } else {
             Arc::clone(&name)
         };
-        let (maki, root) = create_makima_global(
+        let (makima, root) = create_makima_global(
             &self.lua,
             context,
             Arc::clone(&name),
@@ -3598,10 +3599,10 @@ impl LuaRuntime {
         if let Some(cs) = config_store {
             let setup_fn = crate::api::util::setup::create_setup_fn(&self.lua, Arc::clone(cs))
                 .map_err(map_err)?;
-            maki.set("setup", setup_fn).map_err(map_err)?;
+            makima.set("setup", setup_fn).map_err(map_err)?;
         }
 
-        let env = self.build_env(maki, require_root).map_err(map_err)?;
+        let env = self.build_env(makima, require_root).map_err(map_err)?;
 
         self.lua
             .set_app_data(LoadingPlugin(Arc::clone(&name), generation));
@@ -4541,7 +4542,7 @@ fn layer_delegation<'a>(
 /// `nil, reason` stops the call with a reason the model reads.
 ///
 /// Every failure below is a pass-through, because a layer is an opinion about a
-/// call and never a precondition for making it.
+/// call and never a precondition for makimang it.
 ///
 /// [`run_awaited`] is what makes the chain answerable to the call waiting on
 /// it, down to a layer that never comes back ending at the window dispatch
@@ -7363,7 +7364,7 @@ mod tests {
                 // runs; the armed one-shot then kills at the first safepoint
                 // if the call sits under the doomed handle.
                 "local t = os.clock() while os.clock() - t < 0.1 do end \
-                 return { { { glyphs = 'maki', style = '#ffffff' } } }",
+                 return { { { glyphs = 'makima', style = '#ffffff' } } }",
             )
             .into_function()
             .unwrap();

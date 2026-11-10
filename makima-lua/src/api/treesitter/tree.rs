@@ -46,5 +46,5 @@ lua_class! {
     /// local trees = parser:parse()
     /// local root = trees[1]:root()
     /// ```
-    "maki.treesitter.Tree" => LuaTree, DOCS [root, copy]
+    "makima.treesitter.Tree" => LuaTree, DOCS [root, copy]
 }

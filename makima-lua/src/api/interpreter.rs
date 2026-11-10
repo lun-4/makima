@@ -225,7 +225,7 @@ lua_table! {
     ///   on_output = function(line) print(line) end,
     /// })
     /// ```
-    "maki.interpreter" => pub(crate) fn create_interpreter_table(perms: &PluginPermissions), DOCS [
+    "makima.interpreter" => pub(crate) fn create_interpreter_table(perms: &PluginPermissions), DOCS [
         interpreter_run(perms),
     ]
 }

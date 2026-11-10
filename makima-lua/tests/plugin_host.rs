@@ -2723,7 +2723,7 @@ fn setup_all_sections_at_once() {
 }
 
 const OPTS_PROBE_PLUGIN: &str = r#"
-local opts = maki.api.register_options({
+local opts = makima.api.register_options({
     timeout_secs = { default = 120, min = 5, desc = "Timeout." },
     label = { type = "string", desc = "Label." },
 })
@@ -2757,7 +2757,7 @@ const OPTION_MIN_ON_STRING_ERR: &str = "option \"label\": min is not allowed for
 const OPTION_RESERVED_ERR: &str = "option \"enabled\": reserved name";
 const OPTION_TWICE_ERR: &str = "register_options: called more than once";
 const UNDECLARED_OPTS_ERR: &str = "unknown options in plugins.bare_plugin: timeout_secs \
-(this plugin declares no options via maki.api.register_options)";
+(this plugin declares no options via makima.api.register_options)";
 
 fn probe_opts(reg: &ToolRegistry) -> serde_json::Value {
     let out = exec_tool(reg, "opts_probe", serde_json::json!({})).unwrap();
@@ -2807,44 +2807,44 @@ fn register_options_rejects_bad_user_opts(opts: serde_json::Value, expected: &st
 }
 
 #[test_case::test_case(
-    r#"maki.api.register_options({ timeout_secs = { default = 120 } })"#,
+    r#"makima.api.register_options({ timeout_secs = { default = 120 } })"#,
     OPTION_DESC_ERR
     ; "missing_desc"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_options({ bare = { desc = "no type or default" } })"#,
+    r#"makima.api.register_options({ bare = { desc = "no type or default" } })"#,
     OPTION_NO_TYPE_ERR
     ; "missing_type_and_default"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_options({ timeout_secs = { default = 120, mins = 5, desc = "T." } })"#,
+    r#"makima.api.register_options({ timeout_secs = { default = 120, mins = 5, desc = "T." } })"#,
     OPTION_SPEC_KEY_ERR
     ; "unknown_spec_key"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_options({ timeout_secs = { type = "string", default = 120, desc = "T." } })"#,
+    r#"makima.api.register_options({ timeout_secs = { type = "string", default = 120, desc = "T." } })"#,
     OPTION_DEFAULT_TYPE_ERR
     ; "default_contradicts_type"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_options({ timeout_secs = { default = 1, min = 5, desc = "T." } })"#,
+    r#"makima.api.register_options({ timeout_secs = { default = 1, min = 5, desc = "T." } })"#,
     OPTION_DEFAULT_MIN_ERR
     ; "default_below_min"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_options({ label = { type = "string", min = 1, desc = "L." } })"#,
+    r#"makima.api.register_options({ label = { type = "string", min = 1, desc = "L." } })"#,
     OPTION_MIN_ON_STRING_ERR
     ; "min_on_string"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_options({ enabled = { default = true, desc = "E." } })"#,
+    r#"makima.api.register_options({ enabled = { default = true, desc = "E." } })"#,
     OPTION_RESERVED_ERR
     ; "reserved_enabled"
 )]
 #[test_case::test_case(
     r#"
-    maki.api.register_options({ a = { default = 1, desc = "A." } })
-    maki.api.register_options({ b = { default = 2, desc = "B." } })
+    makima.api.register_options({ a = { default = 1, desc = "A." } })
+    makima.api.register_options({ b = { default = 2, desc = "B." } })
     "#,
     OPTION_TWICE_ERR
     ; "called_twice"

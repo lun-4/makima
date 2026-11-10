@@ -523,21 +523,21 @@ mod tests {
     fn write_read_roundtrip_and_stat_fields() {
         let fs = InMemoryFs::new();
         smol::block_on(fs.mkdir(PathBuf::from(ROOT), true)).unwrap();
-        smol::block_on(fs.write(PathBuf::from("/t/note.md"), b"hello-maki".to_vec())).unwrap();
+        smol::block_on(fs.write(PathBuf::from("/t/note.md"), b"hello-makima".to_vec())).unwrap();
 
         assert_eq!(
             smol::block_on(fs.read(PathBuf::from("/t/note.md"))).unwrap(),
-            "hello-maki"
+            "hello-makima"
         );
         assert_eq!(
             smol::block_on(fs.read_bytes(PathBuf::from("/t/note.md"))).unwrap(),
-            b"hello-maki"
+            b"hello-makima"
         );
 
         let meta = smol::block_on(fs.stat(PathBuf::from("/t/note.md"))).unwrap();
         assert!(meta.is_file);
         assert!(!meta.is_dir);
-        assert_eq!(meta.size, 10);
+        assert_eq!(meta.size, 12);
         assert!(meta.mtime.is_some(), "file mtime must be present");
 
         let dir_meta = smol::block_on(fs.stat(PathBuf::from(ROOT))).unwrap();

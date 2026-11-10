@@ -68,7 +68,7 @@ lua_table! {
     /// makima.log.info("ready")
     /// makima.log.warn("something looks off")
     /// ```
-    "maki.log" => pub(crate) fn create_log_table(plugin: Arc<str>), DOCS [
+    "makima.log" => pub(crate) fn create_log_table(plugin: Arc<str>), DOCS [
         debug(plugin), info(plugin), warn(plugin), error(plugin),
     ]
 }

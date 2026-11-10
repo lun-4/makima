@@ -57,7 +57,7 @@ lua_table! {
     /// local encoded = makima.base64.encode("hello")
     /// local decoded = makima.base64.decode(encoded)
     /// ```
-    "maki.base64" => pub(crate) fn create_base64_table(), DOCS [
+    "makima.base64" => pub(crate) fn create_base64_table(), DOCS [
         encode, decode,
     ]
 }

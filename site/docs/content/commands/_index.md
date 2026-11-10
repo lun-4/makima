@@ -9,7 +9,7 @@ group = "Reference"
 
 Type `/` in the TUI input box to open the command palette. A leading slash command is also recognized in `--print`, SDK stream mode, and ACP. Command names use exact ASCII-insensitive matching. Unknown and unavailable slash-prefixed text is rejected with an error instead of becoming a prompt. Prefix a literal message that starts with `/` with another slash to send it as text: `//lmao` sends `/lmao`. Text sent programmatically (`Agent:send`, subagent chat) is not parsed as a command. A known available command with invalid arguments returns an error instead of becoming a prompt.
 
-The active registry combines built-ins, custom Markdown commands, MCP prompts, and Lua commands. Lua commands have the highest collision priority, followed by MCP prompts, custom commands, and built-ins. Each frontend advertises its capabilities, and the registry omits commands that require unavailable capabilities. Registrations can change when plugins reload or MCP servers reconnect. The palette and protocol command lists show the current target-scoped winners. Root CLI subcommands such as `maki auth` are separate from slash commands.
+The active registry combines built-ins, custom Markdown commands, MCP prompts, and Lua commands. Lua commands have the highest collision priority, followed by MCP prompts, custom commands, and built-ins. Each frontend advertises its capabilities, and the registry omits commands that require unavailable capabilities. Registrations can change when plugins reload or MCP servers reconnect. The palette and protocol command lists show the current target-scoped winners. Root CLI subcommands such as `makima auth` are separate from slash commands.
 
 ## Built-in commands
 
@@ -119,7 +119,7 @@ For example, `/project:review main.rs` replaces `$ARGUMENTS` with `main.rs`.
 
 ## Aliasing commands
 
-Prefer a different name for a command? `maki.api.run_command` runs any slash command exactly as typing it would, so an alias is a one-line handler in your `init.lua` instead of a reimplementation.
+Prefer a different name for a command? `makima.api.run_command` runs any slash command exactly as typing it would, so an alias is a one-line handler in your `init.lua` instead of a reimplementation.
 
 ```lua
 -- ~/.config/makima/init.lua
@@ -129,19 +129,19 @@ local aliases = {
 }
 
 for _, alias in ipairs(aliases) do
-    maki.api.register_command({
+    makima.api.register_command({
         name = alias.name,
         description = alias.description,
         handler = function()
-            local ok, err = maki.api.run_command(alias.target)
+            local ok, err = makima.api.run_command(alias.target)
             if not ok then
-                maki.ui.flash("could not run " .. alias.target .. ": " .. err)
+                makima.ui.flash("could not run " .. alias.target .. ": " .. err)
             end
         end,
     })
 end
 ```
 
-Both names stay in the palette: aliasing adds a name, it does not rename or hide the original. It works for commands that finish in their handler, such as `/new`, `/sessions`, `/cd` and plugin commands. A command that starts a model turn (custom Markdown commands, MCP prompts), `/compact` and `/btw` report an error from inside another command's handler; bind those to a key with `maki.ui.action` instead. See [`maki.api.run_command`](/docs/lua-api/#maki-api-run_command) for matching and error handling, or [`maki.ui.action`](/docs/lua-api/#maki-ui-action) to bind a key instead of a name.
+Both names stay in the palette: aliasing adds a name, it does not rename or hide the original. It works for commands that finish in their handler, such as `/new`, `/sessions`, `/cd` and plugin commands. A command that starts a model turn (custom Markdown commands, MCP prompts), `/compact` and `/btw` report an error from inside another command's handler; bind those to a key with `makima.ui.action` instead. See [`makima.api.run_command`](/docs/lua-api/#makima-api-run_command) for matching and error handling, or [`makima.ui.action`](/docs/lua-api/#makima-ui-action) to bind a key instead of a name.
 
 Related: [CLI](/docs/cli/) for shell flags and subcommands, [Skills](/docs/skills/) for on-demand playbooks.

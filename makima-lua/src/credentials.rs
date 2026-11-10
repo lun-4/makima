@@ -283,12 +283,12 @@ lua_class! {
     /// A credentials file: a provider's (its ctx's `credentials`) or a
     /// plugin's (`makima.credentials.open`). The value is whatever JSON table
     /// is stored, such as `{ api_key }` or `{ access, refresh, expires }`.
-    "maki.credentials.Store" => Store, STORE_DOCS [read, write, delete, refresh, lock]
+    "makima.credentials.Store" => Store, STORE_DOCS [read, write, delete, refresh, lock]
 }
 
 lua_table! {
     /// Credential stores for plugins. A provider's own credentials are its
     /// ctx's `credentials`; state a plugin shares across its providers, such
     /// as one sign-in, goes in a plugin store.
-    "maki.credentials" => pub(crate) fn create_credentials_table(), DOCS [open]
+    "makima.credentials" => pub(crate) fn create_credentials_table(), DOCS [open]
 }

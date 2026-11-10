@@ -40,7 +40,7 @@ const PROJECT_INIT_OWNER: &str = "makima_init.project";
 #[allow(dead_code)]
 pub const SKIPPED_PLUGIN_WARNING: &str = "skipping plugin lua";
 /// Tests assert on this exact text, so a wording tweak here updates them too.
-pub const PERMISSION_NAME_WARNING: &str = "inherits maki's permission rules for the builtin \
+pub const PERMISSION_NAME_WARNING: &str = "inherits makima's permission rules for the builtin \
      tool of the same name, together with any \"always allow\" you saved";
 pub const TRUST_SCOPE_WARNING: &str =
     "trust is only read from the global init.lua; ignoring the trust table in";
@@ -1299,7 +1299,7 @@ impl EventHandle {
 
     /// Blocks until every restore item queued so far has finished; restores
     /// run as spawned tasks, and the `RestoreComplete` flag flips only once
-    /// the whole batch has landed, making it the batch barrier.
+    /// the whole batch has landed, makimang it the batch barrier.
     #[doc(hidden)]
     pub fn wait_restore_complete_for_test(&self) {
         const DEADLINE: Duration = runtime::RESTORE_ITEM_TIMEOUT.saturating_mul(2);
@@ -1523,7 +1523,7 @@ mod tests {
     #[test]
     fn global_and_project_init_session_options_coexist_with_stable_owners() {
         const GLOBAL_SOURCE: &str = r#"
-            maki.api.register_session_option({
+            makima.api.register_session_option({
                 id = "makima_init.global.choice",
                 name = "Global choice",
                 description = "Global init choice",
@@ -1533,7 +1533,7 @@ mod tests {
             })
         "#;
         const PROJECT_SOURCE: &str = r#"
-            maki.api.register_session_option({
+            makima.api.register_session_option({
                 id = "makima_init.project.choice",
                 name = "Project choice",
                 description = "Project init choice",
@@ -1599,7 +1599,7 @@ mod tests {
     #[test]
     fn session_option_load_reload_failure_and_unload_are_transactional() {
         const SOURCE: &str = r#"
-            maki.api.register_session_option({
+            makima.api.register_session_option({
                 id = "choice.value",
                 name = "Choice",
                 description = "Test choice",
@@ -1649,8 +1649,11 @@ mod tests {
             let before_unload = generation();
 
             assert!(
-                host.load_source("choice", "maki.api.register_session_option({ id = 'bad' })")
-                    .is_err()
+                host.load_source(
+                    "choice",
+                    "makima.api.register_session_option({ id = 'bad' })"
+                )
+                .is_err()
             );
             assert_eq!(current(), "b");
 
@@ -1673,19 +1676,19 @@ mod tests {
     #[test]
     fn tool_conflict_preserves_plugin_catalog_and_commands() {
         const ORIGINAL: &str = r#"
-            maki.api.register_tool({
+            makima.api.register_tool({
                 name = "original_tool",
                 description = "Original tool",
                 schema = { type = "object", properties = {}, additionalProperties = false },
                 handler = function() return "ok" end,
             })
-            maki.api.register_command({
+            makima.api.register_command({
                 name = "/original",
                 description = "Original command",
                 tui_only = false,
                 handler = function() end,
             })
-            maki.api.register_session_option({
+            makima.api.register_session_option({
                 id = "choice.original",
                 name = "Original option",
                 description = "Original option",
@@ -1695,19 +1698,19 @@ mod tests {
             })
         "#;
         const CANDIDATE: &str = r#"
-            maki.api.register_tool({
+            makima.api.register_tool({
                 name = "shared_tool",
                 description = "Conflicting tool",
                 schema = { type = "object", properties = {}, additionalProperties = false },
                 handler = function() return "ok" end,
             })
-            maki.api.register_command({
+            makima.api.register_command({
                 name = "/candidate",
                 description = "Candidate command",
                 tui_only = false,
                 handler = function() end,
             })
-            maki.api.register_session_option({
+            makima.api.register_session_option({
                 id = "choice.candidate",
                 name = "Candidate option",
                 description = "Candidate option",
@@ -1723,7 +1726,7 @@ mod tests {
             host.load_source(
                 "other",
                 r#"
-                maki.api.register_tool({
+                makima.api.register_tool({
                     name = "shared_tool",
                     description = "Shared tool",
                     schema = { type = "object", properties = {}, additionalProperties = false },
@@ -1776,7 +1779,7 @@ mod tests {
     #[test]
     fn event_handle_validates_and_commits_session_option() {
         const SOURCE: &str = r#"
-            maki.api.register_session_option({
+            makima.api.register_session_option({
                 id = "choice.value",
                 name = "Choice",
                 description = "Test choice",
@@ -1818,13 +1821,13 @@ mod tests {
     #[test]
     fn unload_failure_clears_generic_state_and_can_retry_session_options() {
         const SOURCE: &str = r#"
-            maki.api.register_tool({
+            makima.api.register_tool({
                 name = "choice_tool",
                 description = "Test tool",
                 schema = { type = "object", properties = {}, additionalProperties = false },
                 handler = function() return "ok" end,
             })
-            maki.api.register_session_option({
+            makima.api.register_session_option({
                 id = "choice.value",
                 name = "Choice",
                 description = "Test choice",
@@ -1894,7 +1897,7 @@ mod tests {
     #[test]
     fn independent_plugin_hosts_do_not_share_session_option_catalogs() {
         const FIRST: &str = r#"
-            maki.api.register_session_option({
+            makima.api.register_session_option({
                 id = "choice.value",
                 name = "Choice",
                 description = "First choice",
@@ -1904,7 +1907,7 @@ mod tests {
             })
         "#;
         const SECOND: &str = r#"
-            maki.api.register_session_option({
+            makima.api.register_session_option({
                 id = "choice.value",
                 name = "Choice",
                 description = "Second choice",
@@ -1998,7 +2001,7 @@ mod tests {
         let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(
             "hinted",
-            r#"maki.api.register_prompt_hint({ slot = "tool_usage", content = "live" })"#,
+            r#"makima.api.register_prompt_hint({ slot = "tool_usage", content = "live" })"#,
         )
         .unwrap();
         let handle = host.event_handle();
@@ -2078,7 +2081,7 @@ mod tests {
         let unchanged = registry.get("glob").unwrap();
         host.load_source(
             "read",
-            r#"maki.api.register_tool({name = "read", description = "probe", schema = {type = "object", properties = {}}, handler = function() return "ok" end})"#,
+            r#"makima.api.register_tool({name = "read", description = "probe", schema = {type = "object", properties = {}}, handler = function() return "ok" end})"#,
         )
         .unwrap();
         assert!(!Arc::ptr_eq(
@@ -2226,7 +2229,7 @@ mod tests {
         host.load_source(
             "plugin_a",
             r#"
-            maki.api.register_command({
+            makima.api.register_command({
                 name = "/alpha",
                 description = "from a",
                 tui_only = false,
@@ -2238,7 +2241,7 @@ mod tests {
         host.load_source(
             "plugin_b",
             r#"
-            maki.api.register_command({
+            makima.api.register_command({
                 name = "/beta",
                 description = "from b",
                 tui_only = false,
@@ -2265,7 +2268,7 @@ mod tests {
         host.load_source(
             "noslash",
             r#"
-            maki.api.register_command({
+            makima.api.register_command({
                 name = "hello",
                 description = "no slash",
                 tui_only = false,
@@ -2288,11 +2291,11 @@ mod tests {
         host.load_source(
             "usage_observer",
             r#"
-            maki.usage.on_change(function(snapshot)
-                local current = maki.usage.get()
+            makima.usage.on_change(function(snapshot)
+                local current = makima.usage.get()
                 if current.provider_id == snapshot.provider_id
                     and current.status == snapshot.status then
-                    maki.ui.flash("usage:" .. current.status)
+                    makima.ui.flash("usage:" .. current.status)
                 end
             end)
             "#,
@@ -2356,8 +2359,8 @@ mod tests {
         host.load_source(
             "kb",
             r#"
-            maki.keymap.set("n", "<C-g>", function()
-                maki.api.register_command({
+            makima.keymap.set("n", "<C-g>", function()
+                makima.api.register_command({
                     name = "/fired",
                     description = "callback ran",
                     tui_only = false,
@@ -2401,14 +2404,14 @@ mod tests {
     #[test]
     fn slots_prompts_and_status_hints_replace_transactionally() {
         const OLD: &str = r#"
-            maki.api.declare_slot("transaction.slot", function() return "old slot" end)
-            maki.api.set_prompt({ slot = "identity", content = function() return "old prompt" end })
-            maki.ui.set_status_hint({ { "o", "old hint" } })
+            makima.api.declare_slot("transaction.slot", function() return "old slot" end)
+            makima.api.set_prompt({ slot = "identity", content = function() return "old prompt" end })
+            makima.ui.set_status_hint({ { "o", "old hint" } })
         "#;
         const FAILED: &str = r#"
-            maki.api.declare_slot("transaction.slot", function() return "candidate slot" end)
-            maki.api.set_prompt({ slot = "identity", content = function() return "candidate prompt" end })
-            maki.ui.set_status_hint({ { "c", "candidate hint" } })
+            makima.api.declare_slot("transaction.slot", function() return "candidate slot" end)
+            makima.api.set_prompt({ slot = "identity", content = function() return "candidate prompt" end })
+            makima.ui.set_status_hint({ { "c", "candidate hint" } })
             error("reject candidate")
         "#;
 
@@ -2434,10 +2437,10 @@ mod tests {
     #[test]
     fn keymap_deletion_is_transactional_across_owners() {
         const BINDING: &str = r#"
-            maki.keymap.set("n", "<C-p>", function() end, { desc = "bundled mapping" })
+            makima.keymap.set("n", "<C-p>", function() end, { desc = "bundled mapping" })
         "#;
         const FAILED_DELETE: &str = r#"
-            maki.keymap.del("n", "<C-p>")
+            makima.keymap.del("n", "<C-p>")
             error("reject deletion")
         "#;
 
@@ -2454,7 +2457,7 @@ mod tests {
         assert_eq!(keymaps.entries[0].plugin.as_ref(), "sessions");
         drop(keymaps);
 
-        host.load_source("user", r#"maki.keymap.del("n", "<C-p>")"#)
+        host.load_source("user", r#"makima.keymap.del("n", "<C-p>")"#)
             .unwrap();
         assert!(host.keymap_reader().load().entries.is_empty());
     }
@@ -2462,14 +2465,14 @@ mod tests {
     #[test]
     fn command_and_keymap_replacement_is_transactional() {
         const OLD: &str = r#"
-            maki.api.register_command({
+            makima.api.register_command({
                 name = "/choice",
                 description = "old command",
                 tui_only = false,
                 handler = function() end,
             })
-            maki.keymap.set("n", "<C-g>", function()
-                maki.api.register_command({
+            makima.keymap.set("n", "<C-g>", function()
+                makima.api.register_command({
                     name = "/old_callback",
                     description = "old callback",
                     tui_only = false,
@@ -2478,13 +2481,13 @@ mod tests {
             end, { desc = "old keymap" })
         "#;
         const FAILED: &str = r#"
-            maki.api.register_command({
+            makima.api.register_command({
                 name = "/choice",
                 description = "candidate command",
                 tui_only = false,
                 handler = function() end,
             })
-            maki.keymap.set("n", "<C-g>", function() error("candidate callback") end,
+            makima.keymap.set("n", "<C-g>", function() error("candidate callback") end,
                 { desc = "candidate keymap" })
             error("reject candidate")
         "#;
@@ -2529,8 +2532,8 @@ mod tests {
     #[test]
     fn autocmd_failed_replacement_keeps_old_listener() {
         const OLD: &str = r#"
-            maki.api.create_autocmd("Replacement", { callback = function()
-                maki.api.register_command({
+            makima.api.create_autocmd("Replacement", { callback = function()
+                makima.api.register_command({
                     name = "/old-fired",
                     description = "old",
                     tui_only = false,
@@ -2539,8 +2542,8 @@ mod tests {
             end })
         "#;
         const FAILED: &str = r#"
-            maki.api.create_autocmd("Replacement", { callback = function()
-                maki.api.register_command({
+            makima.api.create_autocmd("Replacement", { callback = function()
+                makima.api.register_command({
                     name = "/new-fired",
                     description = "new",
                     tui_only = false,
@@ -2576,8 +2579,8 @@ mod tests {
     #[test]
     fn autocmd_successful_replacement_omits_old_listener_and_keeps_others() {
         const LISTENER: &str = r#"
-            maki.api.create_autocmd("Replacement", { callback = function()
-                maki.api.register_command({
+            makima.api.create_autocmd("Replacement", { callback = function()
+                makima.api.register_command({
                     name = "/retained-fired",
                     description = "retained",
                     tui_only = false,
@@ -2586,8 +2589,8 @@ mod tests {
             end })
         "#;
         const OLD: &str = r#"
-            maki.api.create_autocmd("Replacement", { callback = function()
-                maki.api.register_command({
+            makima.api.create_autocmd("Replacement", { callback = function()
+                makima.api.register_command({
                     name = "/omitted-fired",
                     description = "omitted",
                     tui_only = false,
@@ -2630,8 +2633,8 @@ mod tests {
             host.load_source(
                 "timer_replacement",
                 r#"
-                    maki.timer.set(0.001, function()
-                        maki.api.register_command({
+                    makima.timer.set(0.001, function()
+                        makima.api.register_command({
                             name = "/candidate-timer-fired",
                             description = "candidate",
                             tui_only = false,
@@ -2659,15 +2662,15 @@ mod tests {
             "timer_replacement",
             r#"
                 local count = 0
-                maki.timer.set(0.001, function(id)
+                makima.timer.set(0.001, function(id)
                     count = count + 1
-                    maki.api.register_command({
+                    makima.api.register_command({
                         name = "/committed-timer-" .. tostring(count),
                         description = "committed timer",
                         tui_only = false,
                         handler = function() end,
                     })
-                    maki.timer.del(id)
+                    makima.timer.del(id)
                 end)
             "#,
         )
@@ -2715,11 +2718,11 @@ mod tests {
         host.load_source(
             "late",
             &format!(
-                r#"maki.api.register_command({{
+                r#"makima.api.register_command({{
                     name = "/late",
                     description = "late registration",
                     tui_only = false,
-                    handler = function() maki.api.{api}({spec}) end,
+                    handler = function() makima.api.{api}({spec}) end,
                 }})"#
             ),
         )
@@ -2735,39 +2738,39 @@ mod tests {
     #[test]
     fn complete_plugin_replacement_is_transactional() {
         const OLD: &str = r#"
-            maki.api.register_command({ name = "/old", description = "old", tui_only = false, handler = function() end })
-            maki.keymap.set("n", "<C-o>", function() maki.api.register_command({ name = "/old-key", description = "old", tui_only = false, handler = function() end }) end, { desc = "old key" })
-            maki.store.register("transaction", "old", { value = "old" })
-            maki.api.register_options({ old = { type = "string", desc = "old" } })
-            maki.api.register_completion_source("old", { get_items = function() return {{ label = "old", kind = "old", insertion = "@old:x" }} end })
-            maki.api.register_expander("old", function(ref) return "<old:" .. ref.value .. ">", nil end)
-            maki.api.declare_slot("transaction.slot", function() return "old slot" end)
-            maki.api.set_prompt({ slot = "identity", content = function() return "old prompt" end })
-            maki.ui.set_status_hint({ { "o", "old hint" } })
-            maki.api.create_autocmd("TransactionProbe", { callback = function()
-                local entries = maki.store.collect("transaction")
-                if entries.old then maki.api.register_command({ name = "/old-store", description = "old", tui_only = false, handler = function() end }) end
-                if entries.candidate then maki.api.register_command({ name = "/candidate-store", description = "candidate", tui_only = false, handler = function() end }) end
+            makima.api.register_command({ name = "/old", description = "old", tui_only = false, handler = function() end })
+            makima.keymap.set("n", "<C-o>", function() makima.api.register_command({ name = "/old-key", description = "old", tui_only = false, handler = function() end }) end, { desc = "old key" })
+            makima.store.register("transaction", "old", { value = "old" })
+            makima.api.register_options({ old = { type = "string", desc = "old" } })
+            makima.api.register_completion_source("old", { get_items = function() return {{ label = "old", kind = "old", insertion = "@old:x" }} end })
+            makima.api.register_expander("old", function(ref) return "<old:" .. ref.value .. ">", nil end)
+            makima.api.declare_slot("transaction.slot", function() return "old slot" end)
+            makima.api.set_prompt({ slot = "identity", content = function() return "old prompt" end })
+            makima.ui.set_status_hint({ { "o", "old hint" } })
+            makima.api.create_autocmd("TransactionProbe", { callback = function()
+                local entries = makima.store.collect("transaction")
+                if entries.old then makima.api.register_command({ name = "/old-store", description = "old", tui_only = false, handler = function() end }) end
+                if entries.candidate then makima.api.register_command({ name = "/candidate-store", description = "candidate", tui_only = false, handler = function() end }) end
             end })
-            maki.timer.set(0.001, function(id)
-                maki.api.register_command({ name = "/old-timer", description = "old", tui_only = false, handler = function() end })
-                maki.timer.del(id)
+            makima.timer.set(0.001, function(id)
+                makima.api.register_command({ name = "/old-timer", description = "old", tui_only = false, handler = function() end })
+                makima.timer.del(id)
             end)
-            maki.api.register_session_option({ id = "transaction.old", name = "Old", description = "old", category = "mode", values = {{ value = "yes", name = "Yes" }}, initial_value = "yes", persistent = true })
+            makima.api.register_session_option({ id = "transaction.old", name = "Old", description = "old", category = "mode", values = {{ value = "yes", name = "Yes" }}, initial_value = "yes", persistent = true })
         "#;
         const FAILED: &str = r#"
-            maki.api.register_command({ name = "/candidate", description = "candidate", tui_only = false, handler = function() end })
-            maki.keymap.set("n", "<C-o>", function() maki.api.register_command({ name = "/candidate-key", description = "candidate", tui_only = false, handler = function() end }) end, { desc = "candidate key" })
-            maki.store.register("transaction", "candidate", { value = "candidate" })
-            maki.api.register_options({ candidate = { type = "string", desc = "candidate" } })
-            maki.api.register_completion_source("candidate", { get_items = function() return {{ label = "candidate", kind = "candidate", insertion = "@candidate:x" }} end })
-            maki.api.register_expander("candidate", function(ref) return "<candidate:" .. ref.value .. ">", nil end)
-            maki.api.declare_slot("transaction.slot", function() return "candidate slot" end)
-            maki.api.set_prompt({ slot = "identity", content = function() return "candidate prompt" end })
-            maki.ui.set_status_hint({ { "c", "candidate hint" } })
-            maki.api.create_autocmd("TransactionProbe", { callback = function() maki.api.register_command({ name = "/candidate-autocmd", description = "candidate", tui_only = false, handler = function() end }) end })
-            maki.timer.set(0.001, function() maki.api.register_command({ name = "/candidate-timer", description = "candidate", tui_only = false, handler = function() end }) end)
-            maki.api.register_session_option({ id = "transaction.candidate", name = "Candidate", description = "candidate", category = "mode", values = {{ value = "no", name = "No" }}, initial_value = "no", persistent = true })
+            makima.api.register_command({ name = "/candidate", description = "candidate", tui_only = false, handler = function() end })
+            makima.keymap.set("n", "<C-o>", function() makima.api.register_command({ name = "/candidate-key", description = "candidate", tui_only = false, handler = function() end }) end, { desc = "candidate key" })
+            makima.store.register("transaction", "candidate", { value = "candidate" })
+            makima.api.register_options({ candidate = { type = "string", desc = "candidate" } })
+            makima.api.register_completion_source("candidate", { get_items = function() return {{ label = "candidate", kind = "candidate", insertion = "@candidate:x" }} end })
+            makima.api.register_expander("candidate", function(ref) return "<candidate:" .. ref.value .. ">", nil end)
+            makima.api.declare_slot("transaction.slot", function() return "candidate slot" end)
+            makima.api.set_prompt({ slot = "identity", content = function() return "candidate prompt" end })
+            makima.ui.set_status_hint({ { "c", "candidate hint" } })
+            makima.api.create_autocmd("TransactionProbe", { callback = function() makima.api.register_command({ name = "/candidate-autocmd", description = "candidate", tui_only = false, handler = function() end }) end })
+            makima.timer.set(0.001, function() makima.api.register_command({ name = "/candidate-timer", description = "candidate", tui_only = false, handler = function() end }) end)
+            makima.api.register_session_option({ id = "transaction.candidate", name = "Candidate", description = "candidate", category = "mode", values = {{ value = "no", name = "No" }}, initial_value = "no", persistent = true })
             error("reject candidate")
         "#;
 
@@ -2886,9 +2889,9 @@ mod tests {
         host.load_source(
             "transaction",
             r#"
-            maki.api.register_options({ old = { type = "string", desc = "old" } })
-            maki.api.register_completion_source("old", { get_items = function() return {} end })
-            maki.api.register_expander("old", function() return "old", nil end)
+            makima.api.register_options({ old = { type = "string", desc = "old" } })
+            makima.api.register_completion_source("old", { get_items = function() return {} end })
+            makima.api.register_expander("old", function() return "old", nil end)
         "#,
         )
         .unwrap();
@@ -2896,8 +2899,8 @@ mod tests {
             host.load_source(
                 "transaction",
                 r#"
-            maki.api.register_options({ bad = { type = "string", desc = "bad" } })
-            maki.api.register_completion_source("bad", { get_items = function() return {} end })
+            makima.api.register_options({ bad = { type = "string", desc = "bad" } })
+            makima.api.register_completion_source("bad", { get_items = function() return {} end })
             error("reject")
         "#
             )
@@ -2912,8 +2915,8 @@ mod tests {
         host.load_source(
             "transaction",
             r#"
-            maki.api.register_options({ new = { type = "string", desc = "new" } })
-            maki.api.register_completion_source("new", { get_items = function() return {} end })
+            makima.api.register_options({ new = { type = "string", desc = "new" } })
+            makima.api.register_completion_source("new", { get_items = function() return {} end })
         "#,
         )
         .unwrap();
@@ -2970,7 +2973,7 @@ mod tests {
         let (_host, slots) = slots_from(
             "cb",
             r#"
-            maki.api.register_prompt_hint({
+            makima.api.register_prompt_hint({
                 slot = "tool_usage",
                 prompt = "general",
                 content = function() return "from_cb" end,
@@ -2989,7 +2992,7 @@ mod tests {
         let (_host, slots) = slots_from(
             "nil_cb",
             r#"
-            maki.api.register_prompt_hint({
+            makima.api.register_prompt_hint({
                 slot = "tool_usage",
                 content = function() return nil end,
             })
@@ -3004,7 +3007,7 @@ mod tests {
         let (_host, slots) = slots_from(
             "static_hint",
             r#"
-            maki.api.register_prompt_hint({
+            makima.api.register_prompt_hint({
                 slot = "efficient_tools",
                 content = "index",
             })
@@ -3022,7 +3025,7 @@ mod tests {
         let (_host, slots) = slots_from(
             "conv",
             r#"
-            maki.api.register_prompt_hint({
+            makima.api.register_prompt_hint({
                 slot = "conventions",
                 content = "follow conventions",
             })
@@ -3044,7 +3047,7 @@ mod tests {
         let r = host.load_source(
             "drop",
             r#"
-            maki.api.register_prompt_hint({
+            makima.api.register_prompt_hint({
                 slot = "after_instructions",
                 prompt = "research",
                 content = "never lands",
@@ -3061,7 +3064,7 @@ mod tests {
         let (_host, slots) = slots_from(
             "list",
             r#"
-            maki.api.register_prompt_hint({
+            makima.api.register_prompt_hint({
                 slot = "tool_usage",
                 prompt = { "system", "research" },
                 content = "shared",
@@ -3086,7 +3089,7 @@ mod tests {
             host.load_source(
                 plugin,
                 r#"
-                maki.api.register_prompt_hint({ slot = "tool_usage", content = "from_PLUGIN" })
+                makima.api.register_prompt_hint({ slot = "tool_usage", content = "from_PLUGIN" })
                 "#
                 .replace("PLUGIN", plugin)
                 .as_str(),
@@ -3108,8 +3111,8 @@ mod tests {
         host.load_source(
             "multi",
             r#"
-            maki.api.register_prompt_hint({ slot = "tool_usage", prompt = "system", content = "usage" })
-            maki.api.register_prompt_hint({ slot = "conventions", prompt = "system", content = "conv" })
+            makima.api.register_prompt_hint({ slot = "tool_usage", prompt = "system", content = "usage" })
+            makima.api.register_prompt_hint({ slot = "conventions", prompt = "system", content = "conv" })
             "#,
         )
         .unwrap();
@@ -3140,7 +3143,7 @@ mod tests {
     #[test_case(r#"{ slot = "tool_usage", content = "x", prompt = 42 }"# ; "prompt_wrong_type")]
     fn invalid_hint_spec_is_rejected(spec: &str) {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-        let src = format!("maki.api.register_prompt_hint({spec})");
+        let src = format!("makima.api.register_prompt_hint({spec})");
         assert!(host.load_source("bad", &src).is_err());
     }
 
@@ -3149,7 +3152,7 @@ mod tests {
         let (_host, slots) = slots_from(
             "id",
             r#"
-            maki.api.set_prompt({
+            makima.api.set_prompt({
                 slot = "identity",
                 content = "Custom identity",
             })
@@ -3168,7 +3171,7 @@ mod tests {
         let (_host, slots) = slots_from(
             "tone",
             r#"
-            maki.api.set_prompt({
+            makima.api.set_prompt({
                 slot = "tone",
                 content = "Custom tone",
             })
@@ -3187,12 +3190,12 @@ mod tests {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(
             "aaa",
-            r#"maki.api.set_prompt({ slot = "identity", content = "AAA" })"#,
+            r#"makima.api.set_prompt({ slot = "identity", content = "AAA" })"#,
         )
         .unwrap();
         host.load_source(
             "zzz",
-            r#"maki.api.set_prompt({ slot = "identity", content = "ZZZ" })"#,
+            r#"makima.api.set_prompt({ slot = "identity", content = "ZZZ" })"#,
         )
         .unwrap();
         let slots = host.event_handle().collect_prompt_slots();
@@ -3204,7 +3207,7 @@ mod tests {
     #[test]
     fn content_required() {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-        let r = host.load_source("bad", r#"maki.api.set_prompt({ slot = "identity" })"#);
+        let r = host.load_source("bad", r#"makima.api.set_prompt({ slot = "identity" })"#);
         assert!(r.is_err());
         assert!(r.unwrap_err().to_string().contains("'content' is required"));
     }
@@ -3214,7 +3217,7 @@ mod tests {
         let (_host, slots) = slots_from(
             "setter",
             r#"
-            maki.api.set_prompt({
+            makima.api.set_prompt({
                 slot = "identity",
                 content = "New identity",
             })
@@ -3231,7 +3234,7 @@ mod tests {
         let (_host, slots) = slots_from(
             "setter",
             r#"
-            maki.api.set_prompt({
+            makima.api.set_prompt({
                 slot = "identity",
                 prompt = "system",
                 content = "Explicit identity",
@@ -3249,7 +3252,7 @@ mod tests {
         let (_host, slots) = slots_from(
             "targeter",
             r#"
-            maki.api.register_prompt_hint({
+            makima.api.register_prompt_hint({
                 slot = "tool_usage",
                 prompt = "general",
                 content = "General hint",
@@ -3268,7 +3271,7 @@ mod tests {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         let r = host.load_source(
             "bad",
-            r#"maki.api.set_prompt({ slot = "identity", prompt = "nope", content = "x" })"#,
+            r#"makima.api.set_prompt({ slot = "identity", prompt = "nope", content = "x" })"#,
         );
         assert!(r.is_err());
     }
@@ -3278,12 +3281,12 @@ mod tests {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(
             "hint",
-            r#"maki.api.register_prompt_hint({ slot = "tool_usage", content = "HINT" })"#,
+            r#"makima.api.register_prompt_hint({ slot = "tool_usage", content = "HINT" })"#,
         )
         .unwrap();
         host.load_source(
             "setter",
-            r#"maki.api.set_prompt({ slot = "identity", content = "SET" })"#,
+            r#"makima.api.set_prompt({ slot = "identity", content = "SET" })"#,
         )
         .unwrap();
         let slots = host.event_handle().collect_prompt_slots();
@@ -3299,7 +3302,7 @@ mod tests {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         let r = host.load_source(
             "bad",
-            r#"maki.api.set_prompt({ slot = "tool_usage", content = "nope" })"#,
+            r#"makima.api.set_prompt({ slot = "tool_usage", content = "nope" })"#,
         );
         assert!(r.is_err());
     }
@@ -3309,7 +3312,7 @@ mod tests {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         let r = host.load_source(
             "bad",
-            r#"maki.api.set_prompt({ slot = "identity", prompt = "research", content = "x" })"#,
+            r#"makima.api.set_prompt({ slot = "identity", prompt = "research", content = "x" })"#,
         );
         assert!(r.is_err());
         assert!(r.unwrap_err().to_string().contains("not available"));
@@ -3320,7 +3323,7 @@ mod tests {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         let r = host.load_source(
             "bad",
-            r#"maki.api.set_prompt({ slot = "identity", prompt = {}, content = "x" })"#,
+            r#"makima.api.set_prompt({ slot = "identity", prompt = {}, content = "x" })"#,
         );
         assert!(r.is_err());
         assert!(r.unwrap_err().to_string().contains("no sequence entries"));
@@ -3331,7 +3334,7 @@ mod tests {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         let r = host.load_source(
             "bad",
-            r#"maki.api.set_prompt({ slot = "identity", content = "" })"#,
+            r#"makima.api.set_prompt({ slot = "identity", content = "" })"#,
         );
         assert!(r.is_err());
         assert!(r.unwrap_err().to_string().contains("empty"));
@@ -3342,7 +3345,7 @@ mod tests {
         let (_host, slots) = slots_from(
             "setter_cb",
             r#"
-            maki.api.set_prompt({
+            makima.api.set_prompt({
                 slot = "identity",
                 content = function() return "Dyn identity" end,
             })

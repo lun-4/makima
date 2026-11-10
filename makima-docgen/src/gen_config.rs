@@ -145,7 +145,7 @@ fn write_theme_section(out: &mut String) {
         out,
         "A theme TOML file can define optional `italic` and `bold_italic` keys \
          inside its `[ui]` table. These are theme styles, not fields in the \
-         `ui` table passed to `maki.setup()`. Without `[ui].italic`, Markdown \
+         `ui` table passed to `makima.setup()`. Without `[ui].italic`, Markdown \
          italics use the foreground from the `markup.italic` syntax scope. An \
          explicit `[ui].italic` takes precedence. Makima adds the italic \
          modifier in either case.\n\nWithout `[ui].bold_italic`, bold italics preserve \
@@ -176,7 +176,7 @@ fn write_theme_section(out: &mut String) {
     writeln!(
         out,
         "Kinds registered by your own completion sources (via \
-        `maki.api.register_completion_source`) fall back to the plain item \
+        `makima.api.register_completion_source`) fall back to the plain item \
         style until your theme defines them.\n"
     )
     .unwrap();
@@ -219,9 +219,9 @@ fn write_net_section(out: &mut String) {
     write_section(out, "[net]", NetConfig::FIELDS);
     writeln!(
         out,
-        "`maki.net.request` refuses private, loopback and metadata addresses, \
+        "`makima.net.request` refuses private, loopback and metadata addresses, \
          because the model picks the URLs. List a host here to let it through. \
-         Providers use `maki.net.send`, which has no such guard, so a local \
+         Providers use `makima.net.send`, which has no such guard, so a local \
          model server needs no entry:\n"
     )
     .unwrap();
@@ -229,7 +229,7 @@ fn write_net_section(out: &mut String) {
         out,
         "\
 ```lua
-maki.setup({{
+makima.setup({{
     net = {{
         allowed_private_hosts = {{ \"localhost:8080\", \"nas.lan\", \"10.0.0.0/8\" }},
     }},
@@ -290,7 +290,7 @@ group = \"Getting Started\"
 
 # Configuration
 
-Settings go in `init.lua`, a Lua script that calls `maki.setup()`. Same language as plugins.
+Settings go in `init.lua`, a Lua script that calls `makima.setup()`. Same language as plugins.
 
 Two places, both optional:
 
@@ -302,7 +302,7 @@ When both exist, project settings override global ones. Neither file is required
 ## Example
 
 ```lua
-maki.setup({{
+makima.setup({{
     ui = {{
         splash_animation = true,
         mouse_scroll_lines = {mouse_scroll},
@@ -336,7 +336,7 @@ All fields are optional. Typos in field names cause an error right away.
 
 `provider.allowed_models` is a list of glob patterns for qualified `provider/model-id` specs. `*` also matches `/`, so `provider/*` includes nested model IDs. When the list is empty or omitted, every model is allowed. `provider.excluded_models` removes matching models after that, so exclusions always win. A project list replaces the matching global list; omit it to inherit or use `{{}}` to clear it. The policy applies to selectors, CLI and API model changes, delegation, and `makima models`.
 
-`maki.setup()` can only be called once per init.lua.
+`makima.setup()` can only be called once per init.lua.
 
 ## Full Reference
 ",
@@ -375,8 +375,8 @@ All fields are optional. Typos in field names cause an error right away.
          A plugin that is off never loads, so its tool name is free for one \
          of your own plugins to take. Permission rules are keyed by the tool \
          name alone, and names such as `bash`, `write`, and `task_spawn` already \
-         have rules in maki. A plugin that takes one of them inherits those \
-         rules, together with any \"always allow\" you saved. Maki warns you \
+         have rules in makima. A plugin that takes one of them inherits those \
+         rules, together with any \"always allow\" you saved. Makima warns you \
          at load when this happens.\n\n\
          Each plugin checks its own options at startup. A typo, a wrong \
          type, or an unknown plugin name gives you a clear error right \
@@ -393,7 +393,7 @@ All fields are optional. Typos in field names cause an error right away.
         out,
         "\
 ```lua
-maki.setup({{
+makima.setup({{
     plugins = {{
         bash = {{ timeout_secs = 180 }},
         websearch = {{ enabled = false }},

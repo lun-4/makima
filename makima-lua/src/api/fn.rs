@@ -711,7 +711,7 @@ lua_table! {
     ///   on_exit = function(code) print("done: " .. code) end,
     /// })
     /// ```
-    "maki.fn" => pub(crate) fn create_fn_table(
+    "makima.fn" => pub(crate) fn create_fn_table(
         plugin: Arc<str>,
         perms: &PluginPermissions,
         tx: Option<flume::Sender<UiAction>>,

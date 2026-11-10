@@ -379,7 +379,7 @@ fn definition_table(lua: &Lua, definition: &SessionOptionDefinition) -> LuaResul
 }
 
 lua_table! {
-    extend "maki.api" => pub(crate) fn add_session_option_fn(
+    extend "makima.api" => pub(crate) fn add_session_option_fn(
         pending: PendingSessionOptions
     ), DOCS [register_session_option(pending), get_session_options]
 }

@@ -1380,7 +1380,7 @@ lua_table! {
     /// makima.api.register_tool({ name = "greet", ... })
     /// makima.api.register_prompt_hint({ slot = "tool_usage", content = "..." })
     /// ```
-    extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, pending_commands: PendingCommandMap, pending_options: crate::api::options::PendingPluginOptionSpecs, pending_prompts: crate::runtime::PendingPromptHintCallbacks, plugin: Arc<str>, opts: PluginOpts), DOCS [
+    extend "makima.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, pending_commands: PendingCommandMap, pending_options: crate::api::options::PendingPluginOptionSpecs, pending_prompts: crate::runtime::PendingPromptHintCallbacks, plugin: Arc<str>, opts: PluginOpts), DOCS [
         register_tool(pending), register_permission_rule(pending_rules), register_command(pending_commands, plugin),
         register_prompt_hint(pending_prompts, plugin), register_options(pending_options, plugin, opts), set_prompt(pending_prompts, plugin),
         get_tools, get_tool,

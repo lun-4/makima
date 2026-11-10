@@ -173,7 +173,7 @@ lua_table! {
     /// unloads (one event per touched registry, no ordering guarantee).
     /// Gather the initial state at load time and keep it fresh from events;
     /// do not poll.
-    "maki.store" => pub(crate) fn create_store_table(pending: PendingStore, plugin: Arc<str>), DOCS [
+    "makima.store" => pub(crate) fn create_store_table(pending: PendingStore, plugin: Arc<str>), DOCS [
         register(pending, plugin), collect(pending, plugin),
     ]
 }

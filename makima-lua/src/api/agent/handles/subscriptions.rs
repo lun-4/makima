@@ -130,5 +130,5 @@ fn subscription_close(lua: &Lua, this: &LuaAgentSubscription) -> mlua::Result<Pa
 lua_class! {
     /// An autocmd filtered to one agent. Garbage collection does not
     /// unsubscribe; close it, or unload the plugin.
-    "maki.agent.AgentSubscription" => LuaAgentSubscription, SUBSCRIPTION_DOCS [subscription_close]
+    "makima.agent.AgentSubscription" => LuaAgentSubscription, SUBSCRIPTION_DOCS [subscription_close]
 }

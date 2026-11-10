@@ -93,7 +93,7 @@ lua_table! {
     /// ```lua
     /// local cfg = makima.env.config_dir()
     /// ```
-    "maki.env" => pub(crate) fn create_env_table(perms: &PluginPermissions), DOCS [
+    "makima.env" => pub(crate) fn create_env_table(perms: &PluginPermissions), DOCS [
         state_dir(perms), config_dir(perms), logs_dir(perms), cache_dir(perms),
         no_project(perms),
     ]

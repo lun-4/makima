@@ -317,7 +317,7 @@ lua_table! {
     ///   print("five seconds gone")
     /// end)
     /// ```
-    "maki.timer" => pub(crate) fn create_timer_table(pending: PendingTimerStore, plugin: Arc<str>), DOCS [
+    "makima.timer" => pub(crate) fn create_timer_table(pending: PendingTimerStore, plugin: Arc<str>), DOCS [
         set(pending, plugin), del(pending, plugin),
     ]
 }

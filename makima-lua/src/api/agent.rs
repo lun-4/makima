@@ -615,7 +615,7 @@ fn allowed_model(ctx: &AgentContext, spec: &str) -> Result<Model, ModelError> {
 fn dispatch_ctx<'a>(lua: &Lua, ctx: &'a LuaCtx, method: &str) -> Result<&'a AgentContext, String> {
     ctx.validate_origin(lua)?;
     ctx.agent()
-        .ok_or_else(|| ctx.cap_err(&format!("maki.agent.{method}")))
+        .ok_or_else(|| ctx.cap_err(&format!("makima.agent.{method}")))
 }
 
 /// Runtime resolution touches no actor state, so a trusted invocation may
@@ -623,7 +623,7 @@ fn dispatch_ctx<'a>(lua: &Lua, ctx: &'a LuaCtx, method: &str) -> Result<&'a Agen
 fn resolve_ctx<'a>(lua: &Lua, ctx: &'a LuaCtx) -> Result<&'a AgentContext, String> {
     ctx.validate_origin(lua)?;
     ctx.model_context()
-        .ok_or_else(|| ctx.cap_err("maki.agent.resolve_model"))
+        .ok_or_else(|| ctx.cap_err("makima.agent.resolve_model"))
 }
 
 /// Forwards subagent events to the parent, stamped with the subagent identity.
@@ -1880,7 +1880,7 @@ lua_table! {
     /// print(r.text)
     /// agent:close(ctx)
     /// ```
-    "maki.agent" => pub(crate) fn create_agent_table(), DOCS [
+    "makima.agent" => pub(crate) fn create_agent_table(), DOCS [
         resolve_model, system_prompt, tools, callable_tools, call_tool, permission_prompt,
         root, list, get, spawn,
     ]

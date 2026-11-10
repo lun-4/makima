@@ -292,7 +292,7 @@ lua_table! {
     ///   print(m.score) -- matched codepoint offsets in m.indices
     /// end
     /// ```
-    "maki.match" => pub(crate) fn create_match_table(),     DOCS [
+    "makima.match" => pub(crate) fn create_match_table(),     DOCS [
         fuzzy,
         completion,
         compare,

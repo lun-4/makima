@@ -593,10 +593,10 @@ fn agent_defer_close(
     Ok((Some(true), None))
 }
 
-// Bundled task plugin internals, not public API. `_makima_session_id` reads the
-// task/UI identity. `_makima_task_owner` returns a host-stamped guard whose
-// `_makima_can_control` checks plugin generation, host and parent branch, and whose
-// `_makima_retired` reports a closed child. The guard authorizes no effect.
+// Bundled task plugin internals, not public API. `_maki_session_id` reads the
+// task/UI identity. `_maki_task_owner` returns a host-stamped guard whose
+// `_maki_can_control` checks plugin generation, host and parent branch, and whose
+// `_maki_retired` reports a closed child. The guard authorizes no effect.
 fn agent_internal_methods<M: UserDataMethods<LuaAgent>>(methods: &mut M) {
     methods.add_method("_maki_task_owner", |lua, this, ctx: UserDataRef<LuaCtx>| {
         authorize(lua, &ctx, this).map_err(mlua::Error::runtime)?;
@@ -626,7 +626,7 @@ lua_class! {
     /// A nonowning agent handle. Garbage collection never closes its actor.
     /// Reads and effects require current invocation authority; identity is context-free.
     /// A held managed handle retains authorized closed-status reads, not mutation rights.
-    "maki.agent.Agent" => LuaAgent, AGENT_DOCS [
+    "makima.agent.Agent" => LuaAgent, AGENT_DOCS [
         agent_id, agent_latest_turn, agent_status, agent_config, agent_available_models,
         agent_transcript, agent_ref, agent_send, agent_set_model,
         agent_set_mode, agent_set_option, agent_cancel, agent_cancel_subtree, agent_close, agent_defer_close,

@@ -25,10 +25,10 @@ mod tests {
         text.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
-    #[test_case("maki.api.register_command()", "maki.api.register_command({spec})"; "register_command")]
-    #[test_case("maki.keymap.set()", "maki.keymap.set({mode}, {lhs}, {rhs}, {opts?})"; "keymap_set")]
-    #[test_case("maki.api.run_command()", "maki.api.run_command({ctx?}, {cmdline})"; "run_command")]
-    #[test_case("maki.agent.spawn()", "maki.agent.spawn({ctx}, {opts})"; "agent_spawn")]
+    #[test_case("makima.api.register_command()", "makima.api.register_command({spec})"; "register_command")]
+    #[test_case("makima.keymap.set()", "makima.keymap.set({mode}, {lhs}, {rhs}, {opts?})"; "keymap_set")]
+    #[test_case("makima.api.run_command()", "makima.api.run_command({ctx?}, {cmdline})"; "run_command")]
+    #[test_case("makima.agent.spawn()", "makima.agent.spawn({ctx}, {opts})"; "agent_spawn")]
     #[test_case("Agent:status()", "Agent:status({ctx})"; "agent_status")]
     #[test_case("Agent:config()", "Agent:config({ctx})"; "agent_config")]
     #[test_case("Agent:available_models()", "Agent:available_models({ctx})"; "agent_available_models")]
@@ -56,8 +56,8 @@ mod tests {
         );
     }
 
-    #[test_case("maki.agent.AgentTurn"; "agent_turn")]
-    #[test_case("maki.agent.AgentSubscription"; "agent_subscription")]
+    #[test_case("makima.agent.AgentTurn"; "agent_turn")]
+    #[test_case("makima.agent.AgentSubscription"; "agent_subscription")]
     fn generated_docs_render_agent_class_description(name: &str) {
         let module = makima_lua::docs::api_docs()
             .into_iter()
@@ -97,7 +97,7 @@ mod tests {
     fn generated_docs_contain_typed_arguments_contract() {
         let page = generate();
         let start = page
-            .find("### `maki.api.register_command()`")
+            .find("### `makima.api.register_command()`")
             .expect("generated docs must render register_command");
         let end = page[start..]
             .find(SECTION_SEPARATOR)

@@ -190,7 +190,7 @@ pub(crate) fn frame_from_lua(value: Value, width: u16, height: u16) -> LuaResult
 /// Guard-free read-only `makima.version()` returning `{ current, latest,
 /// update_available }`. The host owns the update check and pushes the result
 /// via [`Request::SetVersion`]; plugins only mirror it.
-pub(crate) fn register_version_api(lua: &Lua, maki: &Table) -> LuaResult<()> {
+pub(crate) fn register_version_api(lua: &Lua, makima: &Table) -> LuaResult<()> {
     let f = lua.create_function(|lua, ()| {
         let info = lua
             .app_data_ref::<VersionInfo>()
@@ -203,7 +203,7 @@ pub(crate) fn register_version_api(lua: &Lua, maki: &Table) -> LuaResult<()> {
         t.set("update_available", info.latest.is_some())?;
         Ok(t)
     })?;
-    maki.set("version", f)?;
+    makima.set("version", f)?;
     Ok(())
 }
 
@@ -237,7 +237,7 @@ pub(crate) const version__doc: FnDoc = FnDoc {
     desc: "Read the current makima version and, if the built-in update check found one, the newer version. Rust owns the update check; plugins only mirror it, so the version text and update notice belong to whoever draws them.",
     params: &[],
     returns: "(table) { current = string, latest = string|nil, update_available = boolean }",
-    example: "local v = maki.version()\nif v.update_available then\n  print(\"run makima update to get v\" .. v.latest)\nend",
+    example: "local v = makima.version()\nif v.update_available then\n  print(\"run makima update to get v\" .. v.latest)\nend",
     guard: None,
 };
 

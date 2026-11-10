@@ -97,7 +97,7 @@ lua_table! {
     /// ```lua
     /// local md = makima.text.html_to_markdown(html)
     /// ```
-    "maki.text" => pub(crate) fn create_text_table(), DOCS [
+    "makima.text" => pub(crate) fn create_text_table(), DOCS [
         html_to_markdown,
         truncate_line,
         truncate_file,

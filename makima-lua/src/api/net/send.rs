@@ -33,7 +33,7 @@ const DEFAULT_LOW_SPEED_TIMEOUT_SECS: f64 = 30.0;
 const DEFAULT_IDLE_TIMEOUT_SECS: f64 = 300.0;
 const LOW_SPEED_BYTES_PER_SEC: u32 = 1;
 const USER_AGENT_HEADER: &str = "user-agent";
-const USER_AGENT: &str = concat!("maki/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT: &str = concat!("makima/", env!("CARGO_PKG_VERSION"));
 const HEADER_VALUE_SEPARATOR: &str = ", ";
 const CLOSED_ERR: &str = "response is closed";
 /// Starts the error for a connection that was never established: refused, or
@@ -349,7 +349,7 @@ lua_class! {
     /// the body with `:read()`. Closing or dropping the handle, or the end of
     /// the task that sent the request, closes the connection once the next
     /// byte arrives from the server.
-    "maki.net.Response" => LuaResponse, RESPONSE_DOCS [read, close] fields response_fields
+    "makima.net.Response" => LuaResponse, RESPONSE_DOCS [read, close] fields response_fields
 }
 
 #[cfg(test)]

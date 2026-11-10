@@ -71,7 +71,7 @@ fn thinking_levels(lua: &Lua) -> LuaResult<Table> {
 lua_table! {
     /// Model catalog reads that address no agent. `Agent:config`,
     /// `Agent:set_model` and `Agent:available_models` act on an agent.
-    "maki.model" => pub(crate) fn create_model_table(),
+    "makima.model" => pub(crate) fn create_model_table(),
     DOCS [info, thinking_levels]
 }
 

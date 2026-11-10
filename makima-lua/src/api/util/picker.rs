@@ -18,7 +18,7 @@ const ITEM_MISSING_LABEL: &str = "picker item missing `label`";
 const ITEM_LABEL_MUST_BE_STRING: &str = "picker item `label` must be a string";
 const ITEM_FIELD_MUST_BE_STRING: &str = "picker item field must be a string or nil";
 const ITEM_AGE_MUST_BE_TIMESTAMP: &str =
-    "picker item `age` must be a timestamp from maki.time.now or maki.time.at";
+    "picker item `age` must be a timestamp from makima.time.now or makima.time.at";
 const TITLE_MUST_BE_STRING: &str = "open_list_picker: title must be a string";
 const CURSOR_MUST_BE_POSITIVE: &str = "open_list_picker: cursor must be >= 1";
 const TIMEOUT_MUST_BE_NON_NEGATIVE: &str = "open_list_picker: timeout_ms must be >= 0";

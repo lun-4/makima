@@ -401,7 +401,7 @@ fn declare_slot(
     crate::runtime::deny_delegated_registration(lua)?;
     if name.starts_with(HOST_PREFIX) {
         return Err(mlua::Error::runtime(format!(
-            "slot '{name}' is host owned: '{HOST_PREFIX}' names are fired by maki itself, \
+            "slot '{name}' is host owned: '{HOST_PREFIX}' names are fired by makima itself, \
              use set_slot to wrap one"
         )));
     }
@@ -507,7 +507,7 @@ fn get_slots(lua: &Lua) -> LuaResult<Table> {
 }
 
 lua_table! {
-    extend "maki.api" => pub(crate) fn add_slot_methods(plugin: Arc<str>), DOCS [
+    extend "makima.api" => pub(crate) fn add_slot_methods(plugin: Arc<str>), DOCS [
         declare_slot(plugin), set_slot(plugin), get_slots,
     ]
 }

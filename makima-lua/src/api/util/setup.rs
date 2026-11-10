@@ -9,10 +9,10 @@ use crate::splash::version__doc;
 
 pub(crate) type ConfigStore = Arc<Mutex<Option<RawConfig>>>;
 
-const DOUBLE_SETUP_MSG: &str = "maki.setup() already called in this init.lua";
+const DOUBLE_SETUP_MSG: &str = "makima.setup() already called in this init.lua";
 
 pub(crate) const DOCS: ModuleDoc = ModuleDoc {
-    name: "maki",
+    name: "makima",
     kind: DocKind::Table,
     desc: "The global entry point. Every API lives under this table.",
     fns: &[
@@ -29,7 +29,7 @@ accepts the same keys as the Configuration reference.",
             }],
             returns: "",
             guard: None,
-            example: "maki.setup({\n\
+            example: "makima.setup({\n\
   model = \"opus\",\n\
   keymaps = false,\n\
 })",

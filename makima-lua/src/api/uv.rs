@@ -47,7 +47,7 @@ lua_table! {
     /// ```lua
     /// local home = makima.uv.os_homedir()
     /// ```
-    "maki.uv" => pub(crate) fn create_uv_table(perms: &PluginPermissions), DOCS [
+    "makima.uv" => pub(crate) fn create_uv_table(perms: &PluginPermissions), DOCS [
         cwd(perms), os_homedir(perms), os_getenv(perms),
     ]
 }

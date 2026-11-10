@@ -131,7 +131,7 @@ lua_table! {
     /// `makima.api.mode`: define, override and list agent modes. Built-in
     /// `build` and `plan` are pre-registered, so overrides use the same call
     /// as defining a custom mode. Switch an agent with `Agent:set_mode`.
-    "maki.api.mode" => pub(crate) fn create_mode_table(),
+    "makima.api.mode" => pub(crate) fn create_mode_table(),
     DOCS [define, list, reset]
 }
 

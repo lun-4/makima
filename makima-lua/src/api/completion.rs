@@ -186,7 +186,7 @@ lua_table! {
     /// and expanders (submit-time token replacement) keyed by prefix. The
     /// built-in `skill`, `task`, and `model` plugins provide the defaults; you
     /// can add your own kinds the same way.
-    extend "maki.api" => pub(crate) fn add_completion_fns(plugin: Arc<str>, pending_sources: Arc<Mutex<PendingCompletionStore>>, pending_expanders: Arc<Mutex<PendingExpanderStore>>), DOCS [
+    extend "makima.api" => pub(crate) fn add_completion_fns(plugin: Arc<str>, pending_sources: Arc<Mutex<PendingCompletionStore>>, pending_expanders: Arc<Mutex<PendingExpanderStore>>), DOCS [
         register_completion_source(plugin, pending_sources), register_expander(plugin, pending_expanders),
     ]
 }

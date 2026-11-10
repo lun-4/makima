@@ -258,7 +258,7 @@ lua_table! {
     /// local res, err = makima.net.request("https://example.com")
     /// if res then print(res.body) end
     /// ```
-    "maki.net" => pub(crate) fn create_net_table(perms: &PluginPermissions), DOCS [
+    "makima.net" => pub(crate) fn create_net_table(perms: &PluginPermissions), DOCS [
         request(perms), send(perms),
     ]
 }

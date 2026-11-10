@@ -39,7 +39,7 @@ lua_table! {
     /// local t = makima.yaml.decode("greeting: hello")
     /// print(t.greeting)
     /// ```
-    "maki.yaml" => pub(crate) fn create_yaml_table(), DOCS [
+    "makima.yaml" => pub(crate) fn create_yaml_table(), DOCS [
         encode, decode,
     ]
 }

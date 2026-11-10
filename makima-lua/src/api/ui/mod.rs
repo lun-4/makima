@@ -772,7 +772,7 @@ pub(crate) const set_status_content__doc: FnDoc = FnDoc {
     }],
     returns: "",
     guard: None,
-    example: "maki.ui.set_status_content({ {\"connected\", \"success\"}, {\" readonly\", \"muted\"} })\n-- clickable entry:\nmaki.ui.set_status_content({ {\"refresh\", \"accent\", function() maki.ui.flash(\"refreshing\") end} })",
+    example: "makima.ui.set_status_content({ {\"connected\", \"success\"}, {\" readonly\", \"muted\"} })\n-- clickable entry:\nmaki.ui.set_status_content({ {\"refresh\", \"accent\", function() makima.ui.flash(\"refreshing\") end} })",
 };
 
 #[allow(non_upper_case_globals)]
@@ -787,7 +787,7 @@ pub(crate) const set_status_hint__doc: FnDoc = FnDoc {
     }],
     returns: "",
     guard: None,
-    example: "maki.ui.set_status_hint({ {\"q\", \"quit\"}, {\"j\", \"down\"} })\n-- later, clear them:\nmaki.ui.set_status_hint(nil)",
+    example: "makima.ui.set_status_hint({ {\"q\", \"quit\"}, {\"j\", \"down\"} })\n-- later, clear them:\nmaki.ui.set_status_hint(nil)",
 };
 
 /// Resolve the agent that has UI focus now. Later focus changes do not
@@ -883,7 +883,7 @@ lua_table! {
     /// buf:line("hello from my plugin!")
     /// local win = makima.ui.open_win(buf, { title = "Greeting", width = "50%", height = 5 })
     /// ```
-    extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
+    extend "makima.ui" => pub(crate) fn add_ui_fns(), DOCS [
         buf, theme_color, format_time, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text, focused_agent, post,
         manual flash, manual action, manual open_editor, manual open_list_picker, manual open_win,

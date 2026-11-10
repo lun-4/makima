@@ -189,7 +189,7 @@ lua_table! {
     /// local trees = parser:parse()
     /// local root = trees[1]:root()
     /// ```
-    extend "maki.treesitter" => pub(crate) fn add_treesitter_fns(), DOCS [
+    extend "makima.treesitter" => pub(crate) fn add_treesitter_fns(), DOCS [
         get_parser, get_string_parser, get_node_text, get_node_range, get_range,
         is_ancestor, is_in_node_range, node_contains, get_node,
     ]

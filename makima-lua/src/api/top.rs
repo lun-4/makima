@@ -105,7 +105,7 @@ fn stop(_lua: &Lua, this: &Timer) -> LuaResult<()> {
 lua_class! {
     /// Handle returned by `makima.defer_fn`. Its `:stop()` cancels the
     /// callback before it fires, which is what debouncing is built on.
-    "maki.Timer" => Timer, TIMER_DOCS [stop]
+    "makima.Timer" => Timer, TIMER_DOCS [stop]
 }
 
 /// Show a one line notice. By default it goes to `makima.ui.flash`, with
@@ -158,7 +158,7 @@ fn notify(
         match func.call::<()>((msg.clone(), level.clone(), opts)) {
             Ok(()) => return Ok(()),
             Err(e) => {
-                tracing::warn!(error = %e, "maki.notify handler failed; falling through to flash");
+                tracing::warn!(error = %e, "makima.notify handler failed; falling through to flash");
             }
         }
     }
@@ -243,7 +243,7 @@ pub(crate) fn clear_notify_handler(lua: &Lua, plugin: &str) {
 }
 
 lua_table! {
-    extend "maki" => pub(crate) fn add_top_methods(
+    extend "makima" => pub(crate) fn add_top_methods(
         plugin: Arc<str>,
     ), DOCS [
         defer_fn(plugin), manual notify, set_notify_handler(plugin),
@@ -256,8 +256,8 @@ mod tests {
 
     use super::*;
 
-    const BY_FUNCTION: &str = "maki.set_notify_handler(function(msg) seen = msg end)";
-    const BY_ASSIGNMENT: &str = "maki.notify = function(msg) seen = msg end";
+    const BY_FUNCTION: &str = "makima.set_notify_handler(function(msg) seen = msg end)";
+    const BY_ASSIGNMENT: &str = "makima.notify = function(msg) seen = msg end";
 
     /// Builds one plugin's `makima` table under the global {plugin}, wired the
     /// way `create_makima_global` wires it: `notify` on the metatable's
@@ -267,9 +267,9 @@ mod tests {
         if lua.app_data_ref::<NotifyHandler>().is_none() {
             lua.set_app_data(NotifyHandler::default());
         }
-        let maki = lua.create_table().unwrap();
+        let makima = lua.create_table().unwrap();
         let owner: Arc<str> = Arc::from(plugin);
-        add_top_methods(&maki, lua, Arc::clone(&owner)).unwrap();
+        add_top_methods(&makima, lua, Arc::clone(&owner)).unwrap();
         let index = lua.create_table().unwrap();
         notify__register(&index, lua, tx, Arc::clone(&owner)).unwrap();
         let router = lua
@@ -283,8 +283,8 @@ mod tests {
         let meta = lua.create_table().unwrap();
         meta.set("__index", index).unwrap();
         meta.set("__newindex", router).unwrap();
-        maki.set_metatable(Some(meta)).unwrap();
-        lua.globals().set(plugin, maki).unwrap();
+        makima.set_metatable(Some(meta)).unwrap();
+        lua.globals().set(plugin, makima).unwrap();
     }
 
     fn flashed(rx: &flume::Receiver<UiAction>) -> String {
@@ -295,12 +295,12 @@ mod tests {
     }
 
     #[test_case("" ; "no handler installed")]
-    #[test_case("maki.set_notify_handler(function() end) maki.set_notify_handler(nil)" ; "handler removed again")]
+    #[test_case("makima.set_notify_handler(function() end) makima.set_notify_handler(nil)" ; "handler removed again")]
     fn notify_falls_back_to_flash(prelude: &str) {
         let lua = Lua::new();
         let (tx, rx) = flume::unbounded();
-        install(&lua, Some(tx), "maki");
-        lua.load(format!(r#"{prelude} maki.notify("hi")"#))
+        install(&lua, Some(tx), "makima");
+        lua.load(format!(r#"{prelude} makima.notify("hi")"#))
             .exec()
             .unwrap();
         assert_eq!(flashed(&rx), "hi");
@@ -310,8 +310,8 @@ mod tests {
     fn notify_title_labels_the_flash() {
         let lua = Lua::new();
         let (tx, rx) = flume::unbounded();
-        install(&lua, Some(tx), "maki");
-        lua.load(r#"maki.notify("hi", nil, { title = "make" })"#)
+        install(&lua, Some(tx), "makima");
+        lua.load(r#"makima.notify("hi", nil, { title = "make" })"#)
             .exec()
             .unwrap();
         assert_eq!(flashed(&rx), "make: hi");
@@ -322,8 +322,8 @@ mod tests {
     #[test]
     fn notify_without_a_ui_is_not_an_error() {
         let lua = Lua::new();
-        install(&lua, None, "maki");
-        lua.load(r#"maki.notify("hi", "warn")"#).exec().unwrap();
+        install(&lua, None, "makima");
+        lua.load(r#"makima.notify("hi", "warn")"#).exec().unwrap();
     }
 
     /// Both spellings of "override notify" have to reach notify calls made
@@ -334,7 +334,7 @@ mod tests {
     fn override_reroutes_every_plugins_notify(install_handler: &str) {
         let lua = Lua::new();
         let (tx, _rx) = flume::unbounded();
-        install(&lua, Some(tx.clone()), "maki");
+        install(&lua, Some(tx.clone()), "makima");
         install(&lua, Some(tx), "makima_b");
 
         let seen: String = lua
@@ -357,19 +357,21 @@ mod tests {
     fn unloading_the_installer_restores_the_default() {
         let lua = Lua::new();
         let (tx, rx) = flume::unbounded();
-        install(&lua, Some(tx.clone()), "maki");
+        install(&lua, Some(tx.clone()), "makima");
         install(&lua, Some(tx), "makima_b");
         lua.load(r#"seen = "" makima_b.set_notify_handler(function(msg) seen = msg end)"#)
             .exec()
             .unwrap();
 
-        clear_notify_handler(&lua, "maki");
-        lua.load(r#"maki.notify("still routed")"#).exec().unwrap();
+        clear_notify_handler(&lua, "makima");
+        lua.load(r#"makima.notify("still routed")"#).exec().unwrap();
         assert_eq!(lua.globals().get::<String>("seen").unwrap(), "still routed");
         assert!(rx.try_recv().is_err(), "the handler took it, not the flash");
 
         clear_notify_handler(&lua, "makima_b");
-        lua.load(r#"maki.notify("back to flash")"#).exec().unwrap();
+        lua.load(r#"makima.notify("back to flash")"#)
+            .exec()
+            .unwrap();
         assert_eq!(flashed(&rx), "back to flash");
     }
 
@@ -377,17 +379,17 @@ mod tests {
     fn notify_handler_keeps_installer_authority_in_delegated_tools() {
         let lua = Lua::new();
         let (tx, _rx) = flume::unbounded();
-        install(&lua, Some(tx), "maki");
+        install(&lua, Some(tx), "makima");
         let delegated = lua
             .create_function(|lua, ()| Ok(crate::runtime::in_delegated_tool(lua)))
             .unwrap();
         lua.globals().set("delegated", delegated).unwrap();
-        lua.load(r#"maki.set_notify_handler(function() seen = delegated() end)"#)
+        lua.load(r#"makima.set_notify_handler(function() seen = delegated() end)"#)
             .exec()
             .unwrap();
         let scope = crate::runtime::TaskScope::detached(&lua);
         crate::runtime::lock_cell(scope.handle()).delegated_tool = Some(Default::default());
-        lua.load(r#"maki.notify("from a tool")"#).exec().unwrap();
+        lua.load(r#"makima.notify("from a tool")"#).exec().unwrap();
         assert!(!lua.globals().get::<bool>("seen").unwrap());
         assert!(crate::runtime::in_delegated_tool(&lua));
     }
@@ -396,11 +398,11 @@ mod tests {
     fn notify_assignment_rejects_non_function() {
         let lua = Lua::new();
         let (tx, _rx) = flume::unbounded();
-        install(&lua, Some(tx), "maki");
+        install(&lua, Some(tx), "makima");
         let err = lua
-            .load(r#"maki.notify = 42"#)
+            .load(r#"makima.notify = 42"#)
             .exec()
-            .expect_err("assigning a non-function to maki.notify must fail");
+            .expect_err("assigning a non-function to makima.notify must fail");
         let msg = format!("{err}");
         assert!(
             msg.contains("function or nil"),
@@ -414,8 +416,8 @@ mod tests {
     fn defer_handle_stop_marks_cancel_flag() {
         let lua = Lua::new();
         lua.set_app_data(DeferQueue::new());
-        install(&lua, None, "maki");
-        lua.load(r#"H = maki.defer_fn(function() end, 5000)"#)
+        install(&lua, None, "makima");
+        lua.load(r#"H = makima.defer_fn(function() end, 5000)"#)
             .exec()
             .unwrap();
         let cancel = {

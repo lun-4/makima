@@ -74,29 +74,29 @@ mod tests {
 
     fn eval(chunk: &str) -> mlua::Result<Vec<String>> {
         let lua = Lua::new();
-        let maki = lua.create_table().unwrap();
-        split__register(&maki, &lua).unwrap();
-        lua.globals().set("maki", maki).unwrap();
+        let makima = lua.create_table().unwrap();
+        split__register(&makima, &lua).unwrap();
+        lua.globals().set("makima", makima).unwrap();
         lua.load(chunk).eval()
     }
 
-    #[test_case(r#"maki.split("a,b,c", ",")"#, &["a", "b", "c"] ; "basic")]
-    #[test_case(r#"maki.split(":aa::b:", ":")"#, &["", "aa", "", "b", ""] ; "keeps_empty_pieces")]
-    #[test_case(r#"maki.split(":aa::b:", ":", { trimempty = true })"#, &["aa", "", "b"] ; "trimempty_only_trims_ends")]
-    #[test_case(r#"maki.split("x*y*z", "*", { plain = true })"#, &["x", "y", "z"] ; "plain_disables_patterns")]
-    #[test_case(r#"maki.split("|x|y|z|", "|", true)"#, &["", "x", "y", "z", ""] ; "legacy_boolean_plain")]
-    #[test_case(r#"maki.split("a1b22c333", "%d+")"#, &["a", "b", "c", ""] ; "pattern_separator")]
-    #[test_case(r#"maki.split("abc", "")"#, &["a", "b", "c"] ; "empty_sep_splits_chars")]
-    #[test_case(r#"maki.split("", ",")"#, &[""] ; "empty_string_one_piece")]
-    #[test_case(r#"maki.split("", "")"#, &[] ; "empty_string_empty_sep")]
-    #[test_case(r#"maki.split("a\nb", "\n")"#, &["a", "b"] ; "newline_no_trailing")]
-    #[test_case(r#"maki.split("a\nb\n", "\n")"#, &["a", "b", ""] ; "newline_trailing_empty")]
+    #[test_case(r#"makima.split("a,b,c", ",")"#, &["a", "b", "c"] ; "basic")]
+    #[test_case(r#"makima.split(":aa::b:", ":")"#, &["", "aa", "", "b", ""] ; "keeps_empty_pieces")]
+    #[test_case(r#"makima.split(":aa::b:", ":", { trimempty = true })"#, &["aa", "", "b"] ; "trimempty_only_trims_ends")]
+    #[test_case(r#"makima.split("x*y*z", "*", { plain = true })"#, &["x", "y", "z"] ; "plain_disables_patterns")]
+    #[test_case(r#"makima.split("|x|y|z|", "|", true)"#, &["", "x", "y", "z", ""] ; "legacy_boolean_plain")]
+    #[test_case(r#"makima.split("a1b22c333", "%d+")"#, &["a", "b", "c", ""] ; "pattern_separator")]
+    #[test_case(r#"makima.split("abc", "")"#, &["a", "b", "c"] ; "empty_sep_splits_chars")]
+    #[test_case(r#"makima.split("", ",")"#, &[""] ; "empty_string_one_piece")]
+    #[test_case(r#"makima.split("", "")"#, &[] ; "empty_string_empty_sep")]
+    #[test_case(r#"makima.split("a\nb", "\n")"#, &["a", "b"] ; "newline_no_trailing")]
+    #[test_case(r#"makima.split("a\nb\n", "\n")"#, &["a", "b", ""] ; "newline_trailing_empty")]
     fn split_matches_vim_split(chunk: &str, expected: &[&str]) {
         assert_eq!(eval(chunk).unwrap(), expected);
     }
 
-    #[test_case(r#"maki.split("ab", "x*")"#, INFINITE_LOOP_MSG ; "empty_match_pattern")]
-    #[test_case(r#"maki.split("a", ",", 5)"#, OPTS_TYPE_MSG ; "bad_opts_type")]
+    #[test_case(r#"makima.split("ab", "x*")"#, INFINITE_LOOP_MSG ; "empty_match_pattern")]
+    #[test_case(r#"makima.split("a", ",", 5)"#, OPTS_TYPE_MSG ; "bad_opts_type")]
     fn split_rejects(chunk: &str, expected_err: &str) {
         let err = eval(chunk).unwrap_err().to_string();
         assert!(err.contains(expected_err), "got: {err}");

@@ -162,7 +162,7 @@ lua_class! {
     /// user_message and retryable; cancelled results include cancellation_reason.
     /// origin contains kind ("user", "plugin", or "internal"), plugin?,
     /// plugin_generation?, source_agent?, source_turn?. It conveys provenance only.
-    "maki.agent.AgentTurn" => LuaAgentTurn, TURN_DOCS [
+    "makima.agent.AgentTurn" => LuaAgentTurn, TURN_DOCS [
         turn_id, turn_agent_id, ticket_result, ticket_wait, ticket_cancel,
     ]
 }

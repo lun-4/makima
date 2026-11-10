@@ -43,7 +43,7 @@ lua_table! {
     /// ```lua
     /// local signature = makima.crypto.hmac_sha256(key, makima.crypto.sha256(body))
     /// ```
-    "maki.crypto" => pub(crate) fn create_crypto_table(), DOCS [
+    "makima.crypto" => pub(crate) fn create_crypto_table(), DOCS [
         sha256, hmac_sha256,
     ]
 }

@@ -14,9 +14,9 @@ use makima_lua::test_support::{InMemoryFs, run_command};
 use makima_lua::{CommandArgumentContext, CommandArgumentItem, CommandArgumentLifecycle};
 
 const NOTE_PATH: &str = "note.md";
-const NOTE_BODY: &str = "hello-maki";
+const NOTE_BODY: &str = "hello-makima";
 const WROTE_PREFIX: &str = "wrote note.md";
-const PROJECTS_PREFIX: &str = "/maki-test-state/projects/";
+const PROJECTS_PREFIX: &str = "/makima-test-state/projects/";
 const SPLASH_DEADLINE: Duration = Duration::from_secs(30);
 const SPLASH_BACKOFF: Duration = Duration::from_millis(100);
 

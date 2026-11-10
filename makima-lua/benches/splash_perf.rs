@@ -41,22 +41,23 @@ const FRAME_STEP: f64 = 0.033;
 const MEMORY_LIMIT: usize = 512 * 1024 * 1024;
 
 fn install_makima_stub(lua: &Lua) {
-    let maki = lua.create_table().unwrap();
+    let makima = lua.create_table().unwrap();
     let ui = lua.create_table().unwrap();
     ui.set(
         "theme_color",
         lua.create_function(|_, _: ()| Ok(None::<String>)).unwrap(),
     )
     .unwrap();
-    maki.set("ui", ui).unwrap();
+    makima.set("ui", ui).unwrap();
     let version = lua.create_table().unwrap();
     version.set("current", "0.0.0-test").unwrap();
-    maki.set(
-        "version",
-        lua.create_function(move |_, _: ()| Ok(version.clone()))
-            .unwrap(),
-    )
-    .unwrap();
+    makima
+        .set(
+            "version",
+            lua.create_function(move |_, _: ()| Ok(version.clone()))
+                .unwrap(),
+        )
+        .unwrap();
     let api = lua.create_table().unwrap();
     api.set(
         "set_slot",
@@ -68,8 +69,8 @@ fn install_makima_stub(lua: &Lua) {
         lua.create_function(|_, _: MultiValue| Ok(())).unwrap(),
     )
     .unwrap();
-    maki.set("api", api).unwrap();
-    lua.globals().set("maki", maki).unwrap();
+    makima.set("api", api).unwrap();
+    lua.globals().set("makima", makima).unwrap();
 }
 
 fn runtime_lua() -> Lua {
@@ -107,8 +108,8 @@ fn env_table(lua: &Lua, safe: bool) -> Table {
     let mt = lua.create_table().unwrap();
     mt.set("__index", lua.globals()).unwrap();
     env.set_metatable(Some(mt)).unwrap();
-    let maki: Table = lua.globals().get("maki").unwrap();
-    env.set("maki", maki).unwrap();
+    let makima: Table = lua.globals().get("makima").unwrap();
+    env.set("makima", makima).unwrap();
     if safe {
         env.set_safeenv(true);
     }
