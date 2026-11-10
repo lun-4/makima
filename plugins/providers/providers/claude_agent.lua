@@ -219,11 +219,16 @@ function M.provider(cache)
   function spec.discover(ctx, config)
     local socket = M.socket(config)
     if not socket then
-      return {}
+      return M.cached_models(cache)
     end
     local body, err = get_json(ctx, socket, MODELS_PATH)
     if not body then
-      return nil, err
+      -- Discovery is best effort: a bridge that is down, or a Claude Code
+      -- that is not logged in, only matters to a step. `prepare` reports it
+      -- then, and `auth_status` reports it from the login picker, so the
+      -- cached models stay listed without a warning at startup.
+      maki.log.debug("claude-agent: model discovery failed: " .. http.message(err))
+      return M.cached_models(cache)
     end
     local models, seen = {}, {}
     for _, row in ipairs(type(body.models) == "table" and body.models or {}) do
