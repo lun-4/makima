@@ -716,11 +716,11 @@ mod tests {
             fs.files(),
             vec![
                 (
-                    PathBuf::from("/ordinary.txt"),
+                    make_absolute("/ordinary.txt").unwrap(),
                     FIRST_CONTENT.as_bytes().to_vec()
                 ),
                 (
-                    PathBuf::from("/plan.md"),
+                    make_absolute("/plan.md").unwrap(),
                     REPLACEMENT_CONTENT.as_bytes().to_vec()
                 ),
             ]

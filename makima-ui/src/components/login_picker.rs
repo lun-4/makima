@@ -563,7 +563,7 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let state = TempDir::new().unwrap();
-            makima_storage::paths::init_at(state.path().to_path_buf()).unwrap();
+            makima_storage::paths::init_shared_for_test();
             let host = PluginHost::with_session_provider_preparer(
                 Arc::new(ToolRegistry::new()),
                 Default::default(),

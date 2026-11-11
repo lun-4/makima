@@ -3061,8 +3061,15 @@ mod tests {
             makima_lua::ui_sink::HostUi::Sink(Box::new(ui)),
         )
         .unwrap();
-        host.load_source("sdk_bundled_task", include_str!("../plugins/task/init.lua"))
-            .unwrap();
+        // The global registry outlives every test in this process, so a
+        // fixed tool name would collide with the other test that loads the
+        // bundled task plugin.
+        let task_source = include_str!("../plugins/task/init.lua")
+            .replace("task_spawn", "sdk_task_spawn")
+            .replace("task_wait", "sdk_task_wait")
+            .replace("task_send", "sdk_task_send")
+            .replace("task_despawn", "sdk_task_despawn");
+        host.load_source("sdk_bundled_task", &task_source).unwrap();
         host.load_source(
             "sdk_command_spawn",
             &format!(
@@ -3105,12 +3112,12 @@ mod tests {
                         assert(captured.fast == inherited.fast)
                     end
                     local prompt = input.child and "{SDK_GRANDCHILD_PROMPT}" or "{SDK_CHILD_PROMPT}"
-                    local spawned, err = makima.agent.call_tool(ctx, "task_spawn", {{
+                    local spawned, err = makima.agent.call_tool(ctx, "sdk_task_spawn", {{
                         description = prompt, prompt = prompt, subagent_type = "general",
                     }})
                     assert(not err, err)
                     local task = makima.json.decode(spawned)
-                    local joined, wait_err = makima.agent.call_tool(ctx, "task_wait", {{ task_id = task.task_id, turn_id = task.turn_id }})
+                    local joined, wait_err = makima.agent.call_tool(ctx, "sdk_task_wait", {{ task_id = task.task_id, turn_id = task.turn_id }})
                     assert(not wait_err, wait_err)
                     local result = makima.json.decode(joined)
                     local expected = input.child and "{SDK_GRANDCHILD_RESPONSE}" or "{SDK_CHILD_RESPONSE}"

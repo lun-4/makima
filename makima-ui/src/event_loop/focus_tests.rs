@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use makima_agent::actor::{ConfigChange, ConfigPatch, PendingQueueEntry, PreparedModel};
@@ -224,7 +225,16 @@ fn live_slash_controls_commit_on_the_admitted_actor(command: &str) {
         match command {
             "/fast" => assert_eq!(commit.config.fast, !previous.fast),
             "/workflow" => assert_eq!(commit.config.workflow, !previous.workflow),
-            _ => assert_eq!(commit.config.context.cwd(), std::path::Path::new("/")),
+            _ => {
+                let root = Path::new(&event_loop.session_cwd)
+                    .ancestors()
+                    .find(|path| path.parent().is_none())
+                    .unwrap();
+                assert_eq!(
+                    commit.config.context.cwd(),
+                    std::fs::canonicalize(root).unwrap()
+                );
+            }
         }
     });
 }

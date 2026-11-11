@@ -4,6 +4,7 @@ use crate::chat::{CANCELLED_TEXT, DONE_TEXT};
 use crate::click::{ClickTarget, PickerId, ScrollOwner, Surface};
 use crate::components::btw_modal::BtwEvent;
 use crate::components::command::ParsedCommand;
+use crate::components::file_completion::DIRECTORY_SUFFIX;
 use crate::components::file_picker::EMPTY_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
 use crate::components::{Action, ExitRequest, TEST_MODEL_PROVIDER, buffer_text, key, test_model};
@@ -11307,7 +11308,7 @@ fn parent_path_completion_advances_then_finishes() {
     assert!(app.file_completion.is_active());
     assert_eq!(
         app.input_box.buffer.value(),
-        format!("@../sibling{}", std::path::MAIN_SEPARATOR)
+        format!("@../sibling{}", DIRECTORY_SUFFIX)
     );
 
     for character in "out".chars() {
@@ -11317,7 +11318,7 @@ fn parent_path_completion_advances_then_finishes() {
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert_eq!(
         app.input_box.buffer.value(),
-        format!("@../sibling{}outside.txt", std::path::MAIN_SEPARATOR)
+        format!("@../sibling{}outside.txt", DIRECTORY_SUFFIX)
     );
     assert!(!app.file_completion.is_active());
 }
@@ -11352,7 +11353,7 @@ fn quoted_explicit_path_advances_then_closes_on_file() {
     let directory = parent.path().join("release notes");
     std::fs::create_dir_all(&project).unwrap();
     std::fs::create_dir_all(&directory).unwrap();
-    std::fs::write(directory.join("final report?.md"), b"report").unwrap();
+    std::fs::write(directory.join("final report!.md"), b"report").unwrap();
     Arc::get_mut(&mut app.state.session)
         .unwrap()
         .set_cwd(project.to_string_lossy().into_owned());
@@ -11364,7 +11365,7 @@ fn quoted_explicit_path_advances_then_closes_on_file() {
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert_eq!(
         app.input_box.buffer.value(),
-        format!("@\"../release notes{}", std::path::MAIN_SEPARATOR)
+        format!("@\"../release notes{}", DIRECTORY_SUFFIX)
     );
     assert!(app.file_completion.is_active());
 
@@ -11375,10 +11376,7 @@ fn quoted_explicit_path_advances_then_closes_on_file() {
     app.update(Msg::Key(key(KeyCode::Tab)));
     assert_eq!(
         app.input_box.buffer.value(),
-        format!(
-            "@\"../release notes{}final report?.md\"",
-            std::path::MAIN_SEPARATOR
-        )
+        format!("@\"../release notes{}final report!.md\"", DIRECTORY_SUFFIX)
     );
     assert!(!app.file_completion.is_active());
 }
@@ -11410,10 +11408,7 @@ fn cd_completion_filters_directories_and_accepts_before_execution() {
     converge_completion(&mut app);
     let items = app.command_palette.argument_match_items();
     assert_eq!(items.len(), 1);
-    assert_eq!(
-        items[0].label,
-        format!("alpha{}", std::path::MAIN_SEPARATOR).into()
-    );
+    assert_eq!(items[0].label, format!("alpha{}", DIRECTORY_SUFFIX).into());
 
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert_eq!(app.input_box.buffer.value(), "/cd alpha/");
@@ -11461,7 +11456,7 @@ fn quoted_directory_descent_keeps_cursor_inside_quotes() {
     converge_completion(&mut app);
     app.update(Msg::Key(key(KeyCode::Tab)));
 
-    let descended = format!("/cd \"release notes{}\"", std::path::MAIN_SEPARATOR);
+    let descended = format!("/cd \"release notes{}\"", DIRECTORY_SUFFIX);
     assert_eq!(app.input_box.buffer.value(), descended);
     assert_eq!(
         app.input_box.buffer.cursor_byte_offset(),
@@ -11471,10 +11466,7 @@ fn quoted_directory_descent_keeps_cursor_inside_quotes() {
     app.update(Msg::Paste("draft copy".into()));
     assert_eq!(
         app.input_box.buffer.value(),
-        format!(
-            "/cd \"release notes{}draft copy\"",
-            std::path::MAIN_SEPARATOR
-        )
+        format!("/cd \"release notes{}draft copy\"", DIRECTORY_SUFFIX)
     );
     converge_completion(&mut app);
     app.update(Msg::Key(key(KeyCode::Enter)));

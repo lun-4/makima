@@ -137,14 +137,18 @@ pub(super) fn spawn_file_walker(
                             return ignore::WalkState::Continue;
                         }
                         let path = entry.path().strip_prefix(&root).unwrap_or(entry.path());
-                        let mut name = path.to_string_lossy().into_owned();
+                        // A walker path becomes prompt text: `/` on every
+                        // platform. Windows names cannot contain a backslash.
+                        let mut name = path
+                            .to_string_lossy()
+                            .replace(std::path::MAIN_SEPARATOR, "/");
                         // `file_type` is an lstat, so follow the symlink to learn
                         // whether it points at a directory.
                         let is_directory = entry.file_type().is_some_and(|ft| ft.is_dir())
                             || entry.file_type().is_some_and(|ft| ft.is_symlink())
                                 && entry.path().metadata().is_ok_and(|m| m.is_dir());
                         if is_directory {
-                            name.push(std::path::MAIN_SEPARATOR);
+                            name.push('/');
                         }
                         injector.push((), |_, cols| {
                             cols[0] = Utf32String::from(name.as_str());

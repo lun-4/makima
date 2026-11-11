@@ -496,6 +496,16 @@ mod tests {
 
     const ROOT: &str = "/t";
 
+    /// `/t` is rooted but not absolute on Windows, and `resolve_root` joins the
+    /// cwd for that, so seeds and scopes must spell it the same way.
+    fn rooted(path: &str) -> PathBuf {
+        std::env::current_dir().unwrap().join(path)
+    }
+
+    fn scope(path: &str) -> String {
+        rooted(path).to_string_lossy().into_owned()
+    }
+
     fn seeded() -> InMemoryFs {
         let fs = InMemoryFs::new();
         smol::block_on(fs.mkdir(PathBuf::from(ROOT), true)).unwrap();
@@ -708,39 +718,35 @@ mod tests {
     #[test]
     fn glob_scope_limit_and_mtime_order() {
         let fs = InMemoryFs::new();
-        smol::block_on(fs.mkdir(PathBuf::from("/t/sub"), true)).unwrap();
-        smol::block_on(fs.write(PathBuf::from("/t/top.rs"), Vec::new())).unwrap();
-        smol::block_on(fs.write(PathBuf::from("/t/sub/inner.rs"), Vec::new())).unwrap();
+        smol::block_on(fs.mkdir(rooted("/t/sub"), true)).unwrap();
+        smol::block_on(fs.write(rooted("/t/top.rs"), Vec::new())).unwrap();
+        smol::block_on(fs.write(rooted("/t/sub/inner.rs"), Vec::new())).unwrap();
 
         // gitignore semantics (real backend delegates to the `ignore` crate):
         // a pattern without a slash matches at any depth under the scope.
         let shallow =
-            smol::block_on(fs.glob(vec!["*.rs".into()], Some("/t".into()), None, true, false))
+            smol::block_on(fs.glob(vec!["*.rs".into()], Some(scope("/t")), None, true, false))
                 .unwrap();
-        let mut shallow: Vec<&str> = shallow.iter().map(String::as_str).collect();
-        shallow.sort();
-        assert_eq!(shallow, vec!["/t/sub/inner.rs", "/t/top.rs"]);
+        assert_eq!(shallow, vec![scope("/t/sub/inner.rs"), scope("/t/top.rs")]);
 
         let scoped = smol::block_on(fs.glob(
             vec!["*.rs".into()],
-            Some("/t/sub".into()),
+            Some(scope("/t/sub")),
             None,
             true,
             false,
         ))
         .unwrap();
-        assert_eq!(scoped, vec!["/t/sub/inner.rs"]);
+        assert_eq!(scoped, vec![scope("/t/sub/inner.rs")]);
 
         let deep =
-            smol::block_on(fs.glob(vec!["**/*.rs".into()], Some("/t".into()), None, true, false))
+            smol::block_on(fs.glob(vec!["**/*.rs".into()], Some(scope("/t")), None, true, false))
                 .unwrap();
-        let mut deep: Vec<&str> = deep.iter().map(String::as_str).collect();
-        deep.sort();
-        assert_eq!(deep, vec!["/t/sub/inner.rs", "/t/top.rs"]);
+        assert_eq!(deep, vec![scope("/t/sub/inner.rs"), scope("/t/top.rs")]);
 
         let limited = smol::block_on(fs.glob(
             vec!["**/*.rs".into()],
-            Some("/t".into()),
+            Some(scope("/t")),
             Some(1),
             true,
             false,
@@ -750,17 +756,20 @@ mod tests {
 
         // mtime sort is insertion order, newest first.
         let f = InMemoryFs::new();
-        smol::block_on(f.mkdir(PathBuf::from(ROOT), true)).unwrap();
-        smol::block_on(f.write(PathBuf::from("/t/one.rs"), Vec::new())).unwrap();
-        smol::block_on(f.write(PathBuf::from("/t/two.rs"), Vec::new())).unwrap();
-        smol::block_on(f.write(PathBuf::from("/t/three.rs"), Vec::new())).unwrap();
+        smol::block_on(f.mkdir(rooted(ROOT), true)).unwrap();
+        smol::block_on(f.write(rooted("/t/one.rs"), Vec::new())).unwrap();
+        smol::block_on(f.write(rooted("/t/two.rs"), Vec::new())).unwrap();
+        smol::block_on(f.write(rooted("/t/three.rs"), Vec::new())).unwrap();
         let by_mtime =
-            smol::block_on(f.glob(vec!["*.rs".into()], Some("/t".into()), None, true, true))
+            smol::block_on(f.glob(vec!["*.rs".into()], Some(scope("/t")), None, true, true))
                 .unwrap();
-        assert_eq!(by_mtime, vec!["/t/three.rs", "/t/two.rs", "/t/one.rs"]);
+        assert_eq!(
+            by_mtime,
+            vec![scope("/t/three.rs"), scope("/t/two.rs"), scope("/t/one.rs")]
+        );
 
         assert!(
-            smol::block_on(f.glob(vec!["[".into()], Some("/t".into()), None, true, false,))
+            smol::block_on(f.glob(vec!["[".into()], Some(scope("/t")), None, true, false,))
                 .is_err(),
             "invalid pattern must surface as an error"
         );
@@ -769,21 +778,32 @@ mod tests {
     #[test]
     fn grep_matches_with_context_include_and_limit() {
         let fs = InMemoryFs::new();
-        smol::block_on(fs.mkdir(PathBuf::from(ROOT), true)).unwrap();
+        smol::block_on(fs.mkdir(rooted(ROOT), true)).unwrap();
         let mut content = String::new();
         for i in 1..=5 {
-            content.push_str(&format!("line_{i}\n"));
+            content.push_str(&format!(
+                "line_{i}
+"
+            ));
         }
-        smol::block_on(fs.write(PathBuf::from("/t/data.rs"), content.into_bytes())).unwrap();
-        smol::block_on(fs.write(PathBuf::from("/t/other.txt"), b"line_99\n".to_vec())).unwrap();
+        smol::block_on(fs.write(rooted("/t/data.rs"), content.into_bytes())).unwrap();
+        smol::block_on(
+            fs.write(
+                rooted("/t/other.txt"),
+                b"line_99
+"
+                .to_vec(),
+            ),
+        )
+        .unwrap();
 
         let mut params = GrepParams::new("line_3".to_string());
-        params.path = Some("/t".to_string());
+        params.path = Some(scope("/t"));
         params.context_before = 1;
         params.context_after = 1;
         params.include = Some("*.rs".to_string());
         let (base, entries) = smol::block_on(fs.grep(params)).unwrap();
-        assert_eq!(base, PathBuf::from("/t"));
+        assert_eq!(base, rooted("/t"));
         assert_eq!(entries.len(), 1, "include must exclude other.txt");
         assert_eq!(entries[0].path, "data.rs");
         assert_eq!(entries[0].groups.len(), 1);
@@ -799,20 +819,20 @@ mod tests {
 
         // Without the include filter both files hit.
         let mut params = GrepParams::new("line_".to_string());
-        params.path = Some("/t".to_string());
+        params.path = Some(scope(ROOT));
         let (_, all) = smol::block_on(fs.grep(params)).unwrap();
         assert_eq!(all.len(), 2);
 
         // The limit caps total groups across files.
         let mut params = GrepParams::new("line_".to_string());
-        params.path = Some("/t".to_string());
+        params.path = Some(scope(ROOT));
         params.include = Some("*.rs".to_string());
         params.limit = 2;
         let (_, capped) = smol::block_on(fs.grep(params)).unwrap();
         assert_eq!(capped[0].groups.len(), 2);
 
         let mut params = GrepParams::new("[".to_string());
-        params.path = Some("/t".to_string());
+        params.path = Some(scope(ROOT));
         let err = smol::block_on(fs.grep(params)).unwrap_err().to_string();
         assert!(err.starts_with("invalid regex pattern"), "{err}");
     }

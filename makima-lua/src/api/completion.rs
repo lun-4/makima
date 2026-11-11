@@ -294,6 +294,14 @@ fn raw_token_end(text: &str, start: usize, limit: usize) -> usize {
 /// Scan one token with `limit` as the exclusive visible end. Passing the full
 /// text makes this the submit scanner; passing a cursor byte makes it the
 /// completion scanner for the same state machine.
+/// Whether the colon at {colon} follows a single ASCII letter and the byte
+/// after it starts a path, as in `C:\Users` or `C:/Users`.
+fn is_drive_letter(text: &str, start: usize, colon: usize) -> bool {
+    colon == start + 2
+        && text.as_bytes()[start + 1].is_ascii_alphabetic()
+        && text[colon + 1..].starts_with(&['/', '\\'][..])
+}
+
 fn scan_at_token(text: &str, start: usize, limit: usize) -> Option<ScannedAtToken> {
     if start >= limit || !text.get(start..)?.starts_with('@') || !at_is_token_start(text, start) {
         return None;
@@ -317,6 +325,9 @@ fn scan_at_token(text: &str, start: usize, limit: usize) -> Option<ScannedAtToke
             cursor += c.len_utf8();
         }
         match colon {
+            // `@C:\dirile`: a drive letter is not a tag prefix, or every
+            // absolute Windows path would read as an unknown reference.
+            Some(colon) if is_drive_letter(text, start, colon) => (None, start + 1, None),
             Some(colon) => {
                 let value_start = colon + 1;
                 let quote = text[value_start..limit]
@@ -1062,6 +1073,25 @@ mod tests {
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].prefix, "skill");
         assert_eq!(tokens[0].value, " ");
+    }
+
+    #[test]
+    fn a_drive_path_survives_active_at_token() {
+        let path = r"C:\Users\me\Temp\note";
+        let text = format!("read @{path}");
+        let token = active_at_token(&text, text.len()).unwrap();
+        assert_eq!(token.prefix, "");
+        assert_eq!(token.value, path);
+    }
+
+    #[test]
+    fn a_drive_letter_is_a_file_reference_not_a_tag_prefix() {
+        for text in [r"open @C:\Users\me\notes.md", "open @C:/Users/me/notes.md"] {
+            let tokens = parse_at_tokens(text);
+            assert_eq!(tokens.len(), 1, "{text}");
+            assert_eq!(tokens[0].prefix, "", "{text}");
+            assert!(tokens[0].value.starts_with("C:"), "{text}");
+        }
     }
 
     #[test]
