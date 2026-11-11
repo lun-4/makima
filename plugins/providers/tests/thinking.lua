@@ -1,4 +1,4 @@
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 local thinking = require("providers.thinking")
 
 local OFF = { kind = "off" }

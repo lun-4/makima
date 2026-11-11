@@ -7,14 +7,14 @@ group = "Reference"
 
 # Lua API
 
-Maki plugins are plain Lua files. Everything a plugin can touch lives under
-one global table: `maki`. This reference documents every module, function,
-and method. It is generated straight from the source code by `maki-docgen`.
+Makima plugins are plain Lua files. Everything a plugin can touch lives under
+one global table: `makima`. This reference documents every module, function,
+and method. It is generated straight from the source code by `makima-docgen`.
 For where plugin files live and how to load them, read the
 [Plugins guide](/docs/plugins/) first.
 
-The API tries to mirror Neovim as much as possible (`maki.fs`, `maki.uv`,
-`maki.treesitter`, `maki.keymap`, `maki.base64`), signatures are kept identical
+The API tries to mirror Neovim as much as possible (`makima.fs`, `makima.uv`,
+`makima.treesitter`, `makima.keymap`, `makima.base64`), signatures are kept identical
 so code can be copy-pasted between the two without too many modifications.
 
 Plugins run compiled to native code (Luau JIT). If you are debugging a
@@ -24,12 +24,12 @@ Lua on the interpreter with complete debug info instead.
 A small plugin looks like this:
 
 ```lua
-maki.api.register_command({
+makima.api.register_command({
   name = "greet",
   description = "Say hello from Lua",
   tui_only = false,
   handler = function()
-    maki.ui.flash("hello from a plugin!")
+    makima.ui.flash("hello from a plugin!")
   end,
 })
 ```
@@ -43,9 +43,9 @@ One convention to remember: fallible runtime operations return a
 `(value, err)` pair instead of throwing. Check `err` before using `value`:
 
 ```lua
-local text, err = maki.fs.read("config.json")
+local text, err = makima.fs.read("config.json")
 if err then
-  maki.log.error("read failed: " .. err)
+  makima.log.error("read failed: " .. err)
   return
 end
 ```
@@ -86,57 +86,57 @@ The rules:
 | Module | What it is for |
 | --- | --- |
 | [`LuaCtx`](#LuaCtx) | Host-issued invocation context. |
-| [`maki`](#maki) | The global entry point. |
-| [`maki.api`](#maki-api) | Plugin registration. |
-| [`maki.perf`](#maki-perf) | Performance instrumentation for splashes and the UI. |
-| [`maki.store`](#maki-store) | Shared key-value store for plugin contributions. |
-| [`maki.agent`](#maki-agent) | Subagent primitives for plugins that need to talk to an LLM. |
-| [`maki.agent.Agent`](#maki-agent-Agent) | A nonowning agent handle. |
-| [`maki.agent.AgentRef`](#maki-agent-AgentRef) | Visibility-only identity. |
-| [`maki.agent.AgentSubscription`](#maki-agent-AgentSubscription) | An autocmd filtered to one agent. |
-| [`maki.agent.AgentTurn`](#maki-agent-AgentTurn) | An exact-turn ticket with repeatable retained result reads. |
-| [`maki.async`](#maki-async) | Tools for running things concurrently in Lua plugins. |
-| [`maki.async.Semaphore`](#maki-async-Semaphore) | A counting semaphore for limiting how many tasks run at once. |
-| [`maki.async.Permit`](#maki-async-Permit) | One slot in a semaphore, obtained from `Semaphore:acquire()`. |
-| [`maki.base64`](#maki-base64) | Base64 encoding and decoding, modelled after `vim.base64`. |
-| [`maki.crypto`](#maki-crypto) | Hashing on binary strings. |
-| [`maki.env`](#maki-env) | Paths to makima's own directories (config, state, logs, cache), and whether |
-| [`maki.fn`](#maki-fn) | Process and environment helpers, modeled after Neovim's `vim.fn` job |
-| [`maki.fs`](#maki-fs) | File-system utilities, modelled after `vim.fs` and `vim.uv`. |
-| [`maki.host`](#maki-host) | Actions on the host machine: opening a browser, reading the keyring. |
-| [`maki.image`](#maki-image) | Small building blocks for working with images: probe metadata, decode |
-| [`maki.image.Image`](#maki-image-Image) | A decoded image you can inspect, resize, and re-encode. |
-| [`maki.interpreter`](#maki-interpreter) | Run Python code in a memory-safe, time-limited sandbox. |
-| [`maki.json`](#maki-json) | JSON encoding, decoding, and schema validation. |
-| [`maki.json.SchemaValidator`](#maki-json-SchemaValidator) | A compiled JSON Schema validator. |
-| [`maki.keymap`](#maki-keymap) | Key mappings, modeled after `vim.keymap`. |
-| [`maki.log`](#maki-log) | Structured logging for plugins. |
-| [`maki.match`](#maki-match) | Fuzzy matching via nucleo, the same matcher makima's built-in pickers use. |
-| [`maki.api.mode`](#maki-api-mode) | `maki.api.mode`: define, override and list agent modes. |
-| [`maki.model`](#maki-model) | Model catalog reads that address no agent. |
-| [`maki.net`](#maki-net) | HTTP clients: a guarded `request` for web content and a raw, streaming |
-| [`maki.net.Response`](#maki-net-Response) | A streaming HTTP response from `maki.net.send`. |
-| [`maki.session`](#maki-session) | Host session primitives. |
-| [`maki.credentials`](#maki-credentials) | Credential stores for plugins. |
-| [`maki.credentials.Store`](#maki-credentials-Store) | A credentials file: a provider's (its ctx's `credentials`) or a |
-| [`maki.Ctx`](#maki-Ctx) | A plugin's authority. |
-| [`maki.provider.LoginUi`](#maki-provider-LoginUi) | The `ui` a provider's `login(ctx, ui, config)` receives. |
-| [`maki.usage`](#maki-usage) | Provider-side quota snapshots. |
-| [`maki.text`](#maki-text) | Text transformation utilities. |
-| [`maki.time`](#maki-time) | Wall-clock timestamps and relative-age formatting. |
-| [`maki.timer`](#maki-timer) | Recurring callbacks on the runtime's timer pump. |
-| [`maki.treesitter`](#maki-treesitter) | Tree-sitter parsing and query API. |
-| [`maki.treesitter.language`](#maki-treesitter-language) | Language registry for tree-sitter grammars. |
-| [`maki.treesitter.query`](#maki-treesitter-query) | Query compilation and lookup. |
-| [`maki.treesitter.Query`](#maki-treesitter-Query) | A compiled tree-sitter query. |
-| [`maki.treesitter.Tree`](#maki-treesitter-Tree) | A parsed syntax tree. |
-| [`maki.treesitter.Node`](#maki-treesitter-Node) | A single node in a parsed syntax tree. |
-| [`maki.treesitter.LanguageTree`](#maki-treesitter-LanguageTree) | Manages parsing of a source string for a single language. |
-| [`maki.ui`](#maki-ui) | Functions for building interactive UI. |
-| [`maki.ui.Win`](#maki-ui-Win) | Handle to a floating or split window. |
-| [`maki.ui.Buf`](#maki-ui-Buf) | A content buffer that holds styled lines of text. |
-| [`maki.uv`](#maki-uv) | System and environment utilities, modelled after `vim.uv`. |
-| [`maki.yaml`](#maki-yaml) | YAML encoding and decoding. |
+| [`makima`](#makima) | The global entry point. |
+| [`makima.api`](#makima-api) | Plugin registration. |
+| [`makima.perf`](#makima-perf) | Performance instrumentation for splashes and the UI. |
+| [`makima.store`](#makima-store) | Shared key-value store for plugin contributions. |
+| [`makima.agent`](#makima-agent) | Subagent primitives for plugins that need to talk to an LLM. |
+| [`makima.agent.Agent`](#makima-agent-Agent) | A nonowning agent handle. |
+| [`makima.agent.AgentRef`](#makima-agent-AgentRef) | Visibility-only identity. |
+| [`makima.agent.AgentSubscription`](#makima-agent-AgentSubscription) | An autocmd filtered to one agent. |
+| [`makima.agent.AgentTurn`](#makima-agent-AgentTurn) | An exact-turn ticket with repeatable retained result reads. |
+| [`makima.async`](#makima-async) | Tools for running things concurrently in Lua plugins. |
+| [`makima.async.Semaphore`](#makima-async-Semaphore) | A counting semaphore for limiting how many tasks run at once. |
+| [`makima.async.Permit`](#makima-async-Permit) | One slot in a semaphore, obtained from `Semaphore:acquire()`. |
+| [`makima.base64`](#makima-base64) | Base64 encoding and decoding, modelled after `vim.base64`. |
+| [`makima.crypto`](#makima-crypto) | Hashing on binary strings. |
+| [`makima.env`](#makima-env) | Paths to makima's own directories (config, state, logs, cache), and whether |
+| [`makima.fn`](#makima-fn) | Process and environment helpers, modeled after Neovim's `vim.fn` job |
+| [`makima.fs`](#makima-fs) | File-system utilities, modelled after `vim.fs` and `vim.uv`. |
+| [`makima.host`](#makima-host) | Actions on the host machine: opening a browser, reading the keyring. |
+| [`makima.image`](#makima-image) | Small building blocks for working with images: probe metadata, decode |
+| [`makima.image.Image`](#makima-image-Image) | A decoded image you can inspect, resize, and re-encode. |
+| [`makima.interpreter`](#makima-interpreter) | Run Python code in a memory-safe, time-limited sandbox. |
+| [`makima.json`](#makima-json) | JSON encoding, decoding, and schema validation. |
+| [`makima.json.SchemaValidator`](#makima-json-SchemaValidator) | A compiled JSON Schema validator. |
+| [`makima.keymap`](#makima-keymap) | Key mappings, modeled after `vim.keymap`. |
+| [`makima.log`](#makima-log) | Structured logging for plugins. |
+| [`makima.match`](#makima-match) | Fuzzy matching via nucleo, the same matcher makima's built-in pickers use. |
+| [`makima.api.mode`](#makima-api-mode) | `makima.api.mode`: define, override and list agent modes. |
+| [`makima.model`](#makima-model) | Model catalog reads that address no agent. |
+| [`makima.net`](#makima-net) | HTTP clients: a guarded `request` for web content and a raw, streaming |
+| [`makima.net.Response`](#makima-net-Response) | A streaming HTTP response from `makima.net.send`. |
+| [`makima.session`](#makima-session) | Host session primitives. |
+| [`makima.credentials`](#makima-credentials) | Credential stores for plugins. |
+| [`makima.credentials.Store`](#makima-credentials-Store) | A credentials file: a provider's (its ctx's `credentials`) or a |
+| [`makima.Ctx`](#makima-Ctx) | A plugin's authority. |
+| [`makima.provider.LoginUi`](#makima-provider-LoginUi) | The `ui` a provider's `login(ctx, ui, config)` receives. |
+| [`makima.usage`](#makima-usage) | Provider-side quota snapshots. |
+| [`makima.text`](#makima-text) | Text transformation utilities. |
+| [`makima.time`](#makima-time) | Wall-clock timestamps and relative-age formatting. |
+| [`makima.timer`](#makima-timer) | Recurring callbacks on the runtime's timer pump. |
+| [`makima.treesitter`](#makima-treesitter) | Tree-sitter parsing and query API. |
+| [`makima.treesitter.language`](#makima-treesitter-language) | Language registry for tree-sitter grammars. |
+| [`makima.treesitter.query`](#makima-treesitter-query) | Query compilation and lookup. |
+| [`makima.treesitter.Query`](#makima-treesitter-Query) | A compiled tree-sitter query. |
+| [`makima.treesitter.Tree`](#makima-treesitter-Tree) | A parsed syntax tree. |
+| [`makima.treesitter.Node`](#makima-treesitter-Node) | A single node in a parsed syntax tree. |
+| [`makima.treesitter.LanguageTree`](#makima-treesitter-LanguageTree) | Manages parsing of a source string for a single language. |
+| [`makima.ui`](#makima-ui) | Functions for building interactive UI. |
+| [`makima.ui.Win`](#makima-ui-Win) | Handle to a floating or split window. |
+| [`makima.ui.Buf`](#makima-ui-Buf) | A content buffer that holds styled lines of text. |
+| [`makima.uv`](#makima-uv) | System and environment utilities, modelled after `vim.uv`. |
+| [`makima.yaml`](#makima-yaml) | YAML encoding and decoding. |
 
 ## LuaCtx {#LuaCtx}
 
@@ -152,7 +152,7 @@ LuaCtx:agent()
 
 Resolve the pinned invocation subject, not current UI focus.
 
-**Returns:** ([`Agent?`](#maki-agent-Agent), `string?`) Nonowning handle with no authority independent of this context.
+**Returns:** ([`Agent?`](#makima-agent-Agent), `string?`) Nonowning handle with no authority independent of this context.
 
 ---
 
@@ -179,16 +179,16 @@ Read the executing turn's admitted mode. This can differ from Agent:config(ctx).
 **Returns:** (`string?`, `string?`) Registered mode name.
 
 
-## maki {#maki}
+## makima {#makima}
 
 The global entry point. Every API lives under this table.
 
 ---
 
-### `maki.setup()` {#maki-setup}
+### `makima.setup()` {#makima-setup}
 
 ```lua
-maki.setup({config})
+makima.setup({config})
 ```
 
 Apply your personal configuration. This is only available inside `init.lua` (not in plugins) and can be called at most once. The table accepts the same keys as the Configuration reference.
@@ -200,7 +200,7 @@ Apply your personal configuration. This is only available inside `init.lua` (not
 **Example:**
 
 ```lua
-maki.setup({
+makima.setup({
 model = "opus",
 keymaps = false,
 })
@@ -208,15 +208,15 @@ keymaps = false,
 
 ---
 
-### `maki.split()` {#maki-split}
+### `makima.split()` {#makima-split}
 
 ```lua
-maki.split({s}, {sep}, {opts?})
+makima.split({s}, {sep}, {opts?})
 ```
 
 Split {s} at each occurrence of {sep} and return the pieces as a
 list. Mirrors Neovim's `vim.split`, so code using it can be copied
-between Neovim and maki. {sep} is a Lua pattern unless `plain` is
+between Neovim and makima. {sep} is a Lua pattern unless `plain` is
 set; an empty {sep} splits into single characters.
 
 **Parameters:**
@@ -232,17 +232,17 @@ set; an empty {sep} splits into single characters.
 **Example:**
 
 ```lua
-maki.split("a,b,c", ",")                   -- { "a", "b", "c" }
-maki.split("x*y*z", "*", { plain = true }) -- { "x", "y", "z" }
-maki.split("\nhello\nworld\n", "\n", { trimempty = true }) -- { "hello", "world" }
+makima.split("a,b,c", ",")                   -- { "a", "b", "c" }
+makima.split("x*y*z", "*", { plain = true }) -- { "x", "y", "z" }
+makima.split("\nhello\nworld\n", "\n", { trimempty = true }) -- { "hello", "world" }
 ```
 
 ---
 
-### `maki.version()` {#maki-version}
+### `makima.version()` {#makima-version}
 
 ```lua
-maki.version()
+makima.version()
 ```
 
 Read the current makima version and, if the built-in update check found one, the newer version. Rust owns the update check; plugins only mirror it, so the version text and update notice belong to whoever draws them.
@@ -252,7 +252,7 @@ Read the current makima version and, if the built-in update check found one, the
 **Example:**
 
 ```lua
-local v = maki.version()
+local v = makima.version()
 if v.update_available then
   print("run makima update to get v" .. v.latest)
 end
@@ -260,17 +260,17 @@ end
 
 ---
 
-### `maki.defer_fn()` {#maki-defer_fn}
+### `makima.defer_fn()` {#makima-defer_fn}
 
 ```lua
-maki.defer_fn({callback}, {ms})
+makima.defer_fn({callback}, {ms})
 ```
 
 Run {callback} after {ms} milliseconds, on the Lua thread and outside
 any task scope. The timer does not hang off the caller's cancel token
 or the 60 second `async.run` deadline, so the callback still fires
 once the tool call that scheduled it is over. That is what a toast
-needs to dismiss itself, and the difference from `maki.async.sleep`.
+needs to dismiss itself, and the difference from `makima.async.sleep`.
 
 You get back a handle. Its `:stop()` cancels a callback that has not
 fired yet, which is how you debounce: schedule, then stop and
@@ -289,10 +289,10 @@ tasks, including their async children, cannot schedule deferred callbacks.
 
 ```lua
 -- A toast that dismisses itself 4 seconds later:
-local buf = maki.ui.buf({ scratch = true })
+local buf = makima.ui.buf({ scratch = true })
 buf:line("copied!")
-local win = maki.ui.open_win(buf, { split = "right", width = 20, height = 3 })
-maki.defer_fn(function() win:close() end, 4000)
+local win = makima.ui.open_win(buf, { split = "right", width = 20, height = 3 })
+makima.defer_fn(function() win:close() end, 4000)
 
 -- Repaint only after the user has stopped typing for half a second:
 local pending
@@ -300,25 +300,25 @@ local function repaint_soon()
   if pending then
     pending:stop()
   end
-  pending = maki.defer_fn(repaint, 500)
+  pending = makima.defer_fn(repaint, 500)
 end
 ```
 
 ---
 
-### `maki.notify()` {#maki-notify}
+### `makima.notify()` {#makima-notify}
 
 ```lua
-maki.notify({msg}, {level?}, {opts?})
+makima.notify({msg}, {level?}, {opts?})
 ```
 
-Show a one line notice. By default it goes to `maki.ui.flash`, with
+Show a one line notice. By default it goes to `makima.ui.flash`, with
 `{opts.title}` in front of the message when you pass one. A run with
 no UI, such as `makima --print` or the sdk, logs the notice instead of
 dropping it.
 
 There is one handler for the whole process. Once a plugin calls
-`maki.set_notify_handler`, notices from every plugin go through it.
+`makima.set_notify_handler`, notices from every plugin go through it.
 That is how a UI plugin turns flashes into stacked toasts without
 any of the callers knowing about it.
 
@@ -333,25 +333,25 @@ any of the callers knowing about it.
 **Example:**
 
 ```lua
-maki.notify("saved!")
-maki.notify("build failed", "error", { title = "make" })
+makima.notify("saved!")
+makima.notify("build failed", "error", { title = "make" })
 ```
 
 ---
 
-### `maki.set_notify_handler()` {#maki-set_notify_handler}
+### `makima.set_notify_handler()` {#makima-set_notify_handler}
 
 ```lua
-maki.set_notify_handler({handler})
+makima.set_notify_handler({handler})
 ```
 
-Install the handler that every `maki.notify` call in the process goes
+Install the handler that every `makima.notify` call in the process goes
 through, in place of the default flash. Pass `nil` to put the default
 back.
 
 The handler runs on the Lua thread, so keep it short and hand real
-work to `maki.async.run`. If it raises an error, the error is logged
-and the notice falls back to `maki.ui.flash`, so the user still sees
+work to `makima.async.run`. If it raises an error, the error is logged
+and the notice falls back to `makima.ui.flash`, so the user still sees
 it. Unloading the plugin that installed the handler also restores the
 default.
 
@@ -364,14 +364,14 @@ default.
 **Example:**
 
 ```lua
-local Toast = require("maki.toast")
-maki.set_notify_handler(function(msg, level, opts)
+local Toast = require("makima.toast")
+makima.set_notify_handler(function(msg, level, opts)
   Toast.show(msg, { title = opts and opts.title, level = level })
 end)
 ```
 
 
-## maki.api {#maki-api}
+## makima.api {#makima-api}
 
 Plugin registration. This is where you tell makima about your tools,
 slash commands, and prompt contributions.
@@ -380,8 +380,8 @@ Most plugins only need `register_tool` and maybe `register_prompt_hint`.
 Call these at the top level of your plugin file (during load).
 
 ```lua
-maki.api.register_tool({ name = "greet", ... })
-maki.api.register_prompt_hint({ slot = "tool_usage", content = "..." })
+makima.api.register_tool({ name = "greet", ... })
+makima.api.register_prompt_hint({ slot = "tool_usage", content = "..." })
 ```
 
 `@`-reference completion. Plugins register sources (popup candidates)
@@ -391,10 +391,10 @@ can add your own kinds the same way.
 
 ---
 
-### `maki.api.register_tool()` {#maki-api-register_tool}
+### `makima.api.register_tool()` {#makima-api-register_tool}
 
 ```lua
-maki.api.register_tool({spec})
+makima.api.register_tool({spec})
 ```
 
 Register a new tool the agent can call. This is the main way plugins add
@@ -449,7 +449,7 @@ string or a table with richer output fields.
 **Example:**
 
 ```lua
-maki.api.register_tool({
+makima.api.register_tool({
   name = "word_count",
   description = "Count words in a file.",
   kind = "read",
@@ -470,10 +470,10 @@ maki.api.register_tool({
 
 ---
 
-### `maki.api.register_permission_rule()` {#maki-api-register_permission_rule}
+### `makima.api.register_permission_rule()` {#makima-api-register_permission_rule}
 
 ```lua
-maki.api.register_permission_rule({spec})
+makima.api.register_permission_rule({spec})
 ```
 
 Declare an agent permission rule for a native tool. Use it to pre-allow
@@ -496,7 +496,7 @@ deny rules always win over a plugin allow.
 **Example:**
 
 ```lua
-maki.api.register_permission_rule({
+makima.api.register_permission_rule({
   tool = "write",
   scope = notes_dir .. "/**",
 })
@@ -504,10 +504,10 @@ maki.api.register_permission_rule({
 
 ---
 
-### `maki.api.register_command()` {#maki-api-register_command}
+### `makima.api.register_command()` {#makima-api-register_command}
 
 ```lua
-maki.api.register_command({spec})
+makima.api.register_command({spec})
 ```
 
 Register a slash-command that appears in the user input bar.
@@ -599,7 +599,7 @@ browsing memory files or toggling settings.
 ```lua
 -- Documentation and test example. It is not bundled and never copies files.
 local recorded
-maki.api.register_command({
+makima.api.register_command({
   name = "/copy",
   description = "Record typed path arguments",
   tui_only = false,
@@ -615,7 +615,7 @@ maki.api.register_command({
 -- `/copy "input file.txt" "build output" overwrite` records decoded values.
 
 -- Raw commands preserve the complete argument remainder:
-maki.api.register_command({
+makima.api.register_command({
   name = "/hello",
   description = "Say hello",
   tui_only = false,
@@ -628,10 +628,10 @@ maki.api.register_command({
 
 ---
 
-### `maki.api.register_prompt_hint()` {#maki-api-register_prompt_hint}
+### `makima.api.register_prompt_hint()` {#makima-api-register_prompt_hint}
 
 ```lua
-maki.api.register_prompt_hint({spec})
+makima.api.register_prompt_hint({spec})
 ```
 
 Add a piece of text to an aggregate prompt slot. Multiple plugins can each
@@ -653,7 +653,7 @@ Throws if you pass a singleton slot name.
 **Example:**
 
 ```lua
-maki.api.register_prompt_hint({
+makima.api.register_prompt_hint({
   slot = "tool_usage",
   content = "- Prefer **grep** over reading entire files.",
 })
@@ -661,14 +661,14 @@ maki.api.register_prompt_hint({
 
 ---
 
-### `maki.api.register_options()` {#maki-api-register_options}
+### `makima.api.register_options()` {#makima-api-register_options}
 
 ```lua
-maki.api.register_options({spec})
+makima.api.register_options({spec})
 ```
 
 Declare the options your plugin accepts under `plugins.<name>` in
-`maki.setup`, and get back what the user set merged with your defaults.
+`makima.setup`, and get back what the user set merged with your defaults.
 Call it once, at the top level of your plugin file.
 
 An unknown key, a wrong type, or a value below `min` fails the plugin
@@ -688,7 +688,7 @@ fail the load too. The specs also feed the generated configuration docs.
 **Example:**
 
 ```lua
-local opts = maki.api.register_options({
+local opts = makima.api.register_options({
   timeout_secs = { default = 120, min = 5, desc = "Kill the command after this many seconds." },
   max_output_lines = { type = "integer", desc = "Override agent.max_output_lines for this tool." },
 })
@@ -696,10 +696,10 @@ local opts = maki.api.register_options({
 
 ---
 
-### `maki.api.set_prompt()` {#maki-api-set_prompt}
+### `makima.api.set_prompt()` {#makima-api-set_prompt}
 
 ```lua
-maki.api.set_prompt({spec})
+makima.api.set_prompt({spec})
 ```
 
 Set a singleton prompt slot. Only one plugin owns each singleton slot at a
@@ -721,7 +721,7 @@ Throws if you pass an aggregate slot name.
 **Example:**
 
 ```lua
-maki.api.set_prompt({
+makima.api.set_prompt({
   slot = "tone",
   content = "Be concise. No filler words.",
 })
@@ -729,10 +729,10 @@ maki.api.set_prompt({
 
 ---
 
-### `maki.api.get_tools()` {#maki-api-get_tools}
+### `makima.api.get_tools()` {#makima-api-get_tools}
 
 ```lua
-maki.api.get_tools({opts?})
+makima.api.get_tools({opts?})
 ```
 
 Return a list of all registered tools. Useful for building UI that shows
@@ -751,7 +751,7 @@ Describe callbacks are not invoked (the static description is used).
 **Example:**
 
 ```lua
-local tools = maki.api.get_tools()
+local tools = makima.api.get_tools()
 for _, t in ipairs(tools) do
   print(t.name, t.enabled)
 end
@@ -759,10 +759,10 @@ end
 
 ---
 
-### `maki.api.get_tool()` {#maki-api-get_tool}
+### `makima.api.get_tool()` {#makima-api-get_tool}
 
 ```lua
-maki.api.get_tool({name})
+makima.api.get_tool({name})
 ```
 
 Look up a single tool by name. Returns its metadata table or nil if the
@@ -779,7 +779,7 @@ throw).
 **Example:**
 
 ```lua
-local t = maki.api.get_tool("bash")
+local t = makima.api.get_tool("bash")
 if t then
   print("bash audiences:", table.concat(t.audiences, ", "))
 end
@@ -787,10 +787,10 @@ end
 
 ---
 
-### `maki.api.run_command()` {#maki-api-run_command}
+### `makima.api.run_command()` {#makima-api-run_command}
 
 ```lua
-maki.api.run_command({ctx?}, {cmdline})
+makima.api.run_command({ctx?}, {cmdline})
 ```
 
 Runs a slash command by name, as the explicit name-based executor: the
@@ -801,7 +801,7 @@ Works for built-ins, custom `/project:` and `/user:` commands, MCP
 prompts, and commands other plugins registered.
 
 Use it to alias a command you like under a name you prefer, instead of
-reimplementing what it does. See `maki.ui.action` for the same idea
+reimplementing what it does. See `makima.ui.action` for the same idea
 applied to keybound UI actions.
 
 Pass the whole command line, arguments included: `"/cd ~/src"`. The
@@ -835,14 +835,14 @@ keymap, autocmd) can run commands; delegated tool handlers cannot.
 
 ```lua
 -- /resume as an alias for the built-in session picker:
-maki.api.register_command({
+makima.api.register_command({
   name = "/resume",
   description = "Alias for /sessions",
   tui_only = false,
   handler = function(_, ctx)
-    local ok, err = maki.api.run_command(ctx, "/sessions")
+    local ok, err = makima.api.run_command(ctx, "/sessions")
     if not ok then
-      maki.ui.flash("could not run /sessions: " .. err)
+      makima.ui.flash("could not run /sessions: " .. err)
     end
   end,
 })
@@ -850,10 +850,10 @@ maki.api.register_command({
 
 ---
 
-### `maki.api.register_completion_source()` {#maki-api-register_completion_source}
+### `makima.api.register_completion_source()` {#makima-api-register_completion_source}
 
 ```lua
-maki.api.register_completion_source({prefix}, {spec})
+makima.api.register_completion_source({prefix}, {spec})
 ```
 
 Register a completion source for `prefix`. The source's `get_items(ctx)` is
@@ -872,7 +872,7 @@ whitespace or trailing sentence punctuation.
 **Example:**
 
 ```lua
-maki.api.register_completion_source("skill", {
+makima.api.register_completion_source("skill", {
   get_items = function(ctx)
     return { { label = "skill:review", kind = "skill", insertion = "@skill:review" } }
   end,
@@ -881,10 +881,10 @@ maki.api.register_completion_source("skill", {
 
 ---
 
-### `maki.api.register_expander()` {#maki-api-register_expander}
+### `makima.api.register_expander()` {#makima-api-register_expander}
 
 ```lua
-maki.api.register_expander({prefix}, {f})
+makima.api.register_expander({prefix}, {f})
 ```
 
 Register a submit-time expander for `prefix`. Called with `{ value = "..." }`
@@ -904,20 +904,20 @@ expander under every alias you accept (e.g. both `"skill"` and `"s"`).
 **Example:**
 
 ```lua
-maki.api.register_expander("skill", function(ref)
+makima.api.register_expander("skill", function(ref)
   return "<skill:" .. ref.value .. ">", nil
 end)
-maki.api.register_expander("s", function(ref)
+makima.api.register_expander("s", function(ref)
   return "<skill:" .. ref.value .. ">", nil
 end)
 ```
 
 ---
 
-### `maki.api.create_autocmd()` {#maki-api-create_autocmd}
+### `makima.api.create_autocmd()` {#makima-api-create_autocmd}
 
 ```lua
-maki.api.create_autocmd({event}, {opts})
+makima.api.create_autocmd({event}, {opts})
 ```
 
 Listen for one or more events. Returns an id you can pass to
@@ -970,22 +970,22 @@ for registrations, `data.key`. Plugins can fire their own events with
 **Example:**
 
 ```lua
-maki.api.create_autocmd("TurnEnd", {
+makima.api.create_autocmd("TurnEnd", {
   callback = function(ev, ctx)
     if ev.data.parent_id then
       return
     end
-    maki.log.info("root turn ended: " .. ev.data.status)
+    makima.log.info("root turn ended: " .. ev.data.status)
   end,
 })
 ```
 
 ---
 
-### `maki.api.del_autocmd()` {#maki-api-del_autocmd}
+### `makima.api.del_autocmd()` {#makima-api-del_autocmd}
 
 ```lua
-maki.api.del_autocmd({id})
+makima.api.del_autocmd({id})
 ```
 
 Remove a previously registered autocmd and cancel its running callbacks.
@@ -998,15 +998,15 @@ Does nothing if the {id} does not exist.
 **Example:**
 
 ```lua
-maki.api.del_autocmd(id)
+makima.api.del_autocmd(id)
 ```
 
 ---
 
-### `maki.api.exec_autocmds()` {#maki-api-exec_autocmds}
+### `makima.api.exec_autocmds()` {#makima-api-exec_autocmds}
 
 ```lua
-maki.api.exec_autocmds({event}, {opts?})
+makima.api.exec_autocmds({event}, {opts?})
 ```
 
 Fire one or more events manually. Each matching callback starts as its
@@ -1022,7 +1022,7 @@ own task; none has run yet when this function returns.
 **Example:**
 
 ```lua
-maki.api.exec_autocmds("MyEvent", {
+makima.api.exec_autocmds("MyEvent", {
   pattern = "init",
   data = { msg = "hello" },
 })
@@ -1030,10 +1030,10 @@ maki.api.exec_autocmds("MyEvent", {
 
 ---
 
-### `maki.api.declare_slot()` {#maki-api-declare_slot}
+### `makima.api.declare_slot()` {#makima-api-declare_slot}
 
 ```lua
-maki.api.declare_slot({name}, {default})
+makima.api.declare_slot({name}, {default})
 ```
 
 Create a named extension point owned by your plugin. You provide a
@@ -1044,8 +1044,8 @@ layer first, then inward, ending at {default}.
 Throws if another plugin already owns a slot with the same {name}, or
 if {name} starts with `"tool."`, which the host fires itself.
 
-The chain is async: the default and every layer may park (`maki.fs.*`,
-`maki.fn.jobwait`, `maki.agent.call_tool`, ...), and so does the
+The chain is async: the default and every layer may park (`makima.fs.*`,
+`makima.fn.jobwait`, `makima.agent.call_tool`, ...), and so does the
 returned callable. Call it from a tool handler, a command, or an
 autocmd, rather than from a `header` or `restore` function, which
 cannot wait. The chain runs in your task, so cancelling the caller
@@ -1061,7 +1061,7 @@ cancels the layers it is waiting on.
 **Example:**
 
 ```lua
-local render = maki.api.declare_slot("myplugin.render", function(text)
+local render = makima.api.declare_slot("myplugin.render", function(text)
   return text:upper()
 end)
 print(render("hello")) -- HELLO
@@ -1069,10 +1069,10 @@ print(render("hello")) -- HELLO
 
 ---
 
-### `maki.api.set_slot()` {#maki-api-set_slot}
+### `makima.api.set_slot()` {#makima-api-set_slot}
 
 ```lua
-maki.api.set_slot({name}, {wrapper})
+makima.api.set_slot({name}, {wrapper})
 ```
 
 Add a layer around an existing (or future) slot. Layers wrap the
@@ -1090,7 +1090,7 @@ takes the seam down with it.
 Layers wrap in registration order, so the last one registered runs
 first and sees the value before the others do.
 
-Maki fires two slots per tool itself: `tool.<name>.input` before
+Makima fires two slots per tool itself: `tool.<name>.input` before
 permissions look at the call, and `tool.<name>.output` on the text it
 produced. Both take `function(prev, value, ctx)` and answer with a
 table to replace the value, nothing to leave it alone, or
@@ -1108,17 +1108,17 @@ tool declares, and a tool declaring none costs every permission. See
 **Example:**
 
 ```lua
-maki.api.set_slot("myplugin.render", function(prev, text)
+makima.api.set_slot("myplugin.render", function(prev, text)
   return prev("[" .. text .. "]")
 end)
 ```
 
 ---
 
-### `maki.api.get_slots()` {#maki-api-get_slots}
+### `makima.api.get_slots()` {#makima-api-get_slots}
 
 ```lua
-maki.api.get_slots()
+makima.api.get_slots()
 ```
 
 List all known slots and their current state. Useful for debugging
@@ -1128,17 +1128,17 @@ which plugins own or wrap each slot.
 
 ---
 
-### `maki.api.register_session_option()` {#maki-api-register_session_option}
+### `makima.api.register_session_option()` {#makima-api-register_session_option}
 
 ```lua
-maki.api.register_session_option({spec})
+makima.api.register_session_option({spec})
 ```
 
 Registers one selectable session option owned by the loading plugin.
 
 The `id` must use the plugin namespace, such as `bash.auto_mode`. Global
-`init.lua` uses `maki_init.global.*`, and project `init.lua` uses
-`maki_init.project.*`. Core owns
+`init.lua` uses `makima_init.global.*`, and project `init.lua` uses
+`makima_init.project.*`. Core owns
 unqualified ids. The definition supplies `name`, `description`, `category`,
 an ordered non-empty `values` list, and `initial_value`. Set `persistent` to
 retain each session's value across reloads.
@@ -1158,10 +1158,10 @@ value through `Agent:config(ctx).options[id]` and change it with
 
 ---
 
-### `maki.api.get_session_options()` {#maki-api-get_session_options}
+### `makima.api.get_session_options()` {#makima-api-get_session_options}
 
 ```lua
-maki.api.get_session_options()
+makima.api.get_session_options()
 ```
 
 Lists the definitions of every option `Agent:set_option` accepts: the
@@ -1173,17 +1173,17 @@ session's current values are in `Agent:config(ctx).options`.
 **Example:**
 
 ```lua
-for _, option in ipairs(maki.api.get_session_options()) do
+for _, option in ipairs(makima.api.get_session_options()) do
   print(option.id, option.name)
 end
 ```
 
 ---
 
-### `maki.api.register_provider()` {#maki-api-register_provider}
+### `makima.api.register_provider()` {#makima-api-register_provider}
 
 ```lua
-maki.api.register_provider({ctx?}, {spec?})
+makima.api.register_provider({ctx?}, {spec?})
 ```
 
 Registers a model provider under {ctx}, or under the plugin's root ctx
@@ -1211,13 +1211,13 @@ an id another plugin already owns fails and names both plugins.
   provider's `providers.toml` section as a table, read at each call.
   `discover` (function) Optional. `discover(ctx, config, refresh)`
   returns the descriptors the provider offers now. `refresh` is true when
-  the user asked to bypass caches (`maki models --refresh`).
+  the user asked to bypass caches (`makima models --refresh`).
   `config` (table) Optional. `providers.toml` fields asked before login:
   `{ key, prompt, default?, secret?, optional?, choices? }`, where
   `choices` is a list of `{ id, label, detail? }`. Each answer is saved
   as a text field of the provider's section, such as `base_url`.
   `auth` (table) Login methods: `{ id, label, login }`.
-  `login(ctx, ui, config)` gets a `maki.provider.LoginUi` and the
+  `login(ctx, ui, config)` gets a `makima.provider.LoginUi` and the
   provider's section with this login's answers applied, not yet saved.
   It returns a truthy value, optionally a table with `model` to choose
   the default model, or nil plus an error.
@@ -1240,10 +1240,10 @@ an id another plugin already owns fails and names both plugins.
 Config is saved and the default model chosen only after `login`
 succeeds and `auth_status` no longer reports `missing`.
 
-Callbacks receive a provider `maki.Ctx` derived from {ctx}: `id`, `send`
-(`maki.net.send` with the `[provider]` connect, low-speed and stream
+Callbacks receive a provider `makima.Ctx` derived from {ctx}: `id`, `send`
+(`makima.net.send` with the `[provider]` connect, low-speed and stream
 timeouts as defaults) and `credentials` (the provider's
-`maki.credentials.Store`); `maki.credentials.open` reaches {ctx}'s plugin
+`makima.credentials.Store`); `makima.credentials.open` reaches {ctx}'s plugin
 stores through it. Only the registering plugin's callbacks receive it, so
 a provider id's credentials belong to the plugin that registered it. An instance has
 `stream(ctx, request, emit)` and optionally `fetch_usage(ctx)`,
@@ -1273,7 +1273,7 @@ context, which the host answers by compacting instead of retrying;
 anything else is a transport error. An error is retried only when it
 names `retry`: `rate_limit`, `transient`, `connect`, `timeout` or `none`.
 The bundled `http.classify` names it from the status or the
-`maki.net.send` failure. A bare string and a raised error are not
+`makima.net.send` failure. A bare string and a raised error are not
 retried. Every callback that returns nil plus an error follows these
 rules.
 
@@ -1294,13 +1294,13 @@ first event would otherwise leave that state behind.
 
 **Parameters:**
 
-- `{ctx?}` ([`maki.Ctx?`](#maki-Ctx)) The ctx to register under; omit it for the plugin's root ctx.
+- `{ctx?}` ([`makima.Ctx?`](#makima-Ctx)) The ctx to register under; omit it for the plugin's root ctx.
 - `{spec?}` (`table`) Required. Provider definition (see above).
 
 **Example:**
 
 ```lua
-maki.api.register_provider({
+makima.api.register_provider({
   id = "echo",
   display_name = "Echo",
   models = { { id = "echo-1", tier = "strong" } },
@@ -1327,10 +1327,10 @@ maki.api.register_provider({
 
 ---
 
-### `maki.api.provider_config()` {#maki-api-provider_config}
+### `makima.api.provider_config()` {#makima-api-provider_config}
 
 ```lua
-maki.api.provider_config({id?})
+makima.api.provider_config({id?})
 ```
 
 Read `providers.toml`: the section of provider {id}, or every section by
@@ -1351,16 +1351,16 @@ Requires the `env` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local opencode = maki.api.provider_config("opencode") or {}
-for id, section in pairs(maki.api.provider_config()) do print(id, section.protocol) end
+local opencode = makima.api.provider_config("opencode") or {}
+for id, section in pairs(makima.api.provider_config()) do print(id, section.protocol) end
 ```
 
 ---
 
-### `maki.api.startup_provider_config()` {#maki-api-startup_provider_config}
+### `makima.api.startup_provider_config()` {#makima-api-startup_provider_config}
 
 ```lua
-maki.api.startup_provider_config()
+makima.api.startup_provider_config()
 ```
 
 Read every `providers.toml` section while registering providers. Unlike
@@ -1374,10 +1374,10 @@ Requires the `env` [plugin permission](#plugin-permissions).
 
 ---
 
-### `maki.api.save_provider_config()` {#maki-api-save_provider_config}
+### `makima.api.save_provider_config()` {#makima-api-save_provider_config}
 
 ```lua
-maki.api.save_provider_config({id}, {section})
+makima.api.save_provider_config({id}, {section})
 ```
 
 Save {section} as provider {id}'s `providers.toml` section, replacing
@@ -1396,11 +1396,11 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-maki.api.save_provider_config("my-llm", { protocol = "openai", base_url = "http://localhost:8000/v1" })
+makima.api.save_provider_config("my-llm", { protocol = "openai", base_url = "http://localhost:8000/v1" })
 ```
 
 
-## maki.perf {#maki-perf}
+## makima.perf {#makima-perf}
 
 Performance instrumentation for splashes and the UI. The host
 measures splash renders; plugins read the timings and draw their own
@@ -1408,10 +1408,10 @@ readouts.
 
 ---
 
-### `maki.perf.timings()` {#maki-perf-timings}
+### `makima.perf.timings()` {#makima-perf-timings}
 
 ```lua
-maki.perf.timings()
+makima.perf.timings()
 ```
 
 Read the splash render timings the host measured: how long the most
@@ -1428,11 +1428,11 @@ point: it proves the splash is not burning CPU.
 **Example:**
 
 ```lua
-local t = maki.perf.timings()
+local t = makima.perf.timings()
 ```
 
 
-## maki.store {#maki-store}
+## makima.store {#makima-store}
 
 Shared key-value store for plugin contributions. A plugin registers
 values under a (registry, key) pair: the same plugin may replace its
@@ -1448,10 +1448,10 @@ do not poll.
 
 ---
 
-### `maki.store.register()` {#maki-store-register}
+### `makima.store.register()` {#makima-store-register}
 
 ```lua
-maki.store.register({registry}, {key}, {value})
+makima.store.register({registry}, {key}, {value})
 ```
 
 Register a value in a store registry under a stable key. The same plugin
@@ -1471,10 +1471,10 @@ load time and then stay fresh from events instead of polling.
 
 ---
 
-### `maki.store.collect()` {#maki-store-collect}
+### `makima.store.collect()` {#makima-store-collect}
 
 ```lua
-maki.store.collect({registry})
+makima.store.collect({registry})
 ```
 
 Collect the current entries of a store registry. Returns a fresh table
@@ -1488,7 +1488,7 @@ empty table.
 **Returns:** table Map of entry key to registered value.
 
 
-## maki.agent {#maki-agent}
+## makima.agent {#makima-agent}
 
 Subagent primitives for plugins that need to talk to an LLM.
 
@@ -1500,8 +1500,8 @@ Policy like retries, validation, and concurrency lives in the calling
 plugin, not here.
 
 ```lua
-local tools = maki.agent.tools(ctx, { audience = "general_sub" })
-local agent = assert(maki.agent.spawn(ctx, {
+local tools = makima.agent.tools(ctx, { audience = "general_sub" })
+local agent = assert(makima.agent.spawn(ctx, {
   system = "You are a helpful assistant.",
   tools = tools,
 }))
@@ -1512,17 +1512,17 @@ agent:close(ctx)
 
 ---
 
-### `maki.agent.resolve_model()` {#maki-agent-resolve_model}
+### `makima.agent.resolve_model()` {#makima-agent-resolve_model}
 
 ```lua
-maki.agent.resolve_model({ctx}, {opts?})
+makima.agent.resolve_model({ctx}, {opts?})
 ```
 
 Look up the model that the current agent is using, or pick a cheaper one.
 You might want a cheaper model for simple subtasks (summaries, classification)
 without hard-coding a model name.
 
-The returned table has the same fields as `maki.model.info`.
+The returned table has the same fields as `makima.model.info`.
 
 **Parameters:**
 
@@ -1538,17 +1538,17 @@ The returned table has the same fields as `maki.model.info`.
 **Example:**
 
 ```lua
-local model, err = maki.agent.resolve_model(ctx, { tier = "weak" })
+local model, err = makima.agent.resolve_model(ctx, { tier = "weak" })
 if err then error(err) end
 print(model.spec, model.tier)
 ```
 
 ---
 
-### `maki.agent.system_prompt()` {#maki-agent-system_prompt}
+### `makima.agent.system_prompt()` {#makima-agent-system_prompt}
 
 ```lua
-maki.agent.system_prompt({ctx}, {opts})
+makima.agent.system_prompt({ctx}, {opts})
 ```
 
 Build a system prompt from a built-in template. Environment variables like
@@ -1572,7 +1572,7 @@ prompt for a subagent session.
 **Example:**
 
 ```lua
-local prompt, err = maki.agent.system_prompt(ctx, {
+local prompt, err = makima.agent.system_prompt(ctx, {
   prompt_id = "research",
   instructions = true,
 })
@@ -1581,14 +1581,14 @@ if err then error(err) end
 
 ---
 
-### `maki.agent.tools()` {#maki-agent-tools}
+### `makima.agent.tools()` {#makima-agent-tools}
 
 ```lua
-maki.agent.tools({ctx}, {opts})
+makima.agent.tools({ctx}, {opts})
 ```
 
 Get the list of tool definitions for a given audience. Pass the result
-straight into `maki.agent.spawn()` or use it to inspect what tools are
+straight into `makima.agent.spawn()` or use it to inspect what tools are
 available.
 
 **Parameters:**
@@ -1610,7 +1610,7 @@ available.
 **Example:**
 
 ```lua
-local defs, err = maki.agent.tools(ctx, {
+local defs, err = makima.agent.tools(ctx, {
   audience = "general_sub",
   except = { "bash", "write" },
 })
@@ -1620,16 +1620,16 @@ print(#defs .. " tools available")
 
 ---
 
-### `maki.agent.callable_tools()` {#maki-agent-callable_tools}
+### `makima.agent.callable_tools()` {#makima-agent-callable_tools}
 
 ```lua
-maki.agent.callable_tools({ctx})
+makima.agent.callable_tools({ctx})
 ```
 
 Every tool name this context can dispatch: registry tools, MCP tools
 (deferred ones included), host tools (ACP client tools, a subagent's
 `structured_output`) and `tool_search`. Reach for it when you expose tools
-inside a sandbox and need the names to bind. `maki.api.get_tools()` covers
+inside a sandbox and need the names to bind. `makima.api.get_tools()` covers
 the registry alone and has no view of the session.
 
 The list already accounts for this session's audience, the config's
@@ -1653,7 +1653,7 @@ than the shadowed one's.
 **Example:**
 
 ```lua
-local tools, err = maki.agent.callable_tools(ctx)
+local tools, err = makima.agent.callable_tools(ctx)
 if err then error(err) end
 for _, t in ipairs(tools) do
   print(t.source, t.alias or t.name)
@@ -1662,10 +1662,10 @@ end
 
 ---
 
-### `maki.agent.call_tool()` {#maki-agent-call_tool}
+### `makima.agent.call_tool()` {#makima-agent-call_tool}
 
 ```lua
-maki.agent.call_tool({ctx}, {name}, {input}, {opts?})
+makima.agent.call_tool({ctx}, {name}, {input}, {opts?})
 ```
 
 Run a tool by name and wait for the result. This is how you call built-in
@@ -1695,7 +1695,7 @@ through optional callbacks while the tool runs.
 **Example:**
 
 ```lua
-local out, err = maki.agent.call_tool(ctx, "bash", {
+local out, err = makima.agent.call_tool(ctx, "bash", {
   command = "ls -la",
   timeout = 10,
 })
@@ -1705,10 +1705,10 @@ print(out)
 
 ---
 
-### `maki.agent.permission_prompt()` {#maki-agent-permission_prompt}
+### `makima.agent.permission_prompt()` {#makima-agent-permission_prompt}
 
 ```lua
-maki.agent.permission_prompt({ctx}, {opts})
+makima.agent.permission_prompt({ctx}, {opts})
 ```
 
 Run the normal interactive permission prompt for a tool call, without
@@ -1734,7 +1734,7 @@ Allow and deny rules apply exactly as they do for a plain tool call.
 **Example:**
 
 ```lua
-local ok, err = maki.agent.permission_prompt(ctx, {
+local ok, err = makima.agent.permission_prompt(ctx, {
   tool = "bash",
   scopes = { "echo hello" },
   force_prompt = false,
@@ -1744,10 +1744,10 @@ if not ok then return { llm_output = err, is_error = true } end
 
 ---
 
-### `maki.agent.root()` {#maki-agent-root}
+### `makima.agent.root()` {#makima-agent-root}
 
 ```lua
-maki.agent.root({ctx})
+makima.agent.root({ctx})
 ```
 
 Read the root agent of this context's graph.
@@ -1756,14 +1756,14 @@ Read the root agent of this context's graph.
 
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 
-**Returns:** ([`AgentRef?`](#maki-agent-AgentRef), `string?`) Visibility-only root reference.
+**Returns:** ([`AgentRef?`](#makima-agent-AgentRef), `string?`) Visibility-only root reference.
 
 ---
 
-### `maki.agent.list()` {#maki-agent-list}
+### `makima.agent.list()` {#makima-agent-list}
 
 ```lua
-maki.agent.list({ctx})
+makima.agent.list({ctx})
 ```
 
 List accessible live agents in this context's graph.
@@ -1776,10 +1776,10 @@ List accessible live agents in this context's graph.
 
 ---
 
-### `maki.agent.get()` {#maki-agent-get}
+### `makima.agent.get()` {#makima-agent-get}
 
 ```lua
-maki.agent.get({ctx}, {reference})
+makima.agent.get({ctx}, {reference})
 ```
 
 Resolve an AgentRef with current control authority. String IDs are not accepted.
@@ -1787,16 +1787,16 @@ Resolve an AgentRef with current control authority. String IDs are not accepted.
 **Parameters:**
 
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
-- `{reference}` ([`AgentRef`](#maki-agent-AgentRef)) Visibility-only reference.
+- `{reference}` ([`AgentRef`](#makima-agent-AgentRef)) Visibility-only reference.
 
-**Returns:** ([`Agent?`](#maki-agent-Agent), `string?`) Nonowning handle or error.
+**Returns:** ([`Agent?`](#makima-agent-Agent), `string?`) Nonowning handle or error.
 
 ---
 
-### `maki.agent.spawn()` {#maki-agent-spawn}
+### `makima.agent.spawn()` {#makima-agent-spawn}
 
 ```lua
-maki.agent.spawn({ctx}, {opts})
+makima.agent.spawn({ctx}, {opts})
 ```
 
 Spawn a child with a copy of its parent's configuration.
@@ -1837,10 +1837,10 @@ Requires an active managed turn or a trusted manager-backed parent.
   Any other option key is an error.
 
 
-**Returns:** ([`Agent?`](#maki-agent-Agent), `string?`) Nonowning child handle. Garbage collection does not close it.
+**Returns:** ([`Agent?`](#makima-agent-Agent), `string?`) Nonowning child handle. Garbage collection does not close it.
 
 
-## maki.agent.Agent {#maki-agent-Agent}
+## makima.agent.Agent {#makima-agent-Agent}
 
 A nonowning agent handle. Garbage collection never closes its actor.
 Reads and effects require current invocation authority; identity is context-free.
@@ -1873,7 +1873,7 @@ to deliver a child's result.
 
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 
-**Returns:** ([`AgentTurn?`](#maki-agent-AgentTurn), `string?`) Exact-turn ticket, or nil without an error when no turn was admitted or it is no longer retained.
+**Returns:** ([`AgentTurn?`](#makima-agent-AgentTurn), `string?`) Exact-turn ticket, or nil without an error when no turn was admitted or it is no longer retained.
 
 ---
 
@@ -1889,7 +1889,7 @@ Read lifecycle, active turn, queue size, and cumulative usage.
 
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 
-**Returns:** (`table?`, `string?`) Fields: id (string), status ("idle", "working", or "closed", the vocabulary `maki.session` uses, which adds "needs_input"), queued (integer), active_turn (string or nil), input_tokens and output_tokens (cumulative integers). Authorized held managed handles retain a closed snapshot after graph removal.
+**Returns:** (`table?`, `string?`) Fields: id (string), status ("idle", "working", or "closed", the vocabulary `makima.session` uses, which adds "needs_input"), queued (integer), active_turn (string or nil), input_tokens and output_tokens (cumulative integers). Authorized held managed handles retain a closed snapshot after graph removal.
 
 ---
 
@@ -1954,7 +1954,7 @@ Agent:ref()
 
 Return another nonowning handle to this agent.
 
-**Returns:** ([`AgentRef?`](#maki-agent-AgentRef), `string?`) Stable reference.
+**Returns:** ([`AgentRef?`](#makima-agent-AgentRef), `string?`) Stable reference.
 
 ---
 
@@ -1978,7 +1978,7 @@ Wait for the result with `AgentTurn:wait`.
 - `{message}` (`string`) User message (text only).
 - `{opts}` (`table`) Required `when` ("idle", "join" or "queue"). `existing_only` (join only) joins compatible work or returns busy without starting a turn. `after_turn` (idle only) must match the latest terminal turn, including failure or cancellation.
 
-**Returns:** ([`AgentTurn?`](#maki-agent-AgentTurn), `string?`) Exact-turn ticket, or an admission error. Bounded inbox rejection does not cancel accepted work.
+**Returns:** ([`AgentTurn?`](#makima-agent-AgentTurn), `string?`) Exact-turn ticket, or an admission error. Bounded inbox rejection does not cancel accepted work.
 
 ---
 
@@ -2116,7 +2116,7 @@ Alias for `create_autocmd("TurnStart", { agent = self, callback = handler })`.
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Trusted invocation context.
 - `{handler}` (`function`) Called as handler(ev, ctx), like any autocmd callback.
 
-**Returns:** ([`AgentSubscription?`](#maki-agent-AgentSubscription), `string?`) Revocable subscription.
+**Returns:** ([`AgentSubscription?`](#makima-agent-AgentSubscription), `string?`) Revocable subscription.
 
 ---
 
@@ -2133,7 +2133,7 @@ Alias for `create_autocmd("TurnEnd", { agent = self, callback = handler })`.
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Trusted invocation context.
 - `{handler}` (`function`) Called as handler(ev, ctx), like any autocmd callback.
 
-**Returns:** ([`AgentSubscription?`](#maki-agent-AgentSubscription), `string?`) Revocable subscription.
+**Returns:** ([`AgentSubscription?`](#makima-agent-AgentSubscription), `string?`) Revocable subscription.
 
 ---
 
@@ -2152,7 +2152,7 @@ work settled, so a handler that changes config does not wake itself.
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Trusted invocation context.
 - `{handler}` (`function`) Called as handler(ev, ctx), like any autocmd callback.
 
-**Returns:** ([`AgentSubscription?`](#maki-agent-AgentSubscription), `string?`) Revocable subscription.
+**Returns:** ([`AgentSubscription?`](#makima-agent-AgentSubscription), `string?`) Revocable subscription.
 
 ---
 
@@ -2169,7 +2169,7 @@ Alias for `create_autocmd("ConfigChanged", { agent = self, callback = handler })
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Trusted invocation context.
 - `{handler}` (`function`) Called as handler(ev, ctx), like any autocmd callback.
 
-**Returns:** ([`AgentSubscription?`](#maki-agent-AgentSubscription), `string?`) Revocable subscription.
+**Returns:** ([`AgentSubscription?`](#makima-agent-AgentSubscription), `string?`) Revocable subscription.
 
 ---
 
@@ -2186,10 +2186,10 @@ Alias for `create_autocmd("AgentClosed", { agent = self, callback = handler })`.
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Trusted invocation context.
 - `{handler}` (`function`) Called as handler(ev, ctx), like any autocmd callback.
 
-**Returns:** ([`AgentSubscription?`](#maki-agent-AgentSubscription), `string?`) Revocable subscription.
+**Returns:** ([`AgentSubscription?`](#makima-agent-AgentSubscription), `string?`) Revocable subscription.
 
 
-## maki.agent.AgentRef {#maki-agent-AgentRef}
+## makima.agent.AgentRef {#makima-agent-AgentRef}
 
 Visibility-only identity. Resolve with get(ctx, reference) to request control.
 
@@ -2206,7 +2206,7 @@ Read a reference's stable identity.
 **Returns:** (`string?`, `string?`) Agent ID.
 
 
-## maki.agent.AgentSubscription {#maki-agent-AgentSubscription}
+## makima.agent.AgentSubscription {#makima-agent-AgentSubscription}
 
 An autocmd filtered to one agent. Garbage collection does not
 unsubscribe; close it, or unload the plugin.
@@ -2219,13 +2219,13 @@ unsubscribe; close it, or unload the plugin.
 AgentSubscription:close()
 ```
 
-Same as `maki.api.del_autocmd` with this subscription's id: stops future
+Same as `makima.api.del_autocmd` with this subscription's id: stops future
 deliveries and cancels running callbacks.
 
 **Returns:** (`boolean?`, `string?`) Success.
 
 
-## maki.agent.AgentTurn {#maki-agent-AgentTurn}
+## makima.agent.AgentTurn {#makima-agent-AgentTurn}
 
 An exact-turn ticket with repeatable retained result reads. Dropping it does not cancel work.
 Settled results remain readable with current valid authority after lookup eviction
@@ -2317,7 +2317,7 @@ subtrees it delegated. UI cancellation leaves those child subtrees open.
 **Returns:** (`boolean?`, `string?`) Success or error.
 
 
-## maki.async {#maki-async}
+## makima.async {#makima-async}
 
 Tools for running things concurrently in Lua plugins.
 
@@ -2327,7 +2327,7 @@ The `await` and `wrap` helpers bridge callback-based APIs into
 coroutine-friendly calls.
 
 ```lua
-local results = maki.async.gather({
+local results = makima.async.gather({
   function() return fetch("a.txt") end,
   function() return fetch("b.txt") end,
 })
@@ -2335,10 +2335,10 @@ local results = maki.async.gather({
 
 ---
 
-### `maki.async.run()` {#maki-async-run}
+### `makima.async.run()` {#makima-async-run}
 
 ```lua
-maki.async.run({fn}, {on_finish?})
+makima.async.run({fn}, {on_finish?})
 ```
 
 Fire off a function as a new async task. It runs in the background and
@@ -2357,7 +2357,7 @@ active; retained work fails closed after the turn ends.
 **Example:**
 
 ```lua
-maki.async.run(function()
+makima.async.run(function()
   local data = expensive_fetch()
   process(data)
 end)
@@ -2365,10 +2365,10 @@ end)
 
 ---
 
-### `maki.async.await()` {#maki-async-await}
+### `makima.async.await()` {#makima-async-await}
 
 ```lua
-maki.async.await({argc}, {fn}, {...})
+makima.async.await({argc}, {fn}, {...})
 ```
 
 Turn a callback-based function into a normal call you can use in a coroutine. It calls `fn(..., callback)`, inserting the callback at position {argc}, then suspends your coroutine until the callback fires. You get back whatever the callback was called with.
@@ -2384,22 +2384,22 @@ Turn a callback-based function into a normal call you can use in a coroutine. It
 **Example:**
 
 ```lua
-local result = maki.async.await(2, http.get, url)
+local result = makima.async.await(2, http.get, url)
 ```
 
 ---
 
-### `maki.async.wrap()` {#maki-async-wrap}
+### `makima.async.wrap()` {#makima-async-wrap}
 
 ```lua
-maki.async.wrap({argc}, {fn})
+makima.async.wrap({argc}, {fn})
 ```
 
-Create a coroutine-friendly wrapper around a callback-based function. The wrapper calls `maki.async.await` for you, so you can use the result like a normal function call.
+Create a coroutine-friendly wrapper around a callback-based function. The wrapper calls `makima.async.await` for you, so you can use the result like a normal function call.
 
 **Parameters:**
 
-- `{argc}` (`integer`) Callback position, forwarded to `maki.async.await`.
+- `{argc}` (`integer`) Callback position, forwarded to `makima.async.await`.
 - `{fn}` (`function`) Callback-based function to wrap.
 
 **Returns:** (`function`) Wrapped function you can call like a normal function.
@@ -2407,16 +2407,16 @@ Create a coroutine-friendly wrapper around a callback-based function. The wrappe
 **Example:**
 
 ```lua
-local get = maki.async.wrap(2, http.get)
+local get = makima.async.wrap(2, http.get)
 local body = get(url)
 ```
 
 ---
 
-### `maki.async.join()` {#maki-async-join}
+### `makima.async.join()` {#makima-async-join}
 
 ```lua
-maki.async.join({max_jobs}, {fns})
+makima.async.join({max_jobs}, {fns})
 ```
 
 Run all functions in {fns} with at most {max_jobs} going at once. Waits until every function has finished. Unlike `gather`, this does not return individual results.
@@ -2429,7 +2429,7 @@ Run all functions in {fns} with at most {max_jobs} going at once. Waits until ev
 **Example:**
 
 ```lua
-maki.async.join(4, {
+makima.async.join(4, {
   function() process(files[1]) end,
   function() process(files[2]) end,
   function() process(files[3]) end,
@@ -2438,10 +2438,10 @@ maki.async.join(4, {
 
 ---
 
-### `maki.async.gather()` {#maki-async-gather}
+### `makima.async.gather()` {#makima-async-gather}
 
 ```lua
-maki.async.gather({fns})
+makima.async.gather({fns})
 ```
 
 Run all functions in {fns} at the same time and collect their results.
@@ -2460,7 +2460,7 @@ Each entry in the result array has `ok` (boolean), and either `value`
 **Example:**
 
 ```lua
-local results = maki.async.gather({
+local results = makima.async.gather({
   function() return fetch("a.txt") end,
   function() return fetch("b.txt") end,
 })
@@ -2471,10 +2471,10 @@ end
 
 ---
 
-### `maki.async.semaphore()` {#maki-async-semaphore}
+### `makima.async.semaphore()` {#makima-async-semaphore}
 
 ```lua
-maki.async.semaphore({n})
+makima.async.semaphore({n})
 ```
 
 Create a counting semaphore that allows at most {n} concurrent permits.
@@ -2484,12 +2484,12 @@ Use this to limit how many tasks hit a resource at the same time.
 
 - `{n}` (`integer`) Maximum number of concurrent permits. Values below 1 are clamped to 1.
 
-**Returns:** ([`maki.async.Semaphore`](#maki-async-Semaphore)) A new semaphore.
+**Returns:** ([`makima.async.Semaphore`](#makima-async-Semaphore)) A new semaphore.
 
 **Example:**
 
 ```lua
-local sem = maki.async.semaphore(5)
+local sem = makima.async.semaphore(5)
 -- each task acquires a permit before doing work
 local permit = sem:acquire()
 do_work()
@@ -2498,10 +2498,10 @@ permit:release()
 
 ---
 
-### `maki.async.on_cancel()` {#maki-async-on_cancel}
+### `makima.async.on_cancel()` {#makima-async-on_cancel}
 
 ```lua
-maki.async.on_cancel({fn})
+makima.async.on_cancel({fn})
 ```
 
 Register {fn} to run as soon as the current task is cancelled or hits
@@ -2527,19 +2527,19 @@ other hooks still run.
 **Example:**
 
 ```lua
-maki.async.on_cancel(function(reason)
+makima.async.on_cancel(function(reason)
   view:append({ { reason, "tool_error" } })
   ctx:finish({ llm_output = partial .. "\n[cancelled; output is partial]", is_error = true })
 end)
-maki.async.gather(children)
+makima.async.gather(children)
 ```
 
 
-## maki.async.Semaphore {#maki-async-Semaphore}
+## makima.async.Semaphore {#makima-async-Semaphore}
 
 A counting semaphore for limiting how many tasks run at once.
 
-Create one with `maki.async.semaphore(n)`, then call `:acquire()` to
+Create one with `makima.async.semaphore(n)`, then call `:acquire()` to
 get a permit before doing work. If the task is cancelled, the acquire
 is cancelled too.
 
@@ -2554,19 +2554,19 @@ Semaphore:acquire()
 Wait for a permit from the semaphore. Your coroutine suspends until a slot
 opens up. If the owning task is cancelled, the acquire is cancelled too.
 
-**Returns:** ([`maki.async.Permit`](#maki-async-Permit)) A permit handle. Call `:release()` when done, or let it be garbage collected.
+**Returns:** ([`makima.async.Permit`](#makima-async-Permit)) A permit handle. Call `:release()` when done, or let it be garbage collected.
 
 **Example:**
 
 ```lua
-local sem = maki.async.semaphore(3)
+local sem = makima.async.semaphore(3)
 local permit = sem:acquire()
 -- do work that needs the slot
 permit:release()
 ```
 
 
-## maki.async.Permit {#maki-async-Permit}
+## makima.async.Permit {#makima-async-Permit}
 
 One slot in a semaphore, obtained from `Semaphore:acquire()`.
 
@@ -2585,24 +2585,24 @@ Give the permit back to the semaphore so another task can acquire it.
 Throws if you already released this permit.
 
 
-## maki.base64 {#maki-base64}
+## makima.base64 {#makima-base64}
 
 Base64 encoding and decoding, modelled after `vim.base64`.
 
 Both functions accept strings and Luau buffers, so you can round-trip
-binary data read with `maki.fs.read_bytes`.
+binary data read with `makima.fs.read_bytes`.
 
 ```lua
-local encoded = maki.base64.encode("hello")
-local decoded = maki.base64.decode(encoded)
+local encoded = makima.base64.encode("hello")
+local decoded = makima.base64.decode(encoded)
 ```
 
 ---
 
-### `maki.base64.encode()` {#maki-base64-encode}
+### `makima.base64.encode()` {#makima-base64-encode}
 
 ```lua
-maki.base64.encode({data})
+makima.base64.encode({data})
 ```
 
 Encode {data} to standard Base64. Like `vim.base64.encode`.
@@ -2617,15 +2617,15 @@ Accepts both strings and Luau buffers.
 **Example:**
 
 ```lua
-maki.base64.encode("hello") -- "aGVsbG8="
+makima.base64.encode("hello") -- "aGVsbG8="
 ```
 
 ---
 
-### `maki.base64.decode()` {#maki-base64-decode}
+### `makima.base64.decode()` {#makima-base64-decode}
 
 ```lua
-maki.base64.decode({str})
+makima.base64.decode({str})
 ```
 
 Decode a Base64-encoded {str} back to its original bytes. Like `vim.base64.decode`.
@@ -2640,25 +2640,25 @@ Throws if {str} is not valid Base64.
 **Example:**
 
 ```lua
-maki.base64.decode("aGVsbG8=") -- "hello"
+makima.base64.decode("aGVsbG8=") -- "hello"
 ```
 
 
-## maki.crypto {#maki-crypto}
+## makima.crypto {#makima-crypto}
 
 Hashing on binary strings. Digests come back as raw bytes, not hex.
 Both functions accept strings and Luau buffers.
 
 ```lua
-local signature = maki.crypto.hmac_sha256(key, maki.crypto.sha256(body))
+local signature = makima.crypto.hmac_sha256(key, makima.crypto.sha256(body))
 ```
 
 ---
 
-### `maki.crypto.sha256()` {#maki-crypto-sha256}
+### `makima.crypto.sha256()` {#makima-crypto-sha256}
 
 ```lua
-maki.crypto.sha256({data})
+makima.crypto.sha256({data})
 ```
 
 SHA-256 digest of {data}, as 32 raw bytes.
@@ -2672,15 +2672,15 @@ SHA-256 digest of {data}, as 32 raw bytes.
 **Example:**
 
 ```lua
-local digest = maki.crypto.sha256("abc")
+local digest = makima.crypto.sha256("abc")
 ```
 
 ---
 
-### `maki.crypto.hmac_sha256()` {#maki-crypto-hmac_sha256}
+### `makima.crypto.hmac_sha256()` {#makima-crypto-hmac_sha256}
 
 ```lua
-maki.crypto.hmac_sha256({key}, {data})
+makima.crypto.hmac_sha256({key}, {data})
 ```
 
 HMAC-SHA256 of {data} keyed with {key}, as 32 raw bytes.
@@ -2695,11 +2695,11 @@ HMAC-SHA256 of {data} keyed with {key}, as 32 raw bytes.
 **Example:**
 
 ```lua
-local mac = maki.crypto.hmac_sha256("secret", "message")
+local mac = makima.crypto.hmac_sha256("secret", "message")
 ```
 
 
-## maki.env {#maki-env}
+## makima.env {#makima-env}
 
 Paths to makima's own directories (config, state, logs, cache), and whether
 the project's `.makima` directory is off limits.
@@ -2707,15 +2707,15 @@ the project's `.makima` directory is off limits.
 Use these to locate config files or persistent state without hard-coding paths.
 
 ```lua
-local cfg = maki.env.config_dir()
+local cfg = makima.env.config_dir()
 ```
 
 ---
 
-### `maki.env.state_dir()` {#maki-env-state_dir}
+### `makima.env.state_dir()` {#makima-env-state_dir}
 
 ```lua
-maki.env.state_dir()
+makima.env.state_dir()
 ```
 
 Return the directory where makima stores runtime state (sessions, auth tokens, etc.).
@@ -2728,15 +2728,15 @@ Requires the `env` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local dir = maki.env.state_dir()
+local dir = makima.env.state_dir()
 ```
 
 ---
 
-### `maki.env.config_dir()` {#maki-env-config_dir}
+### `makima.env.config_dir()` {#makima-env-config_dir}
 
 ```lua
-maki.env.config_dir()
+makima.env.config_dir()
 ```
 
 Return the directory where makima looks for user configuration files.
@@ -2749,18 +2749,18 @@ Requires the `env` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local dir = maki.env.config_dir()
+local dir = makima.env.config_dir()
 ```
 
 ---
 
-### `maki.env.logs_dir()` {#maki-env-logs_dir}
+### `makima.env.logs_dir()` {#makima-env-logs_dir}
 
 ```lua
-maki.env.logs_dir()
+makima.env.logs_dir()
 ```
 
-Return the directory where maki writes its log files (`maki.log`).
+Return the directory where makima writes its log files (`makima.log`).
 Typically something like `~/.local/logs/makima`.
 
 Requires the `env` [plugin permission](#plugin-permissions).
@@ -2770,15 +2770,15 @@ Requires the `env` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local dir = maki.env.logs_dir()
+local dir = makima.env.logs_dir()
 ```
 
 ---
 
-### `maki.env.cache_dir()` {#maki-env-cache_dir}
+### `makima.env.cache_dir()` {#makima-env-cache_dir}
 
 ```lua
-maki.env.cache_dir()
+makima.env.cache_dir()
 ```
 
 Return the directory where makima keeps caches it can rebuild, such as
@@ -2791,18 +2791,18 @@ Requires the `env` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local dir = maki.env.cache_dir()
+local dir = makima.env.cache_dir()
 ```
 
 ---
 
-### `maki.env.no_project()` {#maki-env-no_project}
+### `makima.env.no_project()` {#makima-env-no_project}
 
 ```lua
-maki.env.no_project()
+makima.env.no_project()
 ```
 
-Whether maki was started with `--no-project`. A plugin that reads files
+Whether makima was started with `--no-project`. A plugin that reads files
 from the project's `.makima` directory should skip them when this is true.
 
 Requires the `env` [plugin permission](#plugin-permissions).
@@ -2812,30 +2812,30 @@ Requires the `env` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-if not maki.env.no_project() then
+if not makima.env.no_project() then
   scan(".makima/skills")
 end
 ```
 
 
-## maki.fn {#maki-fn}
+## makima.fn {#makima-fn}
 
 Process and environment helpers, modeled after Neovim's `vim.fn` job
 control. Use these to run shell commands, wait for output, and check
 whether programs are installed.
 
 ```lua
-local id = maki.fn.jobstart("git status", {
+local id = makima.fn.jobstart("git status", {
   on_exit = function(code) print("done: " .. code) end,
 })
 ```
 
 ---
 
-### `maki.fn.jobstart()` {#maki-fn-jobstart}
+### `makima.fn.jobstart()` {#makima-fn-jobstart}
 
 ```lua
-maki.fn.jobstart({cmd}, {opts?})
+makima.fn.jobstart({cmd}, {opts?})
 ```
 
 Run a shell command in the background. The command runs through
@@ -2862,7 +2862,7 @@ Requires the `run` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local id = maki.fn.jobstart("ls -la", {
+local id = makima.fn.jobstart("ls -la", {
   cwd = "~/projects",
   on_stdout = function(_, line) print(line) end,
   on_exit = function(_, code) print("exit: " .. code) end,
@@ -2871,10 +2871,10 @@ local id = maki.fn.jobstart("ls -la", {
 
 ---
 
-### `maki.fn.jobstop()` {#maki-fn-jobstop}
+### `makima.fn.jobstop()` {#makima-fn-jobstop}
 
 ```lua
-maki.fn.jobstop({job_id})
+makima.fn.jobstop({job_id})
 ```
 
 Kill a running job immediately (SIGKILL on Unix). Safe to call on
@@ -2889,15 +2889,15 @@ Requires the `run` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-maki.fn.jobstop(id)
+makima.fn.jobstop(id)
 ```
 
 ---
 
-### `maki.fn.jobwait()` {#maki-fn-jobwait}
+### `makima.fn.jobwait()` {#makima-fn-jobwait}
 
 ```lua
-maki.fn.jobwait({job_id}, {timeout_ms?})
+makima.fn.jobwait({job_id}, {timeout_ms?})
 ```
 
 Wait for a job to finish and collect its output. Returns a result
@@ -2920,8 +2920,8 @@ Requires the `run` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local id = maki.fn.jobstart("echo hello")
-local result = maki.fn.jobwait(id, 5000)
+local id = makima.fn.jobstart("echo hello")
+local result = makima.fn.jobwait(id, 5000)
 if result then
   print(result.stdout)
 end
@@ -2929,10 +2929,10 @@ end
 
 ---
 
-### `maki.fn.executable()` {#maki-fn-executable}
+### `makima.fn.executable()` {#makima-fn-executable}
 
 ```lua
-maki.fn.executable({name})
+makima.fn.executable({name})
 ```
 
 Check whether {name} can be found on `$PATH` or is a path to a file,
@@ -2950,22 +2950,22 @@ Requires the `env` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-if maki.fn.executable("rg") == 1 then
+if makima.fn.executable("rg") == 1 then
   -- use ripgrep
 end
 ```
 
 ---
 
-### `maki.fn.winsaveview()` {#maki-fn-winsaveview}
+### `makima.fn.winsaveview()` {#makima-fn-winsaveview}
 
 ```lua
-maki.fn.winsaveview()
+makima.fn.winsaveview()
 ```
 
 Read the viewport of the focused chat transcript, like Neovim's
 `vim.fn.winsaveview()`. The transcript is the only scrollable window
-maki has, so there is no window argument.
+makima has, so there is no window argument.
 
 `topline` is the 1-based transcript line at the top of the viewport, so
 the last visible one is `math.min(topline + height - 1, line_count)`.
@@ -2977,16 +2977,16 @@ follows streaming output.
 **Example:**
 
 ```lua
-local view = maki.fn.winsaveview()
-maki.fn.winrestview({ topline = view.topline + 1 })
+local view = makima.fn.winsaveview()
+makima.fn.winrestview({ topline = view.topline + 1 })
 ```
 
 ---
 
-### `maki.fn.winrestview()` {#maki-fn-winrestview}
+### `makima.fn.winrestview()` {#makima-fn-winrestview}
 
 ```lua
-maki.fn.winrestview({view})
+makima.fn.winrestview({view})
 ```
 
 Scroll the focused chat transcript so that the `topline` field of
@@ -3006,11 +3006,11 @@ the bottom re-pins it so streaming output keeps following.
 **Example:**
 
 ```lua
-maki.fn.winrestview({ topline = 1 })
+makima.fn.winrestview({ topline = 1 })
 ```
 
 
-## maki.fs {#maki-fs}
+## makima.fs {#makima-fs}
 
 File-system utilities, modelled after `vim.fs` and `vim.uv`.
 
@@ -3018,16 +3018,16 @@ Fallible operations return `(value, err)` pairs and never throw.
 Paths support `~/` expansion. Relative paths resolve from the current working directory.
 
 ```lua
-local text, err = maki.fs.read("init.lua")
+local text, err = makima.fs.read("init.lua")
 if err then return end
 ```
 
 ---
 
-### `maki.fs.read()` {#maki-fs-read}
+### `makima.fs.read()` {#makima-fs-read}
 
 ```lua
-maki.fs.read({path})
+makima.fs.read({path})
 ```
 
 Read the entire file at {path} as a UTF-8 string.
@@ -3045,23 +3045,23 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local text, err = maki.fs.read("config.toml")
+local text, err = makima.fs.read("config.toml")
 if err then
-  maki.log.warn("could not read config: " .. err)
+  makima.log.warn("could not read config: " .. err)
   return
 end
 ```
 
 ---
 
-### `maki.fs.read_bytes()` {#maki-fs-read_bytes}
+### `makima.fs.read_bytes()` {#makima-fs-read_bytes}
 
 ```lua
-maki.fs.read_bytes({path})
+makima.fs.read_bytes({path})
 ```
 
 Read the entire file at {path} as raw bytes, returned as a Luau buffer.
-Useful for binary files or when you need to pass the data to `maki.base64.encode`.
+Useful for binary files or when you need to pass the data to `makima.base64.encode`.
 
 Requires the `fs_read` [plugin permission](#plugin-permissions).
 
@@ -3074,17 +3074,17 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local buf, err = maki.fs.read_bytes("image.png")
+local buf, err = makima.fs.read_bytes("image.png")
 if err then return end
-local encoded = maki.base64.encode(buf)
+local encoded = makima.base64.encode(buf)
 ```
 
 ---
 
-### `maki.fs.metadata()` {#maki-fs-metadata}
+### `makima.fs.metadata()` {#makima-fs-metadata}
 
 ```lua
-maki.fs.metadata({path})
+makima.fs.metadata({path})
 ```
 
 Get metadata for the file or directory at {path}.
@@ -3104,7 +3104,7 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local meta = maki.fs.metadata("src/main.rs")
+local meta = makima.fs.metadata("src/main.rs")
 if meta and meta.is_file then
   print("size: " .. meta.size)
 end
@@ -3112,10 +3112,10 @@ end
 
 ---
 
-### `maki.fs.dirname()` {#maki-fs-dirname}
+### `makima.fs.dirname()` {#makima-fs-dirname}
 
 ```lua
-maki.fs.dirname({path})
+makima.fs.dirname({path})
 ```
 
 Return the parent directory of {path}. Like `vim.fs.dirname`.
@@ -3129,15 +3129,15 @@ Return the parent directory of {path}. Like `vim.fs.dirname`.
 **Example:**
 
 ```lua
-maki.fs.dirname("/home/user/init.lua") -- "/home/user"
+makima.fs.dirname("/home/user/init.lua") -- "/home/user"
 ```
 
 ---
 
-### `maki.fs.basename()` {#maki-fs-basename}
+### `makima.fs.basename()` {#makima-fs-basename}
 
 ```lua
-maki.fs.basename({path})
+makima.fs.basename({path})
 ```
 
 Return the final component (the file name) of {path}. Like `vim.fs.basename`.
@@ -3151,15 +3151,15 @@ Return the final component (the file name) of {path}. Like `vim.fs.basename`.
 **Example:**
 
 ```lua
-maki.fs.basename("/home/user/init.lua") -- "init.lua"
+makima.fs.basename("/home/user/init.lua") -- "init.lua"
 ```
 
 ---
 
-### `maki.fs.joinpath()` {#maki-fs-joinpath}
+### `makima.fs.joinpath()` {#makima-fs-joinpath}
 
 ```lua
-maki.fs.joinpath({...})
+makima.fs.joinpath({...})
 ```
 
 Join one or more path segments into a single path. Like `vim.fs.joinpath`.
@@ -3173,15 +3173,15 @@ Join one or more path segments into a single path. Like `vim.fs.joinpath`.
 **Example:**
 
 ```lua
-maki.fs.joinpath("src", "api", "fs.rs") -- "src/api/fs.rs"
+makima.fs.joinpath("src", "api", "fs.rs") -- "src/api/fs.rs"
 ```
 
 ---
 
-### `maki.fs.normalize()` {#maki-fs-normalize}
+### `makima.fs.normalize()` {#makima-fs-normalize}
 
 ```lua
-maki.fs.normalize({path})
+makima.fs.normalize({path})
 ```
 
 Clean up `.` and `..` segments and make {path} absolute. Like `vim.fs.normalize`.
@@ -3196,15 +3196,15 @@ This is purely string-based and does not touch the filesystem.
 **Example:**
 
 ```lua
-maki.fs.normalize("src/../src/api") -- "/home/user/project/src/api"
+makima.fs.normalize("src/../src/api") -- "/home/user/project/src/api"
 ```
 
 ---
 
-### `maki.fs.abspath()` {#maki-fs-abspath}
+### `makima.fs.abspath()` {#makima-fs-abspath}
 
 ```lua
-maki.fs.abspath({path})
+makima.fs.abspath({path})
 ```
 
 Make {path} absolute by prepending the current working directory when needed.
@@ -3219,15 +3219,15 @@ Unlike `normalize`, this does not resolve `.` or `..` segments.
 **Example:**
 
 ```lua
-maki.fs.abspath("src/main.rs") -- "/home/user/project/src/main.rs"
+makima.fs.abspath("src/main.rs") -- "/home/user/project/src/main.rs"
 ```
 
 ---
 
-### `maki.fs.parents()` {#maki-fs-parents}
+### `makima.fs.parents()` {#makima-fs-parents}
 
 ```lua
-maki.fs.parents({path})
+makima.fs.parents({path})
 ```
 
 Return all ancestor directories of {path}, from the immediate parent up to the root.
@@ -3242,16 +3242,16 @@ Handy for walking up a directory tree.
 **Example:**
 
 ```lua
-local dirs = maki.fs.parents("/home/user/project/src")
+local dirs = makima.fs.parents("/home/user/project/src")
 -- { "/home/user/project", "/home/user", "/home", "/" }
 ```
 
 ---
 
-### `maki.fs.root()` {#maki-fs-root}
+### `makima.fs.root()` {#makima-fs-root}
 
 ```lua
-maki.fs.root({source}, {marker})
+makima.fs.root({source}, {marker})
 ```
 
 Walk upward from {source} looking for a directory that contains one of the
@@ -3270,16 +3270,16 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local root = maki.fs.root("src/main.rs", { ".git", "Cargo.toml" })
+local root = makima.fs.root("src/main.rs", { ".git", "Cargo.toml" })
 if root then print("project root: " .. root) end
 ```
 
 ---
 
-### `maki.fs.relpath()` {#maki-fs-relpath}
+### `makima.fs.relpath()` {#makima-fs-relpath}
 
 ```lua
-maki.fs.relpath({base}, {target})
+makima.fs.relpath({base}, {target})
 ```
 
 Compute a relative path from {base} to {target}.
@@ -3294,15 +3294,15 @@ Compute a relative path from {base} to {target}.
 **Example:**
 
 ```lua
-maki.fs.relpath("/home/user", "/home/user/project/src") -- "project/src"
+makima.fs.relpath("/home/user", "/home/user/project/src") -- "project/src"
 ```
 
 ---
 
-### `maki.fs.ext()` {#maki-fs-ext}
+### `makima.fs.ext()` {#makima-fs-ext}
 
 ```lua
-maki.fs.ext({path})
+makima.fs.ext({path})
 ```
 
 Return the file extension of {path}, without the leading dot.
@@ -3316,16 +3316,16 @@ Return the file extension of {path}, without the leading dot.
 **Example:**
 
 ```lua
-maki.fs.ext("main.rs")   -- "rs"
-maki.fs.ext("Makefile")  -- nil
+makima.fs.ext("main.rs")   -- "rs"
+makima.fs.ext("Makefile")  -- nil
 ```
 
 ---
 
-### `maki.fs.dir()` {#maki-fs-dir}
+### `makima.fs.dir()` {#makima-fs-dir}
 
 ```lua
-maki.fs.dir({path}, {opts?})
+makima.fs.dir({path}, {opts?})
 ```
 
 List the contents of the directory at {path}.
@@ -3344,7 +3344,7 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local entries, err = maki.fs.dir("src", { depth = 2 })
+local entries, err = makima.fs.dir("src", { depth = 2 })
 if err then return end
 for _, e in ipairs(entries) do
   print(e[1], e[2]) -- "main.rs"  "file"
@@ -3353,10 +3353,10 @@ end
 
 ---
 
-### `maki.fs.write()` {#maki-fs-write}
+### `makima.fs.write()` {#makima-fs-write}
 
 ```lua
-maki.fs.write({path}, {content})
+makima.fs.write({path}, {content})
 ```
 
 Write {content} to the file at {path}, creating it if it does not exist
@@ -3374,16 +3374,16 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local ok, err = maki.fs.write("out.txt", "hello world")
+local ok, err = makima.fs.write("out.txt", "hello world")
 if err then print("write failed: " .. err) end
 ```
 
 ---
 
-### `maki.fs.atomic_write()` {#maki-fs-atomic_write}
+### `makima.fs.atomic_write()` {#makima-fs-atomic_write}
 
 ```lua
-maki.fs.atomic_write({path}, {content})
+makima.fs.atomic_write({path}, {content})
 ```
 
 Atomically replace {path} with {content}. The parent directory must exist.
@@ -3402,16 +3402,16 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local ok, err = maki.fs.atomic_write("state.json", encoded)
+local ok, err = makima.fs.atomic_write("state.json", encoded)
 if err then print("atomic write failed: " .. err) end
 ```
 
 ---
 
-### `maki.fs.rm()` {#maki-fs-rm}
+### `makima.fs.rm()` {#makima-fs-rm}
 
 ```lua
-maki.fs.rm({path}, {opts?})
+makima.fs.rm({path}, {opts?})
 ```
 
 Delete the file, symlink, or directory at {path}.
@@ -3431,17 +3431,17 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local ok, err = maki.fs.rm("temp.txt")
+local ok, err = makima.fs.rm("temp.txt")
 if err then print("rm failed: " .. err) end
-maki.fs.rm("stale_dir", { recursive = true, force = true })
+makima.fs.rm("stale_dir", { recursive = true, force = true })
 ```
 
 ---
 
-### `maki.fs.mkdir()` {#maki-fs-mkdir}
+### `makima.fs.mkdir()` {#makima-fs-mkdir}
 
 ```lua
-maki.fs.mkdir({path}, {opts?})
+makima.fs.mkdir({path}, {opts?})
 ```
 
 Create the directory at {path}. Set `parents = true` to create
@@ -3459,15 +3459,15 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-maki.fs.mkdir("a/b/c", { parents = true })
+makima.fs.mkdir("a/b/c", { parents = true })
 ```
 
 ---
 
-### `maki.fs.glob()` {#maki-fs-glob}
+### `makima.fs.glob()` {#makima-fs-glob}
 
 ```lua
-maki.fs.glob({pattern}, {opts?})
+makima.fs.glob({pattern}, {opts?})
 ```
 
 Find files matching one or more glob patterns.
@@ -3486,17 +3486,17 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local files, err = maki.fs.glob("**/*.lua", { path = "plugins", limit = 10 })
+local files, err = makima.fs.glob("**/*.lua", { path = "plugins", limit = 10 })
 if err then return end
 for _, f in ipairs(files) do print(f) end
 ```
 
 ---
 
-### `maki.fs.grep()` {#maki-fs-grep}
+### `makima.fs.grep()` {#makima-fs-grep}
 
 ```lua
-maki.fs.grep({pattern}, {opts?})
+makima.fs.grep({pattern}, {opts?})
 ```
 
 Search file contents for a regex {pattern}. Returns structured matches
@@ -3517,7 +3517,7 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local hits, err = maki.fs.grep("TODO", { path = "src", include = "*.rs", limit = 5 })
+local hits, err = makima.fs.grep("TODO", { path = "src", include = "*.rs", limit = 5 })
 if err then return end
 for _, file in ipairs(hits) do
   for _, g in ipairs(file.groups) do
@@ -3529,20 +3529,20 @@ end
 ```
 
 
-## maki.host {#maki-host}
+## makima.host {#makima-host}
 
 Actions on the host machine: opening a browser, reading the keyring.
 
 ```lua
-maki.host.open("https://example.com")
+makima.host.open("https://example.com")
 ```
 
 ---
 
-### `maki.host.open()` {#maki-host-open}
+### `makima.host.open()` {#makima-host-open}
 
 ```lua
-maki.host.open({url})
+makima.host.open({url})
 ```
 
 Open {url} in the user's default browser. Only `http` and `https` URLs
@@ -3559,15 +3559,15 @@ Requires the `run` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local ok, err = maki.host.open("https://example.com/login")
+local ok, err = makima.host.open("https://example.com/login")
 ```
 
 ---
 
-### `maki.host.keyring_get()` {#maki-host-keyring_get}
+### `makima.host.keyring_get()` {#makima-host-keyring_get}
 
 ```lua
-maki.host.keyring_get({service}, {account})
+makima.host.keyring_get({service}, {account})
 ```
 
 Read a secret another program stored in the system keyring, such as the
@@ -3585,11 +3585,11 @@ Requires the `env` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local token, err = maki.host.keyring_get("gh:github.com", "octocat")
+local token, err = makima.host.keyring_get("gh:github.com", "octocat")
 ```
 
 
-## maki.image {#maki-image}
+## makima.image {#makima-image}
 
 Small building blocks for working with images: probe metadata, decode
 pixels, resize, and encode back to bytes. Plugins compose these freely.
@@ -3597,17 +3597,17 @@ pixels, resize, and encode back to bytes. Plugins compose these freely.
 Decoding is guarded against pixel-bomb attacks (50 MP limit).
 
 ```lua
-local img = maki.image.decode(raw_bytes)
+local img = makima.image.decode(raw_bytes)
 local small = img:resize(1024, 768)
 local png = small:encode("png")
 ```
 
 ---
 
-### `maki.image.probe()` {#maki-image-probe}
+### `makima.image.probe()` {#makima-image-probe}
 
 ```lua
-maki.image.probe({data})
+makima.image.probe({data})
 ```
 
 Read image metadata (format, dimensions) from raw bytes without fully
@@ -3626,17 +3626,17 @@ Returns a table with `format` (string), `width` (integer), `height`
 **Example:**
 
 ```lua
-local info, err = maki.image.probe(raw_bytes)
+local info, err = makima.image.probe(raw_bytes)
 if err then error(err) end
 print(info.format, info.width, info.height)
 ```
 
 ---
 
-### `maki.image.decode()` {#maki-image-decode}
+### `makima.image.decode()` {#makima-image-decode}
 
 ```lua
-maki.image.decode({data})
+makima.image.decode({data})
 ```
 
 Decode raw image bytes into an Image handle you can resize and re-encode.
@@ -3646,22 +3646,22 @@ Images larger than 50 megapixels are rejected to prevent memory bombs.
 
 - `{data}` (`string|buffer`) Raw image bytes.
 
-**Returns:** ([`maki.image.Image?`](#maki-image-Image), `string?`) Decoded image, or `(nil, err)` on failure.
+**Returns:** ([`makima.image.Image?`](#makima-image-Image), `string?`) Decoded image, or `(nil, err)` on failure.
 
 **Example:**
 
 ```lua
-local img, err = maki.image.decode(raw_bytes)
+local img, err = makima.image.decode(raw_bytes)
 if err then error(err) end
 print(img:width() .. "x" .. img:height())
 ```
 
 
-## maki.image.Image {#maki-image-Image}
+## makima.image.Image {#makima-image-Image}
 
 A decoded image you can inspect, resize, and re-encode.
 
-Get one from `maki.image.decode()`. The image data lives in memory
+Get one from `makima.image.decode()`. The image data lives in memory
 until the handle is garbage collected.
 
 ---
@@ -3704,12 +3704,12 @@ ratio. If the image already fits, it is returned as-is. Never upscales.
 - `{max_w}` (`integer`) Maximum width in pixels. Must be positive.
 - `{max_h}` (`integer`) Maximum height in pixels. Must be positive.
 
-**Returns:** ([`maki.image.Image`](#maki-image-Image)) A new image handle (or the same one if no resize was needed).
+**Returns:** ([`makima.image.Image`](#makima-image-Image)) A new image handle (or the same one if no resize was needed).
 
 **Example:**
 
 ```lua
-local img = maki.image.decode(raw_bytes)
+local img = makima.image.decode(raw_bytes)
 local small = img:resize(800, 600)
 local encoded = small:encode("jpeg")
 ```
@@ -3739,7 +3739,7 @@ local bytes = img:encode("png")
 ```
 
 
-## maki.interpreter {#maki-interpreter}
+## makima.interpreter {#makima-interpreter}
 
 Run Python code in a memory-safe, time-limited sandbox.
 
@@ -3747,7 +3747,7 @@ The sandbox uses the monty interpreter. Python code can call back into
 Lua-defined tools, and stdout is streamed line by line.
 
 ```lua
-local r, err = maki.interpreter.run("print('hello')", {
+local r, err = makima.interpreter.run("print('hello')", {
   timeout = 10,
   max_memory_mb = 128,
   on_output = function(line) print(line) end,
@@ -3756,10 +3756,10 @@ local r, err = maki.interpreter.run("print('hello')", {
 
 ---
 
-### `maki.interpreter.run()` {#maki-interpreter-run}
+### `makima.interpreter.run()` {#makima-interpreter-run}
 
 ```lua
-maki.interpreter.run({code}, {opts})
+makima.interpreter.run({code}, {opts})
 ```
 
 Run Python code in a sandboxed interpreter with memory and time limits.
@@ -3795,7 +3795,7 @@ Requires the `run` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local result, err = maki.interpreter.run("print(2 + 2)", {
+local result, err = makima.interpreter.run("print(2 + 2)", {
   timeout = 30,
   max_memory_mb = 256,
   on_output = function(line) print("py: " .. line) end,
@@ -3805,23 +3805,23 @@ if result.stdout then print(result.stdout) end
 ```
 
 
-## maki.json {#maki-json}
+## makima.json {#makima-json}
 
 JSON encoding, decoding, and schema validation. Encode Lua
 tables to JSON strings, decode JSON back into tables, and
 optionally validate data against a JSON Schema.
 
 ```lua
-local s = maki.json.encode({ ok = true })
-local t = maki.json.decode(s)
+local s = makima.json.encode({ ok = true })
+local t = makima.json.decode(s)
 ```
 
 ---
 
-### `maki.json.encode()` {#maki-json-encode}
+### `makima.json.encode()` {#makima-json-encode}
 
 ```lua
-maki.json.encode({value})
+makima.json.encode({value})
 ```
 
 Turn a Lua value into a JSON string. Tables, strings, numbers,
@@ -3837,16 +3837,16 @@ serialized.
 **Example:**
 
 ```lua
-local s, err = maki.json.encode({ name = "maki", version = 1 })
-print(s) -- {"name":"maki","version":1}
+local s, err = makima.json.encode({ name = "makima", version = 1 })
+print(s) -- {"name":"makima","version":1}
 ```
 
 ---
 
-### `maki.json.decode()` {#maki-json-decode}
+### `makima.json.decode()` {#makima-json-decode}
 
 ```lua
-maki.json.decode({str})
+makima.json.decode({str})
 ```
 
 Parse a JSON string into a Lua value. Objects become tables and
@@ -3861,16 +3861,16 @@ arrays become 1-indexed sequences.
 **Example:**
 
 ```lua
-local t, err = maki.json.decode('{"x": 42}')
+local t, err = makima.json.decode('{"x": 42}')
 print(t.x) -- 42
 ```
 
 ---
 
-### `maki.json.schema_validator()` {#maki-json-schema_validator}
+### `makima.json.schema_validator()` {#makima-json-schema_validator}
 
 ```lua
-maki.json.schema_validator({schema})
+makima.json.schema_validator({schema})
 ```
 
 Compile a JSON Schema into a reusable validator object. Supports
@@ -3881,24 +3881,24 @@ you catch mistakes before doing any real work.
 
 - `{schema}` (`table`) JSON Schema as a Lua table.
 
-**Returns:** ([`maki.json.SchemaValidator?`](#maki-json-SchemaValidator), `string?`) Validator, or nil plus an error.
+**Returns:** ([`makima.json.SchemaValidator?`](#makima-json-SchemaValidator), `string?`) Validator, or nil plus an error.
 
 **Example:**
 
 ```lua
-local v, err = maki.json.schema_validator({
+local v, err = makima.json.schema_validator({
   type = "object",
   properties = { name = { type = "string" } },
   required = { "name" },
 })
-local errs = v:validate({ name = "maki" })
+local errs = v:validate({ name = "makima" })
 assert(errs == nil)
 ```
 
 
-## maki.json.SchemaValidator {#maki-json-SchemaValidator}
+## makima.json.SchemaValidator {#makima-json-SchemaValidator}
 
-A compiled JSON Schema validator. Create one with `maki.json.schema_validator()` and reuse it to validate many values without recompiling the schema each time.
+A compiled JSON Schema validator. Create one with `makima.json.schema_validator()` and reuse it to validate many values without recompiling the schema each time.
 
 ---
 
@@ -3926,23 +3926,23 @@ end
 ```
 
 
-## maki.keymap {#maki-keymap}
+## makima.keymap {#makima-keymap}
 
 Key mappings, modeled after `vim.keymap`. If you have written a
 Neovim keymap plugin before, this will feel familiar.
 
 ```lua
-maki.keymap.set("n", "<C-t>", function()
+makima.keymap.set("n", "<C-t>", function()
   print("hello")
 end, { desc = "Say hello" })
 ```
 
 ---
 
-### `maki.keymap.set()` {#maki-keymap-set}
+### `makima.keymap.set()` {#makima-keymap-set}
 
 ```lua
-maki.keymap.set({mode}, {lhs}, {rhs}, {opts?})
+makima.keymap.set({mode}, {lhs}, {rhs}, {opts?})
 ```
 
 Bind a key to a Lua function, just like `vim.keymap.set`. Only
@@ -3974,17 +3974,17 @@ mapped, the old binding is replaced and a warning is logged.
 **Example:**
 
 ```lua
-maki.keymap.set("n", "<C-t>", function()
+makima.keymap.set("n", "<C-t>", function()
   print("toggle!")
 end, { desc = "Toggle panel" })
 ```
 
 ---
 
-### `maki.keymap.del()` {#maki-keymap-del}
+### `makima.keymap.del()` {#makima-keymap-del}
 
 ```lua
-maki.keymap.del({mode}, {lhs})
+makima.keymap.del({mode}, {lhs})
 ```
 
 Remove the mapping for {lhs} in {mode}. Does nothing if no mapping
@@ -4000,11 +4000,11 @@ exists for that key.
 **Example:**
 
 ```lua
-maki.keymap.del("n", "<C-t>")
+makima.keymap.del("n", "<C-t>")
 ```
 
 
-## maki.log {#maki-log}
+## makima.log {#makima-log}
 
 Structured logging for plugins.
 
@@ -4012,16 +4012,16 @@ Each call emits a tracing event tagged with the calling plugin's name.
 Messages show up in makima's log output, which you can view with `makima --log`.
 
 ```lua
-maki.log.info("ready")
-maki.log.warn("something looks off")
+makima.log.info("ready")
+makima.log.warn("something looks off")
 ```
 
 ---
 
-### `maki.log.debug()` {#maki-log-debug}
+### `makima.log.debug()` {#makima-log-debug}
 
 ```lua
-maki.log.debug({msg})
+makima.log.debug({msg})
 ```
 
 Emit a DEBUG-level log message. Useful for development and troubleshooting.
@@ -4034,15 +4034,15 @@ The message is tagged with the plugin name automatically.
 **Example:**
 
 ```lua
-maki.log.debug("loaded " .. #items .. " items")
+makima.log.debug("loaded " .. #items .. " items")
 ```
 
 ---
 
-### `maki.log.info()` {#maki-log-info}
+### `makima.log.info()` {#makima-log-info}
 
 ```lua
-maki.log.info({msg})
+makima.log.info({msg})
 ```
 
 Emit an INFO-level log message. Good for normal operational events.
@@ -4054,15 +4054,15 @@ Emit an INFO-level log message. Good for normal operational events.
 **Example:**
 
 ```lua
-maki.log.info("plugin initialized")
+makima.log.info("plugin initialized")
 ```
 
 ---
 
-### `maki.log.warn()` {#maki-log-warn}
+### `makima.log.warn()` {#makima-log-warn}
 
 ```lua
-maki.log.warn({msg})
+makima.log.warn({msg})
 ```
 
 Emit a WARN-level log message. Use for recoverable problems.
@@ -4074,15 +4074,15 @@ Emit a WARN-level log message. Use for recoverable problems.
 **Example:**
 
 ```lua
-maki.log.warn("config file missing, using defaults")
+makima.log.warn("config file missing, using defaults")
 ```
 
 ---
 
-### `maki.log.error()` {#maki-log-error}
+### `makima.log.error()` {#makima-log-error}
 
 ```lua
-maki.log.error({msg})
+makima.log.error({msg})
 ```
 
 Emit an ERROR-level log message. Use for failures that need attention.
@@ -4094,18 +4094,18 @@ Emit an ERROR-level log message. Use for failures that need attention.
 **Example:**
 
 ```lua
-maki.log.error("failed to connect to API")
+makima.log.error("failed to connect to API")
 ```
 
 
-## maki.match {#maki-match}
+## makima.match {#makima-match}
 
 Fuzzy matching via nucleo, the same matcher makima's built-in pickers use.
 
 Use it for type-ahead search over a plugin's own item list.
 
 ```lua
-local m = maki.match.fuzzy("gh pr", "gh pr 441 review")
+local m = makima.match.fuzzy("gh pr", "gh pr 441 review")
 if m then
   print(m.score) -- matched codepoint offsets in m.indices
 end
@@ -4113,10 +4113,10 @@ end
 
 ---
 
-### `maki.match.fuzzy()` {#maki-match-fuzzy}
+### `makima.match.fuzzy()` {#makima-match-fuzzy}
 
 ```lua
-maki.match.fuzzy({query}, {text})
+makima.match.fuzzy({query}, {text})
 ```
 
 Compatibility/raw-score fuzzy matching for {query} against {text} with
@@ -4134,7 +4134,7 @@ order does not matter. An empty or whitespace-only query matches everything.
 **Example:**
 
 ```lua
-local m = maki.match.fuzzy("gh pr", "gh pr 441 review")
+local m = makima.match.fuzzy("gh pr", "gh pr 441 review")
 if m then
   print(m.score) -- matched codepoint offsets in m.indices
 end
@@ -4142,10 +4142,10 @@ end
 
 ---
 
-### `maki.match.completion()` {#maki-match-completion}
+### `makima.match.completion()` {#makima-match-completion}
 
 ```lua
-maki.match.completion({query}, {label}, {opts?})
+makima.match.completion({query}, {label}, {opts?})
 ```
 
 Match {query} against a completion {label}, returning one-based Lua
@@ -4169,10 +4169,10 @@ gap_count, span_length, unmatched_suffix, fuzzy_score } }`.
 
 ---
 
-### `maki.match.compare()` {#maki-match-compare}
+### `makima.match.compare()` {#makima-match-compare}
 
 ```lua
-maki.match.compare({left}, {right})
+makima.match.compare({left}, {right})
 ```
 
 Compare the textual ranking of two results from {completion}.
@@ -4181,28 +4181,28 @@ Returns -1 when {left} sorts first, 0 for equal textual ranking, and 1
 when {right} sorts first. Source priority, provider order, list grouping,
 and other caller-owned policy are intentionally not compared. Use the
 result as a boolean predicate for `table.sort`:
-`function(a, b) return maki.match.compare(a, b) < 0 end`.
+`function(a, b) return makima.match.compare(a, b) < 0 end`.
 
 **Parameters:**
 
-- `{left}` (`table`) Match result returned by `maki.match.completion`.
-- `{right}` (`table`) Match result returned by `maki.match.completion`.
+- `{left}` (`table`) Match result returned by `makima.match.completion`.
+- `{right}` (`table`) Match result returned by `makima.match.completion`.
 
 **Returns:** (`integer`) -1, 0, or 1.
 
 
-## maki.api.mode {#maki-api-mode}
+## makima.api.mode {#makima-api-mode}
 
-`maki.api.mode`: define, override and list agent modes. Built-in
+`makima.api.mode`: define, override and list agent modes. Built-in
 `build` and `plan` are pre-registered, so overrides use the same call
 as defining a custom mode. Switch an agent with `Agent:set_mode`.
 
 ---
 
-### `maki.api.mode.define()` {#maki-api-mode-define}
+### `makima.api.mode.define()` {#makima-api-mode-define}
 
 ```lua
-maki.api.mode.define({opts})
+makima.api.mode.define({opts})
 ```
 
 Defines a new mode or fully overrides an existing one (built-ins included).
@@ -4216,15 +4216,15 @@ Defines a new mode or fully overrides an existing one (built-ins included).
 **Example:**
 
 ```lua
-maki.api.mode.define({ name = "plan", label = "[PLAN]", tools = { "read", "write" } })
+makima.api.mode.define({ name = "plan", label = "[PLAN]", tools = { "read", "write" } })
 ```
 
 ---
 
-### `maki.api.mode.list()` {#maki-api-mode-list}
+### `makima.api.mode.list()` {#makima-api-mode-list}
 
 ```lua
-maki.api.mode.list()
+makima.api.mode.list()
 ```
 
 Lists all known modes as `{ name, label }` pairs (built-ins first).
@@ -4234,15 +4234,15 @@ Lists all known modes as `{ name, label }` pairs (built-ins first).
 **Example:**
 
 ```lua
-for _, m in ipairs(maki.api.mode.list()) do print(m.name) end
+for _, m in ipairs(makima.api.mode.list()) do print(m.name) end
 ```
 
 ---
 
-### `maki.api.mode.reset()` {#maki-api-mode-reset}
+### `makima.api.mode.reset()` {#makima-api-mode-reset}
 
 ```lua
-maki.api.mode.reset({name?})
+makima.api.mode.reset({name?})
 ```
 
 Restores a built-in's default definition, dropping any plugin override.
@@ -4257,21 +4257,21 @@ With no argument, resets every built-in.
 **Example:**
 
 ```lua
-maki.api.mode.reset("plan")
+makima.api.mode.reset("plan")
 ```
 
 
-## maki.model {#maki-model}
+## makima.model {#makima-model}
 
 Model catalog reads that address no agent. `Agent:config`,
 `Agent:set_model` and `Agent:available_models` act on an agent.
 
 ---
 
-### `maki.model.info()` {#maki-model-info}
+### `makima.model.info()` {#makima-model-info}
 
 ```lua
-maki.model.info({spec})
+makima.model.info({spec})
 ```
 
 Describes a model by spec without addressing any agent. Unknown specs
@@ -4289,15 +4289,15 @@ return an error.
 **Example:**
 
 ```lua
-local info = assert(maki.model.info("anthropic/claude-sonnet-4-20250514"))
+local info = assert(makima.model.info("anthropic/claude-sonnet-4-20250514"))
 ```
 
 ---
 
-### `maki.model.thinking_levels()` {#maki-model-thinking_levels}
+### `makima.model.thinking_levels()` {#makima-model-thinking_levels}
 
 ```lua
-maki.model.thinking_levels()
+makima.model.thinking_levels()
 ```
 
 Lists the thinking levels a selection accepts, from `off` to `max`. A
@@ -4308,11 +4308,11 @@ token budget is also accepted.
 **Example:**
 
 ```lua
-local levels = maki.model.thinking_levels()
+local levels = makima.model.thinking_levels()
 ```
 
 
-## maki.net {#maki-net}
+## makima.net {#makima-net}
 
 HTTP clients: a guarded `request` for web content and a raw, streaming
 `send` for trusted plugin code.
@@ -4324,16 +4324,16 @@ Hosts listed in the `net.allowed_private_hosts` config option are
 exempt from the block. `send` has none of these guards.
 
 ```lua
-local res, err = maki.net.request("https://example.com")
+local res, err = makima.net.request("https://example.com")
 if res then print(res.body) end
 ```
 
 ---
 
-### `maki.net.request()` {#maki-net-request}
+### `makima.net.request()` {#makima-net-request}
 
 ```lua
-maki.net.request({url}, {opts?})
+makima.net.request({url}, {opts?})
 ```
 
 Make an HTTP request and return the response body. Plain `http://`
@@ -4364,7 +4364,7 @@ Requires the `net` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local res, err = maki.net.request("https://httpbin.org/get")
+local res, err = makima.net.request("https://httpbin.org/get")
 if err then
   print("failed: " .. err)
 else
@@ -4374,10 +4374,10 @@ end
 
 ---
 
-### `maki.net.send()` {#maki-net-send}
+### `makima.net.send()` {#makima-net-send}
 
 ```lua
-maki.net.send({request})
+makima.net.send({request})
 ```
 
 Send one HTTP request and return a streaming response. This is the raw
@@ -4385,7 +4385,7 @@ primitive for trusted plugin code, such as LLM providers: there is no
 private address blocking, no https upgrade, no retry, no size cap, and
 redirects are not followed (a 3xx comes back as is). Never pass it a URL
 that came from the model without checking it first; use
-`maki.net.request` for that.
+`makima.net.request` for that.
 
 The response arrives with the first body byte or when the transfer ends,
 not at the end of the headers. A server that sends headers and then stalls
@@ -4399,7 +4399,7 @@ fails with an error containing `idle timeout`. The providers plugin's
 {request} fields:
   `url` (string) Required, `http://` or `https://`.
   `method` (string) HTTP verb (default `"GET"`).
-  `headers` (table) Header name/value pairs. `User-Agent` defaults to `maki/<version>`.
+  `headers` (table) Header name/value pairs. `User-Agent` defaults to `makima/<version>`.
   `body` (string|buffer) Request body, binary safe.
   `connect_timeout` (number) Seconds to connect (default 10).
   `low_speed_timeout` (number) Seconds without any received byte before
@@ -4414,16 +4414,16 @@ Requires the `net` [plugin permission](#plugin-permissions).
 
 - `{request}` (`table`) Request description (see above).
 
-**Returns:** ([`maki.net.Response?`](#maki-net-Response), `string?`) Response handle, or nil plus an error string.
+**Returns:** ([`makima.net.Response?`](#makima-net-Response), `string?`) Response handle, or nil plus an error string.
 
 **Example:**
 
 ```lua
-local res, err = maki.net.send({
+local res, err = makima.net.send({
   url = "https://api.example.com/v1/stream",
   method = "POST",
   headers = { ["content-type"] = "application/json" },
-  body = maki.json.encode({ stream = true }),
+  body = makima.json.encode({ stream = true }),
 })
 if not res then return print(err) end
 local parts = {}
@@ -4437,9 +4437,9 @@ res:close()
 ```
 
 
-## maki.net.Response {#maki-net-Response}
+## makima.net.Response {#makima-net-Response}
 
-A streaming HTTP response from `maki.net.send`.
+A streaming HTTP response from `makima.net.send`.
 
 `status` is the integer status code. `headers` is a table keyed by
 lowercase header name, with repeated headers joined by `", "`. Read
@@ -4486,7 +4486,7 @@ res:close()
 ```
 
 
-## maki.session {#maki-session}
+## makima.session {#makima-session}
 
 Host session primitives. The interactive UI can run several sessions
 at once; these functions let plugins list, create, focus, rename, and
@@ -4501,10 +4501,10 @@ invocation's session.
 
 ---
 
-### `maki.session.list()` {#maki-session-list}
+### `makima.session.list()` {#makima-session-list}
 
 ```lua
-maki.session.list()
+makima.session.list()
 ```
 
 Lists sessions stored for the current project. Answered from a
@@ -4517,15 +4517,15 @@ counts main transcript messages only and excludes subagent histories.
 **Example:**
 
 ```lua
-local stored, err = maki.session.list()
+local stored, err = makima.session.list()
 ```
 
 ---
 
-### `maki.session.list_all()` {#maki-session-list_all}
+### `makima.session.list_all()` {#makima-session-list_all}
 
 ```lua
-maki.session.list_all()
+makima.session.list_all()
 ```
 
 Lists stored sessions across every project directory, most recently
@@ -4539,15 +4539,15 @@ and excludes subagent histories.
 **Example:**
 
 ```lua
-local stored, err = maki.session.list_all()
+local stored, err = makima.session.list_all()
 ```
 
 ---
 
-### `maki.session.live()` {#maki-session-live}
+### `makima.session.live()` {#makima-session-live}
 
 ```lua
-maki.session.live()
+makima.session.live()
 ```
 
 Lists the sessions currently running in this UI. Status is "working",
@@ -4561,15 +4561,15 @@ intermediate "idle" status.
 **Example:**
 
 ```lua
-local live, err = maki.session.live()
+local live, err = makima.session.live()
 ```
 
 ---
 
-### `maki.session.read()` {#maki-session-read}
+### `makima.session.read()` {#makima-session-read}
 
 ```lua
-maki.session.read({opts})
+makima.session.read({opts})
 ```
 
 Snapshot of the session you name in `session`.
@@ -4604,16 +4604,16 @@ model and leave it empty. Model, mode and options are on the agent:
 **Example:**
 
 ```lua
-local s = maki.session.read({ session = ctx:session_id() })
-maki.ui.notify("spent " .. tostring(s.usage.total.cost))
+local s = makima.session.read({ session = ctx:session_id() })
+makima.ui.notify("spent " .. tostring(s.usage.total.cost))
 ```
 
 ---
 
-### `maki.session.focus()` {#maki-session-focus}
+### `makima.session.focus()` {#makima-session-focus}
 
 ```lua
-maki.session.focus({id})
+makima.session.focus({id})
 ```
 
 Switches the UI to the session with {id}. The session must belong to
@@ -4628,15 +4628,15 @@ the current directory and must not be open in another terminal.
 **Example:**
 
 ```lua
-local _, err = maki.session.focus(id)
+local _, err = makima.session.focus(id)
 ```
 
 ---
 
-### `maki.session.delete()` {#maki-session-delete}
+### `makima.session.delete()` {#makima-session-delete}
 
 ```lua
-maki.session.delete({id})
+makima.session.delete({id})
 ```
 
 Deletes a session and its stored history, cancelling it first if it
@@ -4651,15 +4651,15 @@ is running. The focused session cannot be deleted.
 **Example:**
 
 ```lua
-local _, err = maki.session.delete(id)
+local _, err = makima.session.delete(id)
 ```
 
 ---
 
-### `maki.session.new()` {#maki-session-new}
+### `makima.session.new()` {#makima-session-new}
 
 ```lua
-maki.session.new({opts?})
+makima.session.new({opts?})
 ```
 
 Starts a new session in the current project.
@@ -4676,15 +4676,15 @@ Starts a new session in the current project.
 **Example:**
 
 ```lua
-local id, err = maki.session.new({ prompt = "fix the tests", focus = true })
+local id, err = makima.session.new({ prompt = "fix the tests", focus = true })
 ```
 
 ---
 
-### `maki.session.notify()` {#maki-session-notify}
+### `makima.session.notify()` {#makima-session-notify}
 
 ```lua
-maki.session.notify({text}, {opts})
+makima.session.notify({text}, {opts})
 ```
 
 Reports {text} to a live session without creating a user turn. The
@@ -4702,15 +4702,15 @@ observation waits for the session's next agent run.
 **Example:**
 
 ```lua
-maki.session.notify("[monitor] deploy failed", { session = id, wake = true })
+makima.session.notify("[monitor] deploy failed", { session = id, wake = true })
 ```
 
 ---
 
-### `maki.session.set_title()` {#maki-session-set_title}
+### `makima.session.set_title()` {#makima-session-set_title}
 
 ```lua
-maki.session.set_title({opts})
+makima.session.set_title({opts})
 ```
 
 Renames a session, live or stored.
@@ -4725,15 +4725,15 @@ Renames a session, live or stored.
 **Example:**
 
 ```lua
-local _, err = maki.session.set_title({ id = id, title = "refactor" })
+local _, err = makima.session.set_title({ id = id, title = "refactor" })
 ```
 
 ---
 
-### `maki.session.set_default_thinking()` {#maki-session-set_default_thinking}
+### `makima.session.set_default_thinking()` {#makima-session-set_default_thinking}
 
 ```lua
-maki.session.set_default_thinking({mode})
+makima.session.set_default_thinking({mode})
 ```
 
 Persists the default thinking setting for new sessions without changing
@@ -4751,11 +4751,11 @@ the saved default alone.
 **Example:**
 
 ```lua
-maki.session.set_default_thinking("medium")
+makima.session.set_default_thinking("medium")
 ```
 
 
-## maki.credentials {#maki-credentials}
+## makima.credentials {#makima-credentials}
 
 Credential stores for plugins. A provider's own credentials are its
 ctx's `credentials`; state a plugin shares across its providers, such
@@ -4763,10 +4763,10 @@ as one sign-in, goes in a plugin store.
 
 ---
 
-### `maki.credentials.open()` {#maki-credentials-open}
+### `makima.credentials.open()` {#makima-credentials-open}
 
 ```lua
-maki.credentials.open({ctx}, {key})
+makima.credentials.open({ctx}, {key})
 ```
 
 Open plugin store {key} of {ctx}: a credentials file only that ctx and
@@ -4775,23 +4775,23 @@ ctx's stores.
 
 **Parameters:**
 
-- `{ctx}` ([`maki.Ctx`](#maki-Ctx)) The plugin's ctx, or a provider ctx.
+- `{ctx}` ([`makima.Ctx`](#makima-Ctx)) The plugin's ctx, or a provider ctx.
 - `{key}` (`string`) ASCII letters, digits, `-`, `_` or `.`, not starting with `.`.
 
-**Returns:** ([`maki.credentials.Store`](#maki-credentials-Store)) The store.
+**Returns:** ([`makima.credentials.Store`](#makima-credentials-Store)) The store.
 
 **Example:**
 
 ```lua
-local account = maki.credentials.open(ctx, "account")
+local account = makima.credentials.open(ctx, "account")
 local saved = account:read()
 ```
 
 
-## maki.credentials.Store {#maki-credentials-Store}
+## makima.credentials.Store {#makima-credentials-Store}
 
 A credentials file: a provider's (its ctx's `credentials`) or a
-plugin's (`maki.credentials.open`). The value is whatever JSON table
+plugin's (`makima.credentials.open`). The value is whatever JSON table
 is stored, such as `{ api_key }` or `{ access, refresh, expires }`.
 
 ---
@@ -4881,7 +4881,7 @@ which nothing cancels, {fn} runs in the first caller instead.
 
 ```lua
 local tokens, err = ctx.credentials:refresh(function(current)
-  if current and current.expires > maki.time.now().secs * 1000 + 60000 then return nil end
+  if current and current.expires > makima.time.now().secs * 1000 + 60000 then return nil end
   return exchange(current.refresh)
 end)
 ```
@@ -4914,20 +4914,20 @@ end)
 ```
 
 
-## maki.Ctx {#maki-Ctx}
+## makima.Ctx {#makima-Ctx}
 
 A plugin's authority. An entry chunk (a bundled plugin, or `init.lua`)
 receives its root ctx as `...`; pass it on by reference, such as to
 a module's `setup(ctx)`, and narrow it with `with_name`. APIs that
-act for the plugin take it, such as `maki.credentials.open` and
-`maki.api.register_provider`. Its fields cannot be assigned.
+act for the plugin take it, such as `makima.credentials.open` and
+`makima.api.register_provider`. Its fields cannot be assigned.
 
-`send` is `maki.net.send` with default timeouts: from
+`send` is `makima.net.send` with default timeouts: from
 `MAKIMA_NET_TIMEOUT_SECS` (default 30 seconds) on a plugin ctx, from
 `[provider]` on a provider ctx. A provider ctx, which a provider's
 callbacks receive, also has `id` (the provider id) and `credentials`
-(the provider's `maki.credentials.Store`); a `stream` call's ctx also
-has `mark_request_delivery`, described on `maki.api.register_provider`.
+(the provider's `makima.credentials.Store`); a `stream` call's ctx also
+has `mark_request_delivery`, described on `makima.api.register_provider`.
 
 ---
 
@@ -4945,7 +4945,7 @@ child is a plain plugin ctx.
 
 - `{name}` (`string`) ASCII letters, digits, `-`, `_` or `.`, not starting with `.`.
 
-**Returns:** ([`maki.Ctx`](#maki-Ctx)) The child ctx.
+**Returns:** ([`makima.Ctx`](#makima-Ctx)) The child ctx.
 
 **Example:**
 
@@ -4955,7 +4955,7 @@ require("fountain.provider").setup(ctx:with_name("fountain"))
 ```
 
 
-## maki.provider.LoginUi {#maki-provider-LoginUi}
+## makima.provider.LoginUi {#makima-provider-LoginUi}
 
 The `ui` a provider's `login(ctx, ui, config)` receives.
 
@@ -5103,7 +5103,7 @@ local ok, err = ui:run({ "/home/me/.config/makima/providers/corp", "login" })
 ```
 
 
-## maki.usage {#maki-usage}
+## makima.usage {#makima-usage}
 
 Provider-side quota snapshots. `get` reads the Lua-thread mirror,
 `fetch` asks the interactive UI to refresh it, and `on_change` observes
@@ -5112,10 +5112,10 @@ canonical publications. Without an interactive UI `get` stays nil,
 
 ---
 
-### `maki.usage.get()` {#maki-usage-get}
+### `makima.usage.get()` {#makima-usage-get}
 
 ```lua
-maki.usage.get()
+makima.usage.get()
 ```
 
 Returns the latest provider quota snapshot without starting a network request.
@@ -5125,10 +5125,10 @@ Returns nil until the interactive UI publishes its first snapshot.
 
 ---
 
-### `maki.usage.fetch()` {#maki-usage-fetch}
+### `makima.usage.fetch()` {#makima-usage-fetch}
 
 ```lua
-maki.usage.fetch({opts?})
+makima.usage.fetch({opts?})
 ```
 
 Fetches the active provider account's quota. Ordinary fetches join an
@@ -5142,10 +5142,10 @@ in-flight request; a forced fetch queues one fresh follow-up.
 
 ---
 
-### `maki.usage.on_change()` {#maki-usage-on_change}
+### `makima.usage.on_change()` {#makima-usage-on_change}
 
 ```lua
-maki.usage.on_change({callback})
+makima.usage.on_change({callback})
 ```
 
 Registers a synchronous callback for provider quota snapshot changes.
@@ -5159,26 +5159,26 @@ Callback failures are logged and do not stop other callbacks.
 **Returns:** (`function|nil`, `string|nil`) Idempotent unsubscribe callback. Returns nil and an error when called from a delegated tool handler.
 
 
-## maki.text {#maki-text}
+## makima.text {#makima-text}
 
 Text transformation utilities.
 
 Helper functions for converting between text formats.
 
 ```lua
-local md = maki.text.html_to_markdown(html)
+local md = makima.text.html_to_markdown(html)
 ```
 
 ---
 
-### `maki.text.html_to_markdown()` {#maki-text-html_to_markdown}
+### `makima.text.html_to_markdown()` {#makima-text-html_to_markdown}
 
 ```lua
-maki.text.html_to_markdown({html})
+makima.text.html_to_markdown({html})
 ```
 
 Convert an HTML string to Markdown.
-Useful for cleaning up web content fetched with `maki.webfetch`.
+Useful for cleaning up web content fetched with `makima.webfetch`.
 
 **Parameters:**
 
@@ -5189,17 +5189,17 @@ Useful for cleaning up web content fetched with `maki.webfetch`.
 **Example:**
 
 ```lua
-local md, err = maki.text.html_to_markdown("<h1>Hello</h1><p>world</p>")
+local md, err = makima.text.html_to_markdown("<h1>Hello</h1><p>world</p>")
 if err then return end
 print(md) -- "# Hello\n\nworld"
 ```
 
 ---
 
-### `maki.text.truncate_line()` {#maki-text-truncate_line}
+### `makima.text.truncate_line()` {#makima-text-truncate_line}
 
 ```lua
-maki.text.truncate_line({text}, {max_bytes})
+makima.text.truncate_line({text}, {max_bytes})
 ```
 
 Truncate one line while preserving a UTF-8 boundary and ending it with
@@ -5214,10 +5214,10 @@ Truncate one line while preserving a UTF-8 boundary and ending it with
 
 ---
 
-### `maki.text.truncate_file()` {#maki-text-truncate_file}
+### `makima.text.truncate_file()` {#makima-text-truncate_file}
 
 ```lua
-maki.text.truncate_file({text}, {max_lines}, {max_bytes}, {remaining_lines})
+makima.text.truncate_file({text}, {max_lines}, {max_bytes}, {remaining_lines})
 ```
 
 Truncate file output by line and byte limits, adding `[file truncated]` when needed.
@@ -5233,10 +5233,10 @@ Truncate file output by line and byte limits, adding `[file truncated]` when nee
 
 ---
 
-### `maki.text.truncation_marker()` {#maki-text-truncation_marker}
+### `makima.text.truncation_marker()` {#makima-text-truncation_marker}
 
 ```lua
-maki.text.truncation_marker({line})
+makima.text.truncation_marker({line})
 ```
 
 Name the tool output a line's trailing truncation marker came from, if any.
@@ -5250,10 +5250,10 @@ Mutation guards use it to reject markers pasted back as file content.
 
 ---
 
-### `maki.text.is_offload_notice()` {#maki-text-is_offload_notice}
+### `makima.text.is_offload_notice()` {#makima-text-is_offload_notice}
 
 ```lua
-maki.text.is_offload_notice({line})
+makima.text.is_offload_notice({line})
 ```
 
 Whether a line is the saved-output footer in a tool result.
@@ -5265,7 +5265,7 @@ Whether a line is the saved-output footer in a tool result.
 **Returns:** boolean
 
 
-## maki.time {#maki-time}
+## makima.time {#makima-time}
 
 Wall-clock timestamps and relative-age formatting.
 
@@ -5276,17 +5276,17 @@ numbers to subtract — so callers get one consistent relative-age
 format instead of reimplementing epoch math per plugin.
 
 ```lua
-local t0 = maki.time.now()
+local t0 = makima.time.now()
 -- work...
-print(maki.time.ago(t0))
+print(makima.time.ago(t0))
 ```
 
 ---
 
-### `maki.time.now()` {#maki-time-now}
+### `makima.time.now()` {#makima-time-now}
 
 ```lua
-maki.time.now()
+makima.time.now()
 ```
 
 Return the current wall-clock time as a timestamp table.
@@ -5298,30 +5298,30 @@ stay exact in a Lua number (each under 2^53), so the timestamp keeps full
 nanosecond precision — the same clock the host uses for session
 `updated_at`, just finer than its whole seconds.
 
-Treat the returned table as opaque; pass it to `maki.time.ago` rather than
+Treat the returned table as opaque; pass it to `makima.time.ago` rather than
 doing epoch math by hand. To wrap a stored whole-second value (like a
-session's `updated_at`) use `maki.time.at`.
+session's `updated_at`) use `makima.time.at`.
 
 **Returns:** (`table`) `{secs = integer, nanosecs = integer}` timestamp.
 
 **Example:**
 
 ```lua
-local t0 = maki.time.now()
+local t0 = makima.time.now()
 -- ...work...
-print(maki.time.ago(t0))
+print(makima.time.ago(t0))
 ```
 
 ---
 
-### `maki.time.at()` {#maki-time-at}
+### `makima.time.at()` {#makima-time-at}
 
 ```lua
-maki.time.at({secs})
+makima.time.at({secs})
 ```
 
 Wrap a whole-second Unix timestamp (e.g. a session's `updated_at`) into a
-timestamp object readable by `maki.time.ago`.
+timestamp object readable by `makima.time.ago`.
 
 **Parameters:**
 
@@ -5332,40 +5332,40 @@ timestamp object readable by `maki.time.ago`.
 **Example:**
 
 ```lua
-print(maki.time.ago(maki.time.at(session.updated_at)))
+print(makima.time.ago(makima.time.at(session.updated_at)))
 ```
 
 ---
 
-### `maki.time.ago()` {#maki-time-ago}
+### `makima.time.ago()` {#makima-time-ago}
 
 ```lua
-maki.time.ago({instant}, {reference?})
+makima.time.ago({instant}, {reference?})
 ```
 
 Format {instant} as a live delta like `9s` or `4d 7h 23m 9s`.
-{instant} is a timestamp from `maki.time.now` (or `maki.time.at`). If
+{instant} is a timestamp from `makima.time.now` (or `makima.time.at`). If
 {reference} is given, age is measured from it instead of the current time.
 Fractions truncate to whole seconds, and higher zero units are omitted.
 A timestamp in the future renders as `0s`.
 
 **Parameters:**
 
-- `{instant}` (`table`) Timestamp from `maki.time.now`/`maki.time.at`.
-- `{reference?}` (`table?`) Timestamp to measure from; defaults to `maki.time.now`.
+- `{instant}` (`table`) Timestamp from `makima.time.now`/`makima.time.at`.
+- `{reference?}` (`table?`) Timestamp to measure from; defaults to `makima.time.now`.
 
 **Returns:** (`string`) Elapsed delta, e.g. `2m 9s`.
 
 **Example:**
 
 ```lua
-local t0 = maki.time.now()
+local t0 = makima.time.now()
 -- ...work...
-print(maki.time.ago(t0))
+print(makima.time.ago(t0))
 ```
 
 
-## maki.timer {#maki-timer}
+## makima.timer {#makima-timer}
 
 Recurring callbacks on the runtime's timer pump.
 
@@ -5377,17 +5377,17 @@ agent authority from their registration task. Timers registered by a
 plugin are dropped when the plugin is unloaded.
 
 ```lua
-local id = maki.timer.set(5, function()
+local id = makima.timer.set(5, function()
   print("five seconds gone")
 end)
 ```
 
 ---
 
-### `maki.timer.set()` {#maki-timer-set}
+### `makima.timer.set()` {#makima-timer-set}
 
 ```lua
-maki.timer.set({seconds}, {callback})
+makima.timer.set({seconds}, {callback})
 ```
 
 Schedule {callback} to run every {seconds} on the runtime's timer pump.
@@ -5396,9 +5396,9 @@ Each fire runs as a fresh task, so the callback may be async (`sleep`,
 fs, ...) and fires exactly when due: no per-frame polling. Timer fires do
 not inherit managed agent authority from the task that registered them.
 The callback receives the timer's id as its first argument - use it with
-`maki.timer.del` to stop the timer. Do not capture the returned id in the
-callback instead: `local id = maki.timer.set(5, function()
-maki.timer.del(id) end)` captures nil (a Luau value-capture quirk), which
+`makima.timer.del` to stop the timer. Do not capture the returned id in the
+callback instead: `local id = makima.timer.set(5, function()
+makima.timer.del(id) end)` captures nil (a Luau value-capture quirk), which
 is why the id is passed as an argument. A fire still running when the
 next deadline arrives runs alongside it; every fire task carries the
 standard 60s async deadline. Deadlines missed while the runtime was busy
@@ -5419,20 +5419,20 @@ including their async children, cannot register timers.
 
 ```lua
 local runs = 0
-maki.timer.set(1, function(id)
+makima.timer.set(1, function(id)
   runs = runs + 1
   if runs == 10 then
-    maki.timer.del(id)
+    makima.timer.del(id)
   end
 end)
 ```
 
 ---
 
-### `maki.timer.del()` {#maki-timer-del}
+### `makima.timer.del()` {#makima-timer-del}
 
 ```lua
-maki.timer.del({id})
+makima.timer.del({id})
 ```
 
 Stop the timer {id}. Does nothing for an unknown id. A fire that already
@@ -5440,18 +5440,18 @@ started keeps running out.
 
 **Parameters:**
 
-- `{id}` (`integer`) Id returned by `maki.timer.set`.
+- `{id}` (`integer`) Id returned by `makima.timer.set`.
 
 **Example:**
 
 ```lua
-local id = maki.timer.set(5, on_tick)
+local id = makima.timer.set(5, on_tick)
 -- later
-maki.timer.del(id)
+makima.timer.del(id)
 ```
 
 
-## maki.treesitter {#maki-treesitter}
+## makima.treesitter {#makima-treesitter}
 
 Tree-sitter parsing and query API.
 
@@ -5460,17 +5460,17 @@ Start with `get_parser()` to parse source code, then use `get_node_text()` and
 the `query` sub-module to extract information from the syntax tree.
 
 ```lua
-local parser, err = maki.treesitter.get_parser(source, "lua")
+local parser, err = makima.treesitter.get_parser(source, "lua")
 local trees = parser:parse()
 local root = trees[1]:root()
 ```
 
 ---
 
-### `maki.treesitter.get_parser()` {#maki-treesitter-get_parser}
+### `makima.treesitter.get_parser()` {#makima-treesitter-get_parser}
 
 ```lua
-maki.treesitter.get_parser({source}, {lang})
+makima.treesitter.get_parser({source}, {lang})
 ```
 
 Creates a `LanguageTree` for {source} using the grammar named {lang}.
@@ -5482,21 +5482,21 @@ Signature matches `vim.treesitter.get_parser()`, so Neovim plugins can be copy-p
 - `{source}` (`string`) Source text to parse.
 - `{lang}` (`string`) Language name, e.g. `"rust"` or `"lua"`.
 
-**Returns:** ([`LanguageTree|nil`](#maki-treesitter-LanguageTree), `string|nil`) Parser, or nil and an error message.
+**Returns:** ([`LanguageTree|nil`](#makima-treesitter-LanguageTree), `string|nil`) Parser, or nil and an error message.
 
 **Example:**
 
 ```lua
-local parser, err = maki.treesitter.get_parser(src, "lua")
+local parser, err = makima.treesitter.get_parser(src, "lua")
 if err then print("error: " .. err) end
 ```
 
 ---
 
-### `maki.treesitter.get_string_parser()` {#maki-treesitter-get_string_parser}
+### `makima.treesitter.get_string_parser()` {#makima-treesitter-get_string_parser}
 
 ```lua
-maki.treesitter.get_string_parser({source}, {lang})
+makima.treesitter.get_string_parser({source}, {lang})
 ```
 
 Alias for `get_parser`. Use whichever name you prefer.
@@ -5506,14 +5506,14 @@ Alias for `get_parser`. Use whichever name you prefer.
 - `{source}` (`string`) Source text to parse.
 - `{lang}` (`string`) Language name.
 
-**Returns:** ([`LanguageTree|nil`](#maki-treesitter-LanguageTree), `string|nil`) Parser, or nil and an error message.
+**Returns:** ([`LanguageTree|nil`](#makima-treesitter-LanguageTree), `string|nil`) Parser, or nil and an error message.
 
 ---
 
-### `maki.treesitter.get_node_text()` {#maki-treesitter-get_node_text}
+### `makima.treesitter.get_node_text()` {#makima-treesitter-get_node_text}
 
 ```lua
-maki.treesitter.get_node_text({node}, {source})
+makima.treesitter.get_node_text({node}, {source})
 ```
 
 Gets the text that {node} covers in {source}.
@@ -5521,7 +5521,7 @@ Useful when you have a captured node and need the actual source substring.
 
 **Parameters:**
 
-- `{node}` ([`Node`](#maki-treesitter-Node)) The node whose text you want.
+- `{node}` ([`Node`](#makima-treesitter-Node)) The node whose text you want.
 - `{source}` (`string`) Original source text the tree was parsed from.
 
 **Returns:** (`string`) Substring covered by the node.
@@ -5529,38 +5529,38 @@ Useful when you have a captured node and need the actual source substring.
 **Example:**
 
 ```lua
-local text = maki.treesitter.get_node_text(node, source)
+local text = makima.treesitter.get_node_text(node, source)
 print(text)
 ```
 
 ---
 
-### `maki.treesitter.get_node_range()` {#maki-treesitter-get_node_range}
+### `makima.treesitter.get_node_range()` {#makima-treesitter-get_node_range}
 
 ```lua
-maki.treesitter.get_node_range({node})
+makima.treesitter.get_node_range({node})
 ```
 
 Returns the range of {node} as four 0-based integers: start_row, start_col, end_row, end_col.
 
 **Parameters:**
 
-- `{node}` ([`Node`](#maki-treesitter-Node)) The node to query.
+- `{node}` ([`Node`](#makima-treesitter-Node)) The node to query.
 
 **Returns:** (`integer`, `integer`, `integer`, `integer`) start_row, start_col, end_row, end_col.
 
 **Example:**
 
 ```lua
-local sr, sc, er, ec = maki.treesitter.get_node_range(node)
+local sr, sc, er, ec = makima.treesitter.get_node_range(node)
 ```
 
 ---
 
-### `maki.treesitter.get_range()` {#maki-treesitter-get_range}
+### `makima.treesitter.get_range()` {#makima-treesitter-get_range}
 
 ```lua
-maki.treesitter.get_range({node})
+makima.treesitter.get_range({node})
 ```
 
 Returns a six-element table for {node}: `{start_row, start_col, start_byte, end_row, end_col, end_byte}`.
@@ -5568,23 +5568,23 @@ This gives you byte offsets in addition to row/column positions.
 
 **Parameters:**
 
-- `{node}` ([`Node`](#maki-treesitter-Node)) The node to query.
+- `{node}` ([`Node`](#makima-treesitter-Node)) The node to query.
 
 **Returns:** (`table`) Six-element array: start_row, start_col, start_byte, end_row, end_col, end_byte.
 
 **Example:**
 
 ```lua
-local r = maki.treesitter.get_range(node)
+local r = makima.treesitter.get_range(node)
 print("bytes: " .. r[3] .. "-" .. r[6])
 ```
 
 ---
 
-### `maki.treesitter.is_ancestor()` {#maki-treesitter-is_ancestor}
+### `makima.treesitter.is_ancestor()` {#makima-treesitter-is_ancestor}
 
 ```lua
-maki.treesitter.is_ancestor({dest}, {source})
+makima.treesitter.is_ancestor({dest}, {source})
 ```
 
 Checks whether {dest} is an ancestor of {source} (or the same node).
@@ -5592,17 +5592,17 @@ Walks up from {source} toward the root looking for {dest}.
 
 **Parameters:**
 
-- `{dest}` ([`Node`](#maki-treesitter-Node)) Potential ancestor node.
-- `{source}` ([`Node`](#maki-treesitter-Node)) Node to check ancestry for.
+- `{dest}` ([`Node`](#makima-treesitter-Node)) Potential ancestor node.
+- `{source}` ([`Node`](#makima-treesitter-Node)) Node to check ancestry for.
 
 **Returns:** (`boolean`)
 
 ---
 
-### `maki.treesitter.is_in_node_range()` {#maki-treesitter-is_in_node_range}
+### `makima.treesitter.is_in_node_range()` {#makima-treesitter-is_in_node_range}
 
 ```lua
-maki.treesitter.is_in_node_range({node}, {line}, {col})
+makima.treesitter.is_in_node_range({node}, {line}, {col})
 ```
 
 Checks whether the 0-based position ({line}, {col}) falls inside {node}.
@@ -5610,7 +5610,7 @@ Handy for cursor-position checks.
 
 **Parameters:**
 
-- `{node}` ([`Node`](#maki-treesitter-Node)) Node to test against.
+- `{node}` ([`Node`](#makima-treesitter-Node)) Node to test against.
 - `{line}` (`integer`) 0-based line number.
 - `{col}` (`integer`) 0-based column number.
 
@@ -5618,27 +5618,27 @@ Handy for cursor-position checks.
 
 ---
 
-### `maki.treesitter.node_contains()` {#maki-treesitter-node_contains}
+### `makima.treesitter.node_contains()` {#makima-treesitter-node_contains}
 
 ```lua
-maki.treesitter.node_contains({node}, {range})
+makima.treesitter.node_contains({node}, {range})
 ```
 
 Checks whether {node} fully contains the given {range}.
 
 **Parameters:**
 
-- `{node}` ([`Node`](#maki-treesitter-Node)) Node to test.
+- `{node}` ([`Node`](#makima-treesitter-Node)) Node to test.
 - `{range}` (`table`) Four-element array `{start_row, start_col, end_row, end_col}`.
 
 **Returns:** (`boolean`)
 
 ---
 
-### `maki.treesitter.get_node()` {#maki-treesitter-get_node}
+### `makima.treesitter.get_node()` {#makima-treesitter-get_node}
 
 ```lua
-maki.treesitter.get_node({opts?})
+makima.treesitter.get_node({opts?})
 ```
 
 Placeholder for cursor-based node lookup (not yet implemented, always returns nil).
@@ -5647,10 +5647,10 @@ Placeholder for cursor-based node lookup (not yet implemented, always returns ni
 
 - `{opts?}` (`table?`) Options (currently unused).
 
-**Returns:** ([`Node|nil`](#maki-treesitter-Node)) Always nil.
+**Returns:** ([`Node|nil`](#makima-treesitter-Node)) Always nil.
 
 
-## maki.treesitter.language {#maki-treesitter-language}
+## makima.treesitter.language {#makima-treesitter-language}
 
 Language registry for tree-sitter grammars.
 
@@ -5658,16 +5658,16 @@ Mirrors `vim.treesitter.language`. Use these functions to register grammars,
 map filetypes to languages, and inspect available node types.
 
 ```lua
-maki.treesitter.language.add("lua")
-maki.treesitter.language.register("lua", "luau")
+makima.treesitter.language.add("lua")
+makima.treesitter.language.register("lua", "luau")
 ```
 
 ---
 
-### `maki.treesitter.language.add()` {#maki-treesitter-language-add}
+### `makima.treesitter.language.add()` {#makima-treesitter-language-add}
 
 ```lua
-maki.treesitter.language.add({lang}, {opts?})
+makima.treesitter.language.add({lang}, {opts?})
 ```
 
 Registers {lang} for use with tree-sitter.
@@ -5682,15 +5682,15 @@ Custom grammar paths are not yet supported.
 **Example:**
 
 ```lua
-maki.treesitter.language.add("lua")
+makima.treesitter.language.add("lua")
 ```
 
 ---
 
-### `maki.treesitter.language.register()` {#maki-treesitter-language-register}
+### `makima.treesitter.language.register()` {#makima-treesitter-language-register}
 
 ```lua
-maki.treesitter.language.register({lang}, {filetype})
+makima.treesitter.language.register({lang}, {filetype})
 ```
 
 Associates {lang} with one or more filetypes, so you can look up the right
@@ -5704,15 +5704,15 @@ parser language for a given filetype later with `get_lang()`.
 **Example:**
 
 ```lua
-maki.treesitter.language.register("typescript", { "ts", "tsx" })
+makima.treesitter.language.register("typescript", { "ts", "tsx" })
 ```
 
 ---
 
-### `maki.treesitter.language.get_lang()` {#maki-treesitter-language-get_lang}
+### `makima.treesitter.language.get_lang()` {#makima-treesitter-language-get_lang}
 
 ```lua
-maki.treesitter.language.get_lang({filetype})
+makima.treesitter.language.get_lang({filetype})
 ```
 
 Looks up the tree-sitter language name for {filetype}.
@@ -5728,16 +5728,16 @@ a grammar with that name exists. Returns nil when nothing matches.
 **Example:**
 
 ```lua
-local lang = maki.treesitter.language.get_lang("tsx")
+local lang = makima.treesitter.language.get_lang("tsx")
 if lang then print(lang) end -- "typescript"
 ```
 
 ---
 
-### `maki.treesitter.language.get_filetypes()` {#maki-treesitter-language-get_filetypes}
+### `makima.treesitter.language.get_filetypes()` {#makima-treesitter-language-get_filetypes}
 
 ```lua
-maki.treesitter.language.get_filetypes({lang})
+makima.treesitter.language.get_filetypes({lang})
 ```
 
 Returns all filetypes that have been registered for {lang}.
@@ -5751,16 +5751,16 @@ Returns all filetypes that have been registered for {lang}.
 **Example:**
 
 ```lua
-local fts = maki.treesitter.language.get_filetypes("typescript")
+local fts = makima.treesitter.language.get_filetypes("typescript")
 -- { "ts", "tsx" }
 ```
 
 ---
 
-### `maki.treesitter.language.inspect()` {#maki-treesitter-language-inspect}
+### `makima.treesitter.language.inspect()` {#makima-treesitter-language-inspect}
 
 ```lua
-maki.treesitter.language.inspect({lang})
+makima.treesitter.language.inspect({lang})
 ```
 
 Returns metadata about the grammar for {lang}.
@@ -5775,13 +5775,13 @@ Useful for debugging or discovering which node types and fields a grammar define
 **Example:**
 
 ```lua
-local info = maki.treesitter.language.inspect("lua")
+local info = makima.treesitter.language.inspect("lua")
 print("ABI: " .. info.abi_version)
 for _, nt in ipairs(info.node_types) do print(nt) end
 ```
 
 
-## maki.treesitter.query {#maki-treesitter-query}
+## makima.treesitter.query {#makima-treesitter-query}
 
 Query compilation and lookup.
 
@@ -5789,15 +5789,15 @@ Mirrors `vim.treesitter.query`. Use `parse()` to compile a tree-sitter
 query string into a `Query` object you can run against parsed trees.
 
 ```lua
-local q = maki.treesitter.query.parse("lua", "(string) @str")
+local q = makima.treesitter.query.parse("lua", "(string) @str")
 ```
 
 ---
 
-### `maki.treesitter.query.parse()` {#maki-treesitter-query-parse}
+### `makima.treesitter.query.parse()` {#makima-treesitter-query-parse}
 
 ```lua
-maki.treesitter.query.parse({lang}, {query})
+makima.treesitter.query.parse({lang}, {query})
 ```
 
 Compiles a tree-sitter query string for {lang}.
@@ -5808,20 +5808,20 @@ Throws if the language is unknown or the query has a syntax error.
 - `{lang}` (`string`) Language name, e.g. `"lua"`.
 - `{query}` (`string`) Tree-sitter S-expression query.
 
-**Returns:** ([`Query`](#maki-treesitter-Query)) Compiled query object.
+**Returns:** ([`Query`](#makima-treesitter-Query)) Compiled query object.
 
 **Example:**
 
 ```lua
-local q = maki.treesitter.query.parse("lua", "(identifier) @id")
+local q = makima.treesitter.query.parse("lua", "(identifier) @id")
 ```
 
 ---
 
-### `maki.treesitter.query.get()` {#maki-treesitter-query-get}
+### `makima.treesitter.query.get()` {#makima-treesitter-query-get}
 
 ```lua
-maki.treesitter.query.get({lang}, {name})
+makima.treesitter.query.get({lang}, {name})
 ```
 
 Looks up a named built-in query for {lang} (not yet implemented, always returns nil).
@@ -5831,18 +5831,18 @@ Looks up a named built-in query for {lang} (not yet implemented, always returns 
 - `{lang}` (`string`) Language name.
 - `{name}` (`string`) Query name, e.g. `"highlights"`.
 
-**Returns:** ([`Query|nil`](#maki-treesitter-Query)) Query object, or nil if not found.
+**Returns:** ([`Query|nil`](#makima-treesitter-Query)) Query object, or nil if not found.
 
 
-## maki.treesitter.Query {#maki-treesitter-Query}
+## makima.treesitter.Query {#makima-treesitter-Query}
 
 A compiled tree-sitter query.
 
-Get one by calling `maki.treesitter.query.parse(lang, query_string)`.
+Get one by calling `makima.treesitter.query.parse(lang, query_string)`.
 Then use `:iter_captures()` or `:iter_matches()` to run it against a syntax tree.
 
 ```lua
-local q = maki.treesitter.query.parse("lua", "(identifier) @id")
+local q = makima.treesitter.query.parse("lua", "(identifier) @id")
 for idx, node, meta in q:iter_captures(root, source) do
   print(node:type())
 end
@@ -5860,7 +5860,7 @@ Iterates over every capture matched by this query. Each call to the returned ite
 
 **Parameters:**
 
-- `{node}` ([`Node`](#maki-treesitter-Node)) Root node to search within.
+- `{node}` ([`Node`](#makima-treesitter-Node)) Root node to search within.
 - `{source}` (`string`) Source text the tree was parsed from.
 - `{start_row?}` (`integer`) Only match rows >= this value (0-based).
 - `{stop_row?}` (`integer`) Only match rows < this value (0-based).
@@ -5870,7 +5870,7 @@ Iterates over every capture matched by this query. Each call to the returned ite
 **Example:**
 
 ```lua
-local q = maki.treesitter.query.parse("lua", "(identifier) @id")
+local q = makima.treesitter.query.parse("lua", "(identifier) @id")
 for idx, node, meta in q:iter_captures(root, source) do
   print(idx, node:type())
 end
@@ -5888,7 +5888,7 @@ Iterates over every full pattern match in this query. Each call to the returned 
 
 **Parameters:**
 
-- `{node}` ([`Node`](#maki-treesitter-Node)) Root node to search within.
+- `{node}` ([`Node`](#makima-treesitter-Node)) Root node to search within.
 - `{source}` (`string`) Source text the tree was parsed from.
 - `{start_row?}` (`integer`) Only match rows >= this value (0-based).
 - `{stop_row?}` (`integer`) Only match rows < this value (0-based).
@@ -5898,7 +5898,7 @@ Iterates over every full pattern match in this query. Each call to the returned 
 **Example:**
 
 ```lua
-local q = maki.treesitter.query.parse("lua", "(function_declaration name: (identifier) @name)"
+local q = makima.treesitter.query.parse("lua", "(function_declaration name: (identifier) @name)"
 )
 for pat, captures, meta in q:iter_matches(root, source) do
   for cap_idx, nodes in pairs(captures) do
@@ -5908,7 +5908,7 @@ end
 ```
 
 
-## maki.treesitter.Tree {#maki-treesitter-Tree}
+## makima.treesitter.Tree {#makima-treesitter-Tree}
 
 A parsed syntax tree.
 
@@ -5931,7 +5931,7 @@ Tree:root()
 Returns the root node of this tree. This is where you start walking
 the syntax tree or running queries.
 
-**Returns:** ([`Node`](#maki-treesitter-Node)) Root node.
+**Returns:** ([`Node`](#makima-treesitter-Node)) Root node.
 
 **Example:**
 
@@ -5951,10 +5951,10 @@ Tree:copy()
 Returns an independent copy of this tree.
 Edits to the copy will not affect the original.
 
-**Returns:** ([`Tree`](#maki-treesitter-Tree)) A new Tree with the same content.
+**Returns:** ([`Tree`](#makima-treesitter-Tree)) A new Tree with the same content.
 
 
-## maki.treesitter.Node {#maki-treesitter-Node}
+## makima.treesitter.Node {#makima-treesitter-Node}
 
 A single node in a parsed syntax tree.
 
@@ -6083,7 +6083,7 @@ Returns nil if {index} is out of bounds.
 
 - `{index}` (`integer`) 0-based child index.
 
-**Returns:** ([`Node|nil`](#maki-treesitter-Node)) Child node, or nil.
+**Returns:** ([`Node|nil`](#makima-treesitter-Node)) Child node, or nil.
 
 ---
 
@@ -6100,7 +6100,7 @@ Returns nil if {index} is out of bounds.
 
 - `{index}` (`integer`) 0-based named child index.
 
-**Returns:** ([`Node|nil`](#maki-treesitter-Node)) Named child node, or nil.
+**Returns:** ([`Node|nil`](#makima-treesitter-Node)) Named child node, or nil.
 
 ---
 
@@ -6212,7 +6212,7 @@ Node:parent()
 
 Returns the parent of this node, or nil if this is the root.
 
-**Returns:** ([`Node|nil`](#maki-treesitter-Node)) Parent node.
+**Returns:** ([`Node|nil`](#makima-treesitter-Node)) Parent node.
 
 ---
 
@@ -6224,7 +6224,7 @@ Node:next_sibling()
 
 Returns the next sibling (named or anonymous), or nil if this is the last child.
 
-**Returns:** ([`Node|nil`](#maki-treesitter-Node)) Next sibling.
+**Returns:** ([`Node|nil`](#makima-treesitter-Node)) Next sibling.
 
 ---
 
@@ -6236,7 +6236,7 @@ Node:prev_sibling()
 
 Returns the previous sibling (named or anonymous), or nil if this is the first child.
 
-**Returns:** ([`Node|nil`](#maki-treesitter-Node)) Previous sibling.
+**Returns:** ([`Node|nil`](#makima-treesitter-Node)) Previous sibling.
 
 ---
 
@@ -6248,7 +6248,7 @@ Node:next_named_sibling()
 
 Returns the next named sibling, skipping anonymous nodes. Returns nil at the end.
 
-**Returns:** ([`Node|nil`](#maki-treesitter-Node)) Next named sibling.
+**Returns:** ([`Node|nil`](#makima-treesitter-Node)) Next named sibling.
 
 ---
 
@@ -6260,7 +6260,7 @@ Node:prev_named_sibling()
 
 Returns the previous named sibling, skipping anonymous nodes. Returns nil at the start.
 
-**Returns:** ([`Node|nil`](#maki-treesitter-Node)) Previous named sibling.
+**Returns:** ([`Node|nil`](#makima-treesitter-Node)) Previous named sibling.
 
 ---
 
@@ -6275,9 +6275,9 @@ Returns nil if {descendant} is not actually inside this node.
 
 **Parameters:**
 
-- `{descendant}` ([`Node`](#maki-treesitter-Node)) A node that may be a descendant.
+- `{descendant}` ([`Node`](#makima-treesitter-Node)) A node that may be a descendant.
 
-**Returns:** ([`Node|nil`](#maki-treesitter-Node)) Direct child containing the descendant.
+**Returns:** ([`Node|nil`](#makima-treesitter-Node)) Direct child containing the descendant.
 
 ---
 
@@ -6297,7 +6297,7 @@ Includes both named and anonymous nodes.
 - `{end_row}` (`integer`) End row (0-based).
 - `{end_col}` (`integer`) End column (0-based).
 
-**Returns:** ([`Node|nil`](#maki-treesitter-Node)) Smallest node covering the range, or nil.
+**Returns:** ([`Node|nil`](#makima-treesitter-Node)) Smallest node covering the range, or nil.
 
 ---
 
@@ -6316,7 +6316,7 @@ Like `descendant_for_range`, but only considers named nodes.
 - `{end_row}` (`integer`) End row (0-based).
 - `{end_col}` (`integer`) End column (0-based).
 
-**Returns:** ([`Node|nil`](#maki-treesitter-Node)) Smallest named node covering the range, or nil.
+**Returns:** ([`Node|nil`](#makima-treesitter-Node)) Smallest named node covering the range, or nil.
 
 ---
 
@@ -6390,7 +6390,7 @@ Returns true if this node and {other} are the same node in the tree.
 
 **Parameters:**
 
-- `{other}` ([`Node`](#maki-treesitter-Node)) Node to compare against.
+- `{other}` ([`Node`](#makima-treesitter-Node)) Node to compare against.
 
 **Returns:** (`boolean`)
 
@@ -6423,18 +6423,18 @@ Node:tree()
 
 Returns the Tree that this node belongs to.
 
-**Returns:** ([`Tree`](#maki-treesitter-Tree)) The owning tree.
+**Returns:** ([`Tree`](#makima-treesitter-Tree)) The owning tree.
 
 
-## maki.treesitter.LanguageTree {#maki-treesitter-LanguageTree}
+## makima.treesitter.LanguageTree {#makima-treesitter-LanguageTree}
 
 Manages parsing of a source string for a single language.
 
-Obtained from `maki.treesitter.get_parser()` or `maki.treesitter.get_string_parser()`.
+Obtained from `makima.treesitter.get_parser()` or `makima.treesitter.get_string_parser()`.
 Call `:parse()` to get the syntax tree, then use `:root()` on the tree to start walking nodes.
 
 ```lua
-local parser, err = maki.treesitter.get_parser(source, "lua")
+local parser, err = makima.treesitter.get_parser(source, "lua")
 if not err then
   local trees = parser:parse()
   local root = trees[1]:root()
@@ -6598,24 +6598,24 @@ Drops the cached parse tree and frees its memory.
 After calling this, the next `parse()` will re-parse from scratch.
 
 
-## maki.ui {#maki-ui}
+## makima.ui {#makima-ui}
 
 Functions for building interactive UI. Create buffers to hold
 content, open floating or split windows to display them, highlight
 code, render markdown, and show status hints.
 
 ```lua
-local buf = maki.ui.buf()
+local buf = makima.ui.buf()
 buf:line("hello from my plugin!")
-local win = maki.ui.open_win(buf, { title = "Greeting", width = "50%", height = 5 })
+local win = makima.ui.open_win(buf, { title = "Greeting", width = "50%", height = 5 })
 ```
 
 ---
 
-### `maki.ui.buf()` {#maki-ui-buf}
+### `makima.ui.buf()` {#makima-ui-buf}
 
 ```lua
-maki.ui.buf({opts?})
+makima.ui.buf({opts?})
 ```
 
 Creates a new buffer for building UI content. The first buffer you
@@ -6628,23 +6628,23 @@ without stealing the live stream.
 
 - `{opts?}` (`table?`) Optional. `scratch` (boolean, default false): never claim the live pane.
 
-**Returns:** ([`Buf`](#maki-ui-Buf)) Buffer handle.
+**Returns:** ([`Buf`](#makima-ui-Buf)) Buffer handle.
 
 **Example:**
 
 ```lua
-local buf = maki.ui.buf()
+local buf = makima.ui.buf()
 buf:line("hello world")
-local toast = maki.ui.buf({ scratch = true })
+local toast = makima.ui.buf({ scratch = true })
 toast:line("copied!")
 ```
 
 ---
 
-### `maki.ui.theme_color()` {#maki-ui-theme_color}
+### `makima.ui.theme_color()` {#makima-ui-theme_color}
 
 ```lua
-maki.ui.theme_color({name})
+makima.ui.theme_color({name})
 ```
 
 Looks up a semantic color from the current theme. Use this to keep
@@ -6659,7 +6659,7 @@ your plugin's colors consistent with the rest of the UI.
 **Example:**
 
 ```lua
-local accent = maki.ui.theme_color("accent")
+local accent = makima.ui.theme_color("accent")
 if accent then
   buf:line({ { "note", { fg = accent, bold = true } } })
 end
@@ -6667,10 +6667,10 @@ end
 
 ---
 
-### `maki.ui.format_time()` {#maki-ui-format_time}
+### `makima.ui.format_time()` {#makima-ui-format_time}
 
 ```lua
-maki.ui.format_time({epoch_ms}, {style?})
+makima.ui.format_time({epoch_ms}, {style?})
 ```
 
 Formats a Unix timestamp as local time using the configured clock.
@@ -6684,10 +6684,10 @@ Formats a Unix timestamp as local time using the configured clock.
 
 ---
 
-### `maki.ui.highlight()` {#maki-ui-highlight}
+### `makima.ui.highlight()` {#makima-ui-highlight}
 
 ```lua
-maki.ui.highlight({code}, {lang}, {opts?})
+makima.ui.highlight({code}, {lang}, {opts?})
 ```
 
 Syntax-highlights a chunk of source code. Returns a table of styled
@@ -6707,7 +6707,7 @@ lines that you can feed into a buffer. Each line is a list of
 **Example:**
 
 ```lua
-local lines = maki.ui.highlight("fn main() {}", "rust")
+local lines = makima.ui.highlight("fn main() {}", "rust")
 for _, spans in ipairs(lines) do
   buf:line(spans)
 end
@@ -6715,10 +6715,10 @@ end
 
 ---
 
-### `maki.ui.markdown()` {#maki-ui-markdown}
+### `makima.ui.markdown()` {#makima-ui-markdown}
 
 ```lua
-maki.ui.markdown({text}, {width})
+makima.ui.markdown({text}, {width})
 ```
 
 Renders Markdown into styled lines ready to display in a buffer.
@@ -6736,8 +6736,8 @@ for syntax-highlighted code blocks.
 **Example:**
 
 ```lua
-local size = maki.ui.terminal_size()
-local lines = maki.ui.markdown("# Hello\n\nSome **bold** text.", size.cols)
+local size = makima.ui.terminal_size()
+local lines = makima.ui.markdown("# Hello\n\nSome **bold** text.", size.cols)
 for _, spans in ipairs(lines) do
   buf:line(spans)
 end
@@ -6745,10 +6745,10 @@ end
 
 ---
 
-### `maki.ui.humantime()` {#maki-ui-humantime}
+### `makima.ui.humantime()` {#makima-ui-humantime}
 
 ```lua
-maki.ui.humantime({secs})
+makima.ui.humantime({secs})
 ```
 
 Formats a number of seconds into a short, human-friendly string.
@@ -6763,16 +6763,16 @@ Useful for displaying elapsed time in status messages.
 **Example:**
 
 ```lua
-maki.ui.humantime(90)   -- "1m30s"
-maki.ui.humantime(3661) -- "1h1m1s"
+makima.ui.humantime(90)   -- "1m30s"
+makima.ui.humantime(3661) -- "1h1m1s"
 ```
 
 ---
 
-### `maki.ui.terminal_size()` {#maki-ui-terminal_size}
+### `makima.ui.terminal_size()` {#makima-ui-terminal_size}
 
 ```lua
-maki.ui.terminal_size()
+makima.ui.terminal_size()
 ```
 
 Returns the current terminal size. Handy for sizing floating windows
@@ -6783,16 +6783,16 @@ or wrapping text to fit the screen.
 **Example:**
 
 ```lua
-local size = maki.ui.terminal_size()
+local size = makima.ui.terminal_size()
 local half_width = math.floor(size.cols / 2)
 ```
 
 ---
 
-### `maki.ui.display_width()` {#maki-ui-display_width}
+### `makima.ui.display_width()` {#makima-ui-display_width}
 
 ```lua
-maki.ui.display_width({text})
+makima.ui.display_width({text})
 ```
 
 Returns the display width of a string in terminal cells, matching
@@ -6807,15 +6807,15 @@ how `ratatui` measures text.
 **Example:**
 
 ```lua
-local w = maki.ui.display_width("hello")
+local w = makima.ui.display_width("hello")
 ```
 
 ---
 
-### `maki.ui.truncate_text()` {#maki-ui-truncate_text}
+### `makima.ui.truncate_text()` {#makima-ui-truncate_text}
 
 ```lua
-maki.ui.truncate_text({text}, {max_width})
+makima.ui.truncate_text({text}, {max_width})
 ```
 
 Splits a string at a display-cell boundary.
@@ -6830,41 +6830,41 @@ Splits a string at a display-cell boundary.
 **Example:**
 
 ```lua
-local t = maki.ui.truncate_text("hello world", 5)
+local t = makima.ui.truncate_text("hello world", 5)
 -- t.head == "hello", t.tail == " world"
 ```
 
 ---
 
-### `maki.ui.focused_agent()` {#maki-ui-focused_agent}
+### `makima.ui.focused_agent()` {#makima-ui-focused_agent}
 
 ```lua
-maki.ui.focused_agent()
+makima.ui.focused_agent()
 ```
 
 Resolve the agent that has UI focus now. Later focus changes do not
-retarget the returned reference. Pass it to `maki.agent.get(ctx, ref)` for
+retarget the returned reference. Pass it to `makima.agent.get(ctx, ref)` for
 control; this call grants no authority. Delegated tool handlers cannot read
 UI focus.
 
-**Returns:** ([`AgentRef?`](#maki-agent-AgentRef), `string?`) Visibility-only reference, or nil and an error when no agent has focus.
+**Returns:** ([`AgentRef?`](#makima-agent-AgentRef), `string?`) Visibility-only reference, or nil and an error when no agent has focus.
 
 **Example:**
 
 ```lua
-local focused, err = maki.ui.focused_agent()
+local focused, err = makima.ui.focused_agent()
 if focused then
-  local agent = assert(maki.agent.get(ctx, focused))
+  local agent = assert(makima.agent.get(ctx, focused))
   local model = assert(agent:config(ctx)).model
 end
 ```
 
 ---
 
-### `maki.ui.post()` {#maki-ui-post}
+### `makima.ui.post()` {#makima-ui-post}
 
 ```lua
-maki.ui.post({ctx}, {text}, {opts?})
+makima.ui.post({ctx}, {text}, {opts?})
 ```
 
 Show {text} as a row in the chat of the agent {ctx} is pinned to. A post
@@ -6873,7 +6873,7 @@ do not move it. It is saved with the session and comes back on restore.
 Trusted commands, keymaps and callbacks can post; delegated tool handlers
 cannot, since their tool row already speaks for them.
 
-`maki.agent.spawn` posts a row for each child it shows; see its `show`
+`makima.agent.spawn` posts a row for each child it shows; see its `show`
 option.
 
 **Parameters:**
@@ -6895,7 +6895,7 @@ option.
 **Example:**
 
 ```lua
-local ok, err = maki.ui.post(ctx, "review found 3 issues", {
+local ok, err = makima.ui.post(ctx, "review found 3 issues", {
   level = "warn",
   agent = reviewer,
 })
@@ -6903,10 +6903,10 @@ local ok, err = maki.ui.post(ctx, "review found 3 issues", {
 
 ---
 
-### `maki.ui.flash()` {#maki-ui-flash}
+### `makima.ui.flash()` {#makima-ui-flash}
 
 ```lua
-maki.ui.flash({msg})
+makima.ui.flash({msg})
 ```
 
 Shows a brief message in the status bar. The message disappears
@@ -6920,20 +6920,20 @@ or showing a transient warning.
 **Example:**
 
 ```lua
-maki.ui.flash("Copied to clipboard!")
+makima.ui.flash("Copied to clipboard!")
 ```
 
 ---
 
-### `maki.ui.action()` {#maki-ui-action}
+### `makima.ui.action()` {#makima-ui-action}
 
 ```lua
-maki.ui.action({name})
+makima.ui.action({name})
 ```
 
 Runs a built-in UI action by name, exactly as its default keybinding
-would. Handy when a default key never reaches maki because tmux or
-your terminal grabs it first: bind a new key with `maki.keymap.set`
+would. Handy when a default key never reaches makima because tmux or
+your terminal grabs it first: bind a new key with `makima.keymap.set`
 and call this from it.
 
 Valid names: `"file_picker"`, `"search"`, `"tasks"`, `"help"`,
@@ -6941,7 +6941,7 @@ Valid names: `"file_picker"`, `"search"`, `"tasks"`, `"help"`,
 `"pop_queue"`, `"prev_chat"`, `"next_chat"`.
 
 For slash commands rather than keybound actions, see
-`maki.api.run_command`.
+`makima.api.run_command`.
 
 **Parameters:**
 
@@ -6953,17 +6953,17 @@ For slash commands rather than keybound actions, see
 
 ```lua
 -- Open the built-in file picker with Ctrl+Q instead of Ctrl+S:
-maki.keymap.set("n", "<C-q>", function()
-  maki.ui.action("file_picker")
+makima.keymap.set("n", "<C-q>", function()
+  makima.ui.action("file_picker")
 end)
 ```
 
 ---
 
-### `maki.ui.open_editor()` {#maki-ui-open_editor}
+### `makima.ui.open_editor()` {#makima-ui-open_editor}
 
 ```lua
-maki.ui.open_editor({path})
+makima.ui.open_editor({path})
 ```
 
 Opens {path} in the user's `$EDITOR` (e.g. vim, nano) and waits for
@@ -6979,18 +6979,18 @@ Returns the editor's exit code so you can check if the user saved.
 **Example:**
 
 ```lua
-local code = maki.ui.open_editor("/tmp/scratch.lua")
+local code = makima.ui.open_editor("/tmp/scratch.lua")
 if code == 0 then
-  maki.ui.flash("File saved")
+  makima.ui.flash("File saved")
 end
 ```
 
 ---
 
-### `maki.ui.open_list_picker()` {#maki-ui-open_list_picker}
+### `makima.ui.open_list_picker()` {#makima-ui-open_list_picker}
 
 ```lua
-maki.ui.open_list_picker({items}, {opts?})
+makima.ui.open_list_picker({items}, {opts?})
 ```
 
 Opens a fuzzy-filtering list picker dialog and blocks until the user
@@ -6998,8 +6998,8 @@ decides. Items are ranked by match score with matched characters
 highlighted, exactly like the built-in pickers. Filter edits keep the
 current row instead of jumping to the best match.
 
-An item's optional `age` field is a timestamp from `maki.time.now` or
-`maki.time.at`, not an elapsed duration. The host renders it as a live
+An item's optional `age` field is a timestamp from `makima.time.now` or
+`makima.time.at`, not an elapsed duration. The host renders it as a live
 delta (for example `9s` or `4d 7h 23m 9s`) and refreshes it about once
 per second while the dialog is open. `detail` and `age` can coexist;
 age follows the detail.
@@ -7022,18 +7022,18 @@ age follows the detail.
 **Example:**
 
 ```lua
-local result = maki.ui.open_list_picker({ "alpha", "beta" }, { title = "Pick" })
+local result = makima.ui.open_list_picker({ "alpha", "beta" }, { title = "Pick" })
 if result.type == "choice" then
-  maki.ui.flash("Picked " .. result.index)
+  makima.ui.flash("Picked " .. result.index)
 end
 ```
 
 ---
 
-### `maki.ui.open_win()` {#maki-ui-open_win}
+### `makima.ui.open_win()` {#makima-ui-open_win}
 
 ```lua
-maki.ui.open_win({buf}, {opts})
+makima.ui.open_win({buf}, {opts})
 ```
 
 Opens a floating or split window that displays the contents of {buf}.
@@ -7042,7 +7042,7 @@ and close the window when you are done.
 
 **Parameters:**
 
-- `{buf}` ([`Buf`](#maki-ui-Buf)) Buffer to display.
+- `{buf}` ([`Buf`](#makima-ui-Buf)) Buffer to display.
 - `{opts}` (`table`) Float configuration. Fields:
   - `width` (`integer|string`) window width. Integer for absolute columns; "N%" for percent of terminal width. Default "60%".
   - `height` (`integer|string`) window height. Integer for absolute rows; "N%" for percent of terminal height. Default "70%".
@@ -7063,14 +7063,14 @@ and close the window when you are done.
   - `visible` (`boolean`) whether the window is initially visible. Default true.
   - `needs_input` (`boolean`) whether the window means the session needs user input. Default false.
 
-**Returns:** ([`Win`](#maki-ui-Win)) Window handle.
+**Returns:** ([`Win`](#makima-ui-Win)) Window handle.
 
 **Example:**
 
 ```lua
-local buf = maki.ui.buf()
+local buf = makima.ui.buf()
 buf:line("Pick an option:")
-local win = maki.ui.open_win(buf, {
+local win = makima.ui.open_win(buf, {
   title = "Menu",
   width = "50%",
   height = 10,
@@ -7081,10 +7081,10 @@ local win = maki.ui.open_win(buf, {
 
 ---
 
-### `maki.ui.set_status_content()` {#maki-ui-set_status_content}
+### `makima.ui.set_status_content()` {#makima-ui-set_status_content}
 
 ```lua
-maki.ui.set_status_content({spans})
+makima.ui.set_status_content({spans})
 ```
 
 Sets styled status content for your plugin. Each span is {text, style_name} or {text, style_name, on_click}. An empty table clears your plugin's content. Only your own content is affected. Clickable entries run their callback when clicked in the status bar.
@@ -7096,17 +7096,17 @@ Sets styled status content for your plugin. Each span is {text, style_name} or {
 **Example:**
 
 ```lua
-maki.ui.set_status_content({ {"connected", "success"}, {" readonly", "muted"} })
+makima.ui.set_status_content({ {"connected", "success"}, {" readonly", "muted"} })
 -- clickable entry:
-maki.ui.set_status_content({ {"refresh", "accent", function() maki.ui.flash("refreshing") end} })
+makima.ui.set_status_content({ {"refresh", "accent", function() makima.ui.flash("refreshing") end} })
 ```
 
 ---
 
-### `maki.ui.set_status_hint()` {#maki-ui-set_status_hint}
+### `makima.ui.set_status_hint()` {#makima-ui-set_status_hint}
 
 ```lua
-maki.ui.set_status_hint({spans})
+makima.ui.set_status_hint({spans})
 ```
 
 Shows key hints in the status bar for your plugin. Each hint is a {key, label} pair. Pass nil to clear your plugin's hints. Only your own hints are affected, other plugins keep theirs.
@@ -7118,17 +7118,17 @@ Shows key hints in the status bar for your plugin. Each hint is a {key, label} p
 **Example:**
 
 ```lua
-maki.ui.set_status_hint({ {"q", "quit"}, {"j", "down"} })
+makima.ui.set_status_hint({ {"q", "quit"}, {"j", "down"} })
 -- later, clear them:
-maki.ui.set_status_hint(nil)
+makima.ui.set_status_hint(nil)
 ```
 
 ---
 
-### `maki.ui.set_window_title()` {#maki-ui-set_window_title}
+### `makima.ui.set_window_title()` {#makima-ui-set_window_title}
 
 ```lua
-maki.ui.set_window_title({title})
+makima.ui.set_window_title({title})
 ```
 
 Sets the terminal emulator's window title. Pass an empty string to
@@ -7136,7 +7136,7 @@ clear it.
 
 The title passes through tmux, GNU screen, and zellij untouched, and
 control characters are stripped, so model text cannot inject escape
-sequences into the terminal. On exit maki hands the title back to the
+sequences into the terminal. On exit makima hands the title back to the
 shell, on terminals that support the title stack.
 
 **Parameters:**
@@ -7146,23 +7146,23 @@ shell, on terminals that support the title stack.
 **Example:**
 
 ```lua
-maki.ui.set_window_title("maki: " .. session_name)
+makima.ui.set_window_title("makima: " .. session_name)
 -- Give the title back to the shell:
-maki.ui.set_window_title("")
+makima.ui.set_window_title("")
 ```
 
 
-## maki.ui.Win {#maki-ui-Win}
+## makima.ui.Win {#makima-ui-Win}
 
 Handle to a floating or split window. You get one from
-`maki.ui.open_win()`. Use `recv()` in a loop to handle keyboard
+`makima.ui.open_win()`. Use `recv()` in a loop to handle keyboard
 input, and call `close()` when done.
 
 Fields: `width`, `height` (initial content dimensions in columns/rows),
 `visible` (current visibility).
 
 ```lua
-local win = maki.ui.open_win(buf, { title = "Demo" })
+local win = makima.ui.open_win(buf, { title = "Demo" })
 while true do
   local ev = win:recv()
   if not ev or ev.key == "q" then break end
@@ -7349,14 +7349,14 @@ Returns true if the window is both open and visible (not hidden).
 **Returns:** (`boolean`) true if visible.
 
 
-## maki.ui.Buf {#maki-ui-Buf}
+## makima.ui.Buf {#makima-ui-Buf}
 
 A content buffer that holds styled lines of text. Create one with
-`maki.ui.buf()` and pass it to `maki.ui.open_win()` to show it in
+`makima.ui.buf()` and pass it to `makima.ui.open_win()` to show it in
 a floating or split window.
 
 ```lua
-local buf = maki.ui.buf()
+local buf = makima.ui.buf()
 buf:line("hello")
 buf:line({ { "world", "bold" } })
 ```
@@ -7505,7 +7505,7 @@ Calling `on()` again for the same event replaces the previous handler.
 
 ```lua
 buf:on("click", function(ev)
-  maki.ui.flash("Clicked row " .. ev.row)
+  makima.ui.flash("Clicked row " .. ev.row)
 end)
 ```
 
@@ -7578,7 +7578,7 @@ buf:blit(fb32, 160, 100, { format = "bgra", char = "█" })
 ```
 
 
-## maki.uv {#maki-uv}
+## makima.uv {#makima-uv}
 
 System and environment utilities, modelled after `vim.uv`.
 
@@ -7586,15 +7586,15 @@ Provides access to the working directory, home directory, and environment
 variables. None of these functions throw.
 
 ```lua
-local home = maki.uv.os_homedir()
+local home = makima.uv.os_homedir()
 ```
 
 ---
 
-### `maki.uv.cwd()` {#maki-uv-cwd}
+### `makima.uv.cwd()` {#makima-uv-cwd}
 
 ```lua
-maki.uv.cwd()
+makima.uv.cwd()
 ```
 
 Return the current working directory as an absolute path. Like `vim.uv.cwd`.
@@ -7606,16 +7606,16 @@ Requires the `env` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local cwd = maki.uv.cwd()
+local cwd = makima.uv.cwd()
 if cwd then print("working in: " .. cwd) end
 ```
 
 ---
 
-### `maki.uv.os_homedir()` {#maki-uv-os_homedir}
+### `makima.uv.os_homedir()` {#makima-uv-os_homedir}
 
 ```lua
-maki.uv.os_homedir()
+makima.uv.os_homedir()
 ```
 
 Return the current user's home directory. Like `vim.uv.os_homedir`.
@@ -7627,15 +7627,15 @@ Requires the `env` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local home = maki.uv.os_homedir() -- e.g. "/home/user"
+local home = makima.uv.os_homedir() -- e.g. "/home/user"
 ```
 
 ---
 
-### `maki.uv.os_getenv()` {#maki-uv-os_getenv}
+### `makima.uv.os_getenv()` {#makima-uv-os_getenv}
 
 ```lua
-maki.uv.os_getenv({name})
+makima.uv.os_getenv({name})
 ```
 
 Look up the environment variable {name}. Like `vim.uv.os_getenv`.
@@ -7652,26 +7652,26 @@ Requires the `env` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local editor = maki.uv.os_getenv("EDITOR") or "vi"
+local editor = makima.uv.os_getenv("EDITOR") or "vi"
 ```
 
 
-## maki.yaml {#maki-yaml}
+## makima.yaml {#makima-yaml}
 
-YAML encoding and decoding. Works the same way as `maki.json`,
+YAML encoding and decoding. Works the same way as `makima.json`,
 but for YAML formatted strings.
 
 ```lua
-local t = maki.yaml.decode("greeting: hello")
+local t = makima.yaml.decode("greeting: hello")
 print(t.greeting)
 ```
 
 ---
 
-### `maki.yaml.encode()` {#maki-yaml-encode}
+### `makima.yaml.encode()` {#makima-yaml-encode}
 
 ```lua
-maki.yaml.encode({value})
+makima.yaml.encode({value})
 ```
 
 Turn a Lua value into a YAML string. Most Lua types work, but
@@ -7686,16 +7686,16 @@ circular references will return an error.
 **Example:**
 
 ```lua
-local s, err = maki.yaml.encode({ name = "maki", tags = { "ai", "agent" } })
+local s, err = makima.yaml.encode({ name = "makima", tags = { "ai", "agent" } })
 print(s)
 ```
 
 ---
 
-### `maki.yaml.decode()` {#maki-yaml-decode}
+### `makima.yaml.decode()` {#makima-yaml-decode}
 
 ```lua
-maki.yaml.decode({str})
+makima.yaml.decode({str})
 ```
 
 Parse a YAML string into a Lua value. Mappings become tables and
@@ -7710,8 +7710,8 @@ sequences become 1-indexed arrays.
 **Example:**
 
 ```lua
-local t, err = maki.yaml.decode("name: maki\nversion: 1")
-print(t.name) -- maki
+local t, err = makima.yaml.decode("name: makima\nversion: 1")
+print(t.name) -- makima
 ```
 
 
@@ -7720,7 +7720,7 @@ print(t.name) -- maki
 These ship inside makima; `require` them from any plugin. Small modules are
 shown as full source, larger ones as their public interface.
 
-### `require("maki.color")`
+### `require("makima.color")`
 
 ```lua
 local M = {}
@@ -7740,7 +7740,7 @@ function M.lerp(from, to, t)
 end
 
 function M.dim(color, factor)
-  local background = maki.ui.theme_color("background")
+  local background = makima.ui.theme_color("background")
   if not background then
     return color
   end
@@ -7750,7 +7750,7 @@ end
 return M
 ```
 
-### `require("maki.dir_listing")`
+### `require("makima.dir_listing")`
 
 ```lua
 -- Shared directory listing for index and list plugins.
@@ -7760,7 +7760,7 @@ function M.list(path, ctx)
 function M.view(text, ctx)
 ```
 
-### `require("maki.fuzzy_replace")`
+### `require("makima.fuzzy_replace")`
 
 ```lua
 M.NO_MATCH = "old_string not found in file"
@@ -7774,7 +7774,7 @@ M.EMPTY_OLD_STRING = "old_string must not be empty"
 function M.replace(content, old_string, new_string, replace_all, max_line_bytes)
 ```
 
-### `require("maki.list_picker")`
+### `require("makima.list_picker")`
 
 ```lua
 -- Draws the filter query and its blank spacer into {lines}, pins that height on
@@ -7786,7 +7786,7 @@ function ListPicker.render_header(win, lines, input, prefix, inner)
 
 -- Open a fuzzy-filter picker in a floating window and block until the user
 -- decides. {items} is a list of strings or { label, detail?, age? } tables,
--- where `age` is a timestamp from `maki.time.now` or `maki.time.at` and
+-- where `age` is a timestamp from `makima.time.now` or `makima.time.at` and
 -- refreshes once per displayed second while the dialog is open.
 -- {opts}:
 -- title, footer, cursor (initial index), submit_keys (extra submit keys
@@ -7801,7 +7801,7 @@ ListPicker.matches = matches
 ListPicker.highlight_spans = highlight_spans
 ```
 
-### `require("maki.long_lines")`
+### `require("makima.long_lines")`
 
 ```lua
 -- Write-time guard against lossy write-back of truncated tool output.
@@ -7825,7 +7825,7 @@ function M.check_replace_lines(content, start_line, end_line, new_string, max_li
 function M.check_markers(before, after)
 ```
 
-### `require("maki.output_limits")`
+### `require("makima.output_limits")`
 
 ```lua
 -- Shared per-tool output limit options, so the tools that support them
@@ -7863,7 +7863,7 @@ end
 return M
 ```
 
-### `require("maki.partial")`
+### `require("makima.partial")`
 
 ```lua
 -- When a tool is cut short, it still hands back what it printed. The marker
@@ -7875,7 +7875,7 @@ return M
 function M.cut(view, out, reason, timeout_secs, limits)
 ```
 
-### `require("maki.plan_spec")`
+### `require("makima.plan_spec")`
 
 ```lua
 -- Shared plan specification, spliced verbatim into the plan-mode directive and
@@ -7885,23 +7885,23 @@ function M.cut(view, out, reason, timeout_secs, limits)
 -- keep in sync with upstream.
 ```
 
-### `require("maki.scroll")`
+### `require("makima.scroll")`
 
 ```lua
--- Relative scrolling on top of maki.fn.winsaveview / winrestview.
+-- Relative scrolling on top of makima.fn.winsaveview / winrestview.
 -- Positive {delta} scrolls down, negative up. Returns (true, nil) or (nil, err).
 local function scroll(delta)
-  local view, err = maki.fn.winsaveview()
+  local view, err = makima.fn.winsaveview()
   if not view then
     return nil, err
   end
-  return maki.fn.winrestview({ topline = view.topline + delta })
+  return makima.fn.winrestview({ topline = view.topline + delta })
 end
 
 return scroll
 ```
 
-### `require("maki.shorten_path")`
+### `require("makima.shorten_path")`
 
 ```lua
 local function normalize_sep(s)
@@ -7910,7 +7910,7 @@ end
 
 local function shorten_path(path)
   local p = normalize_sep(path)
-  local cwd = maki.uv.cwd()
+  local cwd = makima.uv.cwd()
   if cwd then
     cwd = normalize_sep(cwd)
     if p:sub(1, #cwd + 1) == cwd .. "/" then
@@ -7918,7 +7918,7 @@ local function shorten_path(path)
       return rel == "" and "." or rel
     end
   end
-  local home = maki.uv.os_homedir()
+  local home = makima.uv.os_homedir()
   if home then
     home = normalize_sep(home)
     if p:sub(1, #home + 1) == home .. "/" then
@@ -7932,13 +7932,13 @@ end
 return shorten_path
 ```
 
-### `require("maki.spans")`
+### `require("makima.spans")`
 
 ```lua
 -- Spans: styled slices of a label for fuzzy-match highlighting.
 --
 -- `match_spans` takes 1-based CODEPOINT indices (as returned by
--- `maki.match.fuzzy`) and slices the label by bytes, so multi-byte titles
+-- `makima.match.fuzzy`) and slices the label by bytes, so multi-byte titles
 -- (CJK, emoji) get whole-codepoint spans. Adjacent indices merge into one
 -- span.
 
@@ -7947,7 +7947,7 @@ return shorten_path
 function Spans.match_spans(text, indices, base_style, match_style)
 ```
 
-### `require("maki.test_helpers")`
+### `require("makima.test_helpers")`
 
 ```lua
 -- Shared test helpers for Lua plugin specs.
@@ -7961,7 +7961,7 @@ function M.has(s, substr, msg)
 function M.mktmpdir(prefix)
 function M.rmtree(dir)
 
--- A scripted `maki.net.send` response that yields {chunks} in order. A
+-- A scripted `makima.net.send` response that yields {chunks} in order. A
 -- `read_error` is returned once the chunks run out instead of the end.
 function M.response(chunks, opts)
 
@@ -7973,7 +7973,7 @@ function M.provider_ctx(responses, saved)
 -- An `emit` for provider streams, plus the list it records into.
 function M.recorder()
 
--- Runs {fn} with `maki.uv.os_getenv` reading from {env} instead.
+-- Runs {fn} with `makima.uv.os_getenv` reading from {env} instead.
 function M.with_env(env, fn)
 
 -- Compares JSON-like values structurally.
@@ -7981,7 +7981,7 @@ function M.same(actual, expected, path)
 function M.report()
 ```
 
-### `require("maki.text_input")`
+### `require("makima.text_input")`
 
 ```lua
 -- TextInput: multi-line editable buffer with a byte-offset cursor.
@@ -8042,10 +8042,10 @@ function TextInput:render(prefix, prefix_width, width)
 function TextInput:click(rendered, row, col)
 ```
 
-### `require("maki.toast")`
+### `require("makima.toast")`
 
 ```lua
--- Corner toast notifications built on floating windows. `maki.ui.flash` gives
+-- Corner toast notifications built on floating windows. `makima.ui.flash` gives
 -- you one line in the status area. A toast stays up long enough to read, can
 -- carry a title, and stacks under the toasts already on screen.
 
@@ -8055,7 +8055,7 @@ function TextInput:click(rendered, row, col)
 function Toast.show(text, opts)
 ```
 
-### `require("maki.tool_view")`
+### `require("makima.tool_view")`
 
 ```lua
 -- The shared truncate/expand body that tool plugins render through.
@@ -8066,7 +8066,7 @@ function Toast.show(text, opts)
 -- reaches the same toggle. Expansion is never stored: the UI records
 -- clicked rows and replays them through `restore` in order, so `toggle`
 -- stays a pure flag flip + re-render, deterministic across replays.
--- Async highlighting goes through `maki.async.run`; during restore the
+-- Async highlighting goes through `makima.async.run`; during restore the
 -- runtime runs those tasks inline before snapshotting.
 
 -- Right aligned, so the content column stays put when a number gains a digit.

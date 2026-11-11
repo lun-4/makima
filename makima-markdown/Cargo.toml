@@ -1,0 +1,17 @@
+[package]
+name = "makima-markdown"
+description = "Theme-free markdown parser and width-aware renderer shared by makima-ui and the makima-lua bridge."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+makima-highlight = { workspace = true }
+unicode-width = { workspace = true }
+
+[dev-dependencies]
+test-case = { workspace = true }
+fastrand = { workspace = true }

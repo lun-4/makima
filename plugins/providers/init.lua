@@ -20,7 +20,7 @@ local function register(spec)
     end
     return table.unpack(results, 1, results.n)
   end
-  maki.api.register_provider(spec)
+  makima.api.register_provider(spec)
   registered[spec.id] = true
 end
 
@@ -31,7 +31,7 @@ local function register_user(id, source, make_spec)
     register(make_spec())
   end)
   if not ok then
-    maki.log.warn(string.format("%s: provider %s left out: %s", source, id, tostring(err)))
+    makima.log.warn(string.format("%s: provider %s left out: %s", source, id, tostring(err)))
   end
 end
 
@@ -73,7 +73,7 @@ register(custom.creator(executable.notes(bases) .. "\n\n" .. catalog.NOTES))
 -- Sections with a protocol, then scripts, each win over a models.dev
 -- provider of the same id but never over a built-in one. A built-in
 -- provider's section may name a protocol of its own.
-local sections = maki.api.startup_provider_config()
+local sections = makima.api.startup_provider_config()
 local ids = {}
 for id, section in pairs(sections) do
   if section.protocol then
@@ -89,12 +89,12 @@ for _, id in ipairs(ids) do
   end
 end
 
-local config_dir, state_dir = maki.env.config_dir(), maki.env.state_dir()
+local config_dir, state_dir = makima.env.config_dir(), makima.env.state_dir()
 if config_dir then
-  local cache_path = state_dir and maki.fs.joinpath(state_dir, executable.CACHE_FILE)
-  for _, script in ipairs(executable.scan(maki.fs.joinpath(config_dir, executable.DIR), cache_path, bases)) do
+  local cache_path = state_dir and makima.fs.joinpath(state_dir, executable.CACHE_FILE)
+  for _, script in ipairs(executable.scan(makima.fs.joinpath(config_dir, executable.DIR), cache_path, bases)) do
     if registered[script.slug] then
-      maki.log.warn(string.format("%s: provider id %s is already taken, skipping", script.path, script.slug))
+      makima.log.warn(string.format("%s: provider id %s is already taken, skipping", script.path, script.slug))
     else
       register_user(script.slug, script.path, function()
         return executable.provider(script, bases[script.info.base])

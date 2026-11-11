@@ -1,4 +1,4 @@
--- Server-sent events over a `maki.net.send` response.
+-- Server-sent events over a `makima.net.send` response.
 
 local M = {}
 

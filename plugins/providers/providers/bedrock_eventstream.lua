@@ -106,13 +106,13 @@ end
 
 -- The Messages event inside a `chunk` frame: `{ bytes }` holding base64 JSON.
 local function chunk_event(payload)
-  local envelope = maki.json.decode(payload)
+  local envelope = makima.json.decode(payload)
   if type(envelope) ~= "table" then
     return nil, INVALID .. "invalid chunk"
   end
   local value = envelope
   if type(envelope.bytes) == "string" then
-    value = maki.json.decode(maki.base64.decode(envelope.bytes))
+    value = makima.json.decode(makima.base64.decode(envelope.bytes))
   end
   if type(value) ~= "table" then
     return nil, INVALID .. "invalid chunk payload"

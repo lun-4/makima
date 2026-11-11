@@ -60,7 +60,7 @@ Fuzzy `edit` and `multi_edit` matches require full coverage of long lines. Nonbl
 
 **Interrupted work is not wasted.** Tools can preserve partial output on cancellation or deadline expiry: bash retains streamed lines and `code_execution` retains script output. Subagent transcripts stay in their own contexts. [Agent work](/docs/agent-work/#cancellation) explains which work continues after cancellation and how later child reports reach the parent.
 
-Lua tool handlers return raw `llm_output` and `output_limits` in a result table or through `ctx:finish`. Output limits apply after the terminal reply leaves Lua. See the [tool API](/docs/lua-api/#maki-api-register_tool).
+Lua tool handlers return raw `llm_output` and `output_limits` in a result table or through `ctx:finish`. Output limits apply after the terminal reply leaves Lua. See the [tool API](/docs/lua-api/#makima-api-register_tool).
 
 ## Fewer round-trips
 

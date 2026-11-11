@@ -28,7 +28,7 @@ local SECONDS_PER_DAY = 86400
 local STATUS_DETAIL = "via Bedrock"
 
 local function env(name)
-  return maki.uv.os_getenv(name)
+  return makima.uv.os_getenv(name)
 end
 
 local function trim(text)
@@ -88,7 +88,7 @@ local function container_credentials(ctx, url)
   local token = env("AWS_CONTAINER_AUTHORIZATION_TOKEN")
   local token_file = env("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE")
   if token_file then
-    local content, err = maki.fs.read(token_file)
+    local content, err = makima.fs.read(token_file)
     if not content then
       return nil, http.config_error(string.format("read container auth token file %s: %s", token_file, tostring(err)))
     end
@@ -151,7 +151,7 @@ function M.resolve(ctx, offline)
     credentials.method = "container"
   else
     local home = env("HOME")
-    local content = home and maki.fs.read(home .. CREDENTIALS_FILE)
+    local content = home and makima.fs.read(home .. CREDENTIALS_FILE)
     credentials = content and M.parse_credentials_file(content, env("AWS_PROFILE") or DEFAULT_PROFILE)
     if not credentials then
       return nil, http.config_error(M.NO_CREDENTIALS)
@@ -230,7 +230,7 @@ function M.headers(credentials, url, body)
       session_token = credentials.session_token,
       region = credentials.region,
       service = SERVICE,
-      timestamp = M.amz_timestamp(maki.time.now().secs),
+      timestamp = M.amz_timestamp(makima.time.now().secs),
     })
     for _, header in ipairs(signed) do
       headers[header[1]] = header[2]
@@ -257,14 +257,14 @@ function M.instance(ctx)
   end
 
   function instance.stream(call_ctx, request, emit)
-    if credentials.expires_at and maki.time.now().secs + REFRESH_MARGIN_SECS >= credentials.expires_at then
+    if credentials.expires_at and makima.time.now().secs + REFRESH_MARGIN_SECS >= credentials.expires_at then
       local _, refresh_err = instance.reload_auth(call_ctx)
       if refresh_err then
         return nil, refresh_err
       end
     end
     local url, body = M.build_request(request, credentials.region)
-    local encoded = assert(maki.json.encode(body))
+    local encoded = assert(makima.json.encode(body))
     local response, send_err = http.send(call_ctx, {
       url = url,
       method = "POST",

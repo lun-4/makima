@@ -11,15 +11,15 @@ import { handler, listen } from "./server.ts"
 import { probe, startSession } from "./session.ts"
 
 const PROBE_TIMEOUT_MS = 30_000
-const USAGE = `Usage: maki-claude-agent-bridge [--socket PATH] [--state DIR] [--claude PATH]
+const USAGE = `Usage: makima-claude-agent-bridge [--socket PATH] [--state DIR] [--claude PATH]
 
   --state   Where the bridge keeps its socket, conversation records and the
-            directory Claude Code runs in. Default: Maki's state directory
-            plus /claude-agent, as Maki's claude-agent provider expects.
+            directory Claude Code runs in. Default: Makima's state directory
+            plus /claude-agent, as Makima's claude-agent provider expects.
   --socket  Listen here instead of <state>/bridge.sock.
   --claude  The Claude Code executable. Default: \`claude\` on PATH.`
 
-// Maki's state directory (maki-storage paths.rs), so the provider finds the
+// Makima's state directory (makima-storage paths.rs), so the provider finds the
 // socket without configuration.
 function defaultState(): string {
   const base = process.env.XDG_STATE_HOME || join(homedir(), ".local", "state")

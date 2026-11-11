@@ -101,7 +101,7 @@ M.def = {
     body.reasoning_effort =
       thinking.effort(request.thinking, thinking.dialects.deepseek, thinking.max_budget(request.model))
     if request.thinking.kind == "budget" then
-      maki.log.warn(BUDGET_UNSUPPORTED)
+      makima.log.warn(BUDGET_UNSUPPORTED)
     end
     M.pad_reasoning(body, model.id)
   end,

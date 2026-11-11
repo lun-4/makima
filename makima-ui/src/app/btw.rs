@@ -1,0 +1,79 @@
+use std::sync::Arc;
+
+use makima_agent::agent::isolated_turn::{
+    IsolatedTurnEvent, IsolatedTurnRequest, run_isolated_turn,
+};
+use makima_providers::provider::Provider;
+use makima_providers::{ConversationRelation, ImageSource, Model};
+use makima_storage::id::SessionRef;
+
+use crate::components::btw_modal::BtwEvent;
+
+use super::App;
+
+pub(super) const BTW_FALLBACK_SYSTEM: &str = "You are a helpful coding assistant. Answer concisely \
+from the conversation context.";
+
+impl App {
+    pub(crate) fn start_btw(
+        &mut self,
+        question: String,
+        images: Vec<ImageSource>,
+        provider: Arc<dyn Provider>,
+        model: Model,
+    ) {
+        let snapshot = self
+            .shared_history
+            .as_ref()
+            .map(|history| history.load_full());
+        let previous = snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .conversation
+                .as_ref()?
+                .link(ConversationRelation::Branches, snapshot.messages.len())
+        });
+        let history = snapshot
+            .map(|snapshot| Vec::clone(&snapshot.messages))
+            .unwrap_or_default();
+        let system = self
+            .btw_system
+            .as_ref()
+            .map(|system| String::clone(&system.load()))
+            .filter(|system| !system.is_empty())
+            .unwrap_or_else(|| BTW_FALLBACK_SYSTEM.to_string());
+        self.start_btw_request(IsolatedTurnRequest {
+            provider,
+            model,
+            history,
+            previous,
+            system,
+            question,
+            images,
+            session_id: Some(SessionRef::from(self.state.session.id)),
+            cancel: makima_agent::CancelToken::none(),
+        });
+    }
+
+    pub(super) fn start_btw_request(&mut self, request: IsolatedTurnRequest) {
+        let (service_tx, service_rx) = flume::bounded(64);
+        let (modal_tx, modal_rx) = flume::bounded(64);
+        self.btw_modal.open(&request.question, modal_rx);
+        smol::spawn(run_isolated_turn(request, service_tx)).detach();
+        smol::spawn(async move {
+            while let Ok(event) = service_rx.recv_async().await {
+                let event = match event {
+                    IsolatedTurnEvent::TextDelta(text) | IsolatedTurnEvent::ThinkingDelta(text) => {
+                        BtwEvent::TextDelta(text)
+                    }
+                    IsolatedTurnEvent::Done | IsolatedTurnEvent::Cancelled => BtwEvent::Done,
+                    IsolatedTurnEvent::Error(error) => BtwEvent::Error(error),
+                };
+                let terminal = matches!(event, BtwEvent::Done | BtwEvent::Error(_));
+                if modal_tx.send_async(event).await.is_err() || terminal {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+}

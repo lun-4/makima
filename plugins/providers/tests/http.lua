@@ -1,5 +1,5 @@
 local http = require("providers.http")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local KEY_ENV = "TEST_API_KEY"
 local HEADER_ERROR = "provider 'test' header 'X-Gateway': environment variable 'GATEWAY' is unset or empty"

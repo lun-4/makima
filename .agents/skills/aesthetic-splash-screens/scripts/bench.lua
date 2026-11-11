@@ -1,5 +1,5 @@
 #!/usr/bin/env lua5.1
--- Perf bench for maki splashes, no maki build needed.
+-- Perf bench for makima splashes, no makima build needed.
 --
 -- Usage:
 --   lua5.1 bench.lua [--dir DIR] [--sizes WxH[,WxH...]] [--budget SECS] [name ...]
@@ -9,13 +9,13 @@
 -- and 200x79 (a tall terminal).
 --
 -- Reports average ms/frame per splash per size measured under lua5.1 (no
--- JIT). maki marks plugin envs safe (set_safeenv), so luau's native codegen
+-- JIT). makima marks plugin envs safe (set_safeenv), so luau's native codegen
 -- applies to real renders: expect roughly lua5.1/5 ms/frame there, plus the
 -- Rust-side per-segment parse the lua5.1 bench does not see. The script also
 -- prints that codegen estimate.
 --
 -- For real-VM numbers (same CLI, Luau + codegen, safeenv envs), run:
---   cargo run -p maki-lua --example splash_bench -- --dir DIR name...
+--   cargo run -p makima-lua --example splash_bench -- --dir DIR name...
 
 local DIR = "."
 local SIZES = { { 80, 24 }, { 200, 79 } }
@@ -50,7 +50,7 @@ end
 
 package.path = DIR .. "/?.lua;" .. package.path
 
-_G.maki = {
+_G.makima = {
   ui = { theme_color = function() return nil end },
   version = function() return { current = "0.0.0-test" } end,
   api = {
@@ -118,4 +118,4 @@ for _, name in ipairs(names) do
     )
   end
 end
-io.write("* luau-codegen estimate = lua5.1 / 5 (maki marks plugin envs safe, so native codegen applies); real frames also pay a Rust-side per-segment parse; fps@60 means the frame fits in a 60hz tick.\n")
+io.write("* luau-codegen estimate = lua5.1 / 5 (makima marks plugin envs safe, so native codegen applies); real frames also pay a Rust-side per-segment parse; fps@60 means the frame fits in a 60hz tick.\n")

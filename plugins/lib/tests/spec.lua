@@ -1,4 +1,4 @@
-local ToolView = require("maki.tool_view")
+local ToolView = require("makima.tool_view")
 
 local failures = {}
 
@@ -27,13 +27,13 @@ local function mock_buf()
 end
 
 case("truncate_within_limits_unchanged", function()
-  eq(maki.text.truncate_file("hello", 100, 1000, nil), "hello")
-  eq(maki.text.truncate_file("a\nb\nc", 3, 1000, nil), "a\nb\nc")
-  eq(maki.text.truncate_file("", 100, 1000, nil), "")
+  eq(makima.text.truncate_file("hello", 100, 1000, nil), "hello")
+  eq(makima.text.truncate_file("a\nb\nc", 3, 1000, nil), "a\nb\nc")
+  eq(makima.text.truncate_file("", 100, 1000, nil), "")
 end)
 
 case("truncate_exceeds_line_limit", function()
-  local result = maki.text.truncate_file("aaa\nbbb\nccc\nddd", 2, 1000, nil)
+  local result = makima.text.truncate_file("aaa\nbbb\nccc\nddd", 2, 1000, nil)
   assert(result:find("aaa", 1, true), "should keep first line")
   assert(result:find("bbb", 1, true), "should keep second line")
   assert(not result:find("ccc", 1, true), "should drop third line")
@@ -42,44 +42,44 @@ end)
 
 case("truncate_exceeds_byte_limit", function()
   local text = string.rep("x", 200)
-  local result = maki.text.truncate_file(text, 1000, 50, nil)
+  local result = makima.text.truncate_file(text, 1000, 50, nil)
   assert(#result < #text, "should be shorter")
   assert(result:find("%[file truncated"), "should have truncation marker")
 end)
 
 case("truncate_byte_limit_mid_line", function()
   local text = "short\n" .. string.rep("x", 100)
-  local result = maki.text.truncate_file(text, 1000, 20, nil)
+  local result = makima.text.truncate_file(text, 1000, 20, nil)
   assert(result:find("short"), "should keep first line")
   assert(not result:find(string.rep("x", 100)), "should drop long line")
   assert(result:find("%[file truncated"), "should have truncation marker")
 end)
 
 case("truncate_trailing_newlines_counted", function()
-  local result = maki.text.truncate_file("a\n\n\n\n\n", 2, 1000, nil)
+  local result = makima.text.truncate_file("a\n\n\n\n\n", 2, 1000, nil)
   assert(result:find("%[file truncated"), "trailing newlines should count as lines")
 end)
 
--- maki.match.fuzzy tests (mirror of the maki-lua unit tests)
+-- makima.match.fuzzy tests (mirror of the makima-lua unit tests)
 
 case("match_fuzzy_empty_query_matches_all", function()
-  local m = maki.match.fuzzy("", "hello world")
+  local m = makima.match.fuzzy("", "hello world")
   assert(m, "empty query must match")
   eq(m.score, 0)
   eq(#m.indices, 0)
-  local w = maki.match.fuzzy("   ", "hello world")
+  local w = makima.match.fuzzy("   ", "hello world")
   assert(w, "whitespace query must match")
   eq(w.score, 0)
   eq(#w.indices, 0)
 end)
 
 case("match_fuzzy_no_match_returns_nil", function()
-  eq(maki.match.fuzzy("xyz", "hello world"), nil)
-  eq(maki.match.fuzzy("hello xyz", "hello world"), nil)
+  eq(makima.match.fuzzy("xyz", "hello world"), nil)
+  eq(makima.match.fuzzy("hello xyz", "hello world"), nil)
 end)
 
 case("match_fuzzy_returns_1based_codepoint_indices", function()
-  local m = maki.match.fuzzy("ap", "apple")
+  local m = makima.match.fuzzy("ap", "apple")
   assert(m, "expected match")
   eq(#m.indices, 2)
   eq(m.indices[1], 1)
@@ -87,16 +87,16 @@ case("match_fuzzy_returns_1based_codepoint_indices", function()
 end)
 
 case("match_fuzzy_multi_term_order_independent", function()
-  assert(maki.match.fuzzy("441 review", "review gh pr 441"), "order must not matter")
+  assert(makima.match.fuzzy("441 review", "review gh pr 441"), "order must not matter")
 end)
 
 case("match_fuzzy_smart_case", function()
-  eq(maki.match.fuzzy("APPLE", "apple pie"), nil)
-  assert(maki.match.fuzzy("apple", "Apple pie"), "lowercase query is case-insensitive")
+  eq(makima.match.fuzzy("APPLE", "apple pie"), nil)
+  assert(makima.match.fuzzy("apple", "Apple pie"), "lowercase query is case-insensitive")
 end)
 
 case("match_fuzzy_cjk_codepoint_indices", function()
-  local m = maki.match.fuzzy("好世", "你好世界")
+  local m = makima.match.fuzzy("好世", "你好世界")
   assert(m, "expected CJK match")
   eq(#m.indices, 2)
   eq(m.indices[1], 2)
@@ -104,34 +104,34 @@ case("match_fuzzy_cjk_codepoint_indices", function()
 end)
 
 case("match_fuzzy_indices_are_codepoints_not_graphemes", function()
-  local m = maki.match.fuzzy("a", "👍🏽abc")
+  local m = makima.match.fuzzy("a", "👍🏽abc")
   assert(m, "expected match")
   eq(#m.indices, 1)
   eq(m.indices[1], 3, "codepoint position, not grapheme position")
 end)
 
 case("match_fuzzy_contiguous_beats_scattered", function()
-  local tight = maki.match.fuzzy("app", "apple")
-  local loose = maki.match.fuzzy("app", "axpyp")
+  local tight = makima.match.fuzzy("app", "apple")
+  local loose = makima.match.fuzzy("app", "axpyp")
   assert(tight and loose, "both must match")
   assert(tight.score > loose.score, "contiguous should score higher")
 end)
 
 case("match_fuzzy_repeated_terms_dedup_indices", function()
-  local m = maki.match.fuzzy("a a", "banana")
+  local m = makima.match.fuzzy("a a", "banana")
   assert(m, "expected match")
   eq(#m.indices, 1)
   eq(m.indices[1], 2)
 end)
 
 case("match_fuzzy_non_string_args_error", function()
-  local ok, err = pcall(maki.match.fuzzy, 123, "hello")
+  local ok, err = pcall(makima.match.fuzzy, 123, "hello")
   assert(not ok, "number query should error")
   assert(
     tostring(err):find("match.fuzzy: query: expected string, got integer", 1, true),
     "error names the query arg: " .. tostring(err)
   )
-  local ok2, err2 = pcall(maki.match.fuzzy, "hello", {})
+  local ok2, err2 = pcall(makima.match.fuzzy, "hello", {})
   assert(not ok2, "table text should error")
   assert(
     tostring(err2):find("match.fuzzy: text: expected string, got table", 1, true),
@@ -140,7 +140,7 @@ case("match_fuzzy_non_string_args_error", function()
 end)
 
 case("match_completion_default_matches_rust_contract", function()
-  local m = maki.match.completion("ap", "apple")
+  local m = makima.match.completion("ap", "apple")
   assert(m, "expected completion match")
   eq(m.indices[1], 1)
   eq(m.indices[2], 2)
@@ -154,21 +154,21 @@ case("match_completion_default_matches_rust_contract", function()
 end)
 
 case("match_completion_options_and_compare", function()
-  assert(maki.match.completion("APPLE", "apple", { case = "ignore" }))
-  assert(maki.match.completion("APPLE", "apple", { case = "smart" }) == nil)
-  assert(maki.match.completion("a", "A", { case = "respect" }) == nil)
-  assert(maki.match.completion("e", "bë", { normalization = "smart" }))
-  assert(maki.match.completion("e", "bë", { normalization = "never" }) == nil)
+  assert(makima.match.completion("APPLE", "apple", { case = "ignore" }))
+  assert(makima.match.completion("APPLE", "apple", { case = "smart" }) == nil)
+  assert(makima.match.completion("a", "A", { case = "respect" }) == nil)
+  assert(makima.match.completion("e", "bë", { normalization = "smart" }))
+  assert(makima.match.completion("e", "bë", { normalization = "never" }) == nil)
 
-  local exact = maki.match.completion("app", "app")
-  local prefix = maki.match.completion("app", "apple")
-  local substring = maki.match.completion("app", "xapp")
-  assert(maki.match.compare(exact, prefix) < 0)
-  assert(maki.match.compare(prefix, exact) > 0)
-  assert(maki.match.compare(exact, exact) == 0)
+  local exact = makima.match.completion("app", "app")
+  local prefix = makima.match.completion("app", "apple")
+  local substring = makima.match.completion("app", "xapp")
+  assert(makima.match.compare(exact, prefix) < 0)
+  assert(makima.match.compare(prefix, exact) > 0)
+  assert(makima.match.compare(exact, exact) == 0)
   local results = { substring, exact, prefix }
   table.sort(results, function(a, b)
-    return maki.match.compare(a, b) < 0
+    return makima.match.compare(a, b) < 0
   end)
   assert(results[1] == exact and results[2] == prefix and results[3] == substring)
 end)
@@ -181,7 +181,7 @@ case("match_completion_unicode_indices_match_rust_contract", function()
     { query = "a", label = "👍🏽abc", expected = { 3 } },
   }
   for _, c in ipairs(cases) do
-    local m = maki.match.completion(c.query, c.label)
+    local m = makima.match.completion(c.query, c.label)
     assert(m, c.label .. " should match")
     eq(#m.indices, #c.expected, c.label .. " index count")
     for i, expected in ipairs(c.expected) do
@@ -204,7 +204,7 @@ case("match_compare_rejects_malformed_operands", function()
     { { score = 1, indices = {} }, {}, "left.ranking" },
   }
   for _, c in ipairs(cases) do
-    local ok, err = pcall(maki.match.compare, c[1], c[2])
+    local ok, err = pcall(makima.match.compare, c[1], c[2])
     assert(not ok, "malformed operand should error")
     assert(tostring(err):find(c[3], 1, true), tostring(err))
   end
@@ -462,17 +462,17 @@ end
 -- the text that reached the buf and how many times the renderer ran.
 local function restore_markdown(output, is_error, markdown)
   local buf = mock_buf()
-  local original = { buf = maki.ui.buf, markdown = maki.ui.markdown }
+  local original = { buf = makima.ui.buf, markdown = makima.ui.markdown }
   local calls = 0
-  maki.ui.buf = function()
+  makima.ui.buf = function()
     return buf
   end
-  maki.ui.markdown = function(...)
+  makima.ui.markdown = function(...)
     calls = calls + 1
     return markdown(...)
   end
   local ok, err = pcall(ToolView.restore_markdown, output, is_error, RESTORE_OPTS)
-  maki.ui.buf, maki.ui.markdown = original.buf, original.markdown
+  makima.ui.buf, makima.ui.markdown = original.buf, original.markdown
   assert(ok, tostring(err))
   return all_text(buf.lines), calls
 end
@@ -500,7 +500,7 @@ case("tool_view_restore_markdown_falls_back_when_rendering_fails", function()
   eq(text, RESTORE_OUTPUT, "a failing renderer must not swallow the output")
 end)
 
-local TextInput = require("maki.text_input")
+local TextInput = require("makima.text_input")
 
 case("text_input_insert_and_value", function()
   local input = TextInput.new()
@@ -1328,7 +1328,7 @@ case("set_highlight_toggle_keeps_lines_and_collapses_back", function()
   eq(buf.lines[4][1][1], "... (2 lines) (click to expand)")
 end)
 
-local Spans = require("maki.spans")
+local Spans = require("makima.spans")
 
 case("match_spans_ascii", function()
   local spans = Spans.match_spans("alphabet", { 1, 4, 8 }, "item", "match")
@@ -1388,14 +1388,14 @@ local SPEC_HEADINGS = {
 }
 
 case("plan_spec_is_shared_source_with_all_headings", function()
-  local spec = require("maki.plan_spec")
-  assert(type(spec) == "string" and #spec > 0, "maki.plan_spec must be a non-empty string")
+  local spec = require("makima.plan_spec")
+  assert(type(spec) == "string" and #spec > 0, "makima.plan_spec must be a non-empty string")
   for _, heading in ipairs(SPEC_HEADINGS) do
     eq(spec:find(heading, 1, true) ~= nil, true, "plan spec missing heading: " .. heading)
   end
 end)
 
-local long_lines = require("maki.long_lines")
+local long_lines = require("makima.long_lines")
 local LL_MAX = 10
 local LONG = string.rep("L", 20)
 local OTHER_LONG = string.rep("M", 20)
@@ -1574,17 +1574,17 @@ case("text_input_click_clamps_to_prefix_and_row_end", function()
 end)
 
 case("list_picker_clicks_filter_caret_and_respects_section_rows", function()
-  local ListPicker = require("maki.list_picker")
-  local original_buf, original_win = maki.ui.buf, maki.ui.open_win
+  local ListPicker = require("makima.list_picker")
+  local original_buf, original_win = makima.ui.buf, makima.ui.open_win
   local lines, closed, step = {}, false, 0
-  maki.ui.buf = function()
+  makima.ui.buf = function()
     return {
       set_lines = function(_, value)
         lines = value
       end,
     }
   end
-  maki.ui.open_win = function()
+  makima.ui.open_win = function()
     return {
       width = 40,
       height = 10,
@@ -1619,7 +1619,7 @@ case("list_picker_clicks_filter_caret_and_respects_section_rows", function()
     { label = "xab", section = "Group" },
     { label = "other", section = "Group" },
   })
-  maki.ui.buf, maki.ui.open_win = original_buf, original_win
+  makima.ui.buf, makima.ui.open_win = original_buf, original_win
   assert(ok, tostring(result))
   eq(result.type, "choice")
   eq(result.index, 1)
@@ -1631,11 +1631,11 @@ local LIST_PICKER_NANOS_PER_SEC = 1000000000
 local LIST_PICKER_NANOS_PER_MS = 1000000
 
 local function list_picker_probe(events, items, opts)
-  local ListPicker = require("maki.list_picker")
+  local ListPicker = require("makima.list_picker")
   local originals = {
-    buf = maki.ui.buf,
-    open_win = maki.ui.open_win,
-    now = maki.time.now,
+    buf = makima.ui.buf,
+    open_win = makima.ui.open_win,
+    now = makima.time.now,
   }
   local clock = { secs = LIST_PICKER_NOW, nanosecs = 0 }
   local snapshots, timeouts = {}, {}
@@ -1647,17 +1647,17 @@ local function list_picker_probe(events, items, opts)
       clock.secs = clock.secs + 1
     end
   end
-  maki.time.now = function()
+  makima.time.now = function()
     return { secs = clock.secs, nanosecs = clock.nanosecs }
   end
-  maki.ui.buf = function()
+  makima.ui.buf = function()
     return {
       set_lines = function(_, value)
         snapshots[#snapshots + 1] = value
       end,
     }
   end
-  maki.ui.open_win = function()
+  makima.ui.open_win = function()
     return {
       width = 80,
       height = 20,
@@ -1679,15 +1679,15 @@ local function list_picker_probe(events, items, opts)
     }
   end
   local ok, result = pcall(ListPicker.open, items, opts)
-  maki.ui.buf, maki.ui.open_win, maki.time.now = originals.buf, originals.open_win, originals.now
+  makima.ui.buf, makima.ui.open_win, makima.time.now = originals.buf, originals.open_win, originals.now
   assert(ok, tostring(result))
   return result, snapshots, timeouts
 end
 
 case("list_picker_live_age_preserves_filter_and_confirmation", function()
   local items = {
-    { label = "alpha", age = maki.time.at(LIST_PICKER_NOW - 9) },
-    { label = "beta", age = maki.time.at(LIST_PICKER_NOW - 3) },
+    { label = "alpha", age = makima.time.at(LIST_PICKER_NOW - 9) },
+    { label = "beta", age = makima.time.at(LIST_PICKER_NOW - 3) },
   }
   local result, snapshots, timeouts = list_picker_probe({
     { type = "paste", text = "alp" },
@@ -1702,25 +1702,25 @@ case("list_picker_live_age_preserves_filter_and_confirmation", function()
 end)
 
 case("list_picker_compound_age_layout", function()
-  local ListPicker = require("maki.list_picker")
-  local reference = maki.time.at(LIST_PICKER_NOW)
-  local age = maki.time.at(LIST_PICKER_NOW - (4 * 86400 + 7 * 3600 + 23 * 60 + 9))
+  local ListPicker = require("makima.list_picker")
+  local reference = makima.time.at(LIST_PICKER_NOW)
+  local age = makima.time.at(LIST_PICKER_NOW - (4 * 86400 + 7 * 3600 + 23 * 60 + 9))
   local items = { { label = "title", detail = "detail", age = age } }
   local wide = ListPicker._render_lines(items, 1, 80, "", reference)
   assert(span_text(wide[1]):find("4d 7h 23m 9s", 1, true), "ordinary width keeps the compound age")
-  assert(maki.ui.display_width(span_text(wide[1])) <= 80)
+  assert(makima.ui.display_width(span_text(wide[1])) <= 80)
   local narrow = ListPicker._render_lines(items, 1, 19, "", reference)
   assert(span_text(narrow[1]):find("…7h 23m 9s", 1, true), "narrow width elides higher units")
-  assert(maki.ui.display_width(span_text(narrow[1])) <= 19)
+  assert(makima.ui.display_width(span_text(narrow[1])) <= 19)
 end)
 
 case("list_picker_age_stays_separated_from_full_label", function()
-  local ListPicker = require("maki.list_picker")
-  local reference = maki.time.at(LIST_PICKER_NOW)
-  local items = { { label = "build-test", age = maki.time.at(LIST_PICKER_NOW - 9) } }
+  local ListPicker = require("makima.list_picker")
+  local reference = makima.time.at(LIST_PICKER_NOW)
+  local items = { { label = "build-test", age = makima.time.at(LIST_PICKER_NOW - 9) } }
   local lines = ListPicker._render_lines(items, 1, 16, "", reference)
   assert(span_text(lines[1]):find("… 9s", 1, true), "a budget-filling label keeps a gap before the age")
-  assert(maki.ui.display_width(span_text(lines[1])) <= 16)
+  assert(makima.ui.display_width(span_text(lines[1])) <= 16)
 end)
 
 case("list_picker_static_items_keep_blocking_recv", function()

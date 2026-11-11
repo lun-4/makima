@@ -14,7 +14,7 @@ Rules come from four layers, combined for resolution:
 1. **Session rules**, set during the current session (in-memory only)
 2. **Config rules**, loaded from TOML permission files
 3. **Builtin rules**, the hardcoded defaults
-4. **Plugin rules**, declared by plugins via [`maki.api.register_permission_rule`](/docs/lua-api/#maki-api-register_permission_rule)
+4. **Plugin rules**, declared by plugins via [`makima.api.register_permission_rule`](/docs/lua-api/#makima-api-register_permission_rule)
 
 Any matching deny blocks the tool. No exceptions, so a config deny always beats a plugin allow.
 
@@ -104,13 +104,13 @@ Each tool gets its own section with `allow` and `deny` arrays. Values are glob-l
 
 > **Note:** In MCP server sections (`[mcp.*]`), `allow` and `deny` take an array of tool names, with `["*"]` for every tool on the server. Use `default = "allow"` or `default = "deny"` for the fallback. Native tool sections (e.g. `[bash]`) take an array of scope patterns, or `allow = true` to cover the whole tool.
 
-A rule that does not parse stops maki from starting, and the error names the file, section and key. This covers unknown keys, a boolean or bare string in an `[mcp.*]` list, section names that are not valid tool names (letters, digits, `-` and `_` only, so the old `["mcp:<server>__<tool>"]` form fails too), and `["*"].default` (use the top-level `default`). It applies to project files too, trusted or not. Maki never skips a rule it cannot read, because a skipped deny would silently allow what it was meant to block.
+A rule that does not parse stops makima from starting, and the error names the file, section and key. This covers unknown keys, a boolean or bare string in an `[mcp.*]` list, section names that are not valid tool names (letters, digits, `-` and `_` only, so the old `["mcp:<server>__<tool>"]` form fails too), and `["*"].default` (use the top-level `default`). It applies to project files too, trusted or not. Makima never skips a rule it cannot read, because a skipped deny would silently allow what it was meant to block.
 
-A well-formed section whose tool does not exist still loads, because a global rule may be for a tool that only some projects have, such as one from a project plugin. At startup maki warns about each rule whose tool nothing registered in the current project, so a typo like `[bassh]` shows up: the TUI flashes the warning, print, SDK and ACP write it to stderr, and every frontend logs it.
+A well-formed section whose tool does not exist still loads, because a global rule may be for a tool that only some projects have, such as one from a project plugin. At startup makima warns about each rule whose tool nothing registered in the current project, so a typo like `[bassh]` shows up: the TUI flashes the warning, print, SDK and ACP write it to stderr, and every frontend logs it.
 
-When the broken file is the project's `.makima/permissions.toml`, the error ends by suggesting `--no-project`. Start with it to work in that repository anyway: maki then reads nothing from the project's `.makima` directory, this file included. See [Folder Trust](/docs/folder-trust/#loading-nothing-from-the-project).
+When the broken file is the project's `.makima/permissions.toml`, the error ends by suggesting `--no-project`. Start with it to work in that repository anyway: makima then reads nothing from the project's `.makima` directory, this file included. See [Folder Trust](/docs/folder-trust/#loading-nothing-from-the-project).
 
-A `~/.makima/permissions.toml` left from the old home layout also stops startup, because maki no longer reads it and its denies would quietly stop applying. Move its rules to the global file above and delete it.
+A `~/.makima/permissions.toml` left from the old home layout also stops startup, because makima no longer reads it and its denies would quietly stop applying. Move its rules to the global file above and delete it.
 
 ### The `default` key
 
@@ -193,7 +193,7 @@ Enable it like YOLO:
 
 ```lua
 -- ~/.config/makima/init.lua
-maki.setup({
+makima.setup({
     plugins = {
         bash = {
             auto_mode = true,
@@ -227,7 +227,7 @@ To start in YOLO mode every time:
 
 ```lua
 -- ~/.config/makima/init.lua
-maki.setup({
+makima.setup({
     always_yolo = true,
 })
 ```
@@ -251,15 +251,15 @@ The permission prompt's actions are clickable, including the confirm and deny-ed
 
 ## Plugin Permissions
 
-Lua plugins have a separate, unrelated gate. A `plugin.toml` manifest next to the Lua file controls which gated `maki.*` APIs it may call. No manifest means every gated call is denied, including for your own `init.lua`. The [Lua API reference](/docs/lua-api/#plugin-permissions) documents the manifest and lists every permission.
+Lua plugins have a separate, unrelated gate. A `plugin.toml` manifest next to the Lua file controls which gated `makima.*` APIs it may call. No manifest means every gated call is denied, including for your own `init.lua`. The [Lua API reference](/docs/lua-api/#plugin-permissions) documents the manifest and lists every permission.
 
 ## Network Addresses
 
-`webfetch`, `websearch` and every plugin that calls `maki.net.request` go through one guard. A request to a private, loopback or link-local address is refused, and so is a redirect that lands on one. The model picks these URLs, so a page it reads could otherwise talk it into fetching `http://169.254.169.254/` or an admin panel on your LAN.
+`webfetch`, `websearch` and every plugin that calls `makima.net.request` go through one guard. A request to a private, loopback or link-local address is refused, and so is a redirect that lands on one. The model picks these URLs, so a page it reads could otherwise talk it into fetching `http://169.254.169.254/` or an admin panel on your LAN.
 
 To reach a service on your own machine or network, list it in [`net.allowed_private_hosts`](/docs/configuration/#net). An allowed host also keeps plain `http://` instead of being upgraded to `https://`, since a service on your LAN rarely has a certificate.
 
-Providers do not go through this guard. They use `maki.net.send`, which reaches any address, because their URLs come from provider code and your config, not from the model: Ollama on `localhost`, a llama.cpp box on your LAN, or the cloud metadata server that Vertex and Bedrock read credentials from. `send` needs the `net` plugin permission like `request` does. A plugin should never hand it a URL the model chose. The [Lua API reference](/docs/lua-api/#maki-net) compares the two.
+Providers do not go through this guard. They use `makima.net.send`, which reaches any address, because their URLs come from provider code and your config, not from the model: Ollama on `localhost`, a llama.cpp box on your LAN, or the cloud metadata server that Vertex and Bedrock read credentials from. `send` needs the `net` plugin permission like `request` does. A plugin should never hand it a URL the model chose. The [Lua API reference](/docs/lua-api/#makima-net) compares the two.
 
 ## Session Persistence
 

@@ -1,0 +1,7546 @@
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::ffi::c_int;
+use std::future::Future;
+use std::panic::catch_unwind;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::ptr;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use event_listener::Event;
+
+use include_dir::Dir;
+use makima_agent::cancel::{CancelToken, CancelTrigger, PublicationRegistration};
+use makima_agent::permissions::PluginRuleStore;
+use makima_agent::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
+use makima_agent::tools::hook::{Authority, Verdict};
+use makima_agent::tools::offload::OutputLimits;
+use makima_agent::tools::{
+    HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
+};
+use makima_agent::{
+    BufferSnapshot, CurrentManagedTurn, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle,
+};
+use makima_providers::{ProviderRegistry, Timeouts};
+use makima_storage::checkpoint::CheckpointPublication;
+use mlua::{
+    Chunk, ChunkMode, Compiler, Function, Lua, MultiValue, RegistryKey, Table, Value as LuaValue,
+    ffi,
+};
+
+use crate::coalesced_latest::{CoalescedLatest, CoalescedWork};
+use crate::splash::{SplashFrame, SplashPull};
+use serde_json::Value;
+
+use makima_commands::{
+    ArgumentValue, CommandBehavior, CommandCompletion, CommandDocs, CommandError, CommandFuture,
+    CommandInvocation, CommandOutcome, CommandRegistry, CommandSpec, CompletionContext,
+    CompletionError, CompletionItem, CompletionLifecycleEvent, CompletionSessionId, ParsedArgument,
+    Producer, ProducerPrecedence, Registration, RegistrationError, TargetCapabilities,
+    TargetCapability,
+};
+use makima_config::RawConfig;
+use makima_storage::id::{MakimaId, SessionRef};
+
+use crate::api::autocmd::{self, AutocmdStore};
+use crate::api::completion::{self, CompletionCtx, ItemSpec};
+use crate::api::r#fn::{JobOwner, JobStore, deliver_job_event};
+use crate::api::fs::FsBackend;
+use crate::api::keymap::KeymapReader;
+use crate::api::keymap::{KeymapStore, KeymapWriter, PendingKeymaps};
+use crate::api::options::{PluginOptionSpecs, PluginOpts, collect_plugin_options};
+use crate::api::provider::{PendingProviders, ProviderStore};
+use crate::api::session_option::{
+    PendingSessionOptions, SessionOptionStore, SessionOptionValidation, SessionOptionValidators,
+    activate_pending as activate_session_options, commit_catalog as commit_session_option_catalog,
+    restore as restore_session_options, unload as unload_session_options, validate_option_value,
+};
+use crate::api::slot::{LayeredTools, SlotStore, run_host_chain};
+use crate::api::store::{self, Store};
+use crate::api::timer::{self, TimerStore};
+use crate::api::tool::{
+    LuaTool, MutablePathSpec, PendingRules, PendingTool, PendingTools, PermissionScopeSpec,
+    ToolCallReply, resolve_rules,
+};
+use crate::api::ui::buf::{BufHandle, BufferStore};
+use crate::api::ui::{ClickRegions, HintStore, StatusContentStore};
+use crate::api::util::command::{
+    ArgumentCompletion, CommandCompletionCallbacks, CommandGenerationMap, CommandHandlerMap,
+    HintWriter, StatusContentWriter, UiAction,
+};
+use crate::api::util::convert::{json_to_lua, lua_to_json_within};
+use crate::api::util::ctx::LuaCtx;
+use crate::api::util::picker::{PickerCallbacks, PickerEvent};
+use crate::api::util::setup::ConfigStore;
+use crate::api::{PluginLoadContext, create_makima_global};
+use crate::ctx::Ctx;
+use crate::docs_render;
+use crate::error::PluginError;
+use crate::loader::GLOBAL_INIT_OWNER;
+use crate::orchestration::TrustedTarget;
+use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
+use crate::provider::ProviderJob;
+
+const INTERRUPT_SHUTDOWN_MSG: &str = "plugin interrupted: host shutting down";
+const INTERRUPT_CANCELLED_MSG: &str = "plugin interrupted: task cancelled";
+const LUA_COMMAND_ATTACHMENTS: &str = "Lua commands cannot include non-text content";
+const LUA_HOST_STOPPED: &str = "Lua host stopped";
+pub const COMMAND_HANDLER_UNAVAILABLE: &str = "command handler is unavailable";
+const INTERRUPT_DEADLINE_MSG: &str = "plugin interrupted: deadline exceeded";
+static NEXT_COMMAND_GENERATION: AtomicU64 = AtomicU64::new(1);
+const DISPATCH_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const NIL_WITHOUT_FINISH_MSG: &str =
+    "handler returned nil without calling ctx:finish() or starting jobs";
+pub(crate) const CANCELLED_MSG: &str = "cancelled";
+const HANDLER_TIMEOUT_MSG: &str = "timeout";
+pub const MAX_INFLIGHT_TOOLS: usize = 64;
+/// Finished tools kept clickable without a restore round-trip. Purely a
+/// cache: a click that misses it falls back to the restore item carried
+/// by the request, so eviction only costs latency, never correctness.
+/// The UI reuses this cap for how many finished bufs it keeps watching.
+pub const WARM_TOOL_CAP: usize = 32;
+const GC_STEP_INTERVAL: usize = 4;
+/// Only sets how fast the one-shot interrupt is re-armed after it fires, so
+/// the kill still lands within a poll of [`KILL_GRACE`]. The thread ticks even
+/// when no Lua runs, so prefer the slowest interval the grace can hide.
+const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// A frame may exceed the UI's pull wait under load, but should not occupy the
+/// Lua dispatcher for more than a couple of frame intervals.
+const SPLASH_RENDER_DEADLINE: Duration = Duration::from_millis(100);
+const SPLASH_RENDER_KILL_GRACE: Duration = Duration::from_millis(100);
+/// Native codegen budget spent inside each splash frame pull. The idle-only
+/// drain in the dispatcher loop starves under a continuous frame stream (the
+/// home screen never leaves the channels empty), so the queue would never
+/// reach the splash chunks. Spending a few ms per frame during the entry fade
+/// pays the queue down in a handful of frames; afterwards renders run
+/// compiled (~5x faster per benches/luau_perf.rs) at zero cost.
+const SPLASH_CODEGEN_BUDGET: Duration = Duration::from_millis(2);
+const SPLASH_CODEGEN_MAX_STEPS: usize = 8;
+const COMMAND_COMPLETION_DEADLINE: Duration = Duration::from_secs(2);
+
+pub(crate) fn next_command_generation() -> u64 {
+    NEXT_COMMAND_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+/// How long a doomed task may run without yielding before the watchdog
+/// shoots it. Cleanup after a cancel or a timeout (batch marking its
+/// children cancelled, rerendering its buf) is plain Lua running with the
+/// interrupt already armed, so killing at the first safepoint strands the
+/// UI mid-flight. Every yield hands back a fresh budget, so cleanup may
+/// take as long as it needs, while a loop that never yields dies within
+/// one grace.
+pub const KILL_GRACE: Duration = Duration::from_millis(500);
+/// Wall clock a cancelled handler gets before the host stops waiting for
+/// it. The watchdog alone never ends a task that parks in an await: it
+/// runs no Lua to interrupt and renews its grace at every yield. Long
+/// enough for cleanup that waits on children, short enough that the next
+/// prompt is not stuck behind abandoned work.
+const CANCEL_ABANDON_AFTER: Duration = Duration::from_secs(5);
+const OPT_LEVEL_JIT: u8 = 2;
+const OPT_LEVEL_DEBUGGABLE: u8 = 1;
+const DEBUG_INFO_FULL: u8 = 2;
+pub(crate) const ASYNC_RUN_DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
+/// Upper bound for `makima.timer.set` seconds values: `f64::MAX` seconds
+/// would panic in `Duration::from_secs_f64`.
+pub(crate) const MAX_LUA_SECONDS: f64 = 1e9;
+/// Async tasks spawned during restore may spawn further tasks; cap the rounds.
+const RESTORE_SPAWN_ROUNDS: usize = 8;
+/// Keeps a buggy plugin's restore task from freezing the lua loop.
+const RESTORE_ASYNC_DEADLINE: Duration = Duration::from_secs(10);
+static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
+/// Hard cap on one whole restore item. The watchdog interrupt only lands
+/// while Lua runs, so a restore parked on a never-resolving await would otherwise
+/// hold its gate slot forever and deadlock `gate.drain()` in the dispatcher.
+/// Generous on purpose: legit restores of heavy items take double-digit
+/// seconds on a loaded debug build, and a wrongly killed restore loses the
+/// tool's rendered output.
+pub(crate) const RESTORE_ITEM_TIMEOUT: Duration = Duration::from_secs(60);
+const SPAWN_QUEUE_NOT_INIT: &str = "spawn queue not initialized";
+/// Without a cap, a runaway plugin OOM-kills the whole process.
+/// With one, it hits a catchable Lua error instead.
+const LUA_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
+
+pub type LoadResult = Result<(), PluginError>;
+pub(crate) enum HintContent {
+    Static(String),
+    Callback(RegistryKey),
+}
+
+pub(crate) struct PromptHintRegistration {
+    pub(crate) prompts: Option<Vec<PromptId>>,
+    pub(crate) slot: Slot,
+    pub(crate) content: HintContent,
+}
+
+pub(crate) type PromptHintCallbacks = BTreeMap<Arc<str>, Vec<PromptHintRegistration>>;
+pub(crate) type PendingPromptHintCallbacks = Arc<Mutex<PromptHintCallbacks>>;
+
+/// One firing of a host-owned slot, as the call being filtered described it.
+pub(crate) struct HookRun {
+    pub slot: String,
+    pub authority: Authority,
+    /// The filtered call's own cancellation and window. The chain runs on the
+    /// Lua thread, so without them nothing here knows when the caller stopped
+    /// waiting, and a layer that parks outlives the call it filters.
+    pub cancel: CancelToken,
+    pub deadline: Instant,
+    pub value: Value,
+    pub call: Value,
+}
+
+#[derive(Clone)]
+pub(crate) struct RequestTx(pub(crate) flume::Sender<Request>);
+
+/// Names this host to the graphs it observes, so each graph feeds it once.
+pub(crate) struct HostId(pub(crate) u64);
+
+static NEXT_HOST_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Load/clear drain in-flight tools before mutating plugin environments.
+pub enum Request {
+    /// Plugins are loaded, so native codegen may start using idle time. Sent
+    /// last so it never interleaves with the loads themselves.
+    WarmJit,
+    /// Install a `SessionSnapshotSlot` on the Lua thread. Headless drivers send
+    /// one so `makima.session.read` works without a UI to ask.
+    InstallSessionSnapshot {
+        provider: crate::api::session::SessionSnapshotFn,
+    },
+    InstallOrchestrationServices(crate::orchestration::OrchestrationServicesSlot),
+    /// `--no-project`: plugins leave the project's `.makima` directory alone.
+    IgnoreProject,
+    /// Print saves nothing, saved preferences included.
+    SaveNoPreferences,
+    SetClockFormat(makima_config::ClockFormat),
+    LoadSource {
+        name: Arc<str>,
+        source: String,
+        plugin_dir: Option<PathBuf>,
+        permissions: PluginPermissions,
+        opts: PluginOpts,
+        reply: flume::Sender<LoadResult>,
+    },
+    CallTool {
+        plugin: Arc<str>,
+        tool: Arc<str>,
+        generation: u64,
+        input: Value,
+        ctx: Box<LuaCtx>,
+        deadline: Option<Instant>,
+        reply: flume::Sender<ToolCallReply>,
+        live: Option<LiveCtx>,
+        /// Runs on the caller's slot instead of taking one of its own.
+        /// See [`under_inflight_slot`].
+        nested: bool,
+    },
+    ComputeHeader {
+        plugin: Arc<str>,
+        tool: Arc<str>,
+        input: Value,
+        reply: flume::Sender<HeaderResult>,
+    },
+    ComputePermissionScopes {
+        plugin: Arc<str>,
+        tool: Arc<str>,
+        input: Value,
+        session_id: Option<SessionRef>,
+        reply: flume::Sender<Option<PermissionScopes>>,
+    },
+    /// A host-owned slot chain (`tool.<name>.input`, `tool.<name>.output`).
+    /// Only sent when the slot has layers, so the idle case never reaches the
+    /// request loop at all.
+    RunHook {
+        run: HookRun,
+        reply: flume::Sender<Verdict>,
+    },
+    MutablePath {
+        plugin: Arc<str>,
+        tool: Arc<str>,
+        input: Value,
+        cwd: PathBuf,
+        reply: flume::Sender<Option<String>>,
+    },
+    ClearPlugin {
+        plugin: Arc<str>,
+        reply: flume::Sender<Result<(), PluginError>>,
+    },
+    DropCommandKeys {
+        plugin: Arc<str>,
+    },
+    RunInitLua {
+        source: String,
+        source_name: String,
+        owner: Arc<str>,
+        plugin_dir: Option<PathBuf>,
+        reply: flume::Sender<Result<Option<RawConfig>, PluginError>>,
+    },
+    ExecuteCommand {
+        plugin: Arc<str>,
+        command: Arc<str>,
+        generation: u64,
+        invocation: CommandInvocation,
+        completion: flume::Sender<Result<(), String>>,
+    },
+    #[cfg(feature = "test-support")]
+    TestPause {
+        ready: flume::Sender<()>,
+        release: flume::Receiver<()>,
+    },
+    #[cfg(feature = "test-support")]
+    TestBarrier {
+        reply: flume::Sender<()>,
+    },
+    #[cfg(feature = "test-support")]
+    TestDrainTasks {
+        reply: flume::Sender<()>,
+    },
+    #[cfg(feature = "test-support")]
+    TestCollectGarbage {
+        reply: flume::Sender<mlua::Result<()>>,
+    },
+    CollectPromptSlots {
+        reply: flume::Sender<ResolvedSlots>,
+    },
+    CollectPluginOptions {
+        reply: flume::Sender<PluginOptionSpecs>,
+    },
+    BuildProviderRegistry {
+        timeouts: Timeouts,
+        reply: flume::Sender<Arc<ProviderRegistry>>,
+    },
+    /// One call into a Lua provider, ended by `cancel`.
+    Provider {
+        job: ProviderJob,
+        cancel: CancelToken,
+    },
+    Shutdown,
+    RestoreToolAsync {
+        item: RestoreItem,
+        event_tx: makima_agent::EventSender,
+    },
+    RestoreComplete {
+        flag: Arc<AtomicBool>,
+    },
+    FireAutocmd {
+        event: String,
+        data: Value,
+        agent: Option<makima_agent::AgentRef>,
+    },
+    ObserveAgents(makima_agent::AgentManagerHandle),
+    SplashFrame(CoalescedWork<SplashFrameRequest>),
+    SetVersion {
+        current: String,
+        latest: Option<String>,
+    },
+    ProviderUsageChanged {
+        snapshot: crate::ProviderUsageSnapshot,
+        invalidation: Option<crate::ProviderUsageInvalidation>,
+    },
+    ClickTool {
+        tool_use_id: String,
+        row: usize,
+        fallback: Option<Box<ClickFallback>>,
+    },
+    ClickRegion {
+        id: u32,
+    },
+    RunKeybindCallback {
+        id: u64,
+        target: Option<Box<crate::orchestration::TrustedTarget>>,
+    },
+    /// Host list-picker dialog event, reported by id because the mlua
+    /// callbacks stay in Lua app-data and never cross the UI channel.
+    PickerEvent {
+        id: u64,
+        ev: PickerEvent,
+    },
+    Describe {
+        plugin: Arc<str>,
+        tool: Arc<str>,
+        dctx: Value,
+        reply: flume::Sender<Option<String>>,
+    },
+    StartTool {
+        plugin: Arc<str>,
+        tool: Arc<str>,
+        input: Value,
+        live: LiveCtx,
+        ctx: Box<LuaCtx>,
+        reply: flume::Sender<()>,
+        /// See [`Request::CallTool::nested`].
+        nested: bool,
+    },
+    CollectCompletionItems {
+        ctx: CompletionCtx,
+        reply: flume::Sender<Vec<ItemSpec>>,
+    },
+    CollectCommandArgumentItems(CoalescedWork<CommandArgumentRequest>),
+    CommandArgumentLifecycle(CoalescedWork<CommandArgumentLifecycleRequest>),
+    ExpandReferences {
+        text: String,
+        reply: flume::Sender<Result<String, String>>,
+    },
+    SetSessionOption {
+        coordinator: makima_agent::session_coordinator::SessionCoordinatorHandle,
+        id: Arc<str>,
+        value: Arc<str>,
+        reply: flume::Sender<
+            Result<
+                makima_agent::session_options::SessionOptionsSnapshot,
+                crate::SessionOptionMutationError,
+            >,
+        >,
+    },
+}
+
+#[derive(Clone)]
+pub struct CommandArgumentContext {
+    pub command: Arc<str>,
+    pub plugin: Arc<str>,
+    pub args: String,
+    pub arg: String,
+    pub index: usize,
+    pub mode: String,
+    pub session: u64,
+    pub generation: u64,
+    pub command_generation: u64,
+    pub argument_name: Option<Arc<str>>,
+    pub argument_kind: Option<String>,
+    pub preceding_arguments: Arc<[ParsedArgument]>,
+}
+
+pub(crate) struct CommandArgumentRequest {
+    pub(crate) context: CommandArgumentContext,
+    pub(crate) callbacks: Option<Arc<crate::api::util::command::CommandCompletionCallbacks>>,
+    pub(crate) cancel: CancelToken,
+    pub(crate) reply: flume::Sender<Vec<crate::api::util::command::CommandArgumentItem>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum CommandArgumentLifecycle {
+    Highlight,
+    Accept,
+    Cancel,
+}
+
+/// Whether `pending` makes `this` stale for the coalescing lifecycle
+/// channel. Highlights coalesce with each other, and a highlight overtaken
+/// by a later accept or cancel is stale. Accepts are never superseded, and
+/// cancels only coalesce with each other: both are terminal actions of
+/// their own session, and an event that arrives after one belongs to a
+/// newer session (the popup reopens after accept/close). Evicting an
+/// Accept would silently drop its `on_accept` side effects, e.g. a splash
+/// selection save.
+pub(crate) fn lifecycle_superseded(
+    this: &CommandArgumentLifecycleRequest,
+    pending: &CommandArgumentLifecycleRequest,
+) -> bool {
+    if this.context.command != pending.context.command
+        || this.context.plugin != pending.context.plugin
+        || this.context.index != pending.context.index
+        || this.context.session != pending.context.session
+        || this.context.command_generation != pending.context.command_generation
+    {
+        return false;
+    }
+    match pending.event {
+        CommandArgumentLifecycle::Highlight => {
+            matches!(this.event, CommandArgumentLifecycle::Highlight)
+        }
+        CommandArgumentLifecycle::Accept => {
+            matches!(this.event, CommandArgumentLifecycle::Highlight)
+        }
+        CommandArgumentLifecycle::Cancel => matches!(
+            this.event,
+            CommandArgumentLifecycle::Highlight | CommandArgumentLifecycle::Cancel
+        ),
+    }
+}
+
+pub(crate) struct CommandArgumentLifecycleRequest {
+    pub(crate) context: CommandArgumentContext,
+    pub(crate) callbacks: Option<Arc<crate::api::util::command::CommandCompletionCallbacks>>,
+    pub(crate) event: CommandArgumentLifecycle,
+    pub(crate) item: Option<crate::api::util::command::CommandArgumentItem>,
+    pub(crate) cancel: CancelToken,
+    pub(crate) _lifecycle_owner: Option<LifecycleOwner>,
+}
+
+pub(crate) struct LifecycleOwner {
+    _trigger: makima_agent::CancelTrigger,
+}
+
+pub(crate) struct SplashFrameRequest {
+    pub(crate) width: u16,
+    pub(crate) height: u16,
+    pub(crate) elapsed_secs: f32,
+    pub(crate) fade: f32,
+    pub(crate) reply: flume::Sender<Option<SplashFrame>>,
+}
+
+pub struct RestoreItem {
+    pub tool: Arc<str>,
+    pub tool_use_id: String,
+    pub output: String,
+    pub input: Value,
+    pub is_error: bool,
+    pub tool_output_lines: makima_config::ToolOutputLines,
+    /// Lets the UI discard snapshots from a stale theme.
+    pub theme_gen: Option<u64>,
+    /// Buf rows the user clicked since the tool completed, replayed in
+    /// order after restore so the tool's own toggle logic reproduces the
+    /// expansion state (each row was measured against the layout the
+    /// previous replays produce).
+    pub clicks: Vec<usize>,
+    /// Structured state the tool persisted alongside its output.
+    pub state: Option<Value>,
+}
+
+pub(crate) struct ClickFallback {
+    pub item: RestoreItem,
+    pub event_tx: makima_agent::EventSender,
+}
+
+pub(crate) struct RestoreReply {
+    pub body: Option<BufferSnapshot>,
+    pub header: Option<BufferSnapshot>,
+}
+
+/// The UI restores tool bodies from these events; a send can only fail when
+/// the receiver is gone, but that still loses the snapshot, so it gets a log.
+pub(crate) fn send_render_event(
+    event_tx: &makima_agent::EventSender,
+    tool_id: &str,
+    what: &str,
+    event: makima_agent::AgentEvent,
+) {
+    if event_tx.send(event).is_err() {
+        tracing::warn!(tool_id, what, "tool render event dropped: channel closed");
+    }
+}
+
+impl RestoreReply {
+    pub(crate) fn emit(
+        self,
+        tool_use_id: &str,
+        theme_gen: Option<u64>,
+        event_tx: &makima_agent::EventSender,
+    ) {
+        if let Some(snapshot) = self.body {
+            send_render_event(
+                event_tx,
+                tool_use_id,
+                "body_snapshot",
+                makima_agent::AgentEvent::ToolSnapshot {
+                    id: tool_use_id.to_owned(),
+                    snapshot,
+                    theme_gen,
+                },
+            );
+        }
+        if let Some(snapshot) = self.header {
+            send_render_event(
+                event_tx,
+                tool_use_id,
+                "header_snapshot",
+                makima_agent::AgentEvent::ToolHeaderSnapshot {
+                    id: tool_use_id.to_owned(),
+                    snapshot,
+                    theme_gen,
+                },
+            );
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct LiveCtx {
+    pub event_tx: makima_agent::EventSender,
+    pub tool_use_id: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum KillReason {
+    Cancelled,
+    Deadline,
+}
+
+/// Shares invocation state between Lua execution and captured publication claims.
+pub(crate) struct TaskCell {
+    pub(crate) id: u64,
+    pub(crate) cancel: CancelToken,
+    pub(crate) managed_turn: Option<CurrentManagedTurn>,
+    pub(crate) plugin_origin: Option<(Arc<str>, u64)>,
+    pub(crate) plugin_owner: Option<Arc<crate::orchestration::PluginAuthority>>,
+    pub(crate) scope_alive: bool,
+    publication_cancel: CancelToken,
+    publication_trigger: Option<CancelTrigger>,
+    pub(crate) delegated_tool: Option<DelegatedTool>,
+    /// Ids of the tasks whose `makima.async.run` spawned this one, outermost first.
+    ancestors: Arc<[u64]>,
+    /// How many event callbacks fired one another to start this task.
+    pub(crate) event_depth: u8,
+    defer_close: Vec<Box<dyn FnOnce() + Send>>,
+    /// End of the current kill grace, armed by the first watchdog poke that
+    /// sees a doomed task and cleared at every yield.
+    kill_at: Cell<Option<Instant>>,
+    kill_grace: Duration,
+    pub(crate) deadline: Cell<Option<Instant>>,
+    pub(crate) deadline_secs: Cell<Option<u64>>,
+    /// Notified by `ctx:set_deadline`, so [`until_abandoned`] re-arms on the
+    /// new deadline instead of staying parked on the one it started with.
+    pub(crate) deadline_changed: Event,
+    pub(crate) bufs: BufferStore,
+    pub(crate) live: Option<LiveCtx>,
+    /// The buf that owns click routing for this task: the last one passed
+    /// to `ctx:live_buf` or returned as a reply/restore `body`. Fallback is
+    /// the first buf the task created (`bufs.live_buf()`).
+    pub(crate) root_buf: Option<Arc<SharedBuf>>,
+    /// Forwards live bufs and annotations to a parent
+    /// `makima.agent.call_tool(on_live_buf/on_annotation)`.
+    pub(crate) live_sink: Option<flume::Sender<ToolLive>>,
+    /// When `Some`, `makima.async.run` tasks queue here instead of the global
+    /// `SpawnQueue` so restore can run them inline before snapshotting.
+    pub(crate) inline_spawn: Option<Vec<PendingAsyncTask>>,
+    /// Cleared for delivery scopes: a job may not bind to a scope that dies
+    /// with one event-delivery batch.
+    owns_jobs: bool,
+    /// `makima.async.on_cancel` callbacks, fired once by [`ScopedFuture::poll`]
+    /// and dropped, so a handler parked in an await still gets to paint the
+    /// cancelled state before the host stops waiting for it.
+    cancel_hooks: Vec<RegistryKey>,
+    /// Set by [`TaskScope::new`]; `enqueue_async_task` upgrades it so queued
+    /// tasks share ownership of `bufs`. See [`BufsClaim`].
+    bufs_claim: Weak<BufsClaim>,
+    /// Slash-command hops that led to this task, so `makima.api.run_command`
+    /// can refuse to extend a chain that never ends. Inherited by
+    /// `makima.async.run` tasks, or a cycle could hop through one and reset it.
+    pub(crate) command_depth: u8,
+    pub(crate) command_invocation: Option<CommandTaskInvocation>,
+    /// The agent a keymap or event callback was pinned to, so nested
+    /// `run_command` calls address it rather than current focus.
+    pub(crate) pinned_target: Option<TrustedTarget>,
+}
+
+impl TaskCell {
+    pub(crate) fn register_publication(
+        &self,
+        publication: &CheckpointPublication,
+    ) -> [PublicationRegistration; 2] {
+        if !self.is_live() {
+            publication.cancel();
+        }
+        [
+            self.publication_cancel.register_publication(publication),
+            self.cancel.register_publication(publication),
+        ]
+    }
+
+    pub(crate) fn invalidate_publications(&mut self) {
+        self.publication_trigger.take();
+    }
+
+    pub(crate) fn set_plugin_origin(&mut self, origin: Option<(Arc<str>, u64)>) {
+        if self.plugin_origin != origin {
+            self.publication_trigger.take();
+            let (trigger, cancel) = CancelToken::new();
+            self.publication_trigger = Some(trigger);
+            self.publication_cancel = cancel;
+            self.plugin_origin = origin;
+        }
+    }
+
+    pub(crate) fn validate_plugin_effect(&self) -> Result<(), String> {
+        if self
+            .plugin_owner
+            .as_ref()
+            .is_some_and(|owner| !owner.is_alive())
+        {
+            return Err(crate::agent_errors::ORCHESTRATION_CONTEXT_EXPIRED.into());
+        }
+        if !self.is_live() {
+            return Err(crate::agent_errors::INVOCATION_EXPIRED.into());
+        }
+        Ok(())
+    }
+
+    /// Whether the task may still act: its scope is open, it is not
+    /// cancelled and its deadline has not passed.
+    pub(crate) fn is_live(&self) -> bool {
+        self.scope_alive
+            && !self.cancel.is_cancelled()
+            && self
+                .deadline
+                .get()
+                .is_none_or(|deadline| Instant::now() <= deadline)
+    }
+
+    pub(crate) fn new(
+        cancel: CancelToken,
+        deadline: Option<Instant>,
+        live: Option<LiveCtx>,
+    ) -> Self {
+        let (publication_trigger, publication_cancel) = CancelToken::new();
+        Self {
+            id: NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed),
+            cancel,
+            managed_turn: None,
+            delegated_tool: None,
+            ancestors: Arc::default(),
+            event_depth: 0,
+            plugin_origin: None,
+            plugin_owner: None,
+            scope_alive: true,
+            publication_cancel,
+            publication_trigger: Some(publication_trigger),
+            defer_close: Vec::new(),
+            kill_at: Cell::new(None),
+            kill_grace: KILL_GRACE,
+            deadline: Cell::new(deadline),
+            deadline_secs: Cell::new(None),
+            deadline_changed: Event::new(),
+            bufs: BufferStore::new(),
+            live,
+            root_buf: None,
+            live_sink: None,
+            inline_spawn: None,
+            cancel_hooks: Vec::new(),
+            bufs_claim: Weak::new(),
+            owns_jobs: true,
+            command_depth: 0,
+            command_invocation: None,
+            pinned_target: None,
+        }
+    }
+
+    fn with_kill_grace(mut self, kill_grace: Duration) -> Self {
+        self.kill_grace = kill_grace;
+        self
+    }
+
+    pub(crate) fn into_handle(self) -> TaskHandle {
+        Arc::new(Mutex::new(self))
+    }
+
+    /// Cancel outranks the deadline: once nobody waits for the reply,
+    /// reporting a timeout would only mislead.
+    fn doomed(&self, now: Instant) -> Option<KillReason> {
+        if self.cancel.is_cancelled() {
+            Some(KillReason::Cancelled)
+        } else if self.deadline.get().is_some_and(|d| now > d) {
+            Some(KillReason::Deadline)
+        } else {
+            None
+        }
+    }
+
+    /// [`Self::doomed`] gated by [`KILL_GRACE`]: the task is only shot
+    /// once it has burned a whole grace inside one execution slice.
+    fn kill_due(&self, now: Instant) -> Option<KillReason> {
+        let Some(reason) = self.doomed(now) else {
+            self.renew_kill_grace();
+            return None;
+        };
+        match self.kill_at.get() {
+            Some(kill_at) if now <= kill_at => None,
+            // No stamp yet, or the grace just ran out. Either way a slice
+            // starts now: a raise is usually caught (a `pcall`, or a
+            // `gather` child dying inside its parent's slice) and what
+            // runs next is the cleanup the grace exists for.
+            stamp => {
+                self.kill_at.set(Some(now + self.kill_grace));
+                stamp.is_some().then_some(reason)
+            }
+        }
+    }
+
+    /// The task yielded, so its grace starts over: a task parked in an await
+    /// would otherwise burn the whole budget before it gets to clean up.
+    fn renew_kill_grace(&self) {
+        self.kill_at.set(None);
+    }
+
+    /// Hooks of a task that ended without a cancel never fire, so this is
+    /// the only thing that unpins their closures and captures.
+    fn clear_cancel_hooks(&mut self, lua: &Lua) {
+        for key in self.cancel_hooks.drain(..) {
+            lua.remove_registry_value(key).ok();
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CommandTaskInvocation {
+    pub(crate) invocation: CommandInvocation,
+}
+
+pub(crate) type TaskHandle = Arc<Mutex<TaskCell>>;
+
+type LiveTasks = Rc<RefCell<HashMap<String, TaskHandle>>>;
+type WarmTools = Rc<RefCell<VecDeque<WarmTool>>>;
+
+/// A finished tool that still answers clicks. `handle` is a fresh cell
+/// holding only the root buf; `_claim` keeps the buf handler slots alive
+/// (they normally clear at scope drop) until this entry is evicted.
+struct WarmTool {
+    id: String,
+    handle: TaskHandle,
+    _claim: Arc<BufsClaim>,
+}
+
+pub(crate) fn lock_cell(handle: &TaskHandle) -> std::sync::MutexGuard<'_, TaskCell> {
+    handle.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Backs `makima.async.on_cancel`. An already cancelled task has no
+/// transition left for [`ScopedFuture::poll`] to ride, so it fires inline,
+/// and only after registering, so a raising hook is contained either way
+/// instead of blowing up whoever armed it.
+pub(crate) fn register_cancel_hook(lua: &Lua, callback: Function) -> Result<(), mlua::Error> {
+    let handle = active_task(lua);
+    let key = lua.create_registry_value(callback)?;
+    let cancelled = {
+        let mut cell = lock_cell(&handle);
+        cell.cancel_hooks.push(key);
+        cell.cancel.is_cancelled()
+    };
+    if cancelled {
+        fire_cancel_hooks(lua, &handle, KillReason::Cancelled);
+    }
+    Ok(())
+}
+
+fn fire_cancel_hooks(lua: &Lua, handle: &TaskHandle, reason: KillReason) {
+    // Hooks word their partial-output marker from this string.
+    let reason = match reason {
+        KillReason::Cancelled => CANCELLED_MSG,
+        KillReason::Deadline => HANDLER_TIMEOUT_MSG,
+    };
+    let hooks = std::mem::take(&mut lock_cell(handle).cancel_hooks);
+    for key in hooks {
+        if let Err(e) = lua
+            .registry_value::<Function>(&key)
+            .and_then(|f| f.call::<()>(reason))
+        {
+            tracing::warn!(error = %strip_traceback(&e), "cancel hook failed");
+        }
+        lua.remove_registry_value(key).ok();
+    }
+}
+
+/// The buf whose click handler owns this task's clicks: the explicit root
+/// (live_buf / reply body / restore body), else the first created buf.
+fn resolve_root_buf(handle: &TaskHandle) -> Option<Arc<SharedBuf>> {
+    let cell = lock_cell(handle);
+    cell.root_buf
+        .clone()
+        .or_else(|| cell.bufs.live_buf().cloned())
+}
+
+/// Sole place the `--no-jit` flag touches VM state. Called once at VM
+/// creation, before any chunk (init.lua included) is compiled, and hands back
+/// the compiler so bundled modules compile the same way. Jit off drops to the
+/// O1 interpreter with full debug info, the combination that keeps the most
+/// usable backtraces.
+///
+/// Native codegen stays off at load time either way: mlua runs it inline from
+/// `Lua::load`, and doing that for every plugin was the single largest cost of
+/// startup. Loaded chunks go to a [`CodegenQueue`] instead.
+fn install_compiler(lua: &Lua, jit: bool) -> Compiler {
+    lua.enable_jit(false);
+    let compiler = if jit {
+        Compiler::new().set_optimization_level(OPT_LEVEL_JIT)
+    } else {
+        Compiler::new()
+            .set_optimization_level(OPT_LEVEL_DEBUGGABLE)
+            .set_debug_level(DEBUG_INFO_FULL)
+    };
+    lua.set_compiler(compiler.clone());
+    compiler
+}
+
+/// Many plugins require the same bundled module, and each one needs a separate
+/// instance because the module closes over the plugin's `makima`. Only the
+/// instantiation has to repeat, so the source is compiled to bytecode once per
+/// VM rather than once per plugin.
+#[derive(Clone)]
+struct BundledModules {
+    dirs: &'static [&'static Dir<'static>],
+    compiler: Compiler,
+    bytecode: Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>,
+}
+
+impl BundledModules {
+    fn bytecode(&self, rel_path: &str) -> Result<Option<Arc<Vec<u8>>>, mlua::Error> {
+        let mut cache = self.bytecode.lock().expect("bytecode cache");
+        if let Some(cached) = cache.get(rel_path) {
+            return Ok(Some(Arc::clone(cached)));
+        }
+        let Some(source) = self
+            .dirs
+            .iter()
+            .find_map(|dir| dir.get_file(rel_path).and_then(|f| f.contents_utf8()))
+        else {
+            return Ok(None);
+        };
+        let compiled = Arc::new(self.compiler.compile(source)?);
+        cache.insert(rel_path.to_owned(), Arc::clone(&compiled));
+        Ok(Some(compiled))
+    }
+}
+
+/// Chunks awaiting native codegen, `None` when jit is off. Compiling a chunk's
+/// main function also compiles every function nested in it, and the native code
+/// lives on the shared proto, so closures already handed to the tool registry
+/// get faster too.
+type CodegenQueue = Option<Arc<Mutex<Vec<Function>>>>;
+
+fn queue_codegen(queue: &CodegenQueue, func: &Function) {
+    if let Some(queue) = queue {
+        queue.lock().expect("codegen queue").push(func.clone());
+    }
+}
+
+struct ModuleLoader {
+    bundled: BundledModules,
+    lua_dir: Option<PathBuf>,
+    env: Table,
+    codegen: CodegenQueue,
+    loaded: Table,
+    loading: Table,
+}
+
+impl ModuleLoader {
+    /// Bundled modules are tried first, so a plugin cannot shadow
+    /// `makima.truncate` and friends with a file of its own.
+    fn plugin_source(&self, rel_path: &str, modname: &str) -> Result<Option<String>, mlua::Error> {
+        let Some(dir) = self.lua_dir.as_ref() else {
+            return Ok(None);
+        };
+        let normalized = dir
+            .join(rel_path)
+            .components()
+            .fold(PathBuf::new(), |mut acc, c| {
+                match c {
+                    std::path::Component::ParentDir => {
+                        acc.pop();
+                    }
+                    std::path::Component::CurDir => {}
+                    _ => acc.push(c),
+                }
+                acc
+            });
+        if !normalized.starts_with(dir) {
+            return Err(mlua::Error::runtime(format!(
+                "require: '{modname}' outside sandbox"
+            )));
+        }
+        Ok(std::fs::read_to_string(&normalized).ok())
+    }
+
+    fn bind(&self, chunk: Chunk<'_>, modname: &str) -> Result<Function, mlua::Error> {
+        chunk
+            .set_name(modname)
+            .set_environment(self.env.clone())
+            .into_function()
+    }
+
+    /// Bundled modules load as bytecode from the shared cache. Plugin files
+    /// load as source, so Luau reports syntax errors against the file the user
+    /// wrote.
+    fn load(&self, lua: &Lua, modname: &str) -> Result<LuaValue, mlua::Error> {
+        let rel_path = modname.replace('.', "/") + ".lua";
+        let func = match self.bundled.bytecode(&rel_path)? {
+            Some(bytecode) => self.bind(
+                lua.load(bytecode.as_slice()).set_mode(ChunkMode::Binary),
+                modname,
+            )?,
+            None => {
+                let Some(source) = self.plugin_source(&rel_path, modname)? else {
+                    return Err(mlua::Error::runtime(format!(
+                        "require '{modname}': module not found"
+                    )));
+                };
+                self.bind(lua.load(source.as_str()), modname)?
+            }
+        };
+        queue_codegen(&self.codegen, &func);
+        func.call(())
+    }
+
+    fn require(&self, lua: &Lua, modname: &str) -> Result<LuaValue, mlua::Error> {
+        if modname.is_empty() {
+            return Err(mlua::Error::runtime(
+                "require: module name must be non-empty",
+            ));
+        }
+
+        if let Ok(cached) = self.loaded.get::<LuaValue>(modname)
+            && cached != LuaValue::Nil
+        {
+            return Ok(cached);
+        }
+
+        if self.loading.get::<bool>(modname).unwrap_or(false) {
+            return Ok(LuaValue::Boolean(true));
+        }
+
+        if let Some(module) = docs_render::virtual_module(lua, modname) {
+            let module = module?;
+            self.loaded.set(modname, module.clone())?;
+            return Ok(LuaValue::Table(module));
+        }
+
+        // Cleared on every path, so a failed require never leaves the module
+        // wedged as "in progress".
+        self.loading.set(modname, true)?;
+        let result = self.load(lua, modname);
+        self.loading.set(modname, LuaValue::Nil)?;
+        let result = result?;
+
+        let stored = if result == LuaValue::Nil {
+            LuaValue::Boolean(true)
+        } else {
+            result.clone()
+        };
+        self.loaded.set(modname, stored)?;
+        Ok(result)
+    }
+}
+
+type InterruptFn = unsafe extern "C-unwind" fn(*mut ffi::lua_State, c_int);
+
+/// The poker thread and the VM thread race on this field, so the write
+/// must be atomic to stay defined behavior on the Rust side.
+fn store_interrupt(state: *mut ffi::lua_State, cb: Option<InterruptFn>) {
+    let raw = cb.map_or(ptr::null_mut(), |f| f as *mut ());
+    unsafe {
+        let slot = &raw mut (*ffi::lua_callbacks(state)).interrupt;
+        AtomicPtr::from_ptr(slot.cast::<*mut ()>()).store(raw, Ordering::Release);
+    }
+}
+
+/// Shutdown flag mirrored into app data so the watchdog interrupt can
+/// re-check it on the Lua thread.
+struct ShutdownFlag(Arc<AtomicBool>);
+
+/// Cancellation watchdog. A resident mlua interrupt fires at every
+/// safepoint and costs ~100ns a pop, which ate most of the codegen win
+/// (see `benches/luau_perf.rs`). So the VM runs with no interrupt at
+/// all, and this thread arms a one-shot native one every poll tick.
+/// Luau documents `lua_callbacks(L)->interrupt` as safe to assign from
+/// another thread, and the VM only pays a null check per safepoint.
+/// The callback re-checks shutdown/cancel/deadline on the Lua thread
+/// before raising, so a stale poke never kills the wrong task.
+struct Watchdog {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Watchdog {
+    fn spawn(lua: &Lua, shutdown: Arc<AtomicBool>) -> Self {
+        lua.set_app_data(ShutdownFlag(shutdown));
+        let main_state =
+            lua.exec_raw_lua(|raw| unsafe { ffi::lua_mainthread(raw.state()) }) as usize;
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = thread::spawn({
+            let stop = Arc::clone(&stop);
+            // Keeps the VM alive while this thread can still write to it,
+            // even if a refactor reorders drops.
+            let keep_alive = lua.clone();
+            move || {
+                let _keep_alive = keep_alive;
+                loop {
+                    thread::park_timeout(WATCHDOG_POLL_INTERVAL);
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    store_interrupt(main_state as *mut ffi::lua_State, Some(watchdog_interrupt));
+                }
+            }
+        });
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            thread.thread().unpark();
+            let _ = thread.join();
+        }
+    }
+}
+
+/// One-shot interrupt armed by [`Watchdog`]: disarms itself, re-checks the
+/// kill conditions, and raises a plain string error that unwinds like any
+/// Lua error. Must not raise during GC (`gc >= 0`), same rule mlua follows.
+unsafe extern "C-unwind" fn watchdog_interrupt(state: *mut ffi::lua_State, gc: c_int) {
+    if gc >= 0 {
+        return;
+    }
+    store_interrupt(state, None);
+    // A Rust panic must not unwind into the VM; treat it as "no kill".
+    let msg = catch_unwind(|| interrupt_reason(state)).unwrap_or(None);
+    if let Some(msg) = msg {
+        unsafe {
+            // A safepoint frame may have zero free slots; grow before pushing
+            // (raw pushes assert a free slot). On failure the next poke retries.
+            if ffi::lua_checkstack(state, 1) == 0 {
+                return;
+            }
+            ffi::lua_pushlstring(state, msg.as_ptr().cast(), msg.len());
+            ffi::lua_error(state);
+        }
+    }
+}
+
+fn interrupt_reason(state: *mut ffi::lua_State) -> Option<&'static str> {
+    let lua = unsafe { Lua::get_or_init_from_ptr(state) };
+    if lua
+        .app_data_ref::<ShutdownFlag>()
+        .is_some_and(|f| f.0.load(Ordering::Relaxed))
+    {
+        return Some(INTERRUPT_SHUTDOWN_MSG);
+    }
+    let handle = lua.app_data_ref::<TaskHandle>()?;
+    let reason = lock_cell(&handle).kill_due(Instant::now())?;
+    Some(match reason {
+        KillReason::Cancelled => INTERRUPT_CANCELLED_MSG,
+        KillReason::Deadline => INTERRUPT_DEADLINE_MSG,
+    })
+}
+
+/// Scopes a `TaskCell` into `Lua::app_data` for one task, restoring
+/// the previous on drop. Async work must use `scope_future` because
+/// concurrent tasks on the same executor overwrite app_data between yields.
+pub(crate) struct TaskScope {
+    lua: Lua,
+    handle: TaskHandle,
+    prev: Option<TaskHandle>,
+    /// Dropped after `Drop::drop` runs, so jobs die before bufs can clear.
+    /// Warm entries clone it to keep buf handlers alive past completion.
+    bufs_claim: Arc<BufsClaim>,
+}
+
+impl TaskScope {
+    pub(crate) fn new(lua: &Lua, cell: TaskCell) -> Self {
+        let handle: TaskHandle = Arc::new(Mutex::new(cell));
+        let claim = Arc::new(BufsClaim(Arc::clone(&handle)));
+        lock_cell(&handle).bufs_claim = Arc::downgrade(&claim);
+        let prev = lua.set_app_data::<TaskHandle>(Arc::clone(&handle));
+        Self {
+            lua: lua.clone(),
+            handle,
+            prev,
+            bufs_claim: claim,
+        }
+    }
+
+    /// The shared Lua keeps the last task's handle around, so system
+    /// callbacks need a fresh scope or the watchdog interrupt kills them
+    /// (stale handle looks cancelled). Prefer [`run_detached`] over raw
+    /// scopes.
+    pub(crate) fn detached(lua: &Lua) -> Self {
+        Self::new(lua, TaskCell::new(CancelToken::none(), None, None))
+    }
+
+    /// [`Self::detached`] for event-delivery batches: the scope dies with the
+    /// batch, so a job bound to it would be killed microseconds after its
+    /// callback returns. `job_task_id` returns `None` under it, turning that
+    /// silent kill into a loud `jobstart` error.
+    pub(crate) fn delivery(lua: &Lua) -> Self {
+        let scope = Self::detached(lua);
+        lock_cell(&scope.handle).owns_jobs = false;
+        scope
+    }
+
+    pub(crate) fn handle(&self) -> &TaskHandle {
+        &self.handle
+    }
+
+    pub(crate) fn bufs_claim(&self) -> Arc<BufsClaim> {
+        Arc::clone(&self.bufs_claim)
+    }
+
+    pub(crate) fn scope_future<F>(&self, inner: F) -> ScopedFuture<F> {
+        ScopedFuture::new(self.lua.clone(), Arc::clone(&self.handle), inner)
+    }
+}
+
+/// Runs an async system callback under a [detached] scope so callers
+/// can't forget to set one up.
+///
+/// Job callbacks (`on_stdout` etc.) are pumped whenever {fut} is
+/// suspended, so a handler parked in e.g. `win:recv()` still streams
+/// job output, like Neovim firing callbacks from its idle event loop.
+///
+/// [detached]: TaskScope::detached
+pub(crate) async fn run_detached<F: Future>(lua: &Lua, fut: F) -> F::Output {
+    run_scoped(lua, TaskScope::detached(lua), fut).await
+}
+
+async fn run_callback<F: Future>(lua: &Lua, fut: F) -> F::Output {
+    run_scoped(
+        lua,
+        TaskScope::new(lua, TaskCell::new(CancelToken::none(), None, None)),
+        fut,
+    )
+    .await
+}
+
+/// [`run_detached`] for plugin code a host caller is blocked on, carrying every
+/// obligation that waiting creates:
+///
+/// - counted against the [`InflightGate`], so a reload drains the code instead
+///   of tearing its environment away;
+/// - [`covered`], so a tool call the code makes rides this slot rather than
+///   queueing behind a gate its own caller is holding;
+/// - scoped to the caller's cancellation and `deadline`, so the watchdog can
+///   interrupt code that spins past either;
+/// - [`until_abandoned`], the only thing that ends code parked in an await,
+///   which runs no Lua for the watchdog to interrupt.
+///
+/// Four properties one call away, so a request handler cannot pick up three and
+/// quietly miss the fourth. `Err` says why the wait ended, never how the code
+/// fared.
+async fn run_awaited<F: Future>(
+    lua: &Lua,
+    gate: &Rc<InflightGate>,
+    cancel: CancelToken,
+    deadline: Instant,
+    fut: F,
+) -> Result<F::Output, &'static str> {
+    let scope = TaskScope::new(lua, TaskCell::new(cancel, Some(deadline), None));
+    let handle = Arc::clone(scope.handle());
+    covered(
+        Some(GateGuard::new(gate)),
+        until_abandoned(run_scoped(lua, scope, fut), &handle),
+    )
+    .await
+}
+
+/// [`run_detached`] for a slash-command handler, seeding the hop count that
+/// `makima.api.run_command` checks before extending the chain.
+pub(crate) async fn run_command_scoped<F: Future>(
+    lua: &Lua,
+    invocation: CommandInvocation,
+    target: Option<TrustedTarget>,
+    fut: F,
+) -> F::Output {
+    let scope = TaskScope::detached(lua);
+    {
+        let mut cell = lock_cell(scope.handle());
+        cell.command_depth = invocation.depth as u8;
+        cell.command_invocation = Some(CommandTaskInvocation { invocation });
+        cell.pinned_target = target;
+    }
+    run_scoped(lua, scope, fut).await
+}
+
+fn set_lua_command_options(
+    lua: &Lua,
+    opts: &mlua::Table,
+    invocation: &CommandInvocation,
+) -> mlua::Result<()> {
+    opts.set("args", invocation.arguments.as_ref())?;
+    let Some(parsed) = invocation.parsed_arguments.as_ref() else {
+        return Ok(());
+    };
+    let fargs = parsed
+        .tokens()
+        .iter()
+        .map(|token| token.value.as_ref())
+        .collect::<Vec<_>>();
+    opts.set("fargs", lua.create_sequence_from(fargs)?)?;
+    let values = lua.create_table()?;
+    for argument in parsed.arguments() {
+        let to_lua = |value: &ArgumentValue| -> mlua::Result<mlua::Value> {
+            Ok(match value {
+                ArgumentValue::String(value) | ArgumentValue::Enum(value) => {
+                    mlua::Value::String(lua.create_string(value.as_ref())?)
+                }
+                ArgumentValue::Integer(value) => mlua::Value::Integer(*value),
+                ArgumentValue::File(value) | ArgumentValue::Directory(value) => {
+                    mlua::Value::String(lua.create_string(value.to_string_lossy().as_ref())?)
+                }
+            })
+        };
+        let value = if argument.variadic {
+            let items = lua.create_table()?;
+            for (index, value) in argument.values.iter().enumerate() {
+                items.set(index + 1, to_lua(value)?)?;
+            }
+            mlua::Value::Table(items)
+        } else {
+            argument
+                .values
+                .first()
+                .map(to_lua)
+                .transpose()?
+                .unwrap_or(mlua::Value::Nil)
+        };
+        values.set(argument.name.as_ref(), value)?;
+    }
+    opts.set("values", values)?;
+    Ok(())
+}
+
+async fn run_command_completion_scoped<F: Future>(
+    lua: &Lua,
+    cancel: CancelToken,
+    fut: F,
+) -> Option<F::Output> {
+    let scope = TaskScope::new(
+        lua,
+        TaskCell::new(
+            cancel.clone(),
+            Some(Instant::now() + COMMAND_COMPLETION_DEADLINE),
+            None,
+        ),
+    );
+    let deadline = smol::Timer::after(COMMAND_COMPLETION_DEADLINE);
+    let bounded = smol::future::or(async { Some(fut.await) }, async {
+        deadline.await;
+        None
+    });
+    let result = scope
+        .scope_future(cancel.race(bounded))
+        .await
+        .ok()
+        .flatten();
+    drop(scope);
+    result
+}
+
+pub(crate) async fn run_scoped<F: Future>(lua: &Lua, scope: TaskScope, fut: F) -> F::Output {
+    let handle = Arc::clone(scope.handle());
+    let pump = async {
+        let mut event_buf = Vec::new();
+        loop {
+            let owner = JobOwner::Task(lock_cell(&handle).id);
+            with_jobs(lua, |store| store.drain_events(&owner, &mut event_buf));
+            for (job_id, event) in event_buf.drain(..) {
+                if let Err(e) = deliver_job_event(lua, job_id, &event) {
+                    tracing::warn!(error = %strip_traceback(&e), "detached job callback failed");
+                }
+            }
+            smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
+        }
+    };
+    let out = scope.scope_future(smol::future::or(fut, pump)).await;
+    drop(scope);
+    out
+}
+
+impl Drop for TaskScope {
+    fn drop(&mut self) {
+        let (task_id, cleanup) = {
+            let mut cell = lock_cell(&self.handle);
+            cell.scope_alive = false;
+            cell.publication_trigger.take();
+            cell.clear_cancel_hooks(&self.lua);
+            (cell.id, std::mem::take(&mut cell.defer_close))
+        };
+        for close in cleanup.into_iter().rev() {
+            if catch_unwind(std::panic::AssertUnwindSafe(close)).is_err() {
+                tracing::error!(task_id, "scope resource cleanup panicked");
+            }
+        }
+        with_jobs(&self.lua, |store| {
+            store.kill_owner(&self.lua, &JobOwner::Task(task_id));
+        });
+        match self.prev.take() {
+            Some(p) => {
+                self.lua.set_app_data(p);
+            }
+            None => {
+                self.lua.remove_app_data::<TaskHandle>();
+            }
+        }
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// Re-publishes the task handle on every `poll` so concurrent tasks
+    /// on the shared Lua each see their own `TaskCell`.
+    pub(crate) struct ScopedFuture<F> {
+        lua: Lua,
+        handle: TaskHandle,
+        // Waker registration on the task's token, dropped once the hooks have
+        // fired. Without it nothing would poll us while the handler sits parked
+        // in an await, and the hooks would wait on a child event that may
+        // never come. Already `Box::pin`ned, so no structural pinning needed.
+        cancel_wait: Option<Pin<Box<dyn Future<Output = ()>>>>,
+        #[pin]
+        inner: F,
+    }
+}
+
+impl<F> ScopedFuture<F> {
+    fn new(lua: Lua, handle: TaskHandle, inner: F) -> Self {
+        let cancel = lock_cell(&handle).cancel.clone();
+        Self {
+            lua,
+            handle,
+            cancel_wait: Some(Box::pin(async move { cancel.cancelled().await })),
+            inner,
+        }
+    }
+}
+
+impl<F: Future> Future for ScopedFuture<F> {
+    type Output = F::Output;
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.project();
+        // A poll means the task yielded, the cooperation the grace rewards.
+        lock_cell(this.handle).renew_kill_grace();
+        let prev = this.lua.set_app_data::<TaskHandle>(Arc::clone(this.handle));
+        if let Some(wait) = this.cancel_wait.as_mut()
+            && wait.as_mut().poll(cx).is_ready()
+        {
+            *this.cancel_wait = None;
+            fire_cancel_hooks(this.lua, this.handle, KillReason::Cancelled);
+        }
+        let result = this.inner.poll(cx);
+        match prev {
+            Some(p) => {
+                this.lua.set_app_data(p);
+            }
+            None => {
+                this.lua.remove_app_data::<TaskHandle>();
+            }
+        }
+        result
+    }
+}
+
+pub fn current_managed_turn(lua: &Lua) -> Option<CurrentManagedTurn> {
+    let handle = lua.app_data_ref::<TaskHandle>()?;
+    let cell = lock_cell(&handle);
+    cell.scope_alive
+        .then(|| cell.managed_turn.clone())
+        .flatten()
+}
+
+pub(crate) fn current_plugin(lua: &Lua) -> Option<(Arc<str>, u64)> {
+    let handle = lua.app_data_ref::<TaskHandle>()?;
+    let cell = lock_cell(&handle);
+    cell.scope_alive
+        .then(|| cell.plugin_origin.clone())
+        .flatten()
+}
+
+pub(crate) fn bind_plugin_owner(
+    lua: &Lua,
+    plugin: Arc<str>,
+    owner: Arc<crate::orchestration::PluginAuthority>,
+) -> mlua::Result<()> {
+    let task = active_task(lua);
+    let mut cell = lock_cell(&task);
+    cell.set_plugin_origin(Some((plugin, owner.generation())));
+    cell.plugin_owner = Some(owner);
+    cell.validate_plugin_effect().map_err(mlua::Error::runtime)
+}
+
+pub(crate) fn validate_plugin_effect(lua: &Lua) -> Result<(), String> {
+    let Some(task) = lua.app_data_ref::<TaskHandle>() else {
+        return Ok(());
+    };
+    lock_cell(&task).validate_plugin_effect()
+}
+
+pub(crate) fn register_defer_close(
+    lua: &Lua,
+    close: Box<dyn FnOnce() + Send>,
+) -> Result<(), String> {
+    let handle = lua
+        .app_data_ref::<TaskHandle>()
+        .ok_or("no active task scope")?;
+    let mut cell = lock_cell(&handle);
+    if !cell.scope_alive || cell.cancel.is_cancelled() {
+        return Err("task scope expired".into());
+    }
+    cell.defer_close.push(close);
+    Ok(())
+}
+
+pub(crate) fn active_task(lua: &Lua) -> TaskHandle {
+    lua.app_data_ref::<TaskHandle>()
+        .map(|r| Arc::clone(&*r))
+        .expect("task accessor called outside a task scope")
+}
+
+pub(crate) fn with_jobs<R>(lua: &Lua, f: impl FnOnce(&mut JobStore) -> R) -> R {
+    if lua.app_data_ref::<JobStore>().is_none() {
+        lua.set_app_data(JobStore::new());
+    }
+    let mut store = lua
+        .app_data_mut::<JobStore>()
+        .expect("job store was just installed");
+    f(&mut store)
+}
+
+pub(crate) fn active_task_id(lua: &Lua) -> Option<u64> {
+    let handle = lua.app_data_ref::<TaskHandle>()?;
+    Some(lock_cell(&handle).id)
+}
+
+/// Whether the running task may act on behalf of `origin`: it is `origin`
+/// or an async worker `origin` spawned. A sibling invocation under the same
+/// managed turn is not. Callers must not hold `origin`'s lock.
+pub(crate) fn same_invocation(lua: &Lua, origin: &TaskHandle) -> bool {
+    let Some(current) = lua.app_data_ref::<TaskHandle>() else {
+        return false;
+    };
+    if Arc::ptr_eq(&current, origin) {
+        return true;
+    }
+    let origin = lock_cell(origin).id;
+    lock_cell(&current).ancestors.contains(&origin)
+}
+
+/// Slash-command hops that led to the running task; 0 outside a command
+/// handler, so a keybind or tool calling `makima.api.run_command` starts fresh.
+pub(crate) fn command_depth(lua: &Lua) -> u8 {
+    lua.app_data_ref::<TaskHandle>()
+        .map_or(0, |handle| lock_cell(&handle).command_depth)
+}
+
+pub(crate) fn pinned_target(lua: &Lua) -> Option<crate::orchestration::TrustedTarget> {
+    lua.app_data_ref::<TaskHandle>()
+        .and_then(|handle| lock_cell(&handle).pinned_target.clone())
+}
+
+pub(crate) fn command_invocation(lua: &Lua) -> Option<CommandTaskInvocation> {
+    lua.app_data_ref::<TaskHandle>()
+        .and_then(|handle| lock_cell(&handle).command_invocation.clone())
+}
+
+/// A tool handler acting for a delegated turn, and the session that turn
+/// belongs to.
+#[derive(Clone, Default)]
+pub(crate) struct DelegatedTool {
+    pub(crate) session: Option<MakimaId>,
+}
+
+pub(crate) fn delegated_tool(lua: &Lua) -> Option<DelegatedTool> {
+    lua.app_data_ref::<TaskHandle>()
+        .and_then(|handle| lock_cell(&handle).delegated_tool.clone())
+}
+
+/// Whether the running code is a tool handler acting for a delegated turn.
+pub(crate) fn in_delegated_tool(lua: &Lua) -> bool {
+    lua.app_data_ref::<TaskHandle>()
+        .is_some_and(|handle| lock_cell(&handle).delegated_tool.is_some())
+}
+
+/// Host entry points registered from a delegated tool would later run with
+/// trusted contexts, so registration requires a non-delegated caller.
+pub(crate) fn deny_delegated_registration(lua: &Lua) -> mlua::Result<()> {
+    if in_delegated_tool(lua) {
+        return Err(mlua::Error::runtime(
+            crate::agent_errors::DELEGATED_REGISTRATION,
+        ));
+    }
+    validate_plugin_effect(lua).map_err(mlua::Error::runtime)
+}
+
+/// Task id for job ownership; `None` under a delivery scope.
+pub(crate) fn job_task_id(lua: &Lua) -> Option<u64> {
+    let handle = lua.app_data_ref::<TaskHandle>()?;
+    let cell = lock_cell(&handle);
+    cell.owns_jobs.then_some(cell.id)
+}
+
+pub(crate) fn with_task_bufs<R>(lua: &Lua, f: impl FnOnce(&mut BufferStore) -> R) -> R {
+    if let Some(handle) = lua.app_data_ref::<TaskHandle>() {
+        f(&mut lock_cell(&handle).bufs)
+    } else {
+        if lua.app_data_ref::<BufferStore>().is_none() {
+            lua.set_app_data(BufferStore::new());
+        }
+        let mut store = lua
+            .app_data_mut::<BufferStore>()
+            .expect("buffer store was just installed");
+        f(&mut store)
+    }
+}
+
+/// A working wake lands in microseconds, so this is only about failing in
+/// seconds instead of parking until nextest gives up on the suite.
+#[cfg(test)]
+const TEST_WAKE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const TEST_WAKE_TIMEOUT_MSG: &str = "timed out waiting for a cancelled task to wake";
+
+#[cfg(test)]
+pub(crate) fn block_on_or_fail<T>(fut: impl Future<Output = T>) -> T {
+    smol::block_on(futures_lite::future::or(fut, async {
+        smol::Timer::after(TEST_WAKE_TIMEOUT).await;
+        panic!("{TEST_WAKE_TIMEOUT_MSG}");
+    }))
+}
+
+#[cfg(test)]
+pub(crate) fn with_live_ctx<R>(lua: &Lua, f: impl FnOnce(&LiveCtx) -> R) -> Option<R> {
+    let handle = lua.app_data_ref::<TaskHandle>()?;
+    lock_cell(&handle).live.as_ref().map(f)
+}
+
+pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), mlua::Error> {
+    let handle = lua.app_data_ref::<TaskHandle>();
+    let (cancel, live_ctx, managed_turn, command_depth, command_invocation, ancestors) =
+        match &handle {
+            Some(h) => {
+                let cell = lock_cell(h);
+                (
+                    cell.cancel.clone(),
+                    cell.live.clone(),
+                    cell.managed_turn.clone(),
+                    cell.command_depth,
+                    cell.command_invocation.clone(),
+                    cell.ancestors.iter().copied().chain([cell.id]).collect(),
+                )
+            }
+            None => (CancelToken::none(), None, None, 0, None, Arc::default()),
+        };
+
+    let mut task = PendingAsyncTask {
+        work_fn,
+        cancel,
+        deadline: Some(Instant::now() + ASYNC_RUN_DEFAULT_DEADLINE),
+        live_ctx,
+        owner: None,
+        plugin_grant: None,
+        managed_turn,
+        ancestors,
+        delegated_tool: handle
+            .as_ref()
+            .and_then(|handle| lock_cell(handle).delegated_tool.clone()),
+        command_depth,
+        command_invocation,
+        pinned_target: handle
+            .as_ref()
+            .and_then(|handle| lock_cell(handle).pinned_target.clone()),
+        call: TaskCall::Plain,
+    };
+
+    if let Some(h) = &handle {
+        let mut cell = lock_cell(h);
+        // Inline tasks live inside the cell, so a claim there would be a
+        // strong Arc cycle; they run before the scope drops anyway.
+        if let Some(inline) = cell.inline_spawn.as_mut() {
+            inline.push(task);
+            return Ok(());
+        }
+        task.owner = cell.bufs_claim.upgrade();
+    }
+
+    let queue = lua
+        .app_data_ref::<SpawnQueue>()
+        .ok_or_else(|| mlua::Error::runtime(SPAWN_QUEUE_NOT_INIT))?;
+    queue.tx.send(task).ok();
+    Ok(())
+}
+
+/// How many event callbacks fired one another to start the running task.
+pub(crate) fn event_depth(lua: &Lua) -> u8 {
+    lua.app_data_ref::<TaskHandle>()
+        .map_or(0, |handle| lock_cell(&handle).event_depth)
+}
+
+/// Names the session and its option values in a permission_scopes context;
+/// the callback runs before the tool has a ctx to read them from.
+fn permission_scopes_session(
+    lua: &Lua,
+    context: &mlua::Table,
+    session: &SessionRef,
+) -> mlua::Result<()> {
+    context.set("session_id", session.to_string())?;
+    let options = lua.create_table()?;
+    if let Ok(coordinator) =
+        makima_agent::session_coordinator::SessionCoordinatorHandle::resolve(session.id())
+    {
+        for state in coordinator.read().options().options.iter() {
+            options.set(state.definition.id.as_ref(), state.current_value.as_ref())?;
+        }
+    }
+    context.set("options", options)
+}
+
+/// Queues an event callback {work} as its own task, owned by {plugin} and
+/// cancelled with {cancel}, with a trusted ctx for {target} when there is one.
+pub(crate) fn enqueue_callback(
+    lua: &Lua,
+    work: Function,
+    plugin: Arc<str>,
+    event: &str,
+    cancel: CancelToken,
+    target: Option<TrustedTarget>,
+) -> mlua::Result<()> {
+    let depth = event_depth(lua) + 1;
+    let owner = crate::orchestration::plugin_authority(lua, plugin.clone());
+    let task = PendingAsyncTask {
+        work_fn: lua.create_registry_value(work)?,
+        cancel,
+        deadline: None,
+        live_ctx: None,
+        owner: None,
+        plugin_grant: Some((plugin.clone(), owner)),
+        managed_turn: None,
+        ancestors: Arc::default(),
+        delegated_tool: delegated_tool(lua),
+        command_depth: 0,
+        command_invocation: None,
+        pinned_target: target,
+        call: TaskCall::Event {
+            plugin,
+            event: Arc::from(event),
+            depth,
+        },
+    };
+    lua.app_data_ref::<SpawnQueue>()
+        .ok_or_else(|| mlua::Error::runtime(SPAWN_QUEUE_NOT_INIT))?
+        .tx
+        .send(task)
+        .ok();
+    Ok(())
+}
+
+/// Caps concurrent coroutines to avoid blowing the Lua stack.
+/// Also serves as a drain barrier for load/clear ops.
+struct InflightGate {
+    lua: Lua,
+    count: Cell<usize>,
+    ops_since_gc: Cell<usize>,
+    event: Event,
+}
+
+impl InflightGate {
+    fn new(lua: Lua) -> Self {
+        Self {
+            lua,
+            count: Cell::new(0),
+            ops_since_gc: Cell::new(0),
+            event: Event::new(),
+        }
+    }
+
+    fn increment(&self) {
+        self.count.set(self.count.get() + 1);
+    }
+
+    fn decrement(&self) {
+        self.count.set(self.count.get().saturating_sub(1));
+        self.event.notify(usize::MAX);
+        let ops = self.ops_since_gc.get() + 1;
+        if ops >= GC_STEP_INTERVAL {
+            self.ops_since_gc.set(0);
+            self.lua.gc_step().ok();
+        } else {
+            self.ops_since_gc.set(ops);
+        }
+    }
+
+    async fn wait_below(&self, limit: usize) {
+        loop {
+            if self.count.get() < limit {
+                return;
+            }
+            let listener = self.event.listen();
+            if self.count.get() < limit {
+                return;
+            }
+            listener.await;
+        }
+    }
+
+    /// Guards are taken on a task's first poll (`acquire`), so one yield
+    /// lets just-spawned tasks register before the barrier reads the count;
+    /// a `drain` queued right behind a spawn cannot slip past it.
+    async fn drain(&self) {
+        smol::future::yield_now().await;
+        self.wait_below(1).await;
+    }
+
+    /// Admission and accounting in one step, on the task's own poll: the
+    /// dispatcher can spawn a whole backlog in one go without ever parking,
+    /// and the cap still holds because no coroutine is created before its
+    /// guard exists.
+    async fn acquire(self: &Rc<Self>) -> GateGuard {
+        self.wait_below(MAX_INFLIGHT_TOOLS).await;
+        GateGuard::new(self)
+    }
+
+    /// [`Self::acquire`] for a call the host cannot interrupt yet. A call
+    /// still queued here has no [`TaskCell`], so the watchdog and
+    /// [`until_abandoned`] have nothing to end. The wait ends itself once
+    /// nobody is left waiting for the reply, and reports what the handler
+    /// would have reported.
+    async fn acquire_before_abandoned(
+        self: &Rc<Self>,
+        cancel: &CancelToken,
+        deadline: Option<Instant>,
+    ) -> Result<GateGuard, &'static str> {
+        let lapsed = async {
+            match deadline {
+                Some(at) => _ = smol::Timer::at(at).await,
+                None => std::future::pending::<()>().await,
+            }
+            HANDLER_TIMEOUT_MSG
+        };
+        let cancelled = async {
+            cancel.cancelled().await;
+            CANCELLED_MSG
+        };
+        futures_lite::future::or(async { Ok(self.acquire().await) }, async {
+            Err(futures_lite::future::or(cancelled, lapsed).await)
+        })
+        .await
+    }
+}
+
+thread_local! {
+    static SLOT_COVERED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the caller already runs under an in-flight slot.
+///
+/// A tool call made from there cannot finish before its caller does, and the
+/// caller holds its slot all that time. Charge the child a slot of its own and
+/// the gate deadlocks against itself: park as many callers as there are slots
+/// and no child is ever admitted, so no caller ever returns. The child rides
+/// the caller's slot instead, which also keeps the drain barrier honest, since
+/// that slot outlives the whole subtree.
+pub(crate) fn under_inflight_slot() -> bool {
+    SLOT_COVERED.get()
+}
+
+pin_project_lite::pin_project! {
+    /// `slot` is `None` when an ancestor holds the slot for this work. The
+    /// flag goes up on every poll and back down after, because other tasks on
+    /// the same executor run in between and must not inherit the cover.
+    struct SlotCovered<F> {
+        _slot: Option<GateGuard>,
+        #[pin]
+        inner: F,
+    }
+}
+
+impl<F: Future> Future for SlotCovered<F> {
+    type Output = F::Output;
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let prev = SLOT_COVERED.replace(true);
+        let result = self.project().inner.poll(cx);
+        SLOT_COVERED.set(prev);
+        result
+    }
+}
+
+fn covered<F: Future>(slot: Option<GateGuard>, inner: F) -> SlotCovered<F> {
+    SlotCovered { _slot: slot, inner }
+}
+
+struct GateGuard(Rc<InflightGate>);
+
+impl GateGuard {
+    fn new(gate: &Rc<InflightGate>) -> Self {
+        gate.increment();
+        Self(Rc::clone(gate))
+    }
+}
+
+impl Drop for GateGuard {
+    fn drop(&mut self) {
+        self.0.decrement();
+    }
+}
+
+/// Restore items run as spawned tasks, so queue order no longer says when a
+/// batch is done: the App sends its `restoring` flag after the items, and the
+/// flag may only clear once every in-flight item has finished (it drives the
+/// restore spinner).
+#[derive(Default)]
+struct RestoreTracker {
+    inflight: Cell<usize>,
+    flags: RefCell<Vec<Arc<AtomicBool>>>,
+}
+
+impl RestoreTracker {
+    /// Flags are global across sessions on purpose: any batch reaching idle
+    /// releases every registered spinner flag.
+    fn release_if_idle(&self) {
+        if self.inflight.get() == 0 {
+            for flag in self.flags.borrow_mut().drain(..) {
+                flag.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn finish(&self) {
+        self.inflight.set(self.inflight.get().saturating_sub(1));
+        self.release_if_idle();
+    }
+
+    fn complete(&self, flag: Arc<AtomicBool>) {
+        self.flags.borrow_mut().push(flag);
+        self.release_if_idle();
+    }
+
+    /// Counts one in-flight item until the guard drops, so an early return
+    /// (or future refactor) inside a restore task can't strand the spinner.
+    fn track(self: &Rc<Self>) -> RestoreGuard {
+        self.inflight.set(self.inflight.get() + 1);
+        RestoreGuard(Rc::clone(self))
+    }
+}
+
+struct RestoreGuard(Rc<RestoreTracker>);
+
+impl Drop for RestoreGuard {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
+}
+
+pub(crate) struct PendingAsyncTask {
+    pub work_fn: RegistryKey,
+    pub cancel: CancelToken,
+    pub deadline: Option<Instant>,
+    pub live_ctx: Option<LiveCtx>,
+    pub owner: Option<Arc<BufsClaim>>,
+    pub plugin_grant: Option<(Arc<str>, Arc<crate::orchestration::PluginAuthority>)>,
+    pub managed_turn: Option<CurrentManagedTurn>,
+    pub ancestors: Arc<[u64]>,
+    pub delegated_tool: Option<DelegatedTool>,
+    pub command_depth: u8,
+    pub command_invocation: Option<CommandTaskInvocation>,
+    pub pinned_target: Option<TrustedTarget>,
+    pub call: TaskCall,
+}
+
+/// What a queued task's function is called with.
+pub(crate) enum TaskCall {
+    Plain,
+    /// Timer fires pass their id as the first argument.
+    Timer(u64),
+    /// Event callbacks get a trusted ctx for the pinned target, or nothing
+    /// when the event has no agent.
+    Event {
+        plugin: Arc<str>,
+        event: Arc<str>,
+        depth: u8,
+    },
+}
+
+/// Shared ownership of a task's `bufs`: the scope holds one clone, each
+/// queued `makima.async.run` task holds one, so the `Arc` strong count is the
+/// single source of truth for liveness. Dropping the last clone clears the
+/// store, breaking Lua GC watcher/click cycles. Root buf is resolved lazily
+/// because it may not exist at enqueue time.
+pub(crate) struct BufsClaim(TaskHandle);
+
+impl BufsClaim {
+    fn root_buf(&self) -> Option<Arc<SharedBuf>> {
+        resolve_root_buf(&self.0)
+    }
+}
+
+impl Drop for BufsClaim {
+    fn drop(&mut self) {
+        lock_cell(&self.0).bufs.clear();
+    }
+}
+
+/// Channel of `makima.async.run` tasks. The dispatcher recvs the `rx` side as
+/// one arm of its biased select, so a send wakes the loop even while the
+/// enqueuing coroutine stays parked.
+pub(crate) struct SpawnQueue {
+    tx: flume::Sender<PendingAsyncTask>,
+    rx: flume::Receiver<PendingAsyncTask>,
+}
+
+impl SpawnQueue {
+    fn new() -> Self {
+        let (tx, rx) = flume::unbounded();
+        Self { tx, rx }
+    }
+}
+
+/// Fire-and-forget callback queued from Lua. Runs on the Lua thread's
+/// executor after `delay`, outside any TaskScope: no cancel token, no
+/// script deadline. Meant for UI intent that must outlive the caller
+/// (a toast dismissing itself, a debounced repaint).
+///
+/// `cancel` is what the `Timer` handed back to Lua flips, and what
+/// [`DeferQueue::cancel_plugin`] flips on unload.
+pub(crate) struct DeferredCallback {
+    pub func: RegistryKey,
+    pub delay: Duration,
+    pub plugin: Arc<str>,
+    pub cancel: Arc<AtomicBool>,
+}
+
+pub(crate) struct DeferQueue {
+    tx: flume::Sender<DeferredCallback>,
+    pub(crate) rx: flume::Receiver<DeferredCallback>,
+    /// Timers that have not fired yet, by owner. A sleeping timer holds no
+    /// [`GateGuard`], so [`drain_barrier`] walks straight past it and a reload
+    /// would leave the callback to wake up against a torn down env. Cancelling
+    /// the doomed plugin's timers in [`LuaRuntime::clear_plugin`] closes that
+    /// window: whatever is left is either cancelled or already gated.
+    timers: Mutex<Vec<(Arc<str>, Arc<AtomicBool>)>>,
+}
+
+impl DeferQueue {
+    pub(crate) fn new() -> Self {
+        let (tx, rx) = flume::unbounded();
+        Self {
+            tx,
+            rx,
+            timers: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn locked(&self) -> std::sync::MutexGuard<'_, Vec<(Arc<str>, Arc<AtomicBool>)>> {
+        self.timers.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Hands the callback to the dispatcher and remembers it as pending, so
+    /// the two can never drift apart.
+    pub(crate) fn push(&self, cb: DeferredCallback) -> Result<(), DeferredCallback> {
+        let pending = (Arc::clone(&cb.plugin), Arc::clone(&cb.cancel));
+        self.tx.try_send(cb).map_err(|e| e.into_inner())?;
+        self.locked().push(pending);
+        Ok(())
+    }
+
+    fn forget(&self, cancel: &Arc<AtomicBool>) {
+        self.locked().retain(|(_, c)| !Arc::ptr_eq(c, cancel));
+    }
+
+    fn cancel_plugin(&self, plugin: &str) {
+        self.locked().retain(|(owner, cancel)| {
+            let doomed = &**owner == plugin;
+            if doomed {
+                cancel.store(true, Ordering::Release);
+            }
+            !doomed
+        });
+    }
+}
+
+fn spawn_deferred_callback(
+    lua: &Lua,
+    ex: &Rc<smol::LocalExecutor<'_>>,
+    gate: &Rc<InflightGate>,
+    cb: DeferredCallback,
+) {
+    let owner = crate::orchestration::plugin_authority(lua, cb.plugin.clone());
+    let lua = lua.clone();
+    let gate = Rc::clone(gate);
+    ex.spawn(async move {
+        smol::Timer::after(cb.delay).await;
+        let _guard = gate.acquire().await;
+        // Only now stop advertising the timer as pending: up to here a
+        // `clear_plugin` can still flip the flag we read below, and from here
+        // on the drain barrier waits for the guard instead.
+        if let Some(queue) = lua.app_data_ref::<DeferQueue>() {
+            queue.forget(&cb.cancel);
+        }
+        if cb.cancel.load(Ordering::Acquire) {
+            let _ = lua.remove_registry_value(cb.func);
+            return;
+        }
+        let run = async {
+            bind_plugin_owner(&lua, cb.plugin.clone(), owner)?;
+            let func: Function = lua.registry_value(&cb.func)?;
+            let thread = lua.create_thread(func)?;
+            thread.into_async::<()>(())?.await
+        };
+        if let Err(e) = run_detached(&lua, run).await {
+            tracing::warn!(plugin = %cb.plugin, error = %strip_traceback(&e), "defer_fn callback failed");
+        }
+        let _ = lua.remove_registry_value(cb.func);
+    })
+    .detach();
+}
+
+/// Ends `fut` once nobody waits for its reply any more: at `deadline`, or
+/// [`CANCEL_ABANDON_AFTER`] past a cancel, answering with why. The watchdog
+/// cannot do this on its own, because a task parked in an await runs no Lua
+/// to interrupt and renews its grace at every yield. `or`, not `race`: a
+/// handler that finished in the same slice deserves to have its result
+/// reported, even one whose deadline had already lapsed when it started.
+async fn until_abandoned<T>(
+    fut: impl Future<Output = T>,
+    handle: &TaskHandle,
+) -> Result<T, &'static str> {
+    let cancel = lock_cell(handle).cancel.clone();
+    let timed_out = async {
+        loop {
+            // Listen before reading: a `ctx:set_deadline` landing between the
+            // two wakes us instead of leaving us armed on the stale deadline.
+            let changed = lock_cell(handle).deadline_changed.listen();
+            // Bound before the match: the guard would outlive the await.
+            let deadline = lock_cell(handle).deadline.get();
+            match deadline {
+                Some(dl) if dl <= Instant::now() => {
+                    lock_cell(handle).invalidate_publications();
+                    break;
+                }
+                Some(dl) => {
+                    futures_lite::future::or(async { _ = smol::Timer::at(dl).await }, changed).await
+                }
+                None => changed.await,
+            }
+        }
+        HANDLER_TIMEOUT_MSG
+    };
+    let cancelled = async {
+        cancel.cancelled().await;
+        smol::Timer::after(CANCEL_ABANDON_AFTER).await;
+        CANCELLED_MSG
+    };
+    futures_lite::future::or(async { Ok(fut.await) }, async {
+        Err(futures_lite::future::or(timed_out, cancelled).await)
+    })
+    .await
+}
+
+async fn run_work_fn(
+    lua: &Lua,
+    work_fn: &RegistryKey,
+    handle: &TaskHandle,
+    call: &TaskCall,
+) -> Result<LuaValue, mlua::Error> {
+    let func: Function = lua.registry_value(work_fn)?;
+    let thread = lua.create_thread(func)?;
+    let fut = match call {
+        TaskCall::Plain => thread.into_async::<LuaValue>(())?,
+        TaskCall::Timer(id) => thread.into_async::<LuaValue>((*id,))?,
+        TaskCall::Event { plugin, .. } => {
+            let target = lock_cell(handle).pinned_target.clone();
+            let ctx = target.map(|target| LuaCtx::trusted_context(lua, target, plugin.clone()));
+            thread.into_async::<LuaValue>(ctx)?
+        }
+    };
+    until_abandoned(fut, handle)
+        .await
+        .unwrap_or_else(|msg| Err(mlua::Error::runtime(msg)))
+}
+
+/// Event callbacks count against {callbacks}, not the tool capacity in
+/// {gate}, so callbacks parked on a child's turn never starve that child's
+/// tools.
+fn spawn_async_task(
+    lua: &Lua,
+    ex: &Rc<smol::LocalExecutor<'_>>,
+    gate: &Rc<InflightGate>,
+    callbacks: &Rc<InflightGate>,
+    task: PendingAsyncTask,
+) {
+    if task.cancel.is_cancelled() {
+        tracing::debug!(
+            tool_id = task.live_ctx.as_ref().map(|l| l.tool_use_id.as_str()),
+            "async.run: cancelled before spawn"
+        );
+        lua.remove_registry_value(task.work_fn).ok();
+        return;
+    }
+
+    let lua = lua.clone();
+    let g = Rc::clone(gate);
+    let callback = matches!(task.call, TaskCall::Event { .. }).then(|| GateGuard::new(callbacks));
+
+    ex.spawn(async move {
+        let slot = match callback {
+            Some(_) => None,
+            None => Some(g.acquire().await),
+        };
+        let _callback = callback;
+
+        let mut cell = TaskCell::new(task.cancel.clone(), task.deadline, task.live_ctx.clone());
+        cell.managed_turn = task.managed_turn;
+        cell.ancestors = task.ancestors;
+        cell.delegated_tool = task.delegated_tool;
+        cell.command_depth = task.command_depth;
+        cell.command_invocation = task.command_invocation;
+        cell.pinned_target = task.pinned_target;
+        if let TaskCall::Event { depth, .. } = &task.call {
+            cell.event_depth = *depth;
+        }
+        if let Some(owner) = &task.owner {
+            let owner = lock_cell(&owner.0);
+            cell.set_plugin_origin(owner.plugin_origin.clone());
+            cell.plugin_owner = owner.plugin_owner.clone();
+        }
+        if let Some((plugin, owner)) = task.plugin_grant {
+            cell.set_plugin_origin(Some((plugin, owner.generation())));
+            cell.plugin_owner = Some(owner);
+        }
+        let scope = TaskScope::new(&lua, cell);
+        let handle = Arc::clone(scope.handle());
+        let result = covered(
+            slot,
+            scope.scope_future(run_work_fn(&lua, &task.work_fn, &handle, &task.call)),
+        )
+        .await;
+        if let Err(e) = &result {
+            match &task.call {
+                TaskCall::Event { plugin, event, .. } if !task.cancel.is_cancelled() => {
+                    tracing::warn!(error = %e, %plugin, %event, "autocmd callback failed");
+                }
+                _ => {
+                    let tool_id = task.live_ctx.as_ref().map(|l| l.tool_use_id.as_str());
+                    tracing::debug!(error = %e, tool_id, "async.run: task failed");
+                }
+            }
+        }
+
+        if let Some(ref live) = task.live_ctx
+            && let Some(buf) = task.owner.as_ref().and_then(|c| c.root_buf())
+        {
+            // Always `read`, not `read_if_dirty`: the dirty flag is
+            // consume-once and the UI polls each frame, so the flag
+            // races. Re-emitting identical content is harmless.
+            send_render_event(
+                &live.event_tx,
+                &live.tool_use_id,
+                "async_snapshot",
+                makima_agent::AgentEvent::ToolSnapshot {
+                    id: live.tool_use_id.clone(),
+                    snapshot: makima_agent::BufferSnapshot::from_arc(buf.read()),
+                    theme_gen: None,
+                },
+            );
+        }
+
+        drop(scope);
+        lua.remove_registry_value(task.work_fn).ok();
+    })
+    .detach();
+}
+
+/// Barrier for load/clear ops: drains queued `makima.async.run` tasks and
+/// waits for every in-flight task, looping until both are quiescent. A bare
+/// `gate.drain()` is not enough: a click handler that runs during the drain
+/// can enqueue an async job into the spawn queue, which only the dispatcher
+/// loop would spawn - after the barrier already passed.
+async fn drain_barrier(
+    lua: &Lua,
+    ex: &Rc<smol::LocalExecutor<'_>>,
+    gate: &Rc<InflightGate>,
+    callbacks: &Rc<InflightGate>,
+    spawn_rx: &flume::Receiver<PendingAsyncTask>,
+) {
+    loop {
+        while let Ok(task) = spawn_rx.try_recv() {
+            spawn_async_task(lua, ex, gate, callbacks, task);
+        }
+        tracing::debug!(tool_count = gate.count.get(), "Lua reload barrier started");
+        gate.drain().await;
+        tracing::debug!(tool_count = gate.count.get(), "Lua reload barrier drained");
+        if spawn_rx.is_empty() {
+            return;
+        }
+    }
+}
+
+struct ToolKeys {
+    generation: u64,
+    handler: RegistryKey,
+    header: Option<RegistryKey>,
+    restore: Option<RegistryKey>,
+    start: Option<RegistryKey>,
+    permission_scopes: Option<RegistryKey>,
+    mutable_path: Option<RegistryKey>,
+    describe: Option<RegistryKey>,
+}
+
+struct PluginOwner {
+    tools: HashMap<Arc<str>, ToolKeys>,
+    permissions: PluginPermissions,
+}
+
+type PluginMap = Rc<RefCell<HashMap<Arc<str>, PluginOwner>>>;
+
+#[derive(Clone)]
+pub(crate) struct LuaCommandBehavior {
+    pub(crate) plugin: Arc<str>,
+    pub(crate) command: Arc<str>,
+    pub(crate) generation: u64,
+    pub(crate) tx: flume::Sender<Request>,
+}
+
+impl CommandBehavior for LuaCommandBehavior {
+    fn execute(
+        &self,
+        invocation: CommandInvocation,
+    ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
+        if !invocation.content.attachments.is_empty() {
+            return Box::pin(async {
+                Err(CommandError::Producer(Arc::from(LUA_COMMAND_ATTACHMENTS)))
+            });
+        }
+        let (completion, finished) = flume::bounded(1);
+        let sent = self.tx.send(Request::ExecuteCommand {
+            plugin: Arc::clone(&self.plugin),
+            command: Arc::clone(&self.command),
+            generation: self.generation,
+            invocation,
+            completion,
+        });
+        Box::pin(async move {
+            let stopped = || CommandError::Producer(Arc::from(LUA_HOST_STOPPED));
+            sent.map_err(|_| stopped())?;
+            finished
+                .recv_async()
+                .await
+                .map_err(|_| stopped())?
+                .map_err(|error| CommandError::Producer(Arc::from(error)))?;
+            Ok(CommandOutcome::Completed)
+        })
+    }
+}
+
+struct LuaCommandCompletion {
+    plugin: Arc<str>,
+    command: Arc<str>,
+    argument_index: Option<usize>,
+    directory_navigation: bool,
+    callbacks: Option<Arc<CommandCompletionCallbacks>>,
+    command_generation: u64,
+    command_arguments: CoalescedLatest<CommandArgumentRequest>,
+    command_argument_lifecycle: CoalescedLatest<CommandArgumentLifecycleRequest>,
+    sessions: Mutex<HashMap<CompletionSessionId, LuaCompletionSession>>,
+    next_session_id: AtomicU64,
+}
+
+struct LuaCompletionSession {
+    id: u64,
+    _trigger: makima_agent::CancelTrigger,
+}
+
+impl LuaCommandCompletion {
+    fn context(
+        &self,
+        context: &CompletionContext,
+        trigger: makima_agent::CancelTrigger,
+        terminal: bool,
+    ) -> (CommandArgumentContext, Option<makima_agent::CancelTrigger>) {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let id = sessions
+            .get(&context.session_id)
+            .map(|session| session.id)
+            .unwrap_or_else(|| self.next_session_id.fetch_add(1, Ordering::Relaxed));
+        let request_trigger = if terminal {
+            sessions.remove(&context.session_id);
+            Some(trigger)
+        } else {
+            sessions.insert(
+                context.session_id,
+                LuaCompletionSession {
+                    id,
+                    _trigger: trigger,
+                },
+            );
+            None
+        };
+        let context = CommandArgumentContext {
+            command: Arc::clone(&self.command),
+            plugin: Arc::clone(&self.plugin),
+            args: context.arguments.to_string(),
+            arg: context.argument.to_string(),
+            index: context.argument_index,
+            mode: context.mode.to_string(),
+            session: id,
+            generation: context.generation,
+            command_generation: self.command_generation,
+            argument_name: context.argument_name.clone(),
+            argument_kind: context
+                .argument_kind
+                .as_ref()
+                .map(|kind| kind.type_name().to_owned()),
+            preceding_arguments: context.preceding_arguments.clone(),
+        };
+        (context, request_trigger)
+    }
+}
+
+impl CommandCompletion for LuaCommandCompletion {
+    fn complete(
+        &self,
+        context: CompletionContext,
+        cancellation: makima_commands::CancellationToken,
+    ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
+        let (trigger, cancel) = CancelToken::new();
+        if self
+            .argument_index
+            .is_some_and(|index| index != context.argument_index)
+        {
+            return Box::pin(async { Ok(Vec::new()) });
+        }
+        let (context, _) = self.context(&context, trigger, false);
+        let (reply, rx) = flume::bounded(1);
+        if !self.command_arguments.submit(CommandArgumentRequest {
+            context,
+            callbacks: self.callbacks.clone(),
+            cancel: cancel.clone(),
+            reply,
+        }) {
+            return Box::pin(async { Ok(Vec::new()) });
+        }
+        Box::pin(async move {
+            let items = cancel.race(rx.recv_async()).await.ok().and_then(Result::ok);
+            if cancellation.is_cancelled() {
+                return Ok(Vec::new());
+            }
+            Ok(items
+                .unwrap_or_default()
+                .into_iter()
+                .map(|item| CompletionItem {
+                    label: Arc::from(item.label),
+                    insertion: Arc::from(item.insertion),
+                    description: item.description.map(Arc::from),
+                })
+                .collect())
+        })
+    }
+
+    fn navigation(
+        &self,
+        _context: &CompletionContext,
+        _item: &CompletionItem,
+    ) -> makima_commands::CompletionItemNavigation {
+        if self.directory_navigation {
+            makima_commands::CompletionItemNavigation::Directory
+        } else {
+            makima_commands::CompletionItemNavigation::Terminal
+        }
+    }
+
+    fn lifecycle(
+        &self,
+        context: &CompletionContext,
+        event: &CompletionLifecycleEvent,
+        _cancellation: &makima_commands::CancellationToken,
+    ) -> Result<(), CompletionError> {
+        let (trigger, cancel) = CancelToken::new();
+        let terminal = matches!(
+            event,
+            CompletionLifecycleEvent::Accept(_) | CompletionLifecycleEvent::Cancel
+        );
+        let (context, trigger) = self.context(context, trigger, terminal);
+        let (event, item) = match event {
+            CompletionLifecycleEvent::Highlight(item) => (
+                CommandArgumentLifecycle::Highlight,
+                Some(command_argument_item(item)),
+            ),
+            CompletionLifecycleEvent::Accept(item) => (
+                CommandArgumentLifecycle::Accept,
+                Some(command_argument_item(item)),
+            ),
+            CompletionLifecycleEvent::Cancel => (CommandArgumentLifecycle::Cancel, None),
+        };
+        self.command_argument_lifecycle
+            .submit(CommandArgumentLifecycleRequest {
+                context,
+                callbacks: self.callbacks.clone(),
+                event,
+                item,
+                cancel,
+                _lifecycle_owner: trigger.map(|trigger| LifecycleOwner { _trigger: trigger }),
+            });
+        Ok(())
+    }
+}
+
+pub(crate) fn publish_registered_commands(lua: &Lua, plugin: &Arc<str>) -> mlua::Result<()> {
+    if lua
+        .app_data_ref::<LoadingPlugin>()
+        .is_some_and(|loading| loading.0 == *plugin)
+    {
+        return Ok(());
+    }
+    let publisher = lua
+        .app_data_ref::<CommandPublisher>()
+        .ok_or_else(|| mlua::Error::runtime("register_command: not initialized"))?;
+    let commands = lua
+        .app_data_ref::<CommandHandlerMap>()
+        .ok_or_else(|| mlua::Error::runtime("register_command: not initialized"))?;
+    let registrations = command_registrations(
+        lua,
+        commands.get(plugin),
+        plugin,
+        &publisher.tx,
+        &publisher.command_arguments,
+        &publisher.command_argument_lifecycle,
+    )?;
+    replace_command_producer(
+        &publisher.registry,
+        &publisher.producers,
+        plugin,
+        registrations,
+    )
+    .map_err(|error| mlua::Error::runtime(format!("invalid command registration: {error}")))?;
+    if let Some(plugin_commands) = commands.get(plugin) {
+        let mut generations = publisher
+            .command_generations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        generations.retain(|(owner, _), _| owner != plugin);
+        generations.extend(
+            plugin_commands
+                .iter()
+                .map(|(name, entry)| ((Arc::clone(plugin), Arc::clone(name)), entry.generation)),
+        );
+    }
+    Ok(())
+}
+
+fn resolve_command_handler(
+    lua: &Lua,
+    plugin: &Arc<str>,
+    command: &Arc<str>,
+    generation: u64,
+) -> Option<Function> {
+    lua.app_data_ref::<CommandHandlerMap>().and_then(|map| {
+        let entry = map.get(plugin)?.get(command)?;
+        (entry.generation == generation)
+            .then(|| lua.registry_value::<Function>(&entry.handler).ok())
+            .flatten()
+    })
+}
+
+fn clone_registry_key(lua: &Lua, key: &RegistryKey) -> mlua::Result<RegistryKey> {
+    lua.create_registry_value(lua.registry_value::<LuaValue>(key)?)
+}
+
+fn completion_callbacks(
+    lua: &Lua,
+    completion: &ArgumentCompletion,
+    argument_schema: Option<Arc<[makima_commands::PositionalArgument]>>,
+) -> mlua::Result<Arc<CommandCompletionCallbacks>> {
+    Ok(Arc::new(CommandCompletionCallbacks {
+        completion: clone_registry_key(lua, &completion.completion)?,
+        argument_schema,
+        on_highlight: completion
+            .on_highlight
+            .as_ref()
+            .map(|key| clone_registry_key(lua, key))
+            .transpose()?,
+        on_accept: completion
+            .on_accept
+            .as_ref()
+            .map(|key| clone_registry_key(lua, key))
+            .transpose()?,
+        on_cancel: completion
+            .on_cancel
+            .as_ref()
+            .map(|key| clone_registry_key(lua, key))
+            .transpose()?,
+    }))
+}
+
+fn command_registrations(
+    lua: &Lua,
+    commands: Option<&HashMap<Arc<str>, crate::api::util::command::CommandEntry>>,
+    plugin: &Arc<str>,
+    tx: &flume::Sender<Request>,
+    command_arguments: &CoalescedLatest<CommandArgumentRequest>,
+    command_argument_lifecycle: &CoalescedLatest<CommandArgumentLifecycleRequest>,
+) -> mlua::Result<Vec<Registration>> {
+    commands
+        .into_iter()
+        .flatten()
+        .map(|(name, entry)| {
+            let schema = entry.arguments.positional().map(Arc::from);
+            let argument_completions = schema
+                .as_deref()
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .map(|(index, _)| {
+                    let Some(completion) = entry
+                        .argument_completions
+                        .get(index)
+                        .and_then(Option::as_ref)
+                    else {
+                        return Ok(None);
+                    };
+                    let callbacks = completion_callbacks(lua, completion, schema.clone())?;
+                    let directory_navigation = matches!(
+                        completion.navigation,
+                        Some(crate::api::util::command::ArgumentCompletionNavigation::Directory)
+                    );
+                    Ok(Some(Arc::new(LuaCommandCompletion {
+                        plugin: Arc::clone(plugin),
+                        command: Arc::clone(name),
+                        argument_index: Some(index),
+                        directory_navigation,
+                        callbacks: Some(callbacks),
+                        command_generation: entry.generation,
+                        command_arguments: command_arguments.clone(),
+                        command_argument_lifecycle: command_argument_lifecycle.clone(),
+                        sessions: Mutex::new(HashMap::new()),
+                        next_session_id: AtomicU64::new(1),
+                    }) as Arc<dyn CommandCompletion>))
+                })
+                .collect::<mlua::Result<Vec<_>>>()?;
+            Ok(Registration {
+                spec: CommandSpec {
+                    name: Arc::clone(name),
+                    aliases: Arc::from([]),
+                    arguments: entry.arguments.clone(),
+                    docs: CommandDocs {
+                        summary: Arc::clone(&entry.description),
+                        argument_hint: entry.argument_hint.clone(),
+                    },
+                    required_capabilities: if entry.tui_only {
+                        TargetCapabilities::from_capability(TargetCapability::InteractiveUi)
+                    } else {
+                        TargetCapabilities::NONE
+                    },
+                },
+                behavior: Arc::new(LuaCommandBehavior {
+                    plugin: Arc::clone(plugin),
+                    command: Arc::clone(name),
+                    generation: entry.generation,
+                    tx: tx.clone(),
+                }),
+                argument_completions,
+            })
+        })
+        .collect()
+}
+
+fn replace_command_producer(
+    registry: &CommandRegistry,
+    producers: &Mutex<HashMap<Arc<str>, Producer>>,
+    plugin: &Arc<str>,
+    registrations: Vec<Registration>,
+) -> Result<(), RegistrationError> {
+    let mut producers = producers.lock().unwrap_or_else(|error| error.into_inner());
+    producers
+        .entry(Arc::clone(plugin))
+        .or_insert_with(|| registry.create_producer(ProducerPrecedence::Plugin))
+        .replace(registrations)
+}
+
+fn command_argument_item(item: &CompletionItem) -> crate::CommandArgumentItem {
+    crate::CommandArgumentItem {
+        label: item.label.to_string(),
+        insertion: item.insertion.to_string(),
+        description: item.description.as_ref().map(ToString::to_string),
+    }
+}
+
+struct CommandPublisher {
+    registry: CommandRegistry,
+    producers: Arc<Mutex<HashMap<Arc<str>, Producer>>>,
+    command_generations: Arc<Mutex<CommandGenerationMap>>,
+    tx: flume::Sender<Request>,
+    command_arguments: CoalescedLatest<CommandArgumentRequest>,
+    command_argument_lifecycle: CoalescedLatest<CommandArgumentLifecycleRequest>,
+}
+
+pub(crate) struct LoadingPlugin(pub(crate) Arc<str>, pub(crate) u64);
+
+pub(crate) fn loading_plugin_is(lua: &Lua, plugin: &str) -> bool {
+    lua.app_data_ref::<LoadingPlugin>()
+        .is_some_and(|loading| loading.0.as_ref() == plugin)
+}
+
+pub(crate) fn loading_plugin_generation(lua: &Lua, plugin: &str) -> Option<u64> {
+    lua.app_data_ref::<LoadingPlugin>()
+        .filter(|loading| loading.0.as_ref() == plugin)
+        .map(|loading| loading.1)
+}
+
+pub(crate) fn require_plugin_load(lua: &Lua, plugin: &str, api: &str) -> mlua::Result<()> {
+    validate_plugin_effect(lua).map_err(mlua::Error::runtime)?;
+    if loading_plugin_is(lua, plugin) {
+        Ok(())
+    } else {
+        Err(mlua::Error::runtime(format!(
+            "{api} may only be called at the top level during plugin load"
+        )))
+    }
+}
+
+struct LuaRuntime {
+    /// Held for its Drop (joins the poker thread). Field order doesn't
+    /// matter: the thread keeps its own `Lua` clone alive.
+    _watchdog: Watchdog,
+    lua: Lua,
+    pending: PendingTools,
+    plugin_rules: Arc<PluginRuleStore>,
+    plugins: PluginMap,
+    live_tasks: LiveTasks,
+    warm_tools: WarmTools,
+    registry: Arc<ToolRegistry>,
+    tx: flume::Sender<Request>,
+    shutdown: Arc<AtomicBool>,
+    bundled: BundledModules,
+    codegen_queue: CodegenQueue,
+    ui_action_tx: Option<flume::Sender<UiAction>>,
+    command_registry: CommandRegistry,
+    command_producers: Arc<Mutex<HashMap<Arc<str>, Producer>>>,
+    command_arguments: CoalescedLatest<CommandArgumentRequest>,
+    command_argument_lifecycle: CoalescedLatest<CommandArgumentLifecycleRequest>,
+}
+
+fn discard_pending_prompt_callbacks(lua: &Lua, pending: PendingPromptHintCallbacks) {
+    let map = std::mem::take(&mut *pending.lock().unwrap_or_else(|e| e.into_inner()));
+    for regs in map.into_values() {
+        for reg in regs {
+            if let HintContent::Callback(key) = reg.content {
+                let _ = lua.remove_registry_value(key);
+            }
+        }
+    }
+    lua.remove_app_data::<PendingPromptHintCallbacks>();
+}
+
+impl LuaRuntime {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        registry: Arc<ToolRegistry>,
+        modes: Arc<makima_agent::ModeRegistry>,
+        tx: flume::Sender<Request>,
+        shutdown: Arc<AtomicBool>,
+        bundled_dirs: &'static [&'static Dir<'static>],
+        ui_action_tx: Option<flume::Sender<UiAction>>,
+        command_registry: CommandRegistry,
+        command_generations: Arc<Mutex<CommandGenerationMap>>,
+        command_arguments: CoalescedLatest<CommandArgumentRequest>,
+        command_argument_lifecycle: CoalescedLatest<CommandArgumentLifecycleRequest>,
+        keymap_writer: KeymapWriter,
+        hint_writer: HintWriter,
+        status_content_writer: StatusContentWriter,
+        jit: bool,
+        plugin_rules: Arc<PluginRuleStore>,
+        session_options: makima_agent::session_coordinator::SessionOptionCatalog,
+        state_dir: Option<PathBuf>,
+        fs: Arc<dyn FsBackend>,
+    ) -> Result<Self, PluginError> {
+        let lua = Lua::new();
+        let compiler = install_compiler(&lua, jit);
+        lua.set_memory_limit(LUA_MEMORY_LIMIT)
+            .map_err(|e| PluginError::Lua {
+                plugin: "<init>".to_owned(),
+                source: e,
+            })?;
+        let pending: PendingTools = Arc::new(Mutex::new(Vec::new()));
+        let watchdog = Watchdog::spawn(&lua, Arc::clone(&shutdown));
+
+        let globals = lua.globals();
+        for name in &["require", "io", "package"] {
+            globals
+                .set(*name, LuaValue::Nil)
+                .map_err(|e| PluginError::Lua {
+                    plugin: "<init>".to_owned(),
+                    source: e,
+                })?;
+        }
+        drop(globals);
+        lua.sandbox(true).map_err(|e| PluginError::Lua {
+            plugin: "<init>".to_owned(),
+            source: e,
+        })?;
+
+        lua.set_app_data(RequestTx(tx.clone()));
+        lua.set_app_data(HostId(NEXT_HOST_ID.fetch_add(1, Ordering::Relaxed)));
+        lua.set_app_data(CommandHandlerMap::new());
+        lua.set_app_data(crate::api::util::command::RetiredCommandHandlerMap::new());
+        lua.set_app_data(Arc::clone(&command_generations));
+        lua.set_app_data(JobStore::new());
+        lua.set_app_data(SpawnQueue::new());
+        lua.set_app_data(DeferQueue::new());
+        lua.set_app_data(crate::api::top::NotifyHandler::default());
+        lua.set_app_data(PromptHintCallbacks::default());
+        lua.set_app_data(PluginOptionSpecs::default());
+        lua.set_app_data(SessionOptionStore::default());
+        lua.set_app_data(SessionOptionValidators::default());
+        lua.set_app_data(SessionOptionValidation::default());
+        lua.set_app_data(session_options);
+        lua.set_app_data(AutocmdStore::default());
+        lua.set_app_data(crate::api::usage::UsageMirror::default());
+        lua.set_app_data(makima_config::ClockFormat::default());
+        lua.set_app_data(TimerStore::new());
+        lua.set_app_data(Store::default());
+        lua.set_app_data(ProviderStore::default());
+        lua.set_app_data(crate::credentials::RefreshFlights::default());
+        let layered: Arc<LayeredTools> = Arc::default();
+        lua.set_app_data(SlotStore::new(Arc::clone(&layered)));
+        registry.set_hook(crate::hook::SlotHook {
+            tx: tx.clone(),
+            layered,
+        });
+        lua.set_app_data(crate::splash::VersionInfo::default());
+        lua.set_app_data(crate::splash::PerfInfo::default());
+        lua.set_app_data(KeymapStore::new());
+        lua.set_app_data(keymap_writer);
+        lua.set_app_data(HintStore::new());
+        lua.set_app_data(hint_writer);
+        lua.set_app_data(StatusContentStore::new());
+        lua.set_app_data(ClickRegions::default());
+        lua.set_app_data(status_content_writer);
+        lua.set_app_data(Arc::clone(&registry));
+        lua.set_app_data(Arc::clone(&modes));
+        if let Some(state_dir) = state_dir {
+            lua.set_app_data(crate::api::env::StateDirOverride(state_dir));
+        }
+        lua.set_app_data(crate::api::fs::FsBackendHandle(fs));
+        let command_producers = Arc::new(Mutex::new(HashMap::new()));
+        lua.set_app_data(CommandPublisher {
+            registry: command_registry.clone(),
+            producers: Arc::clone(&command_producers),
+            command_generations: Arc::clone(&command_generations),
+            tx: tx.clone(),
+            command_arguments: command_arguments.clone(),
+            command_argument_lifecycle: command_argument_lifecycle.clone(),
+        });
+        lua.set_app_data(PickerCallbacks::new());
+        completion::install(&lua);
+
+        let plugins: PluginMap = Rc::new(RefCell::new(HashMap::new()));
+        {
+            let lua = lua.clone();
+            let plugins = Rc::clone(&plugins);
+            crate::api::tool::set_local_describe(move |plugin, tool, dctx| {
+                run_describe(&lua, &plugins, plugin, tool, dctx)
+            });
+        }
+        {
+            let lua = lua.clone();
+            let plugins = Rc::clone(&plugins);
+            crate::api::tool::set_local_tool_handles(move |tool| {
+                let plugins = plugins.borrow();
+                let tk = plugins.values().find_map(|owner| owner.tools.get(tool))?;
+                let to_fn = |key: Option<&RegistryKey>| {
+                    key.and_then(|k| lua.registry_value::<Function>(k).ok())
+                };
+                Some((to_fn(tk.header.as_ref()), to_fn(tk.restore.as_ref())))
+            });
+        }
+
+        Ok(Self {
+            _watchdog: watchdog,
+            lua,
+            pending,
+            plugin_rules,
+            plugins,
+            live_tasks: Rc::new(RefCell::new(HashMap::new())),
+            warm_tools: Rc::new(RefCell::new(VecDeque::new())),
+            registry,
+            tx,
+            shutdown,
+            bundled: BundledModules {
+                dirs: bundled_dirs,
+                compiler,
+                bytecode: Arc::default(),
+            },
+            codegen_queue: jit.then(Arc::default),
+            ui_action_tx,
+            command_registry,
+            command_producers,
+            command_arguments,
+            command_argument_lifecycle,
+        })
+    }
+
+    /// Returns false when there is nothing left to compile, so the caller can
+    /// stop polling.
+    fn codegen_step(&self) -> bool {
+        let Some(queue) = self.codegen_queue.as_ref() else {
+            return false;
+        };
+        let Some(func) = queue.lock().expect("codegen queue").pop() else {
+            return false;
+        };
+        let compiled = unsafe {
+            self.lua
+                .exec_raw::<()>(func, |state| ffi::luau_codegen_compile(state, -1))
+        };
+        if let Err(e) = compiled {
+            tracing::debug!(error = %e, "native codegen failed");
+        }
+        true
+    }
+
+    /// Drains a few queued chunks per call, bounded by wall time. Called from
+    /// the splash frame pull so codegen progresses even when the dispatcher
+    /// never sees an empty channel set.
+    fn codegen_budgeted(&self) {
+        if self.codegen_queue.is_none() {
+            return;
+        }
+        let deadline = Instant::now() + SPLASH_CODEGEN_BUDGET;
+        for _ in 0..SPLASH_CODEGEN_MAX_STEPS {
+            if Instant::now() >= deadline || !self.codegen_step() {
+                return;
+            }
+        }
+    }
+
+    fn abort_candidate_jobs(&self, plugin: &str, generation: u64) {
+        with_jobs(&self.lua, |store| {
+            store.abort_candidate(&self.lua, plugin, generation);
+        });
+    }
+
+    fn promote_candidate_jobs(&self, plugin: &str, generation: u64) {
+        with_jobs(&self.lua, |store| {
+            store.promote_candidate(plugin, generation)
+        });
+    }
+
+    fn drop_plugin_keys(&mut self, name: &str) {
+        crate::orchestration::revoke_plugin(&self.lua, name);
+        if let Some(producer) = self
+            .command_producers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(name)
+        {
+            producer.remove();
+        }
+        let retired = self
+            .lua
+            .app_data_mut::<CommandHandlerMap>()
+            .and_then(|mut commands| commands.remove(name));
+        if let Some(entries) = retired {
+            if let Some(mut retired) = self
+                .lua
+                .app_data_mut::<crate::api::util::command::RetiredCommandHandlerMap>()
+            {
+                retired.push((Arc::from(name), entries));
+            }
+            if let Some(generations) = self.lua.app_data_ref::<Arc<Mutex<CommandGenerationMap>>>() {
+                let mut generations = generations
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                generations.retain(|(plugin, _), _| plugin.as_ref() != name);
+            }
+            let _ = self.tx.send(Request::DropCommandKeys {
+                plugin: Arc::from(name),
+            });
+        }
+        self.warm_tools.borrow_mut().clear();
+        with_jobs(&self.lua, |store| {
+            store.kill_owner(&self.lua, &JobOwner::Plugin(Arc::from(name)));
+        });
+        if let Some(mut store) = self.lua.app_data_mut::<PluginOptionSpecs>() {
+            store.remove(name);
+        }
+        if let Some(mut store) = self.lua.app_data_mut::<ProviderStore>() {
+            store.clear_plugin(name);
+        }
+        if let Some(mut store) = self.lua.app_data_mut::<AutocmdStore>() {
+            store.clear_plugin(name);
+        }
+        if let Some(mut mirror) = self.lua.app_data_mut::<crate::api::usage::UsageMirror>() {
+            mirror.clear_plugin(name);
+        }
+        if let Some(mut store) = self.lua.app_data_mut::<TimerStore>() {
+            for key in store.clear_plugin(name) {
+                let _ = self.lua.remove_registry_value(key);
+            }
+        }
+        let changed = if let Some(mut store) = self.lua.app_data_mut::<Store>() {
+            store.clear_plugin(name)
+        } else {
+            Vec::new()
+        };
+        for registry in changed {
+            let data = self
+                .lua
+                .create_table()
+                .and_then(|t| t.set("registry", registry.as_str()).map(|_| t));
+            match data {
+                Ok(data) => autocmd::dispatch(
+                    &self.lua,
+                    store::STORE_CHANGED,
+                    None,
+                    LuaValue::Table(data),
+                    None,
+                ),
+                Err(e) => {
+                    tracing::warn!(
+                        registry = %registry,
+                        error = %e,
+                        "failed to build StoreChanged data"
+                    )
+                }
+            }
+        }
+        if let Some(mut store) = self.lua.app_data_mut::<SlotStore>() {
+            store.clear_plugin(name);
+        }
+        if let Some(owner) = self.plugins.borrow_mut().remove(name) {
+            for (_, tk) in owner.tools {
+                if let Err(e) = self.lua.remove_registry_value(tk.handler) {
+                    tracing::warn!(plugin = name, error = %e, "failed to drop lua handler key");
+                }
+                if let Some(sk) = tk.header
+                    && let Err(e) = self.lua.remove_registry_value(sk)
+                {
+                    tracing::warn!(plugin = name, error = %e, "failed to drop lua header key");
+                }
+                if let Some(sk) = tk.permission_scopes
+                    && let Err(e) = self.lua.remove_registry_value(sk)
+                {
+                    tracing::warn!(plugin = name, error = %e, "failed to drop lua permission_scopes key");
+                }
+                if let Some(sk) = tk.start
+                    && let Err(e) = self.lua.remove_registry_value(sk)
+                {
+                    tracing::warn!(plugin = name, error = %e, "failed to drop lua start key");
+                }
+                if let Some(sk) = tk.describe
+                    && let Err(e) = self.lua.remove_registry_value(sk)
+                {
+                    tracing::warn!(plugin = name, error = %e, "failed to drop lua describe key");
+                }
+            }
+        }
+        if let Some(mut hints) = self.lua.app_data_mut::<PromptHintCallbacks>()
+            && let Some(regs) = hints.remove(name)
+        {
+            for reg in regs {
+                if let HintContent::Callback(key) = reg.content
+                    && let Err(e) = self.lua.remove_registry_value(key)
+                {
+                    tracing::warn!(plugin = name, error = %e, "failed to drop prompt hint key");
+                }
+            }
+        }
+    }
+
+    async fn run_hint_callback(&self, plugin: &str, func: Function) -> Option<String> {
+        let result: mlua::Result<LuaValue> = run_detached(&self.lua, async {
+            let thread = self.lua.create_thread(func)?;
+            thread.into_async::<LuaValue>(())?.await
+        })
+        .await;
+        match result {
+            Ok(LuaValue::String(s)) => Some(s.to_string_lossy()),
+            Ok(LuaValue::Nil) => None,
+            Ok(_) => {
+                tracing::warn!(plugin, "prompt hint callback returned non-string");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(plugin, error = %e, "prompt hint callback failed");
+                None
+            }
+        }
+    }
+
+    async fn collect_prompt_slots(&self) -> ResolvedSlots {
+        struct Pending {
+            plugin: Arc<str>,
+            prompts: Option<Vec<PromptId>>,
+            slot: Slot,
+            content: PendingContent,
+        }
+        enum PendingContent {
+            Static(String),
+            Callback(Function),
+        }
+
+        let pending: Vec<Pending> = {
+            let Some(map) = self.lua.app_data_ref::<PromptHintCallbacks>() else {
+                return ResolvedSlots::default();
+            };
+            map.iter()
+                .flat_map(|(plugin, regs)| {
+                    regs.iter().filter_map(move |r| {
+                        let content = match &r.content {
+                            HintContent::Static(s) => PendingContent::Static(s.clone()),
+                            HintContent::Callback(key) => match self.lua.registry_value(key) {
+                                Ok(func) => PendingContent::Callback(func),
+                                Err(e) => {
+                                    tracing::warn!(plugin = %plugin, error = %e, "failed to read prompt hint callback");
+                                    return None;
+                                }
+                            },
+                        };
+                        Some(Pending {
+                            plugin: Arc::clone(plugin),
+                            prompts: r.prompts.clone(),
+                            slot: r.slot,
+                            content,
+                        })
+                    })
+                })
+                .collect()
+        };
+
+        let mut slots = ResolvedSlots::default();
+        for item in pending {
+            let content = match item.content {
+                PendingContent::Static(s) => Some(s),
+                PendingContent::Callback(func) => self.run_hint_callback(&item.plugin, func).await,
+            };
+            let Some(content) = content else { continue };
+            let explicit = item.prompts.is_some();
+            for &pid in item.prompts.as_deref().unwrap_or(PromptId::ALL) {
+                if !pid.has_slot(item.slot) {
+                    if explicit {
+                        tracing::warn!(
+                            plugin = %item.plugin,
+                            slot = ?item.slot,
+                            prompt = ?pid,
+                            "prompt hint targets a prompt that has no such slot; ignoring"
+                        );
+                    }
+                    continue;
+                }
+                slots.insert(
+                    pid,
+                    item.slot,
+                    SlotEntry {
+                        plugin: Arc::clone(&item.plugin),
+                        content: content.clone(),
+                    },
+                );
+            }
+        }
+        slots
+    }
+
+    fn drain_pending(&self) -> Vec<PendingTool> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect()
+    }
+
+    fn discard_pending_commands(&mut self, pending: crate::api::util::command::PendingCommandMap) {
+        let entries = std::mem::take(&mut *pending.lock().unwrap_or_else(|e| e.into_inner()));
+        for entry in entries.into_values() {
+            crate::api::util::command::remove_command_entry(&self.lua, entry);
+        }
+    }
+
+    fn discard_pending_keymaps(&mut self, pending: crate::api::keymap::PendingKeymapStore) {
+        let (bindings, _) = pending.lock().unwrap_or_else(|e| e.into_inner()).drain();
+        for binding in bindings {
+            let _ = self.lua.remove_registry_value(binding.callback);
+        }
+    }
+
+    fn prepare_pending_commands(
+        &self,
+        plugin: &Arc<str>,
+        pending: &crate::api::util::command::PendingCommandMap,
+    ) -> Result<Vec<Registration>, PluginError> {
+        let pending = pending.lock().unwrap_or_else(|error| error.into_inner());
+        let registrations = command_registrations(
+            &self.lua,
+            Some(&pending),
+            plugin,
+            &self.tx,
+            &self.command_arguments,
+            &self.command_argument_lifecycle,
+        )
+        .map_err(|source| PluginError::Lua {
+            plugin: plugin.to_string(),
+            source,
+        })?;
+        makima_commands::validate_registrations(registrations).map_err(|error| PluginError::Lua {
+            plugin: plugin.to_string(),
+            source: mlua::Error::runtime(format!("invalid command registration: {error}")),
+        })
+    }
+
+    fn active_command_registrations(
+        &self,
+        plugin: &Arc<str>,
+    ) -> Result<Vec<Registration>, PluginError> {
+        let commands = self.lua.app_data_ref::<CommandHandlerMap>();
+        command_registrations(
+            &self.lua,
+            commands.as_ref().and_then(|commands| commands.get(plugin)),
+            plugin,
+            &self.tx,
+            &self.command_arguments,
+            &self.command_argument_lifecycle,
+        )
+        .map_err(|source| PluginError::Lua {
+            plugin: plugin.to_string(),
+            source,
+        })
+    }
+
+    fn commit_pending_registrations(
+        &mut self,
+        plugin: &Arc<str>,
+        pending_commands: crate::api::util::command::PendingCommandMap,
+        pending_keymaps: crate::api::keymap::PendingKeymapStore,
+    ) {
+        let mut pending_commands = pending_commands
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let candidate = std::mem::take(&mut *pending_commands);
+        drop(pending_commands);
+        let old = {
+            self.lua
+                .app_data_mut::<CommandHandlerMap>()
+                .and_then(|mut live| live.insert(Arc::clone(plugin), candidate))
+        };
+        if let Some(commands) = self.lua.app_data_ref::<CommandHandlerMap>() {
+            let generations = self
+                .lua
+                .app_data_ref::<Arc<Mutex<CommandGenerationMap>>>()
+                .expect("command generation map initialized");
+            let mut generations = generations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            generations.retain(|(owner, _), _| owner != plugin);
+            if let Some(commands) = commands.get(plugin) {
+                generations.extend(commands.iter().map(|(name, entry)| {
+                    ((Arc::clone(plugin), Arc::clone(name)), entry.generation)
+                }));
+            }
+        }
+        if let Some(entries) = old {
+            if let Some(mut retired) = self
+                .lua
+                .app_data_mut::<crate::api::util::command::RetiredCommandHandlerMap>()
+            {
+                retired.push((Arc::clone(plugin), entries));
+            }
+            let _ = self.tx.send(Request::DropCommandKeys {
+                plugin: Arc::clone(plugin),
+            });
+        }
+        let (candidate, deletions) = pending_keymaps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain();
+        let mut old_callbacks = Vec::new();
+        if let Some(mut live) = self.lua.app_data_mut::<KeymapStore>() {
+            old_callbacks.extend(live.clear_plugin(plugin));
+            for (key, modifiers) in deletions {
+                old_callbacks.extend(live.del(key, modifiers));
+            }
+            for binding in candidate {
+                if let Some(old) = live.insert_stored(binding) {
+                    old_callbacks.push(old);
+                }
+            }
+            let entries = live.snapshot_entries();
+            drop(live);
+            if let Some(writer) = self.lua.app_data_ref::<KeymapWriter>() {
+                writer.publish(entries);
+            }
+        }
+        for key in old_callbacks {
+            let _ = self.lua.remove_registry_value(key);
+        }
+    }
+
+    fn commit_pending_completion(
+        &mut self,
+        plugin: &Arc<str>,
+        sources: Arc<Mutex<completion::PendingCompletionStore>>,
+        expanders: Arc<Mutex<completion::PendingExpanderStore>>,
+    ) {
+        let sources = std::mem::take(&mut sources.lock().unwrap_or_else(|e| e.into_inner()).0);
+        let expanders = std::mem::take(&mut expanders.lock().unwrap_or_else(|e| e.into_inner()).0);
+        if let Some(mut store) = self.lua.app_data_mut::<completion::CompletionStore>() {
+            store.0.insert(Arc::clone(plugin), sources);
+        }
+        if let Some(mut store) = self.lua.app_data_mut::<completion::ExpanderStore>() {
+            store.0.insert(Arc::clone(plugin), expanders);
+        }
+    }
+
+    fn commit_pending_options(
+        &mut self,
+        plugin: &Arc<str>,
+        pending: crate::api::options::PendingPluginOptionSpecs,
+    ) {
+        if let Some(specs) = pending.lock().unwrap_or_else(|e| e.into_inner()).take()
+            && let Some(mut store) = self.lua.app_data_mut::<PluginOptionSpecs>()
+        {
+            store.insert(Arc::clone(plugin), specs);
+        } else if let Some(mut store) = self.lua.app_data_mut::<PluginOptionSpecs>() {
+            store.remove(plugin);
+        }
+    }
+
+    fn discard_pending_autocmds(&mut self, pending: crate::api::autocmd::PendingAutocmdStore) {
+        drop(pending.lock().unwrap_or_else(|error| error.into_inner()));
+    }
+
+    fn discard_pending_timers(&mut self, pending: crate::api::timer::PendingTimerStore) {
+        let keys = pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .discard_candidate();
+        for key in keys {
+            let _ = self.lua.remove_registry_value(key);
+        }
+    }
+
+    fn commit_pending_autocmds(
+        &mut self,
+        plugin: &str,
+        pending: crate::api::autocmd::PendingAutocmdStore,
+    ) {
+        let candidate =
+            std::mem::take(&mut *pending.lock().unwrap_or_else(|error| error.into_inner()));
+        if let Some(mut live) = self.lua.app_data_mut::<AutocmdStore>() {
+            live.replace_plugin(plugin, candidate);
+        }
+    }
+
+    fn commit_pending_timers(
+        &mut self,
+        plugin: &str,
+        pending: crate::api::timer::PendingTimerStore,
+    ) {
+        let candidate = std::mem::replace(
+            &mut *pending.lock().unwrap_or_else(|error| error.into_inner()),
+            TimerStore::new(),
+        );
+        let old = self
+            .lua
+            .app_data_mut::<TimerStore>()
+            .map(|mut live| live.replace_plugin(plugin, candidate))
+            .unwrap_or_default();
+        for key in old {
+            let _ = self.lua.remove_registry_value(key);
+        }
+    }
+
+    fn discard_pending_plugin_slice(&mut self, pending: PendingPromptHintCallbacks) {
+        discard_pending_prompt_callbacks(&self.lua, pending);
+    }
+
+    fn discard_pending_completion(
+        &mut self,
+        sources: Arc<Mutex<completion::PendingCompletionStore>>,
+        expanders: Arc<Mutex<completion::PendingExpanderStore>>,
+    ) {
+        let _ = std::mem::take(&mut sources.lock().unwrap_or_else(|e| e.into_inner()).0);
+        let _ = std::mem::take(&mut expanders.lock().unwrap_or_else(|e| e.into_inner()).0);
+    }
+
+    fn commit_pending_store(&mut self, plugin: &str, pending: crate::api::store::PendingStore) {
+        let candidate = pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .drain();
+        let candidate_events: Vec<(String, String)> = candidate
+            .iter()
+            .map(|(registry, key, _, _)| (registry.clone(), key.clone()))
+            .collect();
+        let mut removed = if let Some(mut store) = self.lua.app_data_mut::<Store>() {
+            let removed = store.clear_plugin(plugin);
+            for (registry, key, owner, value) in candidate {
+                store
+                    .register(registry, key, owner, value)
+                    .expect("candidate store was validated during plugin load");
+            }
+            removed
+        } else {
+            Vec::new()
+        };
+        removed.sort_unstable();
+        removed.dedup();
+        for registry in removed {
+            if candidate_events.iter().any(|event| event.0 == registry) {
+                continue;
+            }
+            if let Ok(data) = self
+                .lua
+                .create_table()
+                .and_then(|table| table.set("registry", registry.as_str()).map(|_| table))
+            {
+                autocmd::dispatch(
+                    &self.lua,
+                    store::STORE_CHANGED,
+                    None,
+                    LuaValue::Table(data),
+                    None,
+                );
+            }
+        }
+        for (registry, key) in candidate_events {
+            if let Ok(data) = self.lua.create_table().and_then(|table| {
+                table.set("registry", registry)?;
+                table.set("key", key)?;
+                Ok(table)
+            }) {
+                autocmd::dispatch(
+                    &self.lua,
+                    store::STORE_CHANGED,
+                    None,
+                    LuaValue::Table(data),
+                    None,
+                );
+            }
+        }
+    }
+
+    fn discard_pending(&mut self, tools: Vec<PendingTool>) {
+        for t in tools {
+            if let Err(e) = self.lua.remove_registry_value(t.handler_key) {
+                tracing::warn!(error = %e, "failed to drop lua handler key on rollback");
+            }
+            if let Some(sk) = t.header_key
+                && let Err(e) = self.lua.remove_registry_value(sk)
+            {
+                tracing::warn!(error = %e, "failed to drop lua header key on rollback");
+            }
+            if let Some(PermissionScopeSpec::Callback(sk)) = t.permission_scopes
+                && let Err(e) = self.lua.remove_registry_value(sk)
+            {
+                tracing::warn!(error = %e, "failed to drop lua permission_scopes key on rollback");
+            }
+            if let Some(sk) = t.describe_key
+                && let Err(e) = self.lua.remove_registry_value(sk)
+            {
+                tracing::warn!(error = %e, "failed to drop lua describe key on rollback");
+            }
+        }
+    }
+
+    fn build_env(
+        &self,
+        makima: mlua::Table,
+        require_root: Option<PathBuf>,
+    ) -> Result<mlua::Table, mlua::Error> {
+        let env = self.lua.create_table()?;
+        // Mark the env safe so Luau's native codegen applies to plugin code:
+        // the VM only enters compiled code when the function's env is a safe
+        // table (CHECK_SAFE_ENV at native entry), and every plugin chunk loads
+        // with this env. Without it WarmJit compiles chunks that never run
+        // natively; see makima-lua/benches/splash_perf.rs env_codegen_200x79.
+        env.set_safeenv(true);
+        env.set("makima", makima)?;
+
+        if require_root.is_some() || !self.bundled.dirs.is_empty() {
+            let require_fn = self.create_require_fn(&env, require_root)?;
+            env.set("require", require_fn)?;
+        }
+
+        let meta = self.lua.create_table()?;
+        meta.set("__index", self.lua.globals())?;
+        env.set_metatable(Some(meta))?;
+        Ok(env)
+    }
+
+    /// Bundled dirs go first so plugins can `require()` shared modules
+    /// (like `makima.truncate`) without touching the filesystem.
+    fn create_require_fn(
+        &self,
+        env: &mlua::Table,
+        require_root: Option<PathBuf>,
+    ) -> Result<Function, mlua::Error> {
+        let loader = ModuleLoader {
+            bundled: self.bundled.clone(),
+            lua_dir: require_root.map(|r| r.canonicalize().unwrap_or(r)),
+            env: env.clone(),
+            codegen: self.codegen_queue.clone(),
+            loaded: self.lua.create_table()?,
+            loading: self.lua.create_table()?,
+        };
+
+        self.lua
+            .create_function(move |lua, modname: String| loader.require(lua, &modname))
+    }
+
+    /// `plugins.<name>` options only reach a plugin through
+    /// `makima.api.register_options`; if the plugin never declared any, every
+    /// key the user set is a typo or unsupported, so fail the load loudly.
+    fn check_opts_consumed(
+        &self,
+        name: &str,
+        opts: &PluginOpts,
+        pending: &crate::api::options::PendingPluginOptionSpecs,
+    ) -> Result<(), mlua::Error> {
+        if opts.is_empty()
+            || pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some()
+        {
+            return Ok(());
+        }
+        let keys: Vec<&str> = opts.keys().map(String::as_str).collect();
+        Err(mlua::Error::runtime(format!(
+            "unknown options in plugins.{name}: {} (this plugin declares no options via makima.api.register_options)",
+            keys.join(", ")
+        )))
+    }
+
+    async fn load_source(
+        &mut self,
+        identity: (Arc<str>, &str),
+        source: &str,
+        plugin_dir: Option<PathBuf>,
+        permissions: &PluginPermissions,
+        opts: PluginOpts,
+        config_store: Option<&ConfigStore>,
+    ) -> LoadResult {
+        let (name, source_name) = identity;
+        let map_err = |e: mlua::Error| PluginError::Lua {
+            plugin: source_name.to_owned(),
+            source: e,
+        };
+
+        let stale = self.drain_pending();
+        debug_assert!(
+            stale.is_empty(),
+            "leftover pending tools from previous load"
+        );
+        self.discard_pending(stale);
+
+        // Scoped to this load so a failed load simply drops its rules; only a
+        // successful load commits them to the store.
+        let pending_rules: PendingRules = Arc::default();
+        let pending_commands = Arc::new(Mutex::new(HashMap::new()));
+        let pending_keymaps = Arc::new(Mutex::new(PendingKeymaps::new()));
+        let pending_store = Arc::new(Mutex::new(Store::default()));
+        let pending_options = Arc::new(Mutex::new(None));
+        let pending_sources = Arc::new(Mutex::new(completion::PendingCompletionStore::default()));
+        let pending_expanders = Arc::new(Mutex::new(completion::PendingExpanderStore::default()));
+        let mut candidate_slots = self
+            .lua
+            .app_data_ref::<SlotStore>()
+            .map(|store| store.clone())
+            .unwrap_or_default();
+        candidate_slots.clear_plugin(&name);
+        let pending_slots = Arc::new(Mutex::new(candidate_slots));
+        let pending_prompts = Arc::new(Mutex::new(PromptHintCallbacks::default()));
+        let pending_hint = Arc::new(Mutex::new(None));
+        let pending_autocmds = Arc::new(Mutex::new({
+            let mut candidate = self
+                .lua
+                .app_data_ref::<AutocmdStore>()
+                .map(|store| store.clone())
+                .unwrap_or_default();
+            candidate.clear_plugin(&name);
+            candidate
+        }));
+        let pending_timers = Arc::new(Mutex::new(
+            TimerStore::candidate(&self.lua, &name).map_err(map_err)?,
+        ));
+
+        let require_root = plugin_dir.as_ref().map(|d| d.join("lua"));
+        let generation = self
+            .lua
+            .app_data_ref::<SessionOptionStore>()
+            .map_or(1, |store| store.next_generation(&name));
+        let pending_session_options = PendingSessionOptions::new(Arc::clone(&name), generation);
+        let pending_providers = PendingProviders::default();
+        let context = PluginLoadContext {
+            pending: Arc::clone(&self.pending),
+            pending_rules: Arc::clone(&pending_rules),
+            pending_autocmds: Arc::clone(&pending_autocmds),
+            pending_timers: Arc::clone(&pending_timers),
+            pending_session_options: pending_session_options.clone(),
+            pending_commands: Arc::clone(&pending_commands),
+            pending_keymaps: Arc::clone(&pending_keymaps),
+            pending_store: Arc::clone(&pending_store),
+            pending_options: Arc::clone(&pending_options),
+            pending_sources: Arc::clone(&pending_sources),
+            pending_expanders: Arc::clone(&pending_expanders),
+            pending_slots: Arc::clone(&pending_slots),
+            pending_prompts: Arc::clone(&pending_prompts),
+            pending_hint: Arc::clone(&pending_hint),
+            pending_providers: Arc::clone(&pending_providers),
+        };
+        // Global and project config share one root, so a plugin sees the
+        // same stores from either.
+        let root_name = if config_store.is_some() {
+            Arc::from(GLOBAL_INIT_OWNER)
+        } else {
+            Arc::clone(&name)
+        };
+        let (makima, root) = create_makima_global(
+            &self.lua,
+            context,
+            Arc::clone(&name),
+            root_name,
+            self.ui_action_tx.clone(),
+            permissions,
+            Arc::clone(&opts),
+        )
+        .map_err(map_err)?;
+
+        if let Some(cs) = config_store {
+            let setup_fn = crate::api::util::setup::create_setup_fn(&self.lua, Arc::clone(cs))
+                .map_err(map_err)?;
+            makima.set("setup", setup_fn).map_err(map_err)?;
+        }
+
+        let env = self.build_env(makima, require_root).map_err(map_err)?;
+
+        self.lua
+            .set_app_data(LoadingPlugin(Arc::clone(&name), generation));
+
+        let main_fn = self
+            .lua
+            .load(source)
+            .set_name(source_name)
+            .set_environment(env)
+            .into_function();
+        let exec_result = match main_fn {
+            Ok(func) => {
+                queue_codegen(&self.codegen_queue, &func);
+                func.call_async::<()>(Ctx::Plugin(root)).await
+            }
+            Err(e) => Err(e),
+        };
+
+        self.lua.remove_app_data::<LoadingPlugin>();
+        let exec_result =
+            exec_result.and_then(|()| self.check_opts_consumed(&name, &opts, &pending_options));
+        if let Err(e) = exec_result {
+            self.abort_candidate_jobs(&name, generation);
+            let stale = self.drain_pending();
+            self.discard_pending(stale);
+            self.discard_pending_commands(pending_commands);
+            self.discard_pending_keymaps(pending_keymaps);
+            self.discard_pending_completion(pending_sources, pending_expanders);
+            self.discard_pending_autocmds(pending_autocmds);
+            self.discard_pending_timers(pending_timers);
+            self.discard_pending_plugin_slice(pending_prompts);
+            self.lua
+                .remove_app_data::<crate::api::slot::PendingSlotStore>();
+            self.lua
+                .remove_app_data::<crate::api::ui::PendingHintStore>();
+            return Err(map_err(e));
+        }
+
+        let pending = self.drain_pending();
+
+        let registry_entries: Vec<(Arc<dyn Tool>, ToolSource)> = pending
+            .iter()
+            .map(|t| {
+                let tool: Arc<dyn Tool> = Arc::new(LuaTool {
+                    name: Arc::clone(&t.name),
+                    description: t.description.clone(),
+                    schema: t.schema,
+                    audience: t.audience,
+                    kind: t.kind.clone(),
+                    tx: self.tx.clone(),
+                    plugin: Arc::clone(&name),
+                    generation,
+                    has_header_fn: t.header_key.is_some(),
+                    has_start_fn: t.start_key.is_some(),
+                    permission_scope_kind: t
+                        .permission_scopes
+                        .as_ref()
+                        .map(PermissionScopeSpec::kind),
+                    permission: t.permission,
+                    mutable_path: t.mutable_path.as_ref().map(MutablePathSpec::kind),
+                    timeout: t.timeout,
+                    start_annotation: t.start_annotation.clone(),
+                    examples: t.examples.clone(),
+                    has_describe_fn: t.describe_key.is_some(),
+                });
+                (
+                    tool,
+                    ToolSource::Lua {
+                        plugin: Arc::clone(&name),
+                    },
+                )
+            })
+            .collect();
+
+        if let Err(error) = self
+            .registry
+            .validate_plugin_replacement(&name, &registry_entries)
+        {
+            self.abort_candidate_jobs(&name, generation);
+            self.discard_pending(pending);
+            self.discard_pending_commands(pending_commands);
+            self.discard_pending_keymaps(pending_keymaps);
+            self.discard_pending_completion(
+                Arc::clone(&pending_sources),
+                Arc::clone(&pending_expanders),
+            );
+            self.discard_pending_autocmds(Arc::clone(&pending_autocmds));
+            self.discard_pending_timers(Arc::clone(&pending_timers));
+            self.discard_pending_plugin_slice(Arc::clone(&pending_prompts));
+            self.lua
+                .remove_app_data::<crate::api::slot::PendingSlotStore>();
+            self.lua
+                .remove_app_data::<crate::api::ui::PendingHintStore>();
+            self.lua.remove_app_data::<PendingPromptHintCallbacks>();
+            return Err(match error {
+                RegistryError::NameConflict { name: tool, .. } => PluginError::NameConflict {
+                    plugin: name.to_string(),
+                    tool,
+                },
+            });
+        }
+
+        let command_registrations = match self.prepare_pending_commands(&name, &pending_commands) {
+            Ok(registrations) => registrations,
+            Err(error) => {
+                self.abort_candidate_jobs(&name, generation);
+                self.discard_pending(pending);
+                self.discard_pending_commands(pending_commands);
+                self.discard_pending_keymaps(pending_keymaps);
+                self.discard_pending_completion(
+                    Arc::clone(&pending_sources),
+                    Arc::clone(&pending_expanders),
+                );
+                self.discard_pending_autocmds(Arc::clone(&pending_autocmds));
+                self.discard_pending_timers(Arc::clone(&pending_timers));
+                self.discard_pending_plugin_slice(Arc::clone(&pending_prompts));
+                self.lua
+                    .remove_app_data::<crate::api::slot::PendingSlotStore>();
+                self.lua
+                    .remove_app_data::<crate::api::ui::PendingHintStore>();
+                self.lua.remove_app_data::<PendingPromptHintCallbacks>();
+                return Err(error);
+            }
+        };
+        let previous_command_registrations = match self.active_command_registrations(&name) {
+            Ok(registrations) => registrations,
+            Err(error) => {
+                self.abort_candidate_jobs(&name, generation);
+                self.discard_pending(pending);
+                self.discard_pending_commands(pending_commands);
+                self.discard_pending_keymaps(pending_keymaps);
+                self.discard_pending_completion(pending_sources, pending_expanders);
+                self.discard_pending_autocmds(pending_autocmds);
+                self.discard_pending_timers(pending_timers);
+                self.discard_pending_plugin_slice(pending_prompts);
+                self.lua
+                    .remove_app_data::<crate::api::slot::PendingSlotStore>();
+                self.lua
+                    .remove_app_data::<crate::api::ui::PendingHintStore>();
+                self.lua.remove_app_data::<PendingPromptHintCallbacks>();
+                return Err(error);
+            }
+        };
+        let session_options = self
+            .lua
+            .app_data_ref::<makima_agent::session_coordinator::SessionOptionCatalog>()
+            .expect("session option catalog installed")
+            .clone();
+        let previous_option_definitions = session_options.plugin_definitions(&name);
+        if let Err(error) =
+            commit_session_option_catalog(&self.lua, &session_options, &pending_session_options)
+                .await
+        {
+            self.abort_candidate_jobs(&name, generation);
+            self.discard_pending(pending);
+            self.discard_pending_commands(pending_commands);
+            self.discard_pending_keymaps(pending_keymaps);
+            self.discard_pending_completion(
+                Arc::clone(&pending_sources),
+                Arc::clone(&pending_expanders),
+            );
+            self.discard_pending_autocmds(Arc::clone(&pending_autocmds));
+            self.discard_pending_timers(Arc::clone(&pending_timers));
+            self.discard_pending_plugin_slice(Arc::clone(&pending_prompts));
+            self.lua
+                .remove_app_data::<crate::api::slot::PendingSlotStore>();
+            self.lua
+                .remove_app_data::<crate::api::ui::PendingHintStore>();
+            self.lua.remove_app_data::<PendingPromptHintCallbacks>();
+            return Err(PluginError::Lua {
+                plugin: name.to_string(),
+                source: mlua::Error::runtime(error),
+            });
+        }
+        if let Err(error) = replace_command_producer(
+            &self.command_registry,
+            &self.command_producers,
+            &name,
+            command_registrations,
+        ) {
+            self.abort_candidate_jobs(&name, generation);
+            if let Err(restore_error) =
+                restore_session_options(&session_options, &name, previous_option_definitions).await
+            {
+                tracing::error!(plugin = %name, error = %restore_error, "failed to restore session options after command publication");
+            }
+            self.discard_pending(pending);
+            self.discard_pending_commands(pending_commands);
+            self.discard_pending_keymaps(pending_keymaps);
+            self.discard_pending_completion(pending_sources, pending_expanders);
+            self.discard_pending_autocmds(pending_autocmds);
+            self.discard_pending_timers(pending_timers);
+            self.discard_pending_plugin_slice(pending_prompts);
+            self.lua
+                .remove_app_data::<crate::api::slot::PendingSlotStore>();
+            self.lua
+                .remove_app_data::<crate::api::ui::PendingHintStore>();
+            self.lua.remove_app_data::<PendingPromptHintCallbacks>();
+            return Err(PluginError::Lua {
+                plugin: name.to_string(),
+                source: mlua::Error::runtime(format!("invalid command registration: {error}")),
+            });
+        }
+        if let Err(error) = self.registry.replace_plugin(&name, registry_entries) {
+            self.abort_candidate_jobs(&name, generation);
+            if let Err(restore_error) = replace_command_producer(
+                &self.command_registry,
+                &self.command_producers,
+                &name,
+                previous_command_registrations,
+            ) {
+                tracing::error!(plugin = %name, %restore_error, "failed to restore plugin commands after tool publication");
+            }
+            if let Err(restore_error) =
+                restore_session_options(&session_options, &name, previous_option_definitions).await
+            {
+                tracing::error!(plugin = %name, error = %restore_error, "failed to restore session options after tool publication");
+            }
+            self.discard_pending(pending);
+            self.discard_pending_commands(pending_commands);
+            self.discard_pending_keymaps(pending_keymaps);
+            self.discard_pending_completion(pending_sources, pending_expanders);
+            self.discard_pending_autocmds(pending_autocmds);
+            self.discard_pending_timers(pending_timers);
+            self.discard_pending_plugin_slice(pending_prompts);
+            self.lua
+                .remove_app_data::<crate::api::slot::PendingSlotStore>();
+            self.lua
+                .remove_app_data::<crate::api::ui::PendingHintStore>();
+            self.lua.remove_app_data::<PendingPromptHintCallbacks>();
+            return Err(match error {
+                RegistryError::NameConflict { name: tool, .. } => PluginError::NameConflict {
+                    plugin: name.to_string(),
+                    tool,
+                },
+            });
+        }
+        crate::orchestration::revoke_plugin(&self.lua, &name);
+        crate::orchestration::install_plugin_authority(&self.lua, Arc::clone(&name));
+        activate_session_options(&self.lua, &pending_session_options);
+        if let Some(mut store) = self.lua.app_data_mut::<SessionOptionStore>() {
+            store.commit(Arc::clone(&name), generation);
+        }
+        self.commit_pending_registrations(&name, pending_commands, pending_keymaps);
+        self.commit_pending_autocmds(&name, pending_autocmds);
+        self.commit_pending_timers(&name, pending_timers);
+        if let Some(candidate) = self
+            .lua
+            .remove_app_data::<crate::api::slot::PendingSlotStore>()
+        {
+            let candidate = candidate
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            if let Some(mut live) = self.lua.app_data_mut::<SlotStore>() {
+                live.replace_plugin(&name, candidate);
+            }
+        }
+        if let Some(candidate) = self.lua.remove_app_data::<PendingPromptHintCallbacks>()
+            && let Some(mut live) = self.lua.app_data_mut::<PromptHintCallbacks>()
+            && let Some(old) = live.insert(
+                Arc::clone(&name),
+                candidate
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&name)
+                    .unwrap_or_default(),
+            )
+        {
+            for reg in old {
+                if let HintContent::Callback(key) = reg.content {
+                    let _ = self.lua.remove_registry_value(key);
+                }
+            }
+        }
+        if let Some(candidate) = self
+            .lua
+            .remove_app_data::<crate::api::ui::PendingHintStore>()
+        {
+            let value = candidate.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(mut live) = self.lua.app_data_mut::<HintStore>() {
+                live.clear_plugin(&name);
+                if let Some(spans) = value {
+                    live.set(Arc::clone(&name), spans);
+                }
+                let entries = live.snapshot_entries();
+                drop(live);
+                if let Some(writer) = self.lua.app_data_ref::<HintWriter>() {
+                    writer.publish(entries);
+                }
+            }
+        }
+        self.commit_pending_store(&name, pending_store);
+        crate::api::provider::commit_pending(&self.lua, &name, &pending_providers);
+        self.commit_pending_options(&name, pending_options);
+        self.commit_pending_completion(&name, pending_sources, pending_expanders);
+        with_jobs(&self.lua, |store| {
+            store.kill_owner(&self.lua, &JobOwner::Plugin(Arc::clone(&name)));
+        });
+        self.promote_candidate_jobs(&name, generation);
+        self.warm_tools.borrow_mut().clear();
+
+        let keys: HashMap<Arc<str>, ToolKeys> = pending
+            .into_iter()
+            .map(|t| {
+                (
+                    t.name,
+                    ToolKeys {
+                        generation,
+                        handler: t.handler_key,
+                        header: t.header_key,
+                        restore: t.restore_key,
+                        start: t.start_key,
+                        permission_scopes: match t.permission_scopes {
+                            Some(PermissionScopeSpec::Callback(k)) => Some(k),
+                            _ => None,
+                        },
+                        mutable_path: match t.mutable_path {
+                            Some(MutablePathSpec::Callback(k)) => Some(k),
+                            _ => None,
+                        },
+                        describe: t.describe_key,
+                    },
+                )
+            })
+            .collect();
+
+        let declared =
+            std::mem::take(&mut *pending_rules.lock().unwrap_or_else(|e| e.into_inner()));
+        let rules = resolve_rules(&self.registry, &name, permissions, declared);
+        self.plugin_rules.replace(&name, rules);
+        self.plugins.borrow_mut().insert(
+            name,
+            PluginOwner {
+                tools: keys,
+                permissions: permissions.clone(),
+            },
+        );
+
+        Ok(())
+    }
+
+    async fn clear_plugin(&mut self, plugin: &str) -> Result<(), PluginError> {
+        let session_options = self
+            .lua
+            .app_data_ref::<makima_agent::session_coordinator::SessionOptionCatalog>()
+            .expect("session option catalog installed")
+            .clone();
+        let session_option_error =
+            unload_session_options(&self.lua, &session_options, plugin).await;
+        if let Err(error) = &session_option_error {
+            tracing::warn!(plugin, %error, "failed to unload plugin session options");
+        } else if let Some(mut store) = self.lua.app_data_mut::<SessionOptionStore>() {
+            store.invalidate(plugin);
+        }
+        self.registry.clear_plugin(plugin);
+        if let Some(generations) = self.lua.app_data_ref::<Arc<Mutex<CommandGenerationMap>>>() {
+            generations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .retain(|(owner, _), _| owner.as_ref() != plugin);
+        }
+        self.plugin_rules.remove(plugin);
+        if let Some(queue) = self.lua.app_data_ref::<DeferQueue>() {
+            queue.cancel_plugin(plugin);
+        }
+        crate::api::top::clear_notify_handler(&self.lua, plugin);
+        self.drop_plugin_keys(plugin);
+        if let Some(mut store) = self.lua.app_data_mut::<KeymapStore>() {
+            let keys = store.clear_plugin(plugin);
+            let entries = store.snapshot_entries();
+            drop(store);
+            for key in keys {
+                let _ = self.lua.remove_registry_value(key);
+            }
+            if let Some(writer) = self.lua.app_data_ref::<KeymapWriter>() {
+                writer.publish(entries);
+            }
+        }
+        if let Some(mut store) = self.lua.app_data_mut::<HintStore>() {
+            store.clear_plugin(plugin);
+            let entries = store.snapshot_entries();
+            drop(store);
+            if let Some(writer) = self.lua.app_data_ref::<HintWriter>() {
+                writer.publish(entries);
+            }
+        }
+        if let Some(mut regions) = self.lua.app_data_mut::<ClickRegions>() {
+            regions.remove_plugin(&self.lua, plugin);
+        }
+        if let Some(mut store) = self.lua.app_data_mut::<StatusContentStore>() {
+            let changed = store.clear_plugin(plugin);
+            let entries = changed.then(|| store.snapshot_entries());
+            drop(store);
+            if let Some(entries) = entries
+                && let Some(writer) = self.lua.app_data_ref::<StatusContentWriter>()
+            {
+                writer.publish(entries);
+            }
+        }
+        completion::clear_plugin(&self.lua, plugin);
+        session_option_error.map_err(|error| PluginError::Unload {
+            plugin: plugin.to_owned(),
+            error,
+        })
+    }
+
+    fn evict_warm(&self, tool_use_id: &str) {
+        self.warm_tools.borrow_mut().retain(|w| w.id != tool_use_id);
+    }
+
+    async fn compute_permission_scopes(
+        &self,
+        plugin: &str,
+        tool: &str,
+        input: Value,
+        session_id: Option<SessionRef>,
+    ) -> Option<PermissionScopes> {
+        let (func, lua_input) = match plugin_fn(
+            &self.lua,
+            &self.plugins,
+            plugin,
+            tool,
+            "permission_scopes",
+            |tk| tk.permission_scopes.as_ref(),
+            &input,
+        ) {
+            Some(pair) => pair,
+            // No callback to ask: fail closed to a prompt.
+            None => return Some(PermissionScopes::force_prompt(input.to_string())),
+        };
+        let context = match self.lua.create_table() {
+            Ok(context) => context,
+            Err(error) => {
+                tracing::warn!(plugin, tool, %error, "failed to build permission_scopes context");
+                return Some(PermissionScopes::force_prompt(input.to_string()));
+            }
+        };
+        if let Some(session_id) = session_id
+            && let Err(error) = permission_scopes_session(&self.lua, &context, &session_id)
+        {
+            tracing::warn!(plugin, tool, %error, "failed to build permission_scopes context");
+            return Some(PermissionScopes::force_prompt(input.to_string()));
+        }
+        let result: LuaValue =
+            match run_callback(&self.lua, func.call_async((lua_input, context))).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(plugin, tool, error = %e, "permission_scopes callback failed");
+                    return Some(PermissionScopes::force_prompt(input.to_string()));
+                }
+            };
+        let table = match result {
+            LuaValue::Table(t) => t,
+            // Returning nil means "nothing to enforce": skip the gate
+            // entirely (bash auto mode, blank command).
+            _ => return None,
+        };
+        let scopes_table: mlua::Table = table.get("scopes").ok()?;
+        let mut scopes = Vec::new();
+        for (_, s) in scopes_table.pairs::<usize, String>().flatten() {
+            scopes.push(s);
+        }
+        if scopes.is_empty() {
+            return None;
+        }
+        let force_prompt: bool = table.get("force_prompt").unwrap_or(false);
+        Some(PermissionScopes {
+            scopes,
+            force_prompt,
+        })
+    }
+
+    /// Computes the tool's mutable-path callback result. `None` when the
+    /// tool has no callback or the callback returns nil/non-string, meaning
+    /// the invocation does not participate in write serialization.
+    async fn compute_mutable_path(
+        &self,
+        plugin: &str,
+        tool: &str,
+        input: Value,
+        cwd: PathBuf,
+    ) -> Option<String> {
+        let (func, lua_input) = plugin_fn(
+            &self.lua,
+            &self.plugins,
+            plugin,
+            tool,
+            "mutable_path",
+            |tk| tk.mutable_path.as_ref(),
+            &input,
+        )?;
+        let context = self.lua.create_table().ok()?;
+        context.set("cwd", cwd.to_string_lossy().as_ref()).ok()?;
+        let result: LuaValue =
+            match run_callback(&self.lua, func.call_async((lua_input, context))).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(plugin, tool, error = %e, "mutable_path callback failed");
+                    return None;
+                }
+            };
+        match result {
+            LuaValue::String(s) => s.to_str().ok().map(|s| s.to_string()),
+            _ => None,
+        }
+    }
+
+    async fn run_init_lua(
+        &mut self,
+        source: &str,
+        source_name: &str,
+        owner: Arc<str>,
+        plugin_dir: Option<PathBuf>,
+    ) -> Result<Option<RawConfig>, PluginError> {
+        let config_store: ConfigStore = Arc::new(Mutex::new(None));
+        let perms = plugin_dir
+            .as_deref()
+            .and_then(|dir| {
+                let manifest = dir.join(crate::plugin_permissions::MANIFEST_FILE);
+                if manifest.is_file() {
+                    Some(load_plugin_permissions(Some(dir)))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(PluginPermissions::trusted);
+        self.load_source(
+            (owner, source_name),
+            source,
+            plugin_dir,
+            &perms,
+            PluginOpts::default(),
+            Some(&config_store),
+        )
+        .await?;
+        Ok(config_store.lock().unwrap().take())
+    }
+}
+
+/// Resolves a plugin callback and converts its json input, warning on
+/// failure. `None` when the tool has no such callback registered.
+fn plugin_fn(
+    lua: &Lua,
+    plugins: &PluginMap,
+    plugin: &str,
+    tool: &str,
+    callback: &'static str,
+    key: impl FnOnce(&ToolKeys) -> Option<&RegistryKey>,
+    input: &Value,
+) -> Option<(Function, LuaValue)> {
+    let func = {
+        let plugins = plugins.borrow();
+        let key = key(plugins.get(plugin)?.tools.get(tool)?)?;
+        match lua.registry_value::<Function>(key) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(plugin, tool, callback, error = %e, "callback registry lookup failed");
+                return None;
+            }
+        }
+    };
+    match json_to_lua(lua, input) {
+        Ok(v) => Some((func, v)),
+        Err(e) => {
+            tracing::warn!(plugin, tool, callback, error = %e, "callback input conversion failed");
+            None
+        }
+    }
+}
+
+/// Async so header fns can yield (highlight, markdown). A sync call
+/// would hit the C-call boundary and silently fall back to the plain name.
+async fn compute_header(
+    lua: &Lua,
+    plugins: &PluginMap,
+    plugin: &str,
+    tool: &str,
+    input: Value,
+) -> HeaderResult {
+    let Some((func, input_lua)) = plugin_fn(
+        lua,
+        plugins,
+        plugin,
+        tool,
+        "header",
+        |tk| tk.header.as_ref(),
+        &input,
+    ) else {
+        return HeaderResult::plain(tool.to_string());
+    };
+
+    let result = run_callback(lua, func.call_async::<LuaValue>(input_lua)).await;
+
+    match result {
+        Ok(LuaValue::String(s)) => match s.to_str() {
+            Ok(s) => HeaderResult::plain(s.to_owned()),
+            Err(_) => HeaderResult::plain(tool.to_string()),
+        },
+        Ok(LuaValue::UserData(ud)) => match ud.borrow::<BufHandle>() {
+            Ok(h) => HeaderResult::Styled(h.buf.take()),
+            Err(_) => HeaderResult::plain(tool.to_string()),
+        },
+        Ok(_) => HeaderResult::plain(tool.to_string()),
+        Err(e) => {
+            tracing::warn!(plugin, tool, error = %e, "header fn call failed");
+            HeaderResult::plain(tool.to_string())
+        }
+    }
+}
+
+async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Option<RestoreReply> {
+    let (func, plugin_name) = {
+        let plugins = plugins.borrow();
+        let (pname, tk) = plugins.iter().find_map(|(pname, owner)| {
+            owner.tools.get(&*item.tool).map(|tk| (pname.clone(), tk))
+        })?;
+        let key = tk.restore.as_ref()?;
+        (lua.registry_value::<Function>(key).ok()?, pname)
+    };
+    let input_lua = json_to_lua(lua, &item.input).ok()?;
+    let thread = lua.create_thread(func).ok()?;
+
+    let (dummy_tx, _) = flume::unbounded();
+    let cell = TaskCell::new(
+        CancelToken::none(),
+        Some(Instant::now() + RESTORE_ITEM_TIMEOUT),
+        Some(LiveCtx {
+            event_tx: makima_agent::EventSender::new(dummy_tx),
+            tool_use_id: item.tool_use_id.clone(),
+        }),
+    );
+
+    let ctx = lua
+        .create_userdata(LuaCtx::restore(item.tool_output_lines, item.state))
+        .ok()?;
+    let inner = thread
+        .into_async::<LuaValue>((input_lua, &*item.output, item.is_error, ctx))
+        .ok()?;
+    let scope = TaskScope::new(lua, cell);
+    lock_cell(scope.handle()).inline_spawn = Some(Vec::new());
+    let ret = scope
+        .scope_future(inner)
+        .await
+        .inspect_err(|e| tracing::warn!(tool = &*item.tool, error = %e, "restore callback failed"))
+        .ok()?;
+    run_inline_tasks(lua, &scope).await;
+
+    if let Some(buf) = crate::api::ui::buf::buf_from_reply(&ret) {
+        lock_cell(scope.handle()).root_buf = Some(buf);
+    }
+
+    if !item.clicks.is_empty()
+        && let Some(root) = resolve_root_buf(scope.handle())
+        && let Some(func) = crate::api::ui::buf::click_fn(&root)
+    {
+        for &row in &item.clicks {
+            let Ok(data) = lua.create_table() else {
+                break;
+            };
+            let _ = data.set("row", row);
+            if let Err(e) = scope.scope_future(func.call_async::<()>(data)).await {
+                tracing::warn!(tool = &*item.tool, error = %e, "click replay failed");
+                break;
+            }
+            run_inline_tasks(lua, &scope).await;
+        }
+    }
+
+    drop(scope);
+
+    let mut reply = extract_restore_reply(&ret)?;
+    if reply.header.is_none() {
+        reply.header = Some(
+            compute_header(lua, plugins, &plugin_name, &item.tool, item.input)
+                .await
+                .into_snapshot(),
+        );
+    }
+    Some(reply)
+}
+
+/// Runs `makima.async.run` tasks queued during restore inline, so their
+/// buf mutations land before the snapshot is extracted. Tasks may queue
+/// more tasks, hence the rounds.
+async fn run_inline_tasks(lua: &Lua, scope: &TaskScope) {
+    for _ in 0..RESTORE_SPAWN_ROUNDS {
+        let tasks = {
+            let mut cell = lock_cell(scope.handle());
+            match cell.inline_spawn.as_mut() {
+                Some(queue) if !queue.is_empty() => std::mem::take(queue),
+                _ => return,
+            }
+        };
+        for task in tasks {
+            if !task.cancel.is_cancelled() {
+                // Its own cell: the window is per task, not the restore
+                // scope's, and only `until_abandoned` reads it.
+                let handle = TaskCell::new(
+                    task.cancel.clone(),
+                    Some(Instant::now() + RESTORE_ASYNC_DEADLINE),
+                    None,
+                )
+                .into_handle();
+                if let Err(e) = scope
+                    .scope_future(run_work_fn(lua, &task.work_fn, &handle, &task.call))
+                    .await
+                {
+                    tracing::debug!(error = %e, "restore inline async task failed");
+                }
+            }
+            lua.remove_registry_value(task.work_fn).ok();
+        }
+    }
+}
+
+/// Spawns one restore item as a gated task. The restore supersedes any
+/// warm click handle, so evict it first: a later click must not resurface
+/// the stale view.
+fn spawn_restore(
+    ex: &Rc<smol::LocalExecutor<'_>>,
+    gate: &Rc<InflightGate>,
+    restores: &Rc<RestoreTracker>,
+    rt: &LuaRuntime,
+    item: RestoreItem,
+    event_tx: makima_agent::EventSender,
+) {
+    rt.evict_warm(&item.tool_use_id);
+    let tracker = restores.track();
+    let lua = rt.lua.clone();
+    let plugins = Rc::clone(&rt.plugins);
+    let g = Rc::clone(gate);
+    ex.spawn(async move {
+        let _tracker = tracker;
+        // Acquired before the timeout race starts, so the per-item deadline
+        // measures the item's own run, not time queued behind the whole batch.
+        let slot = Some(g.acquire().await);
+        let id = item.tool_use_id.clone();
+        let theme_gen = item.theme_gen;
+        let tool = Arc::clone(&item.tool);
+        let res = covered(
+            slot,
+            futures_lite::future::race(restore_item(&lua, &plugins, item), async {
+                smol::Timer::after(RESTORE_ITEM_TIMEOUT).await;
+                tracing::warn!(tool = &*tool, "restore item timed out");
+                None
+            }),
+        )
+        .await;
+        if let Some(reply) = res {
+            reply.emit(&id, theme_gen, &event_tx);
+        }
+    })
+    .detach();
+}
+
+fn extract_restore_reply(ret: &LuaValue) -> Option<RestoreReply> {
+    let (body, header) = match ret {
+        LuaValue::UserData(ud) => {
+            let h = ud.borrow::<BufHandle>().ok()?;
+            (Some(h.buf.take()), None)
+        }
+        LuaValue::Table(t) => {
+            let body = t.get::<LuaValue>("body").ok().and_then(|v| {
+                let ud = v.as_userdata()?;
+                let h = ud.borrow::<BufHandle>().ok()?;
+                Some(h.buf.take())
+            });
+            let header = t.get::<LuaValue>("header").ok().and_then(|v| {
+                let ud = v.as_userdata()?;
+                let h = ud.borrow::<BufHandle>().ok()?;
+                Some(h.buf.take())
+            });
+            (body, header)
+        }
+        _ => return None,
+    };
+    Some(RestoreReply { body, header })
+}
+
+/// The last slice a doomed handler gets: its cancel hooks run (firing twice
+/// is free, they drain once), and a reply they queue through `ctx:finish`
+/// wins, because it carries the output the user already watched stream by.
+fn cancel_hook_reply(
+    lua: &Lua,
+    handle: &TaskHandle,
+    finish_rx: &flume::Receiver<ToolCallReply>,
+    reason: KillReason,
+) -> Option<ToolCallReply> {
+    fire_cancel_hooks(lua, handle, reason);
+    finish_rx.try_recv().ok().map(|mut reply| {
+        reply.timeout_cleanup = matches!(reason, KillReason::Deadline);
+        reply
+    })
+}
+
+/// Handler returned nil, meaning it went async. Polls job events
+/// until `ctx:finish()`, all jobs die, or the deadline expires.
+async fn dispatch_async(
+    lua: &Lua,
+    handle: TaskHandle,
+    plugin: &str,
+    tool: &str,
+    finish_rx: flume::Receiver<ToolCallReply>,
+) -> ToolCallReply {
+    let owner = JobOwner::Task(lock_cell(&handle).id);
+    if with_jobs(lua, |store| store.is_empty(&owner)) {
+        lua.gc_collect().ok();
+        smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
+        return match finish_rx.try_recv() {
+            Ok(reply) => reply,
+            _ => ToolCallReply::err(NIL_WITHOUT_FINISH_MSG),
+        };
+    }
+
+    let mut event_buf = Vec::new();
+
+    loop {
+        // No grace here: the handler already returned, so there is no Lua
+        // frame left to unwind. Bound before the match so the guard drops
+        // before `timeout_reply`, which locks the same cell.
+        let kill = lock_cell(&handle).doomed(Instant::now());
+        if let Some(reason) = kill {
+            if let Some(reply) = cancel_hook_reply(lua, &handle, &finish_rx, reason) {
+                return reply;
+            }
+            return match reason {
+                KillReason::Cancelled => ToolCallReply::err(CANCELLED_MSG),
+                KillReason::Deadline => timeout_reply(&handle, plugin, tool),
+            };
+        }
+
+        match finish_rx.try_recv() {
+            Ok(reply) => return reply,
+            Err(flume::TryRecvError::Disconnected) => {
+                return ToolCallReply::err(NIL_WITHOUT_FINISH_MSG);
+            }
+            Err(flume::TryRecvError::Empty) => {}
+        }
+
+        with_jobs(lua, |store| store.drain_events(&owner, &mut event_buf));
+
+        if event_buf.is_empty() {
+            if with_jobs(lua, |store| store.is_empty(&owner)) {
+                smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
+                return match finish_rx.try_recv() {
+                    Ok(reply) => reply,
+                    _ => ToolCallReply::err(NIL_WITHOUT_FINISH_MSG),
+                };
+            }
+            smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
+            continue;
+        }
+
+        for (job_id, event) in event_buf.drain(..) {
+            if let Err(e) = deliver_job_event(lua, job_id, &event) {
+                return ToolCallReply::err(format!("job callback error: {}", strip_traceback(&e)));
+            }
+        }
+    }
+}
+
+pub(crate) fn strip_traceback(err: &mlua::Error) -> String {
+    match err {
+        mlua::Error::CallbackError { cause, .. } => {
+            let mut inner = cause;
+            while let mlua::Error::CallbackError { cause, .. } = inner.as_ref() {
+                inner = cause;
+            }
+            inner.to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Only for a tool whose cancel hooks queued nothing; one that words its
+/// own partial reply never gets here. The message format is load-bearing
+/// for those: the bash plugin's `restore` parses it to re-render the
+/// timeout sentinel on session reload.
+fn timeout_reply(handle: &TaskHandle, plugin: &str, tool: &str) -> ToolCallReply {
+    let secs = lock_cell(handle).deadline_secs.get().unwrap_or(0);
+    let live_buf = resolve_root_buf(handle);
+    let qualified = if plugin == tool || plugin.is_empty() {
+        tool.to_owned()
+    } else {
+        format!("{plugin}.{tool}")
+    };
+
+    if let Some(ref buf) = live_buf {
+        buf.append(SnapshotLine {
+            spans: vec![SnapshotSpan {
+                text: format!("Timed out after {secs}s"),
+                style: SpanStyle::Named("dim".into()),
+            }],
+        });
+    }
+
+    let mut reply = ToolCallReply::err(format!("tool {qualified} timed out after {secs}s"));
+    reply.live_buf = live_buf;
+    reply
+}
+
+/// Whether a plugin may layer this host slot at all.
+///
+/// A layer on `tool.<name>.input` rewrites the call the tool then makes, so it
+/// borrows that call's [`Authority`] and has to already hold it. Without this,
+/// a plugin denied `run` could turn any bash command into its own.
+///
+/// Decided when the chain fires rather than when the layer is registered,
+/// because a layer may legitimately be set before its target tool exists, and
+/// permissions a reload narrows take effect on the very next call.
+fn layer_delegation<'a>(
+    plugins: &'a PluginMap,
+    authority: Authority,
+    slot: &'a str,
+) -> impl Fn(&str) -> bool + 'a {
+    move |plugin| {
+        let loaded = plugins.borrow();
+        let granted = loaded.get(plugin).map(|owner| &owner.permissions);
+        let held = match authority {
+            Authority::Capability(required) => granted.is_some_and(|p| p.is_allowed(required)),
+            // Steering a call whose reach nobody declared takes every
+            // capability: a meta-tool like `batch` names none and reaches all.
+            Authority::Unbounded => granted.is_some_and(PluginPermissions::holds_all),
+        };
+        if !held {
+            // Every call of a layered tool re-decides this, so a warning here
+            // would repeat for the life of the misconfiguration.
+            tracing::debug!(plugin, slot, ?authority, "slot layer skipped: not granted");
+        }
+        held
+    }
+}
+
+/// Fires a host-owned chain and reads back the one contract every host slot
+/// shares: a table replaces the value, `nil` leaves it alone, and
+/// `nil, reason` stops the call with a reason the model reads.
+///
+/// Every failure below is a pass-through, because a layer is an opinion about a
+/// call and never a precondition for making it.
+///
+/// [`run_awaited`] is what makes the chain answerable to the call waiting on
+/// it, down to a layer that never comes back ending at the window dispatch
+/// gave it.
+async fn run_hook(
+    lua: &Lua,
+    plugins: &PluginMap,
+    gate: &Rc<InflightGate>,
+    run: HookRun,
+) -> Verdict {
+    let HookRun {
+        slot,
+        authority,
+        cancel,
+        deadline,
+        value,
+        call,
+    } = run;
+    let slot = slot.as_str();
+    let args = match (json_to_lua(lua, &value), json_to_lua(lua, &call)) {
+        (Ok(value), Ok(call)) => MultiValue::from_vec(vec![value, call]),
+        _ => return Verdict::Unchanged,
+    };
+    let allow_layer = layer_delegation(plugins, authority, slot);
+    let chain = run_host_chain(lua, slot, args, &allow_layer);
+    let returned = match run_awaited(lua, gate, cancel, deadline, chain).await {
+        Ok(Ok(Some(values))) => values,
+        Ok(Ok(None)) => return Verdict::Unchanged,
+        Ok(Err(e)) => {
+            tracing::warn!(slot, error = %strip_traceback(&e), "slot chain failed");
+            return Verdict::Unchanged;
+        }
+        Err(msg) => {
+            tracing::warn!(slot, reason = msg, "slot chain abandoned");
+            return Verdict::Unchanged;
+        }
+    };
+
+    let mut returned = returned.into_iter();
+    match returned.next() {
+        Some(table @ LuaValue::Table(_)) => match lua_to_json_within(lua, &table, &value) {
+            // The identity default hands back the value it was given, so a
+            // layer that only deferred returns a table too. Comparing is the
+            // only way to tell that apart from a rewrite, and it keeps the
+            // original `Value` in play instead of a re-encode of it.
+            Ok(replacement) => {
+                if replacement == value {
+                    Verdict::Unchanged
+                } else {
+                    Verdict::Replaced(replacement)
+                }
+            }
+            Err(e) => {
+                tracing::warn!(slot, error = %strip_traceback(&e), "slot returned a table that is not json");
+                Verdict::Unchanged
+            }
+        },
+        None | Some(LuaValue::Nil) => match returned.next() {
+            Some(LuaValue::String(reason)) => Verdict::Denied(reason.to_string_lossy()),
+            _ => Verdict::Unchanged,
+        },
+        Some(other) => {
+            tracing::warn!(
+                slot,
+                returned = other.type_name(),
+                "slot must return a table, nil, or nil plus a reason"
+            );
+            Verdict::Unchanged
+        }
+    }
+}
+
+fn run_describe(
+    lua: &Lua,
+    plugins: &PluginMap,
+    plugin: &str,
+    tool: &str,
+    dctx: &Value,
+) -> Option<String> {
+    let func: Function = {
+        let plugins_ref = plugins.borrow();
+        let key = plugins_ref
+            .get(plugin)?
+            .tools
+            .get(tool)?
+            .describe
+            .as_ref()?;
+        lua.registry_value(key).ok()?
+    };
+    let arg = match json_to_lua(lua, dctx) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(plugin, tool, error = %e, "describe dctx conversion failed");
+            return None;
+        }
+    };
+    // Runs inline on the dispatcher: without its own scope it executes under
+    // whatever handle a parked coroutine left installed, and that task's
+    // cancel/deadline would kill the callback (see TaskScope::detached).
+    let _scope = TaskScope::detached(lua);
+    match func.call::<String>(arg) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(plugin, tool, error = %e, "describe callback failed");
+            None
+        }
+    }
+}
+
+/// Sends no `ToolSnapshot` on completion: the preview buf must stay live so
+/// the UI keeps polling it until the handler's own `LiveToolBuf` takes over.
+async fn run_tool_start(
+    lua: &Lua,
+    func: Function,
+    tool: &str,
+    input: Value,
+    live: LiveCtx,
+    mut ctx: Box<LuaCtx>,
+) {
+    let mut cell = TaskCell::new(ctx.cancel.clone(), None, Some(live));
+    cell.delegated_tool = Some(ctx.delegated_tool());
+    let scope = TaskScope::new(lua, cell);
+    ctx.bind_origin(scope.handle());
+    let run = async {
+        let input_lua = json_to_lua(lua, &input)?;
+        let ctx_ud = lua.create_userdata(*ctx)?;
+        let thread = lua.create_thread(func)?;
+        thread.into_async::<LuaValue>((input_lua, ctx_ud))?.await
+    };
+    if let Err(e) = scope.scope_future(run).await {
+        tracing::warn!(tool, error = %e, "start callback failed");
+    }
+}
+
+/// Two layers of deadline enforcement: the watchdog interrupt catches
+/// tight CPU loops, the dispatch loop catches I/O waits.
+#[allow(clippy::too_many_arguments)]
+async fn run_tool_call(
+    lua: Lua,
+    plugin: Arc<str>,
+    tool: Arc<str>,
+    generation: u64,
+    input: Value,
+    mut ctx: Box<LuaCtx>,
+    deadline: Option<Instant>,
+    live: Option<LiveCtx>,
+    live_tasks: LiveTasks,
+    warm_tools: WarmTools,
+    plugins: PluginMap,
+    shutdown: Arc<AtomicBool>,
+) -> ToolCallReply {
+    let handler: Function = {
+        let plugins_ref = plugins.borrow();
+        let Some(owner) = plugins_ref.get(&*plugin) else {
+            return ToolCallReply::err(format!("plugin not loaded: {plugin}"));
+        };
+        let Some(tool_keys) = owner.tools.get(&*tool) else {
+            return ToolCallReply::err(format!("tool not found: {tool}"));
+        };
+        if tool_keys.generation != generation {
+            return ToolCallReply::err(format!("tool binding changed: {tool}"));
+        }
+        match lua.registry_value(&tool_keys.handler) {
+            Ok(handler) => handler,
+            Err(e) => return ToolCallReply::err(strip_traceback(&e)),
+        }
+    };
+    if shutdown.load(Ordering::Acquire) {
+        return ToolCallReply::err("plugin host shutting down");
+    }
+
+    let (finish_tx, finish_rx) = flume::bounded::<ToolCallReply>(1);
+    ctx.finish_tx = Some(finish_tx);
+    let cancel = ctx.cancel.clone();
+
+    let input_lua = match json_to_lua(&lua, &input) {
+        Ok(v) => v,
+        Err(e) => return ToolCallReply::err(strip_traceback(&e)),
+    };
+    let Some(agent) = ctx.agent() else {
+        return ToolCallReply::err("tool handler context required");
+    };
+    let output_limits = OutputLimits::from_config(&agent.config);
+    let live_sink = ctx.agent().and_then(|agent| agent.live_sink.clone());
+    let managed_turn = ctx.agent().and_then(|agent| agent.managed_turn.clone());
+    let thread = match lua.create_thread(handler) {
+        Ok(t) => t,
+        Err(e) => return ToolCallReply::err(strip_traceback(&e)),
+    };
+    let live_id = live.as_ref().map(|l| l.tool_use_id.clone());
+    let mut cell = TaskCell::new(cancel.clone(), deadline, live);
+    cell.delegated_tool = Some(ctx.delegated_tool());
+    cell.live_sink = live_sink;
+    cell.managed_turn = managed_turn;
+    let owner = crate::orchestration::plugin_authority(&lua, plugin.clone());
+    cell.set_plugin_origin(Some((plugin.clone(), owner.generation())));
+    cell.plugin_owner = Some(owner);
+    let scope = TaskScope::new(&lua, cell);
+    let handle = Arc::clone(scope.handle());
+    ctx.bind_origin(&handle);
+    let ctx_ud = match lua.create_userdata(*ctx) {
+        Ok(u) => u,
+        Err(e) => return ToolCallReply::err(strip_traceback(&e)),
+    };
+
+    let async_thread = match thread.into_async::<LuaValue>((input_lua, ctx_ud)) {
+        Ok(at) => at,
+        Err(e) => return ToolCallReply::err(strip_traceback(&e)),
+    };
+    if let Some(id) = &live_id {
+        live_tasks
+            .borrow_mut()
+            .insert(id.clone(), Arc::clone(&handle));
+    }
+
+    let call_future = scope.scope_future(async {
+        match until_abandoned(async_thread, &handle)
+            .await
+            .unwrap_or_else(|msg| Err(mlua::Error::runtime(msg)))
+        {
+            Ok(LuaValue::Nil) => {
+                let (live, sink) = {
+                    let cell = lock_cell(&handle);
+                    (cell.live.clone(), cell.live_sink.clone())
+                };
+                if let Some(buf) = resolve_root_buf(&handle) {
+                    if let Some(live) = live {
+                        let _ = live.event_tx.send(makima_agent::AgentEvent::LiveToolBuf {
+                            id: live.tool_use_id.clone(),
+                            body: Arc::clone(&buf),
+                        });
+                    }
+                    if let Some(sink) = sink {
+                        let _ = sink.send(ToolLive::Buf(buf));
+                    }
+                }
+                dispatch_async(&lua, Arc::clone(&handle), &plugin, &tool, finish_rx).await
+            }
+            Ok(val) => {
+                if cancel.is_cancelled()
+                    && let Ok(reply) = finish_rx.try_recv()
+                    && reply.has_output_limits()
+                {
+                    return reply;
+                }
+                if let Some(buf) = crate::api::ui::buf::buf_from_reply(&val) {
+                    lock_cell(&handle).root_buf = Some(buf);
+                }
+                ToolCallReply::from_lua_value_with_limits(&lua, &val, output_limits)
+            }
+            // Bound before the `and_then` so the guard drops before the
+            // hooks run: they lock the same cell.
+            Err(e) => {
+                let kill = lock_cell(&handle).doomed(Instant::now());
+                match kill.and_then(|reason| cancel_hook_reply(&lua, &handle, &finish_rx, reason)) {
+                    // The reply wins, but a doom-window error is still the
+                    // only trace of a plugin bug that raised on its way out.
+                    Some(reply) => {
+                        tracing::debug!(%tool, error = %strip_traceback(&e), "handler error superseded by cancel hook reply");
+                        reply
+                    }
+                    None => ToolCallReply::err(strip_traceback(&e)),
+                }
+            }
+        }
+    });
+
+    // `tool.rs` timeout is the absolute backstop; the dispatch loop
+    // and watchdog interrupt enforce the per-plugin deadline from TaskCell.
+    let mut reply = call_future.await;
+    reply.deadline = lock_cell(&handle).deadline.get();
+    if let Some(id) = &live_id {
+        live_tasks.borrow_mut().remove(id);
+        // Best-effort cache: any tool with a root buf can serve clicks.
+        // Warming a tool the UI never watches is harmless because its
+        // clicks arrive as restore requests, which evict the entry.
+        if let Some(root) = resolve_root_buf(&handle) {
+            // A fresh cell, because the original's cancel token and
+            // deadline are stale: the watchdog interrupt would use them to
+            // kill warm clicks.
+            let mut cell = TaskCell::new(CancelToken::none(), None, None);
+            cell.root_buf = Some(root);
+            let mut warm = warm_tools.borrow_mut();
+            warm.push_back(WarmTool {
+                id: id.clone(),
+                handle: Arc::new(Mutex::new(cell)),
+                _claim: scope.bufs_claim(),
+            });
+            if warm.len() > WARM_TOOL_CAP {
+                warm.pop_front();
+            }
+        }
+    }
+    drop(scope);
+    reply
+}
+
+pub(crate) struct LuaThread {
+    pub tx: flume::Sender<Request>,
+    pub prio_tx: flume::Sender<Request>,
+    pub command_generations: Arc<Mutex<CommandGenerationMap>>,
+    pub command_arguments: crate::coalesced_latest::CoalescedLatest<CommandArgumentRequest>,
+    pub command_argument_lifecycle:
+        crate::coalesced_latest::CoalescedLatest<CommandArgumentLifecycleRequest>,
+    pub splash_frames: crate::coalesced_latest::CoalescedLatest<SplashFrameRequest>,
+    pub join: Option<JoinHandle<()>>,
+    pub shutdown: Arc<AtomicBool>,
+    pub keymap_reader: KeymapReader,
+    pub hint_reader: crate::api::util::command::HintReader,
+    pub status_content_reader: crate::api::util::command::StatusContentReader,
+    pub ui_action_rx: flume::Receiver<UiAction>,
+    pub modes: Arc<makima_agent::ModeRegistry>,
+    pub session_options: makima_agent::session_coordinator::SessionOptionCatalog,
+}
+
+/// Pulls one `splash.render` frame. The shared Lua keeps the last task's
+/// handle in app_data, so the slot call runs under a fresh scope: a stale
+/// cancelled handle (a turn reset mid-flight) cannot kill the render, while
+/// a short deadline prevents the synchronous callback monopolizing the Lua
+/// dispatcher. Splash rendering needs no task cleanup, so it uses a much
+/// shorter kill grace than handlers.
+async fn splash_frame(
+    lua: &Lua,
+    width: u16,
+    height: u16,
+    elapsed_secs: f32,
+    fade: f32,
+) -> SplashPull {
+    let args = mlua::MultiValue::from_vec(vec![
+        LuaValue::Integer(width as i64),
+        LuaValue::Integer(height as i64),
+        LuaValue::Number(elapsed_secs as f64),
+        LuaValue::Number(fade as f64),
+    ]);
+    let started = Instant::now();
+    let cell = TaskCell::new(
+        CancelToken::none(),
+        Some(started + SPLASH_RENDER_DEADLINE),
+        None,
+    )
+    .with_kill_grace(SPLASH_RENDER_KILL_GRACE);
+    let scope = TaskScope::new(lua, cell);
+    let pull = match crate::api::slot::invoke_slot_from_host(lua, "splash.render", args).await {
+        // A starved Lua thread overruns the wall-clock budget as surely as a
+        // slow renderer does, so a deadline kill says nothing about the
+        // renderer. `Missing` would suppress the splash until it is next shown.
+        Err(e) if e.to_string().contains(INTERRUPT_DEADLINE_MSG) => {
+            tracing::debug!(error = %e, elapsed = ?started.elapsed(), "splash.render overran its deadline");
+            SplashPull::Unknown
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "splash.render failed");
+            SplashPull::Missing
+        }
+        Ok(mv) => match mv.into_iter().next() {
+            None | Some(LuaValue::Nil) => SplashPull::Missing,
+            Some(v) => match crate::splash::frame_from_lua(v, width, height) {
+                Ok(f) => SplashPull::Frame(f),
+                Err(e) => {
+                    tracing::warn!(error = %e, "splash.render bad frame");
+                    SplashPull::Missing
+                }
+            },
+        },
+    };
+    drop(scope);
+    if let Some(mut perf) = lua.app_data_mut::<crate::splash::PerfInfo>() {
+        perf.record_render(started.elapsed());
+    }
+    pull
+}
+
+pub struct SpawnConfig {
+    pub command_registry: CommandRegistry,
+    pub modes: Arc<makima_agent::ModeRegistry>,
+    pub session_options: makima_agent::session_coordinator::SessionOptionCatalog,
+    pub bundled_dirs: &'static [&'static Dir<'static>],
+    pub jit: bool,
+    pub plugin_rules: Arc<PluginRuleStore>,
+    pub state_dir: Option<PathBuf>,
+    pub fs: Arc<dyn FsBackend>,
+    pub session_provider_preparer: Option<crate::api::agent::SessionProviderPreparer>,
+    pub orchestration_services: crate::orchestration::OrchestrationServicesSlot,
+}
+
+/// Lua lives on its own OS thread (no Send needed). `smol::block_on`
+/// drives async, load/clear requests wait for in-flight tools.
+pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThread, PluginError> {
+    let SpawnConfig {
+        command_registry,
+        modes,
+        session_options,
+        bundled_dirs,
+        jit,
+        plugin_rules,
+        state_dir,
+        fs,
+        session_provider_preparer,
+        orchestration_services,
+    } = config;
+    let (tx, rx) = flume::unbounded::<Request>();
+    let (prio_tx, prio_rx) = flume::unbounded::<Request>();
+    let command_arguments = {
+        let tx = tx.clone();
+        crate::coalesced_latest::CoalescedLatest::new(move |work| {
+            tx.send(Request::CollectCommandArgumentItems(work)).is_ok()
+        })
+    };
+    let command_argument_lifecycle = {
+        let tx = tx.clone();
+        crate::coalesced_latest::CoalescedLatest::with_supersede(
+            move |work| tx.send(Request::CommandArgumentLifecycle(work)).is_ok(),
+            lifecycle_superseded,
+        )
+    };
+    let splash_frames = {
+        let prio_tx = prio_tx.clone();
+        crate::coalesced_latest::CoalescedLatest::new(move |work| {
+            prio_tx.send(Request::SplashFrame(work)).is_ok()
+        })
+    };
+    let tx_clone = tx.clone();
+    let shutdown: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let shutdown_thread = Arc::clone(&shutdown);
+    let modes_thread = Arc::clone(&modes);
+    let (init_tx, init_rx) = flume::bounded::<Result<(), PluginError>>(1);
+    let (ui_action_tx, ui_action_rx) = flume::unbounded::<UiAction>();
+    let (keymap_writer, keymap_reader) = KeymapWriter::new();
+    let (hint_writer, hint_reader) = HintWriter::new();
+    let (status_content_writer, status_content_reader) = StatusContentWriter::new();
+    let command_generations = Arc::new(Mutex::new(CommandGenerationMap::new()));
+    let runtime_command_arguments = command_arguments.clone();
+    let runtime_command_argument_lifecycle = command_argument_lifecycle.clone();
+    let runtime_session_options = session_options.clone();
+
+    let runtime_command_generations = Arc::clone(&command_generations);
+    let handle = thread::Builder::new()
+        .name("makima-lua".to_owned())
+        .spawn(move || {
+            let mut rt = match LuaRuntime::new(
+                registry,
+                modes_thread,
+                tx_clone,
+                shutdown_thread,
+                bundled_dirs,
+                Some(ui_action_tx),
+                command_registry,
+                runtime_command_generations,
+                runtime_command_arguments,
+                runtime_command_argument_lifecycle,
+                keymap_writer,
+                hint_writer,
+                status_content_writer,
+                jit,
+                plugin_rules,
+                runtime_session_options,
+                state_dir,
+                fs,
+            ) {
+                Ok(r) => {
+                    r.lua.set_app_data(orchestration_services);
+                    if let Some(prepare) = session_provider_preparer {
+                        r.lua.set_app_data(prepare);
+                    }
+                    let _ = init_tx.send(Ok(()));
+                    r
+                }
+                Err(e) => {
+                    let _ = init_tx.send(Err(e));
+                    return;
+                }
+            };
+
+            let ex = Rc::new(smol::LocalExecutor::new());
+            {
+                let lua = rt.lua.clone();
+                ex.spawn(async move {
+                    let mut event_buf = Vec::new();
+                    loop {
+                        with_jobs(&lua, |store| {
+                            store.drain_plugin_events(&mut event_buf);
+                        });
+                        if !event_buf.is_empty() {
+                            let scope = TaskScope::delivery(&lua);
+                            for (job_id, event) in event_buf.drain(..) {
+                                if let Err(e) = deliver_job_event(&lua, job_id, &event) {
+                                    tracing::warn!(
+                                        error = %strip_traceback(&e),
+                                        "plugin job callback failed"
+                                    );
+                                }
+                            }
+                            drop(scope);
+                        }
+                        smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
+                    }
+                })
+                .detach();
+            }
+            let gate = Rc::new(InflightGate::new(rt.lua.clone()));
+            let callbacks = Rc::new(InflightGate::new(rt.lua.clone()));
+            let restores = Rc::new(RestoreTracker::default());
+            let spawn_rx = rt
+                .lua
+                .app_data_ref::<SpawnQueue>()
+                .expect("spawn queue installed at init")
+                .rx
+                .clone();
+            let defer_rx = rt
+                .lua
+                .app_data_ref::<DeferQueue>()
+                .expect("defer queue installed at init")
+                .rx
+                .clone();
+            let timer_wake_rx = timer::wake_rx(&rt.lua);
+
+            let mut codegen_armed = false;
+
+            smol::block_on(ex.run(async {
+                loop {
+                    while let Ok(task) = spawn_rx.try_recv() {
+                        spawn_async_task(&rt.lua, &ex, &gate, &callbacks, task);
+                    }
+                    while let Ok(cb) = defer_rx.try_recv() {
+                        spawn_deferred_callback(&rt.lua, &ex, &gate, cb);
+                    }
+                    // Nothing to serve, so spend the lull on native codegen.
+                    // One chunk per pass with a yield in between, so no request
+                    // or spawned task ever waits for more than a single chunk.
+                    if codegen_armed
+                        && prio_rx.is_empty()
+                        && rx.is_empty()
+                        && spawn_rx.is_empty()
+                        && rt.codegen_step()
+                    {
+                        smol::future::yield_now().await;
+                        continue;
+                    }
+                    // Biased: user-initiated requests (commands, keybinds) jump
+                    // ahead of bulk work like session restores so the UI stays
+                    // snappy, and queued `makima.async.run` tasks jump ahead of
+                    // plain requests. Timer fires lose to anything queued: a late
+                    // fire is a refresh, not a request.
+                    let timer_deadline = timer::next_deadline(&rt.lua);
+                    let next = smol::future::or(
+                        async { prio_rx.recv_async().await.map(Some) },
+                        smol::future::or(
+                            async {
+                                let task = spawn_rx.recv_async().await?;
+                                spawn_async_task(&rt.lua, &ex, &gate, &callbacks, task);
+                                Ok(None)
+                            },
+                            smol::future::or(
+                                async {
+                                    let cb = defer_rx.recv_async().await?;
+                                    spawn_deferred_callback(&rt.lua, &ex, &gate, cb);
+                                    Ok(None)
+                                },
+                                smol::future::or(
+                                    async { rx.recv_async().await.map(Some) },
+                                    async {
+                                    // A task may register a timer with a
+                                    // deadline earlier than the one being
+                                    // slept on; `set` pokes the wake channel
+                                    // so the loop re-picks without the delay.
+                                    if let Some(deadline) = timer_deadline {
+                                        let _ = futures_lite::future::or(
+                                            async { smol::Timer::at(deadline).await; },
+                                            async {
+                                                let _ =
+                                                    timer_wake_rx.recv_async().await;
+                                            },
+                                        )
+                                        .await;
+                                    } else {
+                                        let _ = timer_wake_rx.recv_async().await;
+                                    }
+                                    for task in timer::due_tasks(&rt.lua) {
+                                        spawn_async_task(&rt.lua, &ex, &gate, &callbacks, task);
+                                    }
+                                    Ok(None)
+                                },
+                            ),
+                        ),
+                    ),
+                )
+                .await;
+                    let msg = match next {
+                        Ok(Some(m)) => m,
+                        Ok(None) => {
+                            smol::future::yield_now().await;
+                            continue;
+                        }
+                        Err(_) => break,
+                    };
+                    match msg {
+                        Request::Shutdown => break,
+                        Request::WarmJit => codegen_armed = true,
+                        Request::InstallOrchestrationServices(services) => {
+                            rt.lua.set_app_data(services);
+                        }
+                        Request::IgnoreProject => {
+                            rt.lua.set_app_data(crate::api::env::NoProject);
+                        }
+                        Request::SaveNoPreferences => {
+                            rt.lua.set_app_data(crate::api::session::NoPreferences);
+                        }
+                        Request::InstallSessionSnapshot { provider } => {
+                            rt.lua
+                                .set_app_data(crate::api::session::SessionSnapshotSlot(provider));
+                        }
+                        Request::LoadSource {
+                            name,
+                            source,
+                            plugin_dir,
+                            permissions,
+                            opts,
+                            reply,
+                        } => {
+                            drain_barrier(&rt.lua, &ex, &gate, &callbacks, &spawn_rx).await;
+                            let res = rt
+                                .load_source(
+                                    (Arc::clone(&name), &name),
+                                    &source,
+                                    plugin_dir,
+                                    &permissions,
+                                    opts,
+                                    None,
+                                )
+                                .await;
+                            let _ = reply.send(res);
+                        }
+                        Request::CallTool {
+                            plugin,
+                            tool,
+                            generation,
+                            input,
+                            ctx,
+                            deadline,
+                            reply,
+                            live,
+                            nested,
+                        } => {
+                            let lua = rt.lua.clone();
+                            let plugins = Rc::clone(&rt.plugins);
+                            let live_tasks = Rc::clone(&rt.live_tasks);
+                            let warm_tools = Rc::clone(&rt.warm_tools);
+                            let shutdown_ref = Arc::clone(&rt.shutdown);
+                            let g = Rc::clone(&gate);
+                            let cancel = ctx.cancel.clone();
+                            ex.spawn(async move {
+                                let slot = if nested {
+                                    None
+                                } else {
+                                    match g.acquire_before_abandoned(&cancel, deadline).await {
+                                        Ok(guard) => Some(guard),
+                                        Err(msg) => {
+                                            let _ = reply.send(ToolCallReply::err(msg));
+                                            return;
+                                        }
+                                    }
+                                };
+                                let res = covered(
+                                    slot,
+                                    run_tool_call(
+                                        lua.clone(),
+                                        plugin,
+                                        tool,
+                                        generation,
+                                        input,
+                                        ctx,
+                                        deadline,
+                                        live,
+                                        live_tasks,
+                                        warm_tools,
+                                        plugins,
+                                        shutdown_ref,
+                                    ),
+                                )
+                                .await;
+                                let _ = reply.send(res);
+                            })
+                            .detach();
+                        }
+                        Request::ClearPlugin { plugin, reply } => {
+                            crate::orchestration::revoke_plugin(&rt.lua, &plugin);
+                            drain_barrier(&rt.lua, &ex, &gate, &callbacks, &spawn_rx).await;
+                            let result = rt.clear_plugin(&plugin).await;
+                            let _ = reply.send(result);
+                        }
+                        Request::DropCommandKeys { plugin } => {
+                            let entries = rt
+                                .lua
+                                .app_data_mut::<crate::api::util::command::RetiredCommandHandlerMap>()
+                                .and_then(|mut retired| {
+                                    retired
+                                        .iter()
+                                        .position(|(owner, _)| owner == &plugin)
+                                        .map(|index| retired.remove(index).1)
+                                })
+                                .unwrap_or_default();
+                            for (_, entry) in entries {
+                                if let Err(error) = rt.lua.remove_registry_value(entry.handler) {
+                                    tracing::warn!(%plugin, %error, "failed to drop command handler key");
+                                }
+                                for key in entry
+                                    .argument_completions
+                                    .into_iter()
+                                    .flatten()
+                                    .flat_map(|completion| {
+                                        [
+                                            Some(completion.completion),
+                                            completion.on_highlight,
+                                            completion.on_accept,
+                                            completion.on_cancel,
+                                        ]
+                                        .into_iter()
+                                        .flatten()
+                                    })
+                                {
+                                    if let Err(error) = rt.lua.remove_registry_value(key) {
+                                        tracing::warn!(%plugin, %error, "failed to drop command completion key");
+                                    }
+                                }
+                            }
+                        }
+                        #[cfg(feature = "test-support")]
+                        Request::TestPause { ready, release } => {
+                            let _ = ready.send(());
+                            let _ = release.recv_async().await;
+                        }
+                        #[cfg(feature = "test-support")]
+                        Request::TestBarrier { reply } => {
+                            let _ = reply.send(());
+                        }
+                        #[cfg(feature = "test-support")]
+                        Request::TestDrainTasks { reply } => {
+                            while !spawn_rx.is_empty() || callbacks.count.get() > 0 {
+                                drain_barrier(&rt.lua, &ex, &gate, &callbacks, &spawn_rx).await;
+                                callbacks.drain().await;
+                            }
+                            let _ = reply.send(());
+                        }
+                        #[cfg(feature = "test-support")]
+                        Request::TestCollectGarbage { reply } => {
+                            let result = rt.lua.gc_collect().and_then(|()| rt.lua.gc_collect());
+                            let _ = reply.send(result);
+                        }
+                        Request::ExecuteCommand {
+                            plugin,
+                            command,
+                            generation,
+                            invocation,
+                            completion,
+                        } => {
+                            let handler_fn = resolve_command_handler(
+                                &rt.lua,
+                                &plugin,
+                                &command,
+                                generation,
+                            );
+                            if let Some(func) = handler_fn {
+                                let target = crate::orchestration::resolve_target(&rt.lua, Some(&invocation));
+                                let pinned = target.as_ref().ok().cloned().flatten();
+                                let owner = crate::orchestration::plugin_authority(&rt.lua, plugin.clone());
+                                let lua = rt.lua.clone();
+                                ex.spawn(async move {
+                                    let options_invocation = invocation.clone();
+                                    let run = async {
+                                        bind_plugin_owner(&lua, plugin.clone(), owner)?;
+                                        let opts = lua.create_table()?;
+                                        set_lua_command_options(&lua, &opts, &options_invocation)?;
+                                        let ctx = target
+                                            .map_err(mlua::Error::runtime)?
+                                            .map(|target| LuaCtx::trusted_context(&lua, target, plugin.clone()));
+                                        let thread = lua.create_thread(func)?;
+                                        thread.into_async::<()>((opts, ctx))?.await
+                                    };
+                                    let result = run_command_scoped(&lua, invocation, pinned, run)
+                                        .await
+                                        .map_err(|error| error.to_string());
+                                    if let Err(error) = &result {
+                                        tracing::warn!(plugin = %plugin, command = %command, error, "command handler failed");
+                                    }
+                                    let _ = completion.send(result);
+                                })
+                                .detach();
+                            } else {
+                                tracing::warn!(plugin = %plugin, command = %command, "{COMMAND_HANDLER_UNAVAILABLE}");
+                                let _ = completion.send(Err(COMMAND_HANDLER_UNAVAILABLE.to_owned()));
+                            }
+                        }
+                        Request::ComputeHeader {
+                            plugin,
+                            tool,
+                            input,
+                            reply,
+                        } => {
+                            let res =
+                                compute_header(&rt.lua, &rt.plugins, &plugin, &tool, input).await;
+                            let _ = reply.send(res);
+                        }
+                        Request::ComputePermissionScopes {
+                            plugin,
+                            tool,
+                            input,
+                            session_id,
+                            reply,
+                        } => {
+                            let res = rt
+                                .compute_permission_scopes(&plugin, &tool, input, session_id)
+                                .await;
+                            let _ = reply.send(res);
+                        }
+                        Request::MutablePath {
+                            plugin,
+                            tool,
+                            input,
+                            cwd,
+                            reply,
+                        } => {
+                            let res = rt.compute_mutable_path(&plugin, &tool, input, cwd).await;
+                            let _ = reply.send(res);
+                        }
+                        Request::RunHook { run, reply } => {
+                            // Spawned rather than awaited: a layer may park,
+                            // and every other session is waiting on this
+                            // request loop.
+                            let lua = rt.lua.clone();
+                            let plugins = Rc::clone(&rt.plugins);
+                            let gate = Rc::clone(&gate);
+                            ex.spawn(async move {
+                                let verdict = run_hook(&lua, &plugins, &gate, run).await;
+                                let _ = reply.send(verdict);
+                            })
+                            .detach();
+                        }
+                        Request::RunInitLua {
+                            source,
+                            source_name,
+                            owner,
+                            plugin_dir,
+                            reply,
+                        } => {
+                            drain_barrier(&rt.lua, &ex, &gate, &callbacks, &spawn_rx).await;
+                            let res = rt
+                                .run_init_lua(&source, &source_name, Arc::clone(&owner), plugin_dir)
+                                .await;
+                            let _ = reply.send(res);
+                        }
+                        Request::CollectPromptSlots { reply } => {
+                            let slots = rt.collect_prompt_slots().await;
+                            let _ = reply.send(slots);
+                        }
+                        Request::SetClockFormat(format) => {
+                            rt.lua.set_app_data(format);
+                        }
+                        Request::CollectPluginOptions { reply } => {
+                            let _ = reply.send(collect_plugin_options(&rt.lua));
+                        }
+                        Request::BuildProviderRegistry { timeouts, reply } => {
+                            let registry = Arc::new(crate::provider::build_registry(
+                                &rt.lua, &rt.tx, timeouts,
+                            ));
+                            rt.lua.set_app_data(Arc::clone(&registry));
+                            let _ = reply.send(registry);
+                        }
+                        Request::Provider { job, cancel } => {
+                            let lua = rt.lua.clone();
+                            ex.spawn(async move {
+                                let scope =
+                                    TaskScope::new(&lua, TaskCell::new(cancel.clone(), None, None));
+                                let _ = run_scoped(&lua, scope, cancel.race(job(lua.clone()))).await;
+                            })
+                            .detach();
+                        }
+                        Request::RestoreToolAsync { item, event_tx } => {
+                            spawn_restore(&ex, &gate, &restores, &rt, item, event_tx);
+                        }
+                        Request::RestoreComplete { flag } => {
+                            restores.complete(flag);
+                        }
+                        Request::ClickTool {
+                            tool_use_id,
+                            row,
+                            fallback,
+                        } => {
+                            let handle = rt
+                                .live_tasks
+                                .borrow()
+                                .get(&tool_use_id)
+                                .map(Arc::clone)
+                                .or_else(|| {
+                                    rt.warm_tools
+                                        .borrow()
+                                        .iter()
+                                        .find(|w| w.id == tool_use_id)
+                                        .map(|w| Arc::clone(&w.handle))
+                                });
+                            let func = handle
+                                .as_ref()
+                                .and_then(resolve_root_buf)
+                                .and_then(|root| crate::api::ui::buf::click_fn(&root));
+                            let (Some(handle), Some(func)) = (handle, func) else {
+                                // No handle, or a buf without a click handler
+                                // (some plugins wire clicks only in restore):
+                                // either way the fallback restore serves it.
+                                if let Some(fb) = fallback {
+                                    spawn_restore(
+                                        &ex, &gate, &restores, &rt, fb.item, fb.event_tx,
+                                    );
+                                } else {
+                                    tracing::debug!(tool_use_id, "unhandled click ignored");
+                                }
+                                continue;
+                            };
+                            let lua = rt.lua.clone();
+                            let g = Rc::clone(&gate);
+                            let arg = match rt.lua.create_table() {
+                                Ok(t) => {
+                                    let _ = t.set("row", row);
+                                    LuaValue::Table(t)
+                                }
+                                Err(_) => LuaValue::Nil,
+                            };
+                            ex.spawn(async move {
+                                let slot = Some(g.acquire().await);
+                                let call = covered(
+                                    slot,
+                                    ScopedFuture::new(lua.clone(), handle, func.call_async::<()>(arg)),
+                                );
+                                if let Err(e) = call.await {
+                                    tracing::warn!(tool_use_id, error = %e, "live click failed");
+                                }
+                            })
+                            .detach();
+                        }
+                        Request::ClickRegion { id } => {
+                            let func = rt
+                                .lua
+                                .app_data_ref::<ClickRegions>()
+                                .and_then(|regions| regions.function(&rt.lua, id));
+                            if let Some(func) = func {
+                                let handle = TaskCell::new(CancelToken::none(), None, None)
+                                    .into_handle();
+                                let lua = rt.lua.clone();
+                                let g = Rc::clone(&gate);
+                                ex.spawn(async move {
+                                    let slot = Some(g.acquire().await);
+                                    let call = covered(
+                                        slot,
+                                        ScopedFuture::new(
+                                            lua.clone(),
+                                            handle,
+                                            func.call_async::<()>(()),
+                                        ),
+                                    );
+                                    if let Err(e) = call.await {
+                                        tracing::warn!(id, error = %e, "status click failed");
+                                    }
+                                })
+                                .detach();
+                            }
+                        }
+                        Request::ObserveAgents(manager) => {
+                            crate::agent_autocmd::observe(&rt.lua, &manager);
+                        }
+                        Request::FireAutocmd { event, data, agent } => {
+                            let data = json_to_lua(&rt.lua, &data).unwrap_or(LuaValue::Nil);
+                            crate::api::autocmd::dispatch(&rt.lua, &event, None, data, agent.as_ref());
+                            let root = agent.as_ref().is_none_or(|agent| {
+                                agent.snapshot().is_ok_and(|node| node.parent_id.is_none())
+                            });
+                            if root && event == crate::agent_autocmd::TURN_END_EVENT {
+                                rt.lua.gc_collect().ok();
+                            }
+                        }
+                        Request::SplashFrame(work) => {
+                            rt.codegen_budgeted();
+                            let request = work.value();
+                            let pull = splash_frame(
+                                &rt.lua,
+                                request.width,
+                                request.height,
+                                request.elapsed_secs,
+                                request.fade,
+                            )
+                            .await;
+                            // Unknown drops the reply unanswered, which the
+                            // puller reads as "retry", like a superseded pull.
+                            work.finish(|request| {
+                                let frame = match pull {
+                                    SplashPull::Frame(frame) => Some(frame),
+                                    SplashPull::Missing => None,
+                                    SplashPull::Unknown => return,
+                                };
+                                let _ = request.reply.send(frame);
+                            });
+                        }
+                        Request::SetVersion { current, latest } => {
+                            if let Some(mut info) = rt.lua.app_data_mut::<crate::splash::VersionInfo>() {
+                                info.current = current;
+                                info.latest = latest;
+                            }
+                        }
+                        Request::ProviderUsageChanged {
+                            snapshot,
+                            invalidation,
+                        } => {
+                            crate::api::usage::publish(&rt.lua, snapshot);
+                            if let Some(invalidation) = invalidation
+                                && let Some(tx) = rt.ui_action_tx.as_ref()
+                            {
+                                let usage_has_content = rt
+                                    .lua
+                                    .app_data_ref::<crate::api::ui::StatusContentStore>()
+                                    .map(|store| store.has_plugin_content("usage"))
+                                    .unwrap_or(false);
+                                if !usage_has_content {
+                                    let generation = rt
+                                        .lua
+                                        .app_data_ref::<StatusContentWriter>()
+                                        .map(|writer| writer.generation())
+                                        .unwrap_or_default();
+                                    let _ = tx.try_send(UiAction::ProviderUsageAck(
+                                        crate::ProviderUsageAck {
+                                            invalidation,
+                                            status_generation: generation,
+                                        },
+                                    ));
+                                }
+                            }
+                        }
+                        Request::Describe {
+                            plugin,
+                            tool,
+                            dctx,
+                            reply,
+                        } => {
+                            let _ = reply
+                                .send(run_describe(&rt.lua, &rt.plugins, &plugin, &tool, &dctx));
+                        }
+                        Request::StartTool {
+                            plugin,
+                            tool,
+                            input,
+                            live,
+                            ctx,
+                            reply,
+                            nested,
+                        } => {
+                            let func = {
+                                let plugins = rt.plugins.borrow();
+                                let owner = plugins.get(&*plugin);
+                                owner
+                                    .and_then(|p| p.tools.get(&*tool))
+                                    .and_then(|tk| tk.start.as_ref())
+                                    .and_then(|key| rt.lua.registry_value::<Function>(key).ok())
+                            };
+                            let Some(func) = func else {
+                                let _ = reply.send(());
+                                continue;
+                            };
+                            let lua = rt.lua.clone();
+                            let g = Rc::clone(&gate);
+                            ex.spawn(async move {
+                                let slot = match nested {
+                                    true => None,
+                                    false => Some(g.acquire().await),
+                                };
+                                covered(
+                                    slot,
+                                    run_tool_start(
+                                        &lua,
+                                        func,
+                                        &tool,
+                                        input,
+                                        live,
+                                        ctx,
+                                    ),
+                                )
+                                .await;
+                                let _ = reply.send(());
+                            })
+                            .detach();
+                        }
+                        Request::RunKeybindCallback { id, target } => {
+                            let func = rt.lua.app_data_ref::<KeymapStore>().and_then(|store| {
+                                let plugin = store.snapshot_entries().into_iter().find(|entry| entry.id == id)?.plugin;
+                                let key = store.callback_for_id(id)?;
+                                Some((rt.lua.registry_value::<Function>(key).ok()?, plugin))
+                            });
+                            if let Some((func, plugin)) = func {
+                                let target = crate::orchestration::validate_pinned_target(&rt.lua, target.map(|target| *target));
+                                let owner = crate::orchestration::plugin_authority(&rt.lua, plugin.clone());
+                                let lua = rt.lua.clone();
+                                ex.spawn(async move {
+                                    let scope = TaskScope::detached(&lua);
+                                    if let Ok(Some(target)) = &target {
+                                        lock_cell(scope.handle()).pinned_target = Some(target.clone());
+                                    }
+                                    let run = async {
+                                        bind_plugin_owner(&lua, plugin.clone(), owner)?;
+                                        let ctx = target
+                                            .map_err(mlua::Error::runtime)?
+                                            .map(|target| LuaCtx::trusted_context(&lua, target, plugin));
+                                        func.call_async::<()>((LuaValue::Nil, ctx)).await
+                                    };
+                                    if let Err(e) = run_scoped(&lua, scope, run).await {
+                                        tracing::warn!(keybind_id = id, error = %e, "keybind callback failed");
+                                    }
+                                }).detach();
+                            }
+                        }
+                        Request::PickerEvent { id, ev } => {
+                            let Some(store) = rt.lua.app_data_ref::<PickerCallbacks>() else {
+                                continue;
+                            };
+                            let Some((func, payload)) = (match ev {
+                                PickerEvent::Done => {
+                                    store.remove(id);
+                                    None
+                                }
+                                PickerEvent::Change { index } => store
+                                    .change_payload(id, index)
+                                    .map(|(func, item, index)| (func, Some((item, index)))),
+                                PickerEvent::Timeout => store
+                                    .timeout_callback(id)
+                                    .map(|func| (func, None)),
+                            }) else {
+                                continue;
+                            };
+                            let lua = rt.lua.clone();
+                            ex.spawn(async move {
+                                let call = match payload {
+                                    Some((item, index)) => func.call_async::<()>((item, index)),
+                                    None => func.call_async::<()>(()),
+                                };
+                                if let Err(e) = run_detached(&lua, call).await {
+                                    tracing::warn!(picker_id = id, error = %e, "picker callback failed");
+                                }
+                            })
+                            .detach();
+                        }
+                        Request::CollectCompletionItems { ctx, reply } => {
+                            let items =
+                                run_detached(&rt.lua, completion::collect_completion_items(&rt.lua, &ctx))
+                                    .await;
+                            let _ = reply.send(items);
+                        }
+                        Request::CollectCommandArgumentItems(work) => {
+                            let request = work.value();
+                            let items = run_command_completion_scoped(
+                                &rt.lua,
+                                request.cancel.clone(),
+                                crate::api::completion::collect_command_argument_items(
+                                    &rt.lua,
+                                    &request.context,
+                                    request.callbacks.as_deref(),
+                                ),
+                            )
+                            .await
+                            .unwrap_or_default();
+                            work.finish(|request| {
+                                let _ = request.reply.send(items);
+                            });
+                        }
+                        Request::CommandArgumentLifecycle(work) => {
+                            if !work.is_superseded() {
+                                let request = work.value();
+                                let _ = run_command_completion_scoped(
+                                    &rt.lua,
+                                    request.cancel.clone(),
+                                    crate::api::completion::run_command_argument_lifecycle(
+                                        &rt.lua,
+                                        request,
+                                    ),
+                                )
+                                .await;
+                            }
+                            work.finish(drop);
+                        }
+                        Request::ExpandReferences { text, reply } => {
+                            let res =
+                                run_detached(&rt.lua, completion::expand_references(&rt.lua, &text))
+                                    .await;
+                            let _ = reply.send(res);
+                        }
+                        Request::SetSessionOption {
+                            coordinator,
+                            id,
+                            value,
+                            reply,
+                        } => {
+                            let snapshot = coordinator.read().options();
+                            let validation = snapshot
+                                .options
+                                .iter()
+                                .find(|option| option.definition.id == id)
+                                .map_or(Ok(()), |option| {
+                                    validate_option_value(&rt.lua, option, &value)
+                                });
+                            // Detached: a model change prepares its provider,
+                            // and a Lua provider's prepare runs on this loop.
+                            ex.spawn(async move {
+                                let result = match validation {
+                                    Ok(()) => coordinator
+                                        .set_option_if_version(id, value, Some(snapshot.version))
+                                        .await
+                                        .map_err(Into::into),
+                                    Err(error) => Err(
+                                        makima_agent::config_change::ConfigChangeError::from(error)
+                                            .into(),
+                                    ),
+                                };
+                                let _ = reply.send(result);
+                            })
+                            .detach();
+                        }
+                    }
+                }
+            }));
+            for (_, producer) in rt
+                .command_producers
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .drain()
+            {
+                producer.remove();
+            }
+            // Clones of the host (`EventHandle`, `LuaTool`) can still hold
+            // a live sender, so dropping the receivers alone does not free
+            // queued requests. Drain them so queued command work is dropped.
+            for _ in rx.drain() {}
+            for _ in prio_rx.drain() {}
+            crate::api::tool::clear_local_callbacks();
+        })
+        .map_err(|e| PluginError::Io {
+            path: PathBuf::from("lua-thread"),
+            source: e,
+        })?;
+
+    init_rx.recv().map_err(|_| PluginError::Lua {
+        plugin: "<init>".to_owned(),
+        source: mlua::Error::runtime("lua thread exited before init completed"),
+    })??;
+
+    Ok(LuaThread {
+        tx,
+        prio_tx,
+        command_generations,
+        command_arguments,
+        command_argument_lifecycle,
+        splash_frames,
+        join: Some(handle),
+        shutdown,
+        keymap_reader,
+        hint_reader,
+        status_content_reader,
+        ui_action_rx,
+        modes,
+        session_options,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::tool::ToolCallReply;
+    use futures_lite::future::poll_once;
+    use makima_agent::cancel::CancelTrigger;
+    use makima_commands::CommandArguments;
+    use std::future::poll_fn;
+    use std::task::Poll;
+    use test_case::test_case;
+
+    #[test_case(false; "normal_exit")]
+    #[test_case(true; "cancelled_exit")]
+    fn scope_cleanup_expires_retained_handle(cancelled: bool) {
+        let lua = Lua::new();
+        assert!(current_managed_turn(&lua).is_none());
+        let (trigger, cancel) = CancelToken::new();
+        let scope = TaskScope::new(&lua, TaskCell::new(cancel, None, None));
+        let retained = Arc::clone(scope.handle());
+        let cleaned = Arc::new(AtomicU64::new(0));
+        for index in 1..=2 {
+            let cleaned = cleaned.clone();
+            register_defer_close(
+                &lua,
+                Box::new(move || {
+                    cleaned
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                            Some(value * 10 + index)
+                        })
+                        .unwrap();
+                }),
+            )
+            .unwrap();
+        }
+        let cleanup_handle = retained.clone();
+        register_defer_close(
+            &lua,
+            Box::new(move || {
+                assert!(!lock_cell(&cleanup_handle).scope_alive);
+            }),
+        )
+        .unwrap();
+        if cancelled {
+            drop(trigger);
+        }
+        drop(scope);
+        assert_eq!(cleaned.load(Ordering::SeqCst), 21);
+        assert!(!lock_cell(&retained).scope_alive);
+        assert!(register_defer_close(&lua, Box::new(|| {})).is_err());
+    }
+
+    #[test]
+    fn concurrent_scope_drop_cleans_parked_future_without_resume() {
+        smol::block_on(async {
+            let lua = Lua::new();
+            let first = TaskScope::detached(&lua);
+            let first_id = lock_cell(first.handle()).id;
+            let second = TaskScope::detached(&lua);
+            let second_id = lock_cell(second.handle()).id;
+            let cleaned = Arc::new(AtomicBool::new(false));
+            let cleanup = cleaned.clone();
+            let mut work = Box::pin(first.scope_future(async {
+                assert_eq!(active_task_id(&lua), Some(first_id));
+                register_defer_close(
+                    &lua,
+                    Box::new(move || cleanup.store(true, Ordering::Release)),
+                )
+                .unwrap();
+                std::future::pending::<()>().await;
+            }));
+            assert!(poll_once(&mut work).await.is_none());
+            second
+                .scope_future(async {
+                    assert_eq!(active_task_id(&lua), Some(second_id));
+                })
+                .await;
+            drop(work);
+            drop(first);
+            assert!(cleaned.load(Ordering::Acquire));
+            drop(second);
+        });
+    }
+
+    struct FakeCommandHost;
+
+    #[derive(Default)]
+    struct CompletionContextProbe(Mutex<Vec<CompletionContext>>);
+
+    impl CommandCompletion for CompletionContextProbe {
+        fn complete(
+            &self,
+            context: CompletionContext,
+            _cancellation: makima_commands::CancellationToken,
+        ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
+            self.0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(context);
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    impl makima_commands::CommandHost for FakeCommandHost {
+        fn request(
+            &self,
+            _request: makima_commands::HostRequest,
+        ) -> CommandFuture<Result<makima_commands::HostResponse, CommandError>> {
+            Box::pin(async { Ok(makima_commands::HostResponse::Completed) })
+        }
+    }
+
+    fn make_buf_handle(text: &str) -> BufHandle {
+        let buf = Arc::new(makima_agent::SharedBuf::new());
+        buf.append(SnapshotLine {
+            spans: vec![SnapshotSpan {
+                text: text.into(),
+                style: SpanStyle::Default,
+            }],
+        });
+        BufHandle::foreign(buf)
+    }
+
+    fn test_lua() -> Lua {
+        let lua = Lua::new();
+        lua.set_app_data(BufferStore::new());
+        lua
+    }
+
+    fn lifecycle_req(event: CommandArgumentLifecycle) -> CommandArgumentLifecycleRequest {
+        CommandArgumentLifecycleRequest {
+            context: CommandArgumentContext {
+                command: Arc::from("/cmd"),
+                plugin: Arc::from("plugin"),
+                args: String::new(),
+                arg: String::new(),
+                index: 0,
+                mode: "build".into(),
+                session: 1,
+                generation: 1,
+                command_generation: 0,
+                argument_name: None,
+                argument_kind: None,
+                preceding_arguments: Arc::from([]),
+            },
+            callbacks: None,
+            event,
+            item: None,
+            cancel: CancelToken::none(),
+            _lifecycle_owner: None,
+        }
+    }
+
+    #[test_case(CommandArgumentLifecycle::Highlight, CommandArgumentLifecycle::Highlight, true  ; "highlight_coalesces_highlight")]
+    #[test_case(CommandArgumentLifecycle::Accept,  CommandArgumentLifecycle::Highlight, false ; "late_highlight_keeps_accept")]
+    #[test_case(CommandArgumentLifecycle::Cancel,  CommandArgumentLifecycle::Highlight, false ; "late_highlight_keeps_cancel")]
+    #[test_case(CommandArgumentLifecycle::Highlight, CommandArgumentLifecycle::Accept,  true  ; "accept_supersedes_highlight")]
+    #[test_case(CommandArgumentLifecycle::Highlight, CommandArgumentLifecycle::Cancel,  true  ; "cancel_supersedes_highlight")]
+    #[test_case(CommandArgumentLifecycle::Accept,  CommandArgumentLifecycle::Accept,  false ; "accepts_both_run")]
+    #[test_case(CommandArgumentLifecycle::Accept,  CommandArgumentLifecycle::Cancel,  false ; "accept_then_cancel_both_run")]
+    #[test_case(CommandArgumentLifecycle::Cancel,  CommandArgumentLifecycle::Accept,  false ; "cancel_then_accept_both_run")]
+    #[test_case(CommandArgumentLifecycle::Cancel,  CommandArgumentLifecycle::Cancel,  true  ; "cancels_coalesce")]
+    fn lifecycle_superseded_table(
+        this_event: CommandArgumentLifecycle,
+        pending_event: CommandArgumentLifecycle,
+        expected: bool,
+    ) {
+        assert_eq!(
+            lifecycle_superseded(&lifecycle_req(this_event), &lifecycle_req(pending_event)),
+            expected
+        );
+    }
+
+    #[test_case(|request: &mut CommandArgumentLifecycleRequest| request.context.index += 1; "argument")]
+    #[test_case(|request: &mut CommandArgumentLifecycleRequest| request.context.session += 1; "session")]
+    #[test_case(|request: &mut CommandArgumentLifecycleRequest| request.context.command = Arc::from("/other"); "command")]
+    #[test_case(|request: &mut CommandArgumentLifecycleRequest| request.context.plugin = Arc::from("other"); "plugin")]
+    #[test_case(|request: &mut CommandArgumentLifecycleRequest| request.context.command_generation += 1; "command_generation")]
+    fn lifecycle_events_from_distinct_providers_do_not_coalesce(
+        change_identity: fn(&mut CommandArgumentLifecycleRequest),
+    ) {
+        let this = lifecycle_req(CommandArgumentLifecycle::Cancel);
+        let mut pending = lifecycle_req(CommandArgumentLifecycle::Cancel);
+        change_identity(&mut pending);
+
+        assert!(!lifecycle_superseded(&this, &pending));
+    }
+
+    #[test]
+    fn discarded_prompt_callbacks_leave_no_stale_candidate() {
+        let lua = test_lua();
+        let pending: PendingPromptHintCallbacks = Arc::default();
+        let callback = lua.create_function(|_, ()| Ok(())).unwrap();
+        let key = lua.create_registry_value(callback).unwrap();
+        pending.lock().unwrap().insert(
+            Arc::from("failed"),
+            vec![PromptHintRegistration {
+                prompts: None,
+                slot: Slot::ToolUsage,
+                content: HintContent::Callback(key),
+            }],
+        );
+        lua.set_app_data(Arc::clone(&pending));
+        discard_pending_prompt_callbacks(&lua, pending);
+
+        assert!(lua.app_data_ref::<PendingPromptHintCallbacks>().is_none());
+    }
+
+    #[test]
+    fn from_lua_value_plain_string() {
+        let lua = test_lua();
+        let val = LuaValue::String(lua.create_string("ok").unwrap());
+        let reply = ToolCallReply::from_lua_value(&lua, &val);
+        assert_eq!(reply.result, Ok("ok".to_string()));
+        assert!(reply.snapshot.is_none());
+        assert!(reply.header.is_none());
+    }
+
+    #[test]
+    fn from_lua_value_table_with_body_and_header() {
+        let lua = test_lua();
+        let body_handle = lua.create_userdata(make_buf_handle("body line")).unwrap();
+        let hdr_handle = lua.create_userdata(make_buf_handle("hdr line")).unwrap();
+        let t = lua.create_table().unwrap();
+        t.set("llm_output", "text").unwrap();
+        t.set("body", body_handle).unwrap();
+        t.set("header", hdr_handle).unwrap();
+        let reply = ToolCallReply::from_lua_value(&lua, &LuaValue::Table(t));
+        assert_eq!(reply.result, Ok("text".to_string()));
+        assert_eq!(reply.snapshot.unwrap().first_line_text(), "body line");
+        assert_eq!(reply.header.unwrap().first_line_text(), "hdr line");
+    }
+
+    #[test]
+    fn from_lua_value_missing_llm_output_still_extracts_body() {
+        let lua = test_lua();
+        let t = lua.create_table().unwrap();
+        t.set("body", lua.create_userdata(make_buf_handle("x")).unwrap())
+            .unwrap();
+        let reply = ToolCallReply::from_lua_value(&lua, &LuaValue::Table(t));
+        assert!(reply.result.is_err());
+        assert!(reply.snapshot.is_some());
+    }
+
+    #[test]
+    fn task_scope_clears_bufs_on_drop() {
+        let lua = Lua::new();
+        let scope = TaskScope::new(&lua, task_cell(None));
+        let handle = Arc::clone(scope.handle());
+        lock_cell(&handle).bufs.create_live();
+        assert!(lock_cell(&handle).bufs.live_buf().is_some());
+        drop(scope);
+        assert!(lock_cell(&handle).bufs.live_buf().is_none());
+    }
+
+    #[test]
+    fn task_scope_clears_only_its_jobs_on_drop() {
+        let lua = Lua::new();
+        let scope = TaskScope::new(&lua, task_cell(None));
+        let task_owner = JobOwner::Task(lock_cell(scope.handle()).id);
+        let plugin_owner = JobOwner::Plugin(Arc::from("test-plugin"));
+        with_jobs(&lua, |store| {
+            store
+                .start(task_owner.clone(), "exit 0", None, None, None, None, None)
+                .unwrap();
+            store
+                .start(plugin_owner.clone(), "exit 0", None, None, None, None, None)
+                .unwrap();
+        });
+
+        drop(scope);
+
+        with_jobs(&lua, |store| {
+            assert!(store.is_empty(&task_owner));
+            assert!(!store.is_empty(&plugin_owner));
+            store.kill_owner(&lua, &plugin_owner);
+        });
+    }
+
+    #[test]
+    fn task_scope_drop_clears_buf_handler_slots() {
+        let lua = Lua::new();
+        let scope = TaskScope::new(&lua, task_cell(None));
+        let handle = with_task_bufs(&lua, |store| store.create());
+        let shared = Arc::clone(&handle.buf);
+        lua.globals()
+            .set("buf", lua.create_userdata(handle.clone()).unwrap())
+            .unwrap();
+        lua.load(r#"buf:on("click", function() end); buf:on("change", function() hit = true end)"#)
+            .exec()
+            .unwrap();
+        shared.append(SnapshotLine { spans: vec![] });
+        assert!(lua.globals().get::<bool>("hit").unwrap());
+        assert!(handle.click_fn().is_some());
+        drop(scope);
+        lua.globals().set("hit", false).unwrap();
+        shared.append(SnapshotLine { spans: vec![] });
+        assert!(!lua.globals().get::<bool>("hit").unwrap());
+        assert!(handle.click_fn().is_none());
+    }
+
+    fn task_cell(live: Option<LiveCtx>) -> TaskCell {
+        TaskCell::new(CancelToken::none(), None, live)
+    }
+
+    #[test]
+    fn with_live_ctx_follows_task_live_field() {
+        let lua = Lua::new();
+
+        let (tx, _rx) = flume::unbounded();
+        let with_live = task_cell(Some(LiveCtx {
+            event_tx: makima_agent::EventSender::new(tx),
+            tool_use_id: "tool_abc".into(),
+        }));
+
+        let scope = TaskScope::new(&lua, task_cell(None));
+        assert!(with_live_ctx(&lua, |_| ()).is_none());
+        drop(scope);
+
+        let _scope = TaskScope::new(&lua, with_live);
+        assert_eq!(
+            with_live_ctx(&lua, |ctx| ctx.tool_use_id.clone()).unwrap(),
+            "tool_abc"
+        );
+    }
+
+    fn gate() -> InflightGate {
+        InflightGate::new(Lua::new())
+    }
+
+    #[test]
+    fn inflight_gate_drain_requires_all_decrements() {
+        let ex = smol::LocalExecutor::new();
+        smol::block_on(ex.run(async {
+            let g = Rc::new(gate());
+            g.increment();
+            g.increment();
+            let g2 = Rc::clone(&g);
+            let waiter = ex.spawn(async move { g2.drain().await });
+            smol::future::yield_now().await;
+            assert!(!waiter.is_finished());
+            g.decrement();
+            smol::future::yield_now().await;
+            assert!(!waiter.is_finished());
+            g.decrement();
+            waiter.await;
+        }));
+    }
+
+    #[test]
+    fn inflight_gate_blocks_at_max_capacity() {
+        let ex = smol::LocalExecutor::new();
+        smol::block_on(ex.run(async {
+            let g = Rc::new(gate());
+            for _ in 0..MAX_INFLIGHT_TOOLS {
+                g.increment();
+            }
+            let g2 = Rc::clone(&g);
+            let waiter = ex.spawn(async move { g2.wait_below(MAX_INFLIGHT_TOOLS).await });
+            smol::future::yield_now().await;
+            assert!(!waiter.is_finished());
+            g.decrement();
+            waiter.await;
+        }));
+    }
+
+    #[test]
+    fn acquire_caps_concurrent_holders_even_when_spawned_in_bulk() {
+        let ex = smol::LocalExecutor::new();
+        smol::block_on(ex.run(async {
+            let g = Rc::new(gate());
+            let (release_tx, release_rx) = flume::unbounded::<()>();
+            let tasks: Vec<_> = (0..MAX_INFLIGHT_TOOLS + 1)
+                .map(|_| {
+                    let g = Rc::clone(&g);
+                    let release_rx = release_rx.clone();
+                    ex.spawn(async move {
+                        let _guard = g.acquire().await;
+                        release_rx.recv_async().await.ok();
+                    })
+                })
+                .collect();
+            for _ in 0..MAX_INFLIGHT_TOOLS + 2 {
+                smol::future::yield_now().await;
+            }
+            assert_eq!(g.count.get(), MAX_INFLIGHT_TOOLS);
+            drop(release_tx);
+            for t in tasks {
+                t.await;
+            }
+            assert_eq!(g.count.get(), 0);
+        }));
+    }
+
+    #[test]
+    fn extract_restore_reply_userdata_returns_body_only() {
+        let lua = test_lua();
+        let handle = make_buf_handle("restored line");
+        let ud = lua.create_userdata(handle).unwrap();
+        let val = LuaValue::UserData(ud);
+        let reply = extract_restore_reply(&val).expect("should extract from userdata");
+        assert_eq!(reply.body.unwrap().first_line_text(), "restored line");
+        assert!(reply.header.is_none());
+    }
+
+    #[test]
+    fn extract_restore_reply_table_with_body_and_header() {
+        let lua = test_lua();
+        let body = lua.create_userdata(make_buf_handle("body")).unwrap();
+        let header = lua.create_userdata(make_buf_handle("header")).unwrap();
+        let t = lua.create_table().unwrap();
+        t.set("body", body).unwrap();
+        t.set("header", header).unwrap();
+        let val = LuaValue::Table(t);
+        let reply = extract_restore_reply(&val).unwrap();
+        assert_eq!(reply.body.unwrap().first_line_text(), "body");
+        assert_eq!(reply.header.unwrap().first_line_text(), "header");
+    }
+
+    fn enqueue_test_lua() -> Lua {
+        let lua = Lua::new();
+        lua.set_app_data(SpawnQueue::new());
+        lua
+    }
+
+    fn enqueue_dummy(lua: &Lua) -> RegistryKey {
+        let func = lua.create_function(|_, _: ()| Ok(())).unwrap();
+        lua.create_registry_value(func).unwrap()
+    }
+
+    fn set_active(lua: &Lua, cell: TaskCell) -> TaskScope {
+        TaskScope::new(lua, cell)
+    }
+
+    #[test]
+    fn gate_guard_tracks_count_via_raii() {
+        let g = Rc::new(gate());
+        let g1 = GateGuard::new(&g);
+        let g2 = GateGuard::new(&g);
+        assert_eq!(g.count.get(), 2);
+        drop(g1);
+        assert_eq!(g.count.get(), 1);
+        drop(g2);
+        assert_eq!(g.count.get(), 0);
+    }
+
+    #[test]
+    fn enqueue_async_task_missing_spawn_queue_errors() {
+        let lua = Lua::new();
+        let key = lua
+            .create_registry_value(lua.create_function(|_, _: ()| Ok(())).unwrap())
+            .unwrap();
+        let err = enqueue_async_task(&lua, key).unwrap_err();
+        assert!(err.to_string().contains(SPAWN_QUEUE_NOT_INIT));
+    }
+
+    #[test]
+    fn enqueue_async_task_routes_to_inline_spawn_when_set() {
+        let lua = enqueue_test_lua();
+        let scope = set_active(&lua, TaskCell::new(CancelToken::none(), None, None));
+        lock_cell(scope.handle()).inline_spawn = Some(Vec::new());
+
+        enqueue_async_task(&lua, enqueue_dummy(&lua)).unwrap();
+
+        assert!(
+            lua.app_data_ref::<SpawnQueue>().unwrap().rx.is_empty(),
+            "task must not reach the global queue"
+        );
+        let cell = lock_cell(scope.handle());
+        assert_eq!(cell.inline_spawn.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn enqueue_async_task_works_without_task_ctx() {
+        let lua = enqueue_test_lua();
+        enqueue_async_task(&lua, enqueue_dummy(&lua)).unwrap();
+
+        let queue = lua.app_data_ref::<SpawnQueue>().unwrap();
+        let queued = queue.rx.try_recv().unwrap();
+        assert!(queued.live_ctx.is_none());
+        assert!(queued.owner.is_none());
+    }
+
+    #[test]
+    fn enqueue_async_task_inherits_cancel_token() {
+        let lua = enqueue_test_lua();
+        let (trigger, token) = CancelToken::new();
+        let _h = set_active(&lua, TaskCell::new(token, None, None));
+        enqueue_async_task(&lua, enqueue_dummy(&lua)).unwrap();
+
+        let queue = lua.app_data_ref::<SpawnQueue>().unwrap();
+        let queued = queue.rx.try_recv().unwrap();
+        assert!(!queued.cancel.is_cancelled());
+        trigger.cancel();
+        assert!(
+            queued.cancel.is_cancelled(),
+            "async task should inherit parent cancel"
+        );
+    }
+
+    #[test]
+    fn command_registration_propagates_completion_callback_clone_errors() {
+        let lua = test_lua();
+        let foreign_lua = Lua::new();
+        let invalid = foreign_lua
+            .create_registry_value(foreign_lua.create_table().unwrap())
+            .unwrap();
+        let commands = HashMap::from([(
+            Arc::from("/complete"),
+            crate::api::util::command::CommandEntry {
+                generation: 0,
+                handler: enqueue_dummy(&lua),
+                description: Arc::from("complete"),
+                argument_hint: None,
+                arguments: CommandArguments::Positional(Arc::from([
+                    makima_commands::PositionalArgument::required(
+                        "value",
+                        makima_commands::ArgumentKind::String,
+                    ),
+                ])),
+                tui_only: false,
+                argument_completions: vec![Some(crate::api::util::command::ArgumentCompletion {
+                    completion: invalid,
+                    on_highlight: None,
+                    on_accept: None,
+                    on_cancel: None,
+                    navigation: None,
+                })],
+            },
+        )]);
+        let error = command_registrations(
+            &lua,
+            Some(&commands),
+            &Arc::from("test"),
+            &flume::unbounded().0,
+            &CoalescedLatest::new(|_| false),
+            &CoalescedLatest::new(|_| false),
+        )
+        .expect_err("invalid callback key must abort command publication");
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn lua_completion_retains_session_across_requests_until_terminal_event() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        let probe = Arc::new(CompletionContextProbe::default());
+        let completion: Arc<dyn CommandCompletion> = probe.clone();
+        producer
+            .replace(vec![Registration {
+                spec: CommandSpec {
+                    name: Arc::from("/complete"),
+                    aliases: Arc::from([]),
+                    arguments: CommandArguments::Positional(Arc::from([
+                        makima_commands::PositionalArgument::optional(
+                            "value",
+                            makima_commands::ArgumentKind::String,
+                        )
+                        .with_completion(makima_commands::CompletionPolicy::Replace),
+                    ])),
+                    docs: CommandDocs {
+                        summary: Arc::from("Complete"),
+                        argument_hint: None,
+                    },
+                    required_capabilities: TargetCapabilities::default(),
+                },
+                behavior: Arc::new(LuaCommandBehavior {
+                    plugin: Arc::from("test-plugin"),
+                    command: Arc::from("/complete"),
+                    generation: 0,
+                    tx: flume::unbounded().0,
+                }),
+                argument_completions: vec![Some(Arc::clone(&completion))],
+            }])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(FakeCommandHost));
+        let command = registry.resolve_for(&target, "/complete").unwrap();
+        let session = registry.open_completion(command, target.id()).unwrap();
+        for argument in ["a", "ab"] {
+            assert!(matches!(
+                smol::block_on(session.complete(
+                    Arc::from(argument),
+                    Arc::from(argument),
+                    0,
+                    Arc::from("build"),
+                )),
+                makima_commands::CompletionResult::Items(_)
+            ));
+        }
+        let contexts = probe
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let adapter = LuaCommandCompletion {
+            plugin: Arc::from("test-plugin"),
+            command: Arc::from("/complete"),
+            argument_index: None,
+            directory_navigation: false,
+            callbacks: None,
+            command_generation: 0,
+            command_arguments: CoalescedLatest::new(|_| false),
+            command_argument_lifecycle: CoalescedLatest::new(|_| false),
+            sessions: Mutex::new(HashMap::new()),
+            next_session_id: AtomicU64::new(1),
+        };
+        let (first, _) = adapter.context(&contexts[0], CancelToken::new().0, false);
+        let (second, _) = adapter.context(&contexts[1], CancelToken::new().0, false);
+        let (terminal, _) = adapter.context(&contexts[1], CancelToken::new().0, true);
+        let (reopened, _) = adapter.context(&contexts[1], CancelToken::new().0, false);
+
+        assert_eq!(first.session, second.session);
+        assert!(second.generation > first.generation);
+        assert_eq!(terminal.session, second.session);
+        assert_eq!(terminal.generation, second.generation);
+        assert_ne!(reopened.session, terminal.session);
+    }
+
+    #[test]
+    fn lua_command_handler_generation_rejects_stale_requests() {
+        let lua = test_lua();
+        let plugin: Arc<str> = Arc::from("plugin");
+        let command: Arc<str> = Arc::from("/cmd");
+        let old = lua
+            .create_registry_value(lua.create_function(|_, ()| Ok(())).unwrap())
+            .unwrap();
+        let new = lua
+            .create_registry_value(lua.create_function(|_, ()| Ok(())).unwrap())
+            .unwrap();
+        let mut commands = HashMap::new();
+        commands.insert(
+            command.clone(),
+            crate::api::util::command::CommandEntry {
+                generation: 2,
+                handler: new,
+                description: Arc::from("new"),
+                argument_hint: None,
+                arguments: CommandArguments::Raw { required: false },
+                tui_only: false,
+                argument_completions: Vec::new(),
+            },
+        );
+        lua.set_app_data(CommandHandlerMap::from([(plugin.clone(), commands)]));
+        assert!(resolve_command_handler(&lua, &plugin, &command, 1).is_none());
+        assert!(resolve_command_handler(&lua, &plugin, &command, 2).is_some());
+        let _ = old;
+    }
+
+    #[test]
+    fn lua_command_rejects_attachments_before_handler_dispatch() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        let (tx, rx) = flume::bounded(1);
+        producer
+            .replace(vec![Registration {
+                spec: CommandSpec {
+                    name: Arc::from("/lua-command"),
+                    aliases: Arc::from([]),
+                    arguments: CommandArguments::Raw { required: false },
+                    docs: CommandDocs {
+                        summary: Arc::from("Lua command"),
+                        argument_hint: None,
+                    },
+                    required_capabilities: TargetCapabilities::default(),
+                },
+                behavior: Arc::new(LuaCommandBehavior {
+                    plugin: Arc::from("test-plugin"),
+                    command: Arc::from("/lua-command"),
+                    generation: 0,
+                    tx,
+                }),
+                argument_completions: Vec::new(),
+            }])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(FakeCommandHost));
+        let content = makima_commands::CommandContent {
+            text: Arc::from("/lua-command"),
+            attachments: Arc::from([makima_commands::CommandAttachment {
+                media_type: Arc::from("image/png"),
+                data: Arc::from("AAAA"),
+            }]),
+        };
+
+        let result = smol::block_on(registry.dispatch_input(&target, content));
+
+        assert!(matches!(
+            result,
+            makima_commands::InputDispatch::Dispatched(CommandOutcome::Failed(
+                CommandError::Producer(message)
+            )) if message.as_ref() == LUA_COMMAND_ATTACHMENTS
+        ));
+        assert!(rx.is_empty());
+    }
+
+    /// Without this a `run_command` cycle could hop through `makima.async.run`
+    /// and start over at depth 0, so the cap would never trip.
+    #[test]
+    fn enqueue_async_task_inherits_command_invocation() {
+        struct CaptureBehavior(flume::Sender<CommandInvocation>);
+        impl CommandBehavior for CaptureBehavior {
+            fn execute(
+                &self,
+                invocation: CommandInvocation,
+            ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
+                self.0.send(invocation).unwrap();
+                Box::pin(async { Ok(CommandOutcome::Completed) })
+            }
+        }
+
+        let lua = enqueue_test_lua();
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        let (tx, rx) = flume::bounded(1);
+        producer
+            .replace(vec![Registration {
+                spec: CommandSpec {
+                    name: Arc::from("/capture"),
+                    aliases: Arc::from([]),
+                    arguments: CommandArguments::Raw { required: false },
+                    docs: CommandDocs {
+                        summary: Arc::from("capture"),
+                        argument_hint: None,
+                    },
+                    required_capabilities: TargetCapabilities::default(),
+                },
+                behavior: Arc::new(CaptureBehavior(tx)),
+                argument_completions: Vec::new(),
+            }])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(FakeCommandHost));
+        smol::block_on(registry.dispatch_input(&target, "/capture".into()));
+        let invocation = rx.recv().unwrap();
+        let target_id = invocation.target_id();
+        let mut cell = TaskCell::new(CancelToken::none(), None, None);
+        cell.command_depth = 3;
+        cell.command_invocation = Some(CommandTaskInvocation { invocation });
+        let _h = set_active(&lua, cell);
+        enqueue_async_task(&lua, enqueue_dummy(&lua)).unwrap();
+
+        let queue = lua.app_data_ref::<SpawnQueue>().unwrap();
+        let queued = queue.rx.try_recv().unwrap();
+        let invocation = queued.command_invocation.unwrap();
+        assert_eq!(queued.command_depth, 3);
+        assert_eq!(invocation.invocation.target_id(), target_id);
+    }
+
+    #[test]
+    fn enqueue_async_task_uses_fresh_deadline_regardless_of_parent() {
+        let lua = enqueue_test_lua();
+        let parent_deadline = Instant::now() - Duration::from_secs(10);
+        let _h = set_active(
+            &lua,
+            TaskCell::new(CancelToken::none(), Some(parent_deadline), None),
+        );
+
+        let before = Instant::now();
+        enqueue_async_task(&lua, enqueue_dummy(&lua)).unwrap();
+
+        let queue = lua.app_data_ref::<SpawnQueue>().unwrap();
+        let task_deadline = queue.rx.try_recv().unwrap().deadline.unwrap();
+        assert!(
+            task_deadline > before,
+            "async task should get a fresh deadline, not inherit expired parent"
+        );
+    }
+
+    #[test]
+    fn scope_drop_defers_watcher_clear_until_owned_tasks_release() {
+        use crate::api::ui::buf::HandlerSlot;
+
+        let lua = enqueue_test_lua();
+        let scope = set_active(&lua, TaskCell::new(CancelToken::none(), None, None));
+        let handle = Arc::clone(scope.handle());
+
+        let buf = Arc::new(SharedBuf::new());
+        let fired = Arc::new(AtomicBool::new(false));
+        let f = Arc::clone(&fired);
+        buf.set_on_change(move || f.store(true, Ordering::Release));
+        lock_cell(&handle)
+            .bufs
+            .track(HandlerSlot::Change(Arc::clone(&buf)));
+
+        enqueue_async_task(&lua, enqueue_dummy(&lua)).unwrap();
+        drop(scope);
+
+        buf.set_lines(Vec::new());
+        assert!(
+            fired.load(Ordering::Acquire),
+            "watcher must survive scope drop while an owned async task is pending"
+        );
+
+        let task = lua
+            .app_data_ref::<SpawnQueue>()
+            .unwrap()
+            .rx
+            .try_recv()
+            .unwrap();
+        drop(task);
+        fired.store(false, Ordering::Release);
+        buf.set_lines(Vec::new());
+        assert!(
+            !fired.load(Ordering::Acquire),
+            "dropping the last owned task must clear the deferred watcher"
+        );
+    }
+
+    fn pending_task(lua: &Lua, cancel: CancelToken, deadline: Option<Instant>) -> PendingAsyncTask {
+        PendingAsyncTask {
+            work_fn: enqueue_dummy(lua),
+            cancel,
+            deadline,
+            live_ctx: None,
+            owner: None,
+            plugin_grant: None,
+            managed_turn: None,
+            ancestors: Arc::default(),
+            delegated_tool: None,
+            command_depth: 0,
+            command_invocation: None,
+            pinned_target: None,
+            call: TaskCall::Plain,
+        }
+    }
+
+    #[test]
+    fn spawn_async_task_skips_cancelled_tasks() {
+        let ex = Rc::new(smol::LocalExecutor::new());
+        smol::block_on(ex.run(async {
+            let lua = enqueue_test_lua();
+            let (trigger, token) = CancelToken::new();
+            trigger.cancel();
+
+            let g = Rc::new(gate());
+            spawn_async_task(
+                &lua,
+                &ex,
+                &g,
+                &Rc::new(gate()),
+                pending_task(&lua, token, None),
+            );
+            smol::future::yield_now().await;
+            assert_eq!(g.count.get(), 0);
+        }));
+    }
+
+    fn watchdog_lua(shutdown: bool) -> (Lua, Watchdog) {
+        let lua = Lua::new();
+        let watchdog = Watchdog::spawn(&lua, Arc::new(AtomicBool::new(shutdown)));
+        (lua, watchdog)
+    }
+
+    /// Generous vs the expected kill (one poll plus [`KILL_GRACE`]); only a
+    /// broken watchdog gets here.
+    const WATCHDOG_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+    const JIT_DEADLINE: Duration = Duration::from_millis(20);
+
+    /// `while true do end` only stops if the watchdog kills it, so run it on
+    /// a helper thread with a bounded wait: a broken watchdog then fails the
+    /// test with a reason instead of hanging the harness. The clock starts
+    /// before the loop can, so the reported time is a lower bound.
+    fn hot_loop_expecting_kill(lua: &Lua) -> (mlua::Error, Duration) {
+        let f = lua.load("while true do end").into_function().unwrap();
+        let (tx, rx) = flume::bounded(1);
+        let start = Instant::now();
+        thread::spawn(move || drop(tx.send(f.call::<bool>(()))));
+        let err = rx
+            .recv_timeout(WATCHDOG_TEST_TIMEOUT)
+            .expect("watchdog never killed the hot loop")
+            .unwrap_err();
+        (err, start.elapsed())
+    }
+
+    /// Runs long enough (50ms) to guarantee several watchdog pokes.
+    fn timed_loop(lua: &Lua) -> Function {
+        lua.load("local t = os.clock() while os.clock() - t < 0.05 do end return true")
+            .into_function()
+            .unwrap()
+    }
+
+    fn cancelled_token() -> CancelToken {
+        let (trigger, token) = CancelToken::new();
+        trigger.cancel();
+        token
+    }
+
+    fn cancelled_handle() -> TaskHandle {
+        Arc::new(Mutex::new(TaskCell::new(cancelled_token(), None, None)))
+    }
+
+    /// A cancelled task whose cleanup grace has already run out, so the next
+    /// poke would kill it as cancelled unless shutdown is checked first.
+    fn expired_cancelled_handle() -> TaskHandle {
+        let handle = cancelled_handle();
+        let expired = Instant::now()
+            .checked_sub(KILL_GRACE)
+            .unwrap_or_else(Instant::now);
+        lock_cell(&handle).kill_at.set(Some(expired));
+        handle
+    }
+
+    /// Killing at the first armed safepoint is what froze batch's children
+    /// as in-progress after esc; never killing at all would leave a core
+    /// spinning, which [`WATCHDOG_TEST_TIMEOUT`] catches.
+    #[test]
+    fn stale_cancelled_handle_aborts_callback_after_the_grace() {
+        let (lua, _watchdog) = watchdog_lua(false);
+        lua.set_app_data::<TaskHandle>(cancelled_handle());
+
+        let (err, elapsed) = hot_loop_expecting_kill(&lua);
+
+        assert!(err.to_string().contains(INTERRUPT_CANCELLED_MSG));
+        assert!(elapsed >= KILL_GRACE, "kill skipped the cleanup grace");
+    }
+
+    /// A healthy poke must leave nothing armed, or the first poke after esc
+    /// kills instantly instead of granting the grace.
+    #[test]
+    fn kill_grace_is_armed_once_then_renewed_per_execution_slice() {
+        let (trigger, token) = CancelToken::new();
+        let cell = TaskCell::new(token, None, None);
+        let start = Instant::now();
+        assert_eq!(cell.kill_due(start), None);
+        assert!(cell.kill_at.get().is_none(), "healthy poke must not arm");
+
+        trigger.cancel();
+        assert_eq!(cell.kill_due(start), None, "first doomed poke only arms");
+        assert_eq!(
+            cell.kill_due(start + KILL_GRACE),
+            None,
+            "cleanup must get a full grace counted from the cancel"
+        );
+        assert_eq!(
+            cell.kill_due(start + KILL_GRACE * 2),
+            Some(KillReason::Cancelled)
+        );
+        assert_eq!(
+            cell.kill_due(start + KILL_GRACE * 2),
+            None,
+            "a raise must refill the grace for whoever catches it"
+        );
+
+        cell.renew_kill_grace();
+        assert_eq!(
+            cell.kill_due(start + KILL_GRACE * 2),
+            None,
+            "yielding must hand the task a fresh budget"
+        );
+    }
+
+    /// A doom that lifts (a handler extending its own deadline) must take
+    /// its stamp with it, or the next cancel kills with no grace at all.
+    #[test]
+    fn a_lifted_doom_disarms_the_grace() {
+        let start = Instant::now();
+        let cell = TaskCell::new(CancelToken::none(), Some(start), None);
+        assert_eq!(
+            cell.kill_due(start + KILL_GRACE),
+            None,
+            "first doomed poke only arms"
+        );
+
+        cell.deadline.set(Some(start + KILL_GRACE * 4));
+
+        assert_eq!(cell.kill_due(start + KILL_GRACE * 2), None);
+        assert!(cell.kill_at.get().is_none(), "healthy poke must disarm");
+    }
+
+    fn task_handle(cancel: CancelToken, deadline: Option<Instant>) -> TaskHandle {
+        TaskCell::new(cancel, deadline, None).into_handle()
+    }
+
+    /// The watchdog never reaches a handler parked in an await, so this
+    /// race is what ends it - but not before its cleanup window, and never
+    /// ahead of a result the handler already produced.
+    #[test]
+    fn until_abandoned_ends_a_parked_handler_only_after_its_window() {
+        let parked = std::future::pending::<()>;
+        smol::block_on(async {
+            let early = futures_lite::future::poll_once(until_abandoned(
+                parked(),
+                &task_handle(cancelled_token(), None),
+            ))
+            .await;
+            assert!(
+                early.is_none(),
+                "a cancel must not abandon the handler before its window"
+            );
+
+            assert_eq!(
+                until_abandoned(
+                    parked(),
+                    &task_handle(CancelToken::none(), Some(Instant::now())),
+                )
+                .await
+                .expect_err("a lapsed deadline must end a parked handler"),
+                HANDLER_TIMEOUT_MSG
+            );
+
+            until_abandoned(
+                std::future::ready(()),
+                &task_handle(cancelled_token(), Some(Instant::now())),
+            )
+            .await
+            .expect("a finished handler outranks a doom in the same slice");
+        });
+    }
+
+    /// `ctx:set_deadline` lands after the race is already armed, so the
+    /// arming must be revisited or a parked handler outlives its deadline.
+    #[test]
+    fn until_abandoned_re_arms_on_a_deadline_set_after_it_started() {
+        let handle = task_handle(CancelToken::none(), None);
+        let cell = Arc::clone(&handle);
+        smol::block_on(async {
+            let set = async {
+                smol::Timer::after(Duration::from_millis(1)).await;
+                let cell = lock_cell(&cell);
+                cell.deadline.set(Some(Instant::now()));
+                cell.deadline_changed.notify(usize::MAX);
+            };
+            let wait = until_abandoned(std::future::pending::<()>(), &handle);
+            let (_, err) = futures_lite::future::zip(set, wait).await;
+            assert_eq!(
+                err.expect_err("the new deadline must end the handler"),
+                HANDLER_TIMEOUT_MSG
+            );
+        });
+    }
+
+    /// [`ScopedFuture`] is the one place that observes a task yielding, so
+    /// it is what renews the grace.
+    #[test]
+    fn scoped_future_poll_renews_kill_grace() {
+        let lua = Lua::new();
+        let scope = TaskScope::new(&lua, TaskCell::new(cancelled_token(), None, None));
+        let handle = Arc::clone(scope.handle());
+        lock_cell(&handle).kill_due(Instant::now());
+        assert!(lock_cell(&handle).kill_at.get().is_some());
+
+        smol::block_on(scope.scope_future(std::future::ready(())));
+
+        assert!(lock_cell(&handle).kill_at.get().is_none());
+    }
+
+    const HOOK_MARKS: [&str; 3] = ["first", "second", "third"];
+    const HOOK_GOOD_MARK: &str = "good";
+    const HOOK_NESTED_MARK: &str = "nested";
+    const HOOK_RAISES: &str = "error('hook blew up')";
+    const HOOK_YIELDS: &str = "coroutine.yield()";
+    const HOOK_POLL_ROUNDS: usize = 3;
+    const HOOK_INNER_OUTPUT: u8 = 7;
+    const HOOK_NEVER_FIRED: &str = "cancel hook never fired";
+    const HOOK_SKIPPED_MSG: &str = "a hook registered after the bad one never fired";
+
+    fn recording_hook(lua: &Lua, tx: &flume::Sender<&'static str>, mark: &'static str) {
+        let tx = tx.clone();
+        let hook = lua
+            .create_function(move |_, ()| {
+                tx.send(mark).ok();
+                Ok(())
+            })
+            .unwrap();
+        register_cancel_hook(lua, hook).unwrap();
+    }
+
+    fn live_scope(lua: &Lua) -> (CancelTrigger, TaskScope) {
+        let (trigger, token) = CancelToken::new();
+        (
+            trigger,
+            TaskScope::new(lua, TaskCell::new(token, None, None)),
+        )
+    }
+
+    /// The token is already tripped, so the cancel branch is ready on the
+    /// first poll and no waker round trip is needed.
+    fn poll_cancelled_scope_once(scope: &TaskScope) {
+        let mut fut = scope.scope_future(std::future::pending::<()>());
+        assert!(smol::block_on(poll_once(&mut fut)).is_none());
+    }
+
+    /// A hook armed after the token tripped has no transition left to ride, so
+    /// it fires inline, whether a plugin or another hook armed it. The nested
+    /// case also pins the lock discipline: `fire_cancel_hooks` must not hold
+    /// the cell across a hook.
+    #[test]
+    fn cancel_hook_registered_after_the_cancel_fires_inline() {
+        let lua = Lua::new();
+        let scope = TaskScope::new(&lua, TaskCell::new(cancelled_token(), None, None));
+        let (tx, fired_rx) = flume::unbounded();
+        let outer = lua
+            .create_function(move |lua, ()| {
+                tx.send(HOOK_GOOD_MARK).ok();
+                let tx = tx.clone();
+                let nested = lua.create_function(move |_, ()| {
+                    tx.send(HOOK_NESTED_MARK).ok();
+                    Ok(())
+                })?;
+                register_cancel_hook(lua, nested)
+            })
+            .unwrap();
+
+        register_cancel_hook(&lua, outer).unwrap();
+
+        assert_eq!(
+            fired_rx.try_iter().collect::<Vec<_>>(),
+            [HOOK_GOOD_MARK, HOOK_NESTED_MARK],
+            "{HOOK_NEVER_FIRED}"
+        );
+        assert!(
+            lock_cell(scope.handle()).cancel_hooks.is_empty(),
+            "a hook that already fired must not be kept for the next poll"
+        );
+    }
+
+    /// Hooks are cleanup steps stacked as the handler nests deeper, so every
+    /// one runs, in registration order. A hook that raises, or yields from
+    /// outside its coroutine, is one plugin's bug and must not cost the later
+    /// plugins their cleanup.
+    #[test_case(HOOK_RAISES ; "raising")]
+    #[test_case(HOOK_YIELDS ; "yielding")]
+    fn cancel_hooks_all_fire_in_order_despite_a_bad_one(bad_body: &str) {
+        let lua = Lua::new();
+        let (trigger, scope) = live_scope(&lua);
+        let bad = lua.load(bad_body).into_function().unwrap();
+        register_cancel_hook(&lua, bad).unwrap();
+        let (fired_tx, fired_rx) = flume::unbounded();
+        for mark in HOOK_MARKS {
+            recording_hook(&lua, &fired_tx, mark);
+        }
+        trigger.cancel();
+
+        poll_cancelled_scope_once(&scope);
+
+        assert_eq!(
+            fired_rx.try_iter().collect::<Vec<_>>(),
+            HOOK_MARKS,
+            "{HOOK_SKIPPED_MSG}"
+        );
+    }
+
+    /// `scope_future` nests, a handler's scope wrapping the `gather` that
+    /// parks it, so several levels see the token go ready in one poll and
+    /// every later poll sees it ready again. Cleanup that runs twice repaints
+    /// over what the abandon path already put on screen.
+    #[test]
+    fn cancel_hook_fires_once_across_nested_scopes_and_repeated_polls() {
+        let lua = Lua::new();
+        let (trigger, scope) = live_scope(&lua);
+        let (fired_tx, fired_rx) = flume::unbounded();
+        recording_hook(&lua, &fired_tx, HOOK_GOOD_MARK);
+        trigger.cancel();
+
+        let mut nested = scope.scope_future(scope.scope_future(std::future::pending::<()>()));
+        for _ in 0..HOOK_POLL_ROUNDS {
+            assert!(smol::block_on(poll_once(&mut nested)).is_none());
+        }
+
+        assert_eq!(fired_rx.try_iter().count(), 1);
+    }
+
+    /// The `RegistryKey` is the last reference to a hook, so holding it pins
+    /// the closure and its captures for the VM's whole life. Both endings must
+    /// let go: fired, or dropped with a task that was never cancelled, which
+    /// mlua only reclaims on some later registry op.
+    #[test_case(true ; "after firing")]
+    #[test_case(false ; "when an uncancelled scope ends")]
+    fn cancel_hook_registry_value_is_released(cancel: bool) {
+        let lua = Lua::new();
+        let captured = Arc::new(());
+        let held = Arc::clone(&captured);
+        let (trigger, scope) = live_scope(&lua);
+        let hook = lua
+            .create_function(move |_, ()| {
+                let _ = &held;
+                Ok(())
+            })
+            .unwrap();
+        register_cancel_hook(&lua, hook).unwrap();
+
+        if cancel {
+            trigger.cancel();
+            poll_cancelled_scope_once(&scope);
+        } else {
+            drop(scope);
+        }
+        lua.gc_collect().unwrap();
+        lua.gc_collect().unwrap();
+
+        assert_eq!(Arc::strong_count(&captured), 1);
+    }
+
+    /// With a sibling's handle in app_data the hook would repaint the
+    /// sibling's bufs. The sibling has to get app_data back once the poll is
+    /// over, and its own hooks must not ride someone else's cancel.
+    #[test]
+    fn cancel_hook_runs_under_its_own_task_handle() {
+        let lua = Lua::new();
+        let (trigger, scope) = live_scope(&lua);
+        let (seen_tx, seen_rx) = flume::bounded(1);
+        let hook = lua
+            .create_function(move |lua, ()| {
+                seen_tx.send(active_task(lua)).ok();
+                Ok(())
+            })
+            .unwrap();
+        register_cancel_hook(&lua, hook).unwrap();
+        let (_sibling_trigger, sibling) = live_scope(&lua);
+        let (sibling_tx, sibling_rx) = flume::bounded(1);
+        recording_hook(&lua, &sibling_tx, HOOK_GOOD_MARK);
+        trigger.cancel();
+
+        poll_cancelled_scope_once(&scope);
+
+        let seen = seen_rx.try_recv().expect(HOOK_NEVER_FIRED);
+        assert!(Arc::ptr_eq(&seen, scope.handle()));
+        assert!(Arc::ptr_eq(&active_task(&lua), sibling.handle()));
+        assert!(
+            sibling_rx.try_recv().is_err(),
+            "an uncancelled task's hook must not fire with a sibling's cancel"
+        );
+    }
+
+    /// The whole point of the hook: a handler parked in an await runs no Lua
+    /// of its own, so only the token's waker can get its cleanup on screen
+    /// before the abandon window. The cancel branch and the inner future share
+    /// that one waker, so if firing swallowed the poll, a handler finishing
+    /// right after the cancel would hang instead of returning its output.
+    #[test]
+    fn cancel_hook_fires_on_a_parked_task_and_leaves_it_wakeable() {
+        let lua = Lua::new();
+        let (trigger, scope) = live_scope(&lua);
+        let (fired_tx, fired_rx) = flume::bounded(1);
+        recording_hook(&lua, &fired_tx, HOOK_GOOD_MARK);
+        let (item_tx, item_rx) = flume::bounded(1);
+
+        let out = block_on_or_fail(futures_lite::future::or(
+            scope.scope_future(async move { item_rx.recv_async().await.unwrap() }),
+            async move {
+                trigger.cancel();
+                assert_eq!(fired_rx.recv_async().await.ok(), Some(HOOK_GOOD_MARK));
+                item_tx.send(HOOK_INNER_OUTPUT).unwrap();
+                std::future::pending().await
+            },
+        ));
+
+        assert_eq!(out, HOOK_INNER_OUTPUT);
+        assert!(
+            lock_cell(scope.handle()).cancel_hooks.is_empty(),
+            "a fired hook must not be kept for a second cancel"
+        );
+    }
+
+    /// Order is the whole guarantee: a handler whose last await resolves on
+    /// the very poll the cancel lands returns straight away, and the scope
+    /// dropping behind it clears its hooks unfired. Firing after the inner
+    /// poll would skip the cleanup silently, with nothing on screen.
+    #[test]
+    fn cancel_hooks_fire_before_an_inner_future_that_is_ready_at_once() {
+        let lua = Lua::new();
+        let (trigger, scope) = live_scope(&lua);
+        let inner_ran = Arc::new(AtomicBool::new(false));
+        let seen_by_hook = Arc::clone(&inner_ran);
+        let (fired_tx, fired_rx) = flume::bounded(1);
+        let hook = lua
+            .create_function(move |_, ()| {
+                fired_tx.send(seen_by_hook.load(Ordering::SeqCst)).ok();
+                Ok(())
+            })
+            .unwrap();
+        register_cancel_hook(&lua, hook).unwrap();
+        trigger.cancel();
+
+        let out = smol::block_on(scope.scope_future(poll_fn(move |_| {
+            inner_ran.store(true, Ordering::SeqCst);
+            Poll::Ready(HOOK_INNER_OUTPUT)
+        })));
+
+        assert_eq!(
+            out, HOOK_INNER_OUTPUT,
+            "the scope must still yield the handler's result"
+        );
+        assert!(
+            !fired_rx.try_recv().expect(HOOK_NEVER_FIRED),
+            "the hook must run before the inner future gets its poll"
+        );
+    }
+
+    /// The fire takes the whole list first, so a hook that arms another one
+    /// re-enters `fire_cancel_hooks` from inside itself. That must terminate
+    /// and leave nothing unfired; where the new hook lands among the queued
+    /// ones is not a promise anyone can lean on.
+    #[test]
+    fn cancel_hook_registered_mid_fire_still_fires_every_hook_once() {
+        let lua = Lua::new();
+        let (trigger, scope) = live_scope(&lua);
+        let (fired_tx, fired_rx) = flume::unbounded();
+        let tx = fired_tx.clone();
+        let arming = lua
+            .create_function(move |lua, ()| {
+                tx.send(HOOK_MARKS[0]).ok();
+                recording_hook(lua, &tx, HOOK_NESTED_MARK);
+                Ok(())
+            })
+            .unwrap();
+        register_cancel_hook(&lua, arming).unwrap();
+        for mark in HOOK_MARKS.into_iter().skip(1) {
+            recording_hook(&lua, &fired_tx, mark);
+        }
+        trigger.cancel();
+
+        poll_cancelled_scope_once(&scope);
+
+        let mut fired = fired_rx.try_iter().collect::<Vec<_>>();
+        fired.sort_unstable();
+        let mut expected = HOOK_MARKS.to_vec();
+        expected.push(HOOK_NESTED_MARK);
+        expected.sort_unstable();
+        assert_eq!(fired, expected, "{HOOK_SKIPPED_MSG}");
+        assert!(
+            lock_cell(scope.handle()).cancel_hooks.is_empty(),
+            "a re-entrant fire must not leave a hook behind"
+        );
+    }
+
+    const HOOK_PARENT_MARK: &str = "parent";
+    const HOOK_CHILD_MARK: &str = "child";
+    const HOOK_CHILD_WORK: &str = "arm(); park()";
+    const HOOK_ARM_FN: &str = "arm";
+    const HOOK_PARK_FN: &str = "park";
+
+    /// A `makima.async.run` task gets its own cell but inherits the parent's
+    /// token, so a hook armed inside it fires on the parent's cancel even
+    /// though nothing else polls that task. Only its own hooks: parent and
+    /// siblings share that token, and reading the wrong cell would clean up
+    /// bufs it never owned.
+    #[test]
+    fn cancel_hook_in_a_spawned_task_fires_on_the_inherited_cancel() {
+        let lua = Lua::new();
+        let (trigger, parent) = live_scope(&lua);
+        let (fired_tx, fired_rx) = flume::unbounded();
+        recording_hook(&lua, &fired_tx, HOOK_PARENT_MARK);
+
+        let (armed_tx, armed_rx) = flume::bounded(1);
+        let tx = fired_tx.clone();
+        let arm = lua
+            .create_function(move |lua, ()| {
+                recording_hook(lua, &tx, HOOK_CHILD_MARK);
+                armed_tx.send(()).ok();
+                Ok(())
+            })
+            .unwrap();
+        let park = lua
+            .create_async_function(|_, ()| std::future::pending::<Result<(), mlua::Error>>())
+            .unwrap();
+        lua.globals().set(HOOK_ARM_FN, arm).unwrap();
+        lua.globals().set(HOOK_PARK_FN, park).unwrap();
+        let work_fn = lua
+            .create_registry_value(lua.load(HOOK_CHILD_WORK).into_function().unwrap())
+            .unwrap();
+        let task = PendingAsyncTask {
+            work_fn,
+            cancel: lock_cell(parent.handle()).cancel.clone(),
+            deadline: None,
+            live_ctx: None,
+            owner: None,
+            plugin_grant: None,
+            managed_turn: None,
+            ancestors: Arc::default(),
+            delegated_tool: None,
+            command_depth: 0,
+            command_invocation: None,
+            pinned_target: None,
+            call: TaskCall::Plain,
+        };
+        let ex = Rc::new(smol::LocalExecutor::new());
+        block_on_or_fail(ex.run(async {
+            spawn_async_task(&lua, &ex, &Rc::new(gate()), &Rc::new(gate()), task);
+            armed_rx.recv_async().await.unwrap();
+            trigger.cancel();
+            assert_eq!(fired_rx.recv_async().await.ok(), Some(HOOK_CHILD_MARK));
+        }));
+
+        assert!(
+            fired_rx.is_empty(),
+            "the parent's hook must not ride the child's fire"
+        );
+
+        poll_cancelled_scope_once(&parent);
+
+        assert_eq!(
+            fired_rx.try_iter().collect::<Vec<_>>(),
+            [HOOK_PARENT_MARK],
+            "the parent must fire its own hook, once, and not the child's"
+        );
+    }
+
+    const DISPATCH_TEST_JOB: &str = "sleep 1";
+    const DISPATCH_TEST_PLUGIN: &str = "shell";
+    const DISPATCH_TEST_TOOL: &str = "run";
+    const DISPATCH_TEST_DEADLINE_SECS: u64 = 7;
+
+    /// Drives the job-polling loop of [`dispatch_async`] to its reply. The
+    /// cell needs a live job or the loop is never entered. Helper thread
+    /// again: `timeout_reply` locks the very cell the loop inspects, so a
+    /// regression there deadlocks and must fail rather than hang the suite.
+    fn drive_dispatch(cell: TaskCell) -> (Result<String, String>, Duration) {
+        drive_dispatch_with(cell, |_, _| {})
+    }
+
+    /// `setup` runs on the dispatch thread, standing in for a handler that
+    /// armed cancel hooks.
+    fn drive_dispatch_with(
+        cell: TaskCell,
+        setup: impl FnOnce(&Lua, flume::Sender<ToolCallReply>) + Send + 'static,
+    ) -> (Result<String, String>, Duration) {
+        let (tx, rx) = flume::bounded(1);
+        thread::spawn(move || {
+            let lua = Lua::new();
+            let scope = TaskScope::new(&lua, cell);
+            let owner = JobOwner::Task(lock_cell(scope.handle()).id);
+            with_jobs(&lua, |store| {
+                store.start(owner, DISPATCH_TEST_JOB, None, None, None, None, None)
+            })
+            .unwrap();
+            let (finish_tx, finish_rx) = flume::bounded(1);
+            setup(&lua, finish_tx);
+
+            let start = Instant::now();
+            let reply = smol::block_on(dispatch_async(
+                &lua,
+                Arc::clone(scope.handle()),
+                DISPATCH_TEST_PLUGIN,
+                DISPATCH_TEST_TOOL,
+                finish_rx,
+            ));
+            drop(tx.send((reply.result, start.elapsed())));
+        });
+        rx.recv_timeout(WATCHDOG_TEST_TIMEOUT)
+            .expect("dispatch_async never replied: the cell lock is likely held across the reply")
+    }
+
+    /// A timed-out async tool must report the timeout the bash plugin's
+    /// `restore` parses, and must not wedge the whole Lua thread on the
+    /// non-reentrant cell mutex while doing it.
+    #[test]
+    fn dispatch_async_replies_with_timeout_without_deadlocking() {
+        let cell = TaskCell::new(CancelToken::none(), Some(Instant::now()), None);
+        cell.deadline_secs.set(Some(DISPATCH_TEST_DEADLINE_SECS));
+
+        let (result, _) = drive_dispatch(cell);
+
+        assert_eq!(
+            result,
+            Err(format!(
+                "tool {DISPATCH_TEST_PLUGIN}.{DISPATCH_TEST_TOOL} timed out after {DISPATCH_TEST_DEADLINE_SECS}s"
+            ))
+        );
+    }
+
+    /// Esc on an async tool whose deadline also lapsed must say "cancelled",
+    /// not "timed out after 0s", and must reply at once: the handler already
+    /// returned, so there is nothing left to clean up.
+    #[test]
+    fn dispatch_async_cancel_outranks_deadline_with_no_grace() {
+        let cell = TaskCell::new(cancelled_token(), Some(Instant::now()), None);
+
+        let (result, elapsed) = drive_dispatch(cell);
+
+        assert_eq!(result, Err(CANCELLED_MSG.to_owned()));
+        assert!(
+            elapsed < KILL_GRACE,
+            "dispatch loop must not wait out a grace"
+        );
+    }
+
+    const PARTIAL_REPLY_OUTPUT: &str = "partial output";
+
+    /// A doomed handler's cancel hooks get the last word: the reply they
+    /// queue carries the output the user already saw, so it must beat the
+    /// generic cancelled/timeout error. The reason they are handed is what
+    /// lets a tool word its marker.
+    #[test_case(true, CANCELLED_MSG ; "cancelled")]
+    #[test_case(false, HANDLER_TIMEOUT_MSG ; "deadline")]
+    fn dispatch_async_prefers_the_reply_its_cancel_hooks_queued(
+        cancelled: bool,
+        expected_reason: &str,
+    ) {
+        let cell = if cancelled {
+            TaskCell::new(cancelled_token(), None, None)
+        } else {
+            let cell = TaskCell::new(CancelToken::none(), Some(Instant::now()), None);
+            cell.deadline_secs.set(Some(DISPATCH_TEST_DEADLINE_SECS));
+            cell
+        };
+
+        let (result, _) = drive_dispatch_with(cell, |lua, finish_tx| {
+            let hook = lua
+                .create_function(move |_, reason: String| {
+                    finish_tx
+                        .send(ToolCallReply::err(format!(
+                            "{PARTIAL_REPLY_OUTPUT}:{reason}"
+                        )))
+                        .ok();
+                    Ok(())
+                })
+                .unwrap();
+            register_cancel_hook(lua, hook).unwrap();
+        });
+
+        assert_eq!(
+            result,
+            Err(format!("{PARTIAL_REPLY_OUTPUT}:{expected_reason}"))
+        );
+    }
+
+    #[test]
+    fn delivery_scope_refuses_job_ownership() {
+        let lua = Lua::new();
+
+        let scope = TaskScope::delivery(&lua);
+        assert!(active_task_id(&lua).is_some());
+        assert!(job_task_id(&lua).is_none());
+        drop(scope);
+
+        let scope = TaskScope::detached(&lua);
+        assert_eq!(job_task_id(&lua), active_task_id(&lua));
+        drop(scope);
+    }
+
+    #[test]
+    fn fresh_task_scope_shields_callback_from_stale_cancelled_handle() {
+        let (lua, _watchdog) = watchdog_lua(false);
+        lua.set_app_data::<TaskHandle>(cancelled_handle());
+
+        let scope = TaskScope::detached(&lua);
+        let result = timed_loop(&lua).call::<bool>(());
+        drop(scope);
+
+        assert!(result.unwrap());
+    }
+
+    /// Session reset mid-turn leaves the cancelled handle of the doomed tool
+    /// task in app_data (scopes restore their captured prev). The splash pull
+    /// is the hot host-side slot call; unscoped, the watchdog interrupts the
+    /// render and the UI reads the raise as a missing renderer, suppressing
+    /// the splash on the fresh empty session.
+    #[test]
+    fn splash_frame_survives_a_stale_cancelled_handle() {
+        let (lua, _watchdog) = watchdog_lua(false);
+        lua.set_app_data(crate::api::slot::SlotStore::new(Arc::default()));
+        let render = lua
+            .load(
+                // Long enough that a watchdog poke is armed while the slot
+                // runs; the armed one-shot then kills at the first safepoint
+                // if the call sits under the doomed handle.
+                "local t = os.clock() while os.clock() - t < 0.1 do end \
+                 return { { { glyphs = 'makima', style = '#ffffff' } } }",
+            )
+            .into_function()
+            .unwrap();
+        {
+            let mut store = lua.app_data_mut::<crate::api::slot::SlotStore>().unwrap();
+            store.slots.insert(
+                "splash.render".to_owned(),
+                crate::api::slot::SlotEntry {
+                    owner: Some(Arc::from("splash")),
+                    default: Some(render),
+                    layers: Vec::new(),
+                },
+            );
+        }
+        let handle = cancelled_handle();
+        lua.set_app_data::<TaskHandle>(Arc::clone(&handle));
+        lock_cell(&handle).kill_at.set(Some(Instant::now()));
+
+        let frame = smol::block_on(splash_frame(&lua, 80, 24, 0.0, 1.0));
+        assert!(
+            matches!(frame, SplashPull::Frame(_)),
+            "watchdog killed the render under the stale handle"
+        );
+    }
+
+    #[test]
+    fn runaway_splash_render_is_killed_and_lua_recovers() {
+        const COMPLETION_BOUND: Duration = Duration::from_secs(2);
+        const GLYPHS: &str = "recovered";
+
+        let (tx, rx) = flume::bounded(1);
+        thread::spawn(move || {
+            let (lua, _watchdog) = watchdog_lua(false);
+            lua.set_app_data(crate::api::slot::SlotStore::new(Arc::default()));
+            let runaway = lua.load("while true do end").into_function().unwrap();
+            {
+                let mut store = lua.app_data_mut::<crate::api::slot::SlotStore>().unwrap();
+                store.slots.insert(
+                    "splash.render".to_owned(),
+                    crate::api::slot::SlotEntry {
+                        owner: Some(Arc::from("splash")),
+                        default: Some(runaway),
+                        layers: Vec::new(),
+                    },
+                );
+            }
+
+            let start = Instant::now();
+            let runaway_frame = smol::block_on(splash_frame(&lua, 80, 24, 0.0, 1.0));
+            let elapsed = start.elapsed();
+            let operation = lua.load("return 6 * 7").eval::<i64>().unwrap();
+            let recovered = lua
+                .load(format!(
+                    "return {{ {{ {{ glyphs = '{GLYPHS}', style = '#ffffff' }} }} }}"
+                ))
+                .into_function()
+                .unwrap();
+            lua.app_data_mut::<crate::api::slot::SlotStore>()
+                .unwrap()
+                .slots
+                .get_mut("splash.render")
+                .unwrap()
+                .default = Some(recovered);
+            let recovered_frame = smol::block_on(splash_frame(&lua, 80, 24, 0.0, 1.0));
+            drop(tx.send((runaway_frame, elapsed, operation, recovered_frame)));
+        });
+
+        let (runaway_frame, elapsed, operation, recovered_frame) = rx
+            .recv_timeout(COMPLETION_BOUND)
+            .expect("runaway splash render monopolized the Lua thread");
+        assert!(
+            matches!(runaway_frame, SplashPull::Unknown),
+            "an overrun must ask for a retry, not report a dead renderer"
+        );
+        assert!(elapsed < COMPLETION_BOUND);
+        assert_eq!(operation, 42);
+        assert_eq!(recovered_frame.frame().unwrap().rows[0].glyphs, GLYPHS);
+    }
+
+    #[test]
+    fn shutdown_flag_aborts_callback_even_with_fresh_scope() {
+        let (lua, _watchdog) = watchdog_lua(true);
+
+        let scope = TaskScope::detached(&lua);
+        let (err, _) = hot_loop_expecting_kill(&lua);
+        drop(scope);
+
+        assert!(err.to_string().contains(INTERRUPT_SHUTDOWN_MSG));
+    }
+
+    /// Shutdown is checked before the task cell, so a reload or a quit never
+    /// queues behind the cleanup grace of every cancelled runaway. The grace
+    /// has already run out, so a cell-first check would kill the loop as
+    /// cancelled; only the shutdown message proves shutdown was consulted
+    /// first, with no wall-clock bound.
+    #[test]
+    fn shutdown_outranks_the_cleanup_grace() {
+        let (lua, _watchdog) = watchdog_lua(true);
+        lua.set_app_data::<TaskHandle>(expired_cancelled_handle());
+
+        let (err, _) = hot_loop_expecting_kill(&lua);
+
+        assert!(err.to_string().contains(INTERRUPT_SHUTDOWN_MSG));
+    }
+
+    /// JIT-compiled code must still hit the interrupt, and the timeout
+    /// path gets the same cleanup grace as the cancel path: a timed-out
+    /// handler also has children to settle and a buf to rerender.
+    #[test]
+    fn jit_busy_loop_killed_a_grace_after_the_deadline() {
+        let (lua, _watchdog) = watchdog_lua(false);
+        install_compiler(&lua, true);
+
+        let deadline = Instant::now() + JIT_DEADLINE;
+        let cell = TaskCell::new(CancelToken::none(), Some(deadline), None);
+        lua.set_app_data::<TaskHandle>(Arc::new(Mutex::new(cell)));
+
+        let (err, elapsed) = hot_loop_expecting_kill(&lua);
+
+        assert!(err.to_string().contains(INTERRUPT_DEADLINE_MSG));
+        assert!(
+            elapsed >= JIT_DEADLINE + KILL_GRACE,
+            "kill skipped the cleanup grace"
+        );
+    }
+
+    #[test]
+    fn spawn_async_task_runs_and_decrements_gate() {
+        let ex = Rc::new(smol::LocalExecutor::new());
+        smol::block_on(ex.run(async {
+            let lua = enqueue_test_lua();
+            let task = pending_task(
+                &lua,
+                CancelToken::none(),
+                Some(Instant::now() + Duration::from_secs(5)),
+            );
+
+            let g = Rc::new(gate());
+            spawn_async_task(&lua, &ex, &g, &Rc::new(gate()), task);
+
+            for _ in 0..10 {
+                smol::future::yield_now().await;
+                if g.count.get() == 0 {
+                    return;
+                }
+            }
+            panic!("gate count never reached 0 after draining");
+        }));
+    }
+
+    #[test]
+    fn defer_queue_cancels_only_the_doomed_plugins_timers() {
+        let lua = Lua::new();
+        let queue = DeferQueue::new();
+        let timer = |plugin: &str| {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let queued = queue.push(DeferredCallback {
+                func: lua.create_registry_value(true).unwrap(),
+                delay: Duration::ZERO,
+                plugin: Arc::from(plugin),
+                cancel: Arc::clone(&cancel),
+            });
+            assert!(queued.is_ok(), "the queue is unbounded");
+            cancel
+        };
+        let doomed = timer("memory");
+        let bystander = timer("other");
+
+        queue.cancel_plugin("memory");
+        assert!(doomed.load(Ordering::Acquire));
+        assert!(!bystander.load(Ordering::Acquire));
+
+        queue.forget(&bystander);
+        queue.cancel_plugin("other");
+        assert!(
+            !bystander.load(Ordering::Acquire),
+            "a timer past the gate is running, not pending"
+        );
+    }
+}

@@ -1,5 +1,5 @@
 local clock = require("providers.clock")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local Y2K_MS = 946684800000
 local AUGUST_25_AFTERNOON = 1787665510

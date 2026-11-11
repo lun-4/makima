@@ -11,7 +11,7 @@
 --      host: a broken child degrades to plain rendering, never sinks the
 --      batch.
 
-local ToolView = require("maki.tool_view")
+local ToolView = require("makima.tool_view")
 
 local MAX_BATCH_SIZE = 25
 local SEPARATOR = "──────────────────"
@@ -137,7 +137,7 @@ end
 -- ones, for example) and a broken one comes back nil; either way the
 -- plain tool name is enough.
 local function header_spans(tool, params)
-  local t = maki.api.get_tool(tool)
+  local t = makima.api.get_tool(tool)
   local spans = t and t.header and t.header(params)
   return spans or { { tool, "tool" } }
 end
@@ -151,7 +151,7 @@ end
 -- body must not stop the sweep from repainting the rest.
 local function child_body_buf(c, tol)
   local output = c.output or ""
-  local t = maki.api.get_tool(c.tool)
+  local t = makima.api.get_tool(c.tool)
   local buf
   if t and t.restore then
     local rctx = { tool_output_lines = tol, state = c.state }
@@ -299,7 +299,7 @@ local function children_from_llm(children, output)
   end
   local sections = {}
   local body, prev
-  for _, line in ipairs(maki.split(output, "\n")) do
+  for _, line in ipairs(makima.split(output, "\n")) do
     local tool = line:match(SECTION_PAT)
     local nxt = children[#sections + 1]
     -- render_llm puts a blank line before every header except the first;
@@ -347,7 +347,7 @@ Batch.__index = Batch
 
 function Batch.new(children, tol)
   local self = setmetatable({ children = children, tol = tol }, Batch)
-  self.buf = maki.ui.buf()
+  self.buf = makima.ui.buf()
   -- A click fans out to child bufs, and every child change event would
   -- recompose the whole batch; mute them and recompose once at the end.
   -- pcall keeps a child handler error from leaking the mute, which would
@@ -448,7 +448,7 @@ function Batch:run_child(c, ctx)
   end
   c.status = STATUS.RUNNING
   self:rerender()
-  local text, err, state = maki.agent.call_tool(ctx, c.tool, c.params, {
+  local text, err, state = makima.agent.call_tool(ctx, c.tool, c.params, {
     -- Clicks on a still-streaming child are a no-op: its click handler
     -- lives on the child's own handle, not on this wrapper buf.
     on_live_buf = function(b)
@@ -516,13 +516,13 @@ function Batch:run(ctx)
   -- rather than a bare "cancelled".
   -- The reason is the model's only clue why the children stopped: a
   -- deadline must not read as an Esc it can never retry its way out of.
-  maki.async.on_cancel(function(reason)
+  makima.async.on_cancel(function(reason)
     self.cancelled = true
     self.cut_reason = reason
     self:sweep_cancelled(reason)
     ctx:finish(self:reply())
   end)
-  maki.async.gather(funs)
+  makima.async.gather(funs)
   self:sweep_cancelled(self.cut_reason or CANCELLED_ERROR)
 end
 
@@ -546,12 +546,12 @@ end
 
 -- Last resort: no state, output isn't section-formatted.
 local function legacy_restore(children, output, tol)
-  local buf = maki.ui.buf()
+  local buf = makima.ui.buf()
   local view = ToolView.new(buf, { max_lines = tol.other, keep = "head" })
   local header = render_children(children)
   append_separator(header)
   view:set_header(header)
-  for _, line in ipairs(maki.split(output, "\n")) do
+  for _, line in ipairs(makima.split(output, "\n")) do
     view:append(BODY_INDENT .. line)
   end
   view:finish()
@@ -584,7 +584,7 @@ local function restore(input, output, _is_error, rctx)
   return legacy_restore(children, output, tol)
 end
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "batch",
   description = description,
   kind = "execute",

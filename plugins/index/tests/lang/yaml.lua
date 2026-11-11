@@ -1,4 +1,4 @@
-local th = require("maki.test_helpers")
+local th = require("makima.test_helpers")
 local helpers = require("tests.helpers")
 local case = th.case
 local idx = helpers.idx
@@ -7,7 +7,7 @@ local lacks = helpers.lacks
 
 case("yaml_top_level_keys", function()
   local src = [==[
-name: maki
+name: makima
 version: "0.4.0"
 description: AI coding agent
 ]==]
@@ -80,7 +80,7 @@ end)
 
 case("yaml_quoted_keys_preserved", function()
   local src = [==[
-"full name": maki
+"full name": makima
 'machine': x86
 ]==]
   local out = idx(src, "yaml")
@@ -313,7 +313,7 @@ end)
 
 case("yaml_ranged_meta", function()
   local src = [==[
-name: maki
+name: makima
 metadata:
   author: alice
 ]==]

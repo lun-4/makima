@@ -282,7 +282,7 @@ function M.stream(api, model, ctx, request, emit, system_prefix)
       ["anthropic-beta"] = codec.beta_header(request),
       ["anthropic-version"] = M.API_VERSION,
     }),
-    body = assert(maki.json.encode(codec.build_request(request, system_prefix))),
+    body = assert(makima.json.encode(codec.build_request(request, system_prefix))),
   })
   if not response then
     return nil, err

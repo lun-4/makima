@@ -1,6 +1,6 @@
 local custom = require("providers.custom")
 local http = require("providers.http")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local ID = "my-proxy"
 local KEY_ENV = "MY_PROXY_API_KEY"
@@ -87,11 +87,11 @@ t.case("openai_protocol_streams_chat_with_a_bearer_key", function()
   local req = sent(section(), "fast-v1")
   t.eq(req.url, BASE .. "/chat/completions")
   t.eq(req.headers.Authorization, "Bearer k")
-  local body = maki.json.decode(req.body)
+  local body = makima.json.decode(req.body)
   t.eq(body.max_tokens, 16384)
   t.eq(body.thinking.type, "disabled")
   t.eq(body.reasoning_effort, "none")
-  body = maki.json.decode(sent(section(), "fast-v1", nil, nil, { kind = "effort", level = "high" }).body)
+  body = makima.json.decode(sent(section(), "fast-v1", nil, nil, { kind = "effort", level = "high" }).body)
   t.eq(body.reasoning_effort, "high")
   t.eq(body.thinking, nil)
 end)
@@ -177,8 +177,8 @@ end)
 
 t.case("creator_saves_a_section", function()
   local saved = {}
-  local save = maki.api.save_provider_config
-  maki.api.save_provider_config = function(id, value)
+  local save = makima.api.save_provider_config
+  makima.api.save_provider_config = function(id, value)
     saved[id] = value
     return true
   end
@@ -200,7 +200,7 @@ t.case("creator_saves_a_section", function()
   local creator = custom.creator("")
   t.eq(creator.auth_status().state, "missing")
   local ok = creator.auth[1].login(t.provider_ctx({}), ui)
-  maki.api.save_provider_config = save
+  makima.api.save_provider_config = save
   t.eq(ok, true)
   t.same(saved[ID], {
     display_name = "Custom (my-proxy)",

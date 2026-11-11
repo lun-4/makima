@@ -1,5 +1,5 @@
 --!strict
--- Luau types for `maki.api.register_provider`, as documentation for plugin
+-- Luau types for `makima.api.register_provider`, as documentation for plugin
 -- authors. Nothing checks them against the host; generating them from the
 -- Rust types is tracked in #47.
 
@@ -134,8 +134,8 @@ export type HttpRequest = {
   unix_socket: string?,
 }
 
--- `maki.credentials.Store`: a provider ctx's `credentials`, or
--- `maki.credentials.open(ctx, key)` for a plugin store.
+-- `makima.credentials.Store`: a provider ctx's `credentials`, or
+-- `makima.credentials.open(ctx, key)` for a plugin store.
 export type Store = {
   read: (self: Store) -> (Json?, string?),
   write: (self: Store, value: Json) -> (boolean?, string?),
@@ -144,7 +144,7 @@ export type Store = {
   lock: <T...>(self: Store, fn: () -> T...) -> T...,
 }
 
--- `maki.Ctx` as a provider's callbacks receive it. Its fields cannot be
+-- `makima.Ctx` as a provider's callbacks receive it. Its fields cannot be
 -- assigned; `with_name` narrows it to a plugin ctx.
 export type Context = {
   id: string,

@@ -1,0 +1,3794 @@
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use makima_config_macro::ConfigSection;
+use makima_storage::paths;
+use makima_storage::sessions::{StoredThinking, ThinkingParseError};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map as JsonMap, Value as JsonValue};
+use strum::VariantArray;
+use thiserror::Error;
+
+pub const PROJECT_DIR: &str = ".makima";
+const PERMISSIONS_FILE: &str = "permissions.toml";
+const ENV_FILE: &str = ".env";
+const OLD_MCP_PREFIX: &str = "mcp:";
+const INVALID_TOOL_SECTION: &str = "invalid tool name; a tool section uses only letters, digits, `-` and `_`, and MCP servers go under [mcp.<server>]";
+const OLD_MCP_SECTION: &str =
+    "the `mcp:<server>__<tool>` section form is gone; list the tool under [mcp.<server>] instead";
+pub const NO_PROJECT_HINT: &str = "pass --no-project to start without the project's .makima files";
+pub const UNTRUSTED_PROJECT_WRITE: &str =
+    "folder is not trusted, so nothing was saved to .makima/permissions.toml";
+
+pub mod project;
+pub use project::{GatedFile, ProjectConfig, policy_grant};
+
+pub mod defaults;
+pub use defaults::SessionDefaults;
+
+pub mod providers;
+
+pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
+pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2000;
+pub const DEFAULT_MAX_LINE_BYTES: usize = 1000;
+pub const DEFAULT_FLASH_DURATION_MS: u64 = 1500;
+pub const DEFAULT_TYPEWRITER_MS_PER_CHAR: u64 = 4;
+pub const DEFAULT_MOUSE_SCROLL_LINES: u32 = 3;
+pub const DEFAULT_MAX_INPUT_LINES: u32 = 20;
+pub const DEFAULT_AUTOCOMPLETE_HEIGHT: f64 = 0.7;
+
+pub const MIN_MAX_INPUT_LINES: u32 = 1;
+
+pub const MAX_SERVER_NAME_LEN: usize = 64;
+
+pub const DEFAULT_MAX_CONTINUATION_TURNS: u32 = 3;
+pub const DEFAULT_MAX_CONCURRENT_AGENT_TURNS: usize = 8;
+pub const DEFAULT_MAX_AGENT_DEPTH: usize = 4;
+pub const DEFAULT_MAX_CHILDREN_PER_AGENT: usize = 16;
+pub const DEFAULT_MAX_LIVE_AGENTS: usize = 64;
+pub const DEFAULT_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(20);
+/// What one turn asks to generate. A number of makima's own choosing rather than
+/// "whatever the window can spare", because the latter ties the output cap to a
+/// prompt estimate, and an estimate that reads low buys a rejection from every
+/// server enforcing `prompt + max_tokens <= context_window`.
+///
+/// An answer allowance, not a ceiling on the request: a turn asks for more
+/// where an effort level needs the room.
+pub const DEFAULT_MAX_TURN_OUTPUT: u32 = 32_768;
+
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+pub const DEFAULT_LOW_SPEED_TIMEOUT_SECS: u64 = 120;
+pub const DEFAULT_STREAM_TIMEOUT_SECS: u64 = 300;
+
+pub const DEFAULT_RETRY_BASE_MS: u64 = 2_000;
+/// Server errors are retried for as long as they last, so this cap sets the
+/// pace of a long outage: a minute between tries is around 180 requests over
+/// three hours, where the old eight seconds would have sent around 1350.
+pub const DEFAULT_RETRY_MAX_MS: u64 = 60_000;
+pub const DEFAULT_MAX_TIMEOUT_RETRIES: u32 = 10;
+/// Spent only on rate limits the server sent no `Retry-After` for, which is how
+/// a spend cap reads, and that one does not clear for the rest of the billing
+/// period.
+pub const DEFAULT_MAX_RETRIES: u32 = 5;
+
+pub const DEFAULT_MAX_LOG_BYTES_MB: u64 = 200;
+pub const DEFAULT_MAX_LOG_FILES: u32 = 10;
+pub const DEFAULT_INPUT_HISTORY_SIZE: usize = 100;
+
+pub const MIN_OUTPUT_BYTES: usize = 1024;
+pub const MIN_OUTPUT_LINES: usize = 10;
+pub const MIN_LINE_BYTES: usize = 80;
+pub const MIN_MAX_CONTINUATION_TURNS: u32 = 1;
+pub const MIN_MAX_TURN_OUTPUT: u32 = 1_024;
+pub const MIN_AGENT_LIMIT: usize = 1;
+pub const MIN_COMPACTION_BUFFER: u32 = 1_000;
+const MAX_COMPACTION_PERCENT: u8 = 99;
+const COMPACTION_BUFFER_EXPECTED: &str =
+    r#"a token count (e.g. 12000) or a percent of the context window (e.g. "20%")"#;
+pub const MIN_MOUSE_SCROLL_LINES: u32 = 1;
+pub const MIN_TOOL_OUTPUT_LINES: usize = 1;
+pub const MIN_MAX_LOG_BYTES_MB: u64 = 1;
+pub const MIN_MAX_LOG_FILES: u32 = 1;
+pub const MIN_INPUT_HISTORY_SIZE: usize = 10;
+pub const MIN_CONNECT_TIMEOUT_SECS: u64 = 1;
+pub const MIN_LOW_SPEED_TIMEOUT_SECS: u64 = 1;
+pub const MIN_STREAM_TIMEOUT_SECS: u64 = 10;
+
+pub const MIN_RETRY_BASE_MS: u64 = 1;
+pub const MIN_RETRY_MAX_MS: u64 = 1;
+
+pub const DEFAULT_BUILTINS: &[&str] = &[
+    "bash",
+    "batch",
+    "code_execution",
+    "edit",
+    "glob",
+    "grep",
+    "index",
+    "list",
+    "memory",
+    "mode_plan_override",
+    "model",
+    "options",
+    "perf",
+    "plan_submit_tool",
+    "providers",
+    "question",
+    "read",
+    "sessions",
+    "skill",
+    "splashes",
+    "splashes_default",
+    "task",
+    "thinking",
+    "todo_write",
+    "usage",
+    "view_image",
+    "webfetch",
+    "websearch",
+    "write",
+];
+
+/// Bundled but not enabled by default. Users opt in with
+/// `plugins.<name> = { enabled = true }` in `makima.setup`.
+pub const OPT_IN_BUILTINS: &[&str] = &[];
+
+/// These used to be their own `tools.<name>` tables and are now edit plugin
+/// options; the config layer uses this list to reject the old form with a
+/// pointer to the new one.
+pub const EDIT_SUB_TOOLS: &[&str] = &["edit_lines", "insert_lines", "multiedit"];
+
+pub const FILE_WRITE_TOOLS: &[&str] = &["write", "edit", "multiedit", "edit_lines", "insert_lines"];
+
+/// A capability a lua plugin can hold. Declared in `plugin.toml`, recorded in
+/// the package approval store, and named on every guarded `makima.*` function.
+///
+/// It lives here rather than in `makima-lua` so the tool layer can name the
+/// permission a tool exposes without pulling in the lua runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, VariantArray)]
+pub enum Permission {
+    FsRead,
+    FsWrite,
+    Net,
+    Run,
+    Env,
+}
+
+impl Permission {
+    /// Derived from the enum, because reading a manifest, rendering the docs
+    /// and sizing a permission set all walk this, and a hand-written list is
+    /// the one place a new variant gets forgotten.
+    pub const ALL: &'static [Permission] = <Permission as VariantArray>::VARIANTS;
+
+    /// A permission set is an array this long, indexed by `Permission as
+    /// usize`, which is the position in [`Permission::ALL`] since both follow
+    /// declaration order.
+    pub const COUNT: usize = Permission::ALL.len();
+
+    /// Parses the name used in `plugin.toml` and in the approval store.
+    ///
+    /// Both use one spelling on purpose. If an approval were recorded under a
+    /// different name from the request, `intersect` would silently never
+    /// match, and every managed package would run with nothing granted.
+    pub fn from_key(key: &str) -> Option<Self> {
+        Permission::ALL
+            .iter()
+            .copied()
+            .find(|p| p.manifest_key() == key)
+    }
+
+    pub const fn manifest_key(self) -> &'static str {
+        match self {
+            Permission::FsRead => "fs_read",
+            Permission::FsWrite => "fs_write",
+            Permission::Net => "net",
+            Permission::Run => "run",
+            Permission::Env => "env",
+        }
+    }
+
+    /// What the permission covers, in the words the reference renders. The
+    /// boundaries live here so there is one answer to "which guard does this
+    /// function belong under".
+    pub const fn describes(self) -> &'static str {
+        match self {
+            Permission::FsRead => {
+                "reading files, and locating the directories makima keeps them in"
+            }
+            Permission::FsWrite => "creating, changing, and removing files",
+            Permission::Net => "outbound network requests",
+            Permission::Run => "starting processes",
+            Permission::Env => "reading the process environment, where secrets live",
+        }
+    }
+}
+
+impl std::fmt::Display for Permission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.manifest_key())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ConfigValue {
+    Bool(bool),
+    U64(u64),
+    F64(f64),
+    Str(&'static str),
+}
+
+impl ConfigValue {
+    pub fn format_default(&self) -> String {
+        match self {
+            Self::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+            Self::U64(v) => v.to_string(),
+            Self::F64(v) => v.to_string(),
+            Self::Str(s) => (*s).to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ConfigField {
+    pub name: &'static str,
+    pub ty: &'static str,
+    pub default: ConfigValue,
+    pub min: Option<u64>,
+    pub description: &'static str,
+}
+
+pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
+    ConfigField {
+        name: "always_yolo",
+        ty: "bool",
+        default: ConfigValue::Bool(false),
+        min: None,
+        description: "Start every session with YOLO mode (skip permission prompts, deny rules still apply)",
+    },
+    ConfigField {
+        name: "always_automode",
+        ty: "bool",
+        default: ConfigValue::Bool(false),
+        min: None,
+        description: "Start every session with bash auto mode (classify every bash command)",
+    },
+    ConfigField {
+        name: "always_fast",
+        ty: "bool",
+        default: ConfigValue::Bool(false),
+        min: None,
+        description: "Start every session with fast mode on models that offer it, ignored elsewhere",
+    },
+    ConfigField {
+        name: "always_workflow",
+        ty: "bool",
+        default: ConfigValue::Bool(false),
+        min: None,
+        description: "Start every session with workflow mode (task tools callable inside code_execution)",
+    },
+    ConfigField {
+        name: "always_thinking",
+        ty: "bool | string",
+        default: ConfigValue::Bool(false),
+        min: None,
+        description: "Start every session with extended thinking (true/\"adaptive\", \"off\", an effort level (\"minimal\" to \"max\"), or a token budget). A default saved with `/thinking` wins over it",
+    },
+];
+
+/// Expand `${VAR}` references in a config value from the process environment.
+/// A variable that is unset OR set to empty fails with `Err(var)`, so callers
+/// reject the whole value instead of sending a partially expanded one (e.g.
+/// `Bearer ` with nothing after it). An unterminated `${` passes through
+/// literally; there is no escape syntax for a literal `${`.
+pub fn expand_env(value: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find('}') {
+            Some(end) => {
+                let var = &after[..end];
+                match std::env::var(var) {
+                    Ok(v) if !v.is_empty() => out.push_str(&v),
+                    _ => return Err(var.to_string()),
+                }
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str(&rest[start..]);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("invalid config: {section}.{field} = {value} is below minimum ({min})")]
+    BelowMinimum {
+        section: &'static str,
+        field: &'static str,
+        value: u64,
+        min: u64,
+    },
+    #[error("invalid config: always_thinking: {0}")]
+    Thinking(#[from] ThinkingParseError),
+    #[error(
+        "invalid config: plugins.{tool} was removed; {tool} is provided by the edit plugin, \
+         set plugins.edit = {{ {tool} = true|false }} instead"
+    )]
+    RemovedEditSubTool { tool: &'static str },
+    #[error(
+        "invalid config: plugins.{plugin}: no bundled plugin is named \"{plugin}\" \
+         (bundled plugins: {valid})"
+    )]
+    UnknownPlugin { plugin: String, valid: String },
+    #[error(
+        "invalid config: the `tools` table in makima.setup was renamed to `plugins` \
+         (plugins can provide more than tools).\n\n\
+         Fix your config with:\n\n    \
+         sed -i.bak 's/^\\( *\\)tools *=/\\1plugins =/' ~/.config/makima/init.lua\n\n\
+         Run it on .makima/init.lua too if you keep a project config. \
+         A .bak backup is left next to the file."
+    )]
+    RenamedToolsTable,
+    #[error(
+        "invalid config: ui.autocomplete_height = {value} must be finite and in the range (0, 1]"
+    )]
+    InvalidAutocompleteHeight { value: f64 },
+    #[error("invalid config: provider.{field} contains invalid glob pattern `{pattern}`: {source}")]
+    InvalidModelPattern {
+        field: &'static str,
+        pattern: String,
+        #[source]
+        source: globset::Error,
+    },
+    #[error("cannot load permissions from {}: {reason}", path.display())]
+    PermissionsFile { path: PathBuf, reason: String },
+    #[error("{0}; {NO_PROJECT_HINT}")]
+    ProjectPermissions(Box<ConfigError>),
+    #[error(
+        "{} is no longer read, so its rules do not apply; move them to {} and delete it",
+        old.display(),
+        new.display()
+    )]
+    OldHomePermissions { old: PathBuf, new: PathBuf },
+    #[error(
+        "invalid permissions in {}: {}: {reason}",
+        path.display(),
+        rule_location(section, key)
+    )]
+    PermissionRule {
+        path: PathBuf,
+        section: String,
+        key: String,
+        reason: String,
+    },
+    #[error("invalid config: trust.paths contains invalid glob pattern `{pattern}`: {source}")]
+    InvalidTrustPattern {
+        pattern: String,
+        #[source]
+        source: globset::Error,
+    },
+}
+
+fn rule_location(section: &str, key: &str) -> String {
+    match section {
+        "" => key.to_owned(),
+        section => format!("[{section}] {key}"),
+    }
+}
+
+fn check(
+    section: &'static str,
+    field: &'static str,
+    value: u64,
+    min: u64,
+) -> Result<(), ConfigError> {
+    if value < min {
+        return Err(ConfigError::BelowMinimum {
+            section,
+            field,
+            value,
+            min,
+        });
+    }
+    Ok(())
+}
+
+macro_rules! merge_option {
+    ($self:ident, $overlay:ident, $($field:ident),+) => {
+        $(if $overlay.$field.is_some() { $self.$field = $overlay.$field; })+
+    };
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum AlwaysThinking {
+    Toggle(bool),
+    Budget(u32),
+    Mode(String),
+}
+
+impl AlwaysThinking {
+    fn resolve(self) -> Result<StoredThinking, ThinkingParseError> {
+        match self {
+            Self::Toggle(true) => Ok(StoredThinking::Adaptive),
+            Self::Toggle(false) => Ok(StoredThinking::Off),
+            Self::Budget(n) => StoredThinking::parse_setting(&n.to_string()),
+            Self::Mode(s) => StoredThinking::parse_setting(&s),
+        }
+    }
+}
+
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct RawConfig {
+    pub always_yolo: Option<bool>,
+    pub always_automode: Option<bool>,
+    pub always_fast: Option<bool>,
+    pub always_workflow: Option<bool>,
+    pub always_thinking: Option<AlwaysThinking>,
+    #[serde(default)]
+    pub ui: UiFileConfig,
+    pub agent: AgentFileConfig,
+    pub provider: ProviderFileConfig,
+    pub storage: StorageFileConfig,
+    pub net: NetFileConfig,
+    pub trust: TrustFileConfig,
+    pub plugins: HashMap<String, PluginFileConfig>,
+    /// Renamed to `plugins`; kept so old configs fail with a pointer to the
+    /// new name instead of a generic unknown-field error.
+    tools: HashMap<String, PluginFileConfig>,
+}
+
+impl RawConfig {
+    pub fn merge(&mut self, overlay: RawConfig) {
+        merge_option!(
+            self,
+            overlay,
+            always_yolo,
+            always_automode,
+            always_fast,
+            always_workflow,
+            always_thinking
+        );
+        self.ui.merge(overlay.ui);
+        self.agent.merge(overlay.agent);
+        self.provider.merge(overlay.provider);
+        self.storage.merge(overlay.storage);
+        self.net.merge(overlay.net);
+        self.trust.merge(overlay.trust);
+        for (name, plugin) in overlay.plugins {
+            let entry = self.plugins.entry(name).or_default();
+            if plugin.enabled.is_some() {
+                entry.enabled = plugin.enabled;
+            }
+            entry.opts.extend(plugin.opts);
+        }
+        self.tools.extend(overlay.tools);
+    }
+
+    pub fn into_config(self) -> Result<Config, ConfigError> {
+        self.validate_plugin_tables()?;
+        let net = NetConfig::from_file(self.net);
+        Ok(Config {
+            always_yolo: self.always_yolo.unwrap_or(false),
+            always_automode: self.always_automode.unwrap_or(false),
+            session_defaults: SessionDefaults {
+                fast: self.always_fast.unwrap_or(false),
+                workflow: self.always_workflow.unwrap_or(false),
+                thinking: self
+                    .always_thinking
+                    .map(AlwaysThinking::resolve)
+                    .transpose()?,
+            },
+            ui: UiConfig::from_file(self.ui),
+            agent: AgentConfig::from_file(self.agent),
+            provider: ProviderConfig::from_file(self.provider)?,
+            storage: StorageConfig::from_file(self.storage),
+            net,
+            trust: TrustConfig::from_file(self.trust)?,
+            permissions: PermissionsConfig::default(),
+            plugins: PluginsConfig::from_plugins(self.plugins),
+        })
+    }
+
+    /// A `plugins.<name>` key that matches no bundled plugin is a typo or an
+    /// old config, so fail loudly instead of letting it silently drift.
+    fn validate_plugin_tables(&self) -> Result<(), ConfigError> {
+        if !self.tools.is_empty() {
+            return Err(ConfigError::RenamedToolsTable);
+        }
+        for &name in EDIT_SUB_TOOLS {
+            if self.plugins.contains_key(name) {
+                return Err(ConfigError::RemovedEditSubTool { tool: name });
+            }
+        }
+        let mut unknown: Vec<&String> = self
+            .plugins
+            .keys()
+            .filter(|name| {
+                !DEFAULT_BUILTINS.contains(&name.as_str())
+                    && !OPT_IN_BUILTINS.contains(&name.as_str())
+            })
+            .collect();
+        unknown.sort();
+        if let Some(&plugin) = unknown.first() {
+            let mut valid: Vec<&str> = DEFAULT_BUILTINS.to_vec();
+            valid.extend(OPT_IN_BUILTINS.iter().copied());
+            valid.sort();
+            return Err(ConfigError::UnknownPlugin {
+                plugin: plugin.clone(),
+                valid: valid.join(", "),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize, Default, Debug)]
+#[serde(default)]
+pub struct PluginFileConfig {
+    pub enabled: Option<bool>,
+    /// Plugin-specific options passed through opaquely; each plugin declares
+    /// and validates its own via `makima.api.register_options`.
+    #[serde(flatten)]
+    pub opts: JsonMap<String, JsonValue>,
+}
+
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiFileConfig {
+    pub splash_animation: Option<bool>,
+    pub scrollbar: Option<bool>,
+    pub inline_images: Option<bool>,
+    pub notifications: Option<NotificationMethod>,
+    pub flash_duration_ms: Option<u64>,
+    pub typewriter_ms_per_char: Option<u64>,
+    pub mouse_scroll_lines: Option<u32>,
+    pub show_thinking: Option<bool>,
+    pub theme: Option<String>,
+    pub clock_format: Option<ClockFormat>,
+    pub tool_output_lines: Option<ToolOutputLinesFile>,
+    pub bell: Option<BellFileConfig>,
+    pub max_input_lines: Option<u32>,
+    pub autocomplete_height: Option<f64>,
+}
+
+impl UiFileConfig {
+    fn merge(&mut self, overlay: UiFileConfig) {
+        merge_option!(
+            self,
+            overlay,
+            splash_animation,
+            scrollbar,
+            inline_images,
+            notifications,
+            flash_duration_ms,
+            typewriter_ms_per_char,
+            mouse_scroll_lines,
+            show_thinking,
+            theme,
+            clock_format,
+            max_input_lines,
+            autocomplete_height
+        );
+        match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
+            (Some(base), Some(over)) => base.merge(over),
+            (None, Some(over)) => self.tool_output_lines = Some(over),
+            _ => {}
+        }
+        match (self.bell.as_mut(), overlay.bell) {
+            (Some(base), Some(over)) => base.merge(over),
+            (None, Some(over)) => self.bell = Some(over),
+            _ => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NotificationMethod {
+    #[default]
+    Auto,
+    Osc9,
+    Bell,
+    Off,
+}
+
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct ToolOutputLinesFile {
+    pub bash: Option<usize>,
+    pub code_execution: Option<usize>,
+    pub task_spawn: Option<usize>,
+    pub index: Option<usize>,
+    pub grep: Option<usize>,
+    pub read: Option<usize>,
+    pub write: Option<usize>,
+    pub web: Option<usize>,
+    pub other: Option<usize>,
+}
+
+impl ToolOutputLinesFile {
+    fn merge(&mut self, overlay: ToolOutputLinesFile) {
+        merge_option!(
+            self,
+            overlay,
+            bash,
+            code_execution,
+            task_spawn,
+            index,
+            grep,
+            read,
+            write,
+            web,
+            other
+        );
+    }
+}
+
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct BellFileConfig {
+    pub turn_complete: Option<bool>,
+    pub ask: Option<bool>,
+    pub permission: Option<bool>,
+}
+
+impl BellFileConfig {
+    fn merge(&mut self, overlay: BellFileConfig) {
+        merge_option!(self, overlay, turn_complete, ask, permission);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionBuffer {
+    Tokens(u32),
+    Percent(u8),
+}
+
+impl CompactionBuffer {
+    pub fn resolve(self, context_window: u32) -> u32 {
+        match self {
+            Self::Tokens(n) => n,
+            Self::Percent(p) => (u64::from(context_window) * u64::from(p) / 100) as u32,
+        }
+    }
+}
+
+impl Serialize for CompactionBuffer {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Tokens(n) => s.serialize_u32(*n),
+            Self::Percent(p) => s.collect_str(&format_args!("{p}%")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CompactionBuffer {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct BufferVisitor;
+
+        impl serde::de::Visitor<'_> for BufferVisitor {
+            type Value = CompactionBuffer;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(COMPACTION_BUFFER_EXPECTED)
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                u32::try_from(v)
+                    .ok()
+                    .filter(|n| *n >= MIN_COMPACTION_BUFFER)
+                    .map(CompactionBuffer::Tokens)
+                    .ok_or_else(|| {
+                        E::custom(format!(
+                            "compaction_buffer must be at least {MIN_COMPACTION_BUFFER} tokens"
+                        ))
+                    })
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                self.visit_u64(u64::try_from(v).unwrap_or(0))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Self::Value, E> {
+                s.strip_suffix('%')
+                    .and_then(|n| n.trim().parse::<u8>().ok())
+                    .filter(|p| (1..=MAX_COMPACTION_PERCENT).contains(p))
+                    .map(CompactionBuffer::Percent)
+                    .ok_or_else(|| {
+                        E::custom(format!(
+                            "invalid compaction_buffer {s:?}: expected {COMPACTION_BUFFER_EXPECTED}"
+                        ))
+                    })
+            }
+        }
+
+        d.deserialize_any(BufferVisitor)
+    }
+}
+
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentFileConfig {
+    pub max_output_bytes: Option<usize>,
+    pub max_output_lines: Option<usize>,
+    pub max_line_bytes: Option<usize>,
+    pub max_continuation_turns: Option<u32>,
+    pub max_turn_output: Option<u32>,
+    pub max_concurrent_agent_turns: Option<usize>,
+    pub max_agent_depth: Option<usize>,
+    pub max_children_per_agent: Option<usize>,
+    pub max_live_agents: Option<usize>,
+    pub compaction_buffer: Option<CompactionBuffer>,
+    pub compaction_instructions: Option<String>,
+    pub post_compaction_instructions: Option<String>,
+    pub stale_read_check: Option<bool>,
+    pub rtk: Option<bool>,
+}
+
+impl AgentFileConfig {
+    fn merge(&mut self, overlay: AgentFileConfig) {
+        merge_option!(
+            self,
+            overlay,
+            max_output_bytes,
+            max_output_lines,
+            max_line_bytes,
+            max_continuation_turns,
+            max_turn_output,
+            max_concurrent_agent_turns,
+            max_agent_depth,
+            max_children_per_agent,
+            max_live_agents,
+            compaction_buffer,
+            compaction_instructions,
+            post_compaction_instructions,
+            stale_read_check,
+            rtk
+        );
+    }
+}
+
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderFileConfig {
+    pub default_model: Option<String>,
+    pub allowed_models: Option<Vec<String>>,
+    pub excluded_models: Option<Vec<String>>,
+    pub connect_timeout_secs: Option<u64>,
+    pub low_speed_timeout_secs: Option<u64>,
+    pub stream_timeout_secs: Option<u64>,
+    pub retry_base_ms: Option<u64>,
+    pub retry_max_ms: Option<u64>,
+    pub max_retries: Option<u32>,
+    pub max_timeout_retries: Option<u32>,
+}
+
+impl ProviderFileConfig {
+    fn merge(&mut self, overlay: ProviderFileConfig) {
+        merge_option!(
+            self,
+            overlay,
+            default_model,
+            allowed_models,
+            excluded_models,
+            connect_timeout_secs,
+            low_speed_timeout_secs,
+            stream_timeout_secs,
+            retry_base_ms,
+            retry_max_ms,
+            max_retries,
+            max_timeout_retries
+        );
+    }
+}
+
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct StorageFileConfig {
+    pub max_log_bytes_mb: Option<u64>,
+    pub max_log_files: Option<u32>,
+    pub input_history_size: Option<usize>,
+}
+
+impl StorageFileConfig {
+    fn merge(&mut self, overlay: StorageFileConfig) {
+        merge_option!(
+            self,
+            overlay,
+            max_log_bytes_mb,
+            max_log_files,
+            input_history_size
+        );
+    }
+}
+
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct NetFileConfig {
+    pub allowed_private_hosts: Option<Vec<String>>,
+}
+
+impl NetFileConfig {
+    fn merge(&mut self, overlay: NetFileConfig) {
+        merge_option!(self, overlay, allowed_private_hosts);
+    }
+}
+
+/// Folder trust answered ahead of time. Only the global `init.lua` may set
+/// this: a folder cannot vouch for itself, and `makima-lua` strips the table
+/// from every other scope before it reaches here.
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct TrustFileConfig {
+    pub paths: Option<Vec<String>>,
+    pub prompt: Option<bool>,
+}
+
+impl TrustFileConfig {
+    fn merge(&mut self, overlay: TrustFileConfig) {
+        merge_option!(self, overlay, paths, prompt);
+    }
+
+    /// Whether the file mentioned trust at all, so the scope that is not
+    /// allowed to set it can warn about exactly the configs that tried.
+    pub fn is_set(&self) -> bool {
+        self.paths.is_some() || self.prompt.is_some()
+    }
+}
+
+#[derive(Default)]
+struct PermissionsFileConfig {
+    default: Option<DefaultEffect>,
+    tools: HashMap<String, ToolPermissions>,
+    mcp_rules: Vec<PermissionRule>,
+    mcp_defaults: HashMap<ToolKey, DefaultEffect>,
+}
+
+impl PermissionsFileConfig {
+    /// An untrusted project may only restrict the agent, never widen it: keep
+    /// explicit deny scopes and drop allow scopes plus every default, so the
+    /// repository cannot set a fallback effect of its own.
+    fn restrict_to_deny_scopes(&mut self) {
+        self.default = None;
+        self.mcp_defaults.clear();
+        self.mcp_rules.retain(|rule| rule.effect == Effect::Deny);
+        for perms in self.tools.values_mut() {
+            perms.allow = None;
+            perms.default = None;
+        }
+    }
+}
+
+fn rule_error(path: &Path, section: &str, key: &str, reason: impl Into<String>) -> ConfigError {
+    ConfigError::PermissionRule {
+        path: path.to_path_buf(),
+        section: section.into(),
+        key: key.into(),
+        reason: reason.into(),
+    }
+}
+
+fn expected(what: &str, got: &toml::Value) -> String {
+    format!("expected {what}, got {}", got.type_str())
+}
+
+impl PermissionsFileConfig {
+    fn parse(path: &Path, table: &toml::Table) -> Result<Self, ConfigError> {
+        let mut config = Self::default();
+        for (key, value) in table {
+            match key.as_str() {
+                "default" => {
+                    config.default = Some(
+                        default_effect(value)
+                            .map_err(|reason| rule_error(path, "", key, reason))?,
+                    );
+                }
+                "mcp" => {
+                    let servers = value.as_table().ok_or_else(|| {
+                        rule_error(path, "", key, expected("a table of MCP servers", value))
+                    })?;
+                    for (server, value) in servers {
+                        config.parse_mcp_server(path, server, value)?;
+                    }
+                }
+                tool => {
+                    config
+                        .tools
+                        .insert(tool.to_owned(), ToolPermissions::parse(path, tool, value)?);
+                }
+            }
+        }
+        Ok(config)
+    }
+
+    fn parse_mcp_server(
+        &mut self,
+        path: &Path,
+        server: &str,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let section = format!("mcp.{server}");
+        let table = value
+            .as_table()
+            .ok_or_else(|| rule_error(path, "mcp", server, expected("a table", value)))?;
+        if !is_valid_server_name(server) {
+            return Err(rule_error(
+                path,
+                "mcp",
+                server,
+                "invalid server name; use only alphanumeric characters and hyphens",
+            ));
+        }
+        for (key, value) in table {
+            let effect = match key.as_str() {
+                "allow" => Effect::Allow,
+                "deny" => Effect::Deny,
+                "default" => {
+                    let effect = default_effect(value)
+                        .map_err(|reason| rule_error(path, &section, key, reason))?;
+                    self.mcp_defaults.insert(
+                        ToolKey::McpServer {
+                            server: server.into(),
+                        },
+                        effect,
+                    );
+                    continue;
+                }
+                _ => return Err(rule_error(path, &section, key, "unknown key")),
+            };
+            let tools = string_list(value, "an array of tool names")
+                .map_err(|reason| rule_error(path, &section, key, reason))?;
+            for tool in tools {
+                let key_error = |reason: String| rule_error(path, &section, key, reason);
+                let tool = match tool.as_str() {
+                    "*" => ToolKey::McpServer {
+                        server: server.into(),
+                    },
+                    tool => ToolKey::parse(&format!("{server}.{tool}"))
+                        .map_err(|error| key_error(error.to_string()))?,
+                };
+                self.mcp_rules.push(PermissionRule {
+                    tool,
+                    scope: None,
+                    effect,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn default_effect(value: &toml::Value) -> Result<DefaultEffect, String> {
+    value
+        .clone()
+        .try_into()
+        .map_err(|_| format!("expected \"allow\", \"deny\" or \"prompt\", got {value}"))
+}
+
+fn string_list(value: &toml::Value, what: &str) -> Result<Vec<String>, String> {
+    value
+        .as_array()
+        .ok_or_else(|| expected(what, value))?
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| expected(what, item))
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct ToolPermissions {
+    allow: Option<ScopeSet>,
+    deny: Option<ScopeSet>,
+    default: Option<DefaultEffect>,
+}
+
+impl ToolPermissions {
+    fn parse(path: &Path, tool: &str, value: &toml::Value) -> Result<Self, ConfigError> {
+        let table = value
+            .as_table()
+            .ok_or_else(|| rule_error(path, "", tool, expected("a table", value)))?;
+        if tool != "*" && !is_valid_wire_name(tool) {
+            let reason = if tool.starts_with(OLD_MCP_PREFIX) {
+                OLD_MCP_SECTION
+            } else {
+                INVALID_TOOL_SECTION
+            };
+            return Err(rule_error(path, "", tool, reason));
+        }
+        let mut permissions = Self::default();
+        for (key, value) in table {
+            let error = |reason: String| rule_error(path, tool, key, reason);
+            match key.as_str() {
+                "allow" => permissions.allow = Some(ScopeSet::parse(value).map_err(error)?),
+                "deny" => permissions.deny = Some(ScopeSet::parse(value).map_err(error)?),
+                "default" if tool == "*" => {
+                    return Err(error("use the top-level `default` instead".into()));
+                }
+                "default" => permissions.default = Some(default_effect(value).map_err(error)?),
+                _ => return Err(error("unknown key".into())),
+            }
+        }
+        Ok(permissions)
+    }
+}
+
+enum ScopeSet {
+    All(bool),
+    Scopes(Vec<String>),
+}
+
+impl ScopeSet {
+    fn parse(value: &toml::Value) -> Result<Self, String> {
+        const EXPECTED: &str = "a boolean or an array of scope patterns";
+        match value {
+            toml::Value::Boolean(all) => Ok(Self::All(*all)),
+            _ => string_list(value, EXPECTED).map(Self::Scopes),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effect {
+    Allow,
+    Deny,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DefaultEffect {
+    Allow,
+    Deny,
+    #[default]
+    Prompt,
+}
+
+impl From<Effect> for DefaultEffect {
+    fn from(e: Effect) -> Self {
+        match e {
+            Effect::Allow => DefaultEffect::Allow,
+            Effect::Deny => DefaultEffect::Deny,
+        }
+    }
+}
+
+impl DefaultEffect {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Prompt => "prompt",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum PermissionTarget {
+    Global,
+    Project(ProjectConfig),
+}
+
+use std::sync::Arc;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ToolKey {
+    Wildcard,
+    Native(Arc<str>),
+    McpServer { server: Arc<str> },
+    McpTool { server: Arc<str>, tool: Arc<str> },
+}
+
+/// NOTE: `ToolKey` deliberately does not implement `serde::Deserialize`.
+/// Use `ToolKey::parse(&str)` at deserialization boundaries — it performs
+/// validation (wire format, server name, length) that a blanket Deserialize
+/// would skip. All current deserialization paths go through `parse`.
+impl serde::Serialize for ToolKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+/// Check if a name matches the LLM wire format: `^[a-zA-Z0-9_-]{1,64}$`.
+/// Tool names with dots, over 64 chars, or special characters are rejected.
+pub fn is_valid_wire_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+impl ToolKey {
+    /// Parse a qualified tool name into a `ToolKey`.
+    ///
+    /// Returns `Err` for malformed input (empty names, empty server/tool parts,
+    /// tool names that don't match the wire format `^[a-zA-Z0-9_-]{1,64}$`).
+    /// Use this at config/dispatch boundaries where input is untrusted.
+    pub fn parse(name: &str) -> Result<Self, ToolKeyParseError> {
+        if name.is_empty() {
+            return Err(ToolKeyParseError::EmptyName);
+        }
+        if name == "*" {
+            return Ok(Self::Wildcard);
+        }
+        match name.split_once('.') {
+            Some(("", _)) | Some((_, "")) => {
+                Err(ToolKeyParseError::MalformedParts(name.to_string()))
+            }
+            Some((server, "*")) => {
+                if !is_valid_server_name(server) {
+                    return Err(ToolKeyParseError::InvalidServerName(server.to_string()));
+                }
+                Ok(Self::McpServer {
+                    server: server.into(),
+                })
+            }
+            Some((server, tool)) => {
+                if !is_valid_server_name(server) {
+                    return Err(ToolKeyParseError::InvalidServerName(server.to_string()));
+                }
+                if !is_valid_wire_name(tool) {
+                    return Err(ToolKeyParseError::InvalidToolName(tool.to_string()));
+                }
+                // Wire format is server__tool — check total length fits LLM API limits
+                let wire_len = server.len() + 2 + tool.len();
+                if wire_len > 64 {
+                    return Err(ToolKeyParseError::WireNameTooLong {
+                        server: server.to_string(),
+                        tool: tool.to_string(),
+                        len: wire_len,
+                    });
+                }
+                Ok(Self::McpTool {
+                    server: server.into(),
+                    tool: tool.into(),
+                })
+            }
+            None => {
+                if !is_valid_wire_name(name) {
+                    return Err(ToolKeyParseError::InvalidToolName(name.to_string()));
+                }
+                Ok(Self::Native(name.into()))
+            }
+        }
+    }
+
+    /// Create a `ToolKey` from a known-valid native tool name.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` is empty or contains dots. Use `ToolKey::parse` for
+    /// untrusted input or MCP tool names.
+    pub fn native(name: &str) -> Self {
+        match name {
+            "*" => Self::Wildcard,
+            _ => {
+                assert!(!name.is_empty(), "native tool name must not be empty");
+                assert!(
+                    !name.contains('.'),
+                    "native tool name must not contain dots: {name:?} - use ToolKey::parse for MCP tools"
+                );
+                Self::Native(name.into())
+            }
+        }
+    }
+
+    pub fn is_mcp(&self) -> bool {
+        matches!(self, Self::McpServer { .. } | Self::McpTool { .. })
+    }
+}
+
+impl std::fmt::Display for ToolKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Wildcard => write!(f, "*"),
+            Self::Native(name) => write!(f, "{name}"),
+            Self::McpServer { server } => write!(f, "{server}.*"),
+            Self::McpTool { server, tool } => write!(f, "{server}.{tool}"),
+        }
+    }
+}
+
+/// Error returned when a tool key string fails validation.
+#[derive(Debug, thiserror::Error)]
+pub enum ToolKeyParseError {
+    #[error("tool name is empty")]
+    EmptyName,
+    #[error("malformed tool key: empty server or tool part in {0:?}")]
+    MalformedParts(String),
+    #[error("invalid server name {0:?}: must match [a-zA-Z0-9-]{{1,64}}")]
+    InvalidServerName(String),
+    #[error("invalid tool name {0:?}: must match [a-zA-Z0-9_-]{{1,64}}")]
+    InvalidToolName(String),
+    #[error("wire name {server}__{tool} is {len} chars, max 64")]
+    WireNameTooLong {
+        server: String,
+        tool: String,
+        len: usize,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct PermissionRule {
+    pub tool: ToolKey,
+    pub scope: Option<String>,
+    pub effect: Effect,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PermissionsConfig {
+    pub default: DefaultEffect,
+    pub tool_defaults: HashMap<ToolKey, DefaultEffect>,
+    pub rules: Vec<PermissionRule>,
+    pub yolo: bool,
+}
+
+impl PermissionsConfig {
+    /// The rules and defaults of tool sections that {registered} does not
+    /// name, as they read in the file. Such a section still loads: a global
+    /// rule may be for a tool only some projects register.
+    pub fn unmatched_rules(&self, registered: impl Fn(&str) -> bool) -> Vec<String> {
+        let unmatched = |tool: &ToolKey| match tool {
+            ToolKey::Native(name) if !registered(name) => Some(Arc::clone(name)),
+            _ => None,
+        };
+        let rules = self.rules.iter().filter_map(|rule| {
+            let tool = unmatched(&rule.tool)?;
+            let effect = DefaultEffect::from(rule.effect).as_str();
+            Some(match &rule.scope {
+                Some(scope) => format!("[{tool}] {effect} {scope:?}"),
+                None => format!("[{tool}] {effect} = true"),
+            })
+        });
+        let defaults = self.tool_defaults.iter().filter_map(|(tool, effect)| {
+            Some(format!(
+                "[{}] default = {:?}",
+                unmatched(tool)?,
+                effect.as_str()
+            ))
+        });
+        let mut unmatched: Vec<_> = rules.chain(defaults).collect();
+        unmatched.sort();
+        unmatched
+    }
+}
+
+#[derive(Clone)]
+pub struct Config {
+    pub always_yolo: bool,
+    pub always_automode: bool,
+    pub session_defaults: SessionDefaults,
+    pub ui: UiConfig,
+    pub agent: AgentConfig,
+    pub provider: ProviderConfig,
+    pub storage: StorageConfig,
+    pub net: NetConfig,
+    pub trust: TrustConfig,
+    pub permissions: PermissionsConfig,
+    pub plugins: PluginsConfig,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub enum ClockFormat {
+    #[serde(rename = "12h")]
+    Hour12,
+    #[serde(rename = "24h")]
+    Hour24,
+    #[default]
+    #[serde(rename = "system")]
+    System,
+}
+
+#[derive(Debug, Clone, ConfigSection)]
+#[config(section = "ui")]
+pub struct UiConfig {
+    #[config(default = true, desc = "Show splash animation on startup")]
+    pub splash_animation: bool,
+
+    #[config(
+        default = true,
+        desc = "Show a draggable vertical scrollbar in scrollable areas"
+    )]
+    pub scrollbar: bool,
+
+    #[config(
+        default = true,
+        desc = "Render inline images in terminals with graphics support (Kitty graphics and tmux passthrough are detected automatically without manual multiplexer flags), falling back to an [image] line when off"
+    )]
+    pub inline_images: bool,
+
+    #[config(
+        default = NotificationMethod::Auto,
+        ty = "string",
+        default_doc = "auto",
+        desc = "Terminal notification method: auto, osc9, bell, or off"
+    )]
+    pub notifications: NotificationMethod,
+
+    #[config(default = DEFAULT_FLASH_DURATION_MS, desc = "Duration of flash messages (ms)")]
+    pub flash_duration_ms: u64,
+
+    #[config(default = DEFAULT_TYPEWRITER_MS_PER_CHAR, desc = "Typewriter effect speed (ms/char)")]
+    pub typewriter_ms_per_char: u64,
+
+    #[config(default = DEFAULT_MOUSE_SCROLL_LINES, min = MIN_MOUSE_SCROLL_LINES, desc = "Lines per mouse wheel scroll")]
+    pub mouse_scroll_lines: u32,
+
+    #[config(default = DEFAULT_MAX_INPUT_LINES, min = MIN_MAX_INPUT_LINES, desc = "Maximum visible input lines")]
+    pub max_input_lines: u32,
+
+    #[config(
+        default = DEFAULT_AUTOCOMPLETE_HEIGHT,
+        ty = "number",
+        desc = "Fraction of terminal height used for slash command-argument suggestions; must be finite and in (0, 1]"
+    )]
+    pub autocomplete_height: f64,
+
+    #[config(
+        default = true,
+        desc = "When true (default), show full model reasoning live and persisted. When false, hide reasoning behind an indicator (thinking> ...) with a click-to-expand hint, both while thinking and after it completes"
+    )]
+    pub show_thinking: bool,
+
+    #[config(default = ClockFormat::System, ty = "String", default_doc = "system", desc = "Clock format for timestamps: \"12h\", \"24h\", or \"system\" (follow the OS preference, 24h when unknown)")]
+    pub clock_format: ClockFormat,
+
+    #[config(skip, default = "None")]
+    pub theme: Option<String>,
+
+    #[config(skip, default = "ToolOutputLines::default()")]
+    pub tool_output_lines: ToolOutputLines,
+
+    #[config(skip, default = "BellConfig::default()")]
+    pub bell: BellConfig,
+}
+
+impl UiConfig {
+    pub fn flash_duration(&self) -> Duration {
+        Duration::from_millis(self.flash_duration_ms)
+    }
+
+    fn from_file(f: UiFileConfig) -> Self {
+        Self {
+            splash_animation: f.splash_animation.unwrap_or(true),
+            scrollbar: f.scrollbar.unwrap_or(true),
+            inline_images: f.inline_images.unwrap_or(true),
+            notifications: f.notifications.unwrap_or_default(),
+            flash_duration_ms: f.flash_duration_ms.unwrap_or(DEFAULT_FLASH_DURATION_MS),
+            typewriter_ms_per_char: f
+                .typewriter_ms_per_char
+                .unwrap_or(DEFAULT_TYPEWRITER_MS_PER_CHAR),
+            mouse_scroll_lines: f.mouse_scroll_lines.unwrap_or(DEFAULT_MOUSE_SCROLL_LINES),
+            max_input_lines: f.max_input_lines.unwrap_or(DEFAULT_MAX_INPUT_LINES),
+            autocomplete_height: f.autocomplete_height.unwrap_or(DEFAULT_AUTOCOMPLETE_HEIGHT),
+            show_thinking: f.show_thinking.unwrap_or(true),
+            clock_format: f.clock_format.unwrap_or_default(),
+            theme: f.theme,
+            tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
+            bell: BellConfig::from_file(f.bell),
+        }
+    }
+
+    pub fn validate_all(&self) -> Result<(), ConfigError> {
+        self.validate()?;
+        if !self.autocomplete_height.is_finite()
+            || !(0.0..=1.0).contains(&self.autocomplete_height)
+            || self.autocomplete_height == 0.0
+        {
+            return Err(ConfigError::InvalidAutocompleteHeight {
+                value: self.autocomplete_height,
+            });
+        }
+        self.tool_output_lines.validate()?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolOutputLines {
+    pub bash: usize,
+    pub code_execution: usize,
+    pub task_spawn: usize,
+    pub index: usize,
+    pub grep: usize,
+    pub read: usize,
+    pub write: usize,
+    pub web: usize,
+    pub other: usize,
+}
+
+impl ToolOutputLines {
+    pub const DEFAULT: Self = Self {
+        bash: 5,
+        code_execution: 5,
+        task_spawn: 5,
+        index: 3,
+        grep: 3,
+        read: 3,
+        write: 7,
+        web: 3,
+        other: 3,
+    };
+
+    pub const FIELD_DEFAULTS: &[(&'static str, usize)] = &[
+        ("bash", Self::DEFAULT.bash),
+        ("code_execution", Self::DEFAULT.code_execution),
+        ("task_spawn", Self::DEFAULT.task_spawn),
+        ("index", Self::DEFAULT.index),
+        ("grep", Self::DEFAULT.grep),
+        ("read", Self::DEFAULT.read),
+        ("write", Self::DEFAULT.write),
+        ("web", Self::DEFAULT.web),
+        ("other", Self::DEFAULT.other),
+    ];
+
+    fn from_file(f: Option<ToolOutputLinesFile>) -> Self {
+        let d = Self::DEFAULT;
+        let f = f.unwrap_or_default();
+        Self {
+            bash: f.bash.unwrap_or(d.bash),
+            code_execution: f.code_execution.unwrap_or(d.code_execution),
+            task_spawn: f.task_spawn.unwrap_or(d.task_spawn),
+            index: f.index.unwrap_or(d.index),
+            grep: f.grep.unwrap_or(d.grep),
+            read: f.read.unwrap_or(d.read),
+            write: f.write.unwrap_or(d.write),
+            web: f.web.unwrap_or(d.web),
+            other: f.other.unwrap_or(d.other),
+        }
+    }
+
+    fn fields(&self) -> [(&'static str, usize); 9] {
+        [
+            ("bash", self.bash),
+            ("code_execution", self.code_execution),
+            ("task_spawn", self.task_spawn),
+            ("index", self.index),
+            ("grep", self.grep),
+            ("read", self.read),
+            ("write", self.write),
+            ("web", self.web),
+            ("other", self.other),
+        ]
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        for (name, value) in self.fields() {
+            check(
+                "ui.tool_output_lines",
+                name,
+                value as u64,
+                MIN_TOOL_OUTPUT_LINES as u64,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn get(&self, name: &str) -> usize {
+        match name {
+            "bash" => self.bash,
+            "code_execution" => self.code_execution,
+            "task_spawn" => self.task_spawn,
+            "index" => self.index,
+            "grep" | "glob" => self.grep,
+            "read" => self.read,
+            "memory" => self.write,
+            name if FILE_WRITE_TOOLS.contains(&name) => self.write,
+            "webfetch" | "websearch" => self.web,
+            _ => self.other,
+        }
+    }
+}
+
+impl Default for ToolOutputLines {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BellConfig {
+    pub turn_complete: bool,
+    pub ask: bool,
+    pub permission: bool,
+}
+
+impl BellConfig {
+    pub const DEFAULT: Self = Self {
+        turn_complete: true,
+        ask: true,
+        permission: true,
+    };
+
+    pub const FIELD_DEFAULTS: &[(&'static str, bool)] = &[
+        ("turn_complete", Self::DEFAULT.turn_complete),
+        ("ask", Self::DEFAULT.ask),
+        ("permission", Self::DEFAULT.permission),
+    ];
+
+    fn from_file(f: Option<BellFileConfig>) -> Self {
+        let d = Self::DEFAULT;
+        let f = f.unwrap_or_default();
+        Self {
+            turn_complete: f.turn_complete.unwrap_or(d.turn_complete),
+            ask: f.ask.unwrap_or(d.ask),
+            permission: f.permission.unwrap_or(d.permission),
+        }
+    }
+}
+
+impl Default for BellConfig {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+#[derive(Debug, Clone, ConfigSection, Serialize)]
+#[config(section = "agent")]
+pub struct AgentConfig {
+    #[config(default = DEFAULT_MAX_OUTPUT_BYTES, min = MIN_OUTPUT_BYTES, desc = "Max tool output size (bytes)")]
+    pub max_output_bytes: usize,
+
+    #[config(default = DEFAULT_MAX_OUTPUT_LINES, min = MIN_OUTPUT_LINES, desc = "Max tool output lines")]
+    pub max_output_lines: usize,
+
+    #[config(default = DEFAULT_MAX_LINE_BYTES, min = MIN_LINE_BYTES, desc = "Max bytes of one line shown by read and grep; longer lines are cut, and write and edit_lines refuse to alter them")]
+    pub max_line_bytes: usize,
+
+    #[config(default = DEFAULT_MAX_CONTINUATION_TURNS, min = MIN_MAX_CONTINUATION_TURNS, desc = "Max automatic continuation turns")]
+    pub max_continuation_turns: u32,
+
+    #[config(default = DEFAULT_MAX_TURN_OUTPUT, min = MIN_MAX_TURN_OUTPUT, desc = "Output tokens one turn asks for, raised where an effort level needs the room and capped by the model's own limit")]
+    pub max_turn_output: u32,
+
+    #[config(default = DEFAULT_MAX_CONCURRENT_AGENT_TURNS, min = MIN_AGENT_LIMIT, desc = "Max agent turns running concurrently")]
+    pub max_concurrent_agent_turns: usize,
+
+    #[config(default = DEFAULT_MAX_AGENT_DEPTH, min = MIN_AGENT_LIMIT, desc = "Max nesting depth for child agents")]
+    pub max_agent_depth: usize,
+
+    #[config(default = DEFAULT_MAX_CHILDREN_PER_AGENT, min = MIN_AGENT_LIMIT, desc = "Max child agents created by one agent")]
+    pub max_children_per_agent: usize,
+
+    #[config(default = DEFAULT_MAX_LIVE_AGENTS, min = MIN_AGENT_LIMIT, desc = "Max live agents in one outer session")]
+    pub max_live_agents: usize,
+
+    #[config(default = DEFAULT_COMPACTION_BUFFER, ty = "u32 | string", default_doc = "20%", desc = "Context reserved for compaction: token count or percent of the context window (e.g. \"20%\")")]
+    pub compaction_buffer: CompactionBuffer,
+
+    #[config(
+        ty = "String",
+        default = "None",
+        desc = "Extra instructions appended to the compaction summary prompt"
+    )]
+    pub compaction_instructions: Option<String>,
+
+    #[config(
+        ty = "String",
+        default = "None",
+        desc = "Extra instructions the agent receives after any compaction (e.g. re-read plan.md)"
+    )]
+    pub post_compaction_instructions: Option<String>,
+
+    #[config(
+        default = true,
+        desc = "Require re-reading a file that changed on disk before editing it"
+    )]
+    pub stale_read_check: bool,
+
+    #[config(
+        default = true,
+        desc = "Rewrite bash commands with [rtk](https://github.com/rtk-ai/rtk) when it is installed"
+    )]
+    pub rtk: bool,
+
+    #[config(skip, default = "None")]
+    pub max_turns: Option<u32>,
+
+    #[config(skip, default = "Vec::new()")]
+    pub allowed_tools: Vec<String>,
+
+    /// Only from the CLI's `--disallowed-tools`. A disabled plugin never
+    /// registers its tool, so its name stays free for another plugin to claim.
+    #[config(skip, default = "Vec::new()")]
+    pub disabled_tools: Vec<String>,
+}
+
+impl AgentConfig {
+    fn from_file(file: AgentFileConfig) -> Self {
+        Self {
+            max_output_bytes: file.max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES),
+            max_output_lines: file.max_output_lines.unwrap_or(DEFAULT_MAX_OUTPUT_LINES),
+            max_line_bytes: file.max_line_bytes.unwrap_or(DEFAULT_MAX_LINE_BYTES),
+            max_continuation_turns: file
+                .max_continuation_turns
+                .unwrap_or(DEFAULT_MAX_CONTINUATION_TURNS),
+            max_turn_output: file.max_turn_output.unwrap_or(DEFAULT_MAX_TURN_OUTPUT),
+            max_concurrent_agent_turns: file
+                .max_concurrent_agent_turns
+                .unwrap_or(DEFAULT_MAX_CONCURRENT_AGENT_TURNS),
+            max_agent_depth: file.max_agent_depth.unwrap_or(DEFAULT_MAX_AGENT_DEPTH),
+            max_children_per_agent: file
+                .max_children_per_agent
+                .unwrap_or(DEFAULT_MAX_CHILDREN_PER_AGENT),
+            max_live_agents: file.max_live_agents.unwrap_or(DEFAULT_MAX_LIVE_AGENTS),
+            compaction_buffer: file.compaction_buffer.unwrap_or(DEFAULT_COMPACTION_BUFFER),
+            compaction_instructions: file.compaction_instructions,
+            post_compaction_instructions: file.post_compaction_instructions,
+            stale_read_check: file.stale_read_check.unwrap_or(true),
+            rtk: file.rtk.unwrap_or(true),
+            max_turns: None,
+            allowed_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, ConfigSection)]
+#[config(section = "provider", fields_only)]
+pub struct ProviderConfig {
+    #[config(ty = "String", desc = "Default model identifier, as `provider/model`")]
+    pub default_model: Option<String>,
+
+    #[config(
+        ty = "string[]",
+        default_doc = "[]",
+        desc = "Glob patterns for permitted qualified model specs; empty permits all models"
+    )]
+    pub allowed_models: Vec<String>,
+
+    #[config(
+        ty = "string[]",
+        default_doc = "[]",
+        desc = "Glob patterns for excluded qualified model specs; exclusions take precedence"
+    )]
+    pub excluded_models: Vec<String>,
+
+    #[config(skip)]
+    pub model_policy: ModelPolicy,
+
+    #[config(key = "connect_timeout_secs", ty = "u64", default = DEFAULT_CONNECT_TIMEOUT_SECS,
+             min = MIN_CONNECT_TIMEOUT_SECS, val = "self.connect_timeout.as_secs()",
+             desc = "HTTP connect timeout (seconds)")]
+    pub connect_timeout: Duration,
+
+    #[config(key = "low_speed_timeout_secs", ty = "u64", default = DEFAULT_LOW_SPEED_TIMEOUT_SECS,
+             min = MIN_LOW_SPEED_TIMEOUT_SECS, val = "self.low_speed_timeout.as_secs()",
+             desc = "Low speed timeout (seconds with less than 1 byte received)")]
+    pub low_speed_timeout: Duration,
+
+    #[config(key = "stream_timeout_secs", ty = "u64", default = DEFAULT_STREAM_TIMEOUT_SECS,
+             min = MIN_STREAM_TIMEOUT_SECS, val = "self.stream_timeout.as_secs()",
+             desc = "Streaming response timeout (seconds)")]
+    pub stream_timeout: Duration,
+
+    #[config(key = "retry_base_ms", ty = "u64", default = DEFAULT_RETRY_BASE_MS,
+             min = MIN_RETRY_BASE_MS,
+             desc = "Base delay between retries (milliseconds, grows per attempt)")]
+    pub retry_base_ms: u64,
+
+    #[config(key = "retry_max_ms", ty = "u64", default = DEFAULT_RETRY_MAX_MS,
+             min = MIN_RETRY_MAX_MS,
+             desc = "Cap on the guessed retry backoff (milliseconds)")]
+    pub retry_max_ms: u64,
+
+    #[config(key = "max_retries", ty = "u32", default = DEFAULT_MAX_RETRIES,
+             desc = "Max retries on a rate limit the server sent no Retry-After for, 0 to never retry them")]
+    pub max_retries: u32,
+
+    #[config(key = "max_timeout_retries", ty = "u32", default = DEFAULT_MAX_TIMEOUT_RETRIES,
+             desc = "Max retries on stream timeouts")]
+    pub max_timeout_retries: u32,
+}
+
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self {
+            default_model: None,
+            allowed_models: Vec::new(),
+            excluded_models: Vec::new(),
+            model_policy: ModelPolicy::allow_all(),
+            connect_timeout: Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
+            low_speed_timeout: Duration::from_secs(DEFAULT_LOW_SPEED_TIMEOUT_SECS),
+            stream_timeout: Duration::from_secs(DEFAULT_STREAM_TIMEOUT_SECS),
+            retry_base_ms: DEFAULT_RETRY_BASE_MS,
+            retry_max_ms: DEFAULT_RETRY_MAX_MS,
+            max_retries: DEFAULT_MAX_RETRIES,
+            max_timeout_retries: DEFAULT_MAX_TIMEOUT_RETRIES,
+        }
+    }
+}
+
+impl ProviderConfig {
+    fn from_file(f: ProviderFileConfig) -> Result<Self, ConfigError> {
+        let allowed_models = f.allowed_models.unwrap_or_default();
+        let excluded_models = f.excluded_models.unwrap_or_default();
+        let model_policy = ModelPolicy::new(&allowed_models, &excluded_models)?;
+        Ok(Self {
+            default_model: f.default_model,
+            allowed_models,
+            excluded_models,
+            model_policy,
+            connect_timeout: Duration::from_secs(
+                f.connect_timeout_secs
+                    .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
+            ),
+            low_speed_timeout: Duration::from_secs(
+                f.low_speed_timeout_secs
+                    .unwrap_or(DEFAULT_LOW_SPEED_TIMEOUT_SECS),
+            ),
+            stream_timeout: Duration::from_secs(
+                f.stream_timeout_secs.unwrap_or(DEFAULT_STREAM_TIMEOUT_SECS),
+            ),
+            retry_base_ms: f.retry_base_ms.unwrap_or(DEFAULT_RETRY_BASE_MS),
+            retry_max_ms: f.retry_max_ms.unwrap_or(DEFAULT_RETRY_MAX_MS),
+            max_retries: f.max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
+            max_timeout_retries: f.max_timeout_retries.unwrap_or(DEFAULT_MAX_TIMEOUT_RETRIES),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelPolicy {
+    allowed: GlobSet,
+    excluded: GlobSet,
+    has_allowed_models: bool,
+}
+
+impl Default for ModelPolicy {
+    fn default() -> Self {
+        Self::allow_all()
+    }
+}
+
+impl ModelPolicy {
+    fn allow_all() -> Self {
+        Self::new(&[], &[]).expect("empty model policy is valid")
+    }
+
+    pub fn new(allowed_models: &[String], excluded_models: &[String]) -> Result<Self, ConfigError> {
+        Ok(Self {
+            allowed: Self::compile("allowed_models", allowed_models)?,
+            excluded: Self::compile("excluded_models", excluded_models)?,
+            has_allowed_models: !allowed_models.is_empty(),
+        })
+    }
+
+    fn compile(field: &'static str, patterns: &[String]) -> Result<GlobSet, ConfigError> {
+        let mut globset = GlobSetBuilder::new();
+        for pattern in patterns {
+            let glob = GlobBuilder::new(pattern)
+                .literal_separator(false)
+                .build()
+                .map_err(|source| ConfigError::InvalidModelPattern {
+                    field,
+                    pattern: pattern.clone(),
+                    source,
+                })?;
+            globset.add(glob);
+        }
+        globset
+            .build()
+            .map_err(|source| ConfigError::InvalidModelPattern {
+                field,
+                pattern: String::new(),
+                source,
+            })
+    }
+
+    pub fn is_restrictive(&self) -> bool {
+        self.has_allowed_models || !self.excluded.is_empty()
+    }
+
+    pub fn allows(&self, spec: &str) -> bool {
+        (!self.has_allowed_models || self.allowed.is_match(spec)) && !self.excluded.is_match(spec)
+    }
+}
+
+#[derive(Debug, Clone, Copy, ConfigSection)]
+#[config(section = "storage", fields_only)]
+pub struct StorageConfig {
+    #[config(key = "max_log_bytes_mb", ty = "u64", default = DEFAULT_MAX_LOG_BYTES_MB,
+             min = MIN_MAX_LOG_BYTES_MB, val = "self.max_log_bytes / (1024 * 1024)",
+             desc = "Max total log size (MB)")]
+    pub max_log_bytes: u64,
+
+    #[config(default = DEFAULT_MAX_LOG_FILES, min = MIN_MAX_LOG_FILES,
+             desc = "Max number of log files to keep")]
+    pub max_log_files: u32,
+
+    #[config(default = DEFAULT_INPUT_HISTORY_SIZE, min = MIN_INPUT_HISTORY_SIZE,
+             desc = "Number of input history entries to retain")]
+    pub input_history_size: usize,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            max_log_bytes: DEFAULT_MAX_LOG_BYTES_MB * 1024 * 1024,
+            max_log_files: DEFAULT_MAX_LOG_FILES,
+            input_history_size: DEFAULT_INPUT_HISTORY_SIZE,
+        }
+    }
+}
+
+impl StorageConfig {
+    fn from_file(f: StorageFileConfig) -> Self {
+        Self {
+            max_log_bytes: f.max_log_bytes_mb.unwrap_or(DEFAULT_MAX_LOG_BYTES_MB) * 1024 * 1024,
+            max_log_files: f.max_log_files.unwrap_or(DEFAULT_MAX_LOG_FILES),
+            input_history_size: f.input_history_size.unwrap_or(DEFAULT_INPUT_HISTORY_SIZE),
+        }
+    }
+}
+
+/// Escape hatches for the SSRF guard in `makima.net`, which every HTTP tool
+/// goes through. The model picks the URL, so private and metadata addresses
+/// are refused unless the user named the host here.
+#[derive(Debug, Clone, ConfigSection)]
+#[config(section = "net")]
+pub struct NetConfig {
+    #[config(
+        ty = "string[]",
+        default = "Vec::new()",
+        default_doc = "[]",
+        desc = "Hosts allowed to resolve to a private or loopback address, as `host`, `host:port`, or a CIDR range. Plain `http://` is kept for them instead of being upgraded to `https://`"
+    )]
+    pub allowed_private_hosts: Vec<String>,
+}
+
+impl NetConfig {
+    fn from_file(f: NetFileConfig) -> Self {
+        Self {
+            allowed_private_hosts: f.allowed_private_hosts.unwrap_or_default(),
+        }
+    }
+}
+
+/// Compiled `trust.paths`, matched against the canonical project root the
+/// trust store keys on. The patterns are kept next to the [`GlobSet`] so a
+/// grant can name the one that produced it.
+///
+/// Reading this from the global `init.lua` adds no power: that file already
+/// runs arbitrary Lua in this process. Ask through
+/// [`project::policy_grant`](crate::project::policy_grant) so a match is
+/// recorded like any other yes.
+#[derive(Debug, Clone)]
+pub struct TrustConfig {
+    matcher: GlobSet,
+    patterns: Vec<String>,
+    pub prompt: bool,
+}
+
+impl Default for TrustConfig {
+    fn default() -> Self {
+        Self {
+            matcher: GlobSet::empty(),
+            patterns: Vec::new(),
+            prompt: true,
+        }
+    }
+}
+
+impl TrustConfig {
+    pub fn from_file(f: TrustFileConfig) -> Result<Self, ConfigError> {
+        let patterns = f.paths.unwrap_or_default();
+        Ok(Self {
+            matcher: Self::compile(&patterns)?,
+            patterns,
+            prompt: f.prompt.unwrap_or(true),
+        })
+    }
+
+    /// `literal_separator` is on, unlike [`ModelPolicy`]: a path is segmented,
+    /// so `~/src/*` must mean the projects directly under it and `~/src/**`
+    /// the whole tree.
+    fn compile(patterns: &[String]) -> Result<GlobSet, ConfigError> {
+        let mut globset = GlobSetBuilder::new();
+        for pattern in patterns {
+            let glob = GlobBuilder::new(&expand_home(pattern))
+                .literal_separator(true)
+                .build()
+                .map_err(|source| ConfigError::InvalidTrustPattern {
+                    pattern: pattern.clone(),
+                    source,
+                })?;
+            globset.add(glob);
+        }
+        globset
+            .build()
+            .map_err(|source| ConfigError::InvalidTrustPattern {
+                pattern: String::new(),
+                source,
+            })
+    }
+
+    /// The pattern as the user wrote it, not the expanded form, since it is
+    /// what they would search their `init.lua` for.
+    pub(crate) fn matched_pattern(&self, root: &Path) -> Option<&str> {
+        let matched = *self.matcher.matches(root).first()?;
+        self.patterns.get(matched).map(String::as_str)
+    }
+}
+
+/// Globs are matched against absolute canonical paths, so a leading `~` has to
+/// become one. An unknown home leaves the pattern alone, where it simply
+/// matches nothing. `~user` is not a home reference and is left alone too.
+fn expand_home(pattern: &str) -> String {
+    let Some(rest) = pattern
+        .strip_prefix('~')
+        .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+    else {
+        return pattern.to_owned();
+    };
+    match paths::home() {
+        Some(home) => format!("{}{rest}", home.display()),
+        None => pattern.to_owned(),
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PluginsConfig {
+    pub enabled: bool,
+    pub names: Vec<String>,
+    /// Per-plugin option tables, without `enabled`. Each plugin validates its
+    /// own via `makima.api.register_options` at load time.
+    pub opts: HashMap<String, JsonMap<String, JsonValue>>,
+}
+
+impl PluginsConfig {
+    pub fn from_plugins(plugins: HashMap<String, PluginFileConfig>) -> Self {
+        let mut all: Vec<String> = DEFAULT_BUILTINS
+            .iter()
+            .filter(|name| plugins.get(**name).and_then(|t| t.enabled).unwrap_or(true))
+            .map(|s| s.to_string())
+            .collect();
+
+        let mut extra: Vec<&String> = plugins
+            .iter()
+            .filter(|(name, cfg)| {
+                !DEFAULT_BUILTINS.contains(&name.as_str()) && cfg.enabled.unwrap_or(false)
+            })
+            .map(|(name, _)| name)
+            .collect();
+        extra.sort();
+        all.extend(extra.into_iter().cloned());
+
+        let opts = plugins
+            .iter()
+            .filter(|(_, cfg)| !cfg.opts.is_empty())
+            .map(|(name, cfg)| (name.clone(), cfg.opts.clone()))
+            .collect();
+
+        Self {
+            enabled: true,
+            names: all,
+            opts,
+        }
+    }
+}
+
+impl Config {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.ui.validate_all()?;
+        self.agent.validate()?;
+        self.provider.validate()?;
+        self.storage.validate()?;
+        Ok(())
+    }
+}
+
+fn push_rules(
+    rules: &mut Vec<PermissionRule>,
+    tools: &HashMap<String, ToolPermissions>,
+    effect: Effect,
+) {
+    for (tool, perms) in tools {
+        let scope_set = match effect {
+            Effect::Deny => &perms.deny,
+            Effect::Allow => &perms.allow,
+        };
+        let Some(scope_set) = scope_set else {
+            continue;
+        };
+        match scope_set {
+            ScopeSet::All(true) => rules.push(PermissionRule {
+                tool: ToolKey::native(tool),
+                scope: None,
+                effect,
+            }),
+            ScopeSet::Scopes(scopes) => {
+                for s in scopes {
+                    rules.push(PermissionRule {
+                        tool: ToolKey::native(tool),
+                        scope: Some(s.clone()),
+                        effect,
+                    });
+                }
+            }
+            ScopeSet::All(false) => {}
+        }
+    }
+}
+
+pub fn is_valid_server_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_SERVER_NAME_LEN
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+fn child_table<'a>(
+    table: &'a mut toml_edit::Table,
+    key: &str,
+) -> Result<&'a mut toml_edit::Table, String> {
+    table
+        .entry(key)
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| format!("[{key}] is not a table"))
+}
+
+fn push_unique(table: &mut toml_edit::Table, key: &str, value: &str) -> Result<(), String> {
+    let arr = table
+        .entry(key)
+        .or_insert_with(|| toml_edit::Item::Value(toml_edit::Value::Array(toml_edit::Array::new())))
+        .as_array_mut()
+        .ok_or_else(|| format!("{key} is not an array"))?;
+    if !arr.iter().any(|v| v.as_str() == Some(value)) {
+        arr.push(value);
+        arr.set_trailing("\n");
+        arr.set_trailing_comma(true);
+        for item in arr.iter_mut() {
+            item.decor_mut().set_prefix("\n    ");
+        }
+    }
+    Ok(())
+}
+
+fn build_permissions(
+    global: PermissionsFileConfig,
+    project: PermissionsFileConfig,
+) -> PermissionsConfig {
+    let global_default = global.default.unwrap_or(DefaultEffect::Prompt);
+    let default = match project.default {
+        Some(DefaultEffect::Allow) => global_default,
+        Some(d) => d,
+        None => global_default,
+    };
+
+    let mut tool_defaults = HashMap::new();
+    for (tool, perms) in &global.tools {
+        if let Some(d) = perms.default {
+            tool_defaults.insert(ToolKey::native(tool), d);
+        }
+    }
+    for (key, d) in &global.mcp_defaults {
+        tool_defaults.insert(key.clone(), *d);
+    }
+    for (tool, perms) in &project.tools {
+        if let Some(d) = perms.default
+            && d != DefaultEffect::Allow
+        {
+            tool_defaults.insert(ToolKey::native(tool), d);
+        }
+    }
+    for (key, d) in &project.mcp_defaults {
+        if *d != DefaultEffect::Allow {
+            tool_defaults.insert(key.clone(), *d);
+        }
+    }
+
+    let mut rules = Vec::new();
+    for rule in &global.mcp_rules {
+        if rule.effect == Effect::Deny {
+            rules.push(rule.clone());
+        }
+    }
+    for rule in &global.mcp_rules {
+        if rule.effect == Effect::Allow {
+            rules.push(rule.clone());
+        }
+    }
+    for tools in [&global.tools, &project.tools] {
+        push_rules(&mut rules, tools, Effect::Deny);
+        push_rules(&mut rules, tools, Effect::Allow);
+    }
+    for rule in &project.mcp_rules {
+        if rule.effect == Effect::Deny {
+            rules.push(rule.clone());
+        }
+    }
+    for rule in &project.mcp_rules {
+        if rule.effect == Effect::Allow {
+            rules.push(rule.clone());
+        }
+    }
+    PermissionsConfig {
+        default,
+        tool_defaults,
+        rules,
+        yolo: false,
+    }
+}
+
+pub fn load_env_files(project_config: &ProjectConfig) {
+    load_env_files_with_global(paths::find_config_path(ENV_FILE).as_deref(), project_config);
+}
+
+fn load_env_files_with_global(global_env: Option<&Path>, project_config: &ProjectConfig) {
+    let mut vars = HashMap::new();
+    if let Some(path) = global_env {
+        collect_env_vars(path, &mut vars);
+    }
+    if let Some(path) = project_config.gated_path(GatedFile::Env) {
+        collect_env_vars(&path, &mut vars);
+    }
+
+    for (key, value) in vars {
+        if std::env::var_os(&key).is_none() {
+            // SAFETY: single-threaded at startup, before any async runtime
+            unsafe { std::env::set_var(&key, &value) };
+        }
+    }
+}
+
+fn collect_env_vars(path: &Path, vars: &mut HashMap<String, String>) {
+    let Ok(iter) = dotenvy::from_path_iter(path) else {
+        return;
+    };
+    for item in iter.flatten() {
+        vars.insert(item.0, item.1);
+    }
+}
+
+/// Fails on any permission rule that does not parse, so a typo can never
+/// silently drop a deny.
+pub fn load_permissions(project_config: &ProjectConfig) -> Result<PermissionsConfig, ConfigError> {
+    let global_dir = global_config_dir();
+    if let Some(global_dir) = &global_dir {
+        refuse_old_home_permissions(paths::home().as_deref(), global_dir, project_config)?;
+    }
+    load_permissions_inner(global_dir.as_deref(), project_config)
+}
+
+/// `~/.makima/permissions.toml` was the global file before the platform
+/// config dir. Ignoring it would drop its denies without a word, so it stops
+/// startup unless `~/.makima` is the project's own directory.
+fn refuse_old_home_permissions(
+    home: Option<&Path>,
+    global_dir: &Path,
+    project_config: &ProjectConfig,
+) -> Result<(), ConfigError> {
+    let Some(home) = home else {
+        return Ok(());
+    };
+    let old = home.join(PROJECT_DIR).join(PERMISSIONS_FILE);
+    if project_config.config_root() == paths::canonicalize_clean(home) || !old.exists() {
+        return Ok(());
+    }
+    Err(ConfigError::OldHomePermissions {
+        old,
+        new: global_dir.join(PERMISSIONS_FILE),
+    })
+}
+
+fn load_permissions_inner(
+    global_dir: Option<&Path>,
+    project_config: &ProjectConfig,
+) -> Result<PermissionsConfig, ConfigError> {
+    let global_perms = match global_dir {
+        Some(dir) => read_permissions_file(&dir.join(PERMISSIONS_FILE))?,
+        None => PermissionsFileConfig::default(),
+    };
+
+    // The one deliberate exception to the gate: read at any trust level so a
+    // repository can narrow the agent inside it, then stripped down to its deny
+    // scopes when nobody vouched for the folder.
+    if project_config.is_ignored() {
+        return Ok(build_permissions(
+            global_perms,
+            PermissionsFileConfig::default(),
+        ));
+    }
+    let mut project_perms =
+        read_permissions_file(&project_config.project_file(GatedFile::Permissions))
+            .map_err(|error| ConfigError::ProjectPermissions(Box::new(error)))?;
+    if !project_config.is_trusted() {
+        project_perms.restrict_to_deny_scopes();
+    }
+
+    Ok(build_permissions(global_perms, project_perms))
+}
+
+fn read_permissions_file(path: &Path) -> Result<PermissionsFileConfig, ConfigError> {
+    let file_error = |reason: String| ConfigError::PermissionsFile {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PermissionsFileConfig::default());
+        }
+        Err(error) => return Err(file_error(error.to_string())),
+    };
+    let table: toml::Table =
+        toml::from_str(&content).map_err(|error| file_error(error.to_string()))?;
+    PermissionsFileConfig::parse(path, &table)
+}
+
+pub fn global_config_dir() -> Option<PathBuf> {
+    paths::config_dir().ok()
+}
+
+pub fn append_permission_rule(
+    tool: &ToolKey,
+    scope: Option<&str>,
+    effect: Effect,
+    target: &PermissionTarget,
+) -> Result<(), String> {
+    append_permission_rule_with_global(tool, scope, effect, target, global_config_dir())
+}
+
+fn append_permission_rule_with_global(
+    tool: &ToolKey,
+    scope: Option<&str>,
+    effect: Effect,
+    target: &PermissionTarget,
+    global: Option<PathBuf>,
+) -> Result<(), String> {
+    match target {
+        PermissionTarget::Global => append_global_permission(tool, scope, effect, global),
+        PermissionTarget::Project(project_config) => {
+            append_project_permission(tool, scope, effect, project_config)
+        }
+    }
+}
+
+fn append_global_permission(
+    tool: &ToolKey,
+    scope: Option<&str>,
+    effect: Effect,
+    global: Option<PathBuf>,
+) -> Result<(), String> {
+    let path = global
+        .ok_or_else(|| "cannot determine home directory".to_string())?
+        .join(PERMISSIONS_FILE);
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut doc: toml_edit::DocumentMut = content
+        .parse()
+        .map_err(|e| format!("failed to parse permissions: {e}"))?;
+
+    insert_permission_entry(&mut doc, tool, scope, effect)?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("cannot create config dir: {e}"))?;
+    }
+    makima_storage::atomic_write(&path, doc.to_string().as_bytes())
+        .map_err(|e| format!("cannot write permissions: {e}"))?;
+    Ok(())
+}
+
+fn append_project_permission(
+    tool: &ToolKey,
+    scope: Option<&str>,
+    effect: Effect,
+    project_config: &ProjectConfig,
+) -> Result<(), String> {
+    if !project_config.is_trusted() {
+        return Err(UNTRUSTED_PROJECT_WRITE.to_string());
+    }
+    let path = project_config.project_file(GatedFile::Permissions);
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut doc: toml_edit::DocumentMut = content
+        .parse()
+        .map_err(|e| format!("failed to parse {PROJECT_DIR}/{PERMISSIONS_FILE}: {e}"))?;
+
+    insert_permission_entry(&mut doc, tool, scope, effect)?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {PROJECT_DIR} dir: {e}"))?;
+    }
+    makima_storage::atomic_write(&path, doc.to_string().as_bytes())
+        .map_err(|e| format!("cannot write {PROJECT_DIR}/{PERMISSIONS_FILE}: {e}"))?;
+    project::record_written_file(project_config, PERMISSIONS_FILE);
+    Ok(())
+}
+
+fn insert_permission_entry(
+    doc: &mut toml_edit::DocumentMut,
+    tool_key: &ToolKey,
+    scope: Option<&str>,
+    effect: Effect,
+) -> Result<(), String> {
+    let key = match effect {
+        Effect::Allow => "allow",
+        Effect::Deny => "deny",
+    };
+
+    match tool_key {
+        // MCP scopes are always wildcarded, so `scope` is ignored for MCP keys.
+        ToolKey::McpTool { server, tool } => {
+            let server_table = child_table(child_table(doc.as_table_mut(), "mcp")?, server)?;
+            push_unique(server_table, key, tool)?;
+        }
+        ToolKey::McpServer { server } => {
+            let server_table = child_table(child_table(doc.as_table_mut(), "mcp")?, server)?;
+            server_table.insert("default", toml_edit::value(key));
+        }
+        ToolKey::Wildcard => {
+            // Wildcard rules are config-only; runtime never writes them.
+            return Err("cannot write wildcard permission rule to config".to_string());
+        }
+        ToolKey::Native(name) => {
+            let tool_table = child_table(doc.as_table_mut(), name)?;
+            match scope {
+                Some(s) => push_unique(tool_table, key, s)?,
+                None => {
+                    tool_table.insert(key, toml_edit::value(true));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use makima_storage::sessions::Effort;
+    use std::fs;
+    use tempfile::TempDir;
+    use test_case::test_case;
+
+    #[cfg(unix)]
+    fn plugin_enabled(enabled: bool) -> PluginFileConfig {
+        PluginFileConfig {
+            enabled: Some(enabled),
+            opts: JsonMap::new(),
+        }
+    }
+
+    fn write_global_permissions(dir: &Path, content: &str) {
+        let perms_dir = dir.join(".config/makima");
+        fs::create_dir_all(&perms_dir).unwrap();
+        fs::write(perms_dir.join("permissions.toml"), content).unwrap();
+    }
+
+    fn global_config_dir(dir: &Path) -> PathBuf {
+        dir.join(".config/makima")
+    }
+
+    #[test_case("12000", CompactionBuffer::Tokens(12_000) ; "tokens_number")]
+    #[test_case("\"20%\"", CompactionBuffer::Percent(20) ; "percent_string")]
+    #[test_case("\" 5 %\"", CompactionBuffer::Percent(5) ; "percent_with_spaces")]
+    fn compaction_buffer_deserializes(json: &str, expected: CompactionBuffer) {
+        let parsed: CompactionBuffer = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed, expected);
+    }
+
+    #[test_case("500" ; "tokens_below_min")]
+    #[test_case("-1" ; "negative_tokens")]
+    #[test_case("\"0%\"" ; "zero_percent")]
+    #[test_case("\"100%\"" ; "percent_too_high")]
+    #[test_case("\"abc%\"" ; "non_numeric_percent")]
+    fn compaction_buffer_rejects(json: &str) {
+        assert!(serde_json::from_str::<CompactionBuffer>(json).is_err());
+    }
+
+    #[test_case(CompactionBuffer::Tokens(10_000), 64_000, 10_000 ; "tokens_ignore_window")]
+    #[test_case(CompactionBuffer::Percent(20), 64_000, 12_800 ; "percent_of_window")]
+    fn compaction_buffer_resolves(buffer: CompactionBuffer, window: u32, expected: u32) {
+        assert_eq!(buffer.resolve(window), expected);
+    }
+
+    #[test]
+    fn compaction_buffer_serializes_percent_as_string() {
+        assert_eq!(
+            serde_json::to_value(CompactionBuffer::Percent(20)).unwrap(),
+            serde_json::json!("20%")
+        );
+        assert_eq!(
+            serde_json::to_value(CompactionBuffer::Tokens(9_000)).unwrap(),
+            serde_json::json!(9_000)
+        );
+    }
+
+    #[test]
+    fn empty_config_returns_defaults() {
+        let config = RawConfig::default().into_config().unwrap();
+        assert!(config.ui.splash_animation);
+        assert_eq!(config.ui.notifications, NotificationMethod::Auto);
+        assert_eq!(config.agent.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
+        assert_eq!(
+            config.agent.max_concurrent_agent_turns,
+            DEFAULT_MAX_CONCURRENT_AGENT_TURNS
+        );
+        assert_eq!(config.agent.max_agent_depth, DEFAULT_MAX_AGENT_DEPTH);
+        assert_eq!(
+            config.agent.max_children_per_agent,
+            DEFAULT_MAX_CHILDREN_PER_AGENT
+        );
+        assert_eq!(config.agent.max_live_agents, DEFAULT_MAX_LIVE_AGENTS);
+        assert_eq!(
+            config.provider.connect_timeout,
+            Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            config.storage.max_log_bytes,
+            DEFAULT_MAX_LOG_BYTES_MB * 1024 * 1024
+        );
+    }
+
+    #[test_case("auto", NotificationMethod::Auto ; "auto")]
+    #[test_case("osc9", NotificationMethod::Osc9 ; "osc9")]
+    #[test_case("bell", NotificationMethod::Bell ; "bell")]
+    #[test_case("off", NotificationMethod::Off ; "off")]
+    fn notifications_deserialize(value: &str, expected: NotificationMethod) {
+        let raw: RawConfig =
+            toml::from_str(&format!("[ui]\nnotifications = \"{value}\"\n")).unwrap();
+        assert_eq!(raw.into_config().unwrap().ui.notifications, expected);
+    }
+
+    #[test]
+    fn notifications_reject_unknown_value() {
+        let result: Result<RawConfig, _> = toml::from_str("[ui]\nnotifications = \"desktop\"\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn partial_agent_config_preserves_unset_fields() {
+        let raw = RawConfig {
+            agent: AgentFileConfig {
+                max_output_lines: Some(5000),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let config = raw.into_config().unwrap();
+        assert_eq!(config.agent.max_output_lines, 5000);
+        assert_eq!(config.agent.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
+        assert_eq!(config.agent.max_line_bytes, DEFAULT_MAX_LINE_BYTES);
+    }
+
+    #[test]
+    fn agent_limits_construct_from_file() {
+        let raw: RawConfig = toml::from_str(
+            "[agent]\n\
+             max_concurrent_agent_turns = 2\n\
+             max_agent_depth = 3\n\
+             max_children_per_agent = 5\n\
+             max_live_agents = 7\n",
+        )
+        .unwrap();
+        let config = raw.into_config().unwrap();
+
+        assert_eq!(config.agent.max_concurrent_agent_turns, 2);
+        assert_eq!(config.agent.max_agent_depth, 3);
+        assert_eq!(config.agent.max_children_per_agent, 5);
+        assert_eq!(config.agent.max_live_agents, 7);
+    }
+
+    #[test]
+    fn merge_overlay_wins_field_by_field() {
+        let mut base = RawConfig {
+            always_yolo: Some(false),
+            ui: UiFileConfig {
+                splash_animation: Some(false),
+                notifications: Some(NotificationMethod::Bell),
+                flash_duration_ms: Some(2000),
+                ..Default::default()
+            },
+            agent: AgentFileConfig {
+                max_output_lines: Some(3000),
+                max_output_bytes: Some(80_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let overlay = RawConfig {
+            always_yolo: Some(true),
+            ui: UiFileConfig {
+                notifications: Some(NotificationMethod::Off),
+                ..Default::default()
+            },
+            agent: AgentFileConfig {
+                max_output_lines: Some(5000),
+                max_line_bytes: Some(400),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        base.merge(overlay);
+
+        assert_eq!(base.always_yolo, Some(true), "overlay wins");
+        assert_eq!(base.agent.max_output_lines, Some(5000), "overlay wins");
+        assert_eq!(base.agent.max_output_bytes, Some(80_000), "base preserved");
+        assert_eq!(base.agent.max_line_bytes, Some(400), "overlay adds");
+        assert_eq!(base.ui.splash_animation, Some(false), "base preserved");
+        assert_eq!(
+            base.ui.notifications,
+            Some(NotificationMethod::Off),
+            "overlay wins"
+        );
+        assert_eq!(base.ui.flash_duration_ms, Some(2000), "base preserved");
+    }
+
+    #[test]
+    fn provider_model_lists_inherit_replace_and_clear() {
+        let mut global = RawConfig {
+            provider: ProviderFileConfig {
+                allowed_models: Some(vec!["anthropic/*".into()]),
+                excluded_models: Some(vec!["*/*-preview".into()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        global.merge(RawConfig {
+            provider: ProviderFileConfig {
+                allowed_models: Some(Vec::new()),
+                excluded_models: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let provider = global.into_config().unwrap().provider;
+        assert!(provider.allowed_models.is_empty());
+        assert_eq!(provider.excluded_models, ["*/*-preview"]);
+        assert!(provider.model_policy.allows("openai/gpt-5"));
+        assert!(!provider.model_policy.allows("openai/gpt-5-preview"));
+    }
+
+    #[test]
+    fn model_policy_matches_qualified_specs() {
+        let config = RawConfig {
+            provider: ProviderFileConfig {
+                allowed_models: Some(vec!["openai/gpt-5".into(), "opencode/*".into()]),
+                excluded_models: Some(vec!["*/*-preview".into()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .into_config()
+        .unwrap();
+        let policy = &config.provider.model_policy;
+
+        assert!(policy.allows("openai/gpt-5"));
+        assert!(policy.allows("opencode/nvidia/openai/gpt-oss-120b"));
+        assert!(!policy.allows("anthropic/claude-sonnet-4-6"));
+        assert!(!policy.allows("opencode/gpt-5-preview"));
+
+        let exclude_only = RawConfig {
+            provider: ProviderFileConfig {
+                excluded_models: Some(vec!["anthropic/*".into()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .into_config()
+        .unwrap();
+        assert!(exclude_only.provider.model_policy.allows("openai/gpt-5"));
+        assert!(
+            !exclude_only
+                .provider
+                .model_policy
+                .allows("anthropic/claude-sonnet-4-6")
+        );
+    }
+
+    #[test]
+    fn invalid_model_pattern_is_a_config_error() {
+        let result = RawConfig {
+            provider: ProviderFileConfig {
+                allowed_models: Some(vec!["[".into()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .into_config();
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidModelPattern { field: "allowed_models", pattern, .. }) if pattern == "["
+        ));
+    }
+
+    #[test]
+    fn merge_always_flags_overlay_wins() {
+        let mut base = RawConfig {
+            always_fast: Some(false),
+            always_workflow: Some(false),
+            always_thinking: Some(AlwaysThinking::Mode("off".into())),
+            ..Default::default()
+        };
+        let overlay = RawConfig {
+            always_fast: Some(true),
+            always_workflow: Some(true),
+            always_thinking: Some(AlwaysThinking::Toggle(true)),
+            ..Default::default()
+        };
+        base.merge(overlay);
+
+        assert_eq!(base.always_fast, Some(true), "overlay wins");
+        assert_eq!(base.always_workflow, Some(true), "overlay wins");
+        assert_eq!(
+            base.always_thinking,
+            Some(AlwaysThinking::Toggle(true)),
+            "overlay wins"
+        );
+    }
+
+    #[test]
+    fn always_workflow_resolves_default_and_set() {
+        let defaults = RawConfig::default().into_config().unwrap();
+        assert!(
+            !defaults.session_defaults.workflow,
+            "absent resolves to false"
+        );
+
+        let raw = RawConfig {
+            always_workflow: Some(true),
+            ..Default::default()
+        };
+        assert!(raw.into_config().unwrap().session_defaults.workflow);
+    }
+
+    #[test]
+    fn always_automode_resolves_default_and_set() {
+        let defaults = RawConfig::default().into_config().unwrap();
+        assert!(!defaults.always_automode, "absent resolves to false");
+
+        let raw = RawConfig {
+            always_automode: Some(true),
+            ..Default::default()
+        };
+        assert!(raw.into_config().unwrap().always_automode);
+    }
+
+    #[test]
+    fn always_automode_overlay_wins() {
+        let mut base = RawConfig {
+            always_automode: Some(false),
+            ..Default::default()
+        };
+        base.merge(RawConfig {
+            always_automode: Some(true),
+            ..Default::default()
+        });
+        assert_eq!(base.always_automode, Some(true), "overlay wins");
+    }
+
+    #[test_case(AlwaysThinking::Toggle(true), StoredThinking::Adaptive ; "toggle_true")]
+    #[test_case(AlwaysThinking::Toggle(false), StoredThinking::Off ; "toggle_false")]
+    #[test_case(AlwaysThinking::Budget(8192), StoredThinking::Budget { tokens: 8192 } ; "budget_number")]
+    #[test_case(AlwaysThinking::Mode("xhigh".into()), StoredThinking::Effort { level: Effort::XHigh } ; "effort_xhigh")]
+    #[test_case(AlwaysThinking::Mode("minimal".into()), StoredThinking::Effort { level: Effort::Minimal } ; "effort_minimal")]
+    fn always_thinking_toggle_resolve(input: AlwaysThinking, expected: StoredThinking) {
+        assert_eq!(input.resolve(), Ok(expected));
+    }
+
+    #[test]
+    fn into_config_resolves_always_thinking() {
+        let defaults = RawConfig::default().into_config().unwrap();
+        assert!(defaults.session_defaults.thinking.is_none());
+
+        let raw = RawConfig {
+            always_thinking: Some(AlwaysThinking::Mode("8192".into())),
+            ..Default::default()
+        };
+        let config = raw.into_config().unwrap();
+        assert_eq!(
+            config.session_defaults.thinking,
+            Some(StoredThinking::Budget { tokens: 8192 })
+        );
+
+        let raw = RawConfig {
+            always_thinking: Some(AlwaysThinking::Mode("fast".into())),
+            ..Default::default()
+        };
+        let err = raw.into_config().err().expect("expected config error");
+        assert!(matches!(err, ConfigError::Thinking(_)));
+    }
+
+    #[test_case("max_output_bytes",  0 ; "zero_output_bytes")]
+    #[test_case("max_output_lines",  0 ; "zero_output_lines")]
+    #[test_case("max_line_bytes",  79 ; "max_line_bytes_below_min")]
+    #[test_case("max_output_bytes",  500 ; "below_min_output_bytes")]
+    #[test_case("max_concurrent_agent_turns", 0 ; "zero_concurrent_agent_turns")]
+    #[test_case("max_agent_depth", 0 ; "zero_agent_depth")]
+    #[test_case("max_children_per_agent", 0 ; "zero_children_per_agent")]
+    #[test_case("max_live_agents", 0 ; "zero_live_agents")]
+    fn validate_rejects_invalid_agent(field: &str, value: usize) {
+        let mut config = AgentConfig::default();
+        match field {
+            "max_output_bytes" => config.max_output_bytes = value,
+            "max_output_lines" => config.max_output_lines = value,
+            "max_line_bytes" => config.max_line_bytes = value,
+            "max_concurrent_agent_turns" => config.max_concurrent_agent_turns = value,
+            "max_agent_depth" => config.max_agent_depth = value,
+            "max_children_per_agent" => config.max_children_per_agent = value,
+            "max_live_agents" => config.max_live_agents = value,
+            _ => unreachable!(),
+        }
+        let err = config.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::BelowMinimum { field: f, .. } if f == field));
+    }
+
+    #[test]
+    fn tool_output_lines_per_tool_override() {
+        let raw = RawConfig {
+            ui: UiFileConfig {
+                tool_output_lines: Some(ToolOutputLinesFile {
+                    bash: Some(20),
+                    read: Some(20),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let config = raw.into_config().unwrap();
+        assert_eq!(config.ui.tool_output_lines.bash, 20);
+        assert_eq!(config.ui.tool_output_lines.read, 20);
+        assert_eq!(
+            config.ui.tool_output_lines.index,
+            ToolOutputLines::DEFAULT.index
+        );
+    }
+
+    #[test]
+    fn bell_config_defaults() {
+        let bell = BellConfig::default();
+        assert!(bell.turn_complete);
+        assert!(bell.ask);
+        assert!(bell.permission);
+        let ui = UiConfig::default();
+        assert_eq!(ui.bell, BellConfig::DEFAULT);
+    }
+
+    #[test]
+    fn bell_config_parse_partial() {
+        let raw: RawConfig = toml::from_str("[ui.bell]\nturn_complete = false\n").unwrap();
+        let config = raw.into_config().unwrap();
+        assert!(!config.ui.bell.turn_complete);
+        assert!(config.ui.bell.ask);
+        assert!(config.ui.bell.permission);
+    }
+
+    #[test]
+    fn bell_config_parse_unknown_rejected() {
+        let result: Result<RawConfig, _> = toml::from_str("[ui.bell]\nloudness = true\n");
+        assert!(result.is_err());
+    }
+
+    #[test_case("provider", "connect_timeout_secs", 0 ; "provider_zero_connect_timeout")]
+    #[test_case("storage",  "max_log_files",        0 ; "storage_zero_log_files")]
+    #[test_case("ui",       "mouse_scroll_lines",   0 ; "ui_zero_scroll_lines")]
+    #[test_case("ui",       "max_input_lines",      0 ; "ui_zero_max_input_lines")]
+    #[test_case("agent",    "max_output_lines",     1 ; "agent_output_lines_too_low")]
+    fn validate_rejects_invalid_sections(section: &str, field: &str, value: u64) {
+        let mut config = Config {
+            always_yolo: false,
+            always_automode: false,
+            session_defaults: SessionDefaults::default(),
+            ui: UiConfig::default(),
+            agent: AgentConfig::default(),
+            provider: ProviderConfig::default(),
+            storage: StorageConfig::default(),
+            net: NetConfig::default(),
+            trust: TrustConfig::default(),
+            permissions: PermissionsConfig::default(),
+            plugins: PluginsConfig::default(),
+        };
+        match (section, field) {
+            ("provider", "connect_timeout_secs") => {
+                config.provider.connect_timeout = Duration::from_secs(value)
+            }
+            ("storage", "max_log_files") => config.storage.max_log_files = value as u32,
+            ("ui", "mouse_scroll_lines") => config.ui.mouse_scroll_lines = value as u32,
+            ("ui", "max_input_lines") => config.ui.max_input_lines = value as u32,
+            ("agent", "max_output_lines") => config.agent.max_output_lines = value as usize,
+            _ => unreachable!(),
+        }
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::BelowMinimum { section: s, field: f, .. } if s == section && f == field
+        ));
+    }
+
+    #[test]
+    fn permissions_loaded_from_permissions_file() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(
+            dir.path(),
+            "default = \"allow\"\n\n\
+             [bash]\nallow = [\n    \"cargo *\",\n]\ndeny = [\n    \"rm -rf *\",\n]\n",
+        );
+
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
+        assert_eq!(perms.default, DefaultEffect::Allow);
+        assert_eq!(perms.rules.len(), 2);
+        assert_eq!(perms.rules[0].effect, Effect::Deny);
+        assert_eq!(perms.rules[0].tool, ToolKey::native("bash"));
+        assert_eq!(perms.rules[0].scope.as_deref(), Some("rm -rf *"));
+        assert_eq!(perms.rules[1].effect, Effect::Allow);
+        assert_eq!(perms.rules[1].tool, ToolKey::native("bash"));
+        assert_eq!(perms.rules[1].scope.as_deref(), Some("cargo *"));
+    }
+
+    #[test]
+    fn permissions_merge_global_and_project() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(
+            dir.path(),
+            "[bash]\nallow = [\"git *\"]\ndeny = [\"rm -rf *\"]\n",
+        );
+        let makima_dir = dir.path().join(".makima");
+        fs::create_dir_all(&makima_dir).unwrap();
+        fs::write(
+            makima_dir.join("permissions.toml"),
+            "[read]\nallow = true\n\
+             [write]\ndeny = [\"/etc/*\"]\n",
+        )
+        .unwrap();
+
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
+        assert_eq!(perms.default, DefaultEffect::Prompt);
+        assert_eq!(perms.rules.len(), 4);
+
+        let deny_rules: Vec<_> = perms
+            .rules
+            .iter()
+            .filter(|r| r.effect == Effect::Deny)
+            .collect();
+        let allow_rules: Vec<_> = perms
+            .rules
+            .iter()
+            .filter(|r| r.effect == Effect::Allow)
+            .collect();
+
+        assert_eq!(deny_rules.len(), 2);
+        assert_eq!(deny_rules[0].tool, ToolKey::native("bash"));
+        assert_eq!(deny_rules[1].tool, ToolKey::native("write"));
+
+        assert_eq!(allow_rules.len(), 2);
+        assert_eq!(allow_rules[0].tool, ToolKey::native("bash"));
+        assert_eq!(allow_rules[1].tool, ToolKey::native("read"));
+    }
+
+    #[test]
+    fn project_default_allow_ignored() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        let makima_dir = dir.path().join(".makima");
+        fs::create_dir_all(&makima_dir).unwrap();
+        fs::write(makima_dir.join("permissions.toml"), "default = \"allow\"\n").unwrap();
+
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
+        assert_eq!(perms.default, DefaultEffect::Prompt);
+    }
+
+    #[test]
+    fn append_permission_rule_writes_to_permissions_file() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        fs::create_dir_all(&global).unwrap();
+
+        append_permission_rule_with_global(
+            &ToolKey::native("bash"),
+            Some("cargo *"),
+            Effect::Allow,
+            &PermissionTarget::Global,
+            Some(global.clone()),
+        )
+        .unwrap();
+        append_permission_rule_with_global(
+            &ToolKey::native("bash"),
+            Some("rm -rf *"),
+            Effect::Deny,
+            &PermissionTarget::Global,
+            Some(global.clone()),
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
+        assert!(content.contains("[bash]"));
+        assert!(content.contains("cargo *"));
+        assert!(content.contains("rm -rf *"));
+        assert!(!content.contains("[permissions]"));
+    }
+
+    #[test]
+    fn append_permission_rule_writes_mcp_nested_form() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        fs::create_dir_all(&global).unwrap();
+
+        append_permission_rule_with_global(
+            &ToolKey::parse("deepwiki.search").unwrap(),
+            Some("*"),
+            Effect::Allow,
+            &PermissionTarget::Global,
+            Some(global.clone()),
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
+        assert!(content.contains("[mcp.deepwiki]"), "nested table present");
+        assert!(content.contains("\"search\""), "tool name in array");
+        assert!(!content.contains("deepwiki.search"), "no flat key");
+        assert!(!content.contains("__"), "no __ separator");
+    }
+
+    #[test]
+    fn no_permissions_file_returns_defaults() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
+        assert_eq!(perms.default, DefaultEffect::Prompt);
+        assert!(perms.rules.is_empty());
+    }
+
+    #[test]
+    fn deny_rules_before_allow_rules() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(
+            dir.path(),
+            "[bash]\nallow = [\"git *\"]\ndeny = [\"rm *\"]\n",
+        );
+
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
+        assert_eq!(perms.rules[0].effect, Effect::Deny);
+        assert_eq!(perms.rules[1].effect, Effect::Allow);
+    }
+
+    #[test]
+    fn permissions_default_deny_global() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(dir.path(), "default = \"deny\"\n");
+
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
+        assert_eq!(perms.default, DefaultEffect::Deny);
+    }
+
+    #[test]
+    fn permissions_default_per_tool() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(
+            dir.path(),
+            "default = \"deny\"\n\n[bash]\ndefault = \"allow\"\nallow = [\"cargo *\"]\n",
+        );
+
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
+        assert_eq!(perms.default, DefaultEffect::Deny);
+        assert_eq!(
+            perms.tool_defaults.get(&ToolKey::native("bash")).copied(),
+            Some(DefaultEffect::Allow)
+        );
+    }
+
+    #[test]
+    fn unmatched_rules_name_only_sections_for_unregistered_tools() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(
+            dir.path(),
+            "[bash]\nallow = [\"cargo *\"]\n\n\
+             [bassh]\ndefault = \"deny\"\nallow = [\"ls\"]\ndeny = true\n\n\
+             [mcp.github]\ndeny = [\"delete_repo\"]\n",
+        );
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
+        assert_eq!(
+            perms.unmatched_rules(|tool| tool == "bash"),
+            [
+                r#"[bassh] allow "ls""#,
+                r#"[bassh] default = "deny""#,
+                "[bassh] deny = true",
+            ]
+        );
+    }
+
+    #[test]
+    fn permissions_default_merge_project_overrides_global_per_tool() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(dir.path(), "[bash]\ndefault = \"allow\"\n");
+        let makima_dir = dir.path().join(".makima");
+        fs::create_dir_all(&makima_dir).unwrap();
+        fs::write(
+            makima_dir.join("permissions.toml"),
+            "[bash]\ndefault = \"deny\"\n",
+        )
+        .unwrap();
+
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
+        assert_eq!(
+            perms.tool_defaults.get(&ToolKey::native("bash")).copied(),
+            Some(DefaultEffect::Deny)
+        );
+    }
+
+    #[test]
+    fn project_default_deny_allowed() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        let makima_dir = dir.path().join(".makima");
+        fs::create_dir_all(&makima_dir).unwrap();
+        fs::write(makima_dir.join("permissions.toml"), "default = \"deny\"\n").unwrap();
+
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
+        assert_eq!(perms.default, DefaultEffect::Deny);
+    }
+
+    #[test]
+    fn append_permission_rule_deduplicates() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        fs::create_dir_all(&global).unwrap();
+
+        append_permission_rule_with_global(
+            &ToolKey::native("bash"),
+            Some("cargo *"),
+            Effect::Allow,
+            &PermissionTarget::Global,
+            Some(global.clone()),
+        )
+        .unwrap();
+        append_permission_rule_with_global(
+            &ToolKey::native("bash"),
+            Some("cargo *"),
+            Effect::Allow,
+            &PermissionTarget::Global,
+            Some(global.clone()),
+        )
+        .unwrap();
+        append_permission_rule_with_global(
+            &ToolKey::native("bash"),
+            Some("cargo *"),
+            Effect::Allow,
+            &PermissionTarget::Global,
+            Some(global.clone()),
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
+        assert_eq!(content.matches("cargo *").count(), 1);
+    }
+
+    #[test]
+    fn env_file_precedence() {
+        const GLOBAL_ONLY: &str = "TEST_MAKIMA_GLOBAL_ONLY";
+        const PROJECT_SHADOWS: &str = "TEST_MAKIMA_PROJECT_SHADOWS";
+        const PROCESS_WINS: &str = "TEST_MAKIMA_PROCESS_WINS";
+
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        fs::create_dir_all(&global).unwrap();
+        fs::write(
+            global.join(".env"),
+            format!("{GLOBAL_ONLY}=global\n{PROJECT_SHADOWS}=global\n{PROCESS_WINS}=global"),
+        )
+        .unwrap();
+
+        let makima_dir = dir.path().join(".makima");
+        fs::create_dir_all(&makima_dir).unwrap();
+        fs::write(
+            makima_dir.join(".env"),
+            format!("{PROJECT_SHADOWS}=project\n{PROCESS_WINS}=project"),
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::remove_var(GLOBAL_ONLY);
+            std::env::remove_var(PROJECT_SHADOWS);
+            std::env::set_var(PROCESS_WINS, "process");
+        }
+
+        load_env_files_with_global(
+            Some(&global.join(".env")),
+            &ProjectConfig::for_project(dir.path()),
+        );
+
+        assert_eq!(std::env::var(GLOBAL_ONLY).unwrap(), "global");
+        assert_eq!(std::env::var(PROJECT_SHADOWS).unwrap(), "project");
+        assert_eq!(std::env::var(PROCESS_WINS).unwrap(), "process");
+
+        unsafe {
+            std::env::remove_var(GLOBAL_ONLY);
+            std::env::remove_var(PROJECT_SHADOWS);
+            std::env::remove_var(PROCESS_WINS);
+        }
+    }
+
+    #[test]
+    fn merge_plugins_overlay_wins_per_key() {
+        let mut base: RawConfig = toml::from_str(
+            "[plugins.index]\nenabled = true\n\
+             [plugins.websearch]\nenabled = true\n\
+             [plugins.grep]\nenabled = true\nsearch_result_limit = 200\nmax_line_bytes = 900\n",
+        )
+        .unwrap();
+        let overlay: RawConfig = toml::from_str(
+            "[plugins.websearch]\nenabled = false\n\
+             [plugins.alpha_tool]\nenabled = true\n\
+             [plugins.grep]\nsearch_result_limit = 50\n",
+        )
+        .unwrap();
+
+        base.merge(overlay);
+        assert_eq!(
+            base.plugins["index"].enabled,
+            Some(true),
+            "base-only key preserved"
+        );
+        assert_eq!(
+            base.plugins["websearch"].enabled,
+            Some(false),
+            "overlay replaces"
+        );
+        assert_eq!(
+            base.plugins["alpha_tool"].enabled,
+            Some(true),
+            "overlay-only key added"
+        );
+        let grep = &base.plugins["grep"];
+        assert_eq!(
+            grep.enabled,
+            Some(true),
+            "enabled preserved when overlay omits it"
+        );
+        assert_eq!(
+            grep.opts["search_result_limit"],
+            serde_json::json!(50),
+            "overlay opt wins"
+        );
+        assert_eq!(
+            grep.opts["max_line_bytes"],
+            serde_json::json!(900),
+            "base opt preserved"
+        );
+    }
+
+    #[test]
+    fn show_thinking_deserializes_true() {
+        let raw: RawConfig = toml::from_str("[ui]\nshow_thinking = true\n").unwrap();
+        assert!(raw.ui.show_thinking.unwrap());
+    }
+
+    #[test]
+    fn show_thinking_deserializes_false() {
+        let raw: RawConfig = toml::from_str("[ui]\nshow_thinking = false\n").unwrap();
+        assert!(!raw.ui.show_thinking.unwrap());
+    }
+
+    #[test]
+    fn show_thinking_missing_defaults_true() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        let config = raw.into_config().unwrap();
+        assert!(config.ui.show_thinking);
+    }
+
+    #[test]
+    fn max_input_lines_defaults_and_deserializes() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        let config = raw.into_config().unwrap();
+        assert_eq!(config.ui.max_input_lines, DEFAULT_MAX_INPUT_LINES);
+
+        let raw: RawConfig = toml::from_str("[ui]\nmax_input_lines = 5\n").unwrap();
+        assert_eq!(raw.ui.max_input_lines.unwrap(), 5);
+    }
+
+    #[test]
+    fn autocomplete_height_defaults_parses_and_merges() {
+        let defaults = RawConfig::default().into_config().unwrap();
+        assert_eq!(defaults.ui.autocomplete_height, DEFAULT_AUTOCOMPLETE_HEIGHT);
+
+        let raw: RawConfig = toml::from_str(&format!(
+            "[ui]\nautocomplete_height = {DEFAULT_AUTOCOMPLETE_HEIGHT}\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            raw.ui.autocomplete_height,
+            Some(DEFAULT_AUTOCOMPLETE_HEIGHT)
+        );
+        assert_eq!(
+            raw.into_config().unwrap().ui.autocomplete_height,
+            DEFAULT_AUTOCOMPLETE_HEIGHT
+        );
+
+        let mut base: RawConfig = toml::from_str("[ui]\nautocomplete_height = 0.4\n").unwrap();
+        base.merge(toml::from_str("[ui]\nautocomplete_height = 0.9\n").unwrap());
+        assert_eq!(base.ui.autocomplete_height, Some(0.9));
+    }
+
+    #[test_case(0.0 ; "zero")]
+    #[test_case(-0.1 ; "negative")]
+    #[test_case(1.1 ; "above_one")]
+    fn autocomplete_height_validation_rejects_invalid_values(value: f64) {
+        let mut config = Config {
+            always_yolo: false,
+            always_automode: false,
+            session_defaults: SessionDefaults::default(),
+            ui: UiConfig::default(),
+            agent: AgentConfig::default(),
+            provider: ProviderConfig::default(),
+            storage: StorageConfig::default(),
+            net: NetConfig::default(),
+            trust: TrustConfig::default(),
+            permissions: PermissionsConfig::default(),
+            plugins: PluginsConfig::default(),
+        };
+        config.ui.autocomplete_height = value;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidAutocompleteHeight { value: actual }) if actual == value
+        ));
+    }
+
+    #[test]
+    fn autocomplete_height_validation_rejects_non_finite_values() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut config = Config {
+                always_yolo: false,
+                always_automode: false,
+                session_defaults: SessionDefaults::default(),
+                ui: UiConfig::default(),
+                agent: AgentConfig::default(),
+                provider: ProviderConfig::default(),
+                storage: StorageConfig::default(),
+                net: NetConfig::default(),
+                trust: TrustConfig::default(),
+                permissions: PermissionsConfig::default(),
+                plugins: PluginsConfig::default(),
+            };
+            config.ui.autocomplete_height = value;
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::InvalidAutocompleteHeight { value: actual })
+                    if actual.is_nan() == value.is_nan() && actual.is_infinite() == value.is_infinite()
+            ));
+        }
+    }
+
+    #[test_case("0.0" ; "zero")]
+    #[test_case("-0.1" ; "negative")]
+    #[test_case("1.1" ; "above_one")]
+    fn autocomplete_height_parsed_values_validate_at_startup(value: &str) {
+        let raw: RawConfig =
+            toml::from_str(&format!("[ui]\nautocomplete_height = {value}\n")).unwrap();
+        let config = raw.into_config().unwrap();
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidAutocompleteHeight { .. })
+        ));
+    }
+
+    #[test]
+    fn autocomplete_height_metadata() {
+        let field = UiConfig::FIELDS
+            .iter()
+            .find(|field| field.name == "autocomplete_height")
+            .expect("autocomplete_height metadata");
+        assert_eq!(field.ty, "number");
+        assert!(matches!(
+            field.default,
+            ConfigValue::F64(value) if value == DEFAULT_AUTOCOMPLETE_HEIGHT
+        ));
+        assert!(field.description.contains("finite"));
+        assert!(field.description.contains("(0, 1]"));
+        assert!(field.description.contains("slash command-argument"));
+    }
+
+    #[test_case("[ui]\nsplash_animaton = true\n" ; "top_level_typo")]
+    #[test_case("agent = { bash_timeout_secs = 60 }\n" ; "moved_bash_timeout")]
+    #[test_case("agent = { search_result_limit = 50 }\n" ; "moved_search_limit")]
+    #[test_case("[index]\nmax_file_size_mb = 4\n" ; "removed_index_section")]
+    fn deny_unknown_fields_rejects(toml_str: &str) {
+        let result: Result<RawConfig, _> = toml::from_str(toml_str);
+        assert!(
+            result.is_err(),
+            "unknown field should be rejected: {toml_str}"
+        );
+    }
+
+    #[test]
+    fn deny_unknown_fields_accepts_valid_plugins() {
+        const VALID: &str =
+            "[plugins.bash]\nenabled = true\n[plugins.websearch]\nenabled = false\n";
+        let result: Result<RawConfig, _> = toml::from_str(VALID);
+        assert!(
+            result.is_ok(),
+            "valid plugins section should parse: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn plugin_extra_keys_parse_into_opts() {
+        let raw: RawConfig =
+            toml::from_str("[plugins.bash]\nenabled = true\ntimeout_secs = 180\n").unwrap();
+        let bash = &raw.plugins["bash"];
+        assert_eq!(bash.enabled, Some(true));
+        assert_eq!(bash.opts["timeout_secs"], serde_json::json!(180));
+    }
+
+    #[test]
+    fn into_config_wires_plugin_names_and_opts() {
+        let raw: RawConfig = toml::from_str(
+            "[plugins.bash]\ntimeout_secs = 180\n[plugins.websearch]\nenabled = false\n",
+        )
+        .unwrap();
+        let config = raw.into_config().unwrap();
+        assert!(config.plugins.names.contains(&"bash".to_string()));
+        assert!(!config.plugins.names.contains(&"websearch".to_string()));
+        assert!(
+            config.plugins.names.contains(&"index".to_string()),
+            "untouched builtin stays"
+        );
+        assert_eq!(
+            config.plugins.opts["bash"]["timeout_secs"],
+            serde_json::json!(180)
+        );
+        assert!(
+            !config.plugins.opts.contains_key("websearch"),
+            "enabled-only tables produce no opts"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn from_plugins_enable_disable_and_sort() {
+        let mut entries = HashMap::new();
+        entries.insert("websearch".to_string(), plugin_enabled(false));
+        entries.insert("zeta".to_string(), plugin_enabled(true));
+        entries.insert("alpha".to_string(), plugin_enabled(true));
+        entries.insert("custom_tool".to_string(), PluginFileConfig::default());
+
+        let plugins = PluginsConfig::from_plugins(entries);
+        assert!(
+            !plugins.names.contains(&"websearch".to_string()),
+            "disabled builtin removed"
+        );
+        assert!(
+            plugins.names.contains(&"index".to_string()),
+            "untouched builtin stays"
+        );
+        assert!(
+            plugins.names.contains(&"bash".to_string()),
+            "bash is a default builtin"
+        );
+        assert!(
+            !plugins.names.contains(&"custom_tool".to_string()),
+            "enabled=None non-default ignored"
+        );
+
+        let extras: Vec<_> = plugins
+            .names
+            .iter()
+            .filter(|t| !DEFAULT_BUILTINS.contains(&t.as_str()))
+            .cloned()
+            .collect();
+        assert_eq!(
+            extras,
+            vec!["alpha", "zeta"],
+            "extras sorted alphabetically"
+        );
+    }
+
+    #[test]
+    fn merge_tool_output_lines_field_level_overlay() {
+        let mut base = RawConfig {
+            ui: UiFileConfig {
+                tool_output_lines: Some(ToolOutputLinesFile {
+                    bash: Some(50),
+                    read: Some(30),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let overlay = RawConfig {
+            ui: UiFileConfig {
+                tool_output_lines: Some(ToolOutputLinesFile {
+                    bash: Some(100),
+                    grep: Some(15),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        base.merge(overlay);
+        let tol = base.ui.tool_output_lines.as_ref().unwrap();
+        assert_eq!(tol.bash, Some(100), "overlay wins");
+        assert_eq!(tol.read, Some(30), "base preserved");
+        assert_eq!(tol.grep, Some(15), "overlay added");
+    }
+
+    #[test]
+    fn default_builtins_sorted() {
+        for pair in DEFAULT_BUILTINS.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "DEFAULT_BUILTINS not sorted: {:?} >= {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn default_builtins_include_splash() {
+        assert!(
+            DEFAULT_BUILTINS.contains(&"splashes"),
+            "the splash picker must be enabled by default"
+        );
+        assert!(
+            DEFAULT_BUILTINS.contains(&"splashes_default"),
+            "the home-screen splash renderer must be enabled by default"
+        );
+    }
+
+    #[test]
+    fn removed_sub_tool_tables_error() {
+        for &tool in EDIT_SUB_TOOLS {
+            let raw: RawConfig = toml::from_str(&format!("[plugins.{tool}]\n")).unwrap();
+            let Err(err) = raw.into_config() else {
+                panic!("plugins.{tool} should be rejected");
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("plugins.{tool} was removed"))
+                    && msg.contains("plugins.edit = {"),
+                "error should point at plugins.edit, got: {msg}"
+            );
+        }
+    }
+
+    #[test_case("enabled = false" ; "enabled_false")]
+    #[test_case("search_result_limit = 50" ; "opts_only")]
+    fn unknown_plugin_name_errors(body: &str) {
+        let raw: RawConfig = toml::from_str(&format!("[plugins.gerp]\n{body}\n")).unwrap();
+        let Err(err) = raw.into_config() else {
+            panic!("plugins.gerp should be rejected");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no bundled plugin is named \"gerp\"") && msg.contains("grep"),
+            "error should name the typo and list bundled plugins, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn disabling_a_plugin_leaves_its_tool_name_free() {
+        let raw: RawConfig = toml::from_str("[plugins.grep]\nenabled = false\n").unwrap();
+        let config = raw.into_config().unwrap();
+        assert!(
+            config.agent.disabled_tools.is_empty(),
+            "a disabled plugin never registers, so nothing may filter its name away"
+        );
+    }
+
+    #[test]
+    fn disabled_plugin_keeps_opts_but_not_load_entry() {
+        let raw: RawConfig =
+            toml::from_str("[plugins.bash]\nenabled = false\ntimeout_secs = 180\n").unwrap();
+        let config = raw.into_config().unwrap();
+        assert!(!config.plugins.names.contains(&"bash".to_string()));
+        assert_eq!(
+            config.plugins.opts["bash"]["timeout_secs"],
+            serde_json::json!(180),
+            "opts survive for when the plugin is re-enabled"
+        );
+    }
+
+    #[test]
+    fn renamed_tools_table_errors() {
+        let raw: RawConfig = toml::from_str("[tools.bash]\nenabled = true\n").unwrap();
+        let Err(err) = raw.into_config() else {
+            panic!("old tools table should be rejected");
+        };
+        assert!(
+            err.to_string().contains("renamed to `plugins`"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn edit_sub_tool_toggles_flow_as_edit_opts() {
+        let raw: RawConfig =
+            toml::from_str("[plugins.edit]\nmultiedit = false\nedit_lines = true\n").unwrap();
+        let config = raw.into_config().unwrap();
+        assert_eq!(
+            config.plugins.opts["edit"]["multiedit"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            config.plugins.opts["edit"]["edit_lines"],
+            serde_json::json!(true)
+        );
+        assert!(config.agent.disabled_tools.is_empty());
+    }
+
+    #[test]
+    fn permissions_mcp_per_tool_allow() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(
+            dir.path(),
+            "[mcp.deepwiki]\nallow = [\"search\", \"fetch\"]\n",
+        );
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
+        assert_eq!(perms.rules.len(), 2);
+        assert!(perms.rules.iter().any(|r| r.tool
+            == ToolKey::McpTool {
+                server: "deepwiki".into(),
+                tool: "search".into()
+            }
+            && r.effect == Effect::Allow));
+        assert!(perms.rules.iter().any(|r| r.tool
+            == ToolKey::McpTool {
+                server: "deepwiki".into(),
+                tool: "fetch".into()
+            }
+            && r.effect == Effect::Allow));
+    }
+
+    #[test]
+    fn permissions_mcp_deny_rules() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(dir.path(), "[mcp.github]\ndeny = [\"admin_delete\"]\n");
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
+        assert_eq!(perms.rules.len(), 1);
+        assert_eq!(
+            perms.rules[0].tool,
+            ToolKey::McpTool {
+                server: "github".into(),
+                tool: "admin_delete".into()
+            }
+        );
+        assert_eq!(perms.rules[0].effect, Effect::Deny);
+    }
+
+    #[test]
+    fn permissions_mcp_default_allow() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(
+            dir.path(),
+            "default = \"deny\"\n\n[mcp.exa]\ndefault = \"allow\"\n",
+        );
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
+        assert_eq!(
+            perms.tool_defaults.get(&ToolKey::McpServer {
+                server: "exa".into()
+            }),
+            Some(&DefaultEffect::Allow),
+            "MCP server default should be extracted"
+        );
+    }
+
+    #[test]
+    fn permissions_mcp_default_prompt() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(
+            dir.path(),
+            "[mcp.exa]\ndefault = \"prompt\"\nallow = [\"search\"]\n",
+        );
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
+        assert_eq!(
+            perms.tool_defaults.get(&ToolKey::McpServer {
+                server: "exa".into()
+            }),
+            Some(&DefaultEffect::Prompt),
+            "MCP server default = prompt should be extracted"
+        );
+        assert_eq!(perms.rules.len(), 1);
+        assert_eq!(
+            perms.rules[0].tool,
+            ToolKey::McpTool {
+                server: "exa".into(),
+                tool: "search".into()
+            }
+        );
+    }
+
+    #[test_case("default = \"maybe\"\n", "", "default" ; "invalid_top_level_default")]
+    #[test_case("mcp = 1\n", "", "mcp" ; "mcp_not_a_table")]
+    #[test_case("[mcp]\ngithub = 1\n", "mcp", "github" ; "mcp_server_not_a_table")]
+    #[test_case("[mcp.bad_name]\ndeny = [\"x\"]\n", "mcp", "bad_name" ; "invalid_server_name")]
+    #[test_case("[mcp.github]\ndeny = true\n", "mcp.github", "deny" ; "mcp_boolean_deny")]
+    #[test_case("[mcp.github]\nallow = false\n", "mcp.github", "allow" ; "mcp_boolean_allow")]
+    #[test_case("[mcp.github]\ndeny = \"admin\"\n", "mcp.github", "deny" ; "mcp_string_deny")]
+    #[test_case("[mcp.github]\ndeny = [1]\n", "mcp.github", "deny" ; "mcp_non_string_tool")]
+    #[test_case("[mcp.github]\ndeny = [\"web.search\"]\n", "mcp.github", "deny" ; "mcp_dotted_tool_name")]
+    #[test_case("[mcp.github]\ndefault = \"sometimes\"\n", "mcp.github", "default" ; "mcp_invalid_default")]
+    #[test_case("[mcp.github]\ndeyn = [\"x\"]\n", "mcp.github", "deyn" ; "mcp_unknown_key")]
+    #[test_case("[mcp.github.admin]\n", "mcp.github", "admin" ; "mcp_dotted_server_name")]
+    #[test_case("bash = 1\n", "", "bash" ; "tool_not_a_table")]
+    #[test_case("[\"\"]\ndeny = [\"x\"]\n", "", "" ; "empty_tool_name")]
+    #[test_case("[\"a.b\"]\ndeny = [\"x\"]\n", "", "a.b" ; "dotted_tool_name")]
+    #[test_case("[\"ba sh\"]\ndeny = [\"x\"]\n", "", "ba sh" ; "tool_name_with_space")]
+    #[test_case("[\"mcp:github__delete_repo\"]\ndeny = true\n", "", "mcp:github__delete_repo" ; "old_mcp_tool_section")]
+    #[test_case("[bash]\ndeny = \"rm *\"\n", "bash", "deny" ; "tool_string_deny")]
+    #[test_case("[bash]\ndeny = [1]\n", "bash", "deny" ; "tool_non_string_scope")]
+    #[test_case("[bash]\ndefault = \"sometimes\"\n", "bash", "default" ; "tool_invalid_default")]
+    #[test_case("[bash]\ndeyn = [\"rm *\"]\n", "bash", "deyn" ; "tool_unknown_key")]
+    #[test_case("[bash.extra]\n", "bash", "extra" ; "tool_nested_table")]
+    #[test_case("[\"*\"]\ndefault = \"deny\"\n", "*", "default" ; "wildcard_tool_default")]
+    fn invalid_permission_rule_fails_loading(content: &str, section: &str, key: &str) {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(dir.path(), content);
+        let error = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()))
+            .err()
+            .unwrap();
+        let path = global.join(PERMISSIONS_FILE);
+        assert!(
+            matches!(&error, ConfigError::PermissionRule { path: p, section: s, key: k, .. }
+                if *p == path && s == section && k == key),
+            "{error}"
+        );
+    }
+
+    #[test_case("[\"mcp:github__delete_repo\"]\ndeny = true\n" => OLD_MCP_SECTION ; "old_mcp_section_points_at_mcp_server_sections")]
+    #[test_case("[\"b@sh\"]\ndeny = [\"x\"]\n" => INVALID_TOOL_SECTION ; "invalid_tool_section")]
+    fn invalid_tool_section_says_why(content: &str) -> String {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(dir.path(), content);
+        match load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())) {
+            Err(ConfigError::PermissionRule { reason, .. }) => reason,
+            other => panic!("expected a rule error, got {other:?}"),
+        }
+    }
+
+    #[test_case(true, false => false ; "old_home_file_refused")]
+    #[test_case(true, true => true ; "home_as_project_reads_it_as_the_project_file")]
+    #[test_case(false, false => true ; "no_old_home_file")]
+    fn old_home_permissions_are_refused(old_file: bool, home_is_project: bool) -> bool {
+        let home = TempDir::new().unwrap();
+        if old_file {
+            let old_dir = home.path().join(PROJECT_DIR);
+            fs::create_dir_all(&old_dir).unwrap();
+            fs::write(
+                old_dir.join(PERMISSIONS_FILE),
+                "[bash]\ndeny = [\"rm *\"]\n",
+            )
+            .unwrap();
+        }
+        let elsewhere = TempDir::new().unwrap();
+        let project = if home_is_project {
+            home.path()
+        } else {
+            elsewhere.path()
+        };
+        let global = global_config_dir(home.path());
+        refuse_old_home_permissions(
+            Some(home.path()),
+            &global,
+            &ProjectConfig::for_project(project),
+        )
+        .is_ok()
+    }
+
+    #[test_case(true ; "trusted_project")]
+    #[test_case(false ; "untrusted_project")]
+    fn invalid_project_permission_rule_fails_loading(trusted: bool) {
+        let dir = TempDir::new().unwrap();
+        let makima_dir = dir.path().join(PROJECT_DIR);
+        fs::create_dir_all(&makima_dir).unwrap();
+        fs::write(
+            makima_dir.join(PERMISSIONS_FILE),
+            "[mcp.github]\ndeny = true\n",
+        )
+        .unwrap();
+        let project = if trusted {
+            ProjectConfig::for_project(dir.path())
+        } else {
+            ProjectConfig::discover(dir.path())
+        };
+        let error = load_permissions_inner(None, &project).unwrap_err();
+        assert!(
+            matches!(&error, ConfigError::ProjectPermissions(inner)
+                if matches!(**inner, ConfigError::PermissionRule { .. })),
+            "{error}"
+        );
+        assert!(error.to_string().ends_with(NO_PROJECT_HINT), "{error}");
+    }
+
+    #[test_case(project::TrustMode::Consult, false ; "malformed_file_fails")]
+    #[test_case(project::TrustMode::Session, false ; "trusted_malformed_file_fails")]
+    #[test_case(project::TrustMode::Ignore, true ; "no_project_ignores_it")]
+    fn no_project_ignores_malformed_project_permissions(mode: project::TrustMode, loads: bool) {
+        let dir = TempDir::new().unwrap();
+        let makima_dir = dir.path().join(PROJECT_DIR);
+        fs::create_dir_all(&makima_dir).unwrap();
+        fs::write(makima_dir.join(PERMISSIONS_FILE), "[bash\n").unwrap();
+        let state = TempDir::new().unwrap();
+        let storage = makima_storage::StateDir::from_path(state.path().to_path_buf());
+        let decision = project::resolve(&storage, dir.path(), mode);
+        assert_eq!(
+            load_permissions_inner(None, &decision.project_config).is_ok(),
+            loads
+        );
+    }
+
+    #[test]
+    fn malformed_permissions_file_fails_loading() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(dir.path(), "[bash\n");
+        assert!(matches!(
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())),
+            Err(ConfigError::PermissionsFile { .. })
+        ));
+    }
+
+    const GLOBAL_ALLOWED_HOST: &str = "ollama.lan";
+    const PROJECT_ALLOWED_HOST: &str = "searx.lan:8888";
+
+    #[test]
+    fn allowed_private_hosts_merge_and_defaults() {
+        let global = RawConfig {
+            net: NetFileConfig {
+                allowed_private_hosts: Some(vec![GLOBAL_ALLOWED_HOST.into()]),
+            },
+            ..Default::default()
+        };
+        let project = RawConfig {
+            net: NetFileConfig {
+                allowed_private_hosts: Some(vec![PROJECT_ALLOWED_HOST.into()]),
+            },
+            ..Default::default()
+        };
+        let mut merged = global;
+        merged.merge(project);
+        let config = merged.into_config().unwrap();
+        assert_eq!(
+            config.net.allowed_private_hosts,
+            vec![PROJECT_ALLOWED_HOST.to_string()]
+        );
+    }
+}

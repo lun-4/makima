@@ -5,7 +5,7 @@
 //!
 //! Per-message wire ids (`uuid`, assistant `message.id`) use `uuid::Uuid::now_v7()` to emit the
 //! hyphenated-hex UUIDv7 shape that Claude Code SDK consumers expect, rather than makima's base58
-//! `MakiId` canonical form.
+//! `MakimaId` canonical form.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -20,42 +20,46 @@ use event_listener::Event;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use flume::{Receiver, Sender};
-use maki_agent::agent::PromptSlotSource;
-use maki_agent::cancel::{CancelToken, CancelTrigger};
-use maki_agent::command::{
+use makima_agent::agent::PromptSlotSource;
+use makima_agent::cancel::{CancelToken, CancelTrigger};
+use makima_agent::command::{
     CustomCommand, SessionCommandHost, StandardCommands, StandardCompletions, session_capabilities,
 };
-use maki_agent::config_change::ConfigChangeError;
-use maki_agent::headless::{
+use makima_agent::config_change::ConfigChangeError;
+use makima_agent::headless::{
     self, InteractiveControlSender, InteractiveHandle, InteractiveInputSender, InteractiveParams,
     WorkCancel,
 };
-use maki_agent::mcp;
-use maki_agent::permissions::{PermissionAnswer, PermissionManager, PluginRuleStore, TaggedAnswer};
-use maki_agent::session_coordinator::{SessionCoordinatorHandle, SessionReadHandle};
-use maki_agent::session_defaults;
-use maki_agent::session_options::{DISABLED_VALUE, ENABLED_VALUE, MODEL_OPTION_ID, YOLO_OPTION_ID};
-use maki_agent::tools::{QUESTION_TOOL_NAME, QuestionMode};
-use maki_agent::{
+use makima_agent::mcp;
+use makima_agent::permissions::{
+    PermissionAnswer, PermissionManager, PluginRuleStore, TaggedAnswer,
+};
+use makima_agent::session_coordinator::{SessionCoordinatorHandle, SessionReadHandle};
+use makima_agent::session_defaults;
+use makima_agent::session_options::{
+    DISABLED_VALUE, ENABLED_VALUE, MODEL_OPTION_ID, YOLO_OPTION_ID,
+};
+use makima_agent::tools::{QUESTION_TOOL_NAME, QuestionMode};
+use makima_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentManagerHandle, AgentMode, Envelope, ModeId,
     PermissionsConfig, ToolOutput, TurnId, TurnOutcome,
 };
-use maki_commands::{
+use makima_commands::{
     CommandContent, CommandFuture, CommandHost, CommandOutcome, CommandRegistry, InputDispatch,
     TargetHandle,
 };
-use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
-use maki_lua::orchestration::ModelCatalog;
-use maki_lua::session_snapshot::HeadlessObserver;
-use maki_providers::model::Model;
-use maki_providers::{
+use makima_config::{ModelPolicy, ProjectConfig, SessionDefaults};
+use makima_lua::orchestration::ModelCatalog;
+use makima_lua::session_snapshot::HeadlessObserver;
+use makima_providers::model::Model;
+use makima_providers::{
     ImageSource, Message, ProviderRegistry, StopReason, Timeouts, TokenUsage, add_cost,
 };
-use maki_storage::StateDir;
-use maki_storage::conversation::{ConversationRelation, ConversationState};
-use maki_storage::id::SessionRef;
-use maki_storage::session_lock;
-use maki_storage::sessions::{SESSIONS_DIR, Session, SessionMeta, read_prefs};
+use makima_storage::StateDir;
+use makima_storage::conversation::{ConversationRelation, ConversationState};
+use makima_storage::id::SessionRef;
+use makima_storage::session_lock;
+use makima_storage::sessions::{SESSIONS_DIR, Session, SessionMeta, read_prefs};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use tracing::warn;
@@ -466,7 +470,7 @@ impl StreamSynth {
     }
 }
 
-fn maki_to_claude_tool_name(name: &str) -> &str {
+fn makima_to_claude_tool_name(name: &str) -> &str {
     TOOL_NAME_MAP
         .iter()
         .find(|(m, _)| *m == name)
@@ -531,8 +535,8 @@ pub struct SdkParams {
     pub command_registry: CommandRegistry,
     /// Plugin-registered session options, so a tool's options resolve here the
     /// same way they do in the TUI.
-    pub session_options: maki_agent::session_coordinator::SessionOptionCatalog,
-    pub lua_handle: maki_lua::EventHandle,
+    pub session_options: makima_agent::session_coordinator::SessionOptionCatalog,
+    pub lua_handle: makima_lua::EventHandle,
 }
 
 struct Shared {
@@ -692,7 +696,7 @@ pub fn run(params: SdkParams) -> Result<()> {
 
     let startup_model = model.clone();
     let catalog = ModelCatalog::offline(Arc::clone(&providers), &model_policy);
-    let (binding, root_target) = maki_lua::orchestration::root_binding();
+    let (binding, root_target) = makima_lua::orchestration::root_binding();
     let handle = headless::spawn_interactive_with_binding(
         InteractiveParams {
             model,
@@ -724,7 +728,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         Some(binding),
     );
     smol::block_on(handle.initialized_root()).map_err(|error| eyre!(error))?;
-    let definitions = maki_agent::session_coordinator::builtin_option_definitions(
+    let definitions = makima_agent::session_coordinator::builtin_option_definitions(
         startup_model.spec(),
         catalog.snapshot(),
         yolo,
@@ -741,7 +745,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         .ok_or_else(|| eyre!("session is open in another terminal; close it there first"))?;
     let publication_guard = claimed_lock.publication_guard();
     let checkpoint = Arc::new(
-        maki_agent::session_checkpoint::SessionLogCheckpoint::open(
+        makima_agent::session_checkpoint::SessionLogCheckpoint::open(
             storage.clone(),
             handle.session_id.id(),
             &startup_model.spec(),
@@ -751,7 +755,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         .map_err(|error| eyre!(error))?,
     );
     let coordinator = SessionCoordinatorHandle::register(
-        maki_agent::session_coordinator::SessionCoordinatorParams {
+        makima_agent::session_coordinator::SessionCoordinatorParams {
             session_id: handle.session_id.id(),
             catalog: session_options.clone(),
             definitions,
@@ -762,7 +766,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         },
     )
     .map_err(|error| eyre!("register session coordinator: {error}"))?;
-    let trusted_root = smol::block_on(maki_lua::orchestration::bind_frontend_root(
+    let trusted_root = smol::block_on(makima_lua::orchestration::bind_frontend_root(
         &handle,
         &coordinator,
         &root_target,
@@ -770,7 +774,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     ))
     .map_err(|error| eyre!("bind session actor: {error}"))?;
     let root = trusted_root.target.clone();
-    let orchestration = maki_lua::orchestration::durable_frontend(
+    let orchestration = makima_lua::orchestration::durable_frontend(
         "SDK",
         &catalog,
         trusted_root.clone(),
@@ -780,7 +784,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     let sdk_commands = Arc::new(SdkCommands::new(
         command_registry,
         &commands,
-        maki_lua::orchestration::PinnedCommandHost::new(
+        makima_lua::orchestration::PinnedCommandHost::new(
             SessionCommandHost::new(
                 handle.control_tx.clone(),
                 coordinator.clone(),
@@ -793,23 +797,23 @@ pub fn run(params: SdkParams) -> Result<()> {
     )?);
     orchestration.bind_commands(
         &root,
-        maki_lua::orchestration::command_runner(
+        makima_lua::orchestration::command_runner(
             sdk_commands.registry.clone(),
             sdk_commands.target.clone(),
-            maki_lua::orchestration::headless_outcomes(&handle),
+            makima_lua::orchestration::headless_outcomes(&handle),
         ),
     );
     lua_handle.install_orchestration_services(orchestration.clone());
     let modes = lua_handle.mode_registry();
     let set_mode = |key: &str| {
         let change =
-            maki_lua::orchestration::set_mode(&*orchestration, &root, &modes, key, &storage);
+            makima_lua::orchestration::set_mode(&*orchestration, &root, &modes, key, &storage);
         smol::block_on(change).map(|_| ())
     };
     if permission_mode == PermissionMode::Plan {
         set_mode(ModeId::Plan.key()).map_err(|error| eyre!("enter plan mode: {error}"))?;
     } else if !explicit_permission_mode
-        && let Err(error) = smol::block_on(maki_lua::orchestration::restore_mode(
+        && let Err(error) = smol::block_on(makima_lua::orchestration::restore_mode(
             &*orchestration,
             &root,
             &modes,
@@ -850,7 +854,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     let tools: Vec<&str> = handle
         .tool_names
         .iter()
-        .map(|t| maki_to_claude_tool_name(t))
+        .map(|t| makima_to_claude_tool_name(t))
         .collect();
     writer.emit_system(
         "init",
@@ -1258,7 +1262,7 @@ type StoredSession = Session<Message, TokenUsage, ToolOutput>;
 #[derive(Debug)]
 struct ResolvedSession {
     id: Option<SessionRef>,
-    history: maki_agent::agent::HistorySnapshot,
+    history: makima_agent::agent::HistorySnapshot,
     model: Option<String>,
     meta: SessionMeta,
 }
@@ -1349,8 +1353,8 @@ fn resolve_session(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<ResolvedS
                         return Err(eyre!("session {}: {block}", session.id));
                     }
                 }
-                Err(maki_storage::sessions::SessionError::Storage(
-                    maki_storage::StorageError::NotFound(_),
+                Err(makima_storage::sessions::SessionError::Storage(
+                    makima_storage::StorageError::NotFound(_),
                 )) => {}
                 Err(error) => return Err(eyre!("load session {id}: {error}")),
             }
@@ -1883,7 +1887,7 @@ impl EventPump {
                     let events = self.synth.tool_use(
                         &model,
                         &ts.id,
-                        maki_to_claude_tool_name(&name),
+                        makima_to_claude_tool_name(&name),
                         &serde_json::to_string(&input)?,
                     );
                     self.emit_stream(events)?;
@@ -1997,7 +2001,7 @@ impl EventPump {
                         request_id: req_id,
                         request: ControlRequestInner {
                             subtype: "can_use_tool",
-                            tool_name: Some(maki_to_claude_tool_name(&tool_name).into()),
+                            tool_name: Some(makima_to_claude_tool_name(&tool_name).into()),
                             input: Some(input),
                             tool_use_id: Some(id.clone()),
                         },
@@ -2059,7 +2063,7 @@ fn map_tool_names_in_content(content: &Value) -> Value {
                         && let Some(name) = block.get("name").and_then(Value::as_str)
                     {
                         let mut b = block.clone();
-                        b["name"] = Value::String(maki_to_claude_tool_name(name).to_string());
+                        b["name"] = Value::String(makima_to_claude_tool_name(name).to_string());
                         return b;
                     }
                     block.clone()
@@ -2073,23 +2077,23 @@ fn map_tool_names_in_content(content: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use maki_lua::orchestration::AgentOrchestration;
-    use maki_storage::id::MakiId;
+    use makima_lua::orchestration::AgentOrchestration;
+    use makima_storage::id::MakimaId;
 
     use super::*;
-    use maki_agent::actor::{ConfigChange, ConfigPatch};
-    use maki_agent::session_coordinator::{SessionCheckpoint, SessionCheckpointKind};
-    use maki_agent::tools::ToolRegistry;
-    use maki_agent::{AgentError, AgentId, AgentRef, ModelSource, PreparedModel};
-    use maki_commands::{CommandError, CommandFuture, TargetCapabilities, TargetCapability};
-    use maki_lua::orchestration::{OrchestrationServices, TrustedTarget};
-    use maki_providers::provider::{BoxFuture, Provider};
-    use maki_providers::{
+    use makima_agent::actor::{ConfigChange, ConfigPatch};
+    use makima_agent::session_coordinator::{SessionCheckpoint, SessionCheckpointKind};
+    use makima_agent::tools::ToolRegistry;
+    use makima_agent::{AgentError, AgentId, AgentRef, ModelSource, PreparedModel};
+    use makima_commands::{CommandError, CommandFuture, TargetCapabilities, TargetCapability};
+    use makima_lua::orchestration::{OrchestrationServices, TrustedTarget};
+    use makima_providers::provider::{BoxFuture, Provider};
+    use makima_providers::{
         ContentBlock, Invocation, ProviderEvent, RequestDelivery, RequestOptions, Role,
         StreamResponse,
     };
-    use maki_storage::checkpoint::{CheckpointWriter, ClaimingWriter};
-    use maki_storage::sessions::Prefs;
+    use makima_storage::checkpoint::{CheckpointWriter, ClaimingWriter};
+    use makima_storage::sessions::Prefs;
     use std::path::PathBuf;
     use std::time::Duration;
     use test_case::test_case;
@@ -2118,7 +2122,7 @@ mod tests {
     /// {spec} without fast mode, which none of these models offer.
     fn sdk_model(spec: &str) -> Model {
         Model {
-            fast_support: Some(maki_providers::model::FastSupport::Unsupported),
+            fast_support: Some(makima_providers::model::FastSupport::Unsupported),
             ..Model::from_spec(spec).unwrap()
         }
     }
@@ -2133,7 +2137,7 @@ mod tests {
             meta: SessionMeta::default(),
         };
         let resolved = startup_model(
-            &maki_providers::test_util::offline_ids(&["anthropic", "openai"]),
+            &makima_providers::test_util::offline_ids(&["anthropic", "openai"]),
             Model::from_spec(STARTUP_MODEL).unwrap(),
             &restored,
             explicit_model,
@@ -2148,10 +2152,10 @@ mod tests {
     struct ReplaceAttachment;
     struct RejectAttachment;
 
-    impl maki_commands::CommandBehavior for RejectAttachment {
+    impl makima_commands::CommandBehavior for RejectAttachment {
         fn execute(
             &self,
-            invocation: maki_commands::CommandInvocation,
+            invocation: makima_commands::CommandInvocation,
         ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
             let has_attachment = !invocation.content.attachments.is_empty();
             Box::pin(async move {
@@ -2164,10 +2168,10 @@ mod tests {
         }
     }
 
-    impl maki_commands::CommandBehavior for ReplaceAttachment {
+    impl makima_commands::CommandBehavior for ReplaceAttachment {
         fn execute(
             &self,
-            invocation: maki_commands::CommandInvocation,
+            invocation: makima_commands::CommandInvocation,
         ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
             Box::pin(async move {
                 let Some(attachment) = invocation.content.attachments.first() else {
@@ -2182,10 +2186,10 @@ mod tests {
                         "command attachment changed before dispatch",
                     )));
                 }
-                Ok(CommandOutcome::AgentTurn(maki_commands::AgentTurn {
+                Ok(CommandOutcome::AgentTurn(makima_commands::AgentTurn {
                     content: CommandContent {
                         text: Arc::from("inspected"),
-                        attachments: Arc::from([maki_commands::CommandAttachment {
+                        attachments: Arc::from([makima_commands::CommandAttachment {
                             media_type: Arc::from("image/jpeg"),
                             data: Arc::from("BBBB"),
                         }]),
@@ -2196,10 +2200,10 @@ mod tests {
         }
     }
 
-    impl maki_commands::CommandBehavior for OutcomeBehavior {
+    impl makima_commands::CommandBehavior for OutcomeBehavior {
         fn execute(
             &self,
-            _invocation: maki_commands::CommandInvocation,
+            _invocation: makima_commands::CommandInvocation,
         ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
             let outcome = self.0.clone();
             Box::pin(async move { Ok(outcome) })
@@ -2251,11 +2255,11 @@ mod tests {
             append_system_prompt: None,
             defaults: SessionDefaults::default(),
             model_policy: Arc::default(),
-            providers: Arc::new(maki_providers::test_util::offline_ids(&[
+            providers: Arc::new(makima_providers::test_util::offline_ids(&[
                 "anthropic",
                 "openai",
             ])),
-            modes: Arc::new(maki_agent::ModeRegistry::builtin()),
+            modes: Arc::new(makima_agent::ModeRegistry::builtin()),
             question_mode: QuestionMode::Headless,
             plugin_rules: Arc::default(),
             project_config: ProjectConfig::for_project(&cwd),
@@ -2306,7 +2310,7 @@ mod tests {
 
     struct PendingSdkSession {
         handle: InteractiveHandle,
-        coordinator: maki_agent::session_coordinator::SessionCoordinatorHandle,
+        coordinator: makima_agent::session_coordinator::SessionCoordinatorHandle,
         shared: Arc<Mutex<Shared>>,
         pump: smol::Task<()>,
         out_rx: Receiver<String>,
@@ -2350,7 +2354,7 @@ mod tests {
             request_counter: 0,
             terminal_run_id: None,
             observer: HeadlessObserver::new(
-                maki_lua::EventHandle::disconnected_for_test(),
+                makima_lua::EventHandle::disconnected_for_test(),
                 handle.session_id.id(),
             ),
         }
@@ -2432,7 +2436,7 @@ mod tests {
         }
     }
 
-    /// `echo prompt | maki` must work: the end of input waits for the turn
+    /// `echo prompt | makima` must work: the end of input waits for the turn
     /// in flight, reports it, then lets the session end. A permission ask
     /// left open is denied, since no answer can arrive any more.
     #[test]
@@ -2510,10 +2514,10 @@ mod tests {
     #[test]
     fn command_runner_runs_on_the_pinned_agent_at_its_depth() {
         struct Pinned(Sender<(Option<AgentId>, usize)>);
-        impl maki_commands::CommandBehavior for Pinned {
+        impl makima_commands::CommandBehavior for Pinned {
             fn execute(
                 &self,
-                invocation: maki_commands::CommandInvocation,
+                invocation: makima_commands::CommandInvocation,
             ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
                 let pinned = invocation
                     .admission_context::<TrustedTarget>()
@@ -2528,20 +2532,20 @@ mod tests {
         let (seen_tx, seen) = flume::unbounded();
         let mut pinned = registration(PINNED_COMMAND, CommandOutcome::Completed);
         pinned.behavior = Arc::new(Pinned(seen_tx));
-        let plugin = registry.create_producer(maki_commands::ProducerPrecedence::Plugin);
+        let plugin = registry.create_producer(makima_commands::ProducerPrecedence::Plugin);
         plugin.replace(vec![pinned]).unwrap();
         let commands = sdk_commands(registry.clone());
-        let runner = maki_lua::orchestration::command_runner(
+        let runner = makima_lua::orchestration::command_runner(
             registry,
             commands.target.clone(),
-            maki_lua::orchestration::headless_outcomes(&session.handle),
+            makima_lua::orchestration::headless_outcomes(&session.handle),
         );
         smol::block_on(runner(
             PINNED_COMMAND.into(),
             PINNED_DEPTH,
             TrustedTarget {
                 target: root.clone(),
-                template: maki_agent::tools::cli_tool_ctx(std::env::temp_dir()),
+                template: makima_agent::tools::cli_tool_ctx(std::env::temp_dir()),
             },
         ))
         .unwrap();
@@ -2561,7 +2565,7 @@ mod tests {
         let running = actor.latest_ticket().unwrap().turn_id();
         let failure = CommandError::Producer(Arc::from(HANDLER_ERR));
         let outcome = if turn {
-            CommandOutcome::AgentTurn(maki_commands::AgentTurn {
+            CommandOutcome::AgentTurn(makima_commands::AgentTurn {
                 content: CommandContent::from(SDK_ROOT_PROMPT),
                 prompt: None,
             })
@@ -2569,22 +2573,22 @@ mod tests {
             CommandOutcome::Failed(failure.clone())
         };
         let registry = CommandRegistry::new();
-        let plugin = registry.create_producer(maki_commands::ProducerPrecedence::Plugin);
+        let plugin = registry.create_producer(makima_commands::ProducerPrecedence::Plugin);
         plugin
             .replace(vec![registration(PINNED_COMMAND, outcome)])
             .unwrap();
         let commands = sdk_commands(registry.clone());
-        let runner = maki_lua::orchestration::command_runner(
+        let runner = makima_lua::orchestration::command_runner(
             registry,
             commands.target.clone(),
-            maki_lua::orchestration::headless_outcomes(&session.handle),
+            makima_lua::orchestration::headless_outcomes(&session.handle),
         );
         let result = smol::block_on(runner(
             PINNED_COMMAND.into(),
             PINNED_DEPTH,
             TrustedTarget {
                 target: root.clone(),
-                template: maki_agent::tools::cli_tool_ctx(std::env::temp_dir()),
+                template: makima_agent::tools::cli_tool_ctx(std::env::temp_dir()),
             },
         ));
         assert_eq!(actor.latest_ticket().unwrap().turn_id(), running);
@@ -2640,7 +2644,7 @@ mod tests {
     fn refused_message_is_an_error_not_the_end() {
         let session = pending_sdk_session();
         let input = AgentInput::new(
-            "a".repeat(maki_agent::actor::MAX_PENDING_INSTRUCTION_BYTES + 1),
+            "a".repeat(makima_agent::actor::MAX_PENDING_INSTRUCTION_BYTES + 1),
             Vec::new(),
         );
         assert_eq!(
@@ -2649,7 +2653,7 @@ mod tests {
                 &session.handle.input_tx,
                 input
             )),
-            Err(maki_agent::ActorError::InstructionOverflow.to_string())
+            Err(makima_agent::ActorError::InstructionOverflow.to_string())
         );
         let results = session.end_input();
         assert_eq!(results.len(), 1);
@@ -2707,36 +2711,36 @@ mod tests {
 
     /// A coordinator on {STARTUP_MODEL} with no actor bound to it.
     fn unbound_coordinator(
-        session_id: MakiId,
-    ) -> maki_agent::session_coordinator::SessionCoordinatorHandle {
-        maki_agent::session_coordinator::SessionCoordinatorHandle::register(
-            maki_agent::session_coordinator::SessionCoordinatorParams {
+        session_id: MakimaId,
+    ) -> makima_agent::session_coordinator::SessionCoordinatorHandle {
+        makima_agent::session_coordinator::SessionCoordinatorHandle::register(
+            makima_agent::session_coordinator::SessionCoordinatorParams {
                 session_id,
                 catalog: Default::default(),
-                definitions: maki_agent::session_coordinator::builtin_option_definitions(
+                definitions: makima_agent::session_coordinator::builtin_option_definitions(
                     STARTUP_MODEL,
                     [Arc::from(STARTUP_MODEL)],
                     false,
                     false,
                     false,
-                    maki_agent::ThinkingConfig::Off,
+                    makima_agent::ThinkingConfig::Off,
                 ),
                 persisted_options: Default::default(),
                 model_policy: Arc::default(),
-                checkpoint: maki_storage::checkpoint::ClaimingWriter::accept_all(),
-                mailbox: maki_agent::SessionMailbox::new(session_id),
+                checkpoint: makima_storage::checkpoint::ClaimingWriter::accept_all(),
+                mailbox: makima_agent::SessionMailbox::new(session_id),
             },
         )
         .unwrap()
     }
 
-    fn registration(name: &str, outcome: CommandOutcome) -> maki_commands::Registration {
-        maki_commands::Registration {
-            spec: maki_commands::CommandSpec {
+    fn registration(name: &str, outcome: CommandOutcome) -> makima_commands::Registration {
+        makima_commands::Registration {
+            spec: makima_commands::CommandSpec {
                 name: Arc::from(name),
                 aliases: Arc::from([]),
-                arguments: maki_commands::CommandArguments::Raw { required: false },
-                docs: maki_commands::CommandDocs {
+                arguments: makima_commands::CommandArguments::Raw { required: false },
+                docs: makima_commands::CommandDocs {
                     summary: Arc::from(format!("{name} description")),
                     argument_hint: Some(Arc::from("<arg>")),
                 },
@@ -2815,13 +2819,13 @@ mod tests {
     #[test_case(true; "fork")]
     fn sdk_restoration_preserves_compacted_history(fork: bool) {
         use clap::Parser;
-        use maki_storage::conversation::ConversationLink;
+        use makima_storage::conversation::ConversationLink;
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         const STORED_CONVERSATION: &str = "stored-conversation";
         const STORED_SENT: usize = 2;
         let mut session = StoredSession::new(STARTUP_MODEL, THIS_CWD);
-        session.adopt_history(&maki_storage::sessions::HistorySnapshot::new(vec![
+        session.adopt_history(&makima_storage::sessions::HistorySnapshot::new(vec![
             Message::user("first".into()),
             Message::user("second".into()),
             Message::user("third".into()),
@@ -2839,7 +2843,7 @@ mod tests {
         let cli = Cli::parse_from(args);
         let restored = resolve_session(&cli, THIS_CWD, &storage).unwrap();
         assert!(restored.history.compacted);
-        let history = maki_agent::agent::History::restored_snapshot(restored.history.clone());
+        let history = makima_agent::agent::History::restored_snapshot(restored.history.clone());
         assert_eq!(
             history.conversation_id().as_ref() == STORED_CONVERSATION,
             !fork
@@ -2856,7 +2860,7 @@ mod tests {
         );
     }
 
-    fn claude_to_maki_tool_name(name: &str) -> &str {
+    fn claude_to_makima_tool_name(name: &str) -> &str {
         TOOL_NAME_MAP
             .iter()
             .find(|(_, c)| *c == name)
@@ -2867,11 +2871,11 @@ mod tests {
     #[test]
     fn sdk_commands_projection_includes_shared_producers_and_session_builtins() {
         let registry = CommandRegistry::new();
-        let plugin = registry.create_producer(maki_commands::ProducerPrecedence::Plugin);
+        let plugin = registry.create_producer(makima_commands::ProducerPrecedence::Plugin);
         plugin
             .replace(vec![registration("/lua", CommandOutcome::Completed)])
             .unwrap();
-        let mcp = registry.create_producer(maki_commands::ProducerPrecedence::Mcp);
+        let mcp = registry.create_producer(makima_commands::ProducerPrecedence::Mcp);
         let mut prompt = registration("/mcp:prompt", CommandOutcome::Completed);
         prompt.spec.required_capabilities =
             TargetCapabilities::from_capability(TargetCapability::AgentTurns);
@@ -2908,7 +2912,7 @@ mod tests {
             smol::block_on(commands.dispatch_input("/btw", &[])),
             InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::TypedArguments {
                 command,
-                error: maki_commands::ArgumentParseError::MissingRaw,
+                error: makima_commands::ArgumentParseError::MissingRaw,
             })) if command.as_ref() == "/btw"
         ));
         let projection = commands.projection();
@@ -3016,14 +3020,14 @@ mod tests {
         services: &AgentOrchestration,
         target: &AgentRef,
         patch: ConfigPatch,
-    ) -> maki_agent::actor::ConfigCommit {
+    ) -> makima_agent::actor::ConfigCommit {
         let change = async |_, _| {
             Ok((
-                maki_agent::session_coordinator::publication_claim(),
+                makima_agent::session_coordinator::publication_claim(),
                 ConfigChange::Patch(patch),
             ))
         };
-        smol::block_on(maki_lua::orchestration::commit_config_change(
+        smol::block_on(makima_lua::orchestration::commit_config_change(
             services, target, change,
         ))
         .unwrap()
@@ -3044,17 +3048,17 @@ mod tests {
             grandchild_release: grandchild_resume,
         });
         let child_provider = Arc::clone(&provider);
-        let (ui, notices) = maki_lua::test_support::RecordingUi::new();
-        let host = maki_lua::PluginHost::with_session_provider_preparer(
+        let (ui, notices) = makima_lua::test_support::RecordingUi::new();
+        let host = makima_lua::PluginHost::with_session_provider_preparer(
             Arc::clone(ToolRegistry::global_arc()),
             Default::default(),
             true,
-            Arc::new(maki_lua::test_support::InMemoryFs::new()),
+            Arc::new(makima_lua::test_support::InMemoryFs::new()),
             Some(cwd.clone()),
             Some(Arc::new(move |model| {
                 Ok((model, Arc::clone(&child_provider)))
             })),
-            maki_lua::ui_sink::HostUi::Sink(Box::new(ui)),
+            makima_lua::ui_sink::HostUi::Sink(Box::new(ui)),
         )
         .unwrap();
         host.load_source("sdk_bundled_task", include_str!("../plugins/task/init.lua"))
@@ -3063,24 +3067,24 @@ mod tests {
             "sdk_command_spawn",
             &format!(
                 r#"
-            maki.api.register_command({{
+            makima.api.register_command({{
                 name = "/sdk_spawn", tui_only = false,
                 handler = function(_, ctx)
                     local root = assert(ctx:agent())
-                    local child = assert(maki.agent.spawn(ctx, {{ name = "SDK command child" }}))
+                    local child = assert(makima.agent.spawn(ctx, {{ name = "SDK command child" }}))
                     assert(child:close(ctx))
-                    local view, view_err = maki.fn.winsaveview()
+                    local view, view_err = makima.fn.winsaveview()
                     assert(view == nil and view_err == "{no_ui}", view_err)
-                    maki.ui.flash("{SDK_COMMAND_DONE}")
+                    makima.ui.flash("{SDK_COMMAND_DONE}")
                 end,
             }})
         "#,
-                no_ui = maki_lua::ui_sink::NO_UI_ERR
+                no_ui = makima_lua::ui_sink::NO_UI_ERR
             ),
         )
         .unwrap();
         host.load_source(SDK_NESTED_TOOL, &format!(r#"
-            maki.api.register_tool({{
+            makima.api.register_tool({{
                 name = "{SDK_NESTED_TOOL}", description = "Exercise nested SDK tasks",
                 schema = {{ type = "object", properties = {{ child = {{ type = "boolean" }} }} }},
                 audiences = {{ "main", "general_sub" }},
@@ -3097,18 +3101,18 @@ mod tests {
                         assert(assert(child:config(ctx)).model.spec == "{STARTUP_MODEL}")
                         local captured = assert(ctx:model())
                         assert(captured.spec == inherited.spec)
-                        assert(maki.json.encode(captured.thinking) == maki.json.encode(inherited.thinking))
+                        assert(makima.json.encode(captured.thinking) == makima.json.encode(inherited.thinking))
                         assert(captured.fast == inherited.fast)
                     end
                     local prompt = input.child and "{SDK_GRANDCHILD_PROMPT}" or "{SDK_CHILD_PROMPT}"
-                    local spawned, err = maki.agent.call_tool(ctx, "task_spawn", {{
+                    local spawned, err = makima.agent.call_tool(ctx, "task_spawn", {{
                         description = prompt, prompt = prompt, subagent_type = "general",
                     }})
                     assert(not err, err)
-                    local task = maki.json.decode(spawned)
-                    local joined, wait_err = maki.agent.call_tool(ctx, "task_wait", {{ task_id = task.task_id, turn_id = task.turn_id }})
+                    local task = makima.json.decode(spawned)
+                    local joined, wait_err = makima.agent.call_tool(ctx, "task_wait", {{ task_id = task.task_id, turn_id = task.turn_id }})
                     assert(not wait_err, wait_err)
-                    local result = maki.json.decode(joined)
+                    local result = makima.json.decode(joined)
                     local expected = input.child and "{SDK_GRANDCHILD_RESPONSE}" or "{SDK_CHILD_RESPONSE}"
                     assert(result.result.text == expected, joined)
                     return result.result.text
@@ -3117,13 +3121,13 @@ mod tests {
         "#)).unwrap();
         let lua_handle = host.event_handle();
         let prepared_provider = Arc::clone(&provider);
-        let thinking = maki_providers::ThinkingConfig::Off;
+        let thinking = makima_providers::ThinkingConfig::Off;
         let model = Model::from_spec(STARTUP_MODEL).unwrap();
         let defaults = session_defaults::resolve(
             SessionDefaults {
                 fast: true,
                 thinking: Some(
-                    maki_providers::ThinkingConfig::Effort(maki_providers::Effort::High).into(),
+                    makima_providers::ThinkingConfig::Effort(makima_providers::Effort::High).into(),
                 ),
                 ..Default::default()
             },
@@ -3136,7 +3140,7 @@ mod tests {
             false,
             &model,
         );
-        let (binding, root_target) = maki_lua::orchestration::root_binding();
+        let (binding, root_target) = makima_lua::orchestration::root_binding();
         let handle = headless::spawn_interactive_with_binding(
             InteractiveParams {
                 model,
@@ -3157,7 +3161,7 @@ mod tests {
                 append_system_prompt: None,
                 defaults,
                 model_policy: Arc::default(),
-                providers: Arc::new(maki_providers::test_util::offline_ids(&[
+                providers: Arc::new(makima_providers::test_util::offline_ids(&[
                     "anthropic",
                     "openai",
                 ])),
@@ -3192,8 +3196,8 @@ mod tests {
         let (terminal_started, terminal_gate) = flume::bounded(1);
         let (terminal_release, terminal_resume) = flume::bounded(1);
         let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = Arc::new(
-            move |request: maki_storage::checkpoint::CheckpointRequest<
-                maki_agent::session_coordinator::SessionCheckpoint,
+            move |request: makima_storage::checkpoint::CheckpointRequest<
+                makima_agent::session_coordinator::SessionCheckpoint,
             >| {
                 let checkpointed = Arc::clone(&checkpointed_clone);
                 let terminal_started = terminal_started.clone();
@@ -3203,17 +3207,17 @@ mod tests {
                         terminal_started.send_async(()).await.unwrap();
                         terminal_resume.recv_async().await.unwrap();
                     }
-                    let ack = maki_storage::checkpoint::CheckpointAck::for_request(&request);
+                    let ack = makima_storage::checkpoint::CheckpointAck::for_request(&request);
                     checkpointed.lock().unwrap().push(request.snapshot);
                     Ok(ack)
-                }) as maki_storage::checkpoint::CheckpointFuture
+                }) as makima_storage::checkpoint::CheckpointFuture
             },
         );
-        let coordinator = maki_agent::session_coordinator::SessionCoordinatorHandle::register(
-            maki_agent::session_coordinator::SessionCoordinatorParams {
+        let coordinator = makima_agent::session_coordinator::SessionCoordinatorHandle::register(
+            makima_agent::session_coordinator::SessionCoordinatorParams {
                 session_id: id,
                 catalog: Default::default(),
-                definitions: maki_agent::session_coordinator::builtin_option_definitions(
+                definitions: makima_agent::session_coordinator::builtin_option_definitions(
                     STARTUP_MODEL,
                     [Arc::from(STARTUP_MODEL), Arc::from(TARGET_MODEL)],
                     false,
@@ -3229,7 +3233,7 @@ mod tests {
         )
         .unwrap();
         let shared = Arc::new(Mutex::new(Shared::new()));
-        let trusted_root = smol::block_on(maki_lua::orchestration::bind_frontend_root(
+        let trusted_root = smol::block_on(makima_lua::orchestration::bind_frontend_root(
             &handle,
             &coordinator,
             &root_target,
@@ -3254,7 +3258,8 @@ mod tests {
                 .options
                 .iter()
                 .find(|option| {
-                    option.definition.id.as_ref() == maki_agent::session_options::THINKING_OPTION_ID
+                    option.definition.id.as_ref()
+                        == makima_agent::session_options::THINKING_OPTION_ID
                 })
                 .unwrap()
                 .current_value
@@ -3266,7 +3271,7 @@ mod tests {
         let root_id = agent.id();
         let child_storage = StateDir::from_path(state_dir.path().to_path_buf());
         let child_checkpoint = Arc::new(
-            maki_agent::session_checkpoint::SessionLogCheckpoint::open(
+            makima_agent::session_checkpoint::SessionLogCheckpoint::open(
                 child_storage.clone(),
                 id,
                 STARTUP_MODEL,
@@ -3278,13 +3283,13 @@ mod tests {
         let catalog = ModelCatalog::default();
         smol::block_on(catalog.apply(vec![STARTUP_MODEL.into(), TARGET_MODEL.into()], None));
         let services = Arc::new_cyclic(|weak| {
-            let persistence = maki_lua::orchestration::child_persistence(
+            let persistence = makima_lua::orchestration::child_persistence(
                 "SDK",
                 weak.clone(),
                 Arc::clone(&child_checkpoint),
             );
             let persist = persistence.1;
-            maki_lua::orchestration::frontend_root(
+            makima_lua::orchestration::frontend_root(
                 &catalog,
                 trusted_root.clone(),
                 persistence.0,
@@ -3330,7 +3335,7 @@ mod tests {
                 .manager
                 .snapshot()
                 .iter()
-                .filter(|node| node.graph_lifecycle == maki_agent::GraphLifecycle::Live)
+                .filter(|node| node.graph_lifecycle == makima_agent::GraphLifecycle::Live)
                 .count(),
             1
         );
@@ -3453,7 +3458,7 @@ mod tests {
         let child_key = services.history_key(&child_ref).unwrap();
         let child_config = child_ref.effective_config().unwrap().unwrap();
         assert_eq!(child_config.model.spec(), STARTUP_MODEL);
-        assert_eq!(child_config.thinking, maki_providers::ThinkingConfig::Off);
+        assert_eq!(child_config.thinking, makima_providers::ThinkingConfig::Off);
         assert!(!child_config.fast);
         let persisted = StoredSession::load(id, &child_storage).unwrap();
         let stored = persisted
@@ -3461,7 +3466,7 @@ mod tests {
             .iter()
             .find(|stored| stored.tool_use_id == child_key)
             .unwrap();
-        let mut expected = maki_lua::orchestration::child_metadata(
+        let mut expected = makima_lua::orchestration::child_metadata(
             child_key.clone(),
             child.metadata.label.clone().unwrap_or_default(),
             &child_config,
@@ -3511,7 +3516,7 @@ mod tests {
                 .iter()
                 .any(|stored| stored.tool_use_id == child_key
                     && stored.model.as_deref() == Some(TARGET_MODEL)
-                    && stored.thinking == Some(maki_providers::ThinkingConfig::Off.into())
+                    && stored.thinking == Some(makima_providers::ThinkingConfig::Off.into())
                     && !stored.fast)
         );
         let child_history = persisted.subagent_messages().get(&child_key).unwrap();
@@ -3556,7 +3561,7 @@ mod tests {
         assert!(shared.lock().unwrap().work.is_empty());
         let before_version = coordinator.read().options().version;
         let selected_thinking =
-            maki_providers::ThinkingConfig::Effort(maki_providers::Effort::High);
+            makima_providers::ThinkingConfig::Effort(makima_providers::Effort::High);
         let committed = commit_patch(
             services.as_ref(),
             &agent,
@@ -3627,41 +3632,41 @@ mod tests {
 
         let checkpointed = Arc::new(StdMutex::new(Vec::new()));
         let checkpointed_clone = Arc::clone(&checkpointed);
-        let id = MakiId::generate();
-        let coordinator = maki_agent::session_coordinator::SessionCoordinatorHandle::register(
-            maki_agent::session_coordinator::SessionCoordinatorParams {
+        let id = MakimaId::generate();
+        let coordinator = makima_agent::session_coordinator::SessionCoordinatorHandle::register(
+            makima_agent::session_coordinator::SessionCoordinatorParams {
                 session_id: id,
                 catalog: Default::default(),
-                definitions: maki_agent::session_coordinator::builtin_option_definitions(
+                definitions: makima_agent::session_coordinator::builtin_option_definitions(
                     STARTUP_MODEL,
                     [Arc::from(STARTUP_MODEL)],
                     true,
                     false,
                     false,
-                    maki_agent::ThinkingConfig::Off,
+                    makima_agent::ThinkingConfig::Off,
                 ),
                 persisted_options: Default::default(),
                 model_policy: Arc::new(ModelPolicy::default()),
                 checkpoint: Arc::new(
-                    move |request: maki_storage::checkpoint::CheckpointRequest<
-                        maki_agent::session_coordinator::SessionCheckpoint,
+                    move |request: makima_storage::checkpoint::CheckpointRequest<
+                        makima_agent::session_coordinator::SessionCheckpoint,
                     >| {
                         let checkpointed = Arc::clone(&checkpointed_clone);
                         Box::pin(async move {
                             let ack =
-                                maki_storage::checkpoint::CheckpointAck::for_request(&request);
+                                makima_storage::checkpoint::CheckpointAck::for_request(&request);
                             checkpointed.lock().unwrap().push(request.snapshot);
                             Ok(ack)
-                        }) as maki_storage::checkpoint::CheckpointFuture
+                        }) as makima_storage::checkpoint::CheckpointFuture
                     },
                 ),
-                mailbox: maki_agent::SessionMailbox::new(id),
+                mailbox: makima_agent::SessionMailbox::new(id),
             },
         )
         .unwrap();
         let permissions = Arc::new(test_permissions());
         permissions.set_yolo(true);
-        maki_lua::orchestration::project_yolo(&coordinator, Arc::clone(&permissions));
+        makima_lua::orchestration::project_yolo(&coordinator, Arc::clone(&permissions));
         assert!(permissions.is_yolo());
 
         let committed = StdMutex::new(Vec::new());
@@ -3683,12 +3688,12 @@ mod tests {
             .options
             .iter()
             .find(|option| {
-                option.definition.id.as_ref() == maki_agent::session_options::YOLO_OPTION_ID
+                option.definition.id.as_ref() == makima_agent::session_options::YOLO_OPTION_ID
             })
             .unwrap();
         assert_eq!(
             yolo.current_value.as_ref(),
-            maki_agent::session_options::DISABLED_VALUE
+            makima_agent::session_options::DISABLED_VALUE
         );
         let checkpointed = checkpointed.lock().unwrap();
         assert_eq!(checkpointed.len(), 1);
@@ -3697,12 +3702,12 @@ mod tests {
             .options
             .iter()
             .find(|option| {
-                option.definition.id.as_ref() == maki_agent::session_options::YOLO_OPTION_ID
+                option.definition.id.as_ref() == makima_agent::session_options::YOLO_OPTION_ID
             })
             .unwrap();
         assert_eq!(
             checkpointed_yolo.current_value.as_ref(),
-            maki_agent::session_options::DISABLED_VALUE
+            makima_agent::session_options::DISABLED_VALUE
         );
         smol::block_on(coordinator.close()).unwrap();
     }
@@ -3734,14 +3739,14 @@ mod tests {
         assert!(matches!(
             smol::block_on(commands.dispatch_input("/model", &[])),
             InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::Producer(message)))
-                if message.as_ref() == maki_agent::command::NONINTERACTIVE_MODEL_USAGE
+                if message.as_ref() == makima_agent::command::NONINTERACTIVE_MODEL_USAGE
         ));
     }
 
     #[test]
     fn sdk_command_behavior_owns_attachment_policy() {
         let registry = CommandRegistry::new();
-        let plugin = registry.create_producer(maki_commands::ProducerPrecedence::Plugin);
+        let plugin = registry.create_producer(makima_commands::ProducerPrecedence::Plugin);
         let mut inspect = registration("/inspect", CommandOutcome::Completed);
         inspect.behavior = Arc::new(ReplaceAttachment);
         let mut reject = registration("/reject", CommandOutcome::Completed);
@@ -3749,7 +3754,7 @@ mod tests {
         plugin.replace(vec![inspect, reject]).unwrap();
         let commands = sdk_commands(registry);
         let images = vec![ImageSource::new(
-            maki_providers::ImageMediaType::Png,
+            makima_providers::ImageMediaType::Png,
             Arc::from("AAAA"),
         )];
 
@@ -3763,7 +3768,7 @@ mod tests {
         assert_eq!(input.images.len(), 1);
         assert_eq!(
             input.images[0].media_type,
-            maki_providers::ImageMediaType::Jpeg
+            makima_providers::ImageMediaType::Jpeg
         );
         assert_eq!(input.images[0].data.as_ref(), "BBBB");
 
@@ -3777,7 +3782,7 @@ mod tests {
     #[test]
     fn sdk_dispatch_returns_outcomes_and_preserves_literal_input() {
         let registry = CommandRegistry::new();
-        let plugin = registry.create_producer(maki_commands::ProducerPrecedence::Plugin);
+        let plugin = registry.create_producer(makima_commands::ProducerPrecedence::Plugin);
         plugin
             .replace(vec![registration("/done", CommandOutcome::Completed)])
             .unwrap();
@@ -3788,7 +3793,7 @@ mod tests {
             InputDispatch::Dispatched(CommandOutcome::Completed)
         ));
         let images = vec![ImageSource::new(
-            maki_providers::ImageMediaType::Gif,
+            makima_providers::ImageMediaType::Gif,
             Arc::from("AAAA"),
         )];
         assert!(matches!(
@@ -3848,15 +3853,15 @@ mod tests {
     #[test_case("index", "Index")]
     #[test_case("memory", "Memory")]
     #[test_case("question", "Question")]
-    fn maki_to_claude_roundtrip(maki: &str, claude: &str) {
-        assert_eq!(maki_to_claude_tool_name(maki), claude);
-        assert_eq!(claude_to_maki_tool_name(claude), maki);
+    fn makima_to_claude_roundtrip(makima: &str, claude: &str) {
+        assert_eq!(makima_to_claude_tool_name(makima), claude);
+        assert_eq!(claude_to_makima_tool_name(claude), makima);
     }
 
     #[test]
     fn unknown_tool_name_passthrough() {
-        assert_eq!(maki_to_claude_tool_name("unknown_tool"), "unknown_tool");
-        assert_eq!(claude_to_maki_tool_name("UnknownTool"), "UnknownTool");
+        assert_eq!(makima_to_claude_tool_name("unknown_tool"), "unknown_tool");
+        assert_eq!(claude_to_makima_tool_name("UnknownTool"), "UnknownTool");
     }
 
     const MODEL: &str = "test-model";
@@ -4118,7 +4123,7 @@ mod tests {
                 out_tx,
             },
             shared: Arc::clone(&shared),
-            read: unbound_coordinator(MakiId::generate()).read(),
+            read: unbound_coordinator(MakimaId::generate()).read(),
             permissions: Arc::new(test_permissions()),
             answer_tx: flume::unbounded().0,
             include_partial_messages: false,
@@ -4129,23 +4134,23 @@ mod tests {
             request_counter: 0,
             terminal_run_id: None,
             observer: HeadlessObserver::new(
-                maki_lua::EventHandle::disconnected_for_test(),
-                MakiId::generate(),
+                makima_lua::EventHandle::disconnected_for_test(),
+                MakimaId::generate(),
             ),
         };
         let outcome = || {
             TurnOutcome::completed(
-                maki_agent::AgentId::generate(),
-                maki_agent::TurnId::generate(),
+                makima_agent::AgentId::generate(),
+                makima_agent::TurnId::generate(),
                 TokenUsage::default(),
                 1,
-                maki_agent::DoneReason::EndTurn,
+                makima_agent::DoneReason::EndTurn,
             )
         };
         pump.handle(Envelope {
             event: AgentEvent::TurnOutcome(outcome()),
-            subagent: Some(maki_agent::SubagentInfo {
-                agent_id: maki_agent::AgentId::generate(),
+            subagent: Some(makima_agent::SubagentInfo {
+                agent_id: makima_agent::AgentId::generate(),
                 parent_agent_id: None,
                 parent_tool_use_id: "task".into(),
                 name: "research".into(),
@@ -4189,7 +4194,7 @@ mod tests {
                 out_tx,
             },
             shared: Arc::new(Mutex::new(Shared::new())),
-            read: unbound_coordinator(MakiId::generate()).read(),
+            read: unbound_coordinator(MakimaId::generate()).read(),
             permissions: Arc::new(test_permissions()),
             answer_tx: flume::unbounded().0,
             include_partial_messages: false,
@@ -4200,15 +4205,15 @@ mod tests {
             request_counter: 0,
             terminal_run_id: None,
             observer: HeadlessObserver::new(
-                maki_lua::EventHandle::disconnected_for_test(),
-                MakiId::generate(),
+                makima_lua::EventHandle::disconnected_for_test(),
+                MakimaId::generate(),
             ),
         };
-        let agent_id = maki_agent::AgentId::generate();
-        let turn_id = maki_agent::TurnId::generate();
-        let identity = Some(maki_agent::ActorWorkIdentity::new(
+        let agent_id = makima_agent::AgentId::generate();
+        let turn_id = makima_agent::TurnId::generate();
+        let identity = Some(makima_agent::ActorWorkIdentity::new(
             agent_id,
-            maki_agent::ActorWorkKind::Turn {
+            makima_agent::ActorWorkKind::Turn {
                 operation_id: 0,
                 turn_id,
             },
@@ -4221,7 +4226,7 @@ mod tests {
                     turn_id,
                     TokenUsage::default(),
                     1,
-                    maki_agent::DoneReason::EndTurn,
+                    makima_agent::DoneReason::EndTurn,
                 )),
                 subagent: None,
                 identity,

@@ -4,8 +4,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 
-use maki_agent::tools::{all_builtin_tool_names, is_builtin_tool};
-use maki_config::project::TrustMode;
+use makima_agent::tools::{all_builtin_tool_names, is_builtin_tool};
+use makima_config::project::TrustMode;
 
 use crate::print::OutputFormat;
 

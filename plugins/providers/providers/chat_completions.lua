@@ -7,7 +7,7 @@ local M = {}
 
 local DONE = "[DONE]"
 local TOOL_ID_PREFIX = "call_"
-local UNKNOWN_TOOL = "maki_unknown_tool"
+local UNKNOWN_TOOL = "makima_unknown_tool"
 local STOP_REASONS = { stop = "end_turn", tool_calls = "tool_use", length = "max_tokens" }
 
 local function data_url(source)
@@ -47,7 +47,7 @@ function M.convert_messages(messages, system)
           calls[#calls + 1] = {
             id = block.id,
             type = "function",
-            ["function"] = { name = block.name, arguments = assert(maki.json.encode(block.input)) },
+            ["function"] = { name = block.name, arguments = assert(makima.json.encode(block.input)) },
           }
         end
       end
@@ -181,7 +181,7 @@ function M.stream(response, emit)
     if event.data:match("^%s*(.-)%s*$") == DONE then
       break
     end
-    local chunk = maki.json.decode(event.data)
+    local chunk = makima.json.decode(event.data)
     chunk = type(chunk) == "table" and chunk or {}
     if type(chunk.error) == "table" then
       return nil, codec.frame_error(chunk.error)

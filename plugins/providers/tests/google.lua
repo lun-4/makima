@@ -1,6 +1,6 @@
 local google = require("providers.google")
 local http = require("providers.http")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local KEY_ENV = "GEMINI_API_KEY"
 local BASE = "https://generativelanguage.googleapis.com/v1beta"
@@ -12,11 +12,11 @@ local spec = google.provider()
 
 local function sse(text)
   local chunk = { candidates = { { content = { parts = { { text = text } } }, finishReason = "STOP" } } }
-  return t.response({ "data: " .. assert(maki.json.encode(chunk)) .. "\n\n" })
+  return t.response({ "data: " .. assert(makima.json.encode(chunk)) .. "\n\n" })
 end
 
 local function json(value, opts)
-  return t.response({ assert(maki.json.encode(value)) }, opts)
+  return t.response({ assert(makima.json.encode(value)) }, opts)
 end
 
 local function request(id)
@@ -55,7 +55,7 @@ t.case("stream_sends_key_header_and_gemini_body", function()
   t.eq(sent.headers[KEY_HEADER], "g-1")
   t.eq(sent.headers.Authorization, nil)
   t.eq(sent.headers["Content-Type"], "application/json")
-  local body = maki.json.decode(sent.body)
+  local body = makima.json.decode(sent.body)
   t.eq(body.contents[1].parts[1].text, "hi")
   t.eq(body.systemInstruction.parts[1].text, "sys")
   t.eq(body.generationConfig.maxOutputTokens, 65536)

@@ -6,14 +6,14 @@ local function handler(_input, ctx)
     }
   end
 
-  local ok, err = maki.ui.action("plan_submit")
+  local ok, err = makima.ui.action("plan_submit")
   if not ok then
     return { llm_output = "error: " .. err, is_error = true }
   end
   return { llm_output = "Plan submitted for review." }
 end
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "plan_submit",
   description = [[Submit the finished plan for user review in the interactive UI.
 

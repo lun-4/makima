@@ -175,7 +175,7 @@ function M.reset_text(epoch_ms, now)
     return string.format("Resets in %d hr %d min", hours, minutes)
   end
   local style = delta < 7 * DAY and "weekday" or "date"
-  local ok, formatted = pcall(maki.ui.format_time, epoch_ms, style)
+  local ok, formatted = pcall(makima.ui.format_time, epoch_ms, style)
   return "Resets " .. (ok and formatted or tostring(epoch_ms))
 end
 

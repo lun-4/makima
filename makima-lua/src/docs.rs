@@ -1,0 +1,260 @@
+//! Self-documenting Lua API. `api` modules define functions and userdata
+//! methods with `#[makima_lua_macro::lua_fn]` (Lua name from the fn ident, args
+//! from the signature, `@param`/`@return` tags validated against real
+//! parameters at compile time) and assemble registration plus the `DOCS`
+//! consts with `makima_lua_macro::lua_table!` / `lua_class!`. The few functions
+//! that cannot fit (raw `MultiValue`, Lua chunks, conditional registration)
+//! and `makima.setup` keep hand-written `FnDoc`s. `api_docs()` aggregates
+//! everything for makima-docgen, and the drift test below asserts docs match
+//! the real `makima` global.
+
+pub struct ModuleDoc {
+    /// Dotted path, e.g. "makima.base64". Classes use a type name, e.g.
+    /// "makima.treesitter.Node".
+    pub name: &'static str,
+    pub kind: DocKind,
+    pub desc: &'static str,
+    pub fns: &'static [FnDoc],
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DocKind {
+    /// A real Lua table; the drift test checks its keys.
+    Table,
+    /// Methods on userdata handles; not enumerable, skipped by the drift test.
+    Class,
+}
+
+pub struct FnDoc {
+    pub name: &'static str,
+    /// Argument list in Neovim notation, e.g. "{path}, {opts?}".
+    pub args: &'static str,
+    pub desc: &'static str,
+    pub params: &'static [ParamDoc],
+    /// E.g. "(string) encoded text" or "" when nothing is returned.
+    pub returns: &'static str,
+    /// Lua snippet rendered as a fenced code block, or "" when absent.
+    pub example: &'static str,
+    pub guard: Option<&'static str>,
+}
+
+pub struct ParamDoc {
+    /// E.g. "{path}".
+    pub name: &'static str,
+    /// E.g. "string|buffer".
+    pub ty: &'static str,
+    pub desc: &'static str,
+}
+
+const CONTEXT_DOCS: ModuleDoc = ModuleDoc {
+    name: "LuaCtx",
+    kind: DocKind::Class,
+    desc: "Host-issued invocation context. Tool contexts have delegated authority over the executing agent and allowed descendants. Command/keymap/event contexts have trusted plugin authority over their pinned host target. Authority expires on invocation exit, cancellation or plugin-generation revocation; retaining userdata does not extend it. Unsupported capabilities return nil and an error.",
+    fns: &[
+        FnDoc {
+            name: "agent",
+            args: "",
+            desc: "Resolve the pinned invocation subject, not current UI focus.",
+            params: &[],
+            returns: "(Agent?, string?) Nonowning handle with no authority independent of this context.",
+            example: "",
+            guard: None,
+        },
+        FnDoc {
+            name: "model",
+            args: "",
+            desc: "Read the executing turn's admitted selection. This can differ from Agent:config(ctx).model, which reads committed configuration. Trusted command/event contexts without an executing turn return an unsupported-capability error.",
+            params: &[],
+            returns: "(table?, string?) Complete normalized selection {spec, thinking, fast}; thinking is a setting string or budget integer. Disabled values are off and false.",
+            example: "",
+            guard: None,
+        },
+        FnDoc {
+            name: "mode",
+            args: "",
+            desc: "Read the executing turn's admitted mode. This can differ from Agent:config(ctx).mode, which reads committed configuration. Trusted command/event contexts without an executing turn return an unsupported-capability error.",
+            params: &[],
+            returns: "(string?, string?) Registered mode name.",
+            example: "",
+            guard: None,
+        },
+    ],
+};
+
+pub fn api_docs() -> Vec<&'static ModuleDoc> {
+    use crate::api;
+    vec![
+        &CONTEXT_DOCS,
+        &api::util::setup::DOCS,
+        &api::tool::DOCS,
+        &api::completion::DOCS,
+        &api::perf::DOCS,
+        &api::store::DOCS,
+        &api::autocmd::DOCS,
+        &api::slot::DOCS,
+        &api::agent::DOCS,
+        &api::agent::AGENT_DOCS,
+        &api::agent::REF_DOCS,
+        &api::agent::SUBSCRIPTION_DOCS,
+        &api::agent::TURN_DOCS,
+        &api::r#async::DOCS,
+        &api::r#async::SEMAPHORE_DOCS,
+        &api::r#async::PERMIT_DOCS,
+        &api::base64::DOCS,
+        &api::crypto::DOCS,
+        &api::env::DOCS,
+        &api::r#fn::DOCS,
+        &api::fs::DOCS,
+        &api::host::DOCS,
+        &api::image::DOCS,
+        &api::image::IMAGE_DOCS,
+        &api::interpreter::DOCS,
+        &api::json::DOCS,
+        &api::json::VALIDATOR_DOCS,
+        &api::keymap::DOCS,
+        &api::log::DOCS,
+        &api::r#match::DOCS,
+        &api::mode::DOCS,
+        &api::model::DOCS,
+        &api::net::DOCS,
+        &api::net::send::RESPONSE_DOCS,
+        &api::session::DOCS,
+        &api::session_option::DOCS,
+        &api::provider::DOCS,
+        &crate::credentials::DOCS,
+        &crate::credentials::STORE_DOCS,
+        &crate::ctx::CTX_DOCS,
+        &crate::login_ui::LOGIN_UI_DOCS,
+        &api::usage::DOCS,
+        &api::text::DOCS,
+        &api::time::DOCS,
+        &api::timer::DOCS,
+        &api::treesitter::DOCS,
+        &api::treesitter::language::DOCS,
+        &api::treesitter::query::DOCS,
+        &api::treesitter::query::QUERY_DOCS,
+        &api::treesitter::tree::DOCS,
+        &api::treesitter::node::DOCS,
+        &api::treesitter::language_tree::DOCS,
+        &api::ui::DOCS,
+        &api::ui::win::DOCS,
+        &api::ui::buf::DOCS,
+        &api::uv::DOCS,
+        &api::yaml::DOCS,
+        &api::top::DOCS,
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+
+    use mlua::{Lua, Table, Value};
+
+    use super::{DocKind, api_docs};
+    use crate::api::create_makima_global;
+    use crate::plugin_permissions::PluginPermissions;
+
+    fn resolve_table(makima: &Table, path: &str) -> Table {
+        let mut table = makima.clone();
+        for seg in path.split('.').skip(1) {
+            table = table
+                .get(seg)
+                .unwrap_or_else(|_| panic!("`{path}`: `{seg}` is not a table"));
+        }
+        table
+    }
+
+    fn table_keys(table: &Table) -> BTreeSet<String> {
+        table
+            .pairs::<String, Value>()
+            .map(|pair| pair.unwrap().0)
+            .collect()
+    }
+
+    /// Docs and registration live side by side; this test keeps them equal so
+    /// the generated reference can never drift from the real API.
+    #[test]
+    fn docs_match_registered_api() {
+        let lua = Lua::new();
+        let (ui_tx, _ui_rx) = flume::unbounded();
+        let makima = create_makima_global(
+            &lua,
+            crate::api::PluginLoadContext {
+                pending: Arc::default(),
+                pending_rules: Arc::default(),
+                pending_autocmds: Arc::default(),
+                pending_timers: Arc::new(std::sync::Mutex::new(
+                    crate::api::timer::TimerStore::new(),
+                )),
+                pending_session_options: crate::api::session_option::PendingSessionOptions::new(
+                    Arc::from("docs-test"),
+                    1,
+                ),
+                pending_commands: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                pending_keymaps: Arc::new(std::sync::Mutex::new(
+                    crate::api::keymap::PendingKeymaps::new(),
+                )),
+                pending_store: Arc::new(std::sync::Mutex::new(crate::api::store::Store::default())),
+                pending_options: Arc::new(std::sync::Mutex::new(None)),
+                pending_sources: Arc::new(std::sync::Mutex::new(
+                    crate::api::completion::PendingCompletionStore::default(),
+                )),
+                pending_expanders: Arc::new(std::sync::Mutex::new(
+                    crate::api::completion::PendingExpanderStore::default(),
+                )),
+                pending_slots: Arc::new(std::sync::Mutex::new(
+                    crate::api::slot::SlotStore::default(),
+                )),
+                pending_prompts: Arc::new(std::sync::Mutex::new(
+                    crate::runtime::PromptHintCallbacks::default(),
+                )),
+                pending_hint: Arc::new(std::sync::Mutex::new(None)),
+                pending_providers: Arc::default(),
+            },
+            Arc::from("docs-test"),
+            Arc::from("docs-test"),
+            Some(ui_tx),
+            &PluginPermissions::trusted(),
+            Arc::default(),
+        )
+        .unwrap()
+        .0;
+
+        let mut documented: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for module in api_docs() {
+            if module.kind == DocKind::Table {
+                documented
+                    .entry(module.name)
+                    .or_default()
+                    .extend(module.fns.iter().map(|f| f.name));
+            }
+        }
+        let names: Vec<&str> = documented.keys().copied().collect();
+        for name in names {
+            let Some((parent, key)) = name.rsplit_once('.') else {
+                continue;
+            };
+            documented
+                .get_mut(parent)
+                .unwrap_or_else(|| panic!("`{name}` documented but parent `{parent}` is not"))
+                .insert(key);
+        }
+
+        for (name, mut expected) in documented {
+            let actual = table_keys(&resolve_table(&makima, name));
+            if name == "makima" {
+                // Documented here, but injected later by the runtime.
+                expected.remove("setup");
+                // Handled via metatable __index for __newindex assignment interception.
+                expected.remove("notify");
+            }
+            let expected: BTreeSet<String> = expected.iter().map(|s| s.to_string()).collect();
+            assert_eq!(
+                actual, expected,
+                "documented functions for `{name}` do not match registered keys"
+            );
+        }
+    }
+}

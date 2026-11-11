@@ -28,9 +28,9 @@ jobs:
               - "Cargo.lock"
               - "src/**"
               - "tests/**"
-              - "maki-*/src/**"
-              - "maki-*/benches/**"
-              - "maki-*/tests/**"
+              - "makima-*/src/**"
+              - "makima-*/benches/**"
+              - "makima-*/tests/**"
               - "plugins/**"
               - "justfile"
               - ".github/workflows/rust.yml"
@@ -158,8 +158,8 @@ jobs:
           } finally {
             Remove-Item -LiteralPath $root -Recurse -Force
           }
-      - run: cargo test -p maki-agent --lib tools::offload
-      - run: cargo test -p maki-storage --lib sessions::tests::delete
+      - run: cargo test -p makima-agent --lib tools::offload
+      - run: cargo test -p makima-storage --lib sessions::tests::delete
       - run: just lint
       - run: just build
 

@@ -1,7 +1,7 @@
 local bedrock = require("providers.bedrock")
 local http = require("providers.http")
 local sigv4 = require("providers.sigv4")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local REGION = "us-east-1"
 local HOST = "bedrock-runtime.us-east-1.amazonaws.com"
@@ -34,7 +34,7 @@ local function uint(value, bytes)
 end
 
 local function chunk(event)
-  local payload = assert(maki.json.encode({ bytes = maki.base64.encode(assert(maki.json.encode(event))) }))
+  local payload = assert(makima.json.encode({ bytes = makima.base64.encode(assert(makima.json.encode(event))) }))
   local name, value = ":event-type", "chunk"
   local headers = string.char(#name) .. name .. "\7" .. uint(#value, 2) .. value
   local total = 12 + #headers + #payload + 4
@@ -50,7 +50,7 @@ local function eventstream_text(text)
 end
 
 local function json(value)
-  return t.response({ assert(maki.json.encode(value)) })
+  return t.response({ assert(makima.json.encode(value)) })
 end
 
 local function request(id, tools)
@@ -70,12 +70,12 @@ local function request(id, tools)
 end
 
 local function at(secs, fn)
-  local now = maki.time.now
-  maki.time.now = function()
+  local now = makima.time.now
+  makima.time.now = function()
     return { secs = secs, nanosecs = 0 }
   end
   local ok, err = pcall(fn)
-  maki.time.now = now
+  makima.time.now = now
   if not ok then
     error(err, 0)
   end
@@ -151,8 +151,8 @@ end)
 
 t.case("resolve_reads_the_profile_from_home", function()
   local home = t.mktmpdir("bedrock_home")
-  maki.fs.mkdir(home .. "/.aws")
-  maki.fs.write(home .. "/.aws/credentials", CREDENTIALS_FILE)
+  makima.fs.mkdir(home .. "/.aws")
+  makima.fs.write(home .. "/.aws/credentials", CREDENTIALS_FILE)
   local credentials = resolve({ AWS_REGION = REGION, HOME = home, AWS_PROFILE = "myprofile" })
   t.rmtree(home)
   t.same(credentials, {
@@ -166,7 +166,7 @@ end)
 
 t.case("container_token_file_wins_and_is_trimmed", function()
   local dir = t.mktmpdir("bedrock_token")
-  maki.fs.write(dir .. "/token", "file-token\n")
+  makima.fs.write(dir .. "/token", "file-token\n")
   local credentials, _, ctx = resolve({
     AWS_REGION = REGION,
     AWS_CONTAINER_CREDENTIALS_FULL_URI = CONTAINER_URL,

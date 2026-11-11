@@ -58,10 +58,10 @@ Both install to `%LOCALAPPDATA%\makima` and add it to your user PATH. Override w
 ### Living on the edge (mistress branch)
 
 ```sh
-cargo install --locked --git https://github.com/lun-4/makima.git maki
+cargo install --locked --git https://github.com/lun-4/makima.git makima
 ```
 
-The package is still named `maki`; it installs the `makima` command. Add `--tag v0.5.0` to build a release instead of the latest commit.
+Add `--tag v0.5.0` to build a release instead of the latest commit.
 
 ### With Nix
 
@@ -108,7 +108,7 @@ Main and subagent views use the same input and controls. Messages sent during wo
 
 ```lua
 -- ~/.config/makima/init.lua
-maki.setup({
+makima.setup({
     provider = {
         default_model = "anthropic/claude-sonnet-4-6",
     },

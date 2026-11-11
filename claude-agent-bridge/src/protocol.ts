@@ -1,5 +1,5 @@
-// What the Lua provider posts and receives. Field names follow Maki's provider
-// API (`register_provider` in maki-lua/src/api/provider.rs).
+// What the Lua provider posts and receives. Field names follow Makima's provider
+// API (`register_provider` in makima-lua/src/api/provider.rs).
 
 export const PROTOCOL_VERSION = 1
 
@@ -78,8 +78,8 @@ export type Retry = "rate_limit" | "transient" | "connect" | "timeout" | "none"
 export type EndReason = "cancelled" | "closed" | "compacted" | "rewound"
 export const END_REASONS: readonly EndReason[] = ["cancelled", "closed", "compacted", "rewound"]
 
-// A Maki provider error table. `httpStatus` is only how the bridge answers
-// before the event stream starts; it never reaches Maki.
+// A Makima provider error table. `httpStatus` is only how the bridge answers
+// before the event stream starts; it never reaches Makima.
 export interface ErrorTable {
   message: string
   kind?: "config"

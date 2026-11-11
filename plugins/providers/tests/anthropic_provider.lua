@@ -1,6 +1,6 @@
 local anthropic = require("providers.anthropic_provider")
 local http = require("providers.http")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local KEY_ENV = "ANTHROPIC_API_KEY"
 local ORIGIN = "https://api.anthropic.com"
@@ -23,13 +23,13 @@ local function sse_text(text)
   }
   local frames = {}
   for _, event in ipairs(events) do
-    frames[#frames + 1] = "event: " .. event.type .. "\ndata: " .. assert(maki.json.encode(event)) .. "\n\n"
+    frames[#frames + 1] = "event: " .. event.type .. "\ndata: " .. assert(makima.json.encode(event)) .. "\n\n"
   end
   return t.response({ table.concat(frames) })
 end
 
 local function json(value)
-  return t.response({ assert(maki.json.encode(value)) })
+  return t.response({ assert(makima.json.encode(value)) })
 end
 
 local function request(id, extra)
@@ -99,7 +99,7 @@ t.case("stream_sends_key_version_and_body", function()
   t.eq(header(sent.headers, "x-api-key"), "sk-1")
   t.eq(header(sent.headers, "anthropic-version"), "2023-06-01")
   t.eq(header(sent.headers, "anthropic-beta"), nil)
-  local body = maki.json.decode(sent.body)
+  local body = makima.json.decode(sent.body)
   t.eq(body.model, "claude-sonnet-4-5")
   t.eq(body.stream, true)
   t.eq(body.speed, nil)
@@ -164,16 +164,16 @@ end)
 
 t.case("fast_mode_only_on_capable_models", function()
   local sent = stream({ [KEY_ENV] = "k" }, "claude-opus-4-8", { fast = true })
-  t.eq(maki.json.decode(sent.body).speed, "fast")
+  t.eq(makima.json.decode(sent.body).speed, "fast")
   t.eq(header(sent.headers, "anthropic-beta"), FAST_BETA)
   sent = stream({ [KEY_ENV] = "k" }, "claude-sonnet-4-5", { fast = true })
-  t.eq(maki.json.decode(sent.body).speed, nil)
+  t.eq(makima.json.decode(sent.body).speed, nil)
   t.eq(header(sent.headers, "anthropic-beta"), nil)
 end)
 
 t.case("long_context_strips_the_suffix_and_adds_the_beta", function()
   local sent = stream({ [KEY_ENV] = "k" }, "claude-opus-4-8-1m", { fast = true })
-  t.eq(maki.json.decode(sent.body).model, "claude-opus-4-8")
+  t.eq(makima.json.decode(sent.body).model, "claude-opus-4-8")
   t.eq(header(sent.headers, "anthropic-beta"), FAST_BETA .. "," .. LONG_CONTEXT_BETA)
 end)
 

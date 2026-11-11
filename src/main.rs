@@ -14,9 +14,9 @@ mod command_attachments {
 
     use color_eyre::Result;
     use color_eyre::eyre::eyre;
-    use maki_agent::AgentInput;
-    use maki_commands::{AgentTurn, CommandAttachment};
-    use maki_providers::ImageSource;
+    use makima_agent::AgentInput;
+    use makima_commands::{AgentTurn, CommandAttachment};
+    use makima_providers::ImageSource;
 
     pub(crate) fn from_images(images: &[ImageSource]) -> Arc<[CommandAttachment]> {
         images
@@ -30,11 +30,11 @@ mod command_attachments {
     }
 
     pub(crate) fn into_images(attachments: &[CommandAttachment]) -> Result<Vec<ImageSource>> {
-        maki_agent::command::command_images(attachments).map_err(|error| eyre!(error))
+        makima_agent::command::command_images(attachments).map_err(|error| eyre!(error))
     }
 
     pub(crate) fn agent_input(turn: AgentTurn) -> Result<AgentInput> {
-        maki_agent::command::command_input(turn).map_err(|error| eyre!(error))
+        makima_agent::command::command_input(turn).map_err(|error| eyre!(error))
     }
 }
 
@@ -46,7 +46,7 @@ fn main() {
     // First, before anything can ask for a path: until this runs the state,
     // config, cache and log directories resolve to nothing, which is what
     // keeps a test binary out of the directories a real run reads and writes.
-    maki_storage::paths::init().expect("storage paths must be initialized exactly once");
+    makima_storage::paths::init().expect("storage paths must be initialized exactly once");
     color_eyre::install().ok();
     if let Err(e) = cmd::dispatch(Cli::parse()) {
         print_error(&e);

@@ -4,24 +4,24 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 
-use maki_providers::ProviderRegistry;
-use maki_providers::login::{AuthState, auth_status};
-use maki_providers::model::{Model, ModelTier};
-use maki_storage::StateDir;
-use maki_storage::log::RotatingFileWriter;
-use maki_storage::model::read_model;
+use makima_providers::ProviderRegistry;
+use makima_providers::login::{AuthState, auth_status};
+use makima_providers::model::{Model, ModelTier};
+use makima_storage::StateDir;
+use makima_storage::log::RotatingFileWriter;
+use makima_storage::model::read_model;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
 
-const LOG_ENV: &str = "MAKI_LOG";
+const LOG_ENV: &str = "MAKIMA_LOG";
 const LOG_ENV_SHARED: &str = "RUST_LOG";
 const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::INFO;
 
 pub fn resolve_model(
     providers: &ProviderRegistry,
     explicit: Option<&str>,
-    provider_config: &maki_config::ProviderConfig,
+    provider_config: &makima_config::ProviderConfig,
     storage: &StateDir,
 ) -> Result<Model> {
     let policy = &provider_config.model_policy;
@@ -70,7 +70,7 @@ pub fn resolve_model(
 /// has a model for the tier.
 fn auto_detect_model(
     providers: &ProviderRegistry,
-    policy: &maki_config::ModelPolicy,
+    policy: &makima_config::ModelPolicy,
     storage: &StateDir,
 ) -> Option<Model> {
     let usable: Vec<_> = smol::block_on(auth_status(providers, storage))
@@ -137,11 +137,11 @@ impl<'a> MakeWriter<'a> for SharedWriter {
     }
 }
 
-/// `MAKI_LOG` is ours and is taken literally, `MAKI_LOG=off` included.
+/// `MAKIMA_LOG` is ours and is taken literally, `MAKIMA_LOG=off` included.
 ///
 /// `RUST_LOG` belongs to every Rust program on the machine, and `EnvFilter`
 /// drops any target no directive names, so a `RUST_LOG=other_crate=debug` left
-/// in a shell profile for an unrelated project silenced maki entirely. We still
+/// in a shell profile for an unrelated project silenced makima entirely. We still
 /// read it, and a value that names a level decides ours, but a value that only
 /// lists other people's targets gets our level added underneath, so a foreign
 /// variable can add to our logs and never take them away.
@@ -182,7 +182,7 @@ fn sets_a_level(value: &str) -> bool {
 /// Logging is the first thing to set up and the last thing allowed to stop the
 /// program, but a failure here used to be swallowed whole, so an unwritable log
 /// dir looked exactly like an idle one: no logs, no reason, no clue.
-pub fn init_logging(storage_config: &maki_config::StorageConfig) {
+pub fn init_logging(storage_config: &makima_config::StorageConfig) {
     let writer =
         match RotatingFileWriter::new(storage_config.max_log_bytes, storage_config.max_log_files) {
             Ok(writer) => writer,
@@ -202,7 +202,9 @@ pub fn init_logging(storage_config: &maki_config::StorageConfig) {
 mod tests {
     use test_case::test_case;
 
-    use super::{DEFAULT_LOG_LEVEL, build_log_filter};
+    use makima_storage::paths::APP_NAME;
+
+    use super::{DEFAULT_LOG_LEVEL, LOG_ENV, build_log_filter};
 
     const FOREIGN: &str = "other_crate=debug";
     const FOREIGN_EMPTY_PIECES: &str = ",other_crate=debug,,";
@@ -226,6 +228,11 @@ mod tests {
             rendered.split(',').any(|d| d == expected),
             "{ours:?} + {shared:?} rendered as {rendered:?}, wanted {expected:?}"
         );
+    }
+
+    #[test]
+    fn log_env_is_the_app_name_upper() {
+        assert_eq!(LOG_ENV, format!("{}_LOG", APP_NAME.to_uppercase()));
     }
 
     #[test]

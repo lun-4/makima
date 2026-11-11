@@ -387,7 +387,7 @@ Talks to the server at the `base_url` saved by `makima auth login llama-cpp`, el
 | medium | **sonnet** (default) |  | 200K ctx |
 | strong | **opus** (default) |  | 200K ctx |
 
-Uses your Claude Code login through the Claude Agent SDK. Start the bridge first: `npm install --omit=optional` and then `node src/main.ts` in `claude-agent-bridge/` (Node 24 or later). It runs your installed `claude` with its own tools, settings, hooks, MCP servers and CLAUDE.md files turned off, and offers Claude Maki's tools instead, so Maki's permissions apply to every call. `socket` in the `[claude-agent]` section of `providers.toml` points at a bridge listening elsewhere. Claude Code retries failed requests itself, so Maki does not retry this provider.
+Uses your Claude Code login through the Claude Agent SDK. Start the bridge first: `npm install --omit=optional` and then `node src/main.ts` in `claude-agent-bridge/` (Node 24 or later). It runs your installed `claude` with its own tools, settings, hooks, MCP servers and CLAUDE.md files turned off, and offers Claude Makima's tools instead, so Makima's permissions apply to every call. `socket` in the `[claude-agent]` section of `providers.toml` points at a bridge listening elsewhere. Claude Code retries failed requests itself, so Makima does not retry this provider.
 
 ### Opencode Zen
 

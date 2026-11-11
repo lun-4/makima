@@ -8,19 +8,19 @@ use color_eyre::Result;
 use color_eyre::eyre::{Context, bail};
 use crossterm::style::Stylize;
 
-use maki_agent::command::{self, CustomCommand};
-use maki_agent::tools::ToolRegistry;
-use maki_config::project::{self, ProjectDecision, TrustAnswer, policy_grant};
-use maki_config::{Config, ModelPolicy, ProjectConfig, load_env_files, load_permissions};
-use maki_lua::PluginHost;
-use maki_lua::ui_sink::{HeadlessUi, HostUi};
-use maki_providers::model::{Model, ModelTier};
-use maki_providers::{ProviderRegistry, Timeouts};
-use maki_storage::StateDir;
-use maki_storage::id::MakiId;
-use maki_storage::session_lock;
-use maki_storage::sessions::SESSIONS_DIR;
-use maki_ui::{AppSession, RunOutcome};
+use makima_agent::command::{self, CustomCommand};
+use makima_agent::tools::ToolRegistry;
+use makima_config::project::{self, ProjectDecision, TrustAnswer, policy_grant};
+use makima_config::{Config, ModelPolicy, ProjectConfig, load_env_files, load_permissions};
+use makima_lua::PluginHost;
+use makima_lua::ui_sink::{HeadlessUi, HostUi};
+use makima_providers::model::{Model, ModelTier};
+use makima_providers::{ProviderRegistry, Timeouts};
+use makima_storage::StateDir;
+use makima_storage::id::MakimaId;
+use makima_storage::session_lock;
+use makima_storage::sessions::SESSIONS_DIR;
+use makima_ui::{AppSession, RunOutcome};
 
 use crate::cli::{Cli, normalize_tool_name};
 use crate::setup;
@@ -104,7 +104,7 @@ fn load_config(
         .unwrap_or_default()
         .into_config()
         .context("invalid config")?;
-    maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
+    makima_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
     config.permissions = load_permissions(project_config)?;
 
     if cli.yolo || config.always_yolo {
@@ -157,7 +157,7 @@ fn build_stack(
 ) -> Result<(Stack, Vec<String>)> {
     let mut warnings: Vec<String> = trust.warning.clone().into_iter().collect();
 
-    let command_registry = maki_commands::CommandRegistry::new();
+    let command_registry = makima_commands::CommandRegistry::new();
     let mut plugin_host = PluginHost::with_command_registry(
         Arc::clone(ToolRegistry::global_arc()),
         command_registry,
@@ -258,7 +258,7 @@ fn resolve_session(
 ) -> Result<AppSession> {
     let sessions_dir = storage.ensure_subdir(SESSIONS_DIR)?;
     if let Some(raw) = session_id {
-        let id: MakiId = raw
+        let id: MakimaId = raw
             .parse()
             .map_err(|e| color_eyre::eyre::eyre!("invalid session id {raw:?}: {e}"))?;
         let session = AppSession::load(id, storage).map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
@@ -336,7 +336,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
     let explicit_model = cli.model.is_some();
     let mut apply_explicit_model = explicit_model;
     let storage = StateDir::resolve().context("resolve data directory")?;
-    maki_providers::model_registry::load_from_storage(&storage);
+    makima_providers::model_registry::load_from_storage(&storage);
 
     let mode = cli.trust_mode();
     let mut trust = project::resolve(&storage, &cwd, mode);
@@ -354,7 +354,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
                 TrustAnswer::Trust
             })
             .or_else(|| {
-                (can_ask && stack.config.trust.prompt).then(|| maki_ui::ask_trust(question))
+                (can_ask && stack.config.trust.prompt).then(|| makima_ui::ask_trust(question))
             })
     });
     match answer {
@@ -459,8 +459,8 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
             &stack.config.provider.model_policy,
         );
 
-        let outcome = maki_ui::run(
-            maki_ui::EventLoopParams {
+        let outcome = makima_ui::run(
+            makima_ui::EventLoopParams {
                 cwd: cwd.clone(),
                 model,
                 needs_login: stack.needs_login,
@@ -473,7 +473,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
                 config: stack.config.agent.clone(),
                 ui_config: stack.config.ui.clone(),
                 input_history_size: stack.config.storage.input_history_size,
-                permissions: Arc::new(maki_agent::permissions::PermissionManager::new(
+                permissions: Arc::new(makima_agent::permissions::PermissionManager::new(
                     stack.config.permissions.clone(),
                     cwd.clone(),
                     trust.project_config.clone(),
@@ -571,7 +571,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
 mod tests {
     use super::*;
     use color_eyre::eyre::eyre;
-    use maki_config::RawConfig;
+    use makima_config::RawConfig;
     use std::fs;
     use std::sync::atomic::{AtomicBool, Ordering};
     use test_case::test_case;
@@ -658,7 +658,7 @@ mod tests {
         let session = AppSession::new("anthropic/claude-opus-4-6", "/tmp");
 
         let resolved = restored_session_model(
-            &maki_providers::test_util::offline_ids(&["anthropic", "openai"]),
+            &makima_providers::test_util::offline_ids(&["anthropic", "openai"]),
             &startup,
             &session,
             explicit_model,
@@ -721,14 +721,14 @@ mod tests {
     #[test]
     fn no_plugins_skips_broken_init_lua_but_keeps_host_alive() {
         use clap::Parser;
-        use maki_agent::tools::ToolRegistry;
+        use makima_agent::tools::ToolRegistry;
         use tempfile::tempdir;
 
         let dir = tempdir().expect("tempdir");
-        let maki_dir: PathBuf = dir.path().join(".makima");
-        fs::create_dir_all(&maki_dir).expect("mkdir .makima");
+        let makima_dir: PathBuf = dir.path().join(".makima");
+        fs::create_dir_all(&makima_dir).expect("mkdir .makima");
         fs::write(
-            maki_dir.join("init.lua"),
+            makima_dir.join("init.lua"),
             "error('broken init lua must not run')",
         )
         .expect("write init.lua");
@@ -879,14 +879,14 @@ mod tests {
     #[test]
     fn broken_init_lua_errors_without_no_plugins() {
         use clap::Parser;
-        use maki_agent::tools::ToolRegistry;
+        use makima_agent::tools::ToolRegistry;
         use tempfile::tempdir;
 
         let dir = tempdir().expect("tempdir");
-        let maki_dir: PathBuf = dir.path().join(".makima");
-        fs::create_dir_all(&maki_dir).expect("mkdir .makima");
+        let makima_dir: PathBuf = dir.path().join(".makima");
+        fs::create_dir_all(&makima_dir).expect("mkdir .makima");
         fs::write(
-            maki_dir.join("init.lua"),
+            makima_dir.join("init.lua"),
             "error('broken init lua must not run')",
         )
         .expect("write init.lua");

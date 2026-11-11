@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Measure maki's resident memory under a real session, honestly.
+"""Measure makima's resident memory under a real session, honestly.
 
-Two mistakes make maki memory numbers wrong, and both have burned us:
+Two mistakes make makima memory numbers wrong, and both have burned us:
 
   * Sampling for a fixed wall-clock time. Restoring a session keeps allocating
     long after the first frame paints, so a 22s sample reported a 38% win where
@@ -13,7 +13,7 @@ Two mistakes make maki memory numbers wrong, and both have burned us:
     the spread it actually observed.
 
 Usage:
-    scripts/memprobe.py -s <session-id> -n 5 ./base/maki ./target/debug/maki
+    scripts/memprobe.py -s <session-id> -n 5 ./base/makima ./target/debug/makima
 """
 
 import argparse

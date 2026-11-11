@@ -3,10 +3,10 @@ local DEFAULT_NUM_RESULTS = 8
 
 local parse_sse_response = require("parse_sse")
 local providers = require("providers")
-local ToolView = require("maki.tool_view")
-local output_limits = require("maki.output_limits")
+local ToolView = require("makima.tool_view")
+local output_limits = require("makima.output_limits")
 
-local opts = maki.api.register_options(output_limits.extend({
+local opts = makima.api.register_options(output_limits.extend({
   provider = {
     default = "exa",
     type = "string",
@@ -27,7 +27,7 @@ end
 -- An exported but blank variable is still truthy in lua, and a blank key
 -- means an empty auth header instead of the keyless path that would work.
 local function api_key()
-  local key = (maki.uv.os_getenv(provider.env) or ""):match("^%s*(.-)%s*$")
+  local key = (makima.uv.os_getenv(provider.env) or ""):match("^%s*(.-)%s*$")
   return key ~= "" and key or nil
 end
 
@@ -36,7 +36,7 @@ local function web_view_opts(ctx)
   return { max_lines = (tol and tol.web) or 3, keep = "head" }
 end
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "websearch",
   kind = "fetch",
   permission = "net",
@@ -78,7 +78,7 @@ maki.api.register_tool({
 
     local num_results = input.num_results or DEFAULT_NUM_RESULTS
 
-    local payload, encode_err = maki.json.encode({
+    local payload, encode_err = makima.json.encode({
       jsonrpc = "2.0",
       id = 1,
       method = "tools/call",
@@ -104,7 +104,7 @@ maki.api.register_tool({
     end
     local endpoint = provider.endpoint .. ((not key and provider.keyless_suffix) or "")
 
-    local resp, err = maki.net.request(endpoint, {
+    local resp, err = makima.net.request(endpoint, {
       method = "POST",
       body = payload,
       headers = headers,

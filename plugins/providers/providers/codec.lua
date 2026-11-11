@@ -5,7 +5,7 @@ local M = {}
 
 -- JSON arrays carry mlua's array metatable, which hides behind
 -- `__metatable = false`.
-local ARRAY_MARK = getmetatable(maki.json.decode("[]"))
+local ARRAY_MARK = getmetatable(makima.json.decode("[]"))
 local UNMAPPED_STATUS = 400
 local TOO_MANY_REQUESTS = 429
 local FIRST_SERVER_ERROR = 500
@@ -46,9 +46,9 @@ local TOO_LARGE = 413
 local tool_id_seed
 local tool_id_count = 0
 
--- An empty table that `maki.json.encode` writes as `[]`.
+-- An empty table that `makima.json.encode` writes as `[]`.
 function M.array()
-  return maki.json.decode("[]")
+  return makima.json.decode("[]")
 end
 
 function M.is_array(value)
@@ -155,7 +155,7 @@ end
 
 -- Decodes streamed tool arguments. Anything that is not JSON becomes `{}`.
 function M.tool_input(arguments)
-  local input = maki.json.decode(arguments)
+  local input = makima.json.decode(arguments)
   if input == nil then
     return {}
   end
@@ -166,11 +166,11 @@ end
 -- so a resumed session never mints an id its transcript already holds.
 function M.tool_id(prefix)
   if not tool_id_seed then
-    local now = maki.time.now()
+    local now = makima.time.now()
     tool_id_seed = now.secs .. "." .. now.nanosecs
   end
   tool_id_count = tool_id_count + 1
-  local digest = maki.crypto.sha256(tool_id_seed .. ":" .. tool_id_count):sub(1, TOOL_ID_HEX_BYTES)
+  local digest = makima.crypto.sha256(tool_id_seed .. ":" .. tool_id_count):sub(1, TOOL_ID_HEX_BYTES)
   return prefix .. digest:gsub(".", function(byte)
     return string.format("%02x", string.byte(byte))
   end)

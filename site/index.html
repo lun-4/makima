@@ -1129,25 +1129,25 @@ imports = <span class="fn">set</span>()
     <div class="showcase-header">
       <span>See it in action</span>
       <h2>Lua plugins: hackable all the way down</h2>
-      <p>Every built-in tool, <code>read</code>, <code>bash</code>, <code>edit</code>, even <code>batch</code>, is itself a Lua plugin. Read them in <a href="https://github.com/lun-4/makima/tree/mistress/plugins" target="_blank" rel="noopener"><code>./plugins</code></a>. The <a href="/docs/lua-api/">API</a> mirrors Neovim (<code>maki.fs</code>, <code>maki.uv</code>, <code>maki.keymap</code>, <code>maki.treesitter</code>), so it feels familiar. Drop a file in <code>~/.config/makima/plugins/</code> to add tools, slash commands, keymaps, or UI.</p>
+      <p>Every built-in tool, <code>read</code>, <code>bash</code>, <code>edit</code>, even <code>batch</code>, is itself a Lua plugin. Read them in <a href="https://github.com/lun-4/makima/tree/mistress/plugins" target="_blank" rel="noopener"><code>./plugins</code></a>. The <a href="/docs/lua-api/">API</a> mirrors Neovim (<code>makima.fs</code>, <code>makima.uv</code>, <code>makima.keymap</code>, <code>makima.treesitter</code>), so it feels familiar. Drop a file in <code>~/.config/makima/plugins/</code> to add tools, slash commands, keymaps, or UI.</p>
     </div>
 
     <div class="exec-duo">
       <div class="exec-demo">
         <div class="exec-pane">
           <div class="exec-pane-label">add a ci_status tool: the model checks CI itself</div>
-          <pre><span class="fn">maki.api.register_tool</span>({
+          <pre><span class="fn">makima.api.register_tool</span>({
   name = <span class="st">"ci_status"</span>,
   description = <span class="st">"Latest CI run for this branch"</span>,
   schema = { type = <span class="st">"object"</span>, properties = {} },
   handler = <span class="kw">function</span>()
-    <span class="kw">local</span> res, err = <span class="fn">maki.net.request</span>(
+    <span class="kw">local</span> res, err = <span class="fn">makima.net.request</span>(
       <span class="st">"https://ci.internal/runs/json?branch=main"</span>)
     <span class="kw">if</span> err <span class="kw">then</span>
       <span class="kw">return</span> { llm_output = err, is_error = <span class="kw">true</span> }
     <span class="kw">end</span>
-    <span class="kw">local</span> buf = <span class="fn">maki.ui.buf</span>()
-    <span class="fn">buf:lines</span>(<span class="fn">maki.ui.highlight</span>(res.body, <span class="st">"json"</span>))
+    <span class="kw">local</span> buf = <span class="fn">makima.ui.buf</span>()
+    <span class="fn">buf:lines</span>(<span class="fn">makima.ui.highlight</span>(res.body, <span class="st">"json"</span>))
     <span class="kw">return</span> { llm_output = res.body, body = buf }
   <span class="kw">end</span>,
 })</pre>
@@ -1156,13 +1156,13 @@ imports = <span class="fn">set</span>()
       <div class="exec-demo">
         <div class="exec-pane">
           <div class="exec-pane-label">add /standup: show yesterday's commits</div>
-          <pre><span class="fn">maki.api.register_command</span>({
+          <pre><span class="fn">makima.api.register_command</span>({
   name = <span class="st">"/standup"</span>,
   description = <span class="st">"Yesterday's commits"</span>,
   handler = <span class="kw">function</span>()
-    <span class="kw">local</span> buf = <span class="fn">maki.ui.buf</span>()
-    <span class="kw">local</span> win = <span class="fn">maki.ui.open_win</span>(buf, { title = <span class="st">"standup"</span> })
-    <span class="fn">maki.fn.jobstart</span>(
+    <span class="kw">local</span> buf = <span class="fn">makima.ui.buf</span>()
+    <span class="kw">local</span> win = <span class="fn">makima.ui.open_win</span>(buf, { title = <span class="st">"standup"</span> })
+    <span class="fn">makima.fn.jobstart</span>(
       <span class="st">"git log --since=yesterday --oneline"</span>, {
         on_stdout = <span class="kw">function</span>(_, line) <span class="fn">buf:line</span>(line) <span class="kw">end</span>,
       })

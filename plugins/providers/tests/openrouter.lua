@@ -1,5 +1,5 @@
 local openrouter = require("providers.openrouter")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local KIMI = "moonshotai/kimi-k3"
 

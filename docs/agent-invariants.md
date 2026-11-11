@@ -86,7 +86,7 @@ These invariants cover the actor, manager and agent frontends as they are curren
 60. Terminal child deduplication keys by `(AgentId, TurnId)`, not a task id alone. Reusing a child must allow later distinct turns through.
 61. `ActorWorkIdentity` carries runtime identity through admission, events and settlement. A frontend `run_id` is presentation only and must not become runtime identity, topology, or authorization.
 62. Agents use only the manager's per-outer-session concurrency limit. Do not add a second process-wide turn semaphore.
-63. `maki.async.run` inherits only the originating turn's managed authority. Timer fires intentionally inherit none and must fail closed for managed operations.
+63. `makima.async.run` inherits only the originating turn's managed authority. Timer fires intentionally inherit none and must fail closed for managed operations.
 64. The Lua Agent API and the task plugin may adapt actor state, result text, capture values, and cumulative usage, but they must not become a second lifecycle source.
 65. Durable configuration and history edits follow [durable publication](agent-system.md#durable-publication): the actor commits only after the claim, invalidation before the claim leaves actor, options, host and disk unchanged, and nothing suppresses finalization after it.
 66. SDK and ACP send a turn's terminal result only after its history checkpoint settles. Print publishes through the same path into a writer that saves nothing: its root model, mode and cwd changes apply, and nothing reaches disk.

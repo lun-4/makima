@@ -8,9 +8,9 @@ use std::path::PathBuf;
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
-use maki_agent::tools::ToolRegistry;
-use maki_config::PermissionsConfig;
-use maki_storage::StateDir;
+use makima_agent::tools::ToolRegistry;
+use makima_config::PermissionsConfig;
+use makima_storage::StateDir;
 use tracing::warn;
 
 use crate::cli::{AuthAction, Cli, Command, McpAction, TrustAction};
@@ -26,7 +26,7 @@ fn startup_cwd() -> Result<PathBuf> {
 
 /// Seed `plugins.bash.auto_mode` so the loaded bash plugin classifies every
 /// command. Call after `into_config`, before `load_builtins`.
-pub fn seed_automode(config: &mut maki_config::Config, automode: bool) {
+pub fn seed_automode(config: &mut makima_config::Config, automode: bool) {
     if automode {
         config
             .plugins
@@ -59,7 +59,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Some(Command::Auth { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
-            maki_providers::model_registry::load_from_storage(&storage);
+            makima_providers::model_registry::load_from_storage(&storage);
             let (_host, providers, config) =
                 subcmd::provider_host(&startup_cwd()?, cli.no_plugins, cli.no_jit, trust_mode)?;
             match action {

@@ -9,7 +9,7 @@ import type { EndReason, Event, Message, StepRequest, StepResult } from "./proto
 import { forkPoint, freshRecord } from "./records.ts"
 import type { Record, Records } from "./records.ts"
 import type { Effort, Probe, Session, StartSession } from "./session.ts"
-import { PendingTools } from "./tools.ts"
+import { PendingTools, SERVER_NAME } from "./tools.ts"
 
 export interface Limits {
   // A process stops after this long without a step, unless tools are waiting.
@@ -31,10 +31,10 @@ export const DEFAULT_LIMITS: Limits = {
 }
 
 const MAX_OPERATIONS = 10_000
-const TOOL_SERVER_MISSING = "The Maki tool server did not connect to Claude Code"
+const TOOL_SERVER_MISSING = "The Makima tool server did not connect to Claude Code"
 const NOT_LOGGED_IN = "Claude Code is not logged in. Run `claude auth login` in a terminal."
 
-// Where Maki's step goes while it runs.
+// Where Makima's step goes while it runs.
 export interface StepSink {
   // The step is accepted; later failures arrive as the stream's error frame.
   open(): void
@@ -84,7 +84,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
 
 // The messages after {record.seen} that Claude has not seen. After an
 // interrupt Claude's transcript already holds its partial reply and the
-// cancelled tool results, so Maki's copies of them are left out.
+// cancelled tool results, so Makima's copies of them are left out.
 export function unseen(record: Record, messages: readonly Message[]): Message[] {
   let rest = messages.slice(record.seen)
   const interrupted = record.interrupted
@@ -131,7 +131,7 @@ export class Conversations {
     return this.active.get(id)?.live !== undefined
   }
 
-  // Runs one Maki step. Fails before `sink.open()` for a request the bridge
+  // Runs one Makima step. Fails before `sink.open()` for a request the bridge
   // refuses, and after it for a step that went wrong.
   async step(request: StepRequest, sink: StepSink, signal: AbortSignal): Promise<StepResult> {
     const { conversation_id: id, operation_id, attempt } = request.invocation
@@ -305,7 +305,7 @@ export class Conversations {
 
   private checkToolServer(message: SDKMessage, request: StepRequest): void {
     if (message.type !== "system" || message.subtype !== "init" || request.tools.length === 0) return
-    const connected = message.mcp_servers.some((server) => server.name === "maki" && server.status === "connected")
+    const connected = message.mcp_servers.some((server) => server.name === SERVER_NAME && server.status === "connected")
     if (!connected) throw failure(TOOL_SERVER_MISSING)
   }
 
@@ -402,7 +402,7 @@ export class Conversations {
   }
 
   // A finished step leaves its process running for the next one. One that
-  // waits for tools stays until Maki answers or gives up.
+  // waits for tools stays until Makima answers or gives up.
   private arm(conversation: Conversation): void {
     clearTimeout(conversation.timer)
     if (!conversation.live) return

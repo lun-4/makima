@@ -1,6 +1,6 @@
 local catalog = require("providers.catalog")
 local http = require("providers.http")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local CHAT_API = "https://chat.example.invalid/v1"
 local MESSAGES_API = "https://messages.example.invalid/v1"
@@ -41,12 +41,12 @@ local function index()
 end
 
 local function body(value)
-  return assert(maki.json.encode(value))
+  return assert(makima.json.encode(value))
 end
 
 local function seeded(dir)
   local cache = catalog.new(dir)
-  cache.index, cache.mtime = index(), maki.time.now().secs
+  cache.index, cache.mtime = index(), makima.time.now().secs
   return cache
 end
 
@@ -115,21 +115,21 @@ t.case("refresh_skips_fresh_cache_and_fetches_stale", function()
   local ctx = t.provider_ctx({ t.response({ body({ fresh = { name = "Fresh" } }) }) })
   t.eq(cache:refresh(ctx).chatty.name, "Chatty")
   t.eq(#ctx.requests, 0)
-  cache.mtime = maki.time.now().secs - catalog.TTL_SECS - 1
+  cache.mtime = makima.time.now().secs - catalog.TTL_SECS - 1
   t.eq(cache:refresh(ctx).fresh.name, "Fresh")
   t.eq(ctx.requests[1].url, catalog.URL)
 end)
 
 t.case("refresh_splits_the_catalog_into_index_and_providers", function()
   local root = t.mktmpdir("catalog")
-  local dir = maki.fs.joinpath(root, catalog.CACHE_DIR)
+  local dir = makima.fs.joinpath(root, catalog.CACHE_DIR)
   seeded(dir):refresh(t.provider_ctx({ t.response({ body(index()) }) }), true)
   local reloaded = catalog.new(dir)
   local loaded = reloaded:load()
   t.eq(loaded.chatty.api, CHAT_API)
   t.eq(loaded.chatty.models, nil)
   t.eq(reloaded:model("chatty", "small").attachment, true)
-  local file = maki.json.decode(maki.fs.read(maki.fs.joinpath(dir, "chatty.json")))
+  local file = makima.json.decode(makima.fs.read(makima.fs.joinpath(dir, "chatty.json")))
   t.eq(file.unknown_field.kept, true)
   t.rmtree(root)
 end)
@@ -152,7 +152,7 @@ end)
 
 t.case("load_without_a_file_has_no_catalog", function()
   t.eq(catalog.new(nil):load(), nil)
-  t.eq(catalog.new("/nonexistent/maki/" .. catalog.CACHE_DIR):load(), nil)
+  t.eq(catalog.new("/nonexistent/makima/" .. catalog.CACHE_DIR):load(), nil)
 end)
 
 t.case("discovery_hides_models_without_a_key", function()
@@ -183,7 +183,7 @@ t.case("chat_request_uses_bearer_key_and_prefers_high_effort", function()
   local req = sent(seeded(), "chatty", "vendor/big", { CHATTY_KEY = "k1,k2" }, {}, chat_sse())
   t.eq(req.url, CHAT_API .. "/chat/completions")
   t.eq(req.headers.Authorization, "Bearer k1")
-  local decoded = maki.json.decode(req.body)
+  local decoded = makima.json.decode(req.body)
   t.eq(decoded.model, "vendor/big")
   t.eq(decoded.max_tokens, 32000)
   t.eq(decoded.reasoning_effort, "high")
@@ -196,7 +196,7 @@ t.case("messages_request_uses_api_key_header", function()
   t.eq(req.headers["x-api-key"], "c")
   t.eq(req.headers.Authorization, nil)
   t.eq(req.headers["anthropic-version"], "2023-06-01")
-  local decoded = maki.json.decode(req.body)
+  local decoded = makima.json.decode(req.body)
   t.eq(decoded.model, "sonnet")
   t.eq(decoded.stream, true)
 end)

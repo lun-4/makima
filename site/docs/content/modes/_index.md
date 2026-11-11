@@ -71,11 +71,11 @@ the same call as defining a new mode: it fully replaces the definition.
 
 ## Defining and overriding modes from Lua
 
-The registry lives on the API as `maki.api.mode`. Define a mode or override a
+The registry lives on the API as `makima.api.mode`. Define a mode or override a
 built-in with `define`:
 
 ```lua
-maki.api.mode.define({
+makima.api.mode.define({
   name = "audit",                 -- a new custom mode
   label = "[AUDIT]",
   system_prompt = [[You only review code. You never change it.]],
@@ -88,7 +88,7 @@ Override the built-in plan mode the same way:
 
 ```lua
 -- Replaces the built-in plan directive and toolset.
-maki.api.mode.define({
+makima.api.mode.define({
   name = "plan",
   label = "[PLAN]",
   system_prompt = function(ctx)
@@ -109,9 +109,9 @@ Other methods:
 local agent = ctx:agent()  -- in a command, keymap or tool handler
 agent:config(ctx).mode       -- the agent's mode id: "build", "plan", or a custom name
 agent:set_mode(ctx, "plan")  -- enter a mode; fails if it is not defined
-maki.api.mode.list()         -- all modes as { name, label }
-maki.api.mode.reset("plan")  -- drop a plugin override, restore the built-in
-maki.api.mode.reset()        -- restore every built-in
+makima.api.mode.list()         -- all modes as { name, label }
+makima.api.mode.reset("plan")  -- drop a plugin override, restore the built-in
+makima.api.mode.reset()        -- restore every built-in
 ```
 
 Every committed config change of an agent fires the autocmd `ConfigChanged`, with the agent's mode in `ev.data.mode`. Compare it with the last value you saw to react to mode switches.
@@ -122,7 +122,7 @@ The repositories ship two example plugins that put this together. They are
 bundled and enabled by default; disable the ones you don't want from `init.lua`:
 
 ```lua
-maki.setup({
+makima.setup({
   plugins = {
     mode_plan_override = { enabled = false },
     plan_submit_tool = { enabled = false },

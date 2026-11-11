@@ -1,6 +1,6 @@
 # CONTRIBUTING
 
-Thanks for taking an interest in contributing to maki.
+Thanks for taking an interest in contributing to makima.
 
 Just remember I'd like to keep the project minimal to not become bloat - think if some functionality you need can be done as a Lua plugin, and if not, think about the Lua APIs you need in order to implement the plugin. Do these APIs exist in neovim? If so, shoot up a PR. If the APIs don't exist, open an issue about it, let's discuss.
 

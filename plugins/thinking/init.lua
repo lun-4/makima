@@ -28,7 +28,7 @@ local function render_ladder(active, levels)
       spans[#spans + 1] = { "  ", "dim" }
       col = col + 2
     end
-    local cells = maki.ui.display_width(level)
+    local cells = makima.ui.display_width(level)
     ranges[#ranges + 1] = { first = col, last = col + cells - 1, index = i }
     col = col + cells
     spans[#spans + 1] = { level, (i == active) and "selected" or "item" }
@@ -62,11 +62,11 @@ local function set_thinking(ctx, agent, mode)
   if not committed then
     fail(err)
   end
-  local _, default_err = maki.session.set_default_thinking(committed.thinking)
+  local _, default_err = makima.session.set_default_thinking(committed.thinking)
   if default_err then
-    maki.ui.flash("Thinking: " .. committed.thinking .. " (default not saved: " .. default_err .. ")")
+    makima.ui.flash("Thinking: " .. committed.thinking .. " (default not saved: " .. default_err .. ")")
   else
-    maki.ui.flash("Thinking: " .. committed.thinking .. " (default for new sessions)")
+    makima.ui.flash("Thinking: " .. committed.thinking .. " (default for new sessions)")
   end
 end
 
@@ -75,7 +75,7 @@ local function open_selector(ctx)
   if not agent then
     fail(err)
   end
-  local info, info_err = maki.model.info(selection.spec)
+  local info, info_err = makima.model.info(selection.spec)
   if not info then
     fail(info_err)
   end
@@ -83,11 +83,11 @@ local function open_selector(ctx)
     fail("requires a model that supports it")
   end
 
-  local levels = maki.model.thinking_levels()
+  local levels = makima.model.thinking_levels()
   local cursor = index_of(levels, selection.thinking) or 1
-  local buf = maki.ui.buf()
+  local buf = makima.ui.buf()
 
-  local win = maki.ui.open_win(buf, {
+  local win = makima.ui.open_win(buf, {
     title = "Thinking",
     height = 3,
     footer = {
@@ -136,7 +136,7 @@ local function open_selector(ctx)
   end
 end
 
-maki.api.register_command({
+makima.api.register_command({
   name = "/thinking",
   description = "Set thinking effort (bare opens a selector)",
   tui_only = false,
@@ -148,7 +148,7 @@ maki.api.register_command({
       completion = {
         get_items = function()
           local items = {}
-          for _, level in ipairs(maki.model.thinking_levels()) do
+          for _, level in ipairs(makima.model.thinking_levels()) do
             items[#items + 1] = { label = level, insertion = level }
           end
           return items
@@ -170,9 +170,9 @@ maki.api.register_command({
   end,
 })
 
-maki.keymap.set("n", "<M-t>", function(_, ctx)
+makima.keymap.set("n", "<M-t>", function(_, ctx)
   local ok, err = pcall(open_selector, ctx)
   if not ok then
-    maki.ui.flash(tostring(err))
+    makima.ui.flash(tostring(err))
   end
 end, { desc = "Thinking effort" })

@@ -1,5 +1,5 @@
 local sh = require("sessions_helpers")
-local th = require("maki.test_helpers")
+local th = require("makima.test_helpers")
 
 local case = th.case
 local eq = th.eq
@@ -87,7 +87,7 @@ case("right_selected_focused_wins_over_accent", function()
 end)
 
 case("right_shows_age_for_idle_rows", function()
-  local text, style = sh.right(stored_row({}), false, maki.time.at(NOW))
+  local text, style = sh.right(stored_row({}), false, makima.time.at(NOW))
   eq(text, "0s")
   eq(style, "dim")
 end)
@@ -150,8 +150,8 @@ case("sessions_filter_orders_exact_prefix_and_fuzzy", function()
     stored_row({ id = "prefix", title = "apple" }),
     stored_row({ id = "exact", title = "app" }),
   }
-  local filtered = sh.filter_rows(rows, "app", maki.match.completion, function(left, right)
-    return maki.match.compare(left, right)
+  local filtered = sh.filter_rows(rows, "app", makima.match.completion, function(left, right)
+    return makima.match.compare(left, right)
   end)
   eq(filtered[1].id, "exact")
   eq(filtered[2].id, "prefix")
@@ -196,7 +196,7 @@ case("sessions_filter_clamps_missing_selection", function()
 end)
 
 case("age_buckets", function()
-  local reference = maki.time.at(NOW)
+  local reference = makima.time.at(NOW)
   eq(sh.age(NOW, reference), "0s")
   eq(sh.age(NOW - 5 * MINUTE, reference), "5m 0s")
   eq(sh.age(NOW - 3 * HOUR, reference), "3h 0s")
@@ -333,20 +333,20 @@ end)
 local function picker(events, query, opts)
   opts = opts or {}
   local originals = {
-    buf = maki.ui.buf,
-    open_win = maki.ui.open_win,
-    flash = maki.ui.flash,
-    command = maki.api.register_command,
-    autocmd = maki.api.create_autocmd,
-    keymap = maki.keymap.set,
-    run = maki.async.run,
-    live = maki.session.live,
-    list = maki.session.list,
-    focus = maki.session.focus,
-    title = maki.session.set_title,
-    delete = maki.session.delete,
-    now = maki.time.now,
-    completion = maki.match.completion,
+    buf = makima.ui.buf,
+    open_win = makima.ui.open_win,
+    flash = makima.ui.flash,
+    command = makima.api.register_command,
+    autocmd = makima.api.create_autocmd,
+    keymap = makima.keymap.set,
+    run = makima.async.run,
+    live = makima.session.live,
+    list = makima.session.list,
+    focus = makima.session.focus,
+    title = makima.session.set_title,
+    delete = makima.session.delete,
+    now = makima.time.now,
+    completion = makima.match.completion,
   }
   local command, lines, focused, renamed, closed, deleted
   local clock = { secs = NOW, nanosecs = 0 }
@@ -361,23 +361,23 @@ local function picker(events, query, opts)
       clock.secs = clock.secs + 1
     end
   end
-  maki.time.now = function()
+  makima.time.now = function()
     return { secs = clock.secs, nanosecs = clock.nanosecs }
   end
-  maki.match.completion = function(...)
+  makima.match.completion = function(...)
     match_calls = match_calls + 1
     return originals.completion(...)
   end
-  maki.api.register_command = function(spec)
+  makima.api.register_command = function(spec)
     if spec.name == "/sessions" then
       command = spec.handler
     end
   end
-  maki.api.create_autocmd = function(name, spec)
+  makima.api.create_autocmd = function(name, spec)
     autocmds[name] = spec.callback
   end
-  maki.keymap.set = function() end
-  maki.async.run = function(fn)
+  makima.keymap.set = function() end
+  makima.async.run = function(fn)
     if opts.defer_async then
       async_queue[#async_queue + 1] = fn
     else
@@ -392,22 +392,22 @@ local function picker(events, query, opts)
     list_calls = list_calls + 1
     return opts.rows or { stored_row({ id = "one", title = "first" }), stored_row({ id = "two", title = "second" }) }
   end
-  maki.session.live = session_live
-  maki.session.list = session_list
-  maki.session.focus = function(id)
+  makima.session.live = session_live
+  makima.session.list = session_list
+  makima.session.focus = function(id)
     focused = id
     return true
   end
-  maki.session.set_title = function(spec)
+  makima.session.set_title = function(spec)
     renamed = spec
     return true
   end
-  maki.session.delete = function(id)
+  makima.session.delete = function(id)
     deleted = id
     return true
   end
-  maki.ui.flash = function() end
-  maki.ui.buf = function()
+  makima.ui.flash = function() end
+  makima.ui.buf = function()
     return {
       set_lines = function(_, value)
         lines = value
@@ -421,7 +421,7 @@ local function picker(events, query, opts)
     }
   end
   local step = 0
-  maki.ui.open_win = function()
+  makima.ui.open_win = function()
     return {
       width = opts.width or 80,
       height = 20,
@@ -448,12 +448,12 @@ local function picker(events, query, opts)
     load_plugin()
     command({ values = { query = query } })
   end)
-  maki.ui.buf, maki.ui.open_win, maki.ui.flash = originals.buf, originals.open_win, originals.flash
-  maki.api.register_command, maki.api.create_autocmd = originals.command, originals.autocmd
-  maki.keymap.set, maki.async.run = originals.keymap, originals.run
-  maki.session.live, maki.session.list, maki.session.focus = originals.live, originals.list, originals.focus
-  maki.session.set_title, maki.session.delete = originals.title, originals.delete
-  maki.time.now, maki.match.completion = originals.now, originals.completion
+  makima.ui.buf, makima.ui.open_win, makima.ui.flash = originals.buf, originals.open_win, originals.flash
+  makima.api.register_command, makima.api.create_autocmd = originals.command, originals.autocmd
+  makima.keymap.set, makima.async.run = originals.keymap, originals.run
+  makima.session.live, makima.session.list, makima.session.focus = originals.live, originals.list, originals.focus
+  makima.session.set_title, makima.session.delete = originals.title, originals.delete
+  makima.time.now, makima.match.completion = originals.now, originals.completion
   assert(ok, tostring(err))
   return focused,
     renamed,
@@ -465,14 +465,14 @@ local function picker(events, query, opts)
       counts = snapshot_counts,
       timeouts = timeouts,
       flush_async = function()
-        local saved_list, saved_live = maki.session.list, maki.session.live
-        maki.session.list, maki.session.live = session_list, session_live
+        local saved_list, saved_live = makima.session.list, makima.session.live
+        makima.session.list, makima.session.live = session_list, session_live
         local queued = async_queue
         async_queue = {}
         for _, fn in ipairs(queued) do
           fn()
         end
-        maki.session.list, maki.session.live = saved_list, saved_live
+        makima.session.list, makima.session.live = saved_list, saved_live
       end,
     }
 end
@@ -534,7 +534,7 @@ case("clicking_delete_confirmation_deletes_instead_of_opening", function()
           if span[1]:find("again to delete", 1, true) then
             return { type = "click", row = row, col = col + 2 }
           end
-          col = col + maki.ui.display_width(span[1])
+          col = col + makima.ui.display_width(span[1])
         end
       end
       error("missing delete confirmation")
@@ -546,7 +546,7 @@ case("clicking_delete_confirmation_deletes_instead_of_opening", function()
 end)
 
 case("right_preserves_current_and_open_labels", function()
-  local reference = maki.time.at(NOW)
+  local reference = makima.time.at(NOW)
   local current, current_style = sh.right(live_row({ id = "a1" }), false, reference)
   eq(current, "current")
   eq(current_style, "accent")
@@ -599,7 +599,7 @@ case("sessions_delete_hit_columns_follow_age_layout", function()
             if span[1]:find("again to delete", 1, true) then
               return { type = "click", row = row, col = col + 2 }
             end
-            col = col + maki.ui.display_width(span[1])
+            col = col + makima.ui.display_width(span[1])
           end
         end
         error("missing delete confirmation: " .. all_text(lines))

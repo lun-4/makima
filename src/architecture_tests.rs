@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use tree_sitter::{Node, Parser};
 
-const FRONTEND_ROOTS: &[&str] = &["maki-ui/src", "maki-acp/src", "src"];
+const FRONTEND_ROOTS: &[&str] = &["makima-ui/src", "makima-acp/src", "src"];
 const SOURCE_SCAN_ERROR: &str = "failed to scan production Rust sources";
 const FORBIDDEN_FRONTEND_CALLS: &[&str] = &["create_producer", "register_commands"];
 const FORBIDDEN_FRONTEND_IDENTIFIERS: &[&str] = &[
@@ -62,7 +62,7 @@ const PROVIDER_IDS: &[&str] = &[
 const VENDOR_MODEL_PREFIXES: &[&str] = &["claude-", "gpt-", "gemini-"];
 const VENDOR_ENV_PREFIXES: &[&str] = &["AWS_", "CLAUDE_", "GEMINI_"];
 const PROVIDER_MODULES: &str = "plugins/providers/providers";
-const SHARED_HOSTS: &[&str] = &["localhost", "makima.ln4.net", "maki.sh"];
+const SHARED_HOSTS: &[&str] = &["localhost", "makima.ln4.net"];
 const NON_PROVIDER_HOST_VALUES: &[&str] = &[
     "Rewrite bash commands with [rtk](https://github.com/rtk-ai/rtk) when it is installed",
     "https://api.github.com/repos/lun-4/makima/releases/latest",
@@ -113,7 +113,7 @@ fn rust_frontends_do_not_own_usage_presentation() {
         Path::new("plugins/usage/init.lua").is_file(),
         "bundled usage plugin is missing"
     );
-    for source in production_sources(&["maki-ui/src", "maki-agent/src", "maki-commands/src"])
+    for source in production_sources(&["makima-ui/src", "makima-agent/src", "makima-commands/src"])
         .expect(SOURCE_SCAN_ERROR)
     {
         let path = source.path.to_string_lossy();
@@ -132,7 +132,7 @@ fn rust_frontends_do_not_own_usage_presentation() {
 
 #[test]
 fn acp_is_command_agnostic_proxy() {
-    for source in production_sources(&["maki-acp/src"]).expect(SOURCE_SCAN_ERROR) {
+    for source in production_sources(&["makima-acp/src"]).expect(SOURCE_SCAN_ERROR) {
         let path = source.path.to_string_lossy();
         for identifier in FORBIDDEN_ACP_IDENTIFIERS {
             assert!(
@@ -242,23 +242,23 @@ fn rust_source_names_no_provider() {
 }
 
 #[test]
-fn maki_commands_dependency_direction_is_neutral() {
-    let manifest = fs::read_to_string("maki-commands/Cargo.toml").unwrap();
+fn makima_commands_dependency_direction_is_neutral() {
+    let manifest = fs::read_to_string("makima-commands/Cargo.toml").unwrap();
     for dependency in [
-        "maki-agent",
-        "maki-ui",
-        "maki-acp",
-        "maki-lua",
-        "maki-providers",
-        "maki-config",
-        "maki-storage",
+        "makima-agent",
+        "makima-ui",
+        "makima-acp",
+        "makima-lua",
+        "makima-providers",
+        "makima-config",
+        "makima-storage",
     ] {
         assert!(
             !manifest.lines().any(|line| {
                 line.split_once('=')
                     .is_some_and(|(name, _)| name.trim() == dependency)
             }),
-            "maki-commands depends on `{dependency}`"
+            "makima-commands depends on `{dependency}`"
         );
     }
 }

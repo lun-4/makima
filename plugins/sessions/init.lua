@@ -4,8 +4,8 @@
 -- while background agents keep working. A session open in another terminal
 -- is greyed out and cannot be opened from here.
 
-local TextInput = require("maki.text_input")
-local Spans = require("maki.spans")
+local TextInput = require("makima.text_input")
+local Spans = require("makima.spans")
 local Helpers = require("sessions_helpers")
 
 local FILTER_PREFIX = "❯ "
@@ -112,8 +112,8 @@ end
 local function apply_filter()
   local prev_pos = sel_index() or 1
   local query = board.input:value()
-  board.items = Helpers.filter_rows(board.all, query, maki.match.completion, function(left, right)
-    return maki.match.compare(left, right)
+  board.items = Helpers.filter_rows(board.all, query, makima.match.completion, function(left, right)
+    return makima.match.compare(left, right)
   end)
   board.sel_id = Helpers.reconcile_selection(board.sel_id, prev_pos, board.items)
 end
@@ -124,7 +124,7 @@ local function filter_changed()
 end
 
 local function dispw(s)
-  return maki.ui.display_width(s)
+  return makima.ui.display_width(s)
 end
 
 local function record_age_bucket(reference)
@@ -132,11 +132,11 @@ local function record_age_bucket(reference)
 end
 
 local function age_bucket_changed()
-  return board.age_secs ~= maki.time.now().secs
+  return board.age_secs ~= makima.time.now().secs
 end
 
 local function age_timeout_ms()
-  local now = maki.time.now()
+  local now = makima.time.now()
   local remaining = NANOS_PER_SEC - now.nanosecs
   return math.max(1, math.min(math.ceil(remaining / NANOS_PER_MS), STATUS_POLL_MS))
 end
@@ -145,7 +145,7 @@ local function render()
   local lines = {}
   board.confirm_columns = {}
   local inner = board.width - 4
-  local reference = maki.time.now()
+  local reference = makima.time.now()
   record_age_bucket(reference)
   board.age_visible = false
   local rights, statuses, counts = {}, {}, {}
@@ -238,12 +238,12 @@ end
 -- board is still current.
 local function refresh()
   local this_board = board
-  local live, live_err = maki.session.live()
+  local live, live_err = makima.session.live()
   if board ~= this_board then
     return
   end
   if live_err then
-    maki.ui.flash(live_err)
+    makima.ui.flash(live_err)
     render()
     return
   end
@@ -321,12 +321,12 @@ local function open_selected()
   end
   if not s.focused then
     if not Helpers.can_open(s) then
-      maki.ui.flash(OPEN_ELSEWHERE_MSG)
+      makima.ui.flash(OPEN_ELSEWHERE_MSG)
       return
     end
-    local _, err = maki.session.focus(s.id)
+    local _, err = makima.session.focus(s.id)
     if err then
-      maki.ui.flash(err)
+      makima.ui.flash(err)
       return
     end
   end
@@ -334,9 +334,9 @@ local function open_selected()
 end
 
 local function open_blank()
-  local _, err = maki.session.new({ focus = true })
+  local _, err = makima.session.new({ focus = true })
   if err then
-    maki.ui.flash(err)
+    makima.ui.flash(err)
     return
   end
   close()
@@ -348,7 +348,7 @@ local function delete_selected()
     return
   end
   if s.focused then
-    maki.ui.flash(DELETE_FOCUSED_HINT)
+    makima.ui.flash(DELETE_FOCUSED_HINT)
     return
   end
   if board.confirm ~= s.id then
@@ -357,9 +357,9 @@ local function delete_selected()
     return
   end
   board.confirm = nil
-  local _, err = maki.session.delete(s.id)
+  local _, err = makima.session.delete(s.id)
   if err then
-    maki.ui.flash(err)
+    makima.ui.flash(err)
     return
   end
   board.deleted[s.id] = true
@@ -396,9 +396,9 @@ local function commit_rename()
   if title == "" then
     return
   end
-  local _, err = maki.session.set_title({ id = id, title = title })
+  local _, err = makima.session.set_title({ id = id, title = title })
   if err then
-    maki.ui.flash(err)
+    makima.ui.flash(err)
   else
     local si = find_stored(id)
     if si then
@@ -469,8 +469,8 @@ local function open(query)
   if board then
     return
   end
-  local buf = maki.ui.buf()
-  local win = maki.ui.open_win(buf, {
+  local buf = makima.ui.buf()
+  local win = makima.ui.open_win(buf, {
     title = " Sessions ",
     width = "70%",
     height = "70%",
@@ -504,13 +504,13 @@ local function open(query)
   -- in once it lands.
   refresh()
   local this_board = board
-  maki.async.run(function()
-    local stored, err = maki.session.list()
+  makima.async.run(function()
+    local stored, err = makima.session.list()
     if board ~= this_board then
       return
     end
     if err then
-      maki.ui.flash(err)
+      makima.ui.flash(err)
       stored = {}
     end
     -- A delete may have landed while the scan was in flight; never let the
@@ -575,16 +575,16 @@ end
 -- closed, so the flash names the session and where to find it. The open
 -- board refreshes on the next tick of its recv loop.
 local last_status = {}
-maki.api.create_autocmd("SessionStatusChanged", {
+makima.api.create_autocmd("SessionStatusChanged", {
   callback = function(ev)
     local d = ev.data or {}
     local prev = last_status[d.session_id]
     last_status[d.session_id] = d.status
     if not d.focused then
       if d.status == "needs_input" then
-        maki.ui.flash("◆ " .. d.title .. " needs input · /sessions")
+        makima.ui.flash("◆ " .. d.title .. " needs input · /sessions")
       elseif d.status == "idle" and prev == "working" then
-        maki.ui.flash("✓ " .. d.title .. " finished · /sessions")
+        makima.ui.flash("✓ " .. d.title .. " finished · /sessions")
       end
     end
     if board then
@@ -593,7 +593,7 @@ maki.api.create_autocmd("SessionStatusChanged", {
   end,
 })
 
-maki.api.register_command({
+makima.api.register_command({
   name = "/sessions",
   description = "Browse and switch sessions",
   arguments = {
@@ -605,14 +605,14 @@ maki.api.register_command({
   end,
 })
 
-maki.api.create_autocmd("SessionPickerRequested", {
+makima.api.create_autocmd("SessionPickerRequested", {
   callback = function()
     open()
   end,
 })
-maki.keymap.set("n", "<C-p>", open, { desc = "Browse sessions" })
+makima.keymap.set("n", "<C-p>", open, { desc = "Browse sessions" })
 
-maki.api.register_command({
+makima.api.register_command({
   name = "/rename",
   description = "Rename the current session",
   arguments = { raw = true, required = true },
@@ -620,15 +620,15 @@ maki.api.register_command({
   handler = function(opts, ctx)
     local title = opts.args:match("^%s*(.-)%s*$")
     if title == "" then
-      maki.ui.flash(RENAME_USAGE)
+      makima.ui.flash(RENAME_USAGE)
       return
     end
     local id, err = ctx and ctx:session_id()
     if not id then
-      maki.ui.flash(err or "no session")
+      makima.ui.flash(err or "no session")
       return
     end
-    local _, set_err = maki.session.set_title({ id = id, title = title })
-    maki.ui.flash(set_err or ('Renamed to "' .. title .. '"'))
+    local _, set_err = makima.session.set_title({ id = id, title = title })
+    makima.ui.flash(set_err or ('Renamed to "' .. title .. '"'))
   end,
 })

@@ -32,7 +32,7 @@ local BASE_URL_KEY = "base_url"
 local HOST_PROMPT = "%s host URL"
 
 local function host(def, config)
-  local value = config.base_url or maki.uv.os_getenv(def.host_env)
+  local value = config.base_url or makima.uv.os_getenv(def.host_env)
   return value ~= "" and value or nil
 end
 

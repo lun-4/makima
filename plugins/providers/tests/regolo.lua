@@ -1,6 +1,6 @@
 local regolo = require("providers.regolo")
 local compat = require("providers.openai_compat")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local MODEL_GROUPS = [[{"data":[
   {"model_group": "glm5.2", "mode": "chat", "input_cost_per_token": 2e-06, "output_cost_per_token": 5.2e-06,
@@ -36,7 +36,7 @@ local function near(actual, expected)
 end
 
 local function join(ids)
-  return regolo.join(ids, maki.json.decode(MODEL_GROUPS).data)
+  return regolo.join(ids, makima.json.decode(MODEL_GROUPS).data)
 end
 
 t.case("group_metadata_maps_to_descriptors", function()
@@ -116,7 +116,7 @@ t.case("usage_queries_today_at_the_root", function()
   t.eq(#usage.limits, 2)
   t.eq(usage.by_model_today, nil)
   t.eq(ctx.requests[1].url, "https://api.regolo.ai/key/info")
-  local day = maki.time.now().secs
+  local day = makima.time.now().secs
   assert(ctx.requests[2].url:find("/global/activity?start_date=", 1, true))
   assert(ctx.requests[3].url:find("/spend/logs/v2?start_date=", 1, true))
   assert(day > 0)

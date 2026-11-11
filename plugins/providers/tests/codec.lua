@@ -1,5 +1,5 @@
 local codec = require("providers.codec")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 -- Each refusal is a documented server message; the comment names its source.
 local OVERFLOW_CASES = {

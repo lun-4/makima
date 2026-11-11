@@ -2,8 +2,8 @@ local SKILL_FILE = "SKILL.md"
 local NOT_FOUND = "skill not found: "
 local REFERENCE_FILE = "lua-api.md"
 local REFERENCE_UNAVAILABLE = "(unavailable; full reference inlined below)"
-local shorten_path = require("maki.shorten_path")
-local ToolView = require("maki.tool_view")
+local shorten_path = require("makima.shorten_path")
+local ToolView = require("makima.tool_view")
 local helpers = require("skill_helpers")
 local parse_frontmatter = helpers.parse_frontmatter
 local build_skill_list = helpers.build_skill_list
@@ -22,14 +22,14 @@ local GLOBAL_SKILL_DIRS = {
 }
 
 local function scan_skill_dir(dir, skills)
-  local entries = maki.fs.dir(dir)
+  local entries = makima.fs.dir(dir)
   if not entries then
     return
   end
   for _, entry in ipairs(entries) do
     if entry[2] == "directory" then
-      local skill_path = maki.fs.joinpath(dir, entry[1], SKILL_FILE)
-      local content = maki.fs.read(skill_path)
+      local skill_path = makima.fs.joinpath(dir, entry[1], SKILL_FILE)
+      local content = makima.fs.read(skill_path)
       if content then
         local fm, body = parse_frontmatter(content)
         if body and #body > 0 then
@@ -49,50 +49,50 @@ end
 local function find_project_ancestors(cwd)
   -- Callers without a tool ctx (the completion source, the expander) have no
   -- session cwd to pass, so they fall back to the process cwd.
-  cwd = cwd or maki.uv.cwd()
+  cwd = cwd or makima.uv.cwd()
   if not cwd then
     return {}
   end
   local dirs = { cwd }
-  if maki.fs.metadata(maki.fs.joinpath(cwd, ".git")) then
+  if makima.fs.metadata(makima.fs.joinpath(cwd, ".git")) then
     return dirs
   end
-  for _, parent in ipairs(maki.fs.parents(cwd)) do
+  for _, parent in ipairs(makima.fs.parents(cwd)) do
     dirs[#dirs + 1] = parent
-    if maki.fs.metadata(maki.fs.joinpath(parent, ".git")) then
+    if makima.fs.metadata(makima.fs.joinpath(parent, ".git")) then
       break
     end
   end
   return dirs
 end
 
-local opts = maki.api.register_options({
-  plugin_dev = { default = true, desc = "Offer the builtin maki-plugin-dev skill for writing maki plugins." },
+local opts = makima.api.register_options({
+  plugin_dev = { default = true, desc = "Offer the builtin makima-plugin-dev skill for writing makima plugins." },
 })
 
 local ok, builtin, reference = pcall(function()
   return require("plugin_dev"), require("plugin_dev_reference")
 end)
 if not ok then
-  maki.log.warn("builtin plugin_dev skill unavailable: " .. tostring(builtin))
+  makima.log.warn("builtin plugin_dev skill unavailable: " .. tostring(builtin))
   builtin = nil
 end
 
 local function resolve_builtin_content()
-  local state = maki.env.state_dir()
+  local state = makima.env.state_dir()
   if state then
-    local dir = maki.fs.joinpath(state, "docs")
-    local path = maki.fs.joinpath(dir, REFERENCE_FILE)
-    local _, err = maki.fs.mkdir(dir, { parents = true })
+    local dir = makima.fs.joinpath(state, "docs")
+    local path = makima.fs.joinpath(dir, REFERENCE_FILE)
+    local _, err = makima.fs.mkdir(dir, { parents = true })
     if not err then
-      _, err = maki.fs.atomic_write(path, reference.content)
+      _, err = makima.fs.atomic_write(path, reference.content)
     end
     if not err then
       return (builtin.content:gsub(builtin.reference_placeholder, function()
         return path
       end))
     end
-    maki.log.warn("failed to write lua api reference to " .. path .. ": " .. tostring(err))
+    makima.log.warn("failed to write lua api reference to " .. path .. ": " .. tostring(err))
   end
   local content = builtin.content:gsub(builtin.reference_placeholder, REFERENCE_UNAVAILABLE)
   return content .. "\n---\n\n" .. reference.content
@@ -111,23 +111,23 @@ local function discover_skills(cwd)
     }
   end
 
-  local config = maki.env.config_dir()
+  local config = makima.env.config_dir()
   if config then
-    scan_skill_dir(maki.fs.joinpath(config, "skills"), skills)
+    scan_skill_dir(makima.fs.joinpath(config, "skills"), skills)
   end
 
-  local home = maki.uv.os_homedir()
+  local home = makima.uv.os_homedir()
   if home then
     for _, rel in ipairs(GLOBAL_SKILL_DIRS) do
-      scan_skill_dir(maki.fs.joinpath(home, rel), skills)
+      scan_skill_dir(makima.fs.joinpath(home, rel), skills)
     end
   end
 
-  local no_project = maki.env.no_project()
+  local no_project = makima.env.no_project()
   for _, ancestor in ipairs(find_project_ancestors(cwd)) do
     for _, rel in ipairs(PROJECT_SKILL_DIRS) do
       if not (no_project and rel == MAKIMA_SKILL_DIR) then
-        scan_skill_dir(maki.fs.joinpath(ancestor, rel), skills)
+        scan_skill_dir(makima.fs.joinpath(ancestor, rel), skills)
       end
     end
   end
@@ -135,13 +135,13 @@ local function discover_skills(cwd)
   return skills
 end
 
-local boot_skills = discover_skills(maki.uv.cwd())
+local boot_skills = discover_skills(makima.uv.cwd())
 local description = "Load a skill that provides instructions and workflows for specific tasks."
   .. build_skill_list(boot_skills)
 
 local function format_skill(content, location)
   local lines = {}
-  for i, line in ipairs(maki.split(content, "\n")) do
+  for i, line in ipairs(makima.split(content, "\n")) do
     lines[#lines + 1] = string.format("%4d | %s", i, line)
   end
   return location .. "\n" .. table.concat(lines, "\n")
@@ -149,7 +149,7 @@ end
 
 -- One body builder for the handler and restore, so both render alike.
 local function build_skill_view(content, location, ctx)
-  local buf = maki.ui.buf()
+  local buf = makima.ui.buf()
   local tol = ctx:tool_output_lines()
   local view = ToolView.new(buf, {
     max_lines = (tol and tol.other) or 20,
@@ -169,7 +169,7 @@ local function build_skill_view(content, location, ctx)
   return buf
 end
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "skill",
   kind = "read",
   description = description,
@@ -219,7 +219,7 @@ maki.api.register_tool({
     local formatted = format_skill(skill.content, skill.location)
 
     local short = shorten_path(skill.location)
-    local header_buf = maki.ui.buf()
+    local header_buf = makima.ui.buf()
     header_buf:line({ { short, "path" } })
 
     return {
@@ -232,7 +232,7 @@ maki.api.register_tool({
   end,
 })
 
-maki.api.register_completion_source("skill", {
+makima.api.register_completion_source("skill", {
   get_items = function(_ctx)
     local skills = discover_skills()
     local items = {}
@@ -257,12 +257,12 @@ local function expand_skill(ref)
   return nil, "unknown skill: " .. value
 end
 
-maki.api.register_expander("skill", expand_skill)
-maki.api.register_expander("s", expand_skill)
+makima.api.register_expander("skill", expand_skill)
+makima.api.register_expander("s", expand_skill)
 
 -- `after_instructions` is a system-only slot, so this teaches the main agent
 -- what the token means without costing subagent prompts any tokens.
-maki.api.register_prompt_hint({
+makima.api.register_prompt_hint({
   slot = "after_instructions",
   content = "A `<skill:name>` token in a user message (typed as `@skill:name`) requests that skill: load it with the skill tool before answering.",
 })

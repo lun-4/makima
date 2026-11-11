@@ -42,7 +42,7 @@ function M.convert_input(messages)
             type = "function_call",
             call_id = block.id,
             name = block.name,
-            arguments = assert(maki.json.encode(block.input)),
+            arguments = assert(makima.json.encode(block.input)),
           }
         end
       end
@@ -108,7 +108,7 @@ local function arguments(value)
   if type(value) == "string" then
     return value
   elseif type(value) == "table" and not codec.is_array(value) then
-    return maki.json.encode(value) or ""
+    return makima.json.encode(value) or ""
   end
   return ""
 end
@@ -181,7 +181,7 @@ function M.stream(response, emit)
       end
       break
     end
-    local data = maki.json.decode(event.data)
+    local data = makima.json.decode(event.data)
     local valid = data ~= nil
     data = type(data) == "table" and data or {}
     local kind = event.event == "message" and data.type or event.event

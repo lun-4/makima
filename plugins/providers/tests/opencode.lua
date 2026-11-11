@@ -1,7 +1,7 @@
 local catalog = require("providers.catalog")
 local http = require("providers.http")
 local opencode = require("providers.opencode")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local ZEN_API = "https://opencode.example.invalid/zen/v1"
 local GO_API = "https://opencode.example.invalid/go/v1"
@@ -18,7 +18,7 @@ local GATED_ERROR =
 
 -- What `[opencode]` holds, which Go reads `enable_free_models` from.
 local zen_section = {}
-maki.api.provider_config = function(id)
+makima.api.provider_config = function(id)
   return id == opencode.ZEN.id and zen_section or nil
 end
 
@@ -32,7 +32,7 @@ end
 
 local function cache()
   local result = catalog.new(nil)
-  result.mtime = maki.time.now().secs
+  result.mtime = makima.time.now().secs
   result.index = {
     opencode = {
       name = "OpenCode",
@@ -154,7 +154,7 @@ t.case("opencode_go_stream_sends_session_header", function()
   t.eq(req.url, GO_API .. "/chat/completions")
   t.eq(req.headers.Authorization, "Bearer k")
   t.eq(req.headers[opencode.SESSION_HEADER], SESSION)
-  t.eq(maki.json.decode(req.body).model, "paid")
+  t.eq(makima.json.decode(req.body).model, "paid")
   req = streamed(opencode.ZEN, "paid", { OPENCODE_API_KEY = "k" })
   t.eq(req.headers[opencode.SESSION_HEADER], nil)
 end)
@@ -169,7 +169,7 @@ t.case("zen_sends_catalog_prefixed_models_to_that_provider", function()
   t.eq(req.url, NVIDIA_API .. "/chat/completions")
   t.eq(req.headers.Authorization, "Bearer n")
   t.eq(req.headers[opencode.SESSION_HEADER], nil)
-  t.eq(maki.json.decode(req.body).model, "openai/gpt-oss-120b")
+  t.eq(makima.json.decode(req.body).model, "openai/gpt-oss-120b")
   local saved_ctx, saved_instance, saved_err = prepare(
     opencode.ZEN,
     "nvidia/openai/gpt-oss-120b",
@@ -187,11 +187,11 @@ end)
 t.case("own_prefix_names_the_own_model", function()
   local req = streamed(opencode.ZEN, "opencode/paid", { OPENCODE_API_KEY = "k" })
   t.eq(req.url, ZEN_API .. "/chat/completions")
-  t.eq(maki.json.decode(req.body).model, "paid")
+  t.eq(makima.json.decode(req.body).model, "paid")
 end)
 
 t.case("go_usage_maps_lanes_to_windows", function()
-  local usage = opencode.parse_usage(maki.json.decode(SAMPLE_USAGE))
+  local usage = opencode.parse_usage(makima.json.decode(SAMPLE_USAGE))
   t.same(usage.limits, {
     { kind = { Hours = 5 }, percentage = 1, reset_at = ROLLING_RESET_MS },
     { kind = { Weekly = {} }, percentage = 4, reset_at = WEEKLY_RESET_MS },

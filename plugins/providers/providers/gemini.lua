@@ -28,7 +28,7 @@ end
 -- A tool result as a `functionResponse.response` object: JSON objects as
 -- they are, anything else under `result`, errors wrapped in `error`.
 local function tool_response(block)
-  local value = maki.json.decode(block.content)
+  local value = makima.json.decode(block.content)
   if value == nil then
     value = block.content
   end
@@ -221,7 +221,7 @@ function M.stream(response, emit)
       end
       break
     end
-    local chunk = maki.json.decode(event.data)
+    local chunk = makima.json.decode(event.data)
     chunk = type(chunk) == "table" and chunk or {}
     if type(chunk.usageMetadata) == "table" then
       usage = parse_usage(chunk.usageMetadata)

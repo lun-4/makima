@@ -1,6 +1,6 @@
 local mistral = require("providers.mistral")
 local compat = require("providers.openai_compat")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local function thinking_block(text)
   return { type = "thinking", thinking = { { type = "text", text = text } } }

@@ -18,7 +18,7 @@ function M.parse_verdict(text)
   if type(text) ~= "string" then
     return "error", nil, "verdict is not text"
   end
-  local ok, decoded = pcall(maki.json.decode, text)
+  local ok, decoded = pcall(makima.json.decode, text)
   if not ok or not decoded then
     return "error", nil, "verdict is not valid JSON"
   end
@@ -70,7 +70,7 @@ local classifier_verdict_tool = {
 }
 
 local function default_spawn(ctx, opts)
-  return maki.agent.spawn(ctx, M.spawn_opts(opts))
+  return makima.agent.spawn(ctx, M.spawn_opts(opts))
 end
 
 -- Explicit tools prevent the classifier from inheriting request tools.
@@ -119,7 +119,7 @@ function M.classify_verdict(command, cwd, opts, ctx, spawn)
   end
   local encoded
   if result and result.captured then
-    encoded = maki.json.encode(result.captured)
+    encoded = makima.json.encode(result.captured)
   elseif result and result.text and result.text ~= "" then
     encoded = result.text
   else

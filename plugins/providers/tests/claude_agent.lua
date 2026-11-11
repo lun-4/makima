@@ -1,5 +1,5 @@
 local claude_agent = require("providers.claude_agent")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local SOCKET = "/run/user/1000/bridge.sock"
 local CONFIG = { socket = SOCKET }
@@ -18,11 +18,11 @@ local DONE = {
 local spec = claude_agent.provider()
 
 local function frame(event, data)
-  return "event: " .. event .. "\ndata: " .. assert(maki.json.encode(data)) .. "\n\n"
+  return "event: " .. event .. "\ndata: " .. assert(makima.json.encode(data)) .. "\n\n"
 end
 
 local function json(value, status)
-  return t.response({ assert(maki.json.encode(value)) }, { status = status })
+  return t.response({ assert(makima.json.encode(value)) }, { status = status })
 end
 
 local function failing_ctx(err)
@@ -85,7 +85,7 @@ t.case("a_step_posts_the_request_and_streams_its_events", function()
   t.eq(sent.unix_socket, SOCKET)
   t.eq(sent.method, "POST")
   t.has(sent.url, "/v1/steps")
-  local body = maki.json.decode(sent.body)
+  local body = makima.json.decode(sent.body)
   t.eq(body.protocol_version, claude_agent.PROTOCOL_VERSION)
   t.same(body.request, REQUEST)
   t.same(events, { { type = "text_delta", text = "hel" }, { type = "text_delta", text = "lo" } })
@@ -183,7 +183,7 @@ end)
 
 t.case("discovery_is_cached_for_the_next_start", function()
   local dir = t.mktmpdir("claude-agent")
-  local cache = maki.fs.joinpath(dir, claude_agent.CACHE_FILE)
+  local cache = makima.fs.joinpath(dir, claude_agent.CACHE_FILE)
   t.same(claude_agent.provider(cache).models, claude_agent.MODELS)
   local cached = claude_agent.provider(cache)
   cached.discover(
@@ -198,7 +198,7 @@ end)
 
 t.case("discovery_keeps_the_cached_models_when_the_bridge_does_not_answer", function()
   local dir = t.mktmpdir("claude-agent")
-  local cache = maki.fs.joinpath(dir, claude_agent.CACHE_FILE)
+  local cache = makima.fs.joinpath(dir, claude_agent.CACHE_FILE)
   local provider = claude_agent.provider(cache)
   provider.discover(
     t.provider_ctx({ json({ models = { { value = "opus", resolved_model = "claude-opus-5-5" } } }) }),
@@ -224,7 +224,7 @@ t.case("ending_a_conversation_posts_the_reason", function()
   local instance = assert(spec.prepare(ctx, { id = "sonnet" }, CONFIG))
   instance.end_conversation(ctx, "c/1", "cancelled")
   t.has(ctx.requests[1].url, "/v1/conversations/c%2F1/end")
-  t.same(maki.json.decode(ctx.requests[1].body), { reason = "cancelled" })
+  t.same(makima.json.decode(ctx.requests[1].body), { reason = "cancelled" })
 end)
 
 t.report()

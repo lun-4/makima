@@ -3,7 +3,7 @@ local thinking = require("providers.thinking")
 
 local M = {}
 
-local REFERER = "https://maki.sh"
+local REFERER = "https://makima.ln4.net"
 local APP_TITLE = "Makima"
 local CHAT_API = "chat"
 -- Requesty's curated routing policies, with short stable ids that spread
@@ -24,7 +24,7 @@ local function reader(row)
     if valid(value) then
       return value
     end
-    maki.log.warn(string.format(UNREADABLE, name, row.id))
+    makima.log.warn(string.format(UNREADABLE, name, row.id))
     return nil
   end
 end
@@ -99,7 +99,7 @@ end
 
 -- Both listings at once, since the picker waits for the slowest provider.
 function M.list_models(ctx, client)
-  local results = maki.async.gather({
+  local results = makima.async.gather({
     function()
       return { listing(ctx, client, MANAGED_PATH) }
     end,
@@ -112,10 +112,10 @@ function M.list_models(ctx, client)
   if managed and catalog then
     return M.merge(managed, catalog)
   elseif managed then
-    maki.log.warn(string.format(MANAGED_ONLY, tostring(catalog_err)))
+    makima.log.warn(string.format(MANAGED_ONLY, tostring(catalog_err)))
     return managed
   elseif catalog then
-    maki.log.warn(string.format(CATALOG_ONLY, tostring(managed_err)))
+    makima.log.warn(string.format(CATALOG_ONLY, tostring(managed_err)))
     return catalog
   end
   return nil, managed_err

@@ -1,0 +1,810 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use arc_swap::ArcSwap;
+use makima_agent::{AgentRef, SharedBuf};
+use makima_commands::{CommandArguments, PositionalArgument};
+use makima_storage::id::MakimaId;
+use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
+use strum::{EnumString, VariantNames};
+
+use crate::api::util::convert::json_to_lua;
+use crate::api::util::pair::{Pair, try_pair};
+
+pub(crate) use crate::ui_sink::NO_UI_ERR;
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct StatusEntry {
+    pub text: String,
+    pub style: String,
+    pub click: Option<u32>,
+}
+
+pub type StatusContent = Vec<StatusEntry>;
+pub type StatusContentEntries = Vec<(Arc<str>, StatusContent)>;
+
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct StatusContentSnapshot {
+    pub entries: StatusContentEntries,
+    pub generation: u64,
+}
+
+#[derive(Clone)]
+pub struct StatusContentReader(Arc<ArcSwap<StatusContentSnapshot>>);
+
+impl StatusContentReader {
+    pub fn empty() -> Self {
+        Self(Arc::new(ArcSwap::from_pointee(
+            StatusContentSnapshot::default(),
+        )))
+    }
+
+    pub fn load_full(&self) -> Arc<StatusContentSnapshot> {
+        self.0.load_full()
+    }
+}
+
+pub(crate) struct StatusContentWriter {
+    store: Arc<ArcSwap<StatusContentSnapshot>>,
+    generation: AtomicU64,
+}
+
+impl StatusContentWriter {
+    pub fn new() -> (Self, StatusContentReader) {
+        let inner = Arc::new(ArcSwap::from_pointee(StatusContentSnapshot::default()));
+        (
+            Self {
+                store: Arc::clone(&inner),
+                generation: AtomicU64::new(0),
+            },
+            StatusContentReader(inner),
+        )
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    pub fn publish(&self, entries: StatusContentEntries) -> bool {
+        if self.store.load().entries == entries {
+            return false;
+        }
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        self.store.store(Arc::new(StatusContentSnapshot {
+            entries,
+            generation,
+        }));
+        true
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CommandArgumentItem {
+    pub label: String,
+    pub insertion: String,
+    pub description: Option<String>,
+}
+
+pub type HintEntries = Vec<(Arc<str>, Vec<(String, String)>)>;
+
+#[derive(Clone, Default)]
+pub struct HintSnapshot {
+    pub entries: HintEntries,
+    pub generation: u64,
+}
+
+#[derive(Clone)]
+pub struct HintReader(Arc<ArcSwap<HintSnapshot>>);
+
+impl HintReader {
+    pub fn empty() -> Self {
+        Self(Arc::new(ArcSwap::from_pointee(HintSnapshot::default())))
+    }
+
+    /// Full `Arc` rather than a `Guard`: the UI keeps the last one alive to
+    /// compare identity against the next, which is how it notices a publish.
+    pub fn load_full(&self) -> Arc<HintSnapshot> {
+        self.0.load_full()
+    }
+}
+
+/// Publishing end of a plugin's status hints, owned by the Lua thread.
+pub(crate) struct HintWriter {
+    store: Arc<ArcSwap<HintSnapshot>>,
+    generation: AtomicU64,
+}
+
+impl HintWriter {
+    pub fn new() -> (Self, HintReader) {
+        let inner = Arc::new(ArcSwap::from_pointee(HintSnapshot::default()));
+        (
+            Self {
+                store: Arc::clone(&inner),
+                generation: AtomicU64::new(0),
+            },
+            HintReader(inner),
+        )
+    }
+
+    pub fn publish(&self, entries: HintEntries) {
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        self.store.store(Arc::new(HintSnapshot {
+            entries,
+            generation,
+        }));
+    }
+}
+
+pub(crate) struct ArgumentCompletion {
+    pub completion: RegistryKey,
+    pub on_highlight: Option<RegistryKey>,
+    pub on_accept: Option<RegistryKey>,
+    pub on_cancel: Option<RegistryKey>,
+    pub navigation: Option<ArgumentCompletionNavigation>,
+}
+
+pub(crate) struct CommandCompletionCallbacks {
+    pub completion: RegistryKey,
+    pub argument_schema: Option<Arc<[PositionalArgument]>>,
+    pub on_highlight: Option<RegistryKey>,
+    pub on_accept: Option<RegistryKey>,
+    pub on_cancel: Option<RegistryKey>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ArgumentCompletionNavigation {
+    Directory,
+}
+
+pub(crate) struct CommandEntry {
+    pub generation: u64,
+    pub handler: RegistryKey,
+    pub description: Arc<str>,
+    pub argument_hint: Option<Arc<str>>,
+    pub arguments: CommandArguments,
+    pub tui_only: bool,
+    pub argument_completions: Vec<Option<ArgumentCompletion>>,
+}
+
+pub(crate) type CommandHandlerMap = HashMap<Arc<str>, HashMap<Arc<str>, CommandEntry>>;
+pub(crate) type PendingCommandMap = Arc<Mutex<HashMap<Arc<str>, CommandEntry>>>;
+pub(crate) type RetiredCommandHandlerMap = Vec<(Arc<str>, HashMap<Arc<str>, CommandEntry>)>;
+pub(crate) type CommandGenerationMap = HashMap<(Arc<str>, Arc<str>), u64>;
+
+pub(crate) fn remove_command_entry(lua: &Lua, entry: CommandEntry) {
+    let _ = lua.remove_registry_value(entry.handler);
+    for completion in entry.argument_completions.into_iter().flatten() {
+        for key in [
+            Some(completion.completion),
+            completion.on_highlight,
+            completion.on_accept,
+            completion.on_cancel,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = lua.remove_registry_value(key);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dimension {
+    Abs(u16),
+    Percent(u16),
+}
+
+impl Dimension {
+    pub fn resolve(self, total: u16) -> u16 {
+        match self {
+            Self::Abs(n) => n,
+            Self::Percent(p) => (total as u32 * p as u32 / 100) as u16,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Anchor {
+    #[default]
+    NW,
+    NE,
+    SW,
+    SE,
+}
+
+impl Anchor {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "NE" => Self::NE,
+            "SW" => Self::SW,
+            "SE" => Self::SE,
+            _ => Self::NW,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Border {
+    None,
+    Single,
+    Double,
+    #[default]
+    Rounded,
+}
+
+impl Border {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "none" => Self::None,
+            "single" => Self::Single,
+            "double" => Self::Double,
+            _ => Self::Rounded,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Split {
+    #[default]
+    None,
+    Above,
+    Below,
+    Left,
+    Right,
+    Panel,
+}
+
+/// The renderer and layout read `Axis` rather than matching on `Split`, so a
+/// new direction never needs a new match arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Axis {
+    /// Reserves rows: a band on the top or bottom edge.
+    Vertical,
+    /// Reserves columns: a band on the left or right edge.
+    Horizontal,
+}
+
+/// `at_start` means the top or left edge, otherwise the bottom or right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Edge {
+    pub axis: Axis,
+    pub at_start: bool,
+}
+
+impl Split {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "above" => Self::Above,
+            "below" => Self::Below,
+            "left" => Self::Left,
+            "right" => Self::Right,
+            "panel" => Self::Panel,
+            _ => Self::None,
+        }
+    }
+
+    /// The one place a direction turns into geometry, so the mapping lives in a
+    /// single spot. `None` means the split is off.
+    pub fn edge(self) -> Option<Edge> {
+        Some(match self {
+            Self::None | Self::Panel => return None,
+            Self::Above => Edge {
+                axis: Axis::Vertical,
+                at_start: true,
+            },
+            Self::Below => Edge {
+                axis: Axis::Vertical,
+                at_start: false,
+            },
+            Self::Left => Edge {
+                axis: Axis::Horizontal,
+                at_start: true,
+            },
+            Self::Right => Edge {
+                axis: Axis::Horizontal,
+                at_start: false,
+            },
+        })
+    }
+
+    /// Every real direction, in carve order: columns before rows. Callers loop
+    /// over this so they stay exhaustive without a match. It is hand-written, so
+    /// `all_lists_exactly_the_edge_bearing_variants` keeps it honest.
+    pub const ALL: [Split; 4] = [Split::Left, Split::Right, Split::Above, Split::Below];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TitlePos {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+impl TitlePos {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "center" => Self::Center,
+            "right" => Self::Right,
+            _ => Self::Left,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FloatConfig {
+    pub width: Dimension,
+    pub height: Dimension,
+    pub row: Option<i16>,
+    pub col: Option<i16>,
+    pub anchor: Anchor,
+    pub border: Border,
+    pub title: String,
+    pub title_pos: TitlePos,
+    pub footer: Vec<(String, String)>,
+    pub zindex: u16,
+    pub cursor_line: bool,
+    pub reserved_bottom: usize,
+    pub reserved_top: usize,
+    pub split: Split,
+    pub order: u16,
+    pub visible: bool,
+    pub needs_input: bool,
+    /// Opt in to corner stacking: the UI offsets this window past the other
+    /// stacked windows sharing its anchor. Open time only, so no patch field.
+    pub stack: bool,
+}
+
+impl Default for FloatConfig {
+    fn default() -> Self {
+        Self {
+            width: Dimension::Percent(60),
+            height: Dimension::Percent(70),
+            row: None,
+            col: None,
+            anchor: Anchor::default(),
+            border: Border::default(),
+            title: String::new(),
+            title_pos: TitlePos::default(),
+            footer: Vec::new(),
+            zindex: 50,
+            cursor_line: false,
+            reserved_bottom: 0,
+            reserved_top: 0,
+            split: Split::None,
+            order: 50,
+            visible: true,
+            needs_input: false,
+            stack: false,
+        }
+    }
+}
+
+macro_rules! apply_opt {
+    ($self:ident, $patch:ident, $($field:ident),+ $(,)?) => {
+        $(if let Some(v) = $patch.$field { $self.$field = v; })+
+    };
+}
+
+impl FloatConfig {
+    pub fn apply_patch(&mut self, patch: FloatConfigPatch) {
+        apply_opt!(
+            self,
+            patch,
+            width,
+            height,
+            row,
+            col,
+            anchor,
+            border,
+            title,
+            title_pos,
+            footer,
+            zindex,
+            cursor_line,
+            reserved_bottom,
+            reserved_top,
+            split,
+            order,
+            visible,
+            needs_input
+        );
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FloatConfigPatch {
+    pub width: Option<Dimension>,
+    pub height: Option<Dimension>,
+    pub row: Option<Option<i16>>,
+    pub col: Option<Option<i16>>,
+    pub anchor: Option<Anchor>,
+    pub border: Option<Border>,
+    pub title: Option<String>,
+    pub title_pos: Option<TitlePos>,
+    pub footer: Option<Vec<(String, String)>>,
+    pub zindex: Option<u16>,
+    pub cursor_line: Option<bool>,
+    pub reserved_bottom: Option<usize>,
+    pub reserved_top: Option<usize>,
+    pub split: Option<Split>,
+    pub order: Option<u16>,
+    pub visible: Option<bool>,
+    pub needs_input: Option<bool>,
+}
+
+pub enum WinEvent {
+    Key { key: String },
+    Resize { width: u16, height: u16 },
+    Paste { text: String },
+    Click { row: u16, col: u16 },
+    Close,
+}
+
+pub enum WinCommand {
+    SetConfig(FloatConfigPatch),
+    SetCursor(usize),
+    SetVisible(bool),
+    Close,
+}
+
+pub type SessionReply = Result<serde_json::Value, String>;
+
+pub enum SessionRequest {
+    List,
+    ListAll,
+    Live,
+    Read { id: MakimaId },
+    New { prompt: Option<String>, focus: bool },
+    Focus { id: String },
+    Delete { id: String },
+    SetTitle { id: String, title: String },
+}
+
+pub type UiReply = Result<serde_json::Value, String>;
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProviderUsageSnapshot {
+    pub provider_id: String,
+    pub provider: String,
+    pub model: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limits: Vec<ProviderUsageLimit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProviderUsageLimit {
+    pub window: ProviderUsageWindow,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percentage: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProviderUsageWindow {
+    Hours { value: u64 },
+    Days { value: u64 },
+    Monthly,
+    Weekly { model: Option<String> },
+    Credits,
+    Subscription,
+    Other { label: String },
+}
+
+pub type ProviderUsageReply = Result<ProviderUsageSnapshot, String>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderUsageInvalidation(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderUsageAck {
+    pub invalidation: ProviderUsageInvalidation,
+    pub status_generation: u64,
+}
+
+/// Viewport of the focused chat transcript, zero-based like the rest of the
+/// UI; `makima.fn.winsaveview` is what puts it in Vim's 1-based shape.
+/// `auto_scroll` is true while the transcript follows streaming output.
+pub struct WinView {
+    pub scroll_top: u16,
+    pub line_count: u16,
+    pub height: u16,
+    pub auto_scroll: bool,
+}
+
+/// Lua sees these through `makima.ui.action` as the snake_case variant
+/// names, so renaming a variant breaks user configs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, VariantNames)]
+#[strum(serialize_all = "snake_case")]
+pub enum BuiltinAction {
+    FilePicker,
+    Search,
+    Tasks,
+    Help,
+    PlanToggle,
+    PlanEditor,
+    PlanSubmit,
+    EditInput,
+    PopQueue,
+    PrevChat,
+    NextChat,
+    ModelPicker,
+}
+
+pub enum UiAction {
+    OpenWin {
+        buf: Arc<SharedBuf>,
+        config: FloatConfig,
+        focus: bool,
+        event_tx: flume::Sender<WinEvent>,
+        cmd_rx: flume::Receiver<WinCommand>,
+    },
+    /// A plugin's list-picker dialog. `id` keys the callback store in Lua
+    /// app-data: mlua `Function`s cannot cross this channel, so the host
+    /// reports dialog events by id instead.
+    OpenListPicker {
+        id: u64,
+        items: Vec<crate::api::util::picker::PickerItemSpec>,
+        config: crate::api::util::picker::PickerConfig,
+        reply_tx: flume::Sender<crate::api::util::picker::PickerResult>,
+    },
+    Flash(String),
+    SetWindowTitle(String),
+    OpenEditor {
+        target: Option<AgentRef>,
+        path: PathBuf,
+        reply_tx: flume::Sender<i32>,
+    },
+    Session {
+        req: SessionRequest,
+        reply_tx: flume::Sender<UiReply>,
+    },
+    UsageFetch {
+        force: bool,
+        reply_tx: flume::Sender<ProviderUsageReply>,
+    },
+    ProviderUsageAck(ProviderUsageAck),
+    WinSaveView {
+        reply_tx: flume::Sender<WinView>,
+    },
+    WinRestView {
+        scroll_top: u16,
+    },
+    Builtin(BuiltinAction),
+}
+
+/// Hand an action to the UI event loop. A full or closed channel means the
+/// same thing as a missing sender: nobody is there to run it.
+pub(crate) fn ui_send(
+    tx: Option<&flume::Sender<UiAction>>,
+    action: UiAction,
+) -> Result<(), &'static str> {
+    tx.ok_or(NO_UI_ERR)?.try_send(action).map_err(|_| NO_UI_ERR)
+}
+
+/// Send an action carrying a reply channel and await the answer. A frontend
+/// that does not render the action drops it, which lands here as
+/// `NO_UI_ERR`. The TUI drains between frames, so a call at config load time
+/// waits until its loop starts.
+pub(crate) async fn ui_roundtrip<T>(
+    tx: Option<&flume::Sender<UiAction>>,
+    action: impl FnOnce(flume::Sender<T>) -> UiAction,
+) -> Result<T, &'static str> {
+    let (reply_tx, reply_rx) = flume::bounded(1);
+    ui_send(tx, action(reply_tx))?;
+    reply_rx.recv_async().await.map_err(|_| NO_UI_ERR)
+}
+
+/// `ui_roundtrip` for JSON replies, shaped into the `(value, err)` pair Lua
+/// expects. Never reaching the UI and the UI refusing both land in the error
+/// slot.
+pub(crate) async fn ui_json_roundtrip(
+    lua: &Lua,
+    tx: Option<&flume::Sender<UiAction>>,
+    action: impl FnOnce(flume::Sender<UiReply>) -> UiAction,
+) -> LuaResult<Pair<Value>> {
+    let reply = try_pair!(ui_roundtrip(tx, action).await);
+    let value = try_pair!(reply);
+    Ok((Some(json_to_lua(lua, &value)?), None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_case::test_case;
+
+    #[test]
+    fn plan_submit_parses_from_lua_name() {
+        assert_eq!(
+            "plan_submit".parse::<BuiltinAction>(),
+            Ok(BuiltinAction::PlanSubmit)
+        );
+    }
+
+    #[test]
+    fn builtin_action_names_are_snake_case() {
+        for name in BuiltinAction::VARIANTS {
+            assert!(
+                name.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "lua-facing action name '{name}' is not snake_case"
+            );
+        }
+    }
+
+    #[test_case(Dimension::Abs(42), 200 => 42 ; "abs_ignores_total")]
+    #[test_case(Dimension::Percent(50), 200 => 100 ; "percent_half")]
+    #[test_case(Dimension::Percent(100), 80 => 80 ; "percent_full")]
+    #[test_case(Dimension::Percent(0), 80 => 0 ; "percent_zero")]
+    #[test_case(Dimension::Percent(33), 100 => 33 ; "percent_truncates")]
+    #[test_case(Dimension::Percent(1), 3 => 0 ; "percent_rounds_down_small")]
+    fn dimension_resolve(dim: Dimension, total: u16) -> u16 {
+        dim.resolve(total)
+    }
+
+    #[test_case("NW" => Anchor::NW ; "nw")]
+    #[test_case("NE" => Anchor::NE ; "ne")]
+    #[test_case("SW" => Anchor::SW ; "sw")]
+    #[test_case("SE" => Anchor::SE ; "se")]
+    #[test_case("garbage" => Anchor::NW ; "unknown_defaults_nw")]
+    fn anchor_parse(s: &str) -> Anchor {
+        Anchor::parse(s)
+    }
+
+    #[test_case("none" => Border::None ; "none")]
+    #[test_case("single" => Border::Single ; "single")]
+    #[test_case("double" => Border::Double ; "double")]
+    #[test_case("rounded" => Border::Rounded ; "rounded")]
+    #[test_case("unknown" => Border::Rounded ; "unknown_defaults_rounded")]
+    fn border_parse(s: &str) -> Border {
+        Border::parse(s)
+    }
+
+    #[test_case("center" => TitlePos::Center ; "center")]
+    #[test_case("right" => TitlePos::Right ; "right")]
+    #[test_case("left" => TitlePos::Left ; "left")]
+    #[test_case("" => TitlePos::Left ; "empty_defaults_left")]
+    fn title_pos_parse(s: &str) -> TitlePos {
+        TitlePos::parse(s)
+    }
+
+    #[test_case("panel" => Split::Panel ; "panel")]
+    #[test_case("above" => Split::Above ; "above")]
+    #[test_case("below" => Split::Below ; "below")]
+    #[test_case("left" => Split::Left ; "left")]
+    #[test_case("right" => Split::Right ; "right")]
+    #[test_case("none" => Split::None ; "none")]
+    #[test_case("" => Split::None ; "empty_defaults_none")]
+    #[test_case("Below" => Split::None ; "exact_match_is_case_sensitive")]
+    #[test_case("garbage" => Split::None ; "unknown_defaults_none")]
+    fn split_parse(s: &str) -> Split {
+        Split::parse(s)
+    }
+
+    #[test_case(Split::Panel => None ; "panel_has_no_edge")]
+    #[test_case(Split::None => None ; "none_has_no_edge")]
+    #[test_case(Split::Above => Some(Edge { axis: Axis::Vertical, at_start: true }) ; "above_is_vertical_start")]
+    #[test_case(Split::Below => Some(Edge { axis: Axis::Vertical, at_start: false }) ; "below_is_vertical_end")]
+    #[test_case(Split::Left => Some(Edge { axis: Axis::Horizontal, at_start: true }) ; "left_is_horizontal_start")]
+    #[test_case(Split::Right => Some(Edge { axis: Axis::Horizontal, at_start: false }) ; "right_is_horizontal_end")]
+    fn split_edge(split: Split) -> Option<Edge> {
+        split.edge()
+    }
+
+    /// A variant belongs in `ALL` exactly when it carries an edge, so a dropped
+    /// direction can never ship. The case list is exhaustive: add a variant and
+    /// this fails until `ALL` agrees.
+    #[test_case(Split::None)]
+    #[test_case(Split::Above)]
+    #[test_case(Split::Below)]
+    #[test_case(Split::Left)]
+    #[test_case(Split::Right)]
+    #[test_case(Split::Panel)]
+    fn all_lists_exactly_the_edge_bearing_variants(variant: Split) {
+        assert_eq!(
+            variant.edge().is_some(),
+            Split::ALL.contains(&variant),
+            "{variant:?}: edge-bearing variants belong in ALL, others must not",
+        );
+    }
+
+    #[test]
+    fn apply_patch_selective_fields() {
+        let mut cfg = FloatConfig::default();
+        let patch = FloatConfigPatch {
+            title: Some("hello".into()),
+            zindex: Some(99),
+            cursor_line: Some(true),
+            ..FloatConfigPatch::default()
+        };
+        cfg.apply_patch(patch);
+        assert_eq!(cfg.title, "hello");
+        assert_eq!(cfg.zindex, 99);
+        assert!(cfg.cursor_line);
+        assert_eq!(cfg.width, Dimension::Percent(60), "untouched fields stay");
+        assert_eq!(cfg.border, Border::Rounded, "untouched fields stay");
+    }
+
+    #[test]
+    fn apply_patch_row_col_option_option_semantics() {
+        let mut cfg = FloatConfig {
+            row: Some(10),
+            col: Some(20),
+            ..FloatConfig::default()
+        };
+        let patch = FloatConfigPatch {
+            row: Some(None),
+            col: Some(Some(5)),
+            ..FloatConfigPatch::default()
+        };
+        cfg.apply_patch(patch);
+        assert_eq!(cfg.row, None, "Some(None) clears the value");
+        assert_eq!(cfg.col, Some(5), "Some(Some(5)) overwrites it");
+    }
+
+    #[test]
+    fn apply_patch_sets_split() {
+        let mut cfg = FloatConfig::default();
+        assert_eq!(cfg.split, Split::None);
+        let patch = FloatConfigPatch {
+            split: Some(Split::Below),
+            ..FloatConfigPatch::default()
+        };
+        cfg.apply_patch(patch);
+        assert_eq!(cfg.split, Split::Below);
+        assert_eq!(cfg.border, Border::Rounded, "untouched fields stay");
+    }
+
+    #[test]
+    fn apply_patch_empty_is_noop() {
+        let original = FloatConfig::default();
+        let mut cfg = original.clone();
+        cfg.apply_patch(FloatConfigPatch::default());
+        assert_eq!(cfg, original);
+    }
+
+    #[test]
+    fn status_content_publishes_only_changes() {
+        let (writer, reader) = StatusContentWriter::new();
+        let entries = vec![(
+            Arc::from("plug"),
+            vec![StatusEntry {
+                text: "ready".into(),
+                style: "success".into(),
+                click: None,
+            }],
+        )];
+
+        assert!(writer.publish(entries.clone()));
+        assert_eq!(reader.load_full().generation, 1);
+        assert!(!writer.publish(entries));
+        assert_eq!(reader.load_full().generation, 1);
+        assert!(writer.publish(Vec::new()));
+        assert_eq!(reader.load_full().generation, 2);
+    }
+
+    #[test]
+    fn hint_snapshot_publish_and_read() {
+        let (writer, reader) = HintWriter::new();
+        assert!(reader.load_full().entries.is_empty());
+
+        writer.publish(vec![(
+            Arc::from("plugA"),
+            vec![(" 2/4 ".into(), "fg".into())],
+        )]);
+
+        let snap = reader.load_full();
+        assert_eq!(snap.entries.len(), 1);
+        assert_eq!(snap.generation, 1);
+    }
+}

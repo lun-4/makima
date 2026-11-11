@@ -1,6 +1,6 @@
 local requesty = require("providers.requesty")
 local compat = require("providers.openai_compat")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local SONNET = "anthropic/claude-sonnet-4-5"
 local BASE = "https://router.requesty.ai/v1"
@@ -127,7 +127,7 @@ t.case("auto_cache_effort_and_attribution", function()
     { supports_thinking = true }
   )
   t.same(body, { requesty = { auto_cache = true }, reasoning_effort = "high" })
-  t.same(headers, { ["HTTP-Referer"] = "https://maki.sh", ["X-Title"] = "Makima" })
+  t.same(headers, { ["HTTP-Referer"] = "https://makima.ln4.net", ["X-Title"] = "Makima" })
   body = {}
   requesty.def.encode(body, { thinking = { kind = "off" }, model = {} }, { supports_thinking = false })
   t.eq(body.reasoning_effort, nil)

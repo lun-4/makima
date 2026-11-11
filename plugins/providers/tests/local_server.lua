@@ -2,7 +2,7 @@ local http = require("providers.http")
 local llama_cpp = require("providers.llama_cpp")
 local local_server = require("providers.local_server")
 local ollama = require("providers.ollama")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local HOST = "http://box:1234"
 local CONFIG_HOST = "http://config:4321"
@@ -109,15 +109,15 @@ t.case("keys_rotate", function()
 end)
 
 t.case("chat_body_and_local_thinking", function()
-  local body = maki.json.decode(sent(ollama_spec, { OLLAMA_HOST = HOST }, {}, nil, { kind = "adaptive" }).body)
+  local body = makima.json.decode(sent(ollama_spec, { OLLAMA_HOST = HOST }, {}, nil, { kind = "adaptive" }).body)
   t.eq(body.max_tokens, 16384)
   t.eq(body.stream_options.include_usage, true)
   t.eq(body.thinking_budget_tokens, nil)
   local env = { LLAMA_CPP_HOST = HOST }
-  t.eq(maki.json.decode(sent(llama_spec, env).body).thinking_budget_tokens, 0)
-  t.eq(maki.json.decode(sent(llama_spec, env, {}, nil, { kind = "adaptive" }).body).thinking_budget_tokens, -1)
+  t.eq(makima.json.decode(sent(llama_spec, env).body).thinking_budget_tokens, 0)
+  t.eq(makima.json.decode(sent(llama_spec, env, {}, nil, { kind = "adaptive" }).body).thinking_budget_tokens, -1)
   local budget = sent(llama_spec, env, {}, nil, { kind = "budget", tokens = 4096 })
-  t.eq(maki.json.decode(budget.body).thinking_budget_tokens, 4096)
+  t.eq(makima.json.decode(budget.body).thinking_budget_tokens, 4096)
 end)
 
 t.case("responses_protocol_streams_with_progress", function()
@@ -132,7 +132,7 @@ t.case("responses_protocol_streams_with_progress", function()
   assert(instance.stream(ctx, request({ kind = "adaptive" }), emit))
   local req = ctx.requests[1]
   t.eq(req.url, HOST .. "/v1/responses")
-  local body = maki.json.decode(req.body)
+  local body = makima.json.decode(req.body)
   t.eq(body.return_progress, true)
   t.eq(body.reasoning.effort, "medium")
   t.eq(body.thinking_budget_tokens, nil)

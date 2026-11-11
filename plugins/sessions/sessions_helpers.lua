@@ -277,7 +277,7 @@ function M.reconcile_selection(previous_id, previous_position, rows)
 end
 
 function M.age(updated_at, reference)
-  return maki.time.ago(maki.time.at(updated_at or 0), reference or maki.time.now())
+  return makima.time.ago(makima.time.at(updated_at or 0), reference or makima.time.now())
 end
 
 return M

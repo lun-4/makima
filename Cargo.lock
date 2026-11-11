@@ -2709,7 +2709,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "maki"
+name = "makima"
 version = "0.5.0"
 dependencies = [
  "clap",
@@ -2720,14 +2720,14 @@ dependencies = [
  "futures-lite",
  "isahc",
  "libc",
- "maki-acp",
- "maki-agent",
- "maki-commands",
- "maki-config",
- "maki-lua",
- "maki-providers",
- "maki-storage",
- "maki-ui",
+ "makima-acp",
+ "makima-agent",
+ "makima-commands",
+ "makima-config",
+ "makima-lua",
+ "makima-providers",
+ "makima-storage",
+ "makima-ui",
  "open",
  "serde",
  "serde_json",
@@ -2743,19 +2743,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "maki-acp"
+name = "makima-acp"
 version = "0.5.0"
 dependencies = [
  "agent-client-protocol-schema",
  "color-eyre",
  "event-listener",
  "flume 0.11.1",
- "maki-agent",
- "maki-commands",
- "maki-config",
- "maki-lua",
- "maki-providers",
- "maki-storage",
+ "makima-agent",
+ "makima-commands",
+ "makima-config",
+ "makima-lua",
+ "makima-providers",
+ "makima-storage",
  "serde",
  "serde_json",
  "smol",
@@ -2765,7 +2765,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "maki-agent"
+name = "makima-agent"
 version = "0.5.0"
 dependencies = [
  "arc-swap",
@@ -2786,12 +2786,12 @@ dependencies = [
  "jiff",
  "jsonrepair",
  "libc",
- "maki-commands",
- "maki-config",
- "maki-domain",
- "maki-match",
- "maki-providers",
- "maki-storage",
+ "makima-commands",
+ "makima-config",
+ "makima-domain",
+ "makima-match",
+ "makima-providers",
+ "makima-storage",
  "open",
  "rustix 1.1.4",
  "serde",
@@ -2812,23 +2812,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "maki-commands"
+name = "makima-commands"
 version = "0.5.0"
 dependencies = [
  "futures-lite",
- "maki-domain",
+ "makima-domain",
  "test-case",
  "thiserror 2.0.20",
 ]
 
 [[package]]
-name = "maki-config"
+name = "makima-config"
 version = "0.5.0"
 dependencies = [
  "dotenvy",
  "globset",
- "maki-config-macro",
- "maki-storage",
+ "makima-config-macro",
+ "makima-storage",
  "serde",
  "serde_json",
  "strum 0.27.2",
@@ -2841,7 +2841,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "maki-config-macro"
+name = "makima-config-macro"
 version = "0.5.0"
 dependencies = [
  "proc-macro2",
@@ -2850,16 +2850,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "maki-docgen"
+name = "makima-docgen"
 version = "0.5.0"
 dependencies = [
  "color-eyre",
- "maki-agent",
- "maki-commands",
- "maki-config",
- "maki-lua",
- "maki-providers",
- "maki-ui",
+ "makima-agent",
+ "makima-commands",
+ "makima-config",
+ "makima-lua",
+ "makima-providers",
+ "makima-ui",
  "regex",
  "serde_json",
  "tempfile",
@@ -2869,7 +2869,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "maki-domain"
+name = "makima-domain"
 version = "0.5.0"
 dependencies = [
  "serde",
@@ -2880,7 +2880,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "maki-highlight"
+name = "makima-highlight"
 version = "0.5.0"
 dependencies = [
  "flume 0.11.1",
@@ -2892,7 +2892,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "maki-interpreter"
+name = "makima-interpreter"
 version = "0.5.0"
 dependencies = [
  "get-size2",
@@ -2905,7 +2905,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "maki-lua"
+name = "makima-lua"
 version = "0.5.0"
 dependencies = [
  "arc-swap",
@@ -2927,17 +2927,17 @@ dependencies = [
  "jiff",
  "jsonschema",
  "keyring",
- "maki-agent",
- "maki-commands",
- "maki-config",
- "maki-highlight",
- "maki-interpreter",
- "maki-lua",
- "maki-lua-macro",
- "maki-markdown",
- "maki-match",
- "maki-providers",
- "maki-storage",
+ "makima-agent",
+ "makima-commands",
+ "makima-config",
+ "makima-highlight",
+ "makima-interpreter",
+ "makima-lua",
+ "makima-lua-macro",
+ "makima-markdown",
+ "makima-match",
+ "makima-providers",
+ "makima-storage",
  "mlua",
  "nucleo-matcher",
  "open",
@@ -2995,7 +2995,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "maki-lua-macro"
+name = "makima-lua-macro"
 version = "0.5.0"
 dependencies = [
  "proc-macro2",
@@ -3004,17 +3004,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "maki-markdown"
+name = "makima-markdown"
 version = "0.5.0"
 dependencies = [
  "fastrand",
- "maki-highlight",
+ "makima-highlight",
  "test-case",
  "unicode-width",
 ]
 
 [[package]]
-name = "maki-match"
+name = "makima-match"
 version = "0.5.0"
 dependencies = [
  "nucleo-matcher",
@@ -3022,7 +3022,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "maki-providers"
+name = "makima-providers"
 version = "0.5.0"
 dependencies = [
  "base64 0.22.1",
@@ -3031,9 +3031,9 @@ dependencies = [
  "futures",
  "image",
  "jiff",
- "maki-config",
- "maki-domain",
- "maki-storage",
+ "makima-config",
+ "makima-domain",
+ "makima-storage",
  "serde",
  "serde_json",
  "smol",
@@ -3045,7 +3045,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "maki-storage"
+name = "makima-storage"
 version = "0.5.0"
 dependencies = [
  "bs58",
@@ -3056,7 +3056,7 @@ dependencies = [
  "fs4",
  "getrandom 0.3.4",
  "isahc",
- "maki-domain",
+ "makima-domain",
  "rustix 1.1.4",
  "serde",
  "serde_json",
@@ -3070,7 +3070,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "maki-ui"
+name = "makima-ui"
 version = "0.5.0"
 dependencies = [
  "arboard",
@@ -3087,16 +3087,16 @@ dependencies = [
  "image",
  "jiff",
  "libc",
- "maki-agent",
- "maki-commands",
- "maki-config",
- "maki-domain",
- "maki-highlight",
- "maki-lua",
- "maki-markdown",
- "maki-match",
- "maki-providers",
- "maki-storage",
+ "makima-agent",
+ "makima-commands",
+ "makima-config",
+ "makima-domain",
+ "makima-highlight",
+ "makima-lua",
+ "makima-markdown",
+ "makima-match",
+ "makima-providers",
+ "makima-storage",
  "notify",
  "nucleo",
  "nucleo-matcher",

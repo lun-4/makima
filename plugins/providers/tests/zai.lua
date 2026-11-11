@@ -1,6 +1,6 @@
 local zai = require("providers.zai")
 local compat = require("providers.openai_compat")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local QUOTA_BODY = [[{"code":200,"data":{"limits":[
   {"type":"TOKENS_LIMIT","unit":3,"percentage":16,"nextResetTime":1777819631597},
@@ -65,7 +65,7 @@ t.case("coding_plan_base_url", function()
 end)
 
 t.case("quota", function()
-  t.same(zai.parse_quota(maki.json.decode(QUOTA_BODY)), {
+  t.same(zai.parse_quota(makima.json.decode(QUOTA_BODY)), {
     plan = "lite",
     limits = {
       { kind = { Hours = 5 }, percentage = 16, reset_at = 1777819631597 },

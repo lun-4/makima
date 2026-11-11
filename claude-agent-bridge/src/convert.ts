@@ -7,7 +7,7 @@ import { originalName } from "./tools.ts"
 export type ClaudeBlock = { type: "text"; text: string } | { type: "image"; source: { type: "base64"; media_type: string; data: string } }
 
 const CHECKPOINT_OPEN =
-  "<conversation-checkpoint>\nThe following is conversation history from Maki that you have not seen. Treat it as prior conversation, not a new request. Continue with the user messages after this checkpoint."
+  "<conversation-checkpoint>\nThe following is conversation history from Makima that you have not seen. Treat it as prior conversation, not a new request. Continue with the user messages after this checkpoint."
 const CHECKPOINT_CLOSE = "</conversation-checkpoint>"
 const RESUME_TEXT = "Continue from where the checkpoint ends."
 const STOP_REASONS: Record<string, StopReason> = { end_turn: "end_turn", tool_use: "tool_use", max_tokens: "max_tokens" }
@@ -143,7 +143,7 @@ export class UsageTracker {
   }
 
   // A turn's result sums every model call of the SDK turn, which spans all
-  // the Maki steps between tool calls and re-reads the context in each. It
+  // the Makima steps between tool calls and re-reads the context in each. It
   // stands in only when the step saw no usage and the turn made one call.
   turnTotal(usage: RawUsage, calls: number): void {
     if (this.responses.size === 0 && calls === 1) this.update("turn", usage)
@@ -164,7 +164,7 @@ export class UsageTracker {
 
 type StreamEvent = Extract<SDKMessage, { type: "stream_event" }>["event"]
 
-// Turns one step's SDK messages into Maki events, the reply and its usage.
+// Turns one step's SDK messages into Makima events, the reply and its usage.
 export class StepTranslator {
   private readonly tools: readonly Tool[]
   private readonly usage = new UsageTracker()
@@ -182,7 +182,7 @@ export class StepTranslator {
     this.tools = tools
   }
 
-  // The Maki events for {message}. Messages from Claude Code's own
+  // The Makima events for {message}. Messages from Claude Code's own
   // subagents (a parent tool-use id) are not part of the step.
   translate(message: SDKMessage): Event[] {
     if ("session_id" in message && typeof message.session_id === "string") this.sessionId = message.session_id
@@ -258,8 +258,8 @@ export class StepTranslator {
     return events
   }
 
-  // Whether {message} ends a response that called a Maki tool, which ends
-  // the Maki step while the SDK turn waits for the results.
+  // Whether {message} ends a response that called a Makima tool, which ends
+  // the Makima step while the SDK turn waits for the results.
   endsToolStep(message: SDKMessage): boolean {
     return (
       this.toolCalls.length > 0 &&
@@ -273,7 +273,7 @@ export class StepTranslator {
     return { message: { role: "assistant", content: this.content }, usage: this.usage.snapshot(), stop_reason: stopReason }
   }
 
-  // The step's result for the turn's final {message}, or the Maki error it ends with.
+  // The step's result for the turn's final {message}, or the Makima error it ends with.
   finish(message: Extract<SDKMessage, { type: "result" }>): StepResult {
     const status = message.subtype === "success" ? (message.api_error_status ?? undefined) : undefined
     const failed = message.subtype !== "success" || message.is_error || (status !== undefined && status >= 400)

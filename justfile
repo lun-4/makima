@@ -36,10 +36,10 @@ pylint:
     ty check scripts/
 
 gen-docs:
-    cargo run -p maki-docgen
+    cargo run -p makima-docgen
 
 gen-docs-check:
-    cargo run -p maki-docgen -- --check
+    cargo run -p makima-docgen -- --check
 
 machete:
     cargo-machete
@@ -48,10 +48,10 @@ machete:
 bridge-check:
     cd claude-agent-bridge && npm install --omit=optional && npm run check && npm test
 
-# Criterion benches (maki-lua: luau_perf, splash_perf, provider_perf). Pass a filter to pick
+# Criterion benches (makima-lua: luau_perf, splash_perf, provider_perf). Pass a filter to pick
 # one, e.g. `just bench -- pull_roundtrip`; slow meters are sample_size 10.
 bench *ARGS:
-    cargo bench -p maki-lua {{ARGS}}
+    cargo bench -p makima-lua {{ARGS}}
 
 # Full CI check
 ci: fmt-check lint pylint test gen-docs-check machete

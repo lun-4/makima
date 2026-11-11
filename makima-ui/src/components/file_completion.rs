@@ -1,0 +1,3120 @@
+use std::io;
+use std::mem;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
+
+use crossterm::event::{KeyCode, KeyEvent};
+use makima_lua::ItemSpec;
+#[cfg(test)]
+use makima_match::completion_match_default;
+use makima_match::{
+    CompletionMatch, CompletionMatchOptions, CompletionRanking, compare_completion_matches,
+    completion_match,
+};
+use nucleo::Nucleo;
+use nucleo::pattern::{CaseMatching, Normalization};
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use tracing::warn;
+use unicode_width::UnicodeWidthChar;
+
+use crate::click::{ClickTarget, CompletionGrid, HitTarget, Surface};
+use crate::components::coherent_completion::{CoherentCompletion, Publication};
+use crate::repaint::{Cadence, Dirty};
+use crate::text_buffer::TextBuffer;
+use crate::theme;
+
+const WALKER_CRASHED_MSG: &str = "File scanner crashed";
+const COL_GAP: usize = 2;
+const PENDING_DEBOUNCE_MS: u128 = 100;
+const MAX_MATERIALIZED: u32 = 640;
+const FILE_KIND: &str = "file";
+const DIRECTORY_KIND: &str = "directory";
+const DIRECTORY_SUFFIX: char = std::path::MAIN_SEPARATOR;
+
+fn ends_with_path_separator(value: &str) -> bool {
+    value.ends_with(std::path::is_separator)
+}
+
+pub(crate) struct CompletionGridItem<'a> {
+    pub(crate) label: &'a str,
+    pub(crate) description: Option<&'a str>,
+    pub(crate) indices: &'a [u32],
+    pub(crate) kind: &'a str,
+}
+
+#[derive(Default)]
+pub(crate) struct CompletionGridState {
+    selected: usize,
+    cols: usize,
+    scroll_offset: usize,
+    viewport_height: usize,
+}
+
+impl CompletionGridState {
+    pub(crate) fn selected(&self) -> usize {
+        self.selected
+    }
+
+    pub(crate) fn scroll_offset(&self) -> usize {
+        self.scroll_offset
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.selected = 0;
+        self.scroll_offset = 0;
+    }
+
+    pub(crate) fn set_selected(&mut self, selected: usize) {
+        self.selected = selected;
+    }
+
+    #[cfg(test)]
+    fn set_scroll_offset(&mut self, scroll_offset: usize) {
+        self.scroll_offset = scroll_offset;
+    }
+
+    pub(crate) fn handle_key(&mut self, key: &KeyEvent, item_count: usize, pending: bool) -> bool {
+        let horizontal = matches!(key.code, KeyCode::Left | KeyCode::Right);
+        if !matches!(
+            key.code,
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
+        ) || (horizontal && super::menu_navigation_blocked(key))
+        {
+            return false;
+        }
+        if pending || item_count == 0 {
+            return true;
+        }
+        match key.code {
+            KeyCode::Up => self.move_selection(item_count, -1),
+            KeyCode::Down => self.move_selection(item_count, 1),
+            KeyCode::Left => self.move_column(item_count, -1),
+            KeyCode::Right => self.move_column(item_count, 1),
+            _ => unreachable!(),
+        }
+        true
+    }
+
+    pub(crate) fn set_layout(&mut self, item_count: usize, cols: usize, viewport_height: usize) {
+        self.cols = cols.max(1);
+        self.viewport_height = viewport_height;
+        self.selected = self.selected.min(item_count.saturating_sub(1));
+        self.ensure_visible(item_count);
+    }
+
+    fn move_selection(&mut self, item_count: usize, rows: isize) {
+        let cols = self.cols.max(1);
+        let last = item_count - 1;
+        let col = (self.selected % cols).min(last);
+        let last_row = last / cols;
+        let row = ((self.selected / cols) as isize + rows).clamp(0, last_row as isize) as usize;
+        self.selected = (row * cols + col).min(last);
+        self.ensure_visible(item_count);
+    }
+
+    fn move_column(&mut self, item_count: usize, delta: isize) {
+        if self.cols < 2 {
+            return;
+        }
+        let last = item_count - 1;
+        let row = self.selected / self.cols;
+        let col = self.selected % self.cols;
+        let last_col = (last - row * self.cols).min(self.cols - 1);
+        let new_col = (col as isize + delta).clamp(0, last_col as isize) as usize;
+        self.selected = row * self.cols + new_col;
+        self.ensure_visible(item_count);
+    }
+
+    pub(crate) fn clamp_selection(&mut self, item_count: usize) {
+        self.selected = self.selected.min(item_count.saturating_sub(1));
+        self.ensure_visible(item_count);
+    }
+
+    fn ensure_visible(&mut self, item_count: usize) {
+        if item_count == 0 {
+            self.selected = 0;
+            self.scroll_offset = 0;
+            return;
+        }
+        let cols = self.cols.max(1);
+        let total_rows = item_count.div_ceil(cols);
+        let viewport_height = self.viewport_height.max(1);
+        if total_rows > viewport_height {
+            self.scroll_offset = self.scroll_offset.min(total_rows - viewport_height);
+        } else {
+            self.scroll_offset = 0;
+        }
+        let row = self.selected / cols;
+        if row < self.scroll_offset {
+            self.scroll_offset = row;
+        } else if row >= self.scroll_offset + viewport_height {
+            self.scroll_offset = row + 1 - viewport_height;
+        }
+    }
+}
+
+/// Byte range of the `@`-token under the cursor (including its leading `@`),
+/// or `None` when the most recent `@` does not begin a token.
+pub fn at_token_range(line: &str, cursor_chars: usize) -> Option<(usize, usize)> {
+    let cursor_byte = TextBuffer::char_to_byte(line, cursor_chars);
+    makima_lua::active_at_token(line, cursor_byte).map(|token| (token.range.start, token.range.end))
+}
+
+/// Query for the active token, decoded by the shared Lua parser. The query
+/// excludes the leading `@`, prefix, and quote delimiters.
+pub fn at_token_query(line: &str, cursor_chars: usize) -> Option<String> {
+    let cursor_byte = TextBuffer::char_to_byte(line, cursor_chars);
+    makima_lua::active_at_token(line, cursor_byte).map(|token| {
+        if token.prefix.is_empty() {
+            token.value
+        } else {
+            format!("{}:{}", token.prefix, token.value)
+        }
+    })
+}
+
+/// A generic completion candidate. `label` is the fuzzy-match target and
+/// display text; `kind` drives rendering via `Theme::completion_kinds`;
+/// `insertion` replaces the whole `@`-token (including its leading `@`);
+/// `description` is shown beside the label when present.
+#[derive(Debug, Clone)]
+pub struct CompletionItem {
+    pub label: String,
+    pub kind: String,
+    pub insertion: String,
+    pub description: Option<String>,
+}
+
+impl CompletionItem {
+    /// Text that replaces the whole `@`-token (including its leading `@`).
+    pub(crate) fn replacement(&self) -> String {
+        normalize_completion_insertion(
+            &self.insertion,
+            self.kind == FILE_KIND || self.kind == DIRECTORY_KIND,
+        )
+    }
+
+    pub(crate) fn advance_replacement(&self) -> String {
+        let replacement = self.replacement();
+        let Some(quote) = replacement
+            .chars()
+            .nth(1)
+            .filter(|quote| matches!(quote, '\'' | '"'))
+        else {
+            return replacement;
+        };
+        replacement
+            .strip_suffix(quote)
+            .unwrap_or(&replacement)
+            .to_string()
+    }
+
+    fn file(path: String) -> Self {
+        Self::path(path, false)
+    }
+
+    fn directory(path: String) -> Self {
+        Self::path(path, true)
+    }
+
+    fn path(mut path: String, directory: bool) -> Self {
+        if directory && !path.ends_with(DIRECTORY_SUFFIX) {
+            path.push(DIRECTORY_SUFFIX);
+        }
+        let kind = if directory { DIRECTORY_KIND } else { FILE_KIND };
+        Self {
+            label: path.clone(),
+            kind: kind.to_string(),
+            insertion: format!("@{path}"),
+            description: None,
+        }
+    }
+}
+
+fn normalize_completion_insertion(insertion: &str, file: bool) -> String {
+    let delimiter_start = insertion.trim_end_matches(char::is_whitespace).len();
+    let (token, delimiter) = insertion.split_at(delimiter_start);
+    let Some(body) = token.strip_prefix('@') else {
+        return insertion.to_string();
+    };
+    let (prefix, value) = if file {
+        ("", body)
+    } else {
+        body.split_once(':')
+            .map_or(("", body), |(prefix, value)| (prefix, value))
+    };
+    if matches!(value.chars().next(), Some('\'' | '"'))
+        && value.len() >= 2
+        && value.chars().next() == value.chars().next_back()
+    {
+        return insertion.to_string();
+    }
+    let unsafe_value = value.chars().any(char::is_whitespace)
+        || value
+            .chars()
+            .next_back()
+            .is_some_and(makima_lua::is_trailing_at_token_punctuation);
+    if !unsafe_value {
+        return insertion.to_string();
+    }
+    let quote = if value.contains('"') && !value.contains('\'') {
+        '\''
+    } else {
+        '"'
+    };
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character == quote || character == '\\' {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    let prefix = if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{prefix}:")
+    };
+    format!("@{prefix}{quote}{escaped}{quote}{delimiter}")
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FileCandidate {
+    pub(crate) path: String,
+    pub(crate) is_directory: bool,
+}
+
+#[derive(Debug, Clone)]
+struct Candidate {
+    item: CompletionItem,
+    matching: CompletionMatch,
+    source_rank: u8,
+    source_order: usize,
+    descendable: bool,
+}
+
+#[derive(Debug, Clone)]
+struct QueryIntent {
+    payload: String,
+    kind: Option<&'static str>,
+    has_colon: bool,
+}
+
+#[derive(Debug)]
+pub enum CompletionAction {
+    Consumed,
+    Select(CompletionItem),
+    /// Move filesystem discovery into the selected directory and refresh.
+    Advance(CompletionItem),
+    Close,
+    Passthrough,
+}
+
+enum Discovery {
+    Project {
+        nucleo: Nucleo<()>,
+        done_rx: flume::Receiver<()>,
+        cancel: Arc<AtomicBool>,
+    },
+    Explicit {
+        candidates: Vec<FileCandidate>,
+    },
+}
+
+struct Session {
+    discovery: Discovery,
+    query: String,
+    query_refresh_pending: bool,
+    publication: CoherentCompletion,
+    intent: QueryIntent,
+    /// Non-file candidates from Lua sources, as `(matchable label, item)`.
+    /// Re-fuzzy-matched against each new query in `sync_query`.
+    ref_items: Vec<(String, CompletionItem)>,
+    ref_matches: Vec<Candidate>,
+    pending_ref_matches: Option<Vec<Candidate>>,
+    file_matches: Vec<Candidate>,
+    matches: Vec<Candidate>,
+    coarse_match_count: u32,
+    materialized_count: u32,
+    final_match_count: u32,
+    truncated: bool,
+
+    grid: CompletionGridState,
+
+    started_at: Instant,
+
+    walking: bool,
+    root: PathBuf,
+    matching: bool,
+    visible: bool,
+
+    token_byte_range: (usize, usize),
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if let Discovery::Project { cancel, .. } = &self.discovery {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+pub(crate) trait FileResolver: Send + Sync {
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<FileCandidate>>;
+
+    fn visit_dir(
+        &self,
+        path: &Path,
+        visitor: &mut dyn FnMut(FileCandidate) -> bool,
+    ) -> io::Result<()> {
+        for candidate in self.read_dir(path)? {
+            if !visitor(candidate) {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct RealFileResolver;
+
+impl FileResolver for RealFileResolver {
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<FileCandidate>> {
+        discover_one_level(path)
+    }
+
+    fn visit_dir(
+        &self,
+        path: &Path,
+        visitor: &mut dyn FnMut(FileCandidate) -> bool,
+    ) -> io::Result<()> {
+        visit_one_level(path, visitor)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct PathDiscovery {
+    resolver: Arc<dyn FileResolver>,
+    home: Option<PathBuf>,
+}
+
+impl PathDiscovery {
+    pub(crate) fn new(home: Option<PathBuf>) -> Self {
+        Self {
+            resolver: Arc::new(RealFileResolver),
+            home,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_resolver(resolver: Arc<dyn FileResolver>, home: Option<PathBuf>) -> Self {
+        Self { resolver, home }
+    }
+
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<FileCandidate>> {
+        self.resolver.read_dir(path)
+    }
+
+    fn reference_query(&self, cwd: &Path, value: &str) -> (PathBuf, String, String) {
+        let path = if value == "~" {
+            self.home
+                .as_deref()
+                .map_or_else(|| PathBuf::from(value), Path::to_path_buf)
+        } else if let Some(rest) = value.strip_prefix("~/") {
+            self.home
+                .as_deref()
+                .map(|home| home.join(rest))
+                .unwrap_or_else(|| PathBuf::from(value))
+        } else {
+            PathBuf::from(value)
+        };
+        let path = if path.is_relative() {
+            cwd.join(path)
+        } else {
+            path
+        };
+        let lists_path = ends_with_path_separator(value) || matches!(value, "~" | "." | "..");
+        if lists_path {
+            let display_prefix = if ends_with_path_separator(value) {
+                value.to_string()
+            } else {
+                format!("{value}{DIRECTORY_SUFFIX}")
+            };
+            return (path, String::new(), display_prefix);
+        }
+        let leaf = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let display_prefix = value.strip_suffix(&leaf).unwrap_or(value).to_string();
+        (
+            path.parent().unwrap_or(cwd).to_path_buf(),
+            leaf,
+            display_prefix,
+        )
+    }
+
+    fn explicit_candidates(&self, cwd: &Path, value: &str) -> Vec<FileCandidate> {
+        if value.starts_with('~') && self.home.is_none() {
+            return Vec::new();
+        }
+        let (parent, leaf, display_prefix) = self.reference_query(cwd, value);
+        self.read_dir(&parent)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|candidate| {
+                leaf.is_empty()
+                    || completion_match(
+                        &leaf,
+                        &candidate.path,
+                        CompletionMatchOptions {
+                            case_matching: CaseMatching::Smart,
+                            normalization: Normalization::Smart,
+                        },
+                    )
+                    .is_some()
+            })
+            .map(|candidate| FileCandidate {
+                path: format!("{display_prefix}{}", candidate.path),
+                is_directory: candidate.is_directory,
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn typed_candidates(
+        &self,
+        cwd: &Path,
+        value: &str,
+        directory_only: bool,
+    ) -> io::Result<Vec<(String, bool)>> {
+        let mut candidates = Vec::new();
+        self.visit_typed_candidates(cwd, value, directory_only, &|| false, &mut |candidate| {
+            candidates.push(candidate);
+            true
+        })?;
+        Ok(candidates)
+    }
+
+    pub(crate) fn visit_typed_candidates(
+        &self,
+        cwd: &Path,
+        value: &str,
+        directory_only: bool,
+        cancelled: &dyn Fn() -> bool,
+        visitor: &mut dyn FnMut((String, bool)) -> bool,
+    ) -> io::Result<()> {
+        let (parent, prefix, display_prefix) = self
+            .typed_query(cwd, value)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        self.resolver.visit_dir(&parent, &mut |candidate| {
+            if cancelled() {
+                return false;
+            }
+            if (directory_only && !candidate.is_directory)
+                || (!prefix.is_empty() && !candidate.path.starts_with(&prefix))
+            {
+                return true;
+            }
+            let is_directory = candidate.is_directory;
+            visitor((format!("{display_prefix}{}", candidate.path), is_directory))
+        })
+    }
+
+    fn typed_query(
+        &self,
+        cwd: &Path,
+        value: &str,
+    ) -> Result<(PathBuf, String, String), makima_commands::PathResolutionError> {
+        if value.is_empty() {
+            return Ok((cwd.to_path_buf(), String::new(), String::new()));
+        }
+        let path = makima_commands::resolve_path(cwd, self.home.as_deref(), value)?;
+        let lists_path = ends_with_path_separator(value)
+            || value == "~"
+            || matches!(value.rsplit(['/', '\\']).next(), Some("." | ".."));
+        if lists_path {
+            let display_prefix = if ends_with_path_separator(value) {
+                value.to_string()
+            } else {
+                format!("{value}{DIRECTORY_SUFFIX}")
+            };
+            return Ok((path, String::new(), display_prefix));
+        }
+        let prefix = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let display_prefix = value.strip_suffix(&prefix).unwrap_or(value).to_owned();
+        Ok((
+            path.parent().unwrap_or(cwd).to_path_buf(),
+            prefix,
+            display_prefix,
+        ))
+    }
+}
+
+fn discover_one_level(path: &Path) -> io::Result<Vec<FileCandidate>> {
+    let mut entries = Vec::new();
+    visit_one_level(path, &mut |candidate| {
+        entries.push(candidate);
+        true
+    })?;
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(entries)
+}
+
+fn visit_one_level(path: &Path, visitor: &mut dyn FnMut(FileCandidate) -> bool) -> io::Result<()> {
+    for entry in std::fs::read_dir(path)? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let metadata = match std::fs::metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if !metadata.is_file() && !metadata.is_dir() {
+            continue;
+        }
+        if !visitor(FileCandidate {
+            path: entry.file_name().to_string_lossy().into_owned(),
+            is_directory: metadata.is_dir(),
+        }) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+type Walker = (Nucleo<()>, flume::Receiver<()>, Arc<AtomicBool>);
+type WalkerSpawner = Arc<dyn Fn(&str) -> Option<Walker> + Send + Sync>;
+
+pub struct FileCompletionMenu {
+    session: Option<Session>,
+    discovery: PathDiscovery,
+    walker_spawner: WalkerSpawner,
+    last_hits: Vec<HitTarget>,
+}
+
+impl FileCompletionMenu {
+    pub fn new() -> Self {
+        Self::with_dependencies(
+            PathDiscovery::new(makima_storage::paths::home()),
+            Arc::new(super::file_picker::spawn_file_walker),
+        )
+    }
+
+    #[cfg(test)]
+    fn with_resolver(resolver: Arc<dyn FileResolver>, home: Option<PathBuf>) -> Self {
+        Self::with_dependencies(
+            PathDiscovery::with_resolver(resolver, home),
+            Arc::new(super::file_picker::spawn_file_walker),
+        )
+    }
+
+    fn with_dependencies(discovery: PathDiscovery, walker_spawner: WalkerSpawner) -> Self {
+        Self {
+            session: None,
+            discovery,
+            walker_spawner,
+            last_hits: Vec::new(),
+        }
+    }
+
+    /// Open the popup. `items` are the non-file candidates gathered from Lua
+    /// completion sources by the caller. Files are discovered relative to cwd.
+    pub fn open(
+        &mut self,
+        cwd: &str,
+        items: Vec<ItemSpec>,
+        query: &str,
+        token_byte_range: (usize, usize),
+    ) {
+        self.close();
+        let root = PathBuf::from(cwd);
+        let explicit = query.starts_with(['~', '/', '.']);
+        let (discovery, walking) = if explicit {
+            (
+                Discovery::Explicit {
+                    candidates: self.discovery.explicit_candidates(&root, query),
+                },
+                false,
+            )
+        } else {
+            let Some((nucleo, done_rx, cancel)) = (self.walker_spawner)(cwd) else {
+                return;
+            };
+            (
+                Discovery::Project {
+                    nucleo,
+                    done_rx,
+                    cancel,
+                },
+                true,
+            )
+        };
+
+        let ref_items = items
+            .into_iter()
+            .map(|spec| {
+                let item = CompletionItem {
+                    label: spec.label,
+                    kind: spec.kind,
+                    insertion: spec.insertion,
+                    description: spec.description,
+                };
+                (item.label.clone(), item)
+            })
+            .collect();
+
+        let session = Session {
+            discovery,
+            query: String::new(),
+            query_refresh_pending: false,
+            publication: CoherentCompletion::default(),
+            intent: QueryIntent {
+                payload: String::new(),
+                kind: None,
+                has_colon: false,
+            },
+            ref_items,
+            ref_matches: Vec::new(),
+            pending_ref_matches: None,
+            file_matches: Vec::new(),
+            matches: Vec::new(),
+            coarse_match_count: 0,
+            materialized_count: 0,
+            final_match_count: 0,
+            truncated: false,
+            grid: CompletionGridState::default(),
+            started_at: Instant::now(),
+            walking,
+            root,
+            matching: false,
+            visible: false,
+            token_byte_range,
+        };
+        self.session = Some(session);
+        self.sync_query(query);
+    }
+
+    pub fn close(&mut self) {
+        self.session = None;
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.session.is_some()
+    }
+
+    /// Whether Enter would act on the selection now, not just whether items
+    /// are on screen: a pending publication keeps the previous query's items.
+    #[cfg(test)]
+    pub fn has_selectable(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|s| s.visible && s.publication.ready() && !s.matches.is_empty())
+    }
+
+    #[cfg(test)]
+    pub fn match_items(&self) -> Vec<CompletionItem> {
+        self.session
+            .as_ref()
+            .map(|s| s.matches.iter().map(|c| c.item.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected_for_test(&self) -> usize {
+        self.session.as_ref().map_or(0, |s| s.grid.selected())
+    }
+
+    pub fn needs_reopen(&self, cwd: &str) -> bool {
+        self.session
+            .as_ref()
+            .is_none_or(|session| session.root.as_os_str() != cwd)
+    }
+
+    pub fn token_byte_range(&self) -> (usize, usize) {
+        self.session.as_ref().map_or((0, 0), |s| s.token_byte_range)
+    }
+
+    pub fn set_token_byte_range(&mut self, range: (usize, usize)) {
+        if let Some(s) = &mut self.session {
+            s.token_byte_range = range;
+        }
+    }
+
+    pub fn sync_query(&mut self, query: &str) {
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let explicit = query.starts_with(['~', '/', '.']);
+        session.intent = parse_query(query);
+        let was_explicit = matches!(session.discovery, Discovery::Explicit { .. });
+        if explicit {
+            if let Discovery::Project { cancel, .. } = &session.discovery {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            session.discovery = Discovery::Explicit {
+                candidates: self.discovery.explicit_candidates(&session.root, query),
+            };
+            session.walking = false;
+            session.matching = false;
+            session.publication.synchronous_commit();
+            session.pending_ref_matches = None;
+            session.ref_matches.clear();
+            session.file_matches.clear();
+        } else {
+            if was_explicit {
+                let Some((nucleo, done_rx, cancel)) =
+                    (self.walker_spawner)(&session.root.to_string_lossy())
+                else {
+                    self.session = None;
+                    return;
+                };
+                session.discovery = Discovery::Project {
+                    nucleo,
+                    done_rx,
+                    cancel,
+                };
+                session.walking = true;
+                session.started_at = Instant::now();
+                session.file_matches.clear();
+            }
+            let new_ref_matches = fuzzy_match(
+                &session.intent,
+                session
+                    .ref_items
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(order, (label, item))| (label, item, order)),
+            );
+            let query_changed = session.query != query || was_explicit;
+            if query_changed {
+                session.query_refresh_pending = matches!(&session.discovery, Discovery::Project { nucleo, .. } if nucleo.injector().injected_items() > 0);
+            }
+            if let Discovery::Project { nucleo, .. } = &mut session.discovery {
+                nucleo.pattern.reparse(
+                    0,
+                    &query.to_lowercase(),
+                    CaseMatching::Smart,
+                    Normalization::Smart,
+                    false,
+                );
+                if query_changed {
+                    session.publication.query_reparsed(
+                        nucleo.pattern.column_pattern(0),
+                        nucleo.injector().injected_items() > 0,
+                    );
+                }
+            }
+            if session.publication.pending() {
+                session.pending_ref_matches = Some(new_ref_matches);
+            } else {
+                session.ref_matches = new_ref_matches;
+                session.pending_ref_matches = None;
+            }
+        }
+        session.query = query.to_string();
+        if explicit || session.publication.ready() {
+            session.grid.reset();
+            session.coarse_match_count = 0;
+            session.materialized_count = 0;
+            session.final_match_count = 0;
+            session.truncated = false;
+        }
+        if explicit {
+            refresh_explicit_matches(session);
+            rebuild_combined(session);
+            session.visible = !session.matches.is_empty();
+        } else if session.publication.ready() {
+            rebuild_combined(session);
+        }
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent) -> CompletionAction {
+        let Some(s) = &mut self.session else {
+            return CompletionAction::Close;
+        };
+
+        match key.code {
+            KeyCode::Esc => return CompletionAction::Close,
+            KeyCode::Enter | KeyCode::Tab => {
+                if !s.visible || !s.publication.ready() {
+                    return CompletionAction::Passthrough;
+                }
+                return match s.matches.get(s.grid.selected()) {
+                    Some(candidate) if candidate.descendable => {
+                        CompletionAction::Advance(candidate.item.clone())
+                    }
+                    Some(candidate) => CompletionAction::Select(candidate.item.clone()),
+                    None => CompletionAction::Passthrough,
+                };
+            }
+            _ if s
+                .grid
+                .handle_key(&key, s.matches.len(), !s.publication.ready()) => {}
+            _ => return CompletionAction::Passthrough,
+        }
+        CompletionAction::Consumed
+    }
+
+    pub fn cadence(&self) -> Cadence {
+        let Some(s) = self.session.as_ref() else {
+            return Cadence::IDLE;
+        };
+        Cadence::any([
+            Cadence::when(s.visible && s.walking, Cadence::SPINNER),
+            Cadence::when(
+                s.publication.needs_repaint(s.matching) && !s.walking,
+                Cadence::PENDING,
+            ),
+        ])
+    }
+
+    pub fn tick(&mut self) -> (Dirty, Option<String>) {
+        let Some(s) = &mut self.session else {
+            return (Dirty::NO, None);
+        };
+
+        let mut dirty = Dirty::NO;
+        let mut publication = Publication::Wait;
+        if let Discovery::Project {
+            nucleo, done_rx, ..
+        } = &mut s.discovery
+        {
+            let status = nucleo.tick(0);
+            s.matching = status.running;
+            publication = s
+                .publication
+                .observe(status, nucleo.snapshot().pattern().column_pattern(0));
+            if s.walking {
+                match done_rx.try_recv() {
+                    Ok(()) => {
+                        s.walking = false;
+                        dirty = Dirty::YES;
+                    }
+                    Err(flume::TryRecvError::Disconnected) => {
+                        warn!("{WALKER_CRASHED_MSG}: walker channel disconnected");
+                        self.session = None;
+                        return (Dirty::YES, Some(WALKER_CRASHED_MSG.into()));
+                    }
+                    Err(flume::TryRecvError::Empty) => {}
+                }
+            }
+        }
+        if matches!(s.discovery, Discovery::Explicit { .. }) {
+            s.walking = false;
+            s.matching = false;
+        }
+
+        if !s.visible {
+            let has_files = match &s.discovery {
+                Discovery::Project { nucleo, .. } => nucleo.injector().injected_items() > 0,
+                Discovery::Explicit { candidates } => !candidates.is_empty(),
+            };
+            let has_refs = !s.ref_matches.is_empty();
+            let debounce_elapsed = s.started_at.elapsed().as_millis() >= PENDING_DEBOUNCE_MS;
+
+            if has_files || has_refs || (s.walking && debounce_elapsed) {
+                s.visible = true;
+                dirty = Dirty::YES;
+            }
+        }
+
+        if let Some(s) = self.session.as_mut() {
+            let refresh_finished = s.query_refresh_pending && !s.matching;
+            if publication != Publication::Wait || refresh_finished {
+                refresh_file_matches(s);
+            }
+            if publication == Publication::Commit {
+                if let Some(ref_matches) = s.pending_ref_matches.take() {
+                    s.ref_matches = ref_matches;
+                }
+                s.grid.reset();
+            }
+            if publication != Publication::Wait || refresh_finished {
+                rebuild_combined(s);
+                clamp_selection(s);
+            }
+            if refresh_finished {
+                s.query_refresh_pending = false;
+            }
+            if publication != Publication::Wait {
+                dirty = Dirty::YES;
+            }
+        }
+
+        (dirty, None)
+    }
+
+    pub fn view(&mut self, frame: &mut Frame, input_area: Rect) -> Option<Rect> {
+        self.last_hits.clear();
+        let s = match &mut self.session {
+            Some(s) if s.visible && !s.matches.is_empty() => s,
+            _ => return None,
+        };
+
+        let items: Vec<_> = s
+            .matches
+            .iter()
+            .map(|candidate| CompletionGridItem {
+                label: &candidate.item.label,
+                description: candidate.item.description.as_deref(),
+                indices: &candidate.matching.indices,
+                kind: &candidate.item.kind,
+            })
+            .collect();
+        let rendered = render_completion_grid(frame, input_area, &items, &mut s.grid);
+        self.last_hits = rendered
+            .as_ref()
+            .map(|(popup, hits)| {
+                let mut targets = vec![HitTarget {
+                    rect: *popup,
+                    target: ClickTarget::Surface(Surface::Completion),
+                }];
+                targets.extend(hits.iter().map(|&(rect, index)| HitTarget {
+                    rect,
+                    target: ClickTarget::CompletionRow {
+                        grid: CompletionGrid::FileCompletion,
+                        index,
+                    },
+                }));
+                targets
+            })
+            .unwrap_or_default();
+        rendered.map(|(popup, _)| popup)
+    }
+
+    pub fn hits(&self) -> Vec<HitTarget> {
+        self.last_hits.clone()
+    }
+
+    pub fn select_grid(&mut self, index: usize) -> bool {
+        let Some(s) = &mut self.session else {
+            return false;
+        };
+        if index >= s.matches.len() {
+            return false;
+        }
+        s.grid.set_selected(index);
+        true
+    }
+}
+
+/// Character indices of `query` fuzzy-matched within `label`, for
+/// highlighting. `None` when the query does not match.
+fn parse_query(query: &str) -> QueryIntent {
+    let lowered = query.to_lowercase();
+    for (aliases, kind) in [
+        (&["skill", "sk"][..], "skill"),
+        (&["subagent", "su", "a"][..], "subagent"),
+        (&["model", "m"][..], "model"),
+    ] {
+        for alias in aliases {
+            if lowered == *alias {
+                return QueryIntent {
+                    payload: String::new(),
+                    kind: Some(kind),
+                    has_colon: false,
+                };
+            }
+            let prefix = format!("{alias}:");
+            if lowered.starts_with(&prefix) {
+                let payload = &query[prefix.len()..];
+                return QueryIntent {
+                    payload: payload.into(),
+                    kind: Some(kind),
+                    has_colon: true,
+                };
+            }
+        }
+    }
+    QueryIntent {
+        payload: query.to_string(),
+        kind: None,
+        has_colon: false,
+    }
+}
+
+fn match_candidate(
+    item: CompletionItem,
+    intent: &QueryIntent,
+    source: u8,
+    order: usize,
+    descendable: bool,
+) -> Option<Candidate> {
+    if intent.kind.is_some_and(|kind| kind != item.kind) {
+        return None;
+    }
+    let target = match intent.kind {
+        Some(kind) => {
+            let prefix = format!("{kind}:");
+            item.label.strip_prefix(&prefix).unwrap_or(&item.label)
+        }
+        None => item.label.as_str(),
+    };
+
+    let display_prefix = if intent.has_colon {
+        intent.kind.map_or(0, |kind| kind.chars().count() + 1)
+    } else {
+        0
+    };
+    if intent.payload.is_empty() {
+        return Some(Candidate {
+            item,
+            matching: CompletionMatch {
+                indices: Vec::new(),
+                ranking: CompletionRanking {
+                    quality_rank: 4,
+                    boundary_rank: 1,
+                    start_index: 0,
+                    gap_count: 0,
+                    span_length: 0,
+                    unmatched_suffix: 0,
+                    fuzzy_score: 0,
+                },
+            },
+            source_rank: source,
+            source_order: order,
+            descendable,
+        });
+    }
+    let matched = completion_match(
+        &intent.payload,
+        target,
+        CompletionMatchOptions {
+            case_matching: CaseMatching::Smart,
+            normalization: Normalization::Smart,
+        },
+    )?;
+    let mut matching = matched;
+    for index in &mut matching.indices {
+        *index += display_prefix as u32;
+    }
+    Some(Candidate {
+        item,
+        matching,
+        source_rank: source,
+        source_order: order,
+        descendable,
+    })
+}
+
+fn fuzzy_match(
+    intent: &QueryIntent,
+    items: impl IntoIterator<Item = (String, CompletionItem, usize)>,
+) -> Vec<Candidate> {
+    items
+        .into_iter()
+        .filter_map(|(_, item, order)| match_candidate(item, intent, 1, order, false))
+        .collect()
+}
+
+fn refresh_file_matches(s: &mut Session) {
+    let Discovery::Project { nucleo, .. } = &s.discovery else {
+        return;
+    };
+    let snapshot = nucleo.snapshot();
+    let mut paths = Vec::new();
+    let scan_count = snapshot.matched_item_count().min(MAX_MATERIALIZED);
+    for item in snapshot.matched_items(0..scan_count) {
+        let path = item.matcher_columns[0].slice(..);
+        if paths.len() < MAX_MATERIALIZED as usize {
+            paths.push(path.to_string());
+        }
+    }
+    let coarse_match_count = snapshot.matched_item_count();
+    let materialized_count = paths.len() as u32;
+    paths.sort();
+    s.coarse_match_count = coarse_match_count;
+    s.materialized_count = materialized_count;
+    s.truncated = coarse_match_count > materialized_count;
+    s.file_matches.clear();
+    for (order, path) in paths.into_iter().enumerate() {
+        let directory = path.ends_with(DIRECTORY_SUFFIX);
+        let item = if directory {
+            CompletionItem::directory(path)
+        } else {
+            CompletionItem::file(path)
+        };
+        if let Some(candidate) = match_candidate(item, &s.intent, 0, order, directory) {
+            s.file_matches.push(candidate);
+        }
+    }
+    s.final_match_count = s.file_matches.len() as u32;
+}
+
+fn refresh_explicit_matches(s: &mut Session) {
+    let Discovery::Explicit { candidates } = &s.discovery else {
+        return;
+    };
+    let mut paths = candidates.clone();
+    paths.sort_by(|a, b| a.path.cmp(&b.path));
+    s.file_matches.clear();
+    for (order, candidate) in paths.into_iter().enumerate() {
+        let item = if candidate.is_directory {
+            CompletionItem::directory(candidate.path)
+        } else {
+            CompletionItem::file(candidate.path)
+        };
+        if let Some(candidate) = match_candidate(item, &s.intent, 0, order, candidate.is_directory)
+        {
+            s.file_matches.push(candidate);
+        }
+    }
+    s.coarse_match_count = s.file_matches.len() as u32;
+    s.materialized_count = s.coarse_match_count;
+    s.final_match_count = s.coarse_match_count;
+    s.truncated = false;
+}
+
+fn rebuild_combined(s: &mut Session) {
+    s.matches.clear();
+    s.matches.extend(s.file_matches.iter().cloned());
+    s.matches.extend(s.ref_matches.iter().cloned());
+    s.matches.sort_by(|a, b| {
+        compare_completion_matches(
+            &a.matching,
+            &b.matching,
+            a.source_rank,
+            b.source_rank,
+            a.source_order,
+            b.source_order,
+            &a.item.label,
+            &b.item.label,
+        )
+    });
+}
+
+#[cfg(test)]
+fn highlight_indices(label: &str, query: &str) -> Option<Vec<u32>> {
+    completion_match_default(query, label).map(|matching| matching.indices)
+}
+
+fn clamp_selection(s: &mut Session) {
+    s.grid.clamp_selection(s.matches.len());
+}
+
+pub(crate) fn render_completion_grid(
+    frame: &mut Frame,
+    input_area: Rect,
+    items: &[CompletionGridItem<'_>],
+    grid: &mut CompletionGridState,
+) -> Option<(Rect, Vec<(Rect, usize)>)> {
+    if items.is_empty() || input_area.y == 0 {
+        return None;
+    }
+
+    let max_height = ((frame.area().height as u32 * 30 / 100) as u16).max(2);
+    let avail = max_height.saturating_sub(1) as usize;
+    if avail == 0 {
+        return None;
+    }
+
+    let len = items.len();
+    let cols = if len <= avail {
+        1
+    } else if len <= avail.saturating_mul(2) {
+        2
+    } else {
+        len.min(3)
+    };
+    let total_rows = len.div_ceil(cols);
+    let view_rows = avail.min(total_rows);
+    grid.set_layout(len, cols, view_rows);
+    let selected = grid.selected();
+
+    let budget = (input_area.width as usize).saturating_sub(COL_GAP * (cols - 1)) / cols;
+    let col_widths: Vec<usize> = (0..cols)
+        .map(|column| {
+            items
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| index % cols == column)
+                .map(|(_, item)| completion_item_width(item))
+                .max()
+                .unwrap_or(0)
+                .min(budget)
+        })
+        .collect();
+    let popup_height = (view_rows as u16 + 1).min(max_height);
+    let popup = Rect {
+        x: input_area.x,
+        y: input_area.y.saturating_sub(popup_height),
+        width: input_area.width.max(1),
+        height: popup_height,
+    };
+
+    let t = theme::current();
+    let lines = build_grid(
+        items,
+        view_rows,
+        cols,
+        &col_widths,
+        grid.scroll_offset(),
+        selected,
+        &t,
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .style(Style::new().bg(t.background));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    let mut hits = Vec::new();
+    for row_offset in 0..view_rows {
+        let screen_y = inner.y + row_offset as u16;
+        let mut x = inner.x;
+        for (column, width) in col_widths.iter().enumerate() {
+            let index = (grid.scroll_offset() + row_offset) * cols + column;
+            if index < len {
+                hits.push((Rect::new(x, screen_y, *width as u16, 1), index));
+            }
+            x = x.saturating_add(*width as u16 + COL_GAP as u16);
+        }
+    }
+
+    Some((popup, hits))
+}
+
+fn completion_item_width(item: &CompletionGridItem<'_>) -> usize {
+    item.label.chars().count()
+        + item
+            .description
+            .filter(|description| !description.is_empty())
+            .map_or(0, |description| description.chars().count() + 2)
+}
+
+fn build_grid<'a>(
+    items: &[CompletionGridItem<'_>],
+    view_rows: usize,
+    cols: usize,
+    col_widths: &[usize],
+    scroll_offset: usize,
+    selected: usize,
+    t: &'a theme::Theme,
+) -> Vec<Line<'a>> {
+    let mut lines = Vec::with_capacity(view_rows);
+
+    for row_offset in 0..view_rows {
+        let row = scroll_offset + row_offset;
+        let mut spans = Vec::new();
+        for (column, width) in col_widths.iter().enumerate() {
+            let index = row * cols + column;
+            if let Some(item) = items.get(index) {
+                spans.extend(cell_line(item, *width, index == selected, t).spans);
+            } else {
+                spans.push(Span::raw(" ".repeat(*width)));
+            }
+            if column + 1 < cols {
+                spans.push(Span::raw(" ".repeat(COL_GAP)));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+fn cell_line<'a>(
+    item: &CompletionGridItem<'_>,
+    width: usize,
+    selected: bool,
+    t: &'a theme::Theme,
+) -> Line<'a> {
+    let base = if selected { t.item_selected } else { t.item };
+    let kind_style = t.completion_kinds.get(item.kind).copied().unwrap_or(base);
+    // Matched characters keep the kind foreground but also carry the
+    // selection background, so the highlight is not cut out of the selected
+    // row.
+    let match_style = if selected {
+        Style {
+            bg: base.bg,
+            ..kind_style
+        }
+    } else {
+        kind_style
+    };
+    let text = match item.description {
+        Some(description) if !description.is_empty() => {
+            format!("{}  {}", item.label, description)
+        }
+        _ => item.label.to_owned(),
+    };
+    let mut spans: Vec<Span<'a>> = Vec::new();
+    let mut used = 0usize;
+    let mut in_match = false;
+    let mut run = String::new();
+
+    for (index, ch) in text.chars().enumerate() {
+        let cw = ch.width().unwrap_or(0);
+        if used + cw > width {
+            break;
+        }
+        used += cw;
+        let is_match = item.indices.binary_search(&(index as u32)).is_ok();
+        if is_match != in_match && !run.is_empty() {
+            spans.push(Span::styled(
+                mem::take(&mut run),
+                if in_match { match_style } else { base },
+            ));
+        }
+        in_match = is_match;
+        run.push(ch);
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, if in_match { match_style } else { base }));
+    }
+
+    if used < width {
+        spans.push(Span::raw(" ".repeat(width - used)));
+    }
+    Line::from(spans)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+
+    use crate::theme::ThemesProvider;
+
+    use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
+    use nucleo::{Config, Nucleo, Utf32String};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+
+    use crate::text_buffer::TextBuffer;
+    use makima_lua::ItemSpec;
+
+    use super::*;
+    use test_case::test_case;
+
+    const MATCHER_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn wait_for_matcher(
+        menu: &mut FileCompletionMenu,
+        settled: impl Fn(&FileCompletionMenu) -> bool,
+        message: &str,
+    ) {
+        let deadline = Instant::now() + MATCHER_SETTLE_TIMEOUT;
+        loop {
+            let _ = menu.tick();
+            if settled(menu) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{message}");
+            std::thread::yield_now();
+        }
+    }
+
+    fn item(label: &str, kind: &str, insertion: &str) -> ItemSpec {
+        ItemSpec {
+            label: label.into(),
+            kind: kind.into(),
+            insertion: insertion.into(),
+            description: None,
+        }
+    }
+
+    fn project_nucleo_mut(session: &mut Session) -> &mut Nucleo<()> {
+        let Discovery::Project { nucleo, .. } = &mut session.discovery else {
+            panic!("test session must use project discovery");
+        };
+        nucleo
+    }
+
+    fn session_with_items(items: Vec<ItemSpec>) -> FileCompletionMenu {
+        let nucleo = Nucleo::new(Config::DEFAULT.match_paths(), Arc::new(|| {}), None, 1);
+        let (done_tx, done_rx) = flume::bounded(1);
+        std::mem::forget(done_tx);
+        let mut menu = FileCompletionMenu::new();
+        let ref_items = items
+            .into_iter()
+            .map(|spec| {
+                let item = CompletionItem {
+                    label: spec.label,
+                    kind: spec.kind,
+                    insertion: spec.insertion,
+                    description: spec.description,
+                };
+                (item.label.clone(), item)
+            })
+            .collect();
+        menu.session = Some(Session {
+            discovery: Discovery::Project {
+                nucleo,
+                done_rx,
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+            query: String::new(),
+            query_refresh_pending: false,
+            publication: CoherentCompletion::default(),
+            intent: QueryIntent {
+                payload: String::new(),
+                kind: None,
+                has_colon: false,
+            },
+            ref_items,
+            ref_matches: Vec::new(),
+            pending_ref_matches: None,
+            file_matches: Vec::new(),
+            matches: Vec::new(),
+            coarse_match_count: 0,
+            materialized_count: 0,
+            final_match_count: 0,
+            truncated: false,
+            grid: CompletionGridState::default(),
+            started_at: Instant::now(),
+            walking: true,
+            root: PathBuf::new(),
+            matching: false,
+            visible: false,
+            token_byte_range: (0, 0),
+        });
+        menu
+    }
+
+    #[test_case(0; "closed")]
+    #[test_case(1; "hidden")]
+    #[test_case(2; "empty")]
+    fn early_view_clears_previous_hits(transition: u8) {
+        let mut menu = session_with_items(vec![item("main", "file", "main.rs")]);
+        let session = menu.session.as_mut().unwrap();
+        session.ref_matches = fuzzy_match(
+            &session.intent,
+            session
+                .ref_items
+                .iter()
+                .enumerate()
+                .map(|(i, (label, item))| (label.clone(), item.clone(), i)),
+        );
+        rebuild_combined(session);
+        session.visible = true;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                menu.view(frame, Rect::new(0, 20, 80, 4));
+            })
+            .unwrap();
+        let hits = menu.hits();
+        assert_eq!(hits[0].target, ClickTarget::Surface(Surface::Completion));
+        assert!(hits[1..].iter().all(|hit| {
+            matches!(hit.target, ClickTarget::CompletionRow { .. })
+                && hit.rect.intersection(hits[0].rect) == hit.rect
+        }));
+        match transition {
+            0 => menu.close(),
+            1 => menu.session.as_mut().unwrap().visible = false,
+            _ => menu.session.as_mut().unwrap().matches.clear(),
+        }
+        terminal
+            .draw(|frame| {
+                assert!(menu.view(frame, Rect::new(0, 20, 80, 4)).is_none());
+            })
+            .unwrap();
+        assert!(menu.hits().is_empty());
+    }
+
+    struct CountingResolver {
+        reads: std::sync::Mutex<Vec<PathBuf>>,
+        entries: Vec<FileCandidate>,
+    }
+
+    impl FileResolver for CountingResolver {
+        fn read_dir(&self, path: &Path) -> io::Result<Vec<FileCandidate>> {
+            self.reads.lock().unwrap().push(path.to_path_buf());
+            Ok(self.entries.clone())
+        }
+    }
+
+    fn test_walker() -> Walker {
+        let nucleo = Nucleo::new(Config::DEFAULT.match_paths(), Arc::new(|| {}), None, 1);
+        let (done_tx, done_rx) = flume::bounded(1);
+        std::mem::forget(done_tx);
+        (nucleo, done_rx, Arc::new(AtomicBool::new(false)))
+    }
+
+    #[test]
+    fn explicit_mode_project_walker_lifecycle() {
+        let spawns = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cancellations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let spawner: WalkerSpawner = {
+            let spawns = spawns.clone();
+            let cancellations = cancellations.clone();
+            Arc::new(move |cwd| {
+                spawns.lock().unwrap().push(cwd.to_string());
+                let walker = test_walker();
+                cancellations.lock().unwrap().push(walker.2.clone());
+                Some(walker)
+            })
+        };
+        let resolver = Arc::new(CountingResolver {
+            reads: std::sync::Mutex::new(Vec::new()),
+            entries: Vec::new(),
+        });
+        let mut menu = FileCompletionMenu::with_dependencies(
+            PathDiscovery::with_resolver(resolver, None),
+            spawner,
+        );
+
+        menu.open("/project", Vec::new(), "../", (0, 3));
+        assert!(spawns.lock().unwrap().is_empty());
+        menu.sync_query("src");
+        assert_eq!(spawns.lock().unwrap().as_slice(), &["/project"]);
+        menu.sync_query("../");
+        assert!(cancellations.lock().unwrap()[0].load(Ordering::Relaxed));
+        menu.sync_query("src");
+        assert_eq!(spawns.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn failed_project_restart_closes_stale_explicit_session() {
+        let resolver = Arc::new(CountingResolver {
+            reads: std::sync::Mutex::new(Vec::new()),
+            entries: vec![FileCandidate {
+                path: "outside.txt".into(),
+                is_directory: false,
+            }],
+        });
+        let mut menu = FileCompletionMenu::with_dependencies(
+            PathDiscovery::with_resolver(resolver, None),
+            Arc::new(|_| None),
+        );
+        menu.open("/project", Vec::new(), "../out", (0, 7));
+        assert!(menu.has_selectable());
+
+        menu.sync_query("project");
+
+        assert!(!menu.is_active());
+    }
+
+    #[test]
+    fn explicit_mode_ignores_stale_walker_signals() {
+        let (done_tx, done_rx) = flume::bounded(1);
+        let receiver = Arc::new(std::sync::Mutex::new(Some(done_rx)));
+        let spawner: WalkerSpawner = {
+            let receiver = receiver.clone();
+            Arc::new(move |_| {
+                let nucleo = Nucleo::new(Config::DEFAULT.match_paths(), Arc::new(|| {}), None, 1);
+                Some((
+                    nucleo,
+                    receiver.lock().unwrap().take().unwrap(),
+                    Arc::new(AtomicBool::new(false)),
+                ))
+            })
+        };
+        let resolver = Arc::new(CountingResolver {
+            reads: std::sync::Mutex::new(Vec::new()),
+            entries: vec![FileCandidate {
+                path: "outside.txt".into(),
+                is_directory: false,
+            }],
+        });
+        let mut menu = FileCompletionMenu::with_dependencies(
+            PathDiscovery::with_resolver(resolver, None),
+            spawner,
+        );
+        menu.open("/project", Vec::new(), "src", (0, 4));
+        menu.sync_query("../out");
+        drop(done_tx);
+
+        assert_eq!(menu.tick(), (Dirty::NO, None));
+        assert!(menu.is_active());
+        assert_eq!(menu.match_items()[0].label, "../outside.txt");
+    }
+
+    struct RecoveringResolver;
+
+    impl FileResolver for RecoveringResolver {
+        fn read_dir(&self, path: &Path) -> io::Result<Vec<FileCandidate>> {
+            if path.ends_with("missing") {
+                Err(io::Error::new(io::ErrorKind::NotFound, "missing"))
+            } else {
+                Ok(vec![FileCandidate {
+                    path: "found.txt".into(),
+                    is_directory: false,
+                }])
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_discovery_failures_are_recoverable() {
+        let mut menu = FileCompletionMenu::with_resolver(Arc::new(RecoveringResolver), None);
+        menu.open("/project", Vec::new(), "./missing/", (0, 10));
+        assert!(menu.is_active());
+        assert!(menu.match_items().is_empty());
+
+        menu.sync_query("./valid/");
+        assert!(menu.has_selectable());
+        assert_eq!(menu.match_items()[0].label, "./valid/found.txt");
+    }
+
+    #[test]
+    fn project_walker_disconnect_flashes_and_closes() {
+        let nucleo = Nucleo::new(Config::DEFAULT.match_paths(), Arc::new(|| {}), None, 1);
+        let (done_tx, done_rx) = flume::bounded(1);
+        drop(done_tx);
+        let walker = Arc::new(std::sync::Mutex::new(Some((nucleo, done_rx))));
+        let spawner: WalkerSpawner = Arc::new(move |_| {
+            let (nucleo, done_rx) = walker.lock().unwrap().take().unwrap();
+            Some((nucleo, done_rx, Arc::new(AtomicBool::new(false))))
+        });
+        let mut menu = FileCompletionMenu::with_dependencies(
+            PathDiscovery::with_resolver(
+                Arc::new(CountingResolver {
+                    reads: std::sync::Mutex::new(Vec::new()),
+                    entries: Vec::new(),
+                }),
+                None,
+            ),
+            spawner,
+        );
+        menu.open("/project", Vec::new(), "src", (0, 4));
+
+        assert_eq!(
+            menu.tick(),
+            (Dirty::YES, Some(WALKER_CRASHED_MSG.to_string()))
+        );
+        assert!(!menu.is_active());
+    }
+
+    #[test]
+    fn switching_from_explicit_to_project_restores_project_and_lua_matches() {
+        let spawner: WalkerSpawner = Arc::new(move |_| Some(test_walker()));
+        let resolver = Arc::new(CountingResolver {
+            reads: std::sync::Mutex::new(Vec::new()),
+            entries: vec![FileCandidate {
+                path: "outside.txt".into(),
+                is_directory: false,
+            }],
+        });
+        let mut menu = FileCompletionMenu::with_dependencies(
+            PathDiscovery::with_resolver(resolver, None),
+            spawner,
+        );
+        menu.open(
+            "/project",
+            vec![item("skill:review", "skill", "@skill:review")],
+            "../out",
+            (0, 7),
+        );
+        assert_eq!(menu.match_items()[0].kind, FILE_KIND);
+
+        menu.sync_query("review");
+        let session = menu.session.as_mut().unwrap();
+        project_nucleo_mut(session)
+            .injector()
+            .push((), |_, columns| {
+                columns[0] = Utf32String::from("review.txt")
+            });
+        session.walking = false;
+        wait_for_matcher(
+            &mut menu,
+            |menu| {
+                let session = menu.session.as_ref().unwrap();
+                !session.publication.pending()
+                    && menu
+                        .match_items()
+                        .iter()
+                        .any(|item| item.label == "review.txt")
+            },
+            "project matcher did not surface the injected review.txt match",
+        );
+        let items = menu.match_items();
+        let kinds = items
+            .iter()
+            .map(|item| item.kind.clone())
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&FILE_KIND.to_string()));
+        assert!(kinds.contains(&"skill".to_string()));
+        assert!(
+            items.iter().all(|item| item.label != "../outside.txt"),
+            "stale explicit candidate must not survive the project transition"
+        );
+    }
+
+    #[test]
+    fn lua_directory_kind_does_not_advance() {
+        let mut menu = session_with_items(vec![item(
+            "directory:plugin",
+            DIRECTORY_KIND,
+            "@directory:plugin",
+        )]);
+        menu.sync_query("plugin");
+        menu.session.as_mut().unwrap().visible = true;
+        assert!(matches!(
+            menu.handle_key(key(KeyCode::Enter)),
+            CompletionAction::Select(_)
+        ));
+    }
+
+    #[test]
+    fn explicit_discovery_reads_parent_once_and_marks_directories() {
+        let cwd = PathBuf::from("/workspace/project");
+        let resolver = Arc::new(CountingResolver {
+            reads: std::sync::Mutex::new(Vec::new()),
+            entries: vec![
+                FileCandidate {
+                    path: "alpha.txt".into(),
+                    is_directory: false,
+                },
+                FileCandidate {
+                    path: "archive".into(),
+                    is_directory: true,
+                },
+            ],
+        });
+        let discovery = PathDiscovery::with_resolver(resolver.clone(), None);
+        let candidates = discovery.explicit_candidates(&cwd, "../ar");
+        assert_eq!(resolver.reads.lock().unwrap().as_slice(), &[cwd.join("..")]);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].path, "../archive");
+        assert!(candidates[0].is_directory);
+    }
+
+    #[test_case(".", "/workspace/project/.", "./archive"; "current_directory")]
+    #[test_case("./ar", "/workspace/project", "./archive"; "current_prefix")]
+    #[test_case("..", "/workspace/project/..", "../archive"; "parent_directory")]
+    #[test_case("../ar", "/workspace/project/..", "../archive"; "parent_prefix")]
+    #[test_case("/outside/", "/outside", "/outside/archive"; "absolute_directory")]
+    #[test_case("/outside/ar", "/outside", "/outside/archive"; "absolute_prefix")]
+    #[test_case("~", "/home/tester", "~/archive"; "home_directory")]
+    #[test_case("~/ar", "/home/tester", "~/archive"; "home_prefix")]
+    #[test_case("nested/", "/workspace/project/nested", "nested/archive"; "relative_directory")]
+    #[test_case("nested/ar", "/workspace/project/nested", "nested/archive"; "relative_prefix")]
+    #[test_case("nested/.", "/workspace/project/nested/.", "nested/./archive"; "nested_current_directory")]
+    #[test_case("nested/./", "/workspace/project/nested/.", "nested/./archive"; "nested_current_directory_separator")]
+    #[test_case("nested/..", "/workspace/project/nested/..", "nested/../archive"; "nested_parent_directory")]
+    #[test_case("nested/../", "/workspace/project/nested/..", "nested/../archive"; "nested_parent_directory_separator")]
+    #[test_case("/outside/.", "/outside/.", "/outside/./archive"; "absolute_current_directory")]
+    #[test_case("/outside/./", "/outside/.", "/outside/./archive"; "absolute_current_directory_separator")]
+    #[test_case("/outside/..", "/outside/..", "/outside/../archive"; "absolute_parent_directory")]
+    #[test_case("/outside/../", "/outside/..", "/outside/../archive"; "absolute_parent_directory_separator")]
+    fn typed_paths_use_resolver(query: &str, parent: &str, expected: &str) {
+        let resolver = Arc::new(CountingResolver {
+            reads: std::sync::Mutex::new(Vec::new()),
+            entries: vec![
+                FileCandidate {
+                    path: "archive.txt".into(),
+                    is_directory: false,
+                },
+                FileCandidate {
+                    path: "archive".into(),
+                    is_directory: true,
+                },
+            ],
+        });
+        let discovery =
+            PathDiscovery::with_resolver(resolver.clone(), Some(PathBuf::from("/home/tester")));
+
+        let candidates = discovery
+            .typed_candidates(Path::new("/workspace/project"), query, true)
+            .unwrap();
+
+        assert_eq!(
+            resolver.reads.lock().unwrap().as_slice(),
+            &[PathBuf::from(parent)]
+        );
+        assert_eq!(candidates, vec![(expected.to_owned(), true)]);
+    }
+
+    #[cfg(windows)]
+    #[test_case("src/", "C:\\work\\src", "src/child"; "relative_forward_slash")]
+    #[test_case("./src/", "C:\\work\\src", "./src/child"; "relative_dot_forward_slash")]
+    #[test_case("C:/work/src/", "C:\\work\\src", "C:/work/src/child"; "absolute_forward_slash")]
+    #[test_case("src\\nested/", "C:\\work\\src\\nested", "src\\nested/child"; "mixed_separators")]
+    fn windows_typed_directory_input_accepts_both_separators(
+        query: &str,
+        parent: &str,
+        expected: &str,
+    ) {
+        let resolver = Arc::new(CountingResolver {
+            reads: std::sync::Mutex::new(Vec::new()),
+            entries: vec![FileCandidate {
+                path: "child".into(),
+                is_directory: true,
+            }],
+        });
+        let discovery = PathDiscovery::with_resolver(resolver.clone(), None);
+
+        let candidates = discovery
+            .typed_candidates(Path::new("C:\\work"), query, true)
+            .unwrap();
+
+        assert_eq!(
+            resolver.reads.lock().unwrap().as_slice(),
+            &[PathBuf::from(parent)]
+        );
+        assert_eq!(candidates, vec![(expected.to_owned(), true)]);
+    }
+
+    #[cfg(windows)]
+    #[test_case("src/", "C:\\work\\src", "src/child"; "relative_forward_slash")]
+    #[test_case("./src/", "C:\\work\\src", "./src/child"; "relative_dot_forward_slash")]
+    #[test_case("C:/work/src/", "C:\\work\\src", "C:/work/src/child"; "absolute_forward_slash")]
+    #[test_case("src\\nested/", "C:\\work\\src\\nested", "src\\nested/child"; "mixed_separators")]
+    fn windows_reference_directory_input_accepts_both_separators(
+        query: &str,
+        parent: &str,
+        expected: &str,
+    ) {
+        let resolver = Arc::new(CountingResolver {
+            reads: std::sync::Mutex::new(Vec::new()),
+            entries: vec![FileCandidate {
+                path: "child".into(),
+                is_directory: true,
+            }],
+        });
+        let discovery = PathDiscovery::with_resolver(resolver.clone(), None);
+
+        let candidates = discovery.explicit_candidates(Path::new("C:\\work"), query);
+
+        assert_eq!(
+            resolver.reads.lock().unwrap().as_slice(),
+            &[PathBuf::from(parent)]
+        );
+        assert_eq!(candidates[0].path, expected);
+    }
+
+    #[test]
+    fn home_discovery_preserves_tilde_namespace() {
+        let cwd = PathBuf::from("/workspace/project");
+        let home = PathBuf::from("/home/tester");
+        let resolver = Arc::new(CountingResolver {
+            reads: std::sync::Mutex::new(Vec::new()),
+            entries: vec![FileCandidate {
+                path: "notes.txt".into(),
+                is_directory: false,
+            }],
+        });
+        let discovery = PathDiscovery::with_resolver(resolver.clone(), Some(home.clone()));
+        let candidates = discovery.explicit_candidates(&cwd, "~/not");
+        assert_eq!(resolver.reads.lock().unwrap().as_slice(), &[home]);
+        assert_eq!(candidates[0].path, "~/notes.txt");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn discover_one_level_follows_symlinks() {
+        let unique = format!("makima-file-completion-{}", std::process::id());
+        let tmp = std::env::temp_dir().join(unique);
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("real_dir")).unwrap();
+        std::fs::write(tmp.join("real.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(tmp.join("real.txt"), tmp.join("link_file")).unwrap();
+        std::os::unix::fs::symlink(tmp.join("real_dir"), tmp.join("link_dir")).unwrap();
+        std::os::unix::fs::symlink(tmp.join("missing_target"), tmp.join("dangling")).unwrap();
+
+        let candidates = discover_one_level(&tmp).unwrap();
+
+        std::fs::remove_file(tmp.join("link_file")).unwrap();
+        std::fs::remove_file(tmp.join("link_dir")).unwrap();
+        std::fs::remove_file(tmp.join("dangling")).unwrap();
+        std::fs::remove_file(tmp.join("real.txt")).unwrap();
+        std::fs::remove_dir_all(tmp.join("real_dir")).unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let by_name = |name: &str| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.path == name)
+                .unwrap_or_else(|| panic!("missing candidate {name:?}"))
+        };
+        assert!(
+            !by_name("link_file").is_directory,
+            "file symlink must classify as file"
+        );
+        assert!(
+            by_name("link_dir").is_directory,
+            "dir symlink must classify as directory"
+        );
+        assert!(
+            candidates.iter().all(|c| c.path != "dangling"),
+            "dangling symlink must be skipped"
+        );
+    }
+
+    #[test]
+    fn quoted_directory_advance_keeps_quote_open() {
+        let item = CompletionItem::directory("../release notes".into());
+        assert_eq!(
+            item.advance_replacement(),
+            format!("@\"../release notes{}", DIRECTORY_SUFFIX)
+        );
+        assert_eq!(
+            item.replacement(),
+            format!("@\"../release notes{}\"", DIRECTORY_SUFFIX)
+        );
+    }
+
+    #[test]
+    fn explicit_directory_selection_returns_advance() {
+        let mut menu = session_with_items(Vec::new());
+        let session = menu.session.as_mut().unwrap();
+        let item = CompletionItem::directory("../archive".into());
+        session.matches.push(Candidate {
+            item,
+            matching: completion_match_default("ar", "../archive").unwrap(),
+            source_rank: 0,
+            source_order: 0,
+            descendable: true,
+        });
+        session.visible = true;
+        session.walking = false;
+        assert!(matches!(
+            menu.handle_key(key(KeyCode::Enter)),
+            CompletionAction::Advance(item) if item.insertion.ends_with(DIRECTORY_SUFFIX)
+        ));
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        key_with(code, KeyModifiers::NONE)
+    }
+
+    fn key_with(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    #[test_case("@", 1        => Some((0, 1))  ; "bare_at")]
+    #[test_case("@src", 4      => Some((0, 4))  ; "query_no_prefix")]
+    #[test_case(" @src", 5     => Some((1, 5))  ; "space_prefixed")]
+    #[test_case("prefix @src", 11 => Some((7, 11)) ; "word_then_token")]
+    #[test_case("foo@bar", 7   => None          ; "mid_word_at_rejected")]
+    #[test_case("@src tail", 3 => Some((0, 3))  ; "cursor_mid_token")]
+    fn at_token_cases(line: &str, cursor: usize) -> Option<(usize, usize)> {
+        at_token_range(line, cursor)
+    }
+
+    #[test_case("@src tail", 9 => None; "unquoted_whitespace_closes")]
+    #[test_case("@\"src tail", 10 => Some((0, 10)); "unfinished_quote_keeps_spaces")]
+    #[test_case("@\"src tail\"", 11 => Some((0, 11)); "closed_quote_is_active_at_end")]
+    fn active_at_token_quote_and_whitespace_cases(
+        line: &str,
+        cursor: usize,
+    ) -> Option<(usize, usize)> {
+        at_token_range(line, cursor)
+    }
+
+    #[test_case("@main.rs" => "@main.rs"; "safe_file")]
+    #[test_case("@docs/read me.md" => "@\"docs/read me.md\""; "file_space")]
+    #[test_case("@skill:release review " => "@skill:\"release review\" "; "tagged_space_and_delimiter")]
+    #[test_case("@file?" => "@\"file?\""; "trailing_punctuation")]
+    #[test_case("@\"already quoted\"" => "@\"already quoted\""; "already_quoted")]
+    #[test_case("@say\"what?" => "@'say\"what?'"; "alternate_delimiter")]
+    fn completion_replacement_quotes_unsafe_values(insertion: &str) -> String {
+        normalize_completion_insertion(insertion, false)
+    }
+
+    #[test]
+    fn windows_drive_file_insertion_quotes_whole_path() {
+        let item = CompletionItem::file(r"C:\Program Files\notes.txt".into());
+        assert_eq!(item.replacement(), r#"@"C:\\Program Files\\notes.txt""#);
+    }
+
+    #[test]
+    fn insertion_replaces_token_keeps_single_at() {
+        let mut buf = TextBuffer::new("foo @xyz".into());
+        let range = at_token_range(&buf.lines()[0], 8).unwrap();
+        let item = CompletionItem::file("docs/read me.md".into());
+        buf.replace_range_on_current_line(range.0, range.1, &item.replacement());
+        assert_eq!(buf.value(), "foo @\"docs/read me.md\"");
+    }
+
+    #[test]
+    fn skill_replacement_uses_skill_prefix() {
+        let mut buf = TextBuffer::new("foo @".into());
+        let range = at_token_range(&buf.lines()[0], 5).unwrap();
+        let item = CompletionItem {
+            label: "skill:review".into(),
+            kind: "skill".into(),
+            insertion: "@skill:review".into(),
+            description: None,
+        };
+        buf.replace_range_on_current_line(range.0, range.1, &item.replacement());
+        assert_eq!(buf.value(), "foo @skill:review");
+    }
+
+    #[test]
+    fn cursor_lands_after_insertion() {
+        let mut buf = TextBuffer::new("foo @xyz".into());
+        let range = at_token_range(&buf.lines()[0], 8).unwrap();
+        assert_eq!(range, (4, 8)); // `foo @xyz` -> token is `@xyz`
+        let item = CompletionItem::file("main.rs".into());
+        buf.replace_range_on_current_line(range.0, range.1, &item.replacement());
+        assert_eq!(buf.value(), "foo @main.rs");
+        assert_eq!(buf.x(), 12); // cursor just past the inserted `@main.rs`
+    }
+
+    #[test]
+    fn name_needle_matches_refs_in_unified_list() {
+        let mut menu = session_with_items(vec![item("skill:review", "skill", "@skill:review")]);
+        menu.sync_query("rev");
+        let s = menu.session.as_ref().unwrap();
+        let labels: Vec<_> = s.matches.iter().map(|c| c.item.label.as_str()).collect();
+        assert_eq!(labels, vec!["skill:review"]);
+    }
+
+    #[test]
+    fn skill_prefix_filters_to_skills_only() {
+        let mut menu = session_with_items(vec![
+            item("skill:review", "skill", "@skill:review"),
+            item("skill:tests", "skill", "@skill:tests"),
+        ]);
+        menu.sync_query("skill:");
+        let s = menu.session.as_ref().unwrap();
+        assert!(s.matches.iter().all(|c| c.item.kind == "skill"));
+        assert_eq!(s.matches.len(), 2);
+
+        menu.sync_query("skill:t");
+        let s = menu.session.as_ref().unwrap();
+        let labels: Vec<_> = s.matches.iter().map(|c| c.item.label.as_str()).collect();
+        assert_eq!(labels, vec!["skill:tests"]);
+    }
+
+    #[test]
+    fn skills_match_without_prefix() {
+        let mut menu = session_with_items(vec![item("skill:review", "skill", "@skill:review")]);
+        menu.sync_query("rev");
+        let s = menu.session.as_ref().unwrap();
+        let offered: Vec<_> = s.matches.iter().map(|c| c.item.label.as_str()).collect();
+        assert!(offered.contains(&"skill:review"));
+    }
+
+    #[test]
+    fn subagent_replacement_has_prefix_and_trailing_space() {
+        let item = CompletionItem {
+            label: "subagent:research".into(),
+            kind: "subagent".into(),
+            insertion: "@subagent:research ".into(),
+            description: None,
+        };
+        assert_eq!(item.replacement(), "@subagent:research ");
+    }
+
+    #[test]
+    fn model_replacement_has_prefix_and_trailing_space() {
+        let item = CompletionItem {
+            label: "model:zai/glm-5".into(),
+            kind: "model".into(),
+            insertion: "@model:zai/glm-5 ".into(),
+            description: None,
+        };
+        assert_eq!(item.replacement(), "@model:zai/glm-5 ");
+    }
+
+    fn session_with_all() -> FileCompletionMenu {
+        session_with_items(vec![
+            item("skill:review", "skill", "@skill:review"),
+            item("subagent:research", "subagent", "@subagent:research "),
+            item("subagent:general", "subagent", "@subagent:general "),
+            item("model:zai/glm-5", "model", "@model:zai/glm-5 "),
+            item(
+                "model:anthropic/claude",
+                "model",
+                "@model:anthropic/claude ",
+            ),
+        ])
+    }
+
+    #[test]
+    fn subagent_prefix_filters_to_subagents() {
+        let mut menu = session_with_all();
+        menu.sync_query("subagent:");
+        let s = menu.session.as_ref().unwrap();
+        let labels: Vec<_> = s.matches.iter().map(|c| c.item.label.as_str()).collect();
+        assert_eq!(labels, vec!["subagent:research", "subagent:general"]);
+        assert!(s.matches.iter().all(|c| c.item.kind == "subagent"));
+    }
+
+    #[test]
+    fn subagent_prefix_without_colon_filters_to_subagents() {
+        let mut menu = session_with_all();
+        menu.sync_query("subagent");
+        let s = menu.session.as_ref().unwrap();
+        let labels: Vec<_> = s.matches.iter().map(|c| c.item.label.as_str()).collect();
+        assert_eq!(labels, vec!["subagent:research", "subagent:general"]);
+        assert!(s.matches.iter().all(|c| c.item.kind == "subagent"));
+    }
+
+    #[test]
+    fn a_short_prefix_filters_to_subagents() {
+        let mut menu = session_with_all();
+        menu.sync_query("a:rese");
+        let s = menu.session.as_ref().unwrap();
+        let labels: Vec<_> = s.matches.iter().map(|c| c.item.label.as_str()).collect();
+        assert_eq!(labels, vec!["subagent:research"]);
+    }
+
+    #[test]
+    fn model_prefix_filters_to_models() {
+        let mut menu = session_with_all();
+        menu.sync_query("model:");
+        let s = menu.session.as_ref().unwrap();
+        let labels: Vec<_> = s.matches.iter().map(|c| c.item.label.as_str()).collect();
+        assert_eq!(labels, vec!["model:zai/glm-5", "model:anthropic/claude"]);
+        assert!(s.matches.iter().all(|c| c.item.kind == "model"));
+    }
+
+    #[test]
+    fn m_short_prefix_filters_to_models() {
+        let mut menu = session_with_all();
+        menu.sync_query("m:claude");
+        let s = menu.session.as_ref().unwrap();
+        let labels: Vec<_> = s.matches.iter().map(|c| c.item.label.as_str()).collect();
+        assert_eq!(labels, vec!["model:anthropic/claude"]);
+    }
+
+    #[test]
+    fn s_short_prefix_matches_skills_and_subagents() {
+        // `s:` fuzzy-matches both `skill:` and `subagent:` labels; the unified
+        // list shows both, and the user narrows with `sk:` or `su:`.
+        let mut menu = session_with_all();
+        menu.sync_query("s:");
+        let s = menu.session.as_ref().unwrap();
+        let kinds: Vec<_> = s.matches.iter().map(|c| c.item.kind.as_str()).collect();
+        assert!(kinds.contains(&"skill"));
+        assert!(kinds.contains(&"subagent"));
+    }
+
+    #[test]
+    fn bare_at_shows_all_ref_kinds() {
+        let mut menu = session_with_all();
+        menu.sync_query("");
+        let s = menu.session.as_ref().unwrap();
+        let mut kinds = s
+            .matches
+            .iter()
+            .map(|c| c.item.kind.as_str())
+            .collect::<Vec<_>>();
+        kinds.sort();
+        kinds.dedup();
+        assert_eq!(kinds, vec!["model", "skill", "subagent"]);
+    }
+
+    #[test]
+    fn bare_at_lists_files_before_refs() {
+        let mut menu = session_with_all();
+        let s = menu.session.as_mut().unwrap();
+        s.file_matches = (0..64)
+            .map(|i| Candidate {
+                item: CompletionItem::file(format!("src/file{i}.rs")),
+                matching: CompletionMatch {
+                    indices: Vec::new(),
+                    ranking: CompletionRanking {
+                        quality_rank: 4,
+                        boundary_rank: 1,
+                        start_index: 0,
+                        gap_count: 0,
+                        span_length: 0,
+                        unmatched_suffix: 0,
+                        fuzzy_score: 0,
+                    },
+                },
+                source_rank: 0,
+                source_order: i,
+                descendable: false,
+            })
+            .collect();
+        menu.sync_query("");
+        let s = menu.session.as_ref().unwrap();
+        assert!(!s.matches.is_empty());
+        assert_eq!(s.matches[0].item.kind, "file");
+    }
+
+    #[test]
+    fn prefix_match_ranks_before_non_prefix_files() {
+        let mut menu = session_with_all();
+        let s = menu.session.as_mut().unwrap();
+        s.file_matches = vec![Candidate {
+            item: CompletionItem::file("novo_nordisk_report.csv".into()),
+            matching: CompletionMatch {
+                indices: Vec::new(),
+                ranking: CompletionRanking {
+                    quality_rank: 4,
+                    boundary_rank: 1,
+                    start_index: 0,
+                    gap_count: 0,
+                    span_length: 0,
+                    unmatched_suffix: 0,
+                    fuzzy_score: 0,
+                },
+            },
+            source_rank: 0,
+            source_order: 0,
+            descendable: false,
+        }];
+        project_nucleo_mut(s).restart(true);
+        s.file_matches.clear();
+        menu.sync_query("sk");
+        let s = menu.session.as_ref().unwrap();
+        assert!(!s.matches.is_empty());
+        assert_eq!(s.matches[0].item.kind, "skill");
+    }
+
+    #[test]
+    fn candidate_carries_kind_for_theme_lookup() {
+        let mut menu = session_with_items(vec![item("skill:review", "skill", "@skill:review")]);
+        menu.sync_query("skill:");
+        let s = menu.session.as_ref().unwrap();
+        assert_eq!(s.matches[0].item.kind, "skill");
+        let t = theme::current();
+        // Every kind plugins can emit is seeded in the theme's lookup, so
+        // rendering never silently falls back to the generic item style.
+        for kind in ["file", "skill", "subagent", "model"] {
+            assert!(
+                t.completion_kinds.contains_key(kind),
+                "kind {kind} not seeded"
+            );
+        }
+        assert!(s.matches[0].matching.indices.is_empty());
+    }
+
+    #[test]
+    fn completion_kind_highlights_do_not_collapse_into_item_colour() {
+        let t = theme::InMemoryThemesProvider::bundled()
+            .load("makima")
+            .unwrap();
+        // A kind highlight equal to the base item colour renders as plain
+        // unhighlighted text, hiding prefix matches whose label starts with
+        // the kind name.
+        for kind in ["file", "skill", "subagent", "model"] {
+            let style = t.completion_kinds.get(kind).expect("kind seeded");
+            assert_ne!(
+                style.fg, t.item.fg,
+                "{kind} highlight equals the item colour"
+            );
+        }
+    }
+
+    fn menu_with_matches(count: usize) -> FileCompletionMenu {
+        let mut menu = session_with_items(Vec::new());
+        let s = menu.session.as_mut().unwrap();
+        s.matches = (0..count)
+            .map(|i| Candidate {
+                item: CompletionItem::file(format!("file{i}")),
+                matching: CompletionMatch {
+                    indices: Vec::new(),
+                    ranking: CompletionRanking {
+                        quality_rank: 4,
+                        boundary_rank: 1,
+                        start_index: 0,
+                        gap_count: 0,
+                        span_length: 0,
+                        unmatched_suffix: 0,
+                        fuzzy_score: 0,
+                    },
+                },
+                source_rank: 0,
+                source_order: i,
+                descendable: false,
+            })
+            .collect();
+        menu
+    }
+
+    #[test_case(0, KeyCode::Up, 0     ; "up_clamps_at_start")]
+    #[test_case(4, KeyCode::Down, 4   ; "down_clamps_at_end")]
+    #[test_case(2, KeyCode::Down, 3   ; "moves_down")]
+    #[test_case(2, KeyCode::Up, 1     ; "moves_up")]
+    fn grid_vertical_behavior(start: usize, key_code: KeyCode, expected: usize) {
+        let mut grid = CompletionGridState::default();
+        grid.set_layout(5, 1, 10);
+        grid.set_selected(start);
+        assert!(grid.handle_key(&key(key_code), 5, false));
+        assert_eq!(grid.selected(), expected);
+    }
+
+    #[test_case(1, KeyCode::Left, 0   ; "left_steps_to_prev_column")]
+    #[test_case(0, KeyCode::Left, 0   ; "left_clamps_at_first_column")]
+    #[test_case(0, KeyCode::Right, 1  ; "right_steps_to_next_column")]
+    #[test_case(1, KeyCode::Right, 1  ; "right_clamps_at_row_end")]
+    #[test_case(4, KeyCode::Right, 4  ; "partial_last_row_clamps")]
+    fn grid_horizontal_behavior(start: usize, key_code: KeyCode, expected: usize) {
+        // 5 items in 2 columns: row 0 = 0,1; row 1 = 2,3; row 2 = 4.
+        let mut grid = CompletionGridState::default();
+        grid.set_layout(5, 2, 10);
+        grid.set_selected(start);
+        assert!(grid.handle_key(&key(key_code), 5, false));
+        assert_eq!(grid.selected(), expected);
+    }
+
+    #[test_case(0, KeyCode::Down, 2, 0, 0 ; "down_one_row")]
+    #[test_case(2, KeyCode::Down, 4, 1, 0 ; "down_scrolls")]
+    #[test_case(6, KeyCode::Down, 6, 2, 0 ; "down_clamps_last_row")]
+    #[test_case(4, KeyCode::Up, 2, 1, 1 ; "up_keeps_viewport")]
+    fn grid_navigation_updates_selection_and_scroll(
+        start: usize,
+        key_code: KeyCode,
+        expected_selection: usize,
+        expected_scroll: usize,
+        initial_scroll: usize,
+    ) {
+        let mut grid = CompletionGridState::default();
+        grid.set_layout(7, 2, 2);
+        grid.set_selected(start);
+        grid.set_scroll_offset(initial_scroll);
+        assert!(grid.handle_key(&key(key_code), 7, false));
+        assert_eq!(grid.selected(), expected_selection);
+        assert_eq!(grid.scroll_offset(), expected_scroll);
+    }
+
+    #[test]
+    fn left_right_consumed_and_step_columns() {
+        let mut menu = menu_with_matches(5);
+        let s = menu.session.as_mut().unwrap();
+        s.visible = true;
+        s.grid.set_layout(s.matches.len(), 2, 10);
+        assert!(matches!(
+            menu.handle_key(key(KeyCode::Right)),
+            CompletionAction::Consumed
+        ));
+        assert_eq!(menu.session.as_ref().unwrap().grid.selected(), 1);
+        // Row 0 is full (0,1); a further Right clamps in place.
+        assert!(matches!(
+            menu.handle_key(key(KeyCode::Right)),
+            CompletionAction::Consumed
+        ));
+        assert_eq!(menu.session.as_ref().unwrap().grid.selected(), 1);
+        assert!(matches!(
+            menu.handle_key(key(KeyCode::Left)),
+            CompletionAction::Consumed
+        ));
+        assert_eq!(menu.session.as_ref().unwrap().grid.selected(), 0);
+    }
+
+    #[test]
+    fn modified_left_right_pass_through_to_buffer() {
+        let word_motion_mods = [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ];
+        for mods in word_motion_mods {
+            let mut menu = menu_with_matches(5);
+            let s = menu.session.as_mut().unwrap();
+            s.visible = true;
+            s.grid.set_layout(s.matches.len(), 2, 10);
+            for code in [KeyCode::Left, KeyCode::Right] {
+                assert!(
+                    matches!(
+                        menu.handle_key(key_with(code, mods)),
+                        CompletionAction::Passthrough
+                    ),
+                    "{mods:?}+{code:?} should reach the prompt buffer"
+                );
+                assert_eq!(menu.session.as_ref().unwrap().grid.selected(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn enter_returns_select() {
+        let mut menu = menu_with_matches(3);
+        menu.session.as_mut().unwrap().visible = true;
+        match menu.handle_key(key(KeyCode::Enter)) {
+            CompletionAction::Select(item) => assert_eq!(item.label, "file0"),
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn esc_returns_close() {
+        let mut menu = menu_with_matches(3);
+        menu.session.as_mut().unwrap().visible = true;
+        assert!(matches!(
+            menu.handle_key(key(KeyCode::Esc)),
+            CompletionAction::Close
+        ));
+    }
+
+    #[test]
+    fn other_keys_passthrough_and_updown_consumed() {
+        let mut menu = menu_with_matches(3);
+        menu.session.as_mut().unwrap().visible = true;
+        assert!(matches!(
+            menu.handle_key(key(KeyCode::Char('a'))),
+            CompletionAction::Passthrough
+        ));
+        let sel = menu.session.as_ref().unwrap().grid.selected();
+        assert!(matches!(
+            menu.handle_key(key(KeyCode::Down)),
+            CompletionAction::Consumed
+        ));
+        assert_eq!(menu.session.as_ref().unwrap().grid.selected(), sel + 1);
+    }
+
+    #[test]
+    fn highlight_indices_shared_for_prefix_and_fuzzy() {
+        assert_eq!(highlight_indices("skill:review", "sk"), Some(vec![0, 1]));
+        // Fuzzy: the needle is scattered through the label.
+        assert_eq!(
+            highlight_indices("skill:review", "rev"),
+            Some(vec![6, 7, 8])
+        );
+        assert!(highlight_indices("skill:review", "zzz").is_none());
+    }
+
+    #[test]
+    fn empty_kind_queries_do_not_highlight() {
+        let mut menu = session_with_items(vec![item("skill:review", "skill", "@skill:review")]);
+        menu.sync_query("sk");
+        assert!(
+            menu.session.as_ref().unwrap().matches[0]
+                .matching
+                .indices
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn selected_row_fuzzy_match_spans_keep_selection_background() {
+        let mut menu = session_with_items(vec![item("skill:review", "skill", "@skill:review")]);
+        menu.sync_query("rev");
+        let c = menu.session.as_ref().unwrap().matches[0].clone();
+        assert_eq!(
+            c.matching.indices,
+            vec![6, 7, 8],
+            "fuzzy query must highlight the scattered chars"
+        );
+
+        let t = theme::InMemoryThemesProvider::bundled()
+            .load("makima")
+            .unwrap();
+        let item = CompletionGridItem {
+            label: &c.item.label,
+            description: c.item.description.as_deref(),
+            indices: &c.matching.indices,
+            kind: &c.item.kind,
+        };
+        let line = cell_line(&item, 40, true, &t);
+        let kind = t.completion_kinds.get("skill").copied().unwrap_or(t.item);
+        let expected_match = Style {
+            bg: t.item_selected.bg,
+            ..kind
+        };
+
+        // The scattered match still carries the selection background, so it is
+        // not cut out of the selected row.
+        let match_span = line
+            .spans
+            .iter()
+            .find(|sp| sp.content.as_ref() == "rev")
+            .expect("matched span present");
+        assert_eq!(match_span.style, expected_match);
+        let lead_span = line
+            .spans
+            .iter()
+            .find(|sp| sp.content.as_ref() == "skill:")
+            .expect("leading span present");
+        assert_eq!(lead_span.style, t.item_selected);
+    }
+
+    fn labels(menu: &FileCompletionMenu) -> Vec<String> {
+        menu.session
+            .as_ref()
+            .unwrap()
+            .matches
+            .iter()
+            .map(|candidate| candidate.item.label.clone())
+            .collect()
+    }
+
+    fn add_file(menu: &mut FileCompletionMenu, path: &str) {
+        let session = menu.session.as_mut().unwrap();
+        let order = session.file_matches.len();
+        let candidate = match_candidate(
+            CompletionItem::file(path.into()),
+            &session.intent,
+            0,
+            order,
+            false,
+        )
+        .unwrap();
+        session.file_matches.push(candidate);
+        rebuild_combined(session);
+    }
+
+    #[test]
+    fn completion_quality_tiers_are_ordered() {
+        let mut menu = session_with_items(vec![
+            item("zzneedle", "skill", "@zzneedle"),
+            item("needle-long", "model", "@needle-long"),
+            item("a-needle", "subagent", "@a-needle"),
+            item("nxeedlxe", "skill", "@nxeedlxe"),
+        ]);
+        menu.sync_query("needle");
+        assert_eq!(
+            labels(&menu),
+            vec!["needle-long", "a-needle", "zzneedle", "nxeedlxe"]
+        );
+    }
+
+    #[test]
+    fn closer_match_beats_longer_suffix_match() {
+        let mut menu = session_with_items(vec![
+            item("github-issue-simple", "skill", "@github-issue-simple"),
+            item("github-issue", "skill", "@github-issue"),
+        ]);
+        menu.sync_query("github-iss");
+        assert_eq!(labels(&menu), vec!["github-issue", "github-issue-simple"]);
+    }
+
+    #[test]
+    fn textual_quality_beats_default_file_preference() {
+        let mut menu = session_with_items(vec![item("tagged", "skill", "@tagged")]);
+        menu.sync_query("tag");
+        menu.session.as_mut().unwrap().file_matches.push(Candidate {
+            item: CompletionItem::file("weak_match".into()),
+            matching: CompletionMatch {
+                indices: Vec::new(),
+                ranking: CompletionRanking {
+                    quality_rank: 3,
+                    boundary_rank: 1,
+                    start_index: 0,
+                    gap_count: 0,
+                    span_length: 0,
+                    unmatched_suffix: 0,
+                    fuzzy_score: 0,
+                },
+            },
+            source_rank: 0,
+            source_order: 0,
+            descendable: false,
+        });
+        rebuild_combined(menu.session.as_mut().unwrap());
+        assert_eq!(labels(&menu), vec!["tagged", "weak_match"]);
+    }
+
+    #[test]
+    fn files_win_equal_quality_ties() {
+        let mut menu = session_with_items(vec![item("tag", "skill", "@tag")]);
+        menu.sync_query("tag");
+        add_file(&mut menu, "tag-file");
+        assert_eq!(labels(&menu), vec!["tag", "tag-file"]);
+    }
+
+    #[test]
+    fn explicit_kind_query_ranks_payload_and_offsets_highlights() {
+        let mut menu = session_with_items(vec![
+            item("skill:testing", "skill", "@skill:testing"),
+            item("skill:review", "skill", "@skill:review"),
+            item("model:testing", "model", "@model:testing"),
+        ]);
+        menu.sync_query("sk:tes");
+        let session = menu.session.as_ref().unwrap();
+        assert_eq!(labels(&menu), vec!["skill:testing"]);
+        assert_eq!(session.matches[0].matching.indices, vec![6, 7, 8]);
+    }
+
+    #[test]
+    fn explicit_kind_prefixes_filter_candidates() {
+        for query in ["skill:", "sk:", "subagent:", "su:", "a:", "model:", "m:"] {
+            let mut menu = session_with_all();
+            menu.sync_query(query);
+            let kind = menu.session.as_ref().unwrap().matches[0].item.kind.clone();
+            assert!(
+                menu.session
+                    .as_ref()
+                    .unwrap()
+                    .matches
+                    .iter()
+                    .all(|candidate| candidate.item.kind == kind)
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_kind_remains_broad() {
+        let mut menu = session_with_all();
+        menu.sync_query("s:");
+        let kinds: Vec<_> = menu
+            .session
+            .as_ref()
+            .unwrap()
+            .matches
+            .iter()
+            .map(|candidate| candidate.item.kind.as_str())
+            .collect();
+        assert!(kinds.contains(&"skill"));
+        assert!(kinds.contains(&"subagent"));
+    }
+
+    #[test]
+    fn unrecognized_kind_prefix_is_free_text() {
+        let mut menu = session_with_items(vec![item("x:needle", "skill", "@x:needle")]);
+        menu.sync_query("x:nee");
+        assert_eq!(labels(&menu), vec!["x:needle"]);
+    }
+
+    #[test]
+    fn concatenated_aliases_remain_free_text() {
+        let mut menu = session_with_items(vec![
+            item("skillfoo", "skill", "@skillfoo"),
+            item("modelish", "model", "@modelish"),
+            item("subagent-tools", "subagent", "@subagent-tools"),
+        ]);
+        for query in ["skillfoo", "modelish", "subagent-tools"] {
+            menu.sync_query(query);
+            assert_eq!(labels(&menu), vec![query]);
+        }
+    }
+
+    #[test]
+    fn case_insensitive_ranking_and_codepoint_highlights() {
+        let mut menu = session_with_items(vec![item("東京", "skill", "@東京")]);
+        let intent = parse_query("東");
+        let session = menu.session.as_mut().unwrap();
+        session.query = "東".into();
+        session.ref_matches = fuzzy_match(
+            &intent,
+            session
+                .ref_items
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(i, (label, item))| (label, item, i)),
+        );
+        rebuild_combined(session);
+        assert_eq!(session.ref_matches.len(), 1);
+        let candidate = &menu.session.as_ref().unwrap().matches[0];
+        assert_eq!(candidate.matching.indices, vec![0]);
+        assert_eq!(candidate.item.label, "東京");
+    }
+
+    #[test]
+    fn explicit_non_file_kind_queries_exclude_files() {
+        let mut menu = session_with_items(vec![item("skill:one", "skill", "@skill:one")]);
+        menu.sync_query("skill:");
+        assert!(
+            menu.session
+                .as_ref()
+                .unwrap()
+                .matches
+                .iter()
+                .all(|candidate| candidate.item.kind != FILE_KIND)
+        );
+    }
+
+    #[test]
+    fn equal_rank_preserves_source_order() {
+        let mut menu = session_with_items(vec![
+            item("same", "skill", "@same"),
+            item("same", "model", "@same-model"),
+        ]);
+        menu.sync_query("same");
+        assert_eq!(labels(&menu), vec!["same", "same"]);
+    }
+
+    #[test]
+    fn file_refresh_rebuilds_with_heuristic_order() {
+        let mut menu = session_with_items(Vec::new());
+        let session = menu.session.as_mut().unwrap();
+        session.walking = false;
+        project_nucleo_mut(session)
+            .injector()
+            .push((), |_, columns| {
+                columns[0] = Utf32String::from("weak_match");
+            });
+        project_nucleo_mut(session)
+            .injector()
+            .push((), |_, columns| {
+                columns[0] = Utf32String::from("needle-file");
+            });
+        menu.sync_query("needle");
+        wait_for_matcher(
+            &mut menu,
+            |menu| !menu.session.as_ref().unwrap().matches.is_empty(),
+            "heuristic matcher never surfaced the injected needle-file match",
+        );
+        let session = menu.session.as_ref().unwrap();
+        assert_eq!(labels(&menu), vec!["needle-file"]);
+        assert_eq!(session.coarse_match_count, 1);
+        assert_eq!(session.materialized_count, 1);
+        assert_eq!(session.final_match_count, 1);
+        assert!(!session.truncated);
+    }
+
+    #[test]
+    fn file_refresh_uses_lexical_source_order_for_ties() {
+        let mut menu = session_with_items(Vec::new());
+        {
+            let session = menu.session.as_mut().unwrap();
+            session.walking = false;
+            project_nucleo_mut(session)
+                .injector()
+                .push((), |_, columns| {
+                    columns[0] = Utf32String::from("zeta-file");
+                });
+            project_nucleo_mut(session)
+                .injector()
+                .push((), |_, columns| {
+                    columns[0] = Utf32String::from("alpha-file");
+                });
+        }
+        menu.sync_query("");
+        wait_for_matcher(
+            &mut menu,
+            |menu| {
+                menu.session
+                    .as_ref()
+                    .is_some_and(|session| session.file_matches.len() == 2)
+            },
+            "both injected files must match before order is asserted",
+        );
+        let session = menu.session.as_ref().unwrap();
+        let labels: Vec<_> = session
+            .file_matches
+            .iter()
+            .map(|candidate| candidate.item.label.as_str())
+            .collect();
+        assert_eq!(labels, vec!["alpha-file", "zeta-file"]);
+        assert_eq!(session.materialized_count, 2);
+        assert!(!session.truncated);
+    }
+
+    #[test]
+    fn file_refresh_rejects_coarse_matches_for_non_file_kind_queries() {
+        let mut menu = session_with_items(Vec::new());
+        {
+            let session = menu.session.as_mut().unwrap();
+            session.walking = false;
+            project_nucleo_mut(session)
+                .injector()
+                .push((), |_, columns| {
+                    columns[0] = Utf32String::from("skill:example");
+                });
+        }
+        menu.sync_query("skill:");
+        {
+            let session = menu.session.as_mut().unwrap();
+            while project_nucleo_mut(session).tick(0).running {}
+            refresh_file_matches(session);
+        }
+
+        let session = menu.session.as_ref().unwrap();
+        assert_eq!(session.coarse_match_count, 1);
+        assert_eq!(session.materialized_count, 1);
+        assert_eq!(session.final_match_count, 0);
+        assert!(!session.truncated);
+        assert!(session.file_matches.is_empty());
+    }
+
+    #[test]
+    fn project_root_preserves_files_and_directories() {
+        let mut menu = session_with_items(Vec::new());
+        let session = menu.session.as_mut().unwrap();
+        session.walking = false;
+        let root = DIRECTORY_SUFFIX.to_string();
+        for path in [root.as_str(), "src/", "文档/", "file.rs"] {
+            project_nucleo_mut(session)
+                .injector()
+                .push((), |_, columns| columns[0] = Utf32String::from(path));
+        }
+        wait_for_matcher(
+            &mut menu,
+            |menu| menu.session.as_ref().unwrap().materialized_count > 0,
+            "root matcher did not settle",
+        );
+        let expected = vec![root.as_str(), "file.rs", "src/", "文档/"];
+        assert_eq!(labels(&menu), expected);
+        let session = menu.session.as_ref().unwrap();
+        assert_eq!(session.coarse_match_count, expected.len() as u32);
+        assert!(!session.truncated);
+    }
+
+    #[test]
+    fn file_refresh_tracks_materialization_boundary() {
+        let mut menu = session_with_items(Vec::new());
+        {
+            let session = menu.session.as_mut().unwrap();
+            session.walking = false;
+            for index in 0..=MAX_MATERIALIZED {
+                project_nucleo_mut(session)
+                    .injector()
+                    .push((), |_, columns| {
+                        columns[0] = Utf32String::from(format!("file-{index:03}.rs").as_str());
+                    });
+            }
+            while project_nucleo_mut(session).tick(0).running {}
+            refresh_file_matches(session);
+        }
+        let session = menu.session.as_ref().unwrap();
+        assert_eq!(session.coarse_match_count, MAX_MATERIALIZED + 1);
+        assert_eq!(session.materialized_count, MAX_MATERIALIZED);
+        assert_eq!(session.final_match_count, MAX_MATERIALIZED);
+        assert!(session.truncated);
+        assert_eq!(session.file_matches.len(), MAX_MATERIALIZED as usize);
+        assert_eq!(session.file_matches[0].item.label, "file-000.rs");
+        assert_eq!(
+            session.file_matches.last().unwrap().item.label,
+            format!("file-{:03}.rs", MAX_MATERIALIZED - 1)
+        );
+    }
+
+    #[test]
+    fn refresh_clamps_selection_after_reordering() {
+        let mut menu = session_with_items(Vec::new());
+        let session = menu.session.as_mut().unwrap();
+        project_nucleo_mut(session)
+            .injector()
+            .push((), |_, columns| {
+                columns[0] = Utf32String::from("needle-file");
+            });
+        session.walking = false;
+        session.grid.set_selected(99);
+        project_nucleo_mut(session).tick(0);
+        menu.sync_query("needle");
+        wait_for_matcher(
+            &mut menu,
+            |menu| menu.session.as_ref().unwrap().publication.ready(),
+            "file matcher did not settle",
+        );
+        assert_eq!(menu.session.as_ref().unwrap().grid.selected(), 0);
+    }
+
+    #[test]
+    fn refresh_then_accept_inserts_selected_item() {
+        let mut menu = session_with_items(Vec::new());
+        let session = menu.session.as_mut().unwrap();
+        project_nucleo_mut(session)
+            .injector()
+            .push((), |_, columns| {
+                columns[0] = Utf32String::from("needle-file");
+            });
+        session.walking = false;
+        menu.sync_query("needle");
+        wait_for_matcher(
+            &mut menu,
+            |menu| {
+                let session = menu.session.as_ref().unwrap();
+                !session.publication.pending() && !session.file_matches.is_empty()
+            },
+            "file matcher did not settle",
+        );
+        menu.session.as_mut().unwrap().visible = true;
+        assert!(
+            matches!(menu.handle_key(key(KeyCode::Enter)), CompletionAction::Select(item) if item.label == "needle-file")
+        );
+    }
+
+    #[test]
+    fn host_and_guest_candidates_share_heuristic_order() {
+        let mut menu = session_with_items(vec![item("needle-plugin", "skill", "@needle-plugin")]);
+        menu.sync_query("needle");
+        add_file(&mut menu, "needle-file");
+        assert_eq!(labels(&menu), vec!["needle-file", "needle-plugin"]);
+    }
+
+    #[test]
+    fn query_refresh_keeps_mixed_snapshot_and_geometry_until_current_pattern() {
+        let mut menu = session_with_items(vec![
+            item("alpha-file-plugin", "skill", "@alpha-file-plugin"),
+            item("gamma-file-plugin", "skill", "@gamma-file-plugin"),
+        ]);
+        menu.sync_query("file");
+        {
+            let session = menu.session.as_mut().unwrap();
+            session.walking = false;
+            for path in ["alpha-file", "beta-file", "gamma-file"] {
+                project_nucleo_mut(session)
+                    .injector()
+                    .push((), |_, columns| {
+                        columns[0] = Utf32String::from(path);
+                    });
+            }
+        }
+        wait_for_matcher(
+            &mut menu,
+            |menu| menu.session.as_ref().unwrap().file_matches.len() == 3,
+            "file matcher did not surface the three injected files",
+        );
+        let before = labels(&menu);
+        assert_eq!(before.len(), 5);
+        let input_area = Rect::new(0, 10, 40, 3);
+        let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        menu.session.as_mut().unwrap().visible = true;
+        let rendered_rect = Cell::new(Rect::default());
+        terminal
+            .draw(|frame| rendered_rect.set(menu.view(frame, input_area).unwrap()))
+            .unwrap();
+        let before_rect = rendered_rect.get();
+        {
+            let session = menu.session.as_mut().unwrap();
+            session.grid.set_selected(2);
+            session.grid.set_scroll_offset(1);
+        }
+
+        menu.sync_query("gamma");
+        let session = menu.session.as_ref().unwrap();
+        assert!(session.publication.pending());
+        assert_eq!(session.grid.selected(), 2);
+        assert_eq!(session.grid.scroll_offset(), 1);
+        assert_eq!(labels(&menu), before);
+        terminal
+            .draw(|frame| rendered_rect.set(menu.view(frame, input_area).unwrap()))
+            .unwrap();
+        let pending_rect = rendered_rect.get();
+        assert_eq!(pending_rect, before_rect);
+        assert!(matches!(
+            menu.handle_key(key(KeyCode::Enter)),
+            CompletionAction::Passthrough
+        ));
+        assert!(matches!(
+            menu.handle_key(key(KeyCode::Tab)),
+            CompletionAction::Passthrough
+        ));
+
+        wait_for_matcher(
+            &mut menu,
+            |menu| !menu.session.as_ref().unwrap().publication.pending(),
+            "file matcher did not settle on the filtered gamma query",
+        );
+        assert_eq!(labels(&menu), vec!["gamma-file", "gamma-file-plugin"]);
+        let session = menu.session.as_ref().unwrap();
+        assert_eq!(session.grid.selected(), 0);
+        assert_eq!(session.grid.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn reference_only_query_publishes_immediately() {
+        let mut menu = session_with_items(vec![item("skill:review", "skill", "@skill:review")]);
+
+        menu.sync_query("review");
+
+        let session = menu.session.as_ref().unwrap();
+        assert!(session.publication.ready());
+        assert_eq!(labels(&menu), vec!["skill:review"]);
+    }
+
+    #[test]
+    fn file_completion_query_commit_survives_in_flight_injection() {
+        let mut menu = session_with_items(Vec::new());
+        let injector = {
+            let session = menu.session.as_mut().unwrap();
+            project_nucleo_mut(session).injector().clone()
+        };
+        injector.push((), |_, columns| {
+            columns[0] = Utf32String::from("needle-first");
+        });
+        wait_for_matcher(
+            &mut menu,
+            |menu| labels(menu) == ["needle-first"],
+            "initial file did not publish",
+        );
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        let producer = std::thread::spawn(move || {
+            injector.push((), |_, columns| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                columns[0] = Utf32String::from("needle-later");
+            });
+        });
+        entered_rx.recv_timeout(MATCHER_SETTLE_TIMEOUT).unwrap();
+
+        menu.sync_query("needle");
+        wait_for_matcher(
+            &mut menu,
+            |menu| menu.session.as_ref().unwrap().publication.ready(),
+            "current pattern did not commit during injection",
+        );
+        let session = menu.session.as_ref().unwrap();
+        assert!(session.walking);
+        assert_eq!(labels(&menu), vec!["needle-first"]);
+
+        release_tx.send(()).unwrap();
+        producer.join().unwrap();
+        wait_for_matcher(
+            &mut menu,
+            |menu| labels(menu).len() == 2,
+            "later discovery did not stream",
+        );
+        assert_eq!(labels(&menu), vec!["needle-first", "needle-later"]);
+    }
+
+    #[test]
+    fn view_grid_uses_full_input_width() {
+        let mut menu = menu_with_matches(3);
+        let s = menu.session.as_mut().unwrap();
+        s.visible = true;
+        s.walking = false;
+        s.started_at = Instant::now() - std::time::Duration::from_secs(1);
+        let backend = TestBackend::new(40, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let input_area = Rect {
+            x: 0,
+            y: 10,
+            width: 40,
+            height: 3,
+        };
+        terminal
+            .draw(|frame| {
+                let rect = menu.view(frame, input_area).unwrap();
+                assert_eq!(rect.y, 10 - rect.height);
+                assert_eq!(rect.width, input_area.width);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn uppercase_file_query_does_not_panic() {
+        // Nucleo uses a normalized retrieval query, while final matching and
+        // highlighting use the original query.
+        let mut menu = session_with_items(Vec::new());
+        let s = menu.session.as_mut().unwrap();
+        for path in ["Cargo.lock", "justfile", "makima-ui/src/app/mod.rs"] {
+            project_nucleo_mut(s).injector().push((), |_, cols| {
+                cols[0] = Utf32String::from(path);
+            });
+        }
+        s.walking = false;
+        while project_nucleo_mut(s).tick(0).running {}
+
+        menu.sync_query("Cargo");
+        wait_for_matcher(
+            &mut menu,
+            |menu| !menu.session.as_ref().unwrap().matching,
+            "file matcher did not settle",
+        );
+        let s = menu.session.as_ref().unwrap();
+        assert_eq!(s.query, "Cargo");
+        let c = s
+            .file_matches
+            .iter()
+            .find(|c| c.item.label == "Cargo.lock")
+            .expect("Cargo.lock matches the Cargo query");
+        assert_eq!(c.matching.indices, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn uppercase_ref_query_does_not_panic() {
+        // Refs go through the same matcher in sync_query; `Model:` against
+        // `model:zai/glm-5` is the same uppercase-needle panic on the ref side.
+        let mut menu = session_with_all();
+        menu.sync_query("Model:");
+        let s = menu.session.as_ref().unwrap();
+        assert_eq!(s.query, "Model:");
+        let labels: Vec<&str> = s.matches.iter().map(|c| c.item.label.as_str()).collect();
+        assert_eq!(labels, vec!["model:zai/glm-5", "model:anthropic/claude"]);
+    }
+}

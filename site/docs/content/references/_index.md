@@ -7,7 +7,7 @@ group = "Reference"
 
 # `@` References
 
-Type `@` in the input box and Makima opens a completion popup. File completions are built in, but skills, subagents, and models come from plugins via the completion-source API. The built-in `skill`, `task`, and `model` plugins provide the defaults, and you are free to implement your own completion sources and expanders (see the [Lua API](/docs/lua-api/#maki-api-register_completion_source)).
+Type `@` in the input box and Makima opens a completion popup. File completions are built in, but skills, subagents, and models come from plugins via the completion-source API. The built-in `skill`, `task`, and `model` plugins provide the defaults, and you are free to implement your own completion sources and expanders (see the [Lua API](/docs/lua-api/#makima-api-register_completion_source)).
 
 Each reference has a long prefix, a one-letter short form, and a fixed meaning at submit time. At submit, a recognized `@prefix:value` token is replaced in place with an intent token like `<skill:name>`, `<subagent:type>`, or `<model:spec>`; the agent acts on it per its instructions. Unknown prefixes pass through verbatim.
 
@@ -42,7 +42,7 @@ Project-index completion and the file picker use Nucleo for coarse retrieval and
 
 ## Subagents
 
-`@subagent:` (short `@a:`) lists the subagent types the `task` plugin's [completion source](/docs/lua-api/#maki-api-register_completion_source) offers:
+`@subagent:` (short `@a:`) lists the subagent types the `task` plugin's [completion source](/docs/lua-api/#makima-api-register_completion_source) offers:
 
 - `research` - read-only search and summarize.
 - `general` - can modify files.
@@ -72,15 +72,15 @@ Not every `@` is a reference. Makima only treats `@` as a reference start when i
 
 ## Custom completion sources
 
-The `@` popup is extensible. A plugin can call `maki.api.register_completion_source` to add its own candidate kind (with its own `kind` color and insertion behavior) and `maki.api.register_expander` to control what its `@prefix:` token becomes at submit. See the [Lua API reference](/docs/lua-api/#maki-api-register_completion_source) for both. A one-line sketch:
+The `@` popup is extensible. A plugin can call `makima.api.register_completion_source` to add its own candidate kind (with its own `kind` color and insertion behavior) and `makima.api.register_expander` to control what its `@prefix:` token becomes at submit. See the [Lua API reference](/docs/lua-api/#makima-api-register_completion_source) for both. A one-line sketch:
 
 ```lua
-maki.api.register_completion_source("ticket", {
+makima.api.register_completion_source("ticket", {
   get_items = function(ctx)
     return { { label = "ticket:1234", kind = "ticket", insertion = "@ticket:1234" } }
   end,
 })
-maki.api.register_expander("ticket", function(ref)
+makima.api.register_expander("ticket", function(ref)
   return "<ticket:" .. ref.value .. ">", nil
 end)
 ```

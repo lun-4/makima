@@ -149,7 +149,7 @@ function M.fetch_usage(ctx, client)
   if type(key) ~= "table" or type(key.info) ~= "table" then
     return nil, "invalid Regolo key info response"
   end
-  local now = maki.time.now().secs
+  local now = makima.time.now().secs
   local today = clock.utc_date(now)
   local limits = { M.key_limit(key.info) }
   local activity = client.get_json(ctx, day_query(root, ACTIVITY_PATH, today))

@@ -1,7 +1,7 @@
 local synthetic = require("providers.synthetic")
 local compat = require("providers.openai_compat")
 local http = require("providers.http")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local Y2K_MS = 946684800000
 local QUOTA_URL = "https://api.synthetic.new/v2/quotas"

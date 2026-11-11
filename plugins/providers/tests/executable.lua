@@ -1,7 +1,7 @@
 local executable = require("providers.executable")
 local http = require("providers.http")
 local routes = require("providers.routes")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local PATH = "/scripts/corp"
 local BASE = "https://corp.example.invalid/v1"
@@ -29,7 +29,7 @@ local function script(outputs)
 end
 
 local function auth(token, base_url)
-  return maki.json.encode({ base_url = base_url, headers = { authorization = "Bearer " .. token } })
+  return makima.json.encode({ base_url = base_url, headers = { authorization = "Bearer " .. token } })
 end
 
 local function provider(route, run, info, models)
@@ -136,14 +136,14 @@ end)
 
 t.case("scan_caches_descriptions_until_the_script_changes", function()
   local dir = t.mktmpdir("executable-scan")
-  local cache = maki.fs.joinpath(dir, "cache.json")
-  local scripts = maki.fs.joinpath(dir, "providers")
-  maki.fs.mkdir(scripts)
+  local cache = makima.fs.joinpath(dir, "cache.json")
+  local scripts = makima.fs.joinpath(dir, "providers")
+  makima.fs.mkdir(scripts)
   for _, name in ipairs({ "corp", "has.dot", "weird", "plain" }) do
-    maki.fs.write(maki.fs.joinpath(scripts, name), "#!/bin/sh\n")
+    makima.fs.write(makima.fs.joinpath(scripts, name), "#!/bin/sh\n")
   end
-  local executable_check = maki.fn.executable
-  maki.fn.executable = function(path)
+  local executable_check = makima.fn.executable
+  makima.fn.executable = function(path)
     return path:find("plain", 1, true) and 0 or 1
   end
   local runs = {}
@@ -156,7 +156,7 @@ t.case("scan_caches_descriptions_until_the_script_changes", function()
   end
   local found = executable.scan(scripts, cache, BASES, run)
   local again = executable.scan(scripts, cache, BASES, run)
-  maki.fn.executable = executable_check
+  makima.fn.executable = executable_check
   t.rmtree(dir)
   t.eq(#found, 1)
   t.eq(found[1].slug, "corp")
@@ -250,14 +250,14 @@ t.case("system_prefix_is_a_block_for_anthropic_and_prepended_elsewhere", functio
   local info = { display_name = "Corp", base = "anthropic", has_auth = false, system_prefix = PREFIX }
   local ctx =
     stream(provider("anthropic", script({ resolve = auth("oauth") }), info), { messages }, "claude-sonnet-4-5")
-  local body = maki.json.decode(ctx.requests[1].body)
+  local body = makima.json.decode(ctx.requests[1].body)
   t.eq(ctx.requests[1].url, "https://api.anthropic.com/v1/messages")
   t.eq(body.system[1].text, PREFIX)
   t.eq(body.system[2].text, "sys")
 
   info.base = "openai"
   ctx = stream(provider("openai", script({ resolve = auth("k") }), info), { chat_sse() })
-  body = maki.json.decode(ctx.requests[1].body)
+  body = makima.json.decode(ctx.requests[1].body)
   t.eq(body.messages[1].content, PREFIX .. "\n\nsys")
 end)
 
@@ -284,7 +284,7 @@ t.case("thinking_fields_reach_llama_cpp_bodies", function()
   local info = { display_name = "Corp", base = "llama-cpp", has_auth = false }
   local ctx = stream(provider("llama-cpp", script({ resolve = auth("k") }), info, models), { chat_sse() }, "qwen")
   t.eq(ctx.requests[1].url, "http://localhost:8080/v1/chat/completions")
-  t.eq(maki.json.decode(ctx.requests[1].body).chat_template_kwargs.enable_thinking, false)
+  t.eq(makima.json.decode(ctx.requests[1].body).chat_template_kwargs.enable_thinking, false)
 end)
 
 t.case("login_runs_on_the_terminal_and_logout_runs_quietly", function()

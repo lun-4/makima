@@ -1,5 +1,5 @@
 local sse = require("providers.sse")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local READ_ERROR = "connection reset"
 

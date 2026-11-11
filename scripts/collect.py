@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Coding agent analytics collector - runs Maki, Claude Code, or OpenCode headless, appends to CSV."""
+"""Coding agent analytics collector - runs Makima, Claude Code, or OpenCode headless, appends to CSV."""
 
 import argparse
 import csv

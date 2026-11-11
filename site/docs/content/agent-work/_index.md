@@ -23,7 +23,7 @@ Main and subagent views share input, queue, status, and controls. The subagent l
 
 Model, mode, plan, compact, rewind, shell commands, reference expansion, and file completion target the viewed agent. Each new child inherits its parent's working directory. Later directory changes affect only the target agent and take effect in queue order. Commands and pickers keep their original target when the view changes. A closed target returns an error rather than redirecting work to the main agent. Agent restrictions still apply.
 
-Reset and new-session operations remain session-wide. The Lua `maki.session.*` APIs retain session scope.
+Reset and new-session operations remain session-wide. The Lua `makima.session.*` APIs retain session scope.
 
 ## Cancellation
 

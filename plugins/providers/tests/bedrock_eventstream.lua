@@ -1,5 +1,5 @@
 local eventstream = require("providers.bedrock_eventstream")
-local t = require("maki.test_helpers")
+local t = require("makima.test_helpers")
 
 local THROTTLED = "Rate exceeded"
 local INT_HEADER = 4
@@ -24,8 +24,8 @@ local function frame(headers, payload)
 end
 
 local function chunk(event)
-  local bytes = maki.base64.encode(assert(maki.json.encode(event)))
-  return frame({ [":event-type"] = "chunk" }, assert(maki.json.encode({ bytes = bytes })))
+  local bytes = makima.base64.encode(assert(makima.json.encode(event)))
+  return frame({ [":event-type"] = "chunk" }, assert(makima.json.encode({ bytes = bytes })))
 end
 
 -- Splits {wire} into reads of {size} bytes, so frames straddle reads.
