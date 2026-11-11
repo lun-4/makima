@@ -27,9 +27,10 @@ function M.config_error(message)
   return { kind = M.CONFIG_KIND, message = message }
 end
 
--- The text of an error, whether a string or a table.
+-- The text of an error, whether a string, a table, or a host value such as
+-- an mlua error userdata.
 function M.message(err)
-  return type(err) == "table" and err.message or err
+  return tostring(type(err) == "table" and err.message or err)
 end
 
 -- {err} with the retry class the host reads. A table that names one, and a

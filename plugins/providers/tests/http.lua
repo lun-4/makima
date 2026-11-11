@@ -128,6 +128,19 @@ local CONNECT_FAILED = "token request: could not connect: Connection refused"
 local IDLE_TIMEOUT = "idle timeout waiting for response body"
 local RESET = "connection reset"
 
+t.case("message_always_returns_text", function()
+  local host_error = setmetatable({}, {
+    __tostring = function()
+      return "host error"
+    end,
+  })
+  t.eq(http.message("boom"), "boom")
+  t.eq(http.message({ message = "boom" }), "boom")
+  t.eq(http.message(host_error), "host error")
+  t.eq(http.message(42), "42")
+  t.eq(http.message(true), "true")
+end)
+
 t.case("classify_names_a_retry_class", function()
   for _, case in ipairs({
     { CONNECT_FAILED, "connect" },
