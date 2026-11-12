@@ -6,7 +6,7 @@ use makima_providers::Message;
 use makima_storage::id::MakimaId;
 use thiserror::Error;
 
-use crate::call_scope::{CallScope, MoveError};
+use crate::call_scope::{CallScope, MoveError, MovedBy};
 use crate::cancel::CancelTrigger;
 use crate::types::AgentId;
 
@@ -137,8 +137,9 @@ impl SessionMailbox {
     }
 
     /// Moves one running call to the background and hands its trigger to the
-    /// mailbox, which owns the work until it ends.
-    pub fn move_call(&self, id: &str) -> Result<(), BackgroundMoveError> {
+    /// mailbox, which owns the work until it ends. `moved_by` says who asked,
+    /// which decides what the model is told.
+    pub fn move_call(&self, id: &str, moved_by: MovedBy) -> Result<(), BackgroundMoveError> {
         let scope = {
             let mut state = lock(&self.state);
             let scope = {
@@ -155,7 +156,7 @@ impl SessionMailbox {
             track_locked(&mut state, id);
             scope
         };
-        let trigger = match scope.move_home() {
+        let trigger = match scope.move_home(moved_by) {
             Ok(trigger) => trigger,
             Err(MoveError::AlreadyMoved) if scope.is_moved() => return Ok(()),
             Err(MoveError::AlreadyMoved) => {
@@ -202,7 +203,7 @@ impl SessionMailbox {
                 .map(|entry| entry.scope.id().to_owned())
                 .ok_or(BackgroundMoveError::NothingRunning)?
         };
-        self.move_call(&id)?;
+        self.move_call(&id, MovedBy::User)?;
         Ok(id)
     }
 

@@ -11,7 +11,7 @@ use futures_lite::FutureExt;
 use serde_json::{Value, json};
 use tracing::{debug, error, warn};
 
-use crate::call_scope::{CallGuard, CallScope};
+use crate::call_scope::{CallGuard, CallScope, MovedBy};
 use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
 use crate::tools::hook::{
     Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, OUTPUT_TRAILER, Verdict,
@@ -29,6 +29,7 @@ use makima_storage::id::SessionRef;
 const MOVED_PERMISSION_ERR: &str = "tool moved to the background before permission was answered";
 const BACKGROUND_RECEIPT: &str =
     "Running in the background. Its result will arrive as a message when it finishes.";
+const USER_BACKGROUND_RECEIPT: &str = "The user moved this call to the background. Its result will arrive as a message when it finishes.";
 const DOOM_LOOP_THRESHOLD: usize = 3;
 const DOOM_LOOP_MESSAGE: &str = "You have called this tool with identical input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
@@ -1301,7 +1302,7 @@ pub(super) async fn process_tool_calls(
                 results.push(ToolDoneEvent {
                     id,
                     tool: Arc::from(scope.tool()),
-                    output: ToolOutput::Plain(BACKGROUND_RECEIPT.into()),
+                    output: ToolOutput::Plain(moved_receipt(scope).into()),
                     is_error: false,
                     annotation: None,
                     written_path: None,
@@ -1337,6 +1338,13 @@ fn call_summary(
         .or_else(|| input.get("description").and_then(Value::as_str))
         .map(str::to_owned)
         .unwrap_or_else(|| registry.resolve_header(name, input))
+}
+
+fn moved_receipt(scope: &CallScope) -> &'static str {
+    match scope.home().map(|home| home.moved_by) {
+        Some(MovedBy::User) => USER_BACKGROUND_RECEIPT,
+        _ => BACKGROUND_RECEIPT,
+    }
 }
 
 fn background_text(scope: &CallScope, done: &ToolDoneEvent, lost: bool) -> String {
@@ -4601,6 +4609,7 @@ mod tests {
                     id: TEST_ID.into(),
                     tool: Arc::from(HOOK_TOOL_NAME),
                     summary: "prompt".into(),
+                    moved_by: MovedBy::User,
                 })
                 .unwrap();
             ctx.call = Some(scope);
@@ -4671,6 +4680,7 @@ mod tests {
                     id: TEST_ID.into(),
                     tool: Arc::from(HOOK_TOOL_NAME),
                     summary: "prompt".into(),
+                    moved_by: MovedBy::User,
                 })
                 .unwrap();
             let done = dispatch.await;
@@ -4730,7 +4740,7 @@ mod tests {
                     _ => None,
                 })
                 .unwrap();
-            assert_eq!(receipt, BACKGROUND_RECEIPT);
+            assert_eq!(receipt, USER_BACKGROUND_RECEIPT);
             assert_eq!(mailbox.outstanding(), 1);
 
             release_tx.send(()).unwrap();
@@ -4781,7 +4791,7 @@ mod tests {
                 local_tool(ToolAudience::all(), move |_, call_ctx| {
                     let id = call_ctx.tool_use_id.clone().unwrap();
                     let mailbox = SessionMailbox::open(session).unwrap();
-                    mailbox.move_call(&id).unwrap();
+                    mailbox.move_call(&id, MovedBy::Tool).unwrap();
                     Box::pin(async { Ok(SLOW_OUTPUT.to_owned()) })
                 }),
             )]));

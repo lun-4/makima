@@ -10,11 +10,23 @@ use thiserror::Error;
 use crate::cancel::{CancelToken, CancelTrigger};
 use crate::types::AgentId;
 
+/// Why a call left its turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MovedBy {
+    /// The user pressed the background keybind.
+    User,
+    /// The tool or one of its plugins moved the call.
+    Tool,
+    /// The call outstayed its deadline.
+    Deadline,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallHome {
     pub id: String,
     pub tool: Arc<str>,
     pub summary: String,
+    pub moved_by: MovedBy,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -148,11 +160,12 @@ impl CallScope {
         Ok(trigger)
     }
 
-    pub fn move_home(&self) -> Result<CancelTrigger, MoveError> {
+    pub fn move_home(&self, moved_by: MovedBy) -> Result<CancelTrigger, MoveError> {
         self.move_to(CallHome {
             id: self.id.clone(),
             tool: Arc::clone(&self.tool),
             summary: self.summary.clone(),
+            moved_by,
         })
     }
 
@@ -242,6 +255,7 @@ mod tests {
             id: CALL_ID.to_owned(),
             tool: Arc::from(TOOL),
             summary: "cargo test".into(),
+            moved_by: MovedBy::User,
         }
     }
 
@@ -354,7 +368,7 @@ mod tests {
             Some(tx),
         ));
         let _guard = CallGuard::new(Arc::clone(&scope));
-        let _trigger = scope.move_home().unwrap();
+        let _trigger = scope.move_home(MovedBy::User).unwrap();
         assert_eq!(rx.try_recv().as_deref(), Ok(CALL_ID));
     }
 }

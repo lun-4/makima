@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use makima_agent::agent::LoadedInstructions;
 use makima_agent::cancel::CancelToken;
 use makima_agent::tools::{FileReadTracker, QuestionMode, ToolAudience, ToolContext, ToolLive};
-use makima_agent::{AgentEvent, AgentRef, SessionMailbox};
+use makima_agent::{AgentEvent, AgentRef, MovedBy, SessionMailbox};
 use makima_config::{AgentConfig, ToolOutputLines};
 use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
 use makima_storage::id::SessionRef;
@@ -553,7 +553,7 @@ impl UserData for LuaCtx {
             let Ok(mailbox) = SessionMailbox::open(session) else {
                 return Ok(err_pair(NO_SESSION_MSG));
             };
-            match mailbox.move_call(call.id()) {
+            match mailbox.move_call(call.id(), MovedBy::Tool) {
                 Ok(()) => Ok((Some(true), None)),
                 Err(error) => Ok(err_pair(error.to_string())),
             }

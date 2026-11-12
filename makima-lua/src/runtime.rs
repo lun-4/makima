@@ -24,7 +24,7 @@ use makima_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
 };
 use makima_agent::{
-    BufferSnapshot, CurrentManagedTurn, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle,
+    BufferSnapshot, CurrentManagedTurn, MovedBy, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle,
 };
 use makima_providers::{ProviderRegistry, Timeouts};
 use makima_storage::checkpoint::CheckpointPublication;
@@ -701,7 +701,7 @@ impl TaskCell {
         };
         let moved = makima_agent::SessionMailbox::open(session)
             .ok()
-            .is_some_and(|mailbox| mailbox.move_call(call.id()).is_ok());
+            .is_some_and(|mailbox| mailbox.move_call(call.id(), MovedBy::Deadline).is_ok());
         if moved {
             self.deadline.set(None);
         }

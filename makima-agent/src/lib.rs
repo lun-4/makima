@@ -28,7 +28,7 @@ pub use agent::{
     close_dangling_tool_calls, end_conversation_detached, find_subdirectory_instructions,
     is_instruction_file,
 };
-pub use call_scope::{CallGuard, CallHome, CallScope, MoveError};
+pub use call_scope::{CallGuard, CallHome, CallScope, MoveError, MovedBy};
 pub use cancel::{
     CancelMap, CancelToken, CancelTrigger, ReasonedCancelToken, ReasonedCancelTrigger,
 };
