@@ -59,15 +59,20 @@ function M.base_url_env(def)
   return (def.id:upper():gsub("-", "_")) .. BASE_URL_SUFFIX
 end
 
+local function trim(url)
+  return (url:gsub("/+$", ""))
+end
+
 -- `<ID>_BASE_URL`, then `base_url` and the plan's from `providers.toml`,
--- then the default.
+-- then the default. Trailing slashes are removed so path joins do not
+-- produce a double slash.
 function M.base_url(def, config)
   local override = makima.uv.os_getenv(M.base_url_env(def))
   if override and override ~= "" then
-    return override
+    return trim(override)
   end
   local chosen = plan(def, config)
-  return config.base_url or (chosen and chosen.base_url) or def.base_url
+  return trim(config.base_url or (chosen and chosen.base_url) or def.base_url)
 end
 
 -- A JSON number that fits a u32 token count; anything else is unknown.

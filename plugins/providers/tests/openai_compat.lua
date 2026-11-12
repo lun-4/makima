@@ -79,6 +79,18 @@ t.case("base_url_precedence", function()
   end)
 end)
 
+t.case("base_url_trims_trailing_slashes", function()
+  local d = def()
+  t.with_env({}, function()
+    t.eq(compat.base_url(d, { base_url = "https://config.invalid/" }), "https://config.invalid")
+    t.eq(compat.base_url(d, { base_url = "https://config.invalid///" }), "https://config.invalid")
+    t.eq(compat.base_url(d, { base_url = "https://config.invalid/v1/" }), "https://config.invalid/v1")
+  end)
+  t.with_env({ TEST_BASE_URL = "https://env.invalid//" }, function()
+    t.eq(compat.base_url(d, {}), "https://env.invalid")
+  end)
+end)
+
 t.case("describe_takes_the_longest_prefix_over_defaults", function()
   local d = def({
     adjust = function(model)
