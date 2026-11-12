@@ -12,6 +12,7 @@ use crate::click::{ClickTarget, HitTarget};
 use crate::theme;
 
 use makima_providers::format_tokens;
+use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -80,7 +81,14 @@ pub struct StatusBar {
     cwd: PathBuf,
     cwd_branch: String,
     pub flash_duration: Duration,
-    branch_update_rx: Option<flume::Receiver<()>>,
+    branch_watcher: Option<BranchWatcher>,
+}
+
+struct BranchWatcher {
+    /// Nothing reads this field. It is here so it dies with the bar, and
+    /// dropping it stops notify's event thread and closes the inotify fd.
+    _watcher: RecommendedWatcher,
+    rx: flume::Receiver<()>,
 }
 
 impl StatusBar {
@@ -89,7 +97,7 @@ impl StatusBar {
             flash: None,
             started_at: Instant::now(),
             cwd_branch: cwd_branch_label(&cwd),
-            branch_update_rx: spawn_branch_watcher(&cwd),
+            branch_watcher: watch_branch(&cwd),
             cwd,
             flash_duration,
         }
@@ -114,7 +122,8 @@ impl StatusBar {
             return;
         }
         self.cwd_branch = cwd_branch_label(&cwd);
-        self.branch_update_rx = spawn_branch_watcher(&cwd);
+        drop(self.branch_watcher.take());
+        self.branch_watcher = watch_branch(&cwd);
         self.cwd = cwd;
     }
 
@@ -123,10 +132,10 @@ impl StatusBar {
     }
 
     pub fn poll_branch_update(&mut self) -> Dirty {
-        let Some(rx) = &self.branch_update_rx else {
+        let Some(watcher) = &self.branch_watcher else {
             return Dirty::NO;
         };
-        if rx.try_iter().next().is_none() {
+        if watcher.rx.try_iter().next().is_none() {
             return Dirty::NO;
         }
         let branch = cwd_branch_label(&self.cwd);
@@ -587,26 +596,20 @@ fn find_git_dir(cwd: &Path) -> Option<std::path::PathBuf> {
     }
 }
 
-fn spawn_branch_watcher(cwd: &Path) -> Option<flume::Receiver<()>> {
-    use notify::{RecursiveMode, Watcher};
-
+fn watch_branch(cwd: &Path) -> Option<BranchWatcher> {
     let git_dir = find_git_dir(cwd)?;
     let (tx, rx) = flume::bounded(1);
-
-    std::thread::spawn(move || {
-        let Ok(mut watcher) = notify::recommended_watcher(move |res: Result<notify::Event, _>| {
-            if res.is_ok_and(|e| e.paths.iter().any(|p| p.ends_with("HEAD"))) {
-                let _ = tx.try_send(());
-            }
-        }) else {
-            return;
-        };
-        if watcher.watch(&git_dir, RecursiveMode::NonRecursive).is_ok() {
-            std::thread::park();
+    let mut watcher = notify::recommended_watcher(move |res: Result<Event, _>| {
+        if res.is_ok_and(|e| e.paths.iter().any(|p| p.ends_with("HEAD"))) {
+            let _ = tx.try_send(());
         }
-    });
-
-    Some(rx)
+    })
+    .ok()?;
+    watcher.watch(&git_dir, RecursiveMode::NonRecursive).ok()?;
+    Some(BranchWatcher {
+        _watcher: watcher,
+        rx,
+    })
 }
 
 #[cfg(test)]
@@ -631,6 +634,7 @@ mod tests {
     const SESSION_COST: f64 = 1.5;
     const SESSION_COST_TEXT: &str = "\u{03a3}$1.500";
     const SIGMA: char = '\u{03a3}';
+    const WATCHER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
     fn test_cwd() -> PathBuf {
         env::current_dir().unwrap()
@@ -1079,7 +1083,7 @@ mod tests {
         } else {
             label.clone()
         };
-        bar.branch_update_rx = Some(rx);
+        bar.branch_watcher.as_mut().unwrap().rx = rx;
         tx.send(()).unwrap();
 
         let dirty = bar.poll_branch_update();
@@ -1089,6 +1093,45 @@ mod tests {
             "a full channel makes the watcher drop the next switch"
         );
         dirty
+    }
+
+    /// Dropping a watcher only asks notify's event thread to stop, and the
+    /// sender dies on that thread, so wait for the channel to close instead of
+    /// asserting on the spot.
+    fn assert_watcher_dropped(rx: &flume::Receiver<()>) {
+        let deadline = Instant::now() + WATCHER_SHUTDOWN_TIMEOUT;
+        loop {
+            match rx.recv_deadline(deadline) {
+                Err(flume::RecvTimeoutError::Disconnected) => return,
+                Ok(()) => {}
+                Err(flume::RecvTimeoutError::Timeout) => {
+                    panic!("the replaced watcher kept its event thread alive")
+                }
+            }
+        }
+    }
+
+    /// A bar builds a watcher for its first cwd and another for every `/cd`,
+    /// so a watcher that is only replaced leaves a thread and an inotify fd
+    /// behind per directory the session ever visited.
+    #[test]
+    fn set_cwd_drops_the_previous_branch_watcher() {
+        let (_first, first) = tmp_with_head(Some("ref: refs/heads/main\n"));
+        let (_second, second) = tmp_with_head(Some("ref: refs/heads/main\n"));
+        let (_third, third) = tmp_with_head(Some("ref: refs/heads/main\n"));
+
+        let mut bar = StatusBar::new(FLASH_TTL, PathBuf::from(&first));
+        let first_rx = bar.branch_watcher.as_ref().unwrap().rx.clone();
+        bar.set_cwd(PathBuf::from(&second));
+        let second_rx = bar.branch_watcher.as_ref().unwrap().rx.clone();
+        bar.set_cwd(PathBuf::from(&third));
+
+        assert_watcher_dropped(&first_rx);
+        assert_watcher_dropped(&second_rx);
+        assert!(
+            !bar.branch_watcher.as_ref().unwrap().rx.is_disconnected(),
+            "the bar must keep watching the cwd it moved to"
+        );
     }
 
     #[test]
