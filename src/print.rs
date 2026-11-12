@@ -633,6 +633,9 @@ pub fn run(
                                 | AgentEvent::ToolExecutionStart { .. }
                                 | AgentEvent::ToolOutput { .. }
                                 | AgentEvent::ToolDone(_)
+                                | AgentEvent::ToolMoved { .. }
+                                | AgentEvent::BackgroundDone(_)
+                                | AgentEvent::BackgroundLost { .. }
                                 | AgentEvent::QueueItemConsumed { .. }
                                 | AgentEvent::ModelSwitched { .. }
                                 | AgentEvent::QueueSettled

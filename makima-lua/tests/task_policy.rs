@@ -42,12 +42,14 @@ const TASK_SPAWN_TOOL: &str = "task_spawn";
 const TASK_WAIT_TOOL: &str = "task_wait";
 const TASK_SEND_TOOL: &str = "task_send";
 const TASK_DESPAWN_TOOL: &str = "task_despawn";
-/// The four task lifecycle tools a general child inherits from its parent.
-const NESTED_LIFECYCLE_TOOLS: [&str; 4] = [
+const TASK_STOP_TOOL: &str = "task_stop";
+/// The five task lifecycle tools a general child inherits from its parent.
+const NESTED_LIFECYCLE_TOOLS: [&str; 5] = [
     TASK_SPAWN_TOOL,
     TASK_WAIT_TOOL,
     TASK_SEND_TOOL,
     TASK_DESPAWN_TOOL,
+    TASK_STOP_TOOL,
 ];
 const PROBE_TOOL: &str = "probe";
 const TASK_PROMPT: &str = "do the thing";

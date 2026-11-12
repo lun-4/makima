@@ -17,7 +17,7 @@ use makima_agent::tools::{
     ToolFilter, ToolInvocation, ToolLive, ToolRegistry, ToolSource, TurnToolBindings,
     format_line_truncated_marker, timeout_annotation,
 };
-use makima_agent::{AgentMode, SharedBuf, ToolOutput};
+use makima_agent::{AgentMode, CallScope, CancelToken, SessionMailbox, SharedBuf, ToolOutput};
 use makima_commands::{CommandOutcome, InputDispatch, TargetCapabilities};
 use makima_config::{
     AlwaysThinking, DEFAULT_AUTOCOMPLETE_HEIGHT, Effect, PluginsConfig, ToolKey, ToolOutputLines,
@@ -4320,6 +4320,113 @@ fn cancelled_bash_keeps_streamed_output_as_partial() {
         .strip_prefix(&format!("{BASH_PARTIAL_PROBE}\n"))
         .expect("streamed output precedes the marker");
     assert_partial_marker(marker);
+}
+
+const BACKGROUND_CALL_ID: &str = "bash-background-1";
+const BACKGROUND_PROBE_COMMAND: &str = "printf '%s%s\\n' X Y";
+const BACKGROUND_PROBE_OUTPUT: &str = "XY";
+const BACKGROUND_SLEEP_COMMAND: &str = "sleep 2; printf '%s%s\\n' X Y";
+
+fn background_bash_ctx(
+    host: &PluginHost,
+    command: &str,
+) -> (
+    ToolContext,
+    Arc<CallScope>,
+    SessionMailbox,
+    makima_agent::session_coordinator::SessionCoordinatorHandle,
+) {
+    let session = test_session(host);
+    let session_id = session.read().session_id();
+    let mailbox = SessionMailbox::open(session_id).unwrap();
+    let mut ctx = makima_agent::tools::test_support::stub_ctx_with_session(
+        &AgentMode::Build,
+        None,
+        Some(BACKGROUND_CALL_ID),
+        session_id,
+    );
+    ctx.config.rtk = false;
+    let scope = Arc::new(CallScope::new(
+        BACKGROUND_CALL_ID.into(),
+        Arc::from("bash"),
+        command.into(),
+        Some(session_id),
+        None,
+        &CancelToken::none(),
+        None,
+    ));
+    ctx.call = Some(Arc::clone(&scope));
+    mailbox.register_call(Arc::clone(&scope));
+    (ctx, scope, mailbox, session)
+}
+
+#[test]
+fn bash_background_moves_the_call_and_still_returns_its_output() {
+    let (reg, host) = builtins_host();
+    let (ctx, scope, _mailbox, _session) = background_bash_ctx(&host, BACKGROUND_PROBE_COMMAND);
+    let output = exec_with_ctx(
+        &reg,
+        "bash",
+        json!({ "command": BACKGROUND_PROBE_COMMAND, "background": true }),
+        &ctx,
+    )
+    .unwrap();
+
+    assert_eq!(output, BACKGROUND_PROBE_OUTPUT);
+    assert!(scope.is_moved(), "the call must move to the background");
+}
+
+#[test]
+fn task_stop_stops_a_moved_call_by_its_id() {
+    let (reg, host) = builtins_host();
+    let (ctx, scope, mailbox, _session) = background_bash_ctx(&host, "sleep 30");
+    mailbox.move_latest().unwrap();
+    assert!(scope.is_moved());
+
+    let output = exec_with_ctx(
+        &reg,
+        "task_stop",
+        json!({ "task_id": BACKGROUND_CALL_ID }),
+        &ctx,
+    )
+    .unwrap();
+
+    let reply: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(reply["ok"], true);
+    assert!(scope.cancel().is_cancelled(), "stop must fire the call");
+}
+
+#[test]
+fn bash_background_on_timeout_moves_the_call_instead_of_killing_it() {
+    let mut config = PluginsConfig::from_plugins(HashMap::new());
+    config.opts.insert(
+        "bash".to_owned(),
+        json_obj(json!({ "background_on_timeout": true })),
+    );
+    let (reg, host) = builtins_host_with(&config);
+    let (ctx, scope, mailbox, _session) = background_bash_ctx(&host, BACKGROUND_SLEEP_COMMAND);
+    let reg = Arc::clone(&reg);
+    let (tx, rx) = flume::bounded(1);
+    let worker = std::thread::spawn(move || {
+        let input = json!({ "command": BACKGROUND_SLEEP_COMMAND, "timeout": 1 });
+        let _ = tx.send(exec_with_ctx(&reg, "bash", input, &ctx));
+    });
+
+    poll_until("the timed-out call must move", || {
+        mailbox
+            .background_calls()
+            .iter()
+            .any(|call| call.moved)
+            .then_some(())
+    });
+
+    let output = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("timed-out bash must settle")
+        .unwrap();
+    worker.join().unwrap();
+    assert_eq!(output, BACKGROUND_PROBE_OUTPUT);
+    assert!(scope.is_moved());
 }
 
 /// A run that finishes on its own carries no marker: the elapsed time only

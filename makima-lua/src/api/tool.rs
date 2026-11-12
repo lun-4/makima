@@ -552,11 +552,27 @@ impl ToolInvocation for LuaToolInvocation {
             let recv = async { Some(reply_rx.recv_async().await) };
             let result = match invocation_deadline {
                 Some(deadline) => {
-                    futures_lite::future::race(recv, async move {
-                        smol::Timer::at(deadline + TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT).await;
+                    let call = ctx.call.clone();
+                    let timeout = async move {
+                        let moved = async {
+                            match call.as_ref() {
+                                Some(call) => {
+                                    call.moved().await;
+                                    true
+                                }
+                                None => std::future::pending().await,
+                            }
+                        };
+                        let timer = async {
+                            smol::Timer::at(deadline + TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT).await;
+                            false
+                        };
+                        if futures_lite::future::or(moved, timer).await {
+                            std::future::pending::<()>().await;
+                        }
                         None
-                    })
-                    .await
+                    };
+                    futures_lite::future::or(recv, timeout).await
                 }
                 None => recv.await,
             };

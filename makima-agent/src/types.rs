@@ -878,6 +878,22 @@ pub enum AgentEvent {
         content: String,
     },
     ToolDone(Box<ToolDoneEvent>),
+    /// A running call moved off its turn. The row stays in the chat and a
+    /// `/tasks` entry appears under `summary`.
+    ToolMoved {
+        id: String,
+        tool: Arc<str>,
+        summary: String,
+    },
+    /// The final result of a moved call. It travels apart from the turn that
+    /// took the receipt, so frontends handle it before the run filter.
+    BackgroundDone(Box<ToolDoneEvent>),
+    /// A moved call's work died without a result.
+    BackgroundLost {
+        id: String,
+        tool: Arc<str>,
+        reason: String,
+    },
     TurnComplete(Box<TurnCompleteEvent>),
     ToolResultsSubmitted {
         message: Box<Message>,

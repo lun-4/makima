@@ -525,6 +525,7 @@ impl HeadlessBackend {
             session_id: self.params.session_id.clone(),
             cwd: config.context.cwd().to_path_buf(),
             tool_use_id: None,
+            call: None,
             user_response_rx: self.answer_rx.clone(),
             loaded_instructions: Default::default(),
             cancel: CancelToken::none(),

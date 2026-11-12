@@ -471,6 +471,9 @@ pub struct ToolContext {
     pub session_id: Option<SessionRef>,
     pub cwd: PathBuf,
     pub tool_use_id: Option<String>,
+    /// The model call this context serves, shared by nested calls. `None`
+    /// outside a model call and for calls a batch started.
+    pub call: Option<Arc<crate::call_scope::CallScope>>,
     pub user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     pub loaded_instructions: LoadedInstructions,
     pub cancel: CancelToken,
@@ -878,6 +881,7 @@ pub fn interpreter_ctx(
         session_id: None,
         cwd,
         tool_use_id: None,
+        call: None,
         user_response_rx: None,
         loaded_instructions: LoadedInstructions::new(),
         cancel,

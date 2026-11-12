@@ -263,6 +263,7 @@ Commands run in ]] .. cwd .. [[ by default.
 - Chain dependent commands with `&&`. Use batch for independent ones.
 - Provide a short `description` (3-5 words).
 - Output beyond 2000 lines or 50KB is saved to a file; the result shows its start and end and gives the path.
+- Use `background = true` for long builds, tests, or servers; the call returns at once and the result arrives as a message.
 - Interactive commands (sudo, ssh prompts) fail immediately.]]
 
 local opts = makima.api.register_options(output_limits.extend({
@@ -284,6 +285,11 @@ local opts = makima.api.register_options(output_limits.extend({
     default = 30,
     min = 5,
     desc = "Stop the auto-mode classifier after this many seconds and fall back to normal permission handling.",
+  },
+  background_on_timeout = {
+    default = false,
+    type = "boolean",
+    desc = "Move a command that hits its timeout to the background instead of killing it.",
   },
 }))
 
@@ -388,6 +394,10 @@ makima.api.register_tool({
       timeout = { type = "integer", description = "Execution timeout in seconds (default 120)" },
       workdir = { type = "string", description = "Working directory (default: cwd)" },
       description = { type = "string", description = "Short description (3-5 words) of what the command does" },
+      background = {
+        type = "boolean",
+        description = "Run in the background and return at once; the result arrives as a message when it ends.",
+      },
     },
   },
   permission_scopes = function(input, ctx)
@@ -506,6 +516,13 @@ makima.api.register_tool({
 
     local buf, view = create_bash_view(command, ctx, auto_annotation)
 
+    if input.background then
+      local ok, err = ctx:background()
+      if not ok then
+        view:append({ { "background unavailable: " .. tostring(err), "dim" } })
+      end
+    end
+
     local output_parts = {}
     local has_output = false
     local finished = false
@@ -542,7 +559,9 @@ makima.api.register_tool({
 
     view:append({ { "Waiting for output...", "dim" } })
 
-    ctx:set_deadline(timeout_secs)
+    ctx:set_deadline(timeout_secs, {
+      expire = opts.background_on_timeout and "background" or "timeout",
+    })
     makima.fn.jobstart(command, {
       cwd = workdir,
       env = { GIT_TERMINAL_PROMPT = "0" },

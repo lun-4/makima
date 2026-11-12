@@ -6,20 +6,25 @@ use std::time::{Duration, Instant};
 use makima_agent::agent::LoadedInstructions;
 use makima_agent::cancel::CancelToken;
 use makima_agent::tools::{FileReadTracker, QuestionMode, ToolAudience, ToolContext, ToolLive};
-use makima_agent::{AgentEvent, AgentRef};
+use makima_agent::{AgentEvent, AgentRef, MovedBy, SessionMailbox};
 use makima_config::{AgentConfig, ToolOutputLines};
 use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
 use makima_storage::id::SessionRef;
-use mlua::{LuaSerdeExt, MultiValue, UserData, UserDataMethods, Value as LuaValue};
+use mlua::{LuaSerdeExt, MultiValue, Table, UserData, UserDataMethods, Value as LuaValue};
 
 use crate::agent_errors::INVOCATION_EXPIRED;
 use crate::api::tool::ToolCallReply;
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::json_to_lua;
-use crate::api::util::pair::{Pair, try_pair};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::runtime::{active_task, lock_cell};
 
 const DEADLINE_ALREADY_SET_MSG: &str = "ctx:set_deadline() already called";
+const EXPIRE_TIMEOUT: &str = "timeout";
+const EXPIRE_BACKGROUND: &str = "background";
+const NOT_A_MODEL_CALL_MSG: &str =
+    "background: only the handler of a model's tool call can move to the background";
+const NO_SESSION_MSG: &str = "background: this call has no live session";
 
 fn send_live_buf(lua: &mlua::Lua, buf: &mlua::AnyUserData) -> mlua::Result<()> {
     let shared = buf.borrow::<BufHandle>().map(|h| Arc::clone(&h.buf))?;
@@ -72,6 +77,7 @@ impl AgentContext {
         let mut c = self.0.clone();
         c.tool_use_id = None;
         c.live_sink = None;
+        c.call = None;
         c
     }
 }
@@ -486,28 +492,95 @@ impl UserData for LuaCtx {
             None => Ok(LuaValue::Nil),
         });
 
-        methods.add_method("set_deadline", |lua, this, secs: u64| {
-            if !matches!(this.caps, Caps::Handler { .. }) {
-                return Ok(this.cap_err_pair("set_deadline"));
-            }
+        methods.add_method(
+            "set_deadline",
+            |lua, this, (secs, opts): (u64, Option<Table>)| {
+                if !matches!(this.caps, Caps::Handler { .. }) {
+                    return Ok(this.cap_err_pair("set_deadline"));
+                }
+                try_pair!(this.validate_origin(lua));
+                let expire = match opts
+                    .as_ref()
+                    .and_then(|opts| opts.get::<Option<String>>("expire").ok())
+                    .flatten()
+                    .as_deref()
+                {
+                    None | Some(EXPIRE_TIMEOUT) => false,
+                    Some(EXPIRE_BACKGROUND) => true,
+                    Some(other) => {
+                        return Err(mlua::Error::runtime(format!(
+                            "set_deadline: unknown expire {other:?}, expected \"{EXPIRE_TIMEOUT}\" or \"{EXPIRE_BACKGROUND}\""
+                        )));
+                    }
+                };
+                let handle = active_task(lua);
+                let mut cell = handle.lock().unwrap_or_else(|e| e.into_inner());
+                if cell.deadline_secs.get().is_some() {
+                    return Err(mlua::Error::runtime(DEADLINE_ALREADY_SET_MSG));
+                }
+                if cell.call.is_some() {
+                    cell.expire_background = expire;
+                }
+                cell.deadline_secs.set(Some(secs));
+                let deadline = Instant::now() + Duration::from_secs(secs);
+                cell.deadline.set(Some(
+                    cell.deadline
+                        .get()
+                        .map_or(deadline, |current| current.min(deadline)),
+                ));
+                if !cell.is_live() {
+                    cell.invalidate_publications();
+                }
+                cell.deadline_changed.notify(usize::MAX);
+                Ok((Some(true), None))
+            },
+        );
+
+        methods.add_method("background", |lua, this, ()| {
+            let Some(agent) = this.agent() else {
+                return Ok(this.cap_err_pair("background"));
+            };
             try_pair!(this.validate_origin(lua));
-            let handle = active_task(lua);
-            let mut cell = handle.lock().unwrap_or_else(|e| e.into_inner());
-            if cell.deadline_secs.get().is_some() {
-                return Err(mlua::Error::runtime(DEADLINE_ALREADY_SET_MSG));
+            let Some(call) = &agent.call else {
+                return Ok(err_pair(NOT_A_MODEL_CALL_MSG));
+            };
+            if call.is_moved() {
+                return Ok((Some(true), None));
             }
-            cell.deadline_secs.set(Some(secs));
-            let deadline = Instant::now() + Duration::from_secs(secs);
-            cell.deadline.set(Some(
-                cell.deadline
-                    .get()
-                    .map_or(deadline, |current| current.min(deadline)),
-            ));
-            if !cell.is_live() {
-                cell.invalidate_publications();
+            let Some(session) = call.session() else {
+                return Ok(err_pair(NO_SESSION_MSG));
+            };
+            let Ok(mailbox) = SessionMailbox::open(session) else {
+                return Ok(err_pair(NO_SESSION_MSG));
+            };
+            match mailbox.move_call(call.id(), MovedBy::Tool) {
+                Ok(()) => Ok((Some(true), None)),
+                Err(error) => Ok(err_pair(error.to_string())),
             }
-            cell.deadline_changed.notify(usize::MAX);
-            Ok((Some(true), None))
+        });
+
+        methods.add_method("backgrounded", |_, this, ()| {
+            Ok(this
+                .agent()
+                .and_then(|agent| agent.call.as_ref())
+                .is_some_and(|call| call.is_moved()))
+        });
+
+        methods.add_method("stop_background", |lua, this, id: String| {
+            let Some(agent) = this.agent() else {
+                return Ok(this.cap_err_pair("stop_background"));
+            };
+            try_pair!(this.validate_origin(lua));
+            let Some(session) = agent.session_id.as_ref().map(SessionRef::id) else {
+                return Ok(err_pair(NO_SESSION_MSG));
+            };
+            let Ok(mailbox) = SessionMailbox::open(session) else {
+                return Ok(err_pair(NO_SESSION_MSG));
+            };
+            match mailbox.stop_call(&id) {
+                Ok(()) => Ok((Some(true), None)),
+                Err(error) => Ok(err_pair(error)),
+            }
         });
 
         methods.add_method("capture_read", |lua, this, path: String| {

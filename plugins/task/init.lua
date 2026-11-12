@@ -412,6 +412,18 @@ local despawn_schema = {
   },
 }
 
+local stop_schema = {
+  type = "object",
+  required = { "task_id" },
+  additionalProperties = false,
+  properties = {
+    task_id = {
+      type = "string",
+      description = "Task id returned by task_spawn, or the call id of a tool moved to the background.",
+    },
+  },
+}
+
 local wait_schema = {
   type = "object",
   required = { "task_id" },
@@ -692,6 +704,39 @@ local function despawn_handler(input, ctx)
   return reply(makima.json.encode({ ok = true }))
 end
 
+local function stop_handler(input, ctx)
+  local task = tasks[input.task_id]
+  if task then
+    if not task.owner:_makima_can_control() then
+      return { llm_output = TASK_ACCESS_ERR, is_error = true }
+    end
+    fail_task(task, TASK_CLOSED_ERR, ctx)
+    tasks[input.task_id] = nil
+    for i, id in ipairs(task_order) do
+      if id == input.task_id then
+        table.remove(task_order, i)
+        break
+      end
+    end
+    return makima.json.encode({ ok = true, task_id = input.task_id })
+  end
+  local ok, err = ctx:stop_background(input.task_id)
+  if not ok then
+    return { llm_output = "Stop failed: " .. tostring(err), is_error = true }
+  end
+  return makima.json.encode({ ok = true, task_id = input.task_id })
+end
+
+local function restore_stop(input, output, is_error, ctx)
+  local body = makima.ui.buf()
+  if is_error then
+    body:line({ { "Stop failed: " .. output, "error" } })
+  else
+    body:line({ { "Stopped " .. input.task_id, "dim" } })
+  end
+  return { body = body, header = label_buf(input.task_id) }
+end
+
 local function wait_handler(input, ctx)
   local task, access_err = resolve_task(input.task_id)
   local state = task and { description = task.description } or nil
@@ -793,6 +838,20 @@ makima.api.register_tool({
   handler = despawn_handler,
   header = task_header,
   restore = restore_despawn,
+})
+
+makima.api.register_tool({
+  name = "task_stop",
+  description = "Stop a background subagent or a tool call moved to the background. A moved call's final result still arrives as a message. Returns { ok = true }.",
+  kind = "execute",
+  audiences = { "main", "general_sub", "interpreter", "workflow" },
+  examples = {},
+  schema = stop_schema,
+  handler = stop_handler,
+  header = function(input)
+    return input.task_id
+  end,
+  restore = restore_stop,
 })
 
 local SUBAGENT_TYPES = {

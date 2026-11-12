@@ -228,6 +228,10 @@ pub enum Action {
     CancelSubagent {
         tool_use_id: String,
     },
+    /// Move the running tool call of this chat to the background.
+    MoveToBackground {
+        agent: Option<makima_agent::AgentId>,
+    },
     ReplaceSession(Box<SessionReplacementRequest>),
     RewindAgent {
         target: AgentRef,

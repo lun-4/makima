@@ -134,6 +134,8 @@ const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
 const PROVIDER_USAGE_CHANGED_ERR: &str = "provider changed while fetching usage";
 const PROVIDER_USAGE_SHUTDOWN_ERR: &str = "UI shut down while fetching usage";
 const NOT_LIVE_ERR: &str = "session not live";
+const NO_MAILBOX_ERR: &str = "no live session to move a tool call in";
+const MOVED_BACKGROUND_PREFIX: &str = "Moved to the background: ";
 const UNKNOWN_PROVIDER: &str = "Unknown";
 const RUNTIME_GONE_ERR: &str = "session closed while its model was preparing";
 const CHILD_HISTORY_IDENTITY_ERR: &str = "child history storage identity is unavailable";
@@ -3770,6 +3772,18 @@ impl<'t> EventLoop<'t> {
                     .handles
                     .cmd_tx
                     .try_send(AgentCommand::CancelSubagent { tool_use_id });
+            }
+            Action::MoveToBackground { agent } => {
+                let moved = self.sessions[idx]
+                    .handles
+                    .mailbox()
+                    .map(|mailbox| mailbox.move_latest_for(agent));
+                let message = match moved {
+                    Some(Ok(id)) => format!("{MOVED_BACKGROUND_PREFIX}{id}"),
+                    Some(Err(error)) => error.to_string(),
+                    None => NO_MAILBOX_ERR.into(),
+                };
+                self.sessions[idx].app.flash(message);
             }
             Action::ReplaceSession(request) => self.request_replacement(idx, *request),
             Action::RewindAgent { target, boundary } => {
