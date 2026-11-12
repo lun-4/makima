@@ -85,6 +85,22 @@ fn finish_with_live_buf(
     buf
 }
 
+#[test]
+fn a_running_tool_hints_the_background_key_until_it_moves() {
+    const HINT: &str = "Ctrl+B to background";
+    let mut panel = panel_with_tools(&[("t1", BASH_TOOL_NAME)]);
+    let text = buffer_text(&render(&mut panel, 80, 10));
+    assert!(text.contains(HINT), "{text}");
+
+    panel.mark_backgrounded("t1");
+    let text = buffer_text(&render(&mut panel, 80, 10));
+    assert!(!text.contains(HINT), "{text}");
+
+    panel.tool_done(done("t1"));
+    let text = buffer_text(&render(&mut panel, 80, 10));
+    assert!(!text.contains(HINT), "{text}");
+}
+
 #[test_case(false, ToolStatus::Success ; "success_updates_start_to_success")]
 #[test_case(true,  ToolStatus::Error   ; "error_updates_start_to_error")]
 fn tool_done_updates_start_status(is_error: bool, expected: ToolStatus) {

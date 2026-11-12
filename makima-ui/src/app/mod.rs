@@ -2776,6 +2776,7 @@ impl App {
                     .map(|subagent| self.resolve_or_create_chat(subagent))
                     .unwrap_or(0);
                 self.track_background_call(chat_idx, id, tool, summary);
+                self.chats[chat_idx].mark_tool_backgrounded(id);
                 self.sync_task_picker();
                 return vec![];
             }

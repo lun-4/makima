@@ -478,6 +478,10 @@ impl Chat {
         self.messages_panel.update_tool_summary(tool_id, summary);
     }
 
+    pub fn mark_tool_backgrounded(&mut self, tool_id: &str) {
+        self.messages_panel.mark_backgrounded(tool_id);
+    }
+
     pub fn update_tool_model(&mut self, tool_id: &str, model: &str) {
         self.messages_panel.update_tool_model(tool_id, model);
     }

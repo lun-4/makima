@@ -8,9 +8,9 @@ use self::render::RenderCursor;
 use self::segment::{Segment, SegmentCache};
 
 use super::tool_display::{
-    RenderCtx, RoleNames, RoleStyle, ToolLines, append_annotation, append_right_info,
-    assistant_style, build_instructions_lines, build_tool_lines, done_style, error_style,
-    format_timestamp_now, instructions_search_text, post_style, search_text_for,
+    RenderCtx, RoleNames, RoleStyle, ToolLines, append_annotation, append_background_hint,
+    append_right_info, assistant_style, build_instructions_lines, build_tool_lines, done_style,
+    error_style, format_timestamp_now, instructions_search_text, post_style, search_text_for,
     thinking_indicator, thinking_style, truncate_to_header, user_style,
 };
 use super::{
@@ -88,6 +88,8 @@ pub struct MessagesPanel {
     idle_splash: Splash,
     accent: ColorTransition,
     expanded_tools: HashMap<String, SectionFlags>,
+    /// Calls the user already moved, so their running row drops the hint.
+    backgrounded_tools: HashSet<String>,
     /// Per-tool log of post-completion click rows, replayed on restore.
     lua_clicks: HashMap<String, Vec<usize>>,
     live_bufs: HashMap<String, Arc<SharedBuf>>,
@@ -171,6 +173,7 @@ impl MessagesPanel {
             idle_splash: Splash::new(ui_config.splash_animation),
             accent: ColorTransition::new(theme::current().mode_build),
             expanded_tools: HashMap::new(),
+            backgrounded_tools: HashSet::new(),
             lua_clicks: HashMap::new(),
             live_bufs: HashMap::new(),
             watched_bufs: VecDeque::new(),
@@ -225,6 +228,7 @@ impl MessagesPanel {
         self.messages = msgs;
         self.cache.clear();
         self.expanded_tools.clear();
+        self.backgrounded_tools.clear();
         self.lua_clicks.clear();
         self.live_bufs.clear();
         self.watched_bufs.clear();
@@ -310,6 +314,7 @@ impl MessagesPanel {
 
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
         let had_live_buf = self.retire_live_buf(&event.id);
+        self.backgrounded_tools.remove(&event.id);
         let Some(msg) = self
             .messages
             .iter_mut()
@@ -362,6 +367,11 @@ impl MessagesPanel {
         msg.tool_output = Some(Arc::new(event.output));
         msg.live_output = None;
         self.rebuild_tool_segment(&event.id);
+    }
+
+    pub fn mark_backgrounded(&mut self, tool_id: &str) {
+        self.backgrounded_tools.insert(tool_id.to_owned());
+        self.rebuild_tool_segment(tool_id);
     }
 
     pub fn update_tool_summary(&mut self, tool_id: &str, summary: &str) {
@@ -1477,12 +1487,20 @@ impl MessagesPanel {
     }
 
     fn build_tool_segment_lines(
+        &self,
         msg: &DisplayMessage,
         status: ToolStatus,
         rctx: &RenderCtx,
         exp: SectionFlags,
     ) -> ToolLines {
         let mut tl = build_tool_lines(msg, status, rctx, exp);
+        if let DisplayRole::Tool(tool) = &msg.role
+            && status == ToolStatus::InProgress
+            && !msg.text.is_empty()
+            && !self.backgrounded_tools.contains(&tool.id)
+        {
+            append_background_hint(&mut tl.lines[0]);
+        }
         if let Some(ts) = &msg.timestamp
             && !tl.lines.is_empty()
         {
@@ -1626,7 +1644,7 @@ impl MessagesPanel {
             .copied()
             .unwrap_or_default();
         let rctx = self.rctx();
-        let tl = Self::build_tool_segment_lines(msg, status, &rctx, exp);
+        let tl = self.build_tool_segment_lines(msg, status, &rctx, exp);
 
         let instructions = msg
             .tool_output
@@ -1652,7 +1670,7 @@ impl MessagesPanel {
             if let DisplayRole::Tool(t) = &msg.role {
                 let exp = self.expanded_tools.get(&t.id).copied().unwrap_or_default();
                 let status = t.status;
-                let tl = Self::build_tool_segment_lines(msg, status, &self.rctx(), exp);
+                let tl = self.build_tool_segment_lines(msg, status, &self.rctx(), exp);
                 let id = t.id.clone();
                 self.cache.push_spacer_if_needed();
                 let mut seg = Segment::with_tool(id.clone());

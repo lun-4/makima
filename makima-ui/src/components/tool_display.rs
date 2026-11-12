@@ -1,3 +1,4 @@
+use super::keybindings::key;
 use super::{DisplayMessage, ToolStatus};
 
 use super::code_view;
@@ -216,6 +217,14 @@ impl ToolLines {
 pub fn format_timestamp_now(format: ClockFormat) -> String {
     let zoned = Timestamp::now().to_zoned(TimeZone::system());
     zoned.strftime(crate::clock::hms(format)).to_string()
+}
+
+/// Names the key that moves a running call off its turn.
+pub fn append_background_hint(line: &mut Line<'static>) {
+    line.spans.push(Span::styled(
+        format!(" ({} to background)", key::BACKGROUND.label),
+        theme::current().tool_dim,
+    ));
 }
 
 pub fn append_right_info(

@@ -14159,6 +14159,27 @@ fn ctrl_b_asks_the_session_to_move_the_running_call() {
 }
 
 #[test]
+fn a_running_tool_hints_the_background_key_until_it_moves() {
+    const HINT: &str = "Ctrl+B to background";
+    let mut app = streaming_app();
+    app.update(agent_msg(tool_start("call_hint", "bash")));
+    assert!(
+        rendered(&mut app).contains(HINT),
+        "a running call must name the key that moves it"
+    );
+
+    app.update(agent_msg(AgentEvent::ToolMoved {
+        id: "call_hint".into(),
+        tool: "bash".into(),
+        summary: "call_hint".into(),
+    }));
+    assert!(
+        !rendered(&mut app).contains(HINT),
+        "a moved call must drop the hint"
+    );
+}
+
+#[test]
 fn a_moved_call_appears_in_tasks_until_it_finishes() {
     let mut app = test_app();
     app.update(agent_msg(AgentEvent::ToolMoved {
