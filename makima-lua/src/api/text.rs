@@ -7,7 +7,7 @@ use makima_agent::tools::{
     truncate_line as truncate_line_text,
 };
 
-use super::util::pair::{Pair, pair};
+use super::util::pair::{Pair, pair, try_pair};
 
 /// Convert an HTML string to Markdown.
 /// Useful for cleaning up web content fetched with `makima.webfetch`.
@@ -19,9 +19,12 @@ use super::util::pair::{Pair, pair};
 /// if err then return end
 /// print(md) -- "# Hello\n\nworld"
 #[lua_fn]
-fn html_to_markdown(_lua: &Lua, html: String) -> LuaResult<Pair<String>> {
+async fn html_to_markdown(_lua: Lua, html: LuaString) -> LuaResult<Pair<String>> {
+    let html = try_pair!(html.to_str()).to_owned();
     Ok(pair(
-        htmd::convert(&html).map_err(|e| format!("html_to_markdown: {e}")),
+        smol::unblock(move || htmd::convert(&html))
+            .await
+            .map_err(|e| format!("html_to_markdown: {e}")),
     ))
 }
 
@@ -135,9 +138,48 @@ mod tests {
 
     const LATIN1_TEXT: &[u8] = b"caf\xe9 cr\xe8me";
     const LOSSY_TEXT: &str = "caf\u{fffd} cr\u{fffd}me";
+    const LARGE_DOCUMENT_PARAGRAPHS: usize = 20_000;
+    const LARGE_DOCUMENT_HEADING: &str = "Large document";
+    const LARGE_DOCUMENT_LAST_PARAGRAPH: &str = "The last paragraph of the document.";
+    const INVALID_UTF8_HTML: &[u8] = b"<p>caf\xe9</p>";
+    const INVALID_UTF8_ERR: &str = "invalid utf-8";
 
     fn text_table(lua: &Lua) -> Table {
         create_text_table(lua).unwrap()
+    }
+
+    fn call_html_to_markdown(lua: &Lua, html: &[u8]) -> Pair<String> {
+        let table = text_table(lua);
+        let html_to_markdown: Function = table.get("html_to_markdown").unwrap();
+        smol::block_on(html_to_markdown.call_async(lua.create_string(html).unwrap())).unwrap()
+    }
+
+    #[test]
+    fn html_to_markdown_converts_a_large_document() {
+        let lua = Lua::new();
+        let mut html = format!("<h1>{LARGE_DOCUMENT_HEADING}</h1>");
+        for i in 0..LARGE_DOCUMENT_PARAGRAPHS {
+            html.push_str(&format!("<p>Paragraph {i} of the large document.</p>"));
+        }
+        html.push_str(&format!("<p>{LARGE_DOCUMENT_LAST_PARAGRAPH}</p>"));
+
+        let (markdown, err) = call_html_to_markdown(&lua, html.as_bytes());
+        assert!(err.is_none(), "got: {err:?}");
+        let markdown = markdown.unwrap();
+        assert!(markdown.starts_with(&format!("# {LARGE_DOCUMENT_HEADING}")));
+        assert!(markdown.contains(LARGE_DOCUMENT_LAST_PARAGRAPH));
+        assert!(markdown.contains(&format!(
+            "Paragraph {} of the large document.",
+            LARGE_DOCUMENT_PARAGRAPHS - 1
+        )));
+    }
+
+    #[test]
+    fn html_to_markdown_reports_an_error_pair_for_unconvertible_input() {
+        let lua = Lua::new();
+        let (markdown, err) = call_html_to_markdown(&lua, INVALID_UTF8_HTML);
+        assert!(markdown.is_none());
+        assert!(err.unwrap().contains(INVALID_UTF8_ERR));
     }
 
     #[test_case(b"caf\xc3\xa9", "caf\u{e9}" ; "valid_utf8_is_unchanged")]
