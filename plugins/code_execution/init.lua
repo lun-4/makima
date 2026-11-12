@@ -256,6 +256,7 @@ local function start(input, ctx)
 end
 
 local function handler(input, ctx)
+  local started_at = os.time()
   local timeout = input.timeout or opts.timeout_secs
 
   local buf, view, highlight = build_body(ctx, input.code)
@@ -278,7 +279,7 @@ local function handler(input, ctx)
   local max_lines, max_bytes = output_limits.resolve(opts, ctx)
 
   local function cut(reason)
-    return partial.cut(view, table.concat(output_parts, "\n"), reason, timeout, {
+    return partial.cut(view, table.concat(output_parts, "\n"), reason, timeout, started_at, {
       preview = "head_tail",
       max_lines = max_lines,
       max_bytes = max_bytes,

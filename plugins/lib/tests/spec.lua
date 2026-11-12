@@ -1573,6 +1573,38 @@ case("text_input_click_clamps_to_prefix_and_row_end", function()
   eq(input.col, #"é", "zero-width combining mark stays with its character")
 end)
 
+local function partial_view()
+  local view = { painted = {}, finished = false }
+  function view:append(lines)
+    self.painted[#self.painted + 1] = lines
+  end
+  function view:clear()
+    self.painted = {}
+  end
+  function view:finish()
+    self.finished = true
+  end
+  return view
+end
+
+case("partial_cut_reports_elapsed_before_cut", function()
+  local partial = require("makima.partial")
+  local view = partial_view()
+  local reply = partial.cut(view, "half", "cancelled", 10, os.time() - 12, { max_lines = 0 })
+  local marker = reply.output_limits.trailer
+  assert(marker:match("^%[cancelled by user after %d+s, output above is partial%]$"), marker)
+  eq(view.painted[#view.painted][1][1], marker, "the marker is painted")
+  assert(view.finished, "the view is closed")
+end)
+
+case("partial_cut_timeout_marker_keeps_budget", function()
+  local partial = require("makima.partial")
+  local view = partial_view()
+  local reply = partial.cut(view, "", "timeout", 30, os.time(), {})
+  eq(reply.output_limits.trailer, "[timed out after 30s, no output before the cut]")
+  eq(#view.painted, 1, "an empty cut drops the placeholder and paints the marker")
+end)
+
 case("list_picker_clicks_filter_caret_and_respects_section_rows", function()
   local ListPicker = require("makima.list_picker")
   local original_buf, original_win = makima.ui.buf, makima.ui.open_win
