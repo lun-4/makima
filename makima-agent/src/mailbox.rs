@@ -140,30 +140,49 @@ impl SessionMailbox {
     /// mailbox, which owns the work until it ends.
     pub fn move_call(&self, id: &str) -> Result<(), BackgroundMoveError> {
         let scope = {
-            let state = lock(&self.state);
-            state
-                .calls
-                .iter()
-                .find(|entry| entry.scope.id() == id && !entry.moved && !entry.finished)
-                .map(|entry| Arc::clone(&entry.scope))
-                .ok_or(BackgroundMoveError::NothingRunning)?
+            let mut state = lock(&self.state);
+            let scope = {
+                let entry = state
+                    .calls
+                    .iter_mut()
+                    .find(|entry| entry.scope.id() == id && !entry.moved && !entry.finished)
+                    .ok_or(BackgroundMoveError::NothingRunning)?;
+                entry.moved = true;
+                Arc::clone(&entry.scope)
+            };
+            // Track before the move signal goes out: dispatch can settle a
+            // fast call before this function stores the trigger.
+            track_locked(&mut state, id);
+            scope
         };
         let trigger = match scope.move_home() {
             Ok(trigger) => trigger,
-            Err(MoveError::AlreadyMoved) if scope.is_moved() => {
-                self.track_receipt(id);
-                return Ok(());
+            Err(MoveError::AlreadyMoved) if scope.is_moved() => return Ok(()),
+            Err(MoveError::AlreadyMoved) => {
+                self.unmark_call(id);
+                return Err(MoveError::Cancelled.into());
             }
-            Err(MoveError::AlreadyMoved) => return Err(MoveError::Cancelled.into()),
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                self.unmark_call(id);
+                return Err(error.into());
+            }
         };
         let mut state = lock(&self.state);
         if let Some(entry) = state.calls.iter_mut().find(|entry| entry.scope.id() == id) {
-            entry.moved = true;
             entry.trigger = Some(trigger);
         }
-        track_locked(&mut state, id);
         Ok(())
+    }
+
+    /// A move that never happened leaves no receipt behind.
+    fn unmark_call(&self, id: &str) {
+        let mut state = lock(&self.state);
+        state.outstanding.retain(|known| known != id);
+        if let Some(entry) = state.calls.iter_mut().find(|entry| entry.scope.id() == id)
+            && entry.trigger.is_none()
+        {
+            entry.moved = false;
+        }
     }
 
     /// Moves the most recently started running call, which is the one the
@@ -189,11 +208,6 @@ impl SessionMailbox {
 
     pub fn move_latest(&self) -> Result<String, BackgroundMoveError> {
         self.move_latest_for(None)
-    }
-
-    /// The model now waits on this call's receipt.
-    fn track_receipt(&self, id: &str) {
-        track_locked(&mut lock(&self.state), id);
     }
 
     /// The receipt never went out, so the model does not wait on it.

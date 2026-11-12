@@ -4816,13 +4816,21 @@ mod tests {
             let event_tx = crate::EventSender::new(event_tx);
             let (started_tx, started_rx) = flume::bounded(1);
             let (_release_tx, release_rx) = flume::bounded(1);
-            let mut ctx = slow_tool_ctx(&event_tx, mailbox.session_id(), started_tx, release_rx);
+            let mut ctx = slow_tool_ctx(
+                &event_tx,
+                mailbox.session_id(),
+                started_tx.clone(),
+                release_rx,
+            );
             let (panic_tx, panic_rx) = flume::bounded(1);
+            let started = started_tx.clone();
             ctx.local_tools = Arc::new(HashMap::from([(
                 SLOW_TOOL.to_owned(),
                 local_tool(ToolAudience::all(), move |_, _| {
+                    let started = started.clone();
                     let panic = panic_rx.clone();
                     Box::pin(async move {
+                        let _ = started.send(());
                         let _ = panic.recv_async().await;
                         panic!("tool blew up");
                     })
@@ -4833,8 +4841,7 @@ mod tests {
             let mover = {
                 let mailbox = mailbox.clone();
                 smol::spawn(async move {
-                    smol::Timer::after(Duration::from_millis(20)).await;
-                    let _ = started_rx.try_recv();
+                    started_rx.recv_async().await.unwrap();
                     mailbox.move_latest().unwrap();
                 })
             };
