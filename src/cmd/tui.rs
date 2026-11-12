@@ -11,7 +11,7 @@ use crossterm::style::Stylize;
 use makima_agent::command::{self, CustomCommand};
 use makima_agent::tools::ToolRegistry;
 use makima_config::project::{self, ProjectDecision, TrustAnswer, policy_grant};
-use makima_config::{Config, ModelPolicy, ProjectConfig, load_env_files, load_permissions};
+use makima_config::{Config, ModelPolicy, ProjectConfig, load_env_files};
 use makima_lua::PluginHost;
 use makima_lua::ui_sink::{HeadlessUi, HostUi};
 use makima_providers::model::{Model, ModelTier};
@@ -22,7 +22,8 @@ use makima_storage::session_lock;
 use makima_storage::sessions::SESSIONS_DIR;
 use makima_ui::{AppSession, RunOutcome};
 
-use crate::cli::{Cli, normalize_tool_name};
+use super::load_config;
+use crate::cli::Cli;
 use crate::setup;
 
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
@@ -88,46 +89,6 @@ fn discover_commands(disable: bool, cwd: &Path, project: &ProjectConfig) -> Vec<
         return Vec::new();
     }
     command::discover_commands(cwd, project)
-}
-
-fn load_config(
-    plugin_host: &PluginHost,
-    cli: &Cli,
-    project_config: &ProjectConfig,
-    warnings: &mut Vec<String>,
-) -> Result<Config> {
-    let raw_config = plugin_host
-        .load_init_files_or_skip(cli.no_plugins, project_config, warnings)
-        .context("load init.lua files")?;
-
-    let mut config = raw_config
-        .unwrap_or_default()
-        .into_config()
-        .context("invalid config")?;
-    makima_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
-    config.permissions = load_permissions(project_config)?;
-
-    if cli.yolo || config.always_yolo {
-        config.permissions.yolo = true;
-    }
-    let automode_on = cli.automode || config.always_automode;
-    super::seed_automode(&mut config, automode_on);
-    if !cli.allowed_tools.is_empty() {
-        config.agent.allowed_tools = cli
-            .allowed_tools
-            .iter()
-            .map(|t| normalize_tool_name(t))
-            .collect::<Result<Vec<_>>>()?;
-    }
-    if !cli.disallowed_tools.is_empty() {
-        config.agent.disabled_tools.extend(
-            cli.disallowed_tools
-                .iter()
-                .filter_map(|t| normalize_tool_name(t).ok()),
-        );
-    }
-    config.validate()?;
-    Ok(config)
 }
 
 fn config_or_fallback(

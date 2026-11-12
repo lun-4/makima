@@ -88,7 +88,7 @@ Inbound messages (`user`, `control_request`, `control_response`, `control_cancel
 
 A `user` message sent while a turn runs joins that turn, as typing does in the TUI (see [messages and turns](/docs/agent-work/#messages-and-turns)), and the turn's one `result` covers both. A message that cannot join, for example after a model switch, runs as the next turn and gets its own `result`. While `/compact` or `/btw` runs, a new message is rejected. A plugin command whose handler runs turns also gets one `result`: the reply of the last turn it ran, the same text print prints for it.
 
-SDK-only flags (`--max-turns`, `--session-id`, `--fork-session`, `--permission-mode`, `--include-partial-messages`, ...) are listed in the [CLI flag matrix](/docs/cli/#flags-by-run-path). `--system-prompt` / `--append-system-prompt` apply in every run path.
+SDK-only flags (`--session-id`, `--fork-session`, `--permission-mode`, `--include-partial-messages`, ...) are listed in the [CLI flag matrix](/docs/cli/#flags-by-run-path). `--system-prompt` / `--append-system-prompt` apply in every run path.
 
 One caveat: one-shot `--print` always starts a **new** session in **build** mode and does not save it. Model, mode and directory changes made during the run apply to it, but session resume needs the SDK path (or the TUI). It saves no preferences either: `/thinking high` sets the level for the run, not the saved default for new sessions. Before the first turn it waits a few seconds at most for its own provider's model list, so the run uses the discovered context window; other providers are listed in the background.
 

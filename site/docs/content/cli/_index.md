@@ -32,9 +32,12 @@ Pass a prompt with `-p` / `--prompt`, or pipe it on stdin. With both, stdin foll
 | `--image` | no (use Ctrl+V paste) | yes | via wire protocol |
 | `--verbose`, `--output-format` | no | yes | stream only |
 | `--system-prompt`, `--append-system-prompt` | yes | yes | yes |
-| `--max-turns`, `--session-id`, `--fork-session` | no | no | yes |
+| `--session-id`, `--fork-session` | no | no | yes |
+| `--max-turns` | no | yes | yes |
 | `--permission-mode` | no | no | yes |
 | `--include-partial-messages` | no | no | yes |
+
+ACP applies the global flags too, so `makima --allowed-tools read,grep --yolo acp` covers every ACP session. `--max-turns` does not apply there: an ACP server outlives one run. See [ACP](/docs/acp/).
 
 ### Shared flags (detail)
 
@@ -61,7 +64,7 @@ Pass a prompt with `-p` / `--prompt`, or pipe it on stdin. With both, stdin foll
 | `--disallowed-tools <LIST>` | Comma-separated deny list |
 | `--session-id <ID>` | Session id for SDK mode |
 | `--fork-session` | Load a session's history under a new id (SDK) |
-| `--max-turns <N>` | Cap agent turns (SDK) |
+| `--max-turns <N>` | Cap agent turns (`--print` and SDK) |
 | `--system-prompt <TEXT>` | Replace the system prompt entirely |
 | `--append-system-prompt <TEXT>` | Append to the built-in system prompt |
 | `--permission-mode <MODE>` | SDK: `default`, `acceptEdits`, `plan`, or `bypassPermissions` |
@@ -69,7 +72,7 @@ Pass a prompt with `-p` / `--prompt`, or pipe it on stdin. With both, stdin foll
 
 ### Tool name lists
 
-`--allowed-tools` / `--disallowed-tools` accept Claude Code PascalCase (`Read,Edit,Bash`) or snake_case (`read,edit,bash`). Makima lowercases PascalCase to snake_case and checks the result against the built-in tool names, so `CodeExecution` works but `MultiEdit` errors: it normalizes to `multi_edit`, and the tool is called `multiedit`. Write `multiedit` or `edit_lines` as-is. Unknown names error out with the list of valid names. The opt-in edit tools (`edit_lines`, `insert_lines`, `multiedit`) are always valid names here, even while disabled; listing one does nothing until you enable the tool in config.
+`--allowed-tools` / `--disallowed-tools` accept Claude Code PascalCase (`Read,Edit,Bash`) or snake_case (`read,edit,bash`). Makima lowercases PascalCase to snake_case and checks the result against the built-in tool names, so `CodeExecution` works but `MultiEdit` errors: it normalizes to `multi_edit`, and the tool is called `multiedit`. Write `multiedit` or `edit_lines` as-is. Unknown names in `--allowed-tools` error out with the list of valid names; `--disallowed-tools` skips them. The opt-in edit tools (`edit_lines`, `insert_lines`, `multiedit`) are always valid names here, even while disabled; listing one does nothing until you enable the tool in config.
 
 ### Permission modes (SDK)
 
