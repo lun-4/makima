@@ -7,16 +7,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use makima_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Value as LuaValue};
 
-pub(crate) fn bytes_arg(val: &LuaValue, what: &str) -> LuaResult<Vec<u8>> {
-    match val {
-        LuaValue::String(s) => Ok(s.as_bytes().to_vec()),
-        LuaValue::Buffer(b) => Ok(b.to_vec()),
-        _ => Err(mlua::Error::runtime(format!(
-            "{what}: expected string or buffer, got {}",
-            val.type_name()
-        ))),
-    }
-}
+use crate::api::util::convert::bytes_arg;
 
 /// Encode {data} to standard Base64. Like `vim.base64.encode`.
 /// Accepts both strings and Luau buffers.

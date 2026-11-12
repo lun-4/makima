@@ -5,7 +5,7 @@ use makima_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, String as LuaString, Value as LuaValue};
 use sha2::{Digest, Sha256};
 
-use crate::api::base64::bytes_arg;
+use crate::api::util::convert::bytes_arg;
 
 /// SHA-256 digest of {data}, as 32 raw bytes.
 ///

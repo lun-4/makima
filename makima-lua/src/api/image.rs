@@ -10,7 +10,7 @@ use image::{DynamicImage, ImageFormat, ImageReader};
 use makima_lua_macro::{lua_class, lua_fn, lua_table};
 use mlua::{AnyUserData, Lua, Result as LuaResult, Table, Value as LuaValue};
 
-use super::base64::bytes_arg;
+use super::util::convert::bytes_arg;
 use super::util::pair::{Pair, try_pair};
 
 /// Decode-bomb guard: a tiny file can declare huge dimensions and balloon

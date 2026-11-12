@@ -20,6 +20,17 @@ pub(crate) fn opt_bool(tbl: &Table, key: &str) -> Option<bool> {
     tbl.get::<Option<bool>>(key).ok().flatten()
 }
 
+pub(crate) fn bytes_arg(val: &Value, what: &str) -> LuaResult<Vec<u8>> {
+    match val {
+        Value::String(s) => Ok(s.as_bytes().to_vec()),
+        Value::Buffer(b) => Ok(b.to_vec()),
+        _ => Err(mlua::Error::runtime(format!(
+            "{what}: expected string or buffer, got {}",
+            val.type_name()
+        ))),
+    }
+}
+
 pub(crate) fn lua_tool_result(values: mlua::MultiValue) -> Result<String, String> {
     let mut iter = values.into_iter();
     match iter.next() {
