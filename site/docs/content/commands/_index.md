@@ -70,7 +70,7 @@ Completion callbacks receive the typed argument name as `ctx.argument`, its type
 
 ## Sessions
 
-Sessions run concurrently. `/new` starts a fresh session while the old one keeps working in the background, and `/sessions` shows the live status of each (working, needs input, idle) so you can jump between them. The picker lists this directory's sessions; a session open in another terminal is greyed out and cannot be opened from here. When a background session finishes or needs input, Makima flashes a note in the status bar. `/rename` renames the current session; in the session picker, `Ctrl+N` / `Ctrl+R` / `Ctrl+D` create, rename, and delete.
+Sessions run concurrently. `/new` starts a fresh session while the old one keeps working in the background, and `/sessions` shows the live status of each (working, needs input, idle) so you can jump between them. The picker lists this directory's sessions; a session open in another terminal is greyed out and cannot be opened from here. When a background session finishes or needs input, Makima flashes a note in the status bar. `/rename` renames the current session; in the session picker, `Ctrl+N` / `Ctrl+R` / `Ctrl+D` create, rename, and delete. Deleting the current session moves you to another one and keeps the picker open.
 
 ## Modes and toggles
 

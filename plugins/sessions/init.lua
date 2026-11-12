@@ -11,7 +11,6 @@ local Helpers = require("sessions_helpers")
 local FILTER_PREFIX = "❯ "
 local RENAME_PREFIX = "Rename: "
 local CONFIRM_HINT = "  Ctrl+D again to delete"
-local DELETE_FOCUSED_HINT = "Cannot delete the current session"
 local RENAME_USAGE = "Usage: /rename <title>"
 local EMPTY_HINT = "  No sessions yet. Press Ctrl+N to start one."
 local NO_MATCHES_HINT = "  No matches"
@@ -36,6 +35,9 @@ local RENAME_KEYS = {
 }
 
 local board = nil
+-- Filter text staged when the picker deletes the session hosting its own
+-- window; open() relaunches right away with it.
+local reopen_filter = nil
 
 local function icon_of(s)
   if s.status == "needs_input" then
@@ -342,13 +344,21 @@ local function open_blank()
   close()
 end
 
+-- The picker window belongs to the focused session's App, so deleting the
+-- current session destroys it. Close it deliberately; open() relaunches with
+-- the same filter once the host has focused another session.
+local function delete_current(s)
+  reopen_filter = board.input:value()
+  close()
+  local _, err = makima.session.delete(s.id)
+  if err then
+    makima.ui.flash(err)
+  end
+end
+
 local function delete_selected()
   local s = selected()
   if not s then
-    return
-  end
-  if s.focused then
-    makima.ui.flash(DELETE_FOCUSED_HINT)
     return
   end
   if board.confirm ~= s.id then
@@ -357,6 +367,10 @@ local function delete_selected()
     return
   end
   board.confirm = nil
+  if s.focused then
+    delete_current(s)
+    return
+  end
   local _, err = makima.session.delete(s.id)
   if err then
     makima.ui.flash(err)
@@ -465,7 +479,7 @@ local function handle_key(key)
   end
 end
 
-local function open(query)
+local function open_picker(filter)
   if board then
     return
   end
@@ -487,7 +501,6 @@ local function open(query)
     reserved = 2,
     input = TextInput.new(),
     all = {},
-    query = query or "",
     items = {},
     rank = {},
     deleted = {},
@@ -496,8 +509,8 @@ local function open(query)
     sel_id = nil,
     loading = true,
   }
-  if query and query ~= "" then
-    board.input:insert_text(query)
+  if filter and filter ~= "" then
+    board.input:insert_text(filter)
   end
   -- Two-phase load: live sessions are cheap, so they show up and take keys
   -- right away; the stored scan can be slow, so a background task merges it
@@ -569,6 +582,16 @@ local function open(query)
       render()
     end
   end
+end
+
+-- Deleting the current session destroys this window, so relaunch with the
+-- staged filter instead of making the user reopen the picker by hand.
+local function open(query)
+  local filter = query
+  repeat
+    open_picker(filter)
+    filter, reopen_filter = reopen_filter, nil
+  until filter == nil
 end
 
 -- A background agent flipping state deserves a heads-up even with the picker

@@ -130,7 +130,6 @@ const SESSION_OP_TIMEOUT: Duration = Duration::from_secs(30);
 const SESSION_OP_TIMEOUT_ERR: &str = "session operation timed out";
 const CONFIG_EXPIRED_ERR: &str = "configuration preparation expired";
 const UNSUPPORTED_AGENT_OPTION_PREFIX: &str = "unsupported agent option";
-const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
 const PROVIDER_USAGE_CHANGED_ERR: &str = "provider changed while fetching usage";
 const PROVIDER_USAGE_SHUTDOWN_ERR: &str = "UI shut down while fetching usage";
 const NOT_LIVE_ERR: &str = "session not live";
@@ -3097,11 +3096,19 @@ impl<'t> EventLoop<'t> {
                         return;
                     }
                 };
-                let mut runtime = if let Some(i) = self.position(id) {
-                    if i == self.focused {
-                        let _ = reply_tx.send(Err(DELETE_FOCUSED_ERR.into()));
-                        return;
+                let replacement = match self.position(id) {
+                    Some(i) if i == self.focused && self.sessions.len() == 1 => {
+                        match self.spawn_blank_runtime() {
+                            Ok(runtime) => Some(runtime),
+                            Err(error) => {
+                                let _ = reply_tx.send(Err(error.to_string()));
+                                return;
+                            }
+                        }
                     }
+                    _ => None,
+                };
+                let mut runtime = if let Some(i) = self.position(id) {
                     let session_lock = self.sessions[i].session_lock.take();
                     let mut runtime = self.remove_runtime(i);
                     runtime.session_lock = session_lock;
@@ -3109,6 +3116,9 @@ impl<'t> EventLoop<'t> {
                 } else {
                     None
                 };
+                if let Some(replacement) = replacement {
+                    self.push_runtime(replacement);
+                }
                 let store = runtime
                     .as_ref()
                     .and_then(|rt| rt.handles.offload.as_ref())
@@ -3192,12 +3202,7 @@ impl<'t> EventLoop<'t> {
                 let _ = reply_tx.send(reply);
             }
             SessionRequest::New { prompt, focus } => {
-                let (session, provider) =
-                    new_session_from_slot(self.focused_model_slot(), &self.session_cwd);
-                let mut runtime = match self
-                    .ctx
-                    .spawn_runtime_with_provider(session, Some(provider))
-                {
+                let mut runtime = match self.spawn_blank_runtime() {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         let _ = reply_tx.send(Err(error.to_string()));
@@ -3283,17 +3288,20 @@ impl<'t> EventLoop<'t> {
         serde_json::to_value(snapshot).unwrap_or_default()
     }
 
-    /// The single place that removes a runtime: keeps `focused` pointing at
-    /// the same session afterwards. The focused runtime itself is never
-    /// removable, so `sessions` stays non-empty.
+    /// The single place that removes a runtime: keeps `focused` on the same
+    /// session when an earlier one goes, and moves it to the next session, or
+    /// the previous one, when the focused session goes. A caller deleting the
+    /// last runtime pushes its replacement first, so `sessions` stays
+    /// non-empty.
     fn remove_runtime(&mut self, idx: usize) -> SessionRuntime {
-        debug_assert_ne!(idx, self.focused);
         let mut rt = self.sessions.remove(idx);
         if let Err(error) = release_lock_state(rt.session_lock.take()) {
             warn!(id = %rt.id(), %error, "session lock release failed");
         }
         if idx < self.focused {
             self.focused -= 1;
+        } else if idx == self.focused {
+            self.focused = idx.min(self.sessions.len().saturating_sub(1));
         }
         rt
     }
@@ -3342,6 +3350,13 @@ impl<'t> EventLoop<'t> {
             let _ = reply.send(Err(error));
         })
         .detach();
+    }
+
+    fn spawn_blank_runtime(&self) -> Result<SessionRuntime> {
+        let (session, provider) =
+            new_session_from_slot(self.focused_model_slot(), &self.session_cwd);
+        self.ctx
+            .spawn_runtime_with_provider(session, Some(provider))
     }
 
     fn push_runtime(&mut self, rt: SessionRuntime) -> usize {
@@ -6613,6 +6628,58 @@ mod tests {
                 assert!(!dir.exists());
             }
             assert!(matches!(store.put(BODY), Err(OffloadError::Closed)));
+        });
+    }
+
+    #[test_case(false; "last_session")]
+    #[test_case(true; "next_session")]
+    fn deleting_the_focused_session_leaves_a_live_session(next: bool) {
+        with_event_loop(|event_loop| {
+            let original = event_loop.sessions[0].id();
+            if next {
+                let mut session = AppSession::new("test-model", &event_loop.session_cwd);
+                session.save(&event_loop.ctx.storage).unwrap();
+                let runtime = event_loop.ctx.spawn_runtime(session).unwrap();
+                let idx = event_loop.push_runtime(runtime);
+                event_loop.set_focused(idx);
+            }
+            let id = event_loop.sessions[event_loop.focused].id();
+            let mut stored = Arc::unwrap_or_clone(Arc::clone(
+                &event_loop.sessions[event_loop.focused].app.state.session,
+            ));
+            stored.save(&event_loop.ctx.storage).unwrap();
+
+            let (reply_tx, reply_rx) = flume::bounded(1);
+            event_loop
+                .handle_session_request(SessionRequest::Delete { id: id.to_string() }, reply_tx);
+            assert_eq!(
+                reply_rx.recv_timeout(PUMP_TIMEOUT).unwrap(),
+                Ok(json!(true))
+            );
+
+            assert_eq!(event_loop.sessions.len(), 1);
+            let live_id = event_loop.sessions[event_loop.focused].id();
+            assert_ne!(live_id, id);
+            if next {
+                assert_eq!(live_id, original);
+            }
+
+            let (live_tx, live_rx) = flume::bounded(1);
+            event_loop.handle_session_request(SessionRequest::Live, live_tx);
+            let rows = live_rx.recv_timeout(PUMP_TIMEOUT).unwrap().unwrap();
+            let rows = rows.as_array().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["id"], json!(live_id.to_string()));
+            assert_eq!(rows[0]["focused"], json!(true));
+
+            assert!(matches!(
+                AppSession::load(id, &event_loop.ctx.storage),
+                Err(SessionError::Storage(StorageError::NotFound(_)))
+            ));
+            let lease = session_lock::claim(&event_loop.ctx.sessions_dir, &id)
+                .unwrap()
+                .expect("deleted session lock released");
+            lease.release().unwrap();
         });
     }
 
