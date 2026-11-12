@@ -25,6 +25,7 @@ const DEFAULT_MAX_BYTES: usize = 5 * 1024 * 1024;
 const MAX_RETRIES: u32 = 3;
 const MAX_REDIRECTS: u32 = 10;
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const USER_AGENT_HEADER: &str = "user-agent";
 const CF_MITIGATED: &str = "cf-mitigated";
 const CF_CHALLENGE: &str = "challenge";
 const FALLBACK_USER_AGENT: &str = APP_NAME;
@@ -330,10 +331,14 @@ fn build_request(
     headers: &[(String, String)],
     body: Vec<u8>,
 ) -> Result<Request<AsyncBody>, String> {
-    let mut builder = Request::builder()
-        .method(method)
-        .uri(url)
-        .header("User-Agent", user_agent);
+    let mut builder = Request::builder().method(method).uri(url);
+
+    if !headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case(USER_AGENT_HEADER))
+    {
+        builder = builder.header(USER_AGENT_HEADER, user_agent);
+    }
 
     for (k, v) in headers {
         builder = builder.header(k.as_str(), v.as_str());
@@ -725,6 +730,25 @@ mod tests {
     const AUTH_VALUE: &str = "Bearer tok";
     const ACCEPT_HEADER: &str = "Accept";
     const ACCEPT_VALUE: &str = "text/html";
+    const CALLER_USER_AGENT: &str = "caller-agent/1.0";
+
+    #[test_case(&[], USER_AGENT ; "default_user_agent")]
+    #[test_case(&[("User-Agent", CALLER_USER_AGENT)], CALLER_USER_AGENT ; "exact_case_caller_header_wins")]
+    #[test_case(&[("user-agent", CALLER_USER_AGENT)], CALLER_USER_AGENT ; "lowercase_caller_header_wins")]
+    fn build_request_sends_one_user_agent(headers: &[(&str, &str)], expected: &str) {
+        let headers: Vec<(String, String)> = headers
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        let request = build_request(PUBLIC_URL, USER_AGENT, "GET", &headers, Vec::new()).unwrap();
+        let sent: Vec<&str> = request
+            .headers()
+            .get_all(USER_AGENT_HEADER)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(sent, [expected]);
+    }
 
     #[test]
     fn fallback_user_agent_uses_app_name() {
