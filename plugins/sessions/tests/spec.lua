@@ -386,7 +386,7 @@ local function picker(events, query, opts)
   end
   local function session_live()
     live_calls = live_calls + 1
-    return {}
+    return opts.live or {}
   end
   local function session_list()
     list_calls = list_calls + 1
@@ -404,6 +404,14 @@ local function picker(events, query, opts)
   end
   makima.session.delete = function(id)
     deleted = id
+    for _, list in ipairs({ opts.live or {}, opts.rows or {} }) do
+      for i, row in ipairs(list) do
+        if row.id == id then
+          table.remove(list, i)
+          break
+        end
+      end
+    end
     return true
   end
   makima.ui.flash = function() end
@@ -543,6 +551,28 @@ case("clicking_delete_confirmation_deletes_instead_of_opening", function()
   }, "first")
   eq(focused, nil)
   eq(deleted, "one")
+end)
+
+case("deleting_the_focused_session_reopens_the_picker_without_it", function()
+  local focused, _, closed, deleted, probe = picker(
+    {
+      { type = "key", key = "ctrl+d" },
+      { type = "key", key = "ctrl+d" },
+      { type = "close" },
+    },
+    "fi",
+    {
+      live = { live_row({ id = "one", title = "first" }) },
+      rows = { stored_row({ id = "one", title = "first" }), stored_row({ id = "two", title = "second" }) },
+    }
+  )
+  eq(focused, nil)
+  eq(deleted, "one")
+  eq(closed, true)
+  local last = all_text(probe.snapshots[#probe.snapshots])
+  assert(last:find("fi", 1, true), "the reopened picker keeps the filter")
+  assert(not last:find("first", 1, true), "the deleted session is gone")
+  assert(not last:find("second", 1, true), "the filter still applies")
 end)
 
 case("right_preserves_current_and_open_labels", function()
