@@ -1,5 +1,5 @@
 use makima_lua_macro::{lua_fn, lua_table};
-use mlua::{Lua, Result as LuaResult, Value};
+use mlua::{Lua, Result as LuaResult, String as LuaString, Value};
 
 use makima_agent::tools::offload;
 use makima_agent::tools::{
@@ -23,6 +23,25 @@ fn html_to_markdown(_lua: &Lua, html: String) -> LuaResult<Pair<String>> {
     Ok(pair(
         htmd::convert(&html).map_err(|e| format!("html_to_markdown: {e}")),
     ))
+}
+
+/// Return {s} as valid UTF-8, with every invalid byte sequence replaced by
+/// U+FFFD. Lua strings are bytes, and `makima.net` and `makima.fs` hand them
+/// over as-is, so decode before measuring or cutting a body as text. An
+/// invalid byte can grow to 3 bytes, so a cut made before decoding can triple
+/// in size.
+///
+/// @param s string Bytes to decode.
+/// @return (string) Valid UTF-8 text, `s` itself when it already is.
+/// @example
+/// local resp = makima.net.request(url)
+/// local text = makima.text.to_utf8(resp.body)
+#[lua_fn]
+fn to_utf8(lua: &Lua, s: LuaString) -> LuaResult<LuaString> {
+    if s.to_str().is_ok() {
+        return Ok(s);
+    }
+    lua.create_string(s.to_string_lossy())
 }
 
 /// Truncate one line while preserving a UTF-8 boundary and ending it with
@@ -96,12 +115,38 @@ lua_table! {
     ///
     /// ```lua
     /// local md = makima.text.html_to_markdown(html)
+    /// local text = makima.text.to_utf8(bytes)
     /// ```
     "makima.text" => pub(crate) fn create_text_table(), DOCS [
         html_to_markdown,
+        to_utf8,
         truncate_line,
         truncate_file,
         truncation_marker,
         is_offload_notice,
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlua::{Function, Table};
+    use test_case::test_case;
+
+    const LATIN1_TEXT: &[u8] = b"caf\xe9 cr\xe8me";
+    const LOSSY_TEXT: &str = "caf\u{fffd} cr\u{fffd}me";
+
+    fn text_table(lua: &Lua) -> Table {
+        create_text_table(lua).unwrap()
+    }
+
+    #[test_case(b"caf\xc3\xa9", "caf\u{e9}" ; "valid_utf8_is_unchanged")]
+    #[test_case(LATIN1_TEXT, LOSSY_TEXT ; "invalid_bytes_become_replacement_chars")]
+    fn to_utf8_decodes_lossily(input: &[u8], expected: &str) {
+        let lua = Lua::new();
+        let table = text_table(&lua);
+        let to_utf8: Function = table.get("to_utf8").unwrap();
+        let decoded: LuaString = to_utf8.call(lua.create_string(input).unwrap()).unwrap();
+        assert_eq!(decoded.to_str().unwrap(), expected);
+    }
 }

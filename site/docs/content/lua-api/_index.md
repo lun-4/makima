@@ -3407,7 +3407,7 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{path}` (`string`) Destination file path. `~/` is expanded.
-- `{content}` (`string`) Text to write.
+- `{content}` (`string|buffer`) Bytes to write.
 
 **Returns:** (`true?`, `string?`) `true` on success, or nil plus an error message.
 
@@ -3435,7 +3435,7 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{path}` (`string`) Destination file path. `~/` is expanded.
-- `{content}` (`string`) Text to write.
+- `{content}` (`string|buffer`) Bytes to write.
 
 **Returns:** (`true?`, `string?`) `true` on success, or nil plus an error message.
 
@@ -4384,13 +4384,14 @@ listed in `net.allowed_private_hosts`.
 {opts} fields:
   `method` (string) HTTP verb (default `"GET"`).
   `headers` (table) Header name/value pairs.
-  `body` (string) Request body.
+  `body` (string|buffer) Request body, sent as is.
   `timeout` (integer) Timeout in seconds, max 120 (default 30).
   `max_bytes` (integer) Max response size in bytes (default 5 MB).
   `retry` (integer) Retries on 5xx errors (default 3).
 
 The response table has three fields: `body` (string), `status`
-(integer), and `content_type` (string).
+(integer), and `content_type` (string). `body` holds the raw bytes,
+so a binary download can go straight to `makima.fs.write`.
 
 Requires the `net` [plugin permission](#plugin-permissions).
 
@@ -5207,6 +5208,7 @@ Helper functions for converting between text formats.
 
 ```lua
 local md = makima.text.html_to_markdown(html)
+local text = makima.text.to_utf8(bytes)
 ```
 
 ---
@@ -5232,6 +5234,33 @@ Useful for cleaning up web content fetched with `makima.webfetch`.
 local md, err = makima.text.html_to_markdown("<h1>Hello</h1><p>world</p>")
 if err then return end
 print(md) -- "# Hello\n\nworld"
+```
+
+---
+
+### `makima.text.to_utf8()` {#makima-text-to_utf8}
+
+```lua
+makima.text.to_utf8({s})
+```
+
+Return {s} as valid UTF-8, with every invalid byte sequence replaced by
+U+FFFD. Lua strings are bytes, and `makima.net` and `makima.fs` hand them
+over as-is, so decode before measuring or cutting a body as text. An
+invalid byte can grow to 3 bytes, so a cut made before decoding can triple
+in size.
+
+**Parameters:**
+
+- `{s}` (`string`) Bytes to decode.
+
+**Returns:** (`string`) Valid UTF-8 text, `s` itself when it already is.
+
+**Example:**
+
+```lua
+local resp = makima.net.request(url)
+local text = makima.text.to_utf8(resp.body)
 ```
 
 ---

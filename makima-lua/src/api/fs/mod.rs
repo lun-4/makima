@@ -19,7 +19,7 @@ use std::time::UNIX_EPOCH;
 use makima_lua_macro::{lua_fn, lua_table};
 use mlua::{Buffer, Lua, Result as LuaResult, Table, Value};
 
-use crate::api::util::convert::opt_bool;
+use crate::api::util::convert::{bytes_arg, opt_bool};
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
 
@@ -452,15 +452,16 @@ async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Tabl
 /// or overwriting it if it does.
 ///
 /// @param path string Destination file path. `~/` is expanded.
-/// @param content string Text to write.
+/// @param content string|buffer Bytes to write.
 /// @return (true?, string?) `true` on success, or nil plus an error message.
 /// @example
 /// local ok, err = makima.fs.write("out.txt", "hello world")
 /// if err then print("write failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
-async fn write(lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
+async fn write(lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>> {
+    let content = bytes_arg(&content, "fs.write")?;
     let abs = make_absolute(&path)?;
-    let result = backend(&lua).write(abs, content.into_bytes()).await;
+    let result = backend(&lua).write(abs, content).await;
     Ok(pair(result.map(|()| true)))
 }
 
@@ -469,15 +470,16 @@ async fn write(lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>>
 /// Existing file permissions are preserved. On Unix, new files use mode 0600.
 ///
 /// @param path string Destination file path. `~/` is expanded.
-/// @param content string Text to write.
+/// @param content string|buffer Bytes to write.
 /// @return (true?, string?) `true` on success, or nil plus an error message.
 /// @example
 /// local ok, err = makima.fs.atomic_write("state.json", encoded)
 /// if err then print("atomic write failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
-async fn atomic_write(lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
+async fn atomic_write(lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>> {
+    let content = bytes_arg(&content, "fs.atomic_write")?;
     let abs = make_absolute(&path)?;
-    let result = backend(&lua).atomic_write(abs, content.into_bytes()).await;
+    let result = backend(&lua).atomic_write(abs, content).await;
     Ok(pair(result.map(|()| true)))
 }
 
@@ -682,6 +684,7 @@ mod tests {
     use test_case::test_case;
 
     const FIRST_CONTENT: &str = "first";
+    const BINARY_CONTENT: &[u8] = b"\0\xff\x80\r\n";
     const REPLACEMENT_CONTENT: &str = "replacement";
     const FS_WRITE_PERMISSION: &str = "fs_write";
 
@@ -957,6 +960,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "second");
+    }
+
+    #[test_case("write" ; "write")]
+    #[test_case("atomic_write" ; "atomic_write")]
+    fn file_writes_preserve_binary_content(method: &str) {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("bytes.bin");
+        std::fs::write(&file, FIRST_CONTENT).unwrap();
+        let lua = Lua::new();
+        let table = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let write: mlua::Function = table.get(method).unwrap();
+        let content = lua.create_buffer(BINARY_CONTENT).unwrap();
+        let (ok, error): (Value, Value) =
+            smol::block_on(write.call_async((file.to_str().unwrap(), content))).unwrap();
+        assert_eq!(ok, Value::Boolean(true));
+        assert_eq!(error, Value::Nil);
+        assert_eq!(std::fs::read(&file).unwrap(), BINARY_CONTENT);
     }
 
     #[test]

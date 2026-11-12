@@ -11,11 +11,12 @@ use isahc::config::{Configurable, RedirectPolicy, ResolveMap, VersionNegotiation
 use isahc::{AsyncBody, HttpClient, Request, Response};
 use makima_lua_macro::{lua_fn, lua_table};
 use makima_storage::paths::APP_NAME;
-use mlua::{Lua, Result as LuaResult, Table};
+use mlua::{Lua, Result as LuaResult, Table, Value};
 use smol::{Timer, unblock};
 use url::Url;
 
 use crate::api::net::send::{send__doc, send__register};
+use crate::api::util::convert::bytes_arg;
 use crate::api::util::pair::{Pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
 
@@ -203,9 +204,19 @@ struct RequestParams {
 }
 
 struct ResponseData {
-    body: String,
+    body: Vec<u8>,
     status: u16,
     content_type: String,
+}
+
+impl ResponseData {
+    fn into_table(self, lua: &Lua) -> LuaResult<Table> {
+        let tbl = lua.create_table()?;
+        tbl.set("body", lua.create_string(self.body)?)?;
+        tbl.set("status", self.status)?;
+        tbl.set("content_type", self.content_type)?;
+        Ok(tbl)
+    }
 }
 
 /// Make an HTTP request and return the response body. Plain `http://`
@@ -216,13 +227,14 @@ struct ResponseData {
 /// {opts} fields:
 ///   `method` (string) HTTP verb (default `"GET"`).
 ///   `headers` (table) Header name/value pairs.
-///   `body` (string) Request body.
+///   `body` (string|buffer) Request body, sent as is.
 ///   `timeout` (integer) Timeout in seconds, max 120 (default 30).
 ///   `max_bytes` (integer) Max response size in bytes (default 5 MB).
 ///   `retry` (integer) Retries on 5xx errors (default 3).
 ///
 /// The response table has three fields: `body` (string), `status`
-/// (integer), and `content_type` (string).
+/// (integer), and `content_type` (string). `body` holds the raw bytes,
+/// so a binary download can go straight to `makima.fs.write`.
 ///
 /// @param url string URL starting with `http://` or `https://`.
 /// @param opts table? Request options (see above).
@@ -238,11 +250,7 @@ struct ResponseData {
 async fn request(lua: Lua, url: String, opts: Option<Table>) -> LuaResult<Pair<Table>> {
     let params = try_pair!(extract_request_params(&url, opts.as_ref()).await);
     let resp = try_pair!(do_request(params).await);
-    let tbl = lua.create_table()?;
-    tbl.set("body", resp.body)?;
-    tbl.set("status", resp.status)?;
-    tbl.set("content_type", resp.content_type)?;
-    Ok((Some(tbl), None))
+    Ok((Some(resp.into_table(&lua)?), None))
 }
 
 lua_table! {
@@ -293,10 +301,13 @@ async fn extract_request_params(url: &str, opts: Option<&Table>) -> Result<Reque
         Vec::new()
     };
 
-    let body = opts
-        .and_then(|o| o.get::<String>("body").ok())
-        .map(|s| s.into_bytes())
-        .unwrap_or_default();
+    let body = match opts.map(|o| o.get::<Option<Value>>("body")) {
+        None | Some(Ok(None)) => Vec::new(),
+        Some(Ok(Some(value))) => {
+            bytes_arg(&value, "net.request body").map_err(|e| e.to_string())?
+        }
+        Some(Err(e)) => return Err(e.to_string()),
+    };
 
     let timeout = Duration::from_secs(
         opts.and_then(|o| o.get::<u64>("timeout").ok())
@@ -494,9 +505,8 @@ async fn do_request(mut params: RequestParams) -> Result<ResponseData, String> {
         return Err(format!("response too large: {} bytes", bytes.len()));
     }
 
-    let body = String::from_utf8_lossy(&bytes).into_owned();
     Ok(ResponseData {
-        body,
+        body: bytes,
         status,
         content_type,
     })
@@ -731,6 +741,9 @@ mod tests {
     const ACCEPT_HEADER: &str = "Accept";
     const ACCEPT_VALUE: &str = "text/html";
     const CALLER_USER_AGENT: &str = "caller-agent/1.0";
+    const BINARY_PAYLOAD: &[u8] = b"before\0\xff\x80after\r\n";
+    const OK_STATUS: u16 = 200;
+    const JSON_CONTENT_TYPE: &str = "application/json";
 
     #[test_case(&[], USER_AGENT ; "default_user_agent")]
     #[test_case(&[("User-Agent", CALLER_USER_AGENT)], CALLER_USER_AGENT ; "exact_case_caller_header_wins")]
@@ -1110,15 +1123,48 @@ mod tests {
         assert_eq!(params.timeout, Duration::from_secs(MAX_TIMEOUT_SECS));
     }
 
-    #[test]
-    fn extract_params_post_with_body() {
+    #[test_case(false ; "string")]
+    #[test_case(true ; "buffer")]
+    fn extract_params_post_with_binary_body(buffer: bool) {
         let lua = Lua::new();
         let opts = lua.create_table().unwrap();
         opts.set("method", "POST").unwrap();
-        opts.set("body", r#"{"key":"val"}"#).unwrap();
+        let value = if buffer {
+            Value::Buffer(lua.create_buffer(BINARY_PAYLOAD).unwrap())
+        } else {
+            Value::String(lua.create_string(BINARY_PAYLOAD).unwrap())
+        };
+        opts.set("body", value).unwrap();
         let params = request_params(PUBLIC_URL, Some(&opts)).unwrap();
         assert_eq!(params.method, "POST");
-        assert_eq!(params.body, br#"{"key":"val"}"#);
+        assert_eq!(params.body, BINARY_PAYLOAD);
+    }
+
+    #[test]
+    fn extract_params_rejects_an_invalid_body() {
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+        opts.set("body", lua.create_table().unwrap()).unwrap();
+        assert!(request_params(PUBLIC_URL, Some(&opts)).is_err());
+    }
+
+    #[test]
+    fn response_table_preserves_binary_body() {
+        let lua = Lua::new();
+        let response = ResponseData {
+            body: BINARY_PAYLOAD.to_vec(),
+            status: OK_STATUS,
+            content_type: JSON_CONTENT_TYPE.to_owned(),
+        };
+        let table = response.into_table(&lua).unwrap();
+        let (status, body, content_type): (u16, mlua::String, String) = (
+            table.get("status").unwrap(),
+            table.get("body").unwrap(),
+            table.get("content_type").unwrap(),
+        );
+        assert_eq!(status, OK_STATUS);
+        assert_eq!(&*body.as_bytes(), BINARY_PAYLOAD);
+        assert_eq!(content_type, JSON_CONTENT_TYPE);
     }
 
     #[test]
