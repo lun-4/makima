@@ -84,6 +84,7 @@ use makima_commands::{
 };
 use makima_config::project::{self, GatedFile, TrustQuestion};
 use makima_config::{ModelPolicy, ToolKey, UiConfig};
+use makima_lua::agent_autocmd::SESSION_CWD_CHANGED_EVENT;
 use makima_lua::orchestration::TrustedTarget;
 use makima_lua::{
     BuiltinAction, CompletionCtx, EventHandle, FloatConfig, HintReader, HintSnapshot, ItemSpec,
@@ -3676,6 +3677,10 @@ impl App {
             .session_mut()
             .set_cwd(path.to_string_lossy().into_owned());
         self.status_bar.set_cwd(path.clone());
+        self.fire_session_autocmd(
+            SESSION_CWD_CHANGED_EVENT,
+            serde_json::json!({ "cwd": path.to_string_lossy() }),
+        );
         let input = self.input_box.buffer.value();
         self.sync_command_arguments(&input, self.input_box.buffer.cursor_byte_offset());
         if self.file_completion.is_active() {
