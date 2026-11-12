@@ -5093,12 +5093,14 @@ mod tests {
     }
     use crate::selection::SelectionZone;
     use crossterm::event::{KeyCode, KeyModifiers};
+    use makima_agent::tools::ToolRegistry;
     use makima_agent::tools::offload::{MAX_OFFLOAD_SESSION_BYTES, OffloadBackend, OffloadError};
     use makima_agent::{
         AgentId, DoneReason, Envelope, SessionMailbox, SubagentInfo, TurnId, TurnOutcome,
     };
     use makima_config::PermissionsConfig;
     use makima_lua::BuiltinAction;
+    use makima_lua::PluginHost;
     use makima_providers::model::FastSupport;
     use makima_providers::{Effort, ModelCapabilities, TokenUsage};
     use ratatui::{Terminal, backend::TestBackend};
@@ -5115,6 +5117,20 @@ mod tests {
     const UNRELATED_MODEL_ID: &str = "tui-discovery-unrelated";
     const BUSY_MODEL_ID: &str = "tui-discovery-busy";
     const DISCOVERED_WINDOW: u32 = 524_000;
+    const CWD_OBSERVER_PLUGIN: &str = "cwd-observer";
+    const CWD_OBSERVED_PREFIX: &str = "/cwd-observed-";
+    const CWD_OBSERVER: &str = r#"
+local fires = 0
+makima.api.create_autocmd("SessionCwdChanged", { callback = function(ev)
+    fires = fires + 1
+    makima.api.register_command({
+        name = "/cwd-observed-" .. tostring(fires),
+        description = ev.data.cwd,
+        tui_only = false,
+        handler = function() end,
+    })
+end })
+"#;
 
     #[test]
     fn ui_queue_and_mode_model_projection() {
@@ -8348,6 +8364,96 @@ mod tests {
                 child
             );
         });
+    }
+
+    /// A plugin that tracks the working directory refreshes on this event, so
+    /// it has to fire once per real move and never on a rejected one.
+    #[test]
+    fn cwd_changed_fires_only_when_the_move_succeeds() {
+        with_event_loop(|event_loop| {
+            let host = PluginHost::with_command_registry(
+                Arc::new(ToolRegistry::new()),
+                event_loop.ctx.command_runtime.registry.clone(),
+                false,
+                makima_lua::ui_sink::HostUi::Frontend,
+            )
+            .unwrap();
+            host.event_handle()
+                .install_orchestration_services(event_loop.orchestration.clone());
+            host.load_source(CWD_OBSERVER_PLUGIN, CWD_OBSERVER).unwrap();
+            event_loop.ctx.lua_event_handle = host.event_handle();
+            event_loop.sessions[0].app.lua_event_handle = host.event_handle();
+
+            let moved = tempfile::tempdir().unwrap();
+            let moved = moved.path().canonicalize().unwrap();
+            let expected = [moved.to_string_lossy().into_owned()];
+
+            dispatch_cd(event_loop, moved.clone());
+            pump_directory_change(event_loop).unwrap();
+            assert_eq!(observed_cwds(event_loop, &host), expected);
+
+            dispatch_cd(event_loop, moved.join("missing"));
+            assert!(pump_directory_change(event_loop).is_err());
+            assert_eq!(observed_cwds(event_loop, &host), expected);
+        });
+    }
+
+    fn dispatch_cd(event_loop: &mut EventLoop<'_>, path: PathBuf) {
+        let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+        let target = manager.lookup(root).unwrap();
+        let template = event_loop.sessions[0]
+            .handles
+            .orchestration_template
+            .clone();
+        let (reply, response) = flume::bounded(1);
+        event_loop.handle_command(CommandEvent::Host {
+            target: event_loop.sessions[0].app.command_target.id(),
+            request: makima_commands::HostRequest::Builtin(BuiltinOperation::ChangeDirectory {
+                path,
+            }),
+            admission: Some(Box::new(TrustedTarget { target, template })),
+            reply,
+        });
+        assert!(matches!(
+            response.recv().unwrap().unwrap(),
+            HostResponse::Completed
+        ));
+    }
+
+    fn pump_directory_change(event_loop: &mut EventLoop<'_>) -> Result<(), String> {
+        loop {
+            let event = event_loop
+                .internal_rx
+                .recv_timeout(SESSION_OP_TIMEOUT)
+                .expect(SESSION_OP_TIMEOUT_ERR);
+            if let InternalEvent::SessionOp {
+                kind: SessionOpKind::DirectoryChanged { .. },
+                result,
+                ..
+            } = &event
+            {
+                let result = result.clone();
+                event_loop.handle_internal(event);
+                return result;
+            }
+            event_loop.handle_internal(event);
+        }
+    }
+
+    fn observed_cwds(event_loop: &EventLoop<'_>, host: &PluginHost) -> Vec<String> {
+        host.drain_tasks_for_test();
+        event_loop
+            .ctx
+            .command_runtime
+            .registry
+            .snapshot_for(&event_loop.sessions[0].app.command_target)
+            .unwrap()
+            .commands()
+            .iter()
+            .map(|command| command.spec())
+            .filter(|spec| spec.name.starts_with(CWD_OBSERVED_PREFIX))
+            .map(|spec| spec.docs.summary.to_string())
+            .collect()
     }
 
     #[test]

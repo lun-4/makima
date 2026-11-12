@@ -948,12 +948,14 @@ compaction inside a turn that fails ends the turn, so it reports as a
 failed `"TurnEnd"`.
 
 Host events with no agent, where `ctx` is nil: `"SessionReset"`,
-`"SessionFocusChanged"`, `"ProviderChanged"`, `"SessionPickerRequested"`,
-`"SplashShown"`, `"SplashHidden"` and `"StoreChanged"`. `"SessionReset"`
-and `"SessionFocusChanged"` carry `data.session_id`: the session left
-behind, and the one now focused, which also has `data.previous_session_id`
-except on initial startup. `"StoreChanged"` carries `data.registry` and,
-for registrations, `data.key`. Plugins can fire their own events with
+`"SessionFocusChanged"`, `"SessionCwdChanged"`, `"ProviderChanged"`,
+`"SessionPickerRequested"`, `"SplashShown"`, `"SplashHidden"` and
+`"StoreChanged"`. `"SessionReset"` and `"SessionFocusChanged"` carry
+`data.session_id`: the session left behind, and the one now focused, which
+also has `data.previous_session_id` except on initial startup.
+`"SessionCwdChanged"` carries `data.cwd`, the session's new working
+directory, after `/cd` moves it. `"StoreChanged"` carries `data.registry`
+and, for registrations, `data.key`. Plugins can fire their own events with
 `exec_autocmds`.
 
 **Parameters:**
