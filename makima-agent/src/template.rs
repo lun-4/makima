@@ -2,10 +2,10 @@ use std::borrow::Cow;
 use std::env;
 use std::path::Path;
 
-use jiff::Timestamp;
+use jiff::Zoned;
 
 pub fn env_vars_for(cwd: &Path) -> Vars {
-    let date = Timestamp::now().strftime("%Y-%m-%d").to_string();
+    let date = Zoned::now().strftime("%Y-%m-%d").to_string();
     Vars::new()
         .set("{cwd}", cwd.to_string_lossy().into_owned())
         .set("{platform}", env::consts::OS)
@@ -51,10 +51,15 @@ impl Vars {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jiff::Timestamp;
+    use jiff::tz::{Offset, TimeZone};
     use test_case::test_case;
 
-    fn format_date(ts: Timestamp) -> String {
-        ts.strftime("%Y-%m-%d").to_string()
+    fn format_date(ts: Timestamp, offset_hours: i8) -> String {
+        let offset = Offset::from_hours(offset_hours).unwrap();
+        ts.to_zoned(TimeZone::fixed(offset))
+            .strftime("%Y-%m-%d")
+            .to_string()
     }
 
     #[test_case("{cwd} on {platform}", "/home on linux" ; "multiple_keys")]
@@ -68,13 +73,15 @@ mod tests {
         assert_eq!(vars.apply(input).as_ref(), expected);
     }
 
-    #[test_case(0,             "1970-01-01" ; "unix_epoch")]
-    #[test_case(1_000_000_000, "2001-09-09" ; "billion_seconds")]
-    #[test_case(1_740_700_800, "2025-02-28" ; "feb_28_non_leap")]
-    #[test_case(1_709_164_800, "2024-02-29" ; "leap_day_2024")]
-    fn format_date_cases(secs: i64, expected: &str) {
+    #[test_case(0,             0,   "1970-01-01" ; "unix_epoch")]
+    #[test_case(1_000_000_000, 0,   "2001-09-09" ; "billion_seconds")]
+    #[test_case(1_740_700_800, 0,   "2025-02-28" ; "feb_28_non_leap")]
+    #[test_case(1_709_164_800, 0,   "2024-02-29" ; "leap_day_2024")]
+    #[test_case(1_740_783_600, 14,  "2025-03-01" ; "crosses_forward_with_positive_offset")]
+    #[test_case(1_740_704_400, -12, "2025-02-27" ; "crosses_backward_with_negative_offset")]
+    fn format_date_cases(secs: i64, offset_hours: i8, expected: &str) {
         let ts = Timestamp::from_second(secs).unwrap();
-        assert_eq!(format_date(ts), expected);
+        assert_eq!(format_date(ts, offset_hours), expected);
     }
 
     #[test]
