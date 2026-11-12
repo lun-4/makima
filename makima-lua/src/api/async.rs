@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_lock::{Semaphore, SemaphoreGuardArc};
 use futures::future::join_all;
@@ -11,6 +12,7 @@ use crate::runtime::{TaskHandle, enqueue_async_task, lock_cell, register_cancel_
 
 const AWAIT_MIN_ARGS: usize = 2;
 const PERMIT_RELEASED_ERR: &str = "permit already released";
+const SLEEP_NEGATIVE_ERR: &str = "makima.async.sleep: ms must be >= 0";
 
 /// Cancel-aware counting semaphore. Permits release on `:release()` or gc.
 pub(crate) struct LuaSemaphore {
@@ -199,6 +201,52 @@ async fn gather(lua: Lua, fns: Table) -> LuaResult<Table> {
     Ok(out)
 }
 
+/// Suspend the calling task for {ms} milliseconds. Other tasks and the UI
+/// keep running. Cancelling the task ends the sleep early with an error.
+///
+/// All plugins share one Lua thread. Code that runs for 5 seconds without
+/// yielding is stopped with an error. `sleep(0)` lets every other ready
+/// task run once, then returns. Call it periodically in long loops.
+///
+/// A repeating timer is a sleep loop inside `makima.async.run`. For a
+/// one-shot timer that outlives the tool call, such as a toast that
+/// dismisses itself, use `makima.defer_fn`.
+///
+/// @param ms integer Milliseconds to wait. Negative values raise an error.
+/// @return
+/// @example
+/// makima.async.run(function()
+///   while true do
+///     poll()
+///     makima.async.sleep(5000)
+///   end
+/// end)
+///
+/// -- A long loop that keeps the rest of makima responsive:
+/// for _, line in ipairs(lines) do
+///   process(line)
+///   makima.async.sleep(0)
+/// end
+#[lua_fn]
+async fn sleep(lua: Lua, ms: i64) -> LuaResult<()> {
+    if ms < 0 {
+        return Err(mlua::Error::runtime(SLEEP_NEGATIVE_ERR));
+    }
+    if ms == 0 {
+        smol::future::yield_now().await;
+        return Ok(());
+    }
+    let cancel = lua
+        .app_data_ref::<TaskHandle>()
+        .map(|h| lock_cell(&h).cancel.clone())
+        .unwrap_or_else(CancelToken::none);
+    cancel
+        .race(smol::Timer::after(Duration::from_millis(ms as u64)))
+        .await
+        .map_err(mlua::Error::runtime)?;
+    Ok(())
+}
+
 /// Create a counting semaphore that allows at most {n} concurrent permits.
 /// Use this to limit how many tasks hit a resource at the same time.
 ///
@@ -306,7 +354,7 @@ lua_table! {
     /// })
     /// ```
     extend "makima.async" => pub(crate) fn add_async_fns(), DOCS [
-        run, manual r#await, manual wrap, manual join, gather, semaphore, on_cancel,
+        run, manual r#await, manual wrap, manual join, gather, sleep, semaphore, on_cancel,
     ]
 }
 
@@ -848,5 +896,86 @@ mod tests {
             err.contains(CANCELLED_MSG),
             "expected error containing {CANCELLED_MSG:?}, got: {err}"
         );
+    }
+
+    #[test]
+    fn sleep_rejects_negative_ms() {
+        smol::block_on(async {
+            let (lua, _tbl) = setup();
+            let err = lua
+                .load("return async_tbl.sleep(-1)")
+                .eval_async::<Value>()
+                .await
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains(SLEEP_NEGATIVE_ERR),
+                "expected error containing {SLEEP_NEGATIVE_ERR:?}, got: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn sleep_suspends_for_the_requested_duration() {
+        smol::block_on(async {
+            let (lua, _tbl) = setup();
+            let began = std::time::Instant::now();
+            lua.load("async_tbl.sleep(30)").exec_async().await.unwrap();
+            assert!(
+                began.elapsed() >= Duration::from_millis(30),
+                "sleep(30) returned early after {:?}",
+                began.elapsed()
+            );
+        });
+    }
+
+    #[test]
+    fn sleep_zero_yields_to_another_task() {
+        smol::block_on(async {
+            let (lua, _tbl) = setup();
+            let code = r#"
+                local order = {}
+                async_tbl.gather({
+                    function()
+                        order[#order + 1] = "before"
+                        async_tbl.sleep(0)
+                        order[#order + 1] = "after"
+                    end,
+                    function()
+                        order[#order + 1] = "other"
+                    end,
+                })
+                return table.concat(order, ",")
+            "#;
+            let order: String = lua.load(code).eval_async().await.unwrap();
+            assert_eq!(order, "before,other,after");
+        });
+    }
+
+    #[test]
+    fn sleep_observes_caller_cancel() {
+        smol::block_on(async {
+            let (lua, _tbl) = setup();
+            lua.set_app_data::<TaskHandle>(cancelled_task_handle());
+            let code = r#"
+                local ok, err = pcall(async_tbl.sleep, 60_000)
+                return ok, tostring(err)
+            "#;
+            let vals: Vec<Value> = lua
+                .load(code)
+                .eval_async::<MultiValue>()
+                .await
+                .unwrap()
+                .into_vec();
+            assert!(
+                !vals[0].as_boolean().unwrap(),
+                "a cancelled sleep must not complete"
+            );
+            let err = vals[1].as_string().unwrap().to_string_lossy();
+            assert!(
+                err.contains(CANCELLED_MSG),
+                "expected error containing {CANCELLED_MSG:?}, got: {err}"
+            );
+        });
     }
 }

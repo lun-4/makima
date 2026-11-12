@@ -2471,6 +2471,46 @@ end
 
 ---
 
+### `makima.async.sleep()` {#makima-async-sleep}
+
+```lua
+makima.async.sleep({ms})
+```
+
+Suspend the calling task for {ms} milliseconds. Other tasks and the UI
+keep running. Cancelling the task ends the sleep early with an error.
+
+All plugins share one Lua thread. Code that runs for 5 seconds without
+yielding is stopped with an error. `sleep(0)` lets every other ready
+task run once, then returns. Call it periodically in long loops.
+
+A repeating timer is a sleep loop inside `makima.async.run`. For a
+one-shot timer that outlives the tool call, such as a toast that
+dismisses itself, use `makima.defer_fn`.
+
+**Parameters:**
+
+- `{ms}` (`integer`) Milliseconds to wait. Negative values raise an error.
+
+**Example:**
+
+```lua
+makima.async.run(function()
+  while true do
+    poll()
+    makima.async.sleep(5000)
+  end
+end)
+
+-- A long loop that keeps the rest of makima responsive:
+for _, line in ipairs(lines) do
+  process(line)
+  makima.async.sleep(0)
+end
+```
+
+---
+
 ### `makima.async.semaphore()` {#makima-async-semaphore}
 
 ```lua
