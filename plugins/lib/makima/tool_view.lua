@@ -84,15 +84,10 @@ local function truncate_line(line, max_bytes)
     end
     local remaining = max_bytes - used
     if #text > remaining then
-      text = utf8_truncate_bytes(text, remaining)
-      out[#out + 1] = style and { text, style } or text
+      out[#out + 1] = { utf8_truncate_bytes(text, remaining), style }
       break
     end
-    if style then
-      out[#out + 1] = { text, style }
-    else
-      out[#out + 1] = text
-    end
+    out[#out + 1] = { text, style }
     used = used + #text
   end
   return out
