@@ -44,6 +44,8 @@ local PLAN_MODELS_PATH = "/models?client_version="
 local RESPONSES_PATH = "/responses"
 local CHAT_PATH = "/chat/completions"
 local ACCOUNT_HEADER = "chatgpt-account-id"
+local PROMPT_CACHE_KEY = "prompt_cache_key"
+local SESSION_HEADERS = { "session-id", "x-client-request-id" }
 local AUTH_CLAIMS = "https://api.openai.com/auth"
 local JSON_TYPE = "application/json"
 local FORM_TYPE = "application/x-www-form-urlencoded"
@@ -393,6 +395,16 @@ local function headers(state, extra, plan)
   return out
 end
 
+-- A stable key keeps one session's requests on the same cache shards, so an
+-- unchanged prefix keeps hitting instead of being spread across them.
+local function session_headers(session)
+  local out = {}
+  for _, name in ipairs(SESSION_HEADERS) do
+    out[name] = session
+  end
+  return out
+end
+
 -- Runs {call} with fresh auth, and once more after a refresh when ChatGPT
 -- rejects the token.
 local function authorized(ctx, config, state, call)
@@ -534,10 +546,15 @@ local function stream(state, config, model, ctx, request, emit)
     -- Checked against the live tokens, which may have changed accounts since
     -- the model was prepared.
     body.service_tier = request.fast and fast_eligible(model, state.tokens) and FAST_TIER or nil
+    local extra
+    if state.tokens and request.session_id then
+      body[PROMPT_CACHE_KEY] = request.session_id
+      extra = session_headers(request.session_id)
+    end
     -- The ChatGPT backend keeps its fixed URL; base URL overrides apply to
     -- the platform API only.
     local base = state.tokens and M.BACKEND_URL or state.base
-    return http.post_stream(ctx, base .. RESPONSES_PATH, headers(state, nil, true), body, responses.stream, emit)
+    return http.post_stream(ctx, base .. RESPONSES_PATH, headers(state, extra, true), body, responses.stream, emit)
   end)
 end
 
