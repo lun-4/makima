@@ -2920,6 +2920,15 @@ impl App {
                 self.chats[0].set_tool_turn_usage(tool_id, formatted);
             }
         }
+        if let AgentEvent::CompactionDone {
+            context_size_after, ..
+        } = envelope.event
+        {
+            self.chats[chat_idx].context_size = context_size_after;
+            if chat_idx == 0 {
+                self.state.context_size = context_size_after;
+            }
+        }
 
         let plan_path = if self.root_mode() == Mode::Plan && !self.plan_submit_active() {
             self.state.plan.path()

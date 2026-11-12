@@ -1042,23 +1042,23 @@ impl<'h> Agent<'h> {
             self.session_id.as_ref(),
         )
         .await?;
-        let fast = self.opts.clamped(&compact_model).fast;
+        let fast = false;
         let compact_cost = compact_model.billed_cost(&compaction_usage, fast);
         let compact_list_cost = compact_model.list_cost(&compaction_usage, fast);
         self.ledger
             .add(compaction_usage, compact_cost, compact_list_cost);
-        let context_size_after = compaction_usage.output;
-        self.context_size = context_size_after;
+        self.history
+            .push(Message::synthetic(compaction::continue_message(
+                &self.config,
+            )));
         self.rollback_len = self.history.len();
+        let context_size_after = estimate_message_tokens(self.history.as_slice());
+        self.context_size = context_size_after;
         self.event_tx.send(AgentEvent::CompactionDone {
             context_size_before,
             context_size_after,
             context_window: self.model.context_window,
         })?;
-        self.history
-            .push(Message::synthetic(compaction::continue_message(
-                &self.config,
-            )));
         Ok(())
     }
 
@@ -1227,6 +1227,7 @@ mod tests {
     use crate::mcp::tool_names;
     use crate::permissions::PermissionManager;
     use crate::{ActorWorkIdentity, ActorWorkKind, Envelope};
+    use makima_providers::{FastPricing, ModelPricing};
 
     const TEST_CWD: &str = "/tmp";
     const TEST_PLAN_PATH: &str = "/tmp/plan.md";
@@ -1255,6 +1256,7 @@ mod tests {
         captured_tools: Arc<Mutex<Vec<Value>>>,
         captured_messages: Arc<Mutex<Vec<Vec<Message>>>>,
         captured_systems: Arc<Mutex<Vec<String>>>,
+        captured_opts: Arc<Mutex<Vec<RequestOptions>>>,
     }
 
     impl MockProvider {
@@ -1264,6 +1266,7 @@ mod tests {
                 captured_tools: Arc::default(),
                 captured_messages: Arc::default(),
                 captured_systems: Arc::default(),
+                captured_opts: Arc::default(),
             }
         }
     }
@@ -1276,12 +1279,12 @@ mod tests {
             system: &'a str,
             tools: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
-            _: RequestOptions,
+            opts: RequestOptions,
             _: Option<&'a SessionRef>,
             _invocation: &'a Invocation,
             _delivery: RequestDelivery,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-            Box::pin(async {
+            Box::pin(async move {
                 self.captured_messages
                     .lock()
                     .unwrap()
@@ -1291,6 +1294,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(system.to_owned());
+                self.captured_opts.lock().unwrap().push(opts);
                 let mut responses = self.responses.lock().unwrap();
                 assert!(!responses.is_empty(), "MockProvider: no more responses");
                 Ok(responses.remove(0))
@@ -3020,6 +3024,194 @@ mod tests {
                 &last.content[0],
                 ContentBlock::Text { text } if text.ends_with(POST) && text != POST
             ));
+        });
+    }
+
+    #[test]
+    fn fast_session_compaction_billing_disables_fast_mode() {
+        smol::block_on(async {
+            let usage = TokenUsage {
+                input: 100,
+                output: 50,
+                ..Default::default()
+            };
+            let summary_resp = StreamResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "summary".into(),
+                    }],
+                    ..Default::default()
+                },
+                usage,
+                stop_reason: Some(StopReason::EndTurn),
+            };
+            let turn_resp = StreamResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "turn reply".into(),
+                    }],
+                    ..Default::default()
+                },
+                usage,
+                stop_reason: Some(StopReason::EndTurn),
+            };
+
+            let provider = MockProvider::new(vec![summary_resp, turn_resp]);
+            let captured_opts = Arc::clone(&provider.captured_opts);
+
+            let mut model = default_model();
+            model.pricing = ModelPricing {
+                input: 1.0,
+                output: 2.0,
+                fast: Some(FastPricing {
+                    input: 3.0,
+                    output: 6.0,
+                }),
+                ..Default::default()
+            };
+
+            let mut history = History::new(vec![Message::user("initial prompt".into())]);
+            let (mut agent, _event_rx) = make_agent(provider, &mut history);
+            agent.model = Arc::new(model.clone());
+            agent.opts.fast = true;
+
+            agent.do_compact(None).await.unwrap();
+
+            {
+                let requests = captured_opts.lock().unwrap();
+                assert_eq!(requests.len(), 1);
+                assert!(!requests[0].fast);
+            }
+            assert!(agent.opts.fast);
+
+            let totals_after_compact = agent.ledger.totals();
+            assert_eq!(totals_after_compact.usage, usage);
+            assert_eq!(totals_after_compact.cost, model.billed_cost(&usage, false));
+            assert_eq!(
+                totals_after_compact.list_cost,
+                model.list_cost(&usage, false)
+            );
+
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+
+            let requests = captured_opts.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(requests[1].fast);
+            assert!(agent.opts.fast);
+
+            assert_eq!(outcome.usage(), usage);
+            assert_eq!(outcome.cost(), model.billed_cost(&usage, true));
+            assert_eq!(outcome.list_cost(), model.list_cost(&usage, true));
+            let turn_totals = agent.ledger.totals();
+            assert_eq!(turn_totals.usage, usage);
+            assert_eq!(turn_totals.cost, model.billed_cost(&usage, true));
+            assert_eq!(turn_totals.list_cost, model.list_cost(&usage, true));
+        });
+    }
+
+    #[test]
+    fn compaction_context_size_reflects_compacted_history() {
+        smol::block_on(async {
+            const SUMMARY_OUTPUT_TOKENS: u32 = 500;
+            let usage = TokenUsage {
+                input: 1000,
+                output: SUMMARY_OUTPUT_TOKENS,
+                ..Default::default()
+            };
+            let summary_resp = StreamResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "brief summary".into(),
+                    }],
+                    ..Default::default()
+                },
+                usage,
+                stop_reason: Some(StopReason::EndTurn),
+            };
+
+            let mut history = History::new(vec![
+                Message::user("first question with lots of text".into()),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "first answer with even more text".into(),
+                    }],
+                    ..Default::default()
+                },
+            ]);
+            let (mut agent, event_rx) =
+                make_agent(MockProvider::new(vec![summary_resp]), &mut history);
+            agent.context_size = 2000;
+
+            agent.do_compact(None).await.unwrap();
+
+            let expected_context_size = estimate_message_tokens(agent.history.as_slice());
+            assert_ne!(expected_context_size, SUMMARY_OUTPUT_TOKENS);
+            assert_eq!(agent.context_size, expected_context_size);
+
+            let events = drain_events(&event_rx);
+            let compaction_done = events
+                .iter()
+                .find_map(|e| match &e.event {
+                    AgentEvent::CompactionDone {
+                        context_size_after, ..
+                    } => Some(*context_size_after),
+                    _ => None,
+                })
+                .expect("CompactionDone event must be emitted");
+            assert_eq!(compaction_done, expected_context_size);
+        });
+    }
+
+    #[test]
+    fn normal_session_retains_billing_and_context_size() {
+        smol::block_on(async {
+            let usage = TokenUsage {
+                input: 150,
+                output: 40,
+                ..Default::default()
+            };
+            let response = StreamResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "normal response".into(),
+                    }],
+                    ..Default::default()
+                },
+                usage,
+                stop_reason: Some(StopReason::EndTurn),
+            };
+
+            let mut model = default_model();
+            model.pricing = ModelPricing {
+                input: 1.0,
+                output: 2.0,
+                fast: Some(FastPricing {
+                    input: 3.0,
+                    output: 6.0,
+                }),
+                ..Default::default()
+            };
+
+            let mut history = History::new(vec![]);
+            let (mut agent, _event_rx) =
+                make_agent(MockProvider::new(vec![response]), &mut history);
+            agent.model = Arc::new(model.clone());
+            agent.opts.fast = true;
+
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+
+            let totals = agent.ledger.totals();
+            assert_eq!(totals.usage, usage);
+            assert_eq!(totals.cost, model.billed_cost(&usage, true));
+            assert_eq!(totals.list_cost, model.list_cost(&usage, true));
+            assert_eq!(agent.context_size, usage.total_input());
         });
     }
 

@@ -137,7 +137,10 @@ async fn summarize(
             &empty_tools,
             event_tx,
             cancel,
-            RequestOptions::default(),
+            RequestOptions {
+                fast: false,
+                ..RequestOptions::default()
+            },
             session_id,
             makima_providers::retry::RetryPolicy::default(),
             &delivery,
