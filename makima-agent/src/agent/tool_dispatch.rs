@@ -4559,12 +4559,13 @@ mod tests {
             }
         };
         futures_lite::future::or(wait, async {
-            smol::Timer::after(Duration::from_secs(2)).await;
+            smol::Timer::after(BACKGROUND_RESULT_TIMEOUT).await;
             panic!("background result never landed");
         })
         .await
     }
 
+    const BACKGROUND_RESULT_TIMEOUT: Duration = Duration::from_secs(10);
     const SLOW_TOOL: &str = "slow";
     const SLOW_OUTPUT: &str = "slow done";
     const SLOW_ID: &str = "call_slow";
@@ -4832,7 +4833,10 @@ mod tests {
                     Box::pin(async move {
                         let _ = started.send(());
                         let _ = panic.recv_async().await;
-                        panic!("tool blew up");
+                        // A hook-free unwind: the task must catch the same
+                        // payload a real panic produces without waiting on
+                        // stderr capture under load.
+                        std::panic::resume_unwind(Box::new("tool blew up"));
                     })
                 }),
             )]));
