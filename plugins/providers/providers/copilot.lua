@@ -473,14 +473,7 @@ local function stream(state, model, ctx, request, emit)
   elseif data.route == "responses" then
     local reasoning = responses.reasoning(request.thinking, M.dialect(data), thinking.max_budget(request.model))
     local body = responses.build_request(request, reasoning)
-    return http.post_stream(
-      ctx,
-      auth.endpoint .. RESPONSES_PATH,
-      headers(state, auth, true),
-      body,
-      responses.stream,
-      emit
-    )
+    return responses.post_stream(ctx, auth.endpoint .. RESPONSES_PATH, headers(state, auth, true), body, emit)
   end
   local body = chat.build_request(request, {})
   body.n = 1

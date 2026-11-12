@@ -86,7 +86,7 @@ function M.stream(def, client, config, ctx, request, emit, fields)
     local body =
       responses.build_request(request, responses.reasoning(request.thinking, thinking.dialects.standard, max))
     body.return_progress = true
-    return http.post_stream(ctx, client.base .. RESPONSES_PATH, client.headers(), body, responses.stream, emit)
+    return responses.post_stream(ctx, client.base .. RESPONSES_PATH, client.headers(), body, emit)
   end
   local body = chat.build_request(request, { max_tokens_field = MAX_TOKENS_FIELD, include_stream_usage = true })
   if def.local_thinking then

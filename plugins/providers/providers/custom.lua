@@ -92,7 +92,7 @@ local function responses_stream(client, _, ctx, request, emit)
   local reasoning =
     responses.reasoning(request.thinking, thinking.dialects.standard, thinking.max_budget(request.model))
   local body = responses.build_request(request, reasoning)
-  return http.post_stream(ctx, client.base .. RESPONSES_PATH, client.headers(), body, responses.stream, emit)
+  return responses.post_stream(ctx, client.base .. RESPONSES_PATH, client.headers(), body, emit)
 end
 
 local OPENAI = {
