@@ -14147,3 +14147,108 @@ fn plan_ready_fires_once_per_draft() {
     app.transition_plan(PlanTrigger::WriteDone);
     assert!(app.state.plan.is_ready());
 }
+
+#[test]
+fn ctrl_b_asks_the_session_to_move_the_running_call() {
+    let mut app = test_app();
+    let actions = app.update(Msg::Key(kb::BACKGROUND.to_key_event()));
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::MoveToBackground { .. }]
+    ));
+}
+
+#[test]
+fn a_moved_call_appears_in_tasks_until_it_finishes() {
+    let mut app = test_app();
+    app.update(agent_msg(AgentEvent::ToolMoved {
+        id: "call_moved".into(),
+        tool: "bash".into(),
+        summary: "cargo test".into(),
+    }));
+
+    let entry = app
+        .task_entries()
+        .into_iter()
+        .find(|entry| matches!(&entry.identity, TaskIdentity::Background(id) if id == "call_moved"))
+        .expect("a moved call is a task");
+    assert_eq!(entry.name, "cargo test");
+    assert_eq!(entry.finished, Some(false), "a running call spins");
+
+    app.update(agent_msg(AgentEvent::BackgroundDone(Box::new(
+        ToolDoneEvent {
+            id: "call_moved".into(),
+            tool: "bash".into(),
+            output: ToolOutput::Plain("done".into()),
+            is_error: false,
+            annotation: None,
+            written_path: None,
+        },
+    ))));
+
+    let entry = app
+        .task_entries()
+        .into_iter()
+        .find(|entry| matches!(&entry.identity, TaskIdentity::Background(id) if id == "call_moved"))
+        .expect("a finished call stays listed");
+    assert_eq!(entry.finished, Some(true));
+    assert_eq!(
+        app.state
+            .session
+            .tool_outputs()
+            .get("call_moved")
+            .map(|o| o.as_text()),
+        Some("done".into())
+    );
+}
+
+#[test]
+fn a_lost_background_call_reads_as_failed() {
+    let mut app = test_app();
+    app.update(agent_msg(AgentEvent::ToolMoved {
+        id: "call_lost".into(),
+        tool: "bash".into(),
+        summary: "cargo test".into(),
+    }));
+    app.update(agent_msg(AgentEvent::BackgroundLost {
+        id: "call_lost".into(),
+        tool: "bash".into(),
+        reason: "worker died".into(),
+    }));
+
+    let entry = app
+        .task_entries()
+        .into_iter()
+        .find(|entry| matches!(&entry.identity, TaskIdentity::Background(id) if id == "call_lost"))
+        .expect("a lost call stays listed");
+    assert_eq!(entry.finished, Some(true));
+    assert_eq!(entry.context, "failed");
+    let output = app
+        .state
+        .session
+        .tool_outputs()
+        .get("call_lost")
+        .map(|o| o.as_text())
+        .expect("the row keeps a lost notice");
+    assert!(output.contains("lost"), "{output}");
+}
+
+#[test]
+fn selecting_a_background_task_row_renders_its_chat() {
+    let mut app = test_app();
+    app.update(agent_msg(AgentEvent::ToolMoved {
+        id: "call_moved".into(),
+        tool: "bash".into(),
+        summary: "cargo test".into(),
+    }));
+    app.open_tasks();
+    let index = app
+        .task_picker
+        .items()
+        .unwrap()
+        .iter()
+        .position(|entry| matches!(&entry.identity, TaskIdentity::Background(_)))
+        .expect("the moved call is listed");
+    app.task_picker.select(index);
+    assert_eq!(app.resolve_render_chat(), 0);
+}

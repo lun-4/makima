@@ -3,14 +3,16 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures_lite::FutureExt;
 use serde_json::{Value, json};
 use tracing::{debug, error, warn};
 
+use crate::call_scope::{CallGuard, CallScope};
 use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
-use crate::task_set::TaskSet;
 use crate::tools::hook::{
     Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, OUTPUT_TRAILER, Verdict,
 };
@@ -20,10 +22,13 @@ use crate::tools::{
     CallOrigin, DEADLINE_EXCEEDED, Deadline, LocalTool, LocalToolFn, ToolAudience, ToolContext,
     TurnToolRoute, truncate_scope,
 };
-use crate::{AgentError, AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
+use crate::{AgentError, AgentEvent, SessionMailbox, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use makima_config::{FILE_WRITE_TOOLS, ToolKey};
 use makima_storage::id::SessionRef;
 
+const MOVED_PERMISSION_ERR: &str = "tool moved to the background before permission was answered";
+const BACKGROUND_RECEIPT: &str =
+    "Running in the background. Its result will arrive as a message when it finishes.";
 const DOOM_LOOP_THRESHOLD: usize = 3;
 const DOOM_LOOP_MESSAGE: &str = "You have called this tool with identical input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
@@ -1003,6 +1008,9 @@ async fn enforce_permission(
             "enforce_permission called with dotted name: {name}"
         ));
     }
+    if ctx.call.as_ref().is_some_and(|call| call.is_moved()) {
+        return Err(MOVED_PERMISSION_ERR.into());
+    }
     if let Some(scopes) = inv.permission_scopes(ctx.session_id.as_ref()).await {
         let scopes = if FILE_WRITE_TOOLS.contains(&name) {
             crate::tools::PermissionScopes {
@@ -1017,18 +1025,30 @@ async fn enforce_permission(
             scopes
         };
         let tool_key = ToolKey::native(name);
-        ctx.permissions
-            .enforce(
-                &tool_key,
-                &scopes,
-                &ctx.event_tx,
-                ctx.user_response_rx.as_deref(),
-                id,
-                &ctx.cancel,
-                ctx.restrict_write_to().as_deref(),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
+        let (withdraw_trigger, ask_cancel) = ctx.cancel.child();
+        let decision = async {
+            ctx.permissions
+                .enforce(
+                    &tool_key,
+                    &scopes,
+                    &ctx.event_tx,
+                    ctx.user_response_rx.as_deref(),
+                    id,
+                    &ask_cancel,
+                    ctx.restrict_write_to().as_deref(),
+                )
+                .await
+                .map_err(|e| e.to_string())
+        };
+        let withdrawn = async {
+            match &ctx.call {
+                Some(call) => call.moved().await,
+                None => std::future::pending().await,
+            }
+            withdraw_trigger.cancel();
+            Err(MOVED_PERMISSION_ERR.to_string())
+        };
+        futures_lite::future::or(decision, withdrawn).await?;
     }
     Ok(())
 }
@@ -1060,20 +1080,34 @@ async fn execute_mcp_tool(
     let perm_scope = truncate_scope(&input.to_string(), MCP_PERM_SCOPE_MAX_BYTES);
     let perm_scopes = crate::tools::PermissionScopes::single(perm_scope);
 
-    if let Err(e) = ctx
-        .permissions
-        .enforce(
-            &perm_tool,
-            &perm_scopes,
-            &ctx.event_tx,
-            ctx.user_response_rx.as_deref(),
-            id,
-            &ctx.cancel,
-            ctx.mode.plan_path(),
-        )
-        .await
-    {
-        return done(e.to_string(), true);
+    if ctx.call.as_ref().is_some_and(|call| call.is_moved()) {
+        return done(MOVED_PERMISSION_ERR.into(), true);
+    }
+    let (withdraw_trigger, ask_cancel) = ctx.cancel.child();
+    let decision = async {
+        ctx.permissions
+            .enforce(
+                &perm_tool,
+                &perm_scopes,
+                &ctx.event_tx,
+                ctx.user_response_rx.as_deref(),
+                id,
+                &ask_cancel,
+                ctx.mode.plan_path(),
+            )
+            .await
+            .map_err(|e| e.to_string())
+    };
+    let withdrawn = async {
+        match &ctx.call {
+            Some(call) => call.moved().await,
+            None => std::future::pending().await,
+        }
+        withdraw_trigger.cancel();
+        Err(MOVED_PERMISSION_ERR.to_string())
+    };
+    if let Err(e) = futures_lite::future::or(decision, withdrawn).await {
+        return done(e, true);
     }
 
     if origin.is_model() {
@@ -1133,35 +1167,154 @@ pub(super) async fn process_tool_calls(
         event_tx.try_send(AgentEvent::ToolDone(Box::new(err.clone())));
     }
 
-    let mut set = TaskSet::new();
-    let mut spawned_ids: Vec<String> = Vec::new();
+    let mailbox = ctx
+        .session_id
+        .as_ref()
+        .and_then(|session| SessionMailbox::open(session.id()).ok());
+    let (move_tx, move_rx) = flume::unbounded::<String>();
+    let (result_tx, result_rx) = flume::unbounded::<(String, ToolDoneEvent)>();
+    let mut pending: HashMap<String, smol::Task<()>> = HashMap::new();
+    let mut scopes: HashMap<String, Arc<CallScope>> = HashMap::new();
+
     for (id, name, input) in runnable {
-        spawned_ids.push(id.clone());
-        let event_tx_clone = ctx.event_tx.clone();
+        let tool_name: Arc<str> = Arc::from(name.as_str());
+        let scope = Arc::new(CallScope::new(
+            id.clone(),
+            Arc::clone(&tool_name),
+            call_summary(&ctx.registry, &name, &input),
+            ctx.session_id
+                .as_ref()
+                .map(makima_storage::id::SessionRef::id),
+            ctx.execution_agent_id,
+            &ctx.cancel,
+            Some(move_tx.clone()),
+        ));
+        if let Some(mailbox) = &mailbox {
+            mailbox.register_call(Arc::clone(&scope));
+        }
         let tool_ctx = ToolContext {
             tool_use_id: Some(id.clone()),
+            call: Some(Arc::clone(&scope)),
+            cancel: scope.cancel().clone(),
             ..ctx.clone()
         };
-        set.spawn(async move {
-            let done = run(id, &name, &input, &tool_ctx, CallOrigin::Model).await;
-            event_tx_clone.try_send(AgentEvent::ToolDone(Box::new(done.clone())));
-            done
+        let guard = CallGuard::new(Arc::clone(&scope));
+        let event_tx_clone = ctx.event_tx.clone();
+        let result_tx_clone = result_tx.clone();
+        let mailbox_clone = mailbox.clone();
+        let task_scope = Arc::clone(&scope);
+        let task = smol::spawn(async move {
+            let _guard = guard;
+            let run_id = task_scope.id().to_owned();
+            let outcome = AssertUnwindSafe(async {
+                run(run_id, &name, &input, &tool_ctx, CallOrigin::Model).await
+            })
+            .catch_unwind()
+            .await;
+            let lost = outcome.is_err();
+            let done = match outcome {
+                Ok(done) => done,
+                Err(payload) => {
+                    let message = panic_to_string(payload);
+                    error!(error = %message, "tool task panicked");
+                    ToolDoneEvent::error(
+                        task_scope.id().to_owned(),
+                        format!("internal error: tool panicked: {message}"),
+                    )
+                }
+            };
+            if task_scope.claim_foreground() {
+                event_tx_clone.try_send(AgentEvent::ToolDone(Box::new(done.clone())));
+                if let Some(mailbox) = &mailbox_clone {
+                    mailbox.finish_call(task_scope.id());
+                }
+                let _ = result_tx_clone.send((task_scope.id().to_owned(), done));
+            } else {
+                // A move took the call, or the dispatcher already claimed the
+                // receipt. Either way the result belongs to the mailbox.
+                let _ = task_scope.claim_receipt();
+                if let Some(mailbox) = &mailbox_clone {
+                    let text = background_text(&task_scope, &done, lost);
+                    if lost {
+                        mailbox.lose_call(task_scope.id(), text, true);
+                    } else {
+                        mailbox.settle_call(task_scope.id(), text, true);
+                    }
+                }
+                event_tx_clone.try_send(AgentEvent::BackgroundDone(Box::new(done)));
+            }
         });
+        pending.insert(id.clone(), task);
+        scopes.insert(id, scope);
     }
 
-    let results: Vec<ToolDoneEvent> = set
-        .join_all()
-        .await
-        .into_iter()
-        .zip(spawned_ids)
-        .map(|(r, id)| match r {
-            Ok(out) => out,
-            Err(e) => {
-                error!(error = %e, "tool task panicked");
-                ToolDoneEvent::error(id, format!("internal error: tool panicked: {e}"))
+    enum Next {
+        Result(String, Box<ToolDoneEvent>),
+        Moved(String),
+        Closed,
+    }
+
+    let mut results: Vec<ToolDoneEvent> = Vec::new();
+    while !pending.is_empty() {
+        let next = futures_lite::future::or(
+            async {
+                match result_rx.recv_async().await {
+                    Ok((id, done)) => Next::Result(id, Box::new(done)),
+                    Err(_) => Next::Closed,
+                }
+            },
+            async {
+                match move_rx.recv_async().await {
+                    Ok(id) => Next::Moved(id),
+                    Err(_) => Next::Closed,
+                }
+            },
+        )
+        .await;
+        match next {
+            Next::Result(id, done) => {
+                if pending.remove(&id).is_some() {
+                    results.push(*done);
+                }
             }
-        })
-        .collect();
+            Next::Moved(id) => {
+                let Some(scope) = scopes.get(&id) else {
+                    continue;
+                };
+                if !pending.contains_key(&id) {
+                    continue;
+                }
+                if !scope.claim_receipt() && !scope.receipt() {
+                    if let Some(mailbox) = &mailbox {
+                        mailbox.forget_receipt(&id);
+                    }
+                    continue;
+                }
+                if let Some(task) = pending.remove(&id) {
+                    task.detach();
+                }
+                event_tx.try_send(AgentEvent::ToolMoved {
+                    id: id.clone(),
+                    tool: Arc::from(scope.tool()),
+                    summary: scope.summary().to_owned(),
+                });
+                results.push(ToolDoneEvent {
+                    id,
+                    tool: Arc::from(scope.tool()),
+                    output: ToolOutput::Plain(BACKGROUND_RECEIPT.into()),
+                    is_error: false,
+                    annotation: None,
+                    written_path: None,
+                });
+            }
+            Next::Closed => {
+                for (_, task) in pending.drain() {
+                    task.detach();
+                }
+                break;
+            }
+        }
+    }
 
     let mut all_results = results;
     all_results.extend(immediate_errors);
@@ -1171,6 +1324,53 @@ pub(super) async fn process_tool_calls(
     })?;
     history.push(tool_msg);
     Ok(())
+}
+
+fn call_summary(
+    registry: &crate::tools::registry::ToolRegistry,
+    name: &str,
+    input: &Value,
+) -> String {
+    input
+        .get("command")
+        .and_then(Value::as_str)
+        .or_else(|| input.get("description").and_then(Value::as_str))
+        .map(str::to_owned)
+        .unwrap_or_else(|| registry.resolve_header(name, input))
+}
+
+fn background_text(scope: &CallScope, done: &ToolDoneEvent, lost: bool) -> String {
+    if lost {
+        return format!(
+            "[background] {} (call {}, {}) was lost before it could report a result:\n{}",
+            scope.tool(),
+            scope.id(),
+            scope.summary(),
+            done.output.as_text()
+        );
+    }
+    let status = if done.is_error { "failed" } else { "finished" };
+    format!(
+        "[background] {} {status} (call {}, {}):\n{}",
+        scope.tool(),
+        scope.id(),
+        scope.summary(),
+        done.output.as_text()
+    )
+}
+
+fn panic_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    let message = if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".into()
+    };
+    format!(
+        "{message}\n\nBacktrace:\n{}",
+        std::backtrace::Backtrace::force_capture()
+    )
 }
 
 #[cfg(test)]
@@ -1184,15 +1384,23 @@ mod tests {
     use makima_config::{
         DefaultEffect, Effect, Permission, PermissionRule, PermissionsConfig, ToolKey,
     };
+    use makima_storage::checkpoint::{CheckpointWriter, accept_all};
+    use makima_storage::id::MakimaId;
     use test_case::test_case;
 
     use super::*;
     use crate::AgentMode;
+    use crate::agent::history::History;
+    use crate::call_scope::CallHome;
     use crate::cancel::CancelToken;
     use crate::mcp::test_support::{stub_session, stub_session_with_result};
     use crate::mcp::tool_names;
     use crate::permissions::{
         PERMISSION_DENIED_PREFIX, PermissionAnswer, PermissionManager, TaggedAnswer,
+    };
+    use crate::session_coordinator::{
+        SessionCheckpoint, SessionCoordinatorHandle, SessionCoordinatorParams,
+        builtin_option_definitions,
     };
     use crate::template::Vars;
     use crate::tools::offload::{OFFLOAD_FOOTER_PREFIX, OffloadBackend, OffloadStore};
@@ -4271,6 +4479,382 @@ mod tests {
                 "got: {}",
                 done.output.as_text()
             );
+        });
+    }
+    fn live_background_session() -> (SessionMailbox, SessionCoordinatorHandle) {
+        let id = MakimaId::generate();
+        let mailbox = SessionMailbox::new(id);
+        let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = accept_all();
+        let coordinator = SessionCoordinatorHandle::register(SessionCoordinatorParams {
+            session_id: id,
+            catalog: Default::default(),
+            definitions: builtin_option_definitions(
+                "test/model",
+                [Arc::from("test/model")],
+                false,
+                false,
+                false,
+                makima_providers::ThinkingConfig::Off,
+            ),
+            persisted_options: Default::default(),
+            model_policy: Arc::default(),
+            checkpoint,
+            mailbox: mailbox.clone(),
+        })
+        .unwrap();
+        (mailbox, coordinator)
+    }
+
+    fn slow_tool_ctx(
+        event_tx: &crate::EventSender,
+        session: MakimaId,
+        started: flume::Sender<()>,
+        release: flume::Receiver<()>,
+    ) -> ToolContext {
+        let mut ctx = crate::tools::test_support::stub_ctx_with_session(
+            &AgentMode::Build,
+            Some(event_tx),
+            None,
+            session,
+        );
+        ctx.local_tools = Arc::new(HashMap::from([(
+            SLOW_TOOL.to_owned(),
+            local_tool(ToolAudience::all(), move |_, _| {
+                let started = started.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    let _ = started.send(());
+                    let _ = release.recv_async().await;
+                    Ok(SLOW_OUTPUT.to_owned())
+                })
+            }),
+        )]));
+        pin(&mut ctx);
+        ctx
+    }
+
+    fn one_call(id: &str) -> makima_providers::StreamResponse {
+        makima_providers::StreamResponse {
+            message: makima_providers::Message {
+                role: makima_providers::Role::Assistant,
+                content: vec![makima_providers::ContentBlock::tool_use(
+                    id,
+                    SLOW_TOOL,
+                    json!({}),
+                )],
+                ..Default::default()
+            },
+            usage: makima_providers::TokenUsage::default(),
+            stop_reason: Some(makima_providers::StopReason::EndTurn),
+        }
+    }
+
+    async fn next_message(mailbox: &SessionMailbox) -> String {
+        let wait = async {
+            loop {
+                if let Some(message) = mailbox.drain().into_iter().next() {
+                    break message.user_text().unwrap_or_default().to_owned();
+                }
+                smol::Timer::after(Duration::from_millis(10)).await;
+            }
+        };
+        futures_lite::future::or(wait, async {
+            smol::Timer::after(Duration::from_secs(2)).await;
+            panic!("background result never landed");
+        })
+        .await
+    }
+
+    const SLOW_TOOL: &str = "slow";
+    const SLOW_OUTPUT: &str = "slow done";
+    const SLOW_ID: &str = "call_slow";
+
+    #[test]
+    fn a_call_moved_before_its_permission_check_asks_nobody() {
+        smol::block_on(async {
+            let permissions = Arc::new(PermissionManager::new(
+                PermissionsConfig::default(),
+                PathBuf::from(TEST_ROOT),
+                makima_config::ProjectConfig::discover(Path::new(TEST_ROOT)),
+                Arc::default(),
+            ));
+            let (tx, rx) = flume::unbounded::<crate::Envelope>();
+            let (_response_tx, response_rx) = flume::unbounded::<String>();
+            let mut ctx = stub_ctx_with_permissions(&AgentMode::Build, permissions);
+            ctx.event_tx = crate::EventSender::new(tx);
+            ctx.user_response_rx = Some(Arc::new(async_lock::Mutex::new(response_rx)));
+            let (mut ctx, _hook) =
+                hooked_with(ctx, Some(Permission::Run), RecordingHook::default());
+            let (_run_trigger, run) = CancelToken::new();
+            let scope = Arc::new(CallScope::new(
+                TEST_ID.into(),
+                Arc::from(HOOK_TOOL_NAME),
+                "prompt".into(),
+                None,
+                None,
+                &run,
+                None,
+            ));
+            let _trigger = scope
+                .move_to(CallHome {
+                    id: TEST_ID.into(),
+                    tool: Arc::from(HOOK_TOOL_NAME),
+                    summary: "prompt".into(),
+                })
+                .unwrap();
+            ctx.call = Some(scope);
+            pin(&mut ctx);
+
+            let done = dispatch_pinned(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
+            assert!(done.is_error);
+            assert!(done.output.as_text().contains(MOVED_PERMISSION_ERR));
+            assert_no_permission_request(&rx);
+        });
+    }
+
+    #[test]
+    fn a_move_withdraws_the_permission_prompt_and_frees_the_channel() {
+        smol::block_on(async {
+            let permissions = Arc::new(PermissionManager::new(
+                PermissionsConfig::default(),
+                PathBuf::from(TEST_ROOT),
+                makima_config::ProjectConfig::discover(Path::new(TEST_ROOT)),
+                Arc::default(),
+            ));
+            let (tx, rx) = flume::unbounded::<crate::Envelope>();
+            let (response_tx, response_rx) = flume::unbounded::<String>();
+            let responses = Arc::new(async_lock::Mutex::new(response_rx));
+            let mut ctx = stub_ctx_with_permissions(&AgentMode::Build, permissions);
+            ctx.event_tx = crate::EventSender::new(tx);
+            ctx.user_response_rx = Some(Arc::clone(&responses));
+            let (mut ctx, _hook) =
+                hooked_with(ctx, Some(Permission::Run), RecordingHook::default());
+            let (_run_trigger, run) = CancelToken::new();
+            let scope = Arc::new(CallScope::new(
+                TEST_ID.into(),
+                Arc::from(HOOK_TOOL_NAME),
+                "prompt".into(),
+                None,
+                None,
+                &run,
+                None,
+            ));
+            ctx.call = Some(Arc::clone(&scope));
+            pin(&mut ctx);
+
+            let dispatch = smol::spawn(async move {
+                dispatch_pinned(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await
+            });
+            let prompt = async {
+                loop {
+                    match rx.recv_async().await {
+                        Ok(envelope)
+                            if matches!(envelope.event, AgentEvent::PermissionRequest { .. }) =>
+                        {
+                            break true;
+                        }
+                        Ok(_) => continue,
+                        Err(_) => break false,
+                    }
+                }
+            };
+            let prompted = futures_lite::future::or(prompt, async {
+                smol::Timer::after(Duration::from_secs(2)).await;
+                false
+            })
+            .await;
+            assert!(prompted, "the call must reach the prompt before the move");
+
+            let _trigger = scope
+                .move_to(CallHome {
+                    id: TEST_ID.into(),
+                    tool: Arc::from(HOOK_TOOL_NAME),
+                    summary: "prompt".into(),
+                })
+                .unwrap();
+            let done = dispatch.await;
+            assert!(done.is_error);
+            assert!(
+                done.output.as_text().contains(MOVED_PERMISSION_ERR),
+                "{}",
+                done.output.as_text()
+            );
+            assert!(
+                responses.try_lock().is_some(),
+                "a withdrawn prompt must not hold the channel"
+            );
+            drop(response_tx);
+        });
+    }
+
+    #[test]
+    fn a_moved_call_returns_a_receipt_and_its_result_lands_as_a_message() {
+        smol::block_on(async {
+            let (mailbox, _coordinator) = live_background_session();
+            let (event_tx, events) = flume::unbounded();
+            let event_tx = crate::EventSender::new(event_tx);
+            let (started_tx, started_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            let ctx = slow_tool_ctx(&event_tx, mailbox.session_id(), started_tx, release_rx);
+            let mut history = History::new(Vec::new());
+            let mover = {
+                let mailbox = mailbox.clone();
+                smol::spawn(async move {
+                    started_rx.recv_async().await.unwrap();
+                    mailbox.move_latest().unwrap();
+                })
+            };
+
+            process_tool_calls(
+                one_call(SLOW_ID),
+                &mut RecentCalls::new(),
+                &mut history,
+                &event_tx,
+                &ctx,
+            )
+            .await
+            .unwrap();
+            mover.await;
+
+            let receipt = history
+                .as_slice()
+                .last()
+                .unwrap()
+                .content
+                .iter()
+                .find_map(|block| match block {
+                    makima_providers::ContentBlock::ToolResult { content, .. } => {
+                        Some(content.as_str())
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(receipt, BACKGROUND_RECEIPT);
+            assert_eq!(mailbox.outstanding(), 1);
+
+            release_tx.send(()).unwrap();
+            let message = next_message(&mailbox).await;
+            assert!(message.contains(SLOW_OUTPUT), "{message}");
+            assert_eq!(mailbox.outstanding(), 0);
+
+            let mut moved = false;
+            let mut done = false;
+            while let Ok(envelope) = events.try_recv() {
+                match envelope.event {
+                    AgentEvent::ToolMoved { id, .. } if id == SLOW_ID => moved = true,
+                    AgentEvent::BackgroundDone(event) if event.id == SLOW_ID => done = true,
+                    _ => {}
+                }
+            }
+            assert!(moved, "the UI must hear about the move");
+            assert!(done, "the UI must get the final result");
+        });
+    }
+
+    fn tool_result_text(history: &History) -> String {
+        history
+            .as_slice()
+            .last()
+            .unwrap()
+            .content
+            .iter()
+            .find_map(|block| match block {
+                makima_providers::ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn a_call_that_moves_and_finishes_at_once_never_loses_its_result() {
+        smol::block_on(async {
+            let (mailbox, _coordinator) = live_background_session();
+            let (event_tx, _events) = flume::unbounded();
+            let event_tx = crate::EventSender::new(event_tx);
+            let (started_tx, _started_rx) = flume::bounded(1);
+            let (_release_tx, release_rx) = flume::bounded(1);
+            let mut ctx = slow_tool_ctx(&event_tx, mailbox.session_id(), started_tx, release_rx);
+            let session = mailbox.session_id();
+            ctx.local_tools = Arc::new(HashMap::from([(
+                SLOW_TOOL.to_owned(),
+                local_tool(ToolAudience::all(), move |_, call_ctx| {
+                    let id = call_ctx.tool_use_id.clone().unwrap();
+                    let mailbox = SessionMailbox::open(session).unwrap();
+                    mailbox.move_call(&id).unwrap();
+                    Box::pin(async { Ok(SLOW_OUTPUT.to_owned()) })
+                }),
+            )]));
+            pin(&mut ctx);
+            let mut history = History::new(Vec::new());
+
+            process_tool_calls(
+                one_call(SLOW_ID),
+                &mut RecentCalls::new(),
+                &mut history,
+                &event_tx,
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+            let text = tool_result_text(&history);
+            if text == BACKGROUND_RECEIPT {
+                let message = next_message(&mailbox).await;
+                assert!(message.contains(SLOW_OUTPUT), "{message}");
+            } else {
+                assert!(text.contains(SLOW_OUTPUT), "{text}");
+                assert_eq!(mailbox.outstanding(), 0);
+            }
+        });
+    }
+
+    #[test]
+    fn a_moved_call_that_panics_reports_the_task_lost() {
+        smol::block_on(async {
+            let (mailbox, _coordinator) = live_background_session();
+            let (event_tx, _events) = flume::unbounded();
+            let event_tx = crate::EventSender::new(event_tx);
+            let (started_tx, started_rx) = flume::bounded(1);
+            let (_release_tx, release_rx) = flume::bounded(1);
+            let mut ctx = slow_tool_ctx(&event_tx, mailbox.session_id(), started_tx, release_rx);
+            let (panic_tx, panic_rx) = flume::bounded(1);
+            ctx.local_tools = Arc::new(HashMap::from([(
+                SLOW_TOOL.to_owned(),
+                local_tool(ToolAudience::all(), move |_, _| {
+                    let panic = panic_rx.clone();
+                    Box::pin(async move {
+                        let _ = panic.recv_async().await;
+                        panic!("tool blew up");
+                    })
+                }),
+            )]));
+            pin(&mut ctx);
+            let mut history = History::new(Vec::new());
+            let mover = {
+                let mailbox = mailbox.clone();
+                smol::spawn(async move {
+                    smol::Timer::after(Duration::from_millis(20)).await;
+                    let _ = started_rx.try_recv();
+                    mailbox.move_latest().unwrap();
+                })
+            };
+            let run = smol::spawn(async move {
+                process_tool_calls(
+                    one_call(SLOW_ID),
+                    &mut RecentCalls::new(),
+                    &mut history,
+                    &event_tx,
+                    &ctx,
+                )
+                .await
+                .unwrap();
+            });
+            mover.await;
+            run.await;
+            panic_tx.send(()).unwrap();
+
+            let message = next_message(&mailbox).await;
+            assert!(message.contains("lost"), "{message}");
         });
     }
 }

@@ -134,7 +134,12 @@ pub mod key {
     pub const SCROLL_LINE_UP: Bind = ctrl_bind!('y');
     pub const SCROLL_LINE_DOWN: Bind = ctrl_bind!('e');
     pub const SCROLL_TOP: Bind = ctrl_bind!('g');
-    pub const SCROLL_BOTTOM: Bind = ctrl_bind!('b');
+    pub const SCROLL_BOTTOM: Bind = Bind {
+        code: KeyCode::Char('g'),
+        modifiers: KeyModifiers::CONTROL.union(KeyModifiers::ALT),
+        label: "Ctrl+Alt+G",
+    };
+    pub const BACKGROUND: Bind = ctrl_bind!('b');
     pub const POP_QUEUE: Bind = ctrl_bind!('q');
     pub const DELETE_WORD: Bind = ctrl_bind!('w');
     pub const SEARCH: Bind = ctrl_bind!('f');
@@ -446,6 +451,12 @@ pub const KEYBINDS: &[Keybind] = &[
         label: KeyLabel::Single(key::SCROLL_BOTTOM.label),
         description: "Scroll to bottom",
         context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::BACKGROUND.label),
+        description: "Move the running tool call to the background",
+        context: KeybindContext::Streaming,
         platform: Platform::All,
     },
     Keybind {

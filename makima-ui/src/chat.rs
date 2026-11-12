@@ -241,8 +241,11 @@ impl Chat {
                     ));
                 }
             }
+            AgentEvent::BackgroundDone(e) => self.messages_panel.tool_done(*e),
             AgentEvent::SubagentHistory { .. }
             | AgentEvent::SubagentClosed
+            | AgentEvent::ToolMoved { .. }
+            | AgentEvent::BackgroundLost { .. }
             | AgentEvent::Post(_)
             | AgentEvent::StreamClosed => {}
             AgentEvent::LiveToolBuf { id, body } => {
@@ -1424,6 +1427,30 @@ mod tests {
             history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), &[]).0;
         assert_eq!(display.len(), 1);
         assert!(matches!(&display[0].role, DisplayRole::Tool(t) if t.status == expected));
+    }
+
+    #[test]
+    fn a_moved_bash_row_keeps_its_command_under_the_receipt() {
+        const COMMAND: &str = "cargo test --all";
+        const RECEIPT: &str =
+            "Running in the background. Its result will arrive as a message when it finishes.";
+        let mut chat = chat();
+        let AgentEvent::ToolStart(mut start) = tool_start("t1", "bash") else {
+            unreachable!()
+        };
+        start.summary = COMMAND.into();
+        chat.handle_event(AgentEvent::ToolStart(start), None);
+        chat.handle_event(
+            tool_done("t1", "bash", ToolOutput::Plain(RECEIPT.into())),
+            None,
+        );
+
+        let text = chat.last_message_text();
+        assert!(
+            text.contains(COMMAND),
+            "the command stays on the row: {text}"
+        );
+        assert!(text.contains(RECEIPT), "the receipt is the body: {text}");
     }
 
     #[test]

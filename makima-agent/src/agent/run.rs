@@ -577,10 +577,15 @@ impl<'h> Agent<'h> {
         for message in preamble {
             self.history.push(message);
         }
-        if let Some(mailbox) = &self.mailbox {
-            for message in mailbox.drain() {
-                self.history.push(message);
-            }
+        self.land_mailbox();
+    }
+
+    fn land_mailbox(&mut self) {
+        let Some(mailbox) = &self.mailbox else {
+            return;
+        };
+        for message in mailbox.drain() {
+            self.history.push(message);
         }
     }
 
@@ -802,6 +807,9 @@ impl<'h> Agent<'h> {
         if has_tools {
             let history_len_before = self.history.len();
             self.process_tool_calls(response).await?;
+            // A moved call's result can land between tool rounds; the model
+            // gets it with the results instead of waiting for the next turn.
+            self.land_mailbox();
             self.context_size +=
                 estimate_message_tokens(&self.history.as_slice()[history_len_before..]);
         } else {
@@ -965,6 +973,7 @@ impl<'h> Agent<'h> {
             session_id: self.session_id.clone(),
             cwd,
             tool_use_id: None,
+            call: None,
             user_response_rx: self.user_response_rx.clone(),
             loaded_instructions: self.loaded_instructions.clone(),
             cancel: self.cancel.clone(),

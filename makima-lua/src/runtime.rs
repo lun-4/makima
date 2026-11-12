@@ -591,6 +591,10 @@ pub(crate) struct TaskCell {
     kill_grace: Duration,
     pub(crate) deadline: Cell<Option<Instant>>,
     pub(crate) deadline_secs: Cell<Option<u64>>,
+    /// The model call this task serves, when it is a tool handler.
+    pub(crate) call: Option<Arc<makima_agent::CallScope>>,
+    /// Move the call instead of killing it when the deadline lapses.
+    pub(crate) expire_background: bool,
     /// Notified by `ctx:set_deadline`, so [`until_abandoned`] re-arms on the
     /// new deadline instead of staying parked on the one it started with.
     pub(crate) deadline_changed: Event,
@@ -671,12 +675,37 @@ impl TaskCell {
     /// Whether the task may still act: its scope is open, it is not
     /// cancelled and its deadline has not passed.
     pub(crate) fn is_live(&self) -> bool {
-        self.scope_alive
-            && !self.cancel.is_cancelled()
-            && self
-                .deadline
-                .get()
-                .is_none_or(|deadline| Instant::now() <= deadline)
+        if !self.scope_alive || self.cancel.is_cancelled() {
+            return false;
+        }
+        if self.call.as_ref().is_some_and(|call| call.is_moved()) {
+            return true;
+        }
+        let now = Instant::now();
+        self.deadline
+            .get()
+            .is_none_or(|deadline| now <= deadline || self.expire_to_background())
+    }
+
+    /// Hands the call to the mailbox instead of timing it out. The mailbox
+    /// owns the trigger from here, so `task_stop` can still end it.
+    fn expire_to_background(&self) -> bool {
+        if !self.expire_background || self.deadline.get().is_none() {
+            return false;
+        }
+        let Some(call) = &self.call else {
+            return false;
+        };
+        let Some(session) = call.session() else {
+            return false;
+        };
+        let moved = makima_agent::SessionMailbox::open(session)
+            .ok()
+            .is_some_and(|mailbox| mailbox.move_call(call.id()).is_ok());
+        if moved {
+            self.deadline.set(None);
+        }
+        moved
     }
 
     pub(crate) fn new(
@@ -702,6 +731,8 @@ impl TaskCell {
             kill_grace: KILL_GRACE,
             deadline: Cell::new(deadline),
             deadline_secs: Cell::new(None),
+            call: None,
+            expire_background: false,
             deadline_changed: Event::new(),
             bufs: BufferStore::new(),
             live,
@@ -731,8 +762,10 @@ impl TaskCell {
     fn doomed(&self, now: Instant) -> Option<KillReason> {
         if self.cancel.is_cancelled() {
             Some(KillReason::Cancelled)
+        } else if self.call.as_ref().is_some_and(|call| call.is_moved()) {
+            None
         } else if self.deadline.get().is_some_and(|d| now > d) {
-            Some(KillReason::Deadline)
+            (!self.expire_to_background()).then_some(KillReason::Deadline)
         } else {
             None
         }
@@ -2101,7 +2134,15 @@ async fn until_abandoned<T>(
             let deadline = lock_cell(handle).deadline.get();
             match deadline {
                 Some(dl) if dl <= Instant::now() => {
-                    lock_cell(handle).invalidate_publications();
+                    let mut cell = lock_cell(handle);
+                    if cell.call.as_ref().is_some_and(|call| call.is_moved()) {
+                        cell.deadline.set(None);
+                        continue;
+                    }
+                    if cell.expire_to_background() {
+                        continue;
+                    }
+                    cell.invalidate_publications();
                     break;
                 }
                 Some(dl) => {
@@ -4733,6 +4774,7 @@ async fn run_tool_call(
     };
     let live_id = live.as_ref().map(|l| l.tool_use_id.clone());
     let mut cell = TaskCell::new(cancel.clone(), deadline, live);
+    cell.call = ctx.agent().and_then(|agent| agent.call.clone());
     cell.delegated_tool = Some(ctx.delegated_tool());
     cell.live_sink = live_sink;
     cell.managed_turn = managed_turn;

@@ -2,6 +2,7 @@
 
 pub mod actor;
 pub mod agent;
+pub mod call_scope;
 pub mod cancel;
 pub mod child_guard;
 pub use child_guard::ChildGuard;
@@ -12,11 +13,6 @@ pub mod mcp;
 pub use mcp::config::{McpConfigError, McpConfigErrors, McpServerInfo, McpServerStatus};
 pub use mcp::protocol::PromptRole;
 pub mod modes;
-pub use mcp::{
-    McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpSession, McpSnapshot, McpSnapshotReader,
-};
-pub use modes::{ModeDef, ModeDefSpec, ModeError, ModeId, ModeRegistry};
-pub(crate) mod task_set;
 pub use actor::{
     ActorBackend, ActorError, ActorEvent, ActorLifecycle, ActorSnapshot, ActorStatus, ActorWork,
     AgentActorHandle, AgentContextSnapshot, BackendResult, CompactionStatus, CompletionPolicy,
@@ -32,16 +28,23 @@ pub use agent::{
     close_dangling_tool_calls, end_conversation_detached, find_subdirectory_instructions,
     is_instruction_file,
 };
+pub use call_scope::{CallGuard, CallHome, CallScope, MoveError};
 pub use cancel::{
     CancelMap, CancelToken, CancelTrigger, ReasonedCancelToken, ReasonedCancelTrigger,
 };
-pub use mailbox::{MailboxError, PreparedSessionMailbox, SessionMailbox};
+pub use mailbox::{
+    BackgroundCallInfo, BackgroundMoveError, MailboxError, PreparedSessionMailbox, SessionMailbox,
+};
 pub use makima_config::{AgentConfig, PermissionsConfig, SessionDefaults, ToolOutputLines};
 pub use manager::{
     AgentLimits, AgentManagerHandle, AgentMetadata, AgentNodeSnapshot, AgentRef,
     CurrentManagedTurn, GraphEvents, GraphLifecycle, ManagedPromptWait, ManagerError,
     PromptWaitError, ShutdownReport, TurnPermitLease,
 };
+pub use mcp::{
+    McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpSession, McpSnapshot, McpSnapshotReader,
+};
+pub use modes::{ModeDef, ModeDefSpec, ModeError, ModeId, ModeRegistry};
 pub mod command;
 pub mod config_change;
 pub mod diff;

@@ -40,6 +40,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "task_wait",
             "task_send",
             "task_despawn",
+            "task_stop",
             "todo_write",
             "memory",
             "skill",

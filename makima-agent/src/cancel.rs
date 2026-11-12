@@ -25,15 +25,20 @@ struct Shared {
     publication_gate: Arc<Mutex<()>>,
     event: Event,
     _parent_registration: Option<CancelRegistration>,
+    /// Cleared by [`CancelToken::unlink`], so a parent firing no longer
+    /// reaches this token. A token born under an already-fired parent is
+    /// fired at birth and never needs the link.
+    parent_linked: AtomicBool,
 }
 
 impl Shared {
     fn cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
-            || self
-                ._parent_registration
-                .as_ref()
-                .is_some_and(|registration| registration.source.cancelled())
+            || (self.parent_linked.load(Ordering::Acquire)
+                && self
+                    ._parent_registration
+                    .as_ref()
+                    .is_some_and(|registration| registration.source.cancelled()))
     }
 
     fn fire(&self) {
@@ -55,7 +60,9 @@ impl Shared {
         let children: Vec<_> = state.children.iter().filter_map(Weak::upgrade).collect();
         drop(state);
         for child in children {
-            child.fire_locked();
+            if child.parent_linked.load(Ordering::Acquire) {
+                child.fire_locked();
+            }
         }
         self.event.notify(usize::MAX);
     }
@@ -212,6 +219,7 @@ impl CancelToken {
             publication_gate: Arc::default(),
             event: Event::new(),
             _parent_registration: None,
+            parent_linked: AtomicBool::new(false),
         });
         (CancelTrigger(Arc::clone(&shared)), Self(shared))
     }
@@ -223,6 +231,7 @@ impl CancelToken {
             publication_gate: Arc::default(),
             event: Event::new(),
             _parent_registration: None,
+            parent_linked: AtomicBool::new(false),
         }))
     }
 
@@ -294,6 +303,23 @@ impl CancelToken {
         publication.try_publish()
     }
 
+    /// Removes this token from {parent}'s children, so {parent} firing no
+    /// longer reaches it. A token under a parent that already fired is fired
+    /// here instead, so it never escapes a cancel the parent has not drained.
+    pub fn unlink(&self, parent: &CancelToken) {
+        let mut state = parent.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        if parent.is_cancelled() {
+            drop(state);
+            self.0.fire();
+            return;
+        }
+        self.0.parent_linked.store(false, Ordering::Release);
+        let own = Arc::as_ptr(&self.0);
+        state
+            .children
+            .retain(|child| child.strong_count() > 0 && !std::ptr::eq(child.as_ptr(), own));
+    }
+
     pub fn child(&self) -> (CancelTrigger, Self) {
         let _gate = self
             .0
@@ -310,6 +336,7 @@ impl CancelToken {
                 source: Arc::clone(&self.0),
                 child: child.clone(),
             }),
+            parent_linked: AtomicBool::new(true),
         });
         if self.is_cancelled() {
             shared.fire_locked();
@@ -742,5 +769,39 @@ mod tests {
             let result = token.race(std::future::pending::<()>()).await;
             assert_eq!(result.unwrap_err(), TurnCancellationReason::Shutdown);
         });
+    }
+
+    #[test]
+    fn unlink_stops_propagation_and_leaves_siblings_alone() {
+        let (parent_trigger, parent) = CancelToken::new();
+        let (_unlinked_trigger, unlinked) = parent.child();
+        let (_grandchild_trigger, grandchild) = unlinked.child();
+        let (_sibling_trigger, sibling) = parent.child();
+
+        unlinked.unlink(&parent);
+        parent_trigger.cancel();
+        assert!(sibling.is_cancelled());
+        assert!(!unlinked.is_cancelled());
+        assert!(!grandchild.is_cancelled());
+    }
+
+    #[test]
+    fn unlink_under_an_already_cancelled_parent_fires_the_child() {
+        let (parent_trigger, parent) = CancelToken::new();
+        let (_child_trigger, child) = parent.child();
+        parent_trigger.cancel();
+
+        child.unlink(&parent);
+        assert!(child.is_cancelled());
+    }
+
+    #[test]
+    fn dropping_an_unlinked_child_fires_nothing_upward() {
+        let (_parent_trigger, parent) = CancelToken::new();
+        let (child_trigger, child) = parent.child();
+        child.unlink(&parent);
+        drop(child_trigger);
+        assert!(child.is_cancelled());
+        assert!(!parent.is_cancelled());
     }
 }

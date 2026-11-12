@@ -75,7 +75,7 @@ use makima_agent::tools::ToolFilter;
 use makima_agent::{
     ActorWorkKind, AgentConfig, AgentEvent, AgentId, AgentInput, AgentMode, AgentRef, Envelope,
     ImageMediaType, ImageSource, McpConfigErrors, McpPromptRef, McpSnapshotReader, Post, SharedBuf,
-    SharedMessages, SubagentInfo, TurnCompleteEvent,
+    SharedMessages, SubagentInfo, ToolDoneEvent, ToolOutput, TurnCompleteEvent,
 };
 use makima_commands::{
     AgentTurn, BuiltinOperation, CommandAttachment, CommandContent, CommandError,
@@ -259,7 +259,19 @@ enum TaskIdentity {
     Main,
     Agent(AgentId),
     Restored(String),
+    Background(String),
     Unidentified(usize),
+}
+
+/// A tool call the user moved off its turn with Ctrl+B.
+pub(super) struct BackgroundCallView {
+    id: String,
+    chat_index: usize,
+    tool: String,
+    summary: String,
+    started_at: Instant,
+    /// `None` while the work runs, `Some(is_error)` once it settled.
+    finished: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -385,6 +397,7 @@ pub struct App {
     pub(crate) command_target: TargetHandle,
     pub(super) task_picker: ListPicker<TaskEntry>,
     pub(super) task_picker_original: Option<usize>,
+    pub(super) background_calls: Vec<BackgroundCallView>,
     pub(super) lua_picker: LuaPicker,
     pub(super) theme_picker: ThemePicker,
     pub(super) model_picker: ModelPicker,
@@ -599,6 +612,7 @@ impl App {
             ),
             task_picker: ListPicker::new().with_picker(PickerId::Task),
             task_picker_original: None,
+            background_calls: Vec::new(),
             lua_picker: LuaPicker::new(lua_event_handle.clone()),
             theme_picker: ThemePicker::new(Arc::clone(&theme_provider)),
             model_picker: ModelPicker::new(
@@ -1438,7 +1452,22 @@ impl App {
                     }
                     PickerAction::Select(entry) => {
                         self.task_picker_original = None;
-                        self.active_chat = entry.chat_index;
+                        match &entry.identity {
+                            TaskIdentity::Background(id) => {
+                                self.active_chat = entry.chat_index;
+                                let status = self
+                                    .background_calls
+                                    .iter()
+                                    .find(|call| &call.id == id)
+                                    .map_or("running", |call| match call.finished {
+                                        None => "running",
+                                        Some(true) => "failed",
+                                        Some(false) => "finished",
+                                    });
+                                self.flash(format!("Background task {id}: {status}"));
+                            }
+                            _ => self.active_chat = entry.chat_index,
+                        }
                         vec![]
                     }
                     PickerAction::Close => {
@@ -1624,6 +1653,48 @@ impl App {
         Some(zone)
     }
 
+    fn track_background_call(
+        &mut self,
+        chat_index: usize,
+        id: &str,
+        tool: &std::sync::Arc<str>,
+        summary: &str,
+    ) {
+        if let Some(call) = self.background_calls.iter_mut().find(|call| call.id == id) {
+            call.chat_index = chat_index;
+            call.tool = tool.to_string();
+            call.summary = summary.to_owned();
+            call.finished = None;
+            return;
+        }
+        self.background_calls.push(BackgroundCallView {
+            id: id.to_owned(),
+            chat_index,
+            tool: tool.to_string(),
+            summary: summary.to_owned(),
+            started_at: Instant::now(),
+            finished: None,
+        });
+    }
+
+    fn settle_background_call(&mut self, chat_idx: usize, done: &ToolDoneEvent) {
+        self.state
+            .session_mut()
+            .insert_tool_output(done.id.clone(), done.output.clone());
+        self.chats[chat_idx].handle_event(AgentEvent::BackgroundDone(Box::new(done.clone())), None);
+        if self.background_calls.iter().all(|call| call.id != done.id) {
+            self.track_background_call(chat_idx, &done.id, &done.tool, "");
+        }
+        if let Some(call) = self
+            .background_calls
+            .iter_mut()
+            .find(|call| call.id == done.id)
+        {
+            call.finished = Some(done.is_error);
+        }
+        self.sync_task_picker();
+    }
+
     fn task_entries(&self) -> Vec<TaskEntry> {
         let mut entries: Vec<TaskEntry> = self
             .chats
@@ -1666,6 +1737,27 @@ impl App {
                 .cmp(&b.is_finished())
                 .then_with(|| b.started_at.cmp(&a.started_at))
         });
+        entries.extend(self.background_calls.iter().map(|call| {
+            TaskEntry {
+                name: call
+                    .summary
+                    .lines()
+                    .next()
+                    .filter(|line| !line.is_empty())
+                    .map_or_else(|| call.tool.clone(), str::to_owned),
+                finished: Some(call.finished.is_some()),
+                chat_index: call.chat_index,
+                identity: TaskIdentity::Background(call.id.clone()),
+                parent_chat_index: None,
+                depth: 0,
+                snippet: String::new(),
+                context: match call.finished {
+                    Some(true) => "failed".into(),
+                    _ => String::new(),
+                },
+                started_at: Some(call.started_at),
+            }
+        }));
         Self::order_task_hierarchy(entries)
     }
 
@@ -1803,6 +1895,11 @@ impl App {
         if key::TASKS.matches(key) {
             return Some(self.run_builtin(BuiltinAction::Tasks));
         }
+        if key::BACKGROUND.matches(key) {
+            return Some(vec![Action::MoveToBackground {
+                agent: self.selected_agent_id(),
+            }]);
+        }
         if key::SCROLL_HALF_UP.matches(key) {
             let half = self.chats[self.active_chat].half_page();
             self.active_chat().scroll(half);
@@ -1815,10 +1912,6 @@ impl App {
         }
         if key::SCROLL_TOP.matches(key) {
             self.active_chat().scroll_to_top();
-            return Some(vec![]);
-        }
-        if key::SCROLL_BOTTOM.matches(key) {
-            self.active_chat().enable_auto_scroll();
             return Some(vec![]);
         }
         None
@@ -2164,6 +2257,11 @@ impl App {
 
         if let Some(actions) = self.dispatch_overlay(key) {
             return actions;
+        }
+
+        if key::SCROLL_BOTTOM.matches(key) {
+            self.active_chat().enable_auto_scroll();
+            return vec![];
         }
 
         if !(self.focused_streaming() && is_streaming_stop_key(key))
@@ -2667,6 +2765,47 @@ impl App {
         if let AgentEvent::Post(post) = envelope.event {
             self.push_post(envelope.subagent.as_ref(), post, None);
             return vec![];
+        }
+        // A moved call reports after the turn that took its receipt is gone,
+        // so these skip the run filter like posts do.
+        match &envelope.event {
+            AgentEvent::ToolMoved { id, tool, summary } => {
+                let chat_idx = envelope
+                    .subagent
+                    .as_ref()
+                    .map(|subagent| self.resolve_or_create_chat(subagent))
+                    .unwrap_or(0);
+                self.track_background_call(chat_idx, id, tool, summary);
+                self.sync_task_picker();
+                return vec![];
+            }
+            AgentEvent::BackgroundDone(done) => {
+                let chat_idx = envelope
+                    .subagent
+                    .as_ref()
+                    .map(|subagent| self.resolve_or_create_chat(subagent))
+                    .unwrap_or(0);
+                self.settle_background_call(chat_idx, done);
+                return vec![];
+            }
+            AgentEvent::BackgroundLost { id, tool, reason } => {
+                let done = ToolDoneEvent {
+                    id: id.clone(),
+                    tool: std::sync::Arc::clone(tool),
+                    output: ToolOutput::Plain(format!("Background task lost: {reason}").into()),
+                    is_error: true,
+                    annotation: None,
+                    written_path: None,
+                };
+                let chat_idx = envelope
+                    .subagent
+                    .as_ref()
+                    .map(|subagent| self.resolve_or_create_chat(subagent))
+                    .unwrap_or(0);
+                self.settle_background_call(chat_idx, &done);
+                return vec![];
+            }
+            _ => {}
         }
         self.adopt_actor_presentation(&envelope);
         let presentation = envelope.presentation();
