@@ -62,7 +62,7 @@ makima acp --yolo
 makima --no-jit acp
 ```
 
-`makima acp` only takes `-m` / `--model` and `--yolo` as subcommand flags. Global flags like `--no-jit` must come before the subcommand (`makima --no-jit acp`, not `makima acp --no-jit`).
+`makima acp` only takes `-m` / `--model`, `--yolo` and `--automode` as subcommand flags. Global flags like `--no-jit` must come before the subcommand (`makima --no-jit acp`, not `makima acp --no-jit`). The tool flags apply to every ACP session: `makima --allowed-tools read,grep acp`.
 
 When the client closes stdin, the prompt still running finishes and gets its response, and subagents still working in the background finish too, along with the turns their results start, then the server exits. Permission requests and questions that come after that are refused, since the client can no longer answer them. Send `session/cancel` first to stop the prompt instead.
 
