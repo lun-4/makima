@@ -530,7 +530,7 @@ impl HeadlessBackend {
             loaded_instructions: Default::default(),
             cancel: CancelToken::none(),
             mcp: self.mcp.clone(),
-            deadline: Deadline::None,
+            deadline: Deadline::default(),
             config: self.params.config.clone(),
             tool_filter: Arc::clone(tools.filter()),
             request_tools: Some(tools),

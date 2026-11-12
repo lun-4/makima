@@ -978,7 +978,7 @@ impl<'h> Agent<'h> {
             loaded_instructions: self.loaded_instructions.clone(),
             cancel: self.cancel.clone(),
             mcp: self.mcp.clone(),
-            deadline: Deadline::None,
+            deadline: Deadline::default(),
             config: self.config.clone(),
             tool_filter: Arc::clone(self.tools.filter()),
             request_tools: Some(self.tools.clone()),

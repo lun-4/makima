@@ -137,9 +137,9 @@ async fn wait_for_gate(
     }
     let mut lock = Box::pin(entry.gate.lock_arc());
     let mut cancel_fut = Box::pin(cancel.cancelled());
-    let mut timer: Option<Pin<Box<dyn Future<Output = ()> + Send>>> = match deadline {
-        Deadline::None => None,
-        Deadline::At(instant) => Some(Box::pin(async move {
+    let mut timer: Option<Pin<Box<dyn Future<Output = ()> + Send>>> = match deadline.instant() {
+        None => None,
+        Some(instant) => Some(Box::pin(async move {
             smol::Timer::after(instant.saturating_duration_since(Instant::now())).await;
         })),
     };
@@ -241,13 +241,13 @@ mod tests {
             let (_trigger, cancel) = CancelToken::new();
             let held = PathBuf::from("/reclaim/held");
             let guard = locks
-                .acquire(held.clone(), &[], &cancel, Deadline::None)
+                .acquire(held.clone(), &[], &cancel, Deadline::default())
                 .await
                 .unwrap();
             for i in 0..RETAIN_INTERVAL + 8 {
                 let k = PathBuf::from(format!("/reclaim/idle/{i}"));
                 let _ = locks
-                    .acquire(k, &[], &cancel, Deadline::None)
+                    .acquire(k, &[], &cancel, Deadline::default())
                     .await
                     .unwrap();
             }
@@ -256,7 +256,7 @@ mod tests {
             // quiescent entries; the held entry must survive.
             let k = PathBuf::from("/reclaim/new");
             let _ = locks
-                .acquire(k, &[], &cancel, Deadline::None)
+                .acquire(k, &[], &cancel, Deadline::default())
                 .await
                 .unwrap();
             let entries = locks.inner.entries.lock().expect("lock registry poisoned");
@@ -279,7 +279,7 @@ mod tests {
             let (_trigger, cancel) = CancelToken::new();
             let k = PathBuf::from("/roundtrip");
             let guard = locks
-                .acquire(k.clone(), &[], &cancel, Deadline::None)
+                .acquire(k.clone(), &[], &cancel, Deadline::default())
                 .await
                 .unwrap();
             // A second independent owner queues: it cannot acquire while held.
@@ -287,7 +287,7 @@ mod tests {
             let cancel2 = cancel.clone();
             let second = smol::spawn(async move {
                 locks2
-                    .acquire(k.clone(), &[], &cancel2, Deadline::None)
+                    .acquire(k.clone(), &[], &cancel2, Deadline::default())
                     .await
                     .unwrap()
             });

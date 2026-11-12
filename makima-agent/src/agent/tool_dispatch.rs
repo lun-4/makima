@@ -148,14 +148,16 @@ pub async fn run(
                 .unwrap_or_else(|error| error.into_inner())
                 .take()
         });
-    let output_deadline = finalization.as_ref().map_or(ctx.deadline, |metadata| {
-        let deadline = metadata.deadline.map_or(Deadline::None, Deadline::At);
-        if metadata.terminal_cleanup {
-            deadline
-        } else {
-            deadline.min(ctx.deadline)
-        }
-    });
+    let output_deadline = finalization
+        .as_ref()
+        .map_or(ctx.deadline.clone(), |metadata| {
+            let deadline = Deadline::from(metadata.deadline);
+            if metadata.terminal_cleanup {
+                deadline
+            } else {
+                deadline.min(&ctx.deadline)
+            }
+        });
     let mut output_ctx = ctx.clone();
     output_ctx.deadline = output_deadline;
     let output_hook = hook.as_ref().map(|hook| Hook {
@@ -178,10 +180,10 @@ pub async fn run(
     {
         opts.prepare_for_output_hook(text);
     }
-    let deadline = match output_deadline {
-        Deadline::At(deadline) => Some(deadline),
-        Deadline::None => pending.as_ref().and_then(|opts| opts.deadline),
-    };
+    let deadline = output_ctx
+        .deadline
+        .instant()
+        .or_else(|| pending.as_ref().and_then(|opts| opts.deadline));
     let denied = if let Some(hook) = &output_hook {
         hook.filter_output(&mut done, deadline, pending.as_mut())
             .await
@@ -219,10 +221,7 @@ pub async fn run(
             limits: OutputLimits::from_config(&ctx.config),
         };
         let apply = opts.apply(text, Some(store));
-        let deadline = match ctx.deadline {
-            Deadline::At(deadline) => Some(deadline),
-            Deadline::None => None,
-        };
+        let deadline = ctx.deadline.instant();
         match finalize_output(apply, deadline, ctx).await {
             Ok(limited) => done.output = ToolOutput::Plain(limited.into()),
             Err(reason) => {
@@ -415,10 +414,7 @@ impl<'a> Hook<'a> {
     /// answer would inherit a window the call already used up.
     fn window(&self) -> Instant {
         let cap = Instant::now() + HOOK_CHAIN_MAX;
-        match self.ctx.deadline {
-            Deadline::At(at) => at.min(cap),
-            Deadline::None => cap,
-        }
+        self.ctx.deadline.instant().map_or(cap, |at| at.min(cap))
     }
 }
 
@@ -827,7 +823,7 @@ async fn run_native_tool(
                     key.clone(),
                     &ctx.write_lock_chain,
                     &ctx.cancel,
-                    ctx.deadline,
+                    ctx.deadline.clone(),
                 )
                 .await
             {
@@ -1027,7 +1023,7 @@ async fn enforce_permission(
         };
         let tool_key = ToolKey::native(name);
         let (withdraw_trigger, ask_cancel) = ctx.cancel.child();
-        let decision = async {
+        let decision = ctx.deadline.paused_while(async {
             ctx.permissions
                 .enforce(
                     &tool_key,
@@ -1040,7 +1036,7 @@ async fn enforce_permission(
                 )
                 .await
                 .map_err(|e| e.to_string())
-        };
+        });
         let withdrawn = async {
             match &ctx.call {
                 Some(call) => call.moved().await,
@@ -1085,7 +1081,7 @@ async fn execute_mcp_tool(
         return done(MOVED_PERMISSION_ERR.into(), true);
     }
     let (withdraw_trigger, ask_cancel) = ctx.cancel.child();
-    let decision = async {
+    let decision = ctx.deadline.paused_while(async {
         ctx.permissions
             .enforce(
                 &perm_tool,
@@ -1098,7 +1094,7 @@ async fn execute_mcp_tool(
             )
             .await
             .map_err(|e| e.to_string())
-    };
+    });
     let withdrawn = async {
         match &ctx.call {
             Some(call) => call.moved().await,
@@ -1455,6 +1451,16 @@ mod tests {
     /// Real elapsed time inside the call, so the gap between the two stages'
     /// windows is a measurement rather than a race.
     const HOOK_SLOW_RUN: Duration = Duration::from_millis(20);
+    const DEADLINE_PROBE_NAME: &str = "deadline_probe";
+    const DEADLINE_PROBE_SCOPE: &str = "probe";
+    const DEADLINE_PROBE_HELD: &str = "deadline held";
+    /// Short enough to outlive in a test, long enough that the prompt cannot
+    /// open after it.
+    const PROBE_BUDGET: Duration = Duration::from_millis(20);
+    /// Longer than the budget, so the answer lands after the original deadline.
+    const PROMPT_ANSWER_DELAY: Duration = Duration::from_millis(60);
+    /// How far past the original deadline the probe checks its budget.
+    const PROBE_OVERRUN: Duration = Duration::from_millis(5);
 
     fn recent_calls(entries: &[(&str, Value)]) -> RecentCalls {
         let mut rc = RecentCalls::new();
@@ -2030,7 +2036,7 @@ mod tests {
             let (trigger, token) = CancelToken::new();
             let mut ctx = build_ctx();
             ctx.cancel = token;
-            ctx.deadline = caller.map_or(Deadline::None, Deadline::At);
+            ctx.deadline = Deadline::from(caller);
             let (ctx, recording) = hooked_with(
                 ctx,
                 None,
@@ -2069,7 +2075,7 @@ mod tests {
         smol::block_on(async {
             let at = Instant::now() + HOOK_CALL_DEADLINE;
             let mut ctx = build_ctx();
-            ctx.deadline = Deadline::At(at);
+            ctx.deadline = Deadline::at(at);
             let (trigger, token) = CancelToken::new();
             ctx.cancel = token;
             let (ctx, hook) = hooked_ctx(ctx);
@@ -3639,6 +3645,125 @@ mod tests {
                 "error should be the permission-denied message, got: {}",
                 done.output.as_text()
             );
+        });
+    }
+
+    /// Reads its budget the way `code_execution` does, but only once the
+    /// original deadline is safely past, so an un-paused deadline is spent.
+    struct DeadlineProbe {
+        original_deadline: Instant,
+    }
+
+    struct DeadlineProbeInvocation {
+        original_deadline: Instant,
+    }
+
+    impl ToolInvocation for DeadlineProbeInvocation {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain(DEADLINE_PROBE_NAME.into()))
+        }
+        fn permission_scopes(
+            &self,
+            _session_id: Option<&SessionRef>,
+        ) -> BoxFuture<'_, Option<PermissionScopes>> {
+            Box::pin(std::future::ready(Some(PermissionScopes::single(
+                DEADLINE_PROBE_SCOPE.into(),
+            ))))
+        }
+        fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
+            Box::pin(async move {
+                smol::Timer::at(self.original_deadline + PROBE_OVERRUN).await;
+                match ctx.deadline.check() {
+                    Ok(()) => Ok(ToolOutput::Plain(DEADLINE_PROBE_HELD.into())).into(),
+                    Err(reason) => Err(reason).into(),
+                }
+            })
+        }
+    }
+
+    impl Tool for DeadlineProbe {
+        fn name(&self) -> &str {
+            DEADLINE_PROBE_NAME
+        }
+        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+            "deadline probe".into()
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false})
+        }
+        fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(DeadlineProbeInvocation {
+                original_deadline: self.original_deadline,
+            }))
+        }
+    }
+
+    /// Every rule absent, so the manager asks.
+    fn prompting_ctx() -> ToolContext {
+        let permissions = Arc::new(PermissionManager::new(
+            PermissionsConfig::default(),
+            PathBuf::from(TEST_ROOT),
+            makima_config::ProjectConfig::discover(Path::new(TEST_ROOT)),
+            Arc::default(),
+        ));
+        stub_ctx_with_permissions(&AgentMode::Build, permissions)
+    }
+
+    fn probe_ctx(mut ctx: ToolContext) -> (ToolContext, Instant) {
+        let original_deadline = Instant::now() + PROBE_BUDGET;
+        ctx.deadline = Deadline::at(original_deadline);
+        ctx.registry = registered(Arc::new(DeadlineProbe { original_deadline }));
+        (ctx, original_deadline)
+    }
+
+    #[test]
+    fn time_on_a_permission_prompt_does_not_spend_the_deadline() {
+        smol::block_on(async {
+            let (mut ctx, original_deadline) = probe_ctx(prompting_ctx());
+            let (event_tx, events) = flume::unbounded::<crate::Envelope>();
+            let (answer_tx, answer_rx) = flume::unbounded();
+            ctx.event_tx = crate::EventSender::new(event_tx);
+            ctx.user_response_rx = Some(Arc::new(async_lock::Mutex::new(answer_rx)));
+
+            let user = async {
+                while !matches!(
+                    events.recv_async().await.unwrap().event,
+                    AgentEvent::PermissionRequest { .. }
+                ) {}
+                smol::Timer::after(PROMPT_ANSWER_DELAY).await;
+                answer_tx
+                    .send(TaggedAnswer::new(TEST_ID, PermissionAnswer::AllowOnce).encode())
+                    .unwrap();
+            };
+            let (done, ()) = futures_lite::future::zip(
+                dispatch(&ctx, DEADLINE_PROBE_NAME, &serde_json::json!({})),
+                user,
+            )
+            .await;
+
+            assert!(!done.is_error, "got: {}", done.output.as_text());
+            assert_eq!(done.output.as_text(), DEADLINE_PROBE_HELD);
+            assert!(
+                ctx.deadline.instant().unwrap() > original_deadline,
+                "the pause must move the deadline every clone shares"
+            );
+        });
+    }
+
+    #[test]
+    fn a_call_without_a_prompt_still_times_out() {
+        smol::block_on(async {
+            let ctx = ruled_ctx(
+                &AgentMode::Build,
+                ToolKey::native(DEADLINE_PROBE_NAME),
+                Effect::Allow,
+            );
+            let (ctx, _) = probe_ctx(ctx);
+
+            let done = dispatch(&ctx, DEADLINE_PROBE_NAME, &serde_json::json!({})).await;
+
+            assert!(done.is_error, "got: {}", done.output.as_text());
+            assert_eq!(done.output.as_text(), DEADLINE_EXCEEDED);
         });
     }
 

@@ -1028,7 +1028,7 @@ mod tests {
             "the session owns the whole run, so it is not per-call state"
         );
         assert!(
-            matches!(agent.deadline, Deadline::At(_)),
+            agent.deadline.instant().is_some(),
             "the parent deadline must be inherited, not discarded"
         );
         assert_eq!(agent.tool_output_lines, ToolOutputLines::default());
