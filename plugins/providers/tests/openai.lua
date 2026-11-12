@@ -7,6 +7,7 @@ local API = "https://api.openai.com/v1"
 local PROXY = "https://proxy.example.invalid/v1"
 local ACCOUNT = "account-a"
 local OTHER_ACCOUNT = "account-b"
+local SESSION = "session-1"
 local HOUR_MS = 3600000
 local DONE = "data: [DONE]\n\n"
 local TRANSPORT_ERROR = "could not connect: connection refused"
@@ -343,6 +344,27 @@ t.case("chatgpt_login_uses_the_fixed_backend_and_account_header", function()
   t.eq(sent.url, PROXY .. "/chat/completions")
   t.eq(header(sent.headers, "authorization"), "Bearer access-1")
   t.eq(header(sent.headers, "chatgpt-account-id"), nil)
+end)
+
+t.case("chatgpt_plan_requests_pin_the_session_cache_key", function()
+  local ctx, instance = prepared({}, { id = "gpt-5.5" }, tokens(), { responses_sse("ok"), responses_sse("ok") })
+  local turn = request("gpt-5.5", { session_id = SESSION })
+  assert(instance.stream(ctx, turn, t.recorder()))
+  assert(instance.stream(ctx, turn, t.recorder()))
+  t.eq(#ctx.requests, 2)
+  for _, sent in ipairs(ctx.requests) do
+    t.eq(body(sent).prompt_cache_key, SESSION)
+    t.eq(header(sent.headers, "session-id"), SESSION)
+    t.eq(header(sent.headers, "x-client-request-id"), SESSION)
+  end
+end)
+
+t.case("api_key_requests_carry_no_session_cache_key", function()
+  local ctx = stream({ [KEY_ENV] = "sk-1" }, { id = "gpt-5.5" }, nil, { responses_sse("ok") }, { session_id = SESSION })
+  local sent = ctx.requests[1]
+  t.eq(body(sent).prompt_cache_key, nil)
+  t.eq(header(sent.headers, "session-id"), nil)
+  t.eq(header(sent.headers, "x-client-request-id"), nil)
 end)
 
 t.case("chatgpt_tokens_win_over_the_api_key_and_clamp_plan_windows", function()
