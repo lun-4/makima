@@ -227,7 +227,7 @@ impl OrchestrationServices for AgentOrchestration {
         template.tool_use_id = None;
         template.live_sink = None;
         template.cancel = CancelToken::none();
-        template.deadline = Deadline::None;
+        template.deadline = Deadline::default();
         template.loaded_instructions = LoadedInstructions::new();
         template.pending_output_limits = None;
         template.turn_bindings = Arc::new(TurnToolBindings::default());

@@ -924,7 +924,7 @@ async fn call_tool(
         if let Some(secs) = o.get::<Option<u64>>("timeout")? {
             tctx.deadline = tctx
                 .deadline
-                .min(Deadline::after(Duration::from_secs(secs)));
+                .min(&Deadline::after(Duration::from_secs(secs)));
         }
         on_buf = o.get::<Option<Function>>("on_live_buf")?;
         on_ann = o.get::<Option<Function>>("on_annotation")?;
@@ -1019,8 +1019,8 @@ async fn permission_prompt(
         force_prompt,
     };
     let result = tctx
-        .permissions
-        .enforce(
+        .deadline
+        .paused_while(tctx.permissions.enforce(
             &tool_key,
             &perm_scopes,
             &tctx.event_tx,
@@ -1028,7 +1028,7 @@ async fn permission_prompt(
             tctx.tool_use_id.as_deref().unwrap_or(""),
             &tctx.cancel,
             tctx.restrict_write_to().as_deref(),
-        )
+        ))
         .await;
     try_pair!(invocation.validate(&lua));
     match result {
