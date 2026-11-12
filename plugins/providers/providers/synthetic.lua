@@ -6,7 +6,6 @@ local thinking = require("providers.thinking")
 local M = {}
 
 local QUOTA_URL = "https://api.synthetic.new/v2/quotas"
-local FIVE_HOURS = 5
 local FULL = 100
 M.EMPTY_USAGE_ERROR =
   "Synthetic usage response contained no recognisable quota lane; the endpoint schema likely changed"
@@ -32,39 +31,27 @@ local function lane(value)
   return type(value) == "table" and value or nil
 end
 
--- v3 rolling lanes, with the v2 `subscription` lane as the five-hour
--- fallback.
+-- Synthetic plans only have a weekly credit limit; the older five-hour lanes
+-- (`rollingFiveHourLimit`, the request-based `subscription` block) are gone.
+-- The weekly lane is `planWeeklyLimit` in the current API and `weeklyTokenLimit`
+-- in the older one.
 function M.parse_quotas(body)
   if type(body) ~= "table" then
     return nil, http.config_error(M.EMPTY_USAGE_ERROR)
   end
-  local limits = {}
-  local rolling, subscription, weekly =
-    lane(body.rollingFiveHourLimit), lane(body.subscription), lane(body.weeklyTokenLimit)
-  if rolling and number(rolling.max) and number(rolling.remaining) then
-    limits[#limits + 1] = {
-      kind = { Hours = FIVE_HOURS },
-      percentage = M.percentage(rolling.max - rolling.remaining, rolling.max),
-      reset_at = clock.parse_rfc3339(rolling.nextTickAt),
-    }
-  elseif subscription and number(subscription.limit) and number(subscription.requests) then
-    limits[#limits + 1] = {
-      kind = { Hours = FIVE_HOURS },
-      percentage = M.percentage(subscription.requests, subscription.limit),
-      reset_at = clock.parse_rfc3339(subscription.renewsAt),
-    }
-  end
-  if weekly and number(weekly.percentRemaining) then
-    limits[#limits + 1] = {
-      kind = { Weekly = {} },
-      percentage = M.percentage(FULL - weekly.percentRemaining, FULL),
-      reset_at = clock.parse_rfc3339(weekly.nextRegenAt),
-    }
-  end
-  if #limits == 0 then
+  local weekly = lane(body.planWeeklyLimit) or lane(body.weeklyTokenLimit)
+  if not weekly or not number(weekly.percentRemaining) then
     return nil, http.config_error(M.EMPTY_USAGE_ERROR)
   end
-  return { limits = limits }
+  return {
+    limits = {
+      {
+        kind = { Weekly = {} },
+        percentage = M.percentage(FULL - weekly.percentRemaining, FULL),
+        reset_at = clock.parse_rfc3339(weekly.nextRegenAt),
+      },
+    },
+  }
 end
 
 M.def = {

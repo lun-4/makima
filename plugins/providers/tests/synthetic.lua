@@ -5,14 +5,13 @@ local t = require("makima.test_helpers")
 
 local Y2K_MS = 946684800000
 local QUOTA_URL = "https://api.synthetic.new/v2/quotas"
-local V3_BODY = [[{
+local CURRENT_BODY = [[{
   "subscription": {"limit": 500, "requests": 0, "renewsAt": "2030-01-01T00:00:00.000Z"},
-  "rollingFiveHourLimit": {"remaining": 300, "max": 1000, "limited": false, "nextTickAt": "2000-01-01T00:00:00.000Z"},
-  "weeklyTokenLimit": {"percentRemaining": 50.0, "maxCredits": "$24.00", "nextRegenAt": "2000-01-01T00:00:00.000Z"}
+  "search": {"hourly": {"limit": 250, "requests": 0, "renewsAt": "2000-01-01T00:00:00.000Z"}},
+  "planWeeklyLimit": {"percentRemaining": 50.0, "nextRegenAt": "2000-01-01T00:00:00.000Z", "nextRegenPercent": 2}
 }]]
-local V2_BODY = [[{
-  "subscription": {"limit": 500, "requests": 250, "renewsAt": "2000-01-01T00:00:00.000Z"},
-  "search": {"hourly": {"limit": 10, "requests": 2}}
+local LEGACY_BODY = [[{
+  "weeklyTokenLimit": {"percentRemaining": 50.0, "maxCredits": "$24.00", "nextRegenAt": "2000-01-01T00:00:00.000Z"}
 }]]
 
 local function usage(body)
@@ -26,17 +25,20 @@ local function usage(body)
   return result[1], result[2]
 end
 
-t.case("v3_rolling_lanes", function()
-  t.same(usage(V3_BODY), {
-    limits = {
-      { kind = { Hours = 5 }, percentage = 70, reset_at = Y2K_MS },
-      { kind = { Weekly = {} }, percentage = 50, reset_at = Y2K_MS },
-    },
-  })
+t.case("weekly_lane", function()
+  local expected = { limits = { { kind = { Weekly = {} }, percentage = 50, reset_at = Y2K_MS } } }
+  t.same(usage(CURRENT_BODY), expected)
+  t.same(usage(LEGACY_BODY), expected)
 end)
 
-t.case("v2_subscription_fallback", function()
-  t.same(usage(V2_BODY), { limits = { { kind = { Hours = 5 }, percentage = 50, reset_at = Y2K_MS } } })
+t.case("five_hour_lanes_are_ignored", function()
+  local two_lanes = [[{
+    "subscription": {"limit": 500, "requests": 250, "renewsAt": "2000-01-01T00:00:00.000Z"},
+    "rollingFiveHourLimit": {"remaining": 300, "max": 1000, "limited": false, "nextTickAt": "2000-01-01T00:00:00.000Z"}
+  }]]
+  local result, err = usage(two_lanes)
+  t.eq(result, nil)
+  t.same(err, http.config_error(synthetic.EMPTY_USAGE_ERROR))
 end)
 
 t.case("malformed_or_empty_bodies_fail", function()
