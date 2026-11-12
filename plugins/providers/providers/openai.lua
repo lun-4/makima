@@ -554,7 +554,7 @@ local function stream(state, config, model, ctx, request, emit)
     -- The ChatGPT backend keeps its fixed URL; base URL overrides apply to
     -- the platform API only.
     local base = state.tokens and M.BACKEND_URL or state.base
-    return http.post_stream(ctx, base .. RESPONSES_PATH, headers(state, extra, true), body, responses.stream, emit)
+    return responses.post_stream(ctx, base .. RESPONSES_PATH, headers(state, extra, true), body, emit)
   end)
 end
 
@@ -566,7 +566,7 @@ function M.route_stream(client, ctx, request, emit)
   local dialect = thinking.dialects.standard
   if M.plan_window(request.model.id) then
     local body = responses.build_request(request, responses.reasoning(request.thinking, dialect, max))
-    return http.post_stream(ctx, client.base .. RESPONSES_PATH, client.headers(), body, responses.stream, emit)
+    return responses.post_stream(ctx, client.base .. RESPONSES_PATH, client.headers(), body, emit)
   end
   local body = chat.build_request(request, { max_tokens_field = MAX_TOKENS_FIELD, include_stream_usage = true })
   body.reasoning_effort = thinking.effort(request.thinking, dialect, max)
