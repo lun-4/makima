@@ -55,7 +55,7 @@ const SHADOWED_TOOL: &str = "skill";
 const REPLACEMENT_PLUGIN: &str = "my_skill";
 const REPLACEMENT_DESC: &str = "took the builtin name over";
 const ZERO_LINES_OPTION: &str = "max_output_lines";
-const ZERO_BASH_COMMAND: &str = "printf '%s%s\\n' X Y";
+const BASH_PROBE_COMMAND: &str = "printf '%s%s\\n' X Y";
 const ZERO_BASH_TIMEOUT_SECS: u64 = 10;
 
 struct FakeCommandHost;
@@ -4248,11 +4248,29 @@ fn parked_handler_reports_its_hook_finish_reply_on_deadline() {
 }
 
 const BASH_CANCEL_ID: &str = "bash-cancel-1";
-/// Mirrors the cancelled marker in `plugins/lib/makima/partial.lua`.
-const BASH_PARTIAL_MARKER: &str = "[cancelled by user; output above is partial]";
+/// Mirrors the cancelled marker in `plugins/lib/makima/partial.lua`, split
+/// around the elapsed time.
+const BASH_PARTIAL_MARKER_HEAD: &str = "[cancelled by user after ";
+const BASH_PARTIAL_MARKER_TAIL: &str = ", output above is partial]";
 /// Assembled by printf so the probe never appears in the command header.
 const BASH_PARTIAL_PROBE: &str = "XY";
 const BASH_PARTIAL_CMD: &str = "printf '%s%s\\n' X Y && sleep 30";
+
+/// The marker carries how long the tool ran, so only its edges and a duration
+/// in between are fixed.
+fn assert_partial_marker(marker: &str) {
+    let elapsed = marker
+        .strip_prefix(BASH_PARTIAL_MARKER_HEAD)
+        .and_then(|rest| rest.strip_suffix(BASH_PARTIAL_MARKER_TAIL))
+        .unwrap_or_else(|| panic!("unexpected marker: {marker}"));
+    assert!(
+        elapsed.ends_with('s')
+            && elapsed
+                .chars()
+                .all(|c| c.is_ascii_digit() || "dhms".contains(c)),
+        "unexpected elapsed time in marker: {marker}"
+    );
+}
 
 /// Esc mid-stream on a real bash run: the lines printed so far come back as
 /// an error reply ending in the marker, not a bare "cancelled".
@@ -4298,7 +4316,22 @@ fn cancelled_bash_keeps_streamed_output_as_partial() {
         .recv_timeout(CANCEL_TEST_TIMEOUT)
         .expect("cancelled bash must settle")
         .expect_err("a partial reply is an error reply");
-    assert_eq!(err, format!("{BASH_PARTIAL_PROBE}\n{BASH_PARTIAL_MARKER}"));
+    let marker = err
+        .strip_prefix(&format!("{BASH_PARTIAL_PROBE}\n"))
+        .expect("streamed output precedes the marker");
+    assert_partial_marker(marker);
+}
+
+/// A run that finishes on its own carries no marker: the elapsed time only
+/// belongs on a reply the user cut.
+#[test]
+fn completed_bash_reports_plain_output() {
+    let (reg, host) = builtins_host();
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, _session) = offload_ctx(&host, &disk_store(dir.path()));
+    let output =
+        exec_with_ctx(&reg, "bash", json!({ "command": BASH_PROBE_COMMAND }), &ctx).unwrap();
+    assert_eq!(output, BASH_PARTIAL_PROBE);
 }
 
 #[test]
@@ -6922,7 +6955,7 @@ fn timed_out_bash_keeps_hooked_partial_output_offloaded() {
     ));
     let output = done.output.as_text();
     assert!(done.is_error, "{output}");
-    let trailer = format!("[timed out after {BASH_TIMEOUT_SECS}s; output above is partial]");
+    let trailer = format!("[timed out after {BASH_TIMEOUT_SECS}s, output above is partial]");
     assert!(output.ends_with(&trailer), "{output}");
     let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
     assert_eq!(files.len(), 1);
@@ -6973,7 +7006,7 @@ fn bash_zero_output_override_finishes_on_exit() {
     let output = exec_with_ctx(
         &reg,
         "bash",
-        json!({ "command": ZERO_BASH_COMMAND, "timeout": ZERO_BASH_TIMEOUT_SECS }),
+        json!({ "command": BASH_PROBE_COMMAND, "timeout": ZERO_BASH_TIMEOUT_SECS }),
         &ctx,
     )
     .unwrap();
@@ -7063,7 +7096,10 @@ fn cancelled_bash_large_output_keeps_partial_marker_last() {
         .expect("cancelled bash must settle")
         .expect_err("a partial reply is an error reply");
     worker.join().unwrap();
-    assert!(err.ends_with(BASH_PARTIAL_MARKER), "{err}");
+    assert_partial_marker(
+        err.rsplit_once('\n')
+            .map_or(err.as_str(), |(_, marker)| marker),
+    );
     assert_eq!(
         std::fs::read_to_string(only_offloaded_file(dir.path())).unwrap(),
         format!(
@@ -7177,12 +7213,19 @@ fn code_execution_cancel_deferred_output_offloads() {
         .await
     });
     let output = reply.output.unwrap_err();
-    assert!(output.ends_with(BASH_PARTIAL_MARKER), "{output}");
+    assert_partial_marker(
+        output
+            .rsplit_once('\n')
+            .map_or(output.as_str(), |(_, marker)| marker),
+    );
     let files = fs.files();
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].1, CODE_EXECUTION_CANCEL_BODY.as_bytes());
     let buf = recv_live_buf(&events_rx, "interpreter-cancel-output").unwrap();
-    assert_eq!(buf.take().text().matches(BASH_PARTIAL_MARKER).count(), 1);
+    assert_eq!(
+        buf.take().text().matches(BASH_PARTIAL_MARKER_HEAD).count(),
+        1
+    );
     drop(host);
 }
 
@@ -7218,8 +7261,8 @@ makima.api.register_tool({
             clear = function() end,
         }
         local limits = { max_lines = 0 }
-        local reply = partial.cut(view, input.body, "cancelled", 10, limits)
-        local repeated = partial.cut(view, "changed", "timeout", 10, limits)
+        local reply = partial.cut(view, input.body, "cancelled", 10, os.time() - 3, limits)
+        local repeated = partial.cut(view, "changed", "timeout", 10, os.time(), limits)
         assert(reply == repeated and paints == 1 and closes == 1)
         assert(reply.llm_output == input.body and limits.trailer == nil)
         return reply
@@ -7280,7 +7323,11 @@ fn partial_cut_memoizes_raw_reply_and_paints_marker_once() {
         &ctx,
     )
     .unwrap_err();
-    assert!(output.ends_with(BASH_PARTIAL_MARKER), "{output}");
+    assert_partial_marker(
+        output
+            .rsplit_once('\n')
+            .map_or(output.as_str(), |(_, marker)| marker),
+    );
     let files = fs.files();
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].1, DEFERRED_CALLBACK_BODY.as_bytes());

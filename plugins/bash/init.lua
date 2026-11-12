@@ -442,6 +442,7 @@ makima.api.register_tool({
       return { llm_output = "error: command is required", is_error = true }
     end
 
+    local started_at = os.time()
     local command, workdir = parse_cd_hint(input)
     local resolved_workdir, workdir_err = ctx:resolve_path(workdir or ".")
     if not resolved_workdir then
@@ -573,7 +574,7 @@ makima.api.register_tool({
         return
       end
       finished = true
-      ctx:finish(partial.cut(view, table.concat(output_parts), reason, timeout_secs, {
+      ctx:finish(partial.cut(view, table.concat(output_parts), reason, timeout_secs, started_at, {
         preview = "head_tail",
         max_lines = max_lines,
         max_bytes = max_bytes,

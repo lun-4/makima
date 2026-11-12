@@ -7911,8 +7911,9 @@ return M
 -- wording and the painting, so every tool says it the same way.
 
 --- Close {view} once and return raw output with a deferred marker trailer.
---- {reason} is a cancel-hook reason ("cancelled" | "timeout").
-function M.cut(view, out, reason, timeout_secs, limits)
+--- {reason} is a cancel-hook reason ("cancelled" | "timeout") and {started_at}
+--- the `os.time()` the tool began at.
+function M.cut(view, out, reason, timeout_secs, started_at, limits)
 ```
 
 ### `require("makima.plan_spec")`
