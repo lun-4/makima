@@ -14147,3 +14147,20 @@ fn plan_ready_fires_once_per_draft() {
     app.transition_plan(PlanTrigger::WriteDone);
     assert!(app.state.plan.is_ready());
 }
+
+#[test]
+fn compaction_done_updates_chat_and_state_context_size() {
+    let mut app = test_app();
+    app.run_id = 1;
+    app.chats[0].context_size = 50_000;
+    app.state.context_size = 50_000;
+
+    app.update(agent_msg(AgentEvent::CompactionDone {
+        context_size_before: 50_000,
+        context_size_after: 1_200,
+        context_window: 200_000,
+    }));
+
+    assert_eq!(app.chats[0].context_size, 1_200);
+    assert_eq!(app.state.context_size, 1_200);
+}
