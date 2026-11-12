@@ -10,7 +10,7 @@ local opts = makima.api.register_options(output_limits.extend({
 
 local function glob_view_opts(ctx)
   local tol = ctx:tool_output_lines()
-  return { max_lines = (tol and tol.other) or 3, keep = "head" }
+  return { max_lines = (tol and tol.grep) or 3, keep = "head" }
 end
 
 makima.api.register_tool({

@@ -37,6 +37,7 @@ use serde_json::{Value, json};
 mod common;
 
 const BASH_SRC: &str = include_str!("../../plugins/bash/init.lua");
+const GLOB_SRC: &str = include_str!("../../plugins/glob/init.lua");
 const GREP_SRC: &str = include_str!("../../plugins/grep/init.lua");
 const BATCH_SRC: &str = include_str!("../../plugins/batch/init.lua");
 const TASK_SRC: &str = include_str!("../../plugins/task/init.lua");
@@ -121,6 +122,7 @@ fn load_host() -> PluginHost {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source("bash", BASH_SRC).unwrap();
+    host.load_source("glob", GLOB_SRC).unwrap();
     host.load_source("grep", GREP_SRC).unwrap();
     host.load_source("batch", BATCH_SRC).unwrap();
     host.load_source("task", TASK_SRC).unwrap();
@@ -160,9 +162,8 @@ fn restore_as(
     state: Option<Value>,
     clicks: Vec<usize>,
 ) -> Restored {
-    let handle = host.event_handle();
-    let (tx, rx) = flume::unbounded();
-    handle.request_restore(
+    restore_item(
+        host,
         makima_lua::RestoreItem {
             tool: Arc::from(tool),
             tool_use_id: "restore_id".to_owned(),
@@ -174,8 +175,13 @@ fn restore_as(
             clicks,
             state,
         },
-        makima_agent::EventSender::new(tx),
-    );
+    )
+}
+
+fn restore_item(host: &PluginHost, item: makima_lua::RestoreItem) -> Restored {
+    let handle = host.event_handle();
+    let (tx, rx) = flume::unbounded();
+    handle.request_restore(item, makima_agent::EventSender::new(tx));
     handle.wait_restore_complete_for_test();
     // The empty LoadSource drains the async gate, so spawned highlight tasks
     // finish before we inspect the buffers.
@@ -196,6 +202,51 @@ fn restore_as(
         }
     }
     out
+}
+
+const GREP_VIEW_CAP: usize = 2;
+const GLOB_OUT: &str = "/a/1.txt\n/a/2.txt\n/a/3.txt\n/a/4.txt";
+
+fn restore_with_capped_grep(host: &PluginHost, tool: &str, output: &str) -> Restored {
+    let lines = ToolOutputLines {
+        grep: GREP_VIEW_CAP,
+        other: VIEW_CAP,
+        ..view_lines()
+    };
+    restore_item(
+        host,
+        makima_lua::RestoreItem {
+            tool: Arc::from(tool),
+            tool_use_id: "restore_id".to_owned(),
+            output: output.to_owned(),
+            input: json!({ "pattern": "fn" }),
+            is_error: false,
+            tool_output_lines: lines,
+            theme_gen: None,
+            clicks: Vec::new(),
+            state: None,
+        },
+    )
+}
+
+#[test]
+fn grep_view_honors_the_grep_output_limit() {
+    let host = load_host();
+    let restored = restore_with_capped_grep(&host, "grep", GREP_OUT);
+    assert!(restored.body.contains("src/a.rs"), "{}", restored.body);
+    assert!(restored.body.contains("fn main"), "{}", restored.body);
+    assert!(!restored.body.contains("fn helper"), "{}", restored.body);
+    assert!(restored.body.contains(EXPAND_HINT), "{}", restored.body);
+}
+
+#[test]
+fn glob_view_honors_the_grep_output_limit() {
+    let host = load_host();
+    let restored = restore_with_capped_grep(&host, "glob", GLOB_OUT);
+    assert!(restored.body.contains("1.txt"), "{}", restored.body);
+    assert!(restored.body.contains("2.txt"), "{}", restored.body);
+    assert!(!restored.body.contains("3.txt"), "{}", restored.body);
+    assert!(restored.body.contains(EXPAND_HINT), "{}", restored.body);
 }
 
 #[test_case::test_case(Some(TASK_DESCRIPTION); "persisted_description")]
