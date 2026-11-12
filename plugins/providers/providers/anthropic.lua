@@ -20,6 +20,12 @@ local OPUS = "opus"
 local ADAPTIVE_SINCE = { 5, 0 }
 local ADAPTIVE_SINCE_OPUS = { 4, 7 }
 local STOP_REASONS = { end_turn = "end_turn", tool_use = "tool_use", max_tokens = "max_tokens" }
+local DELTA_USAGE_FIELDS = {
+  "input_tokens",
+  "output_tokens",
+  "cache_creation_input_tokens",
+  "cache_read_input_tokens",
+}
 
 local function wire_block(block)
   if block.type == "text" then
@@ -45,14 +51,25 @@ local function wire_block(block)
   end
 end
 
--- Blank text blocks are dropped, an empty message says so, and the last
+-- The API rejects blank text and thinking it did not sign, which is what a
+-- reasoning summary carried over from a Responses model looks like.
+local function is_replayable(block)
+  if block.type == "text" then
+    return not block.text:match("^%s*$")
+  elseif block.type == "thinking" then
+    return block.signature ~= nil
+  end
+  return true
+end
+
+-- Unreplayable blocks are dropped, an empty message says so, and the last
 -- non-thinking block of the final two messages is marked for caching.
 function M.convert_messages(messages)
   local result = {}
   for index, message in ipairs(messages) do
     local content = {}
     for _, block in ipairs(message.content) do
-      if block.type ~= "text" or not block.text:match("^%s*$") then
+      if is_replayable(block) then
         content[#content + 1] = wire_block(block)
       end
     end
@@ -243,7 +260,14 @@ function M.decode(next_event, emit)
       table.insert(parts[block], type(delta.partial_json) == "string" and delta.partial_json or "")
     elseif kind == "message_delta" then
       if type(value.usage) == "table" then
-        usage.output_tokens = codec.count(value.usage.output_tokens)
+        -- Gateways may report the real counts only here, so a zero means "not
+        -- reported" and must not wipe what `message_start` gave us.
+        for _, key in ipairs(DELTA_USAGE_FIELDS) do
+          local count = codec.count(value.usage[key])
+          if count > 0 then
+            usage[key] = count
+          end
+        end
       end
       if type(delta.stop_reason) == "string" then
         stop_reason = STOP_REASONS[delta.stop_reason] or "end_turn"
