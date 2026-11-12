@@ -261,20 +261,30 @@ fn resolve_session(
         let id: MakimaId = raw
             .parse()
             .map_err(|e| color_eyre::eyre::eyre!("invalid session id {raw:?}: {e}"))?;
-        let session = AppSession::load(id, storage).map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+        let mut session =
+            AppSession::load(id, storage).map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
         let locked = session_lock::open_elsewhere(&sessions_dir, &session.id);
-        if let Some(block) = session_lock::resume_block(&session.cwd, cwd, locked) {
-            return Err(color_eyre::eyre::eyre!("session {id}: {block}"));
+        if locked {
+            return Err(color_eyre::eyre::eyre!(
+                "session {id}: {}",
+                session_lock::OPEN_ELSEWHERE_MSG
+            ));
         }
+        session.set_cwd(cwd.to_owned());
         return Ok(session);
     }
     if last_session {
         match AppSession::latest(cwd, storage) {
-            Ok(Some(session)) => {
+            Ok(Some(mut session)) => {
                 let locked = session_lock::open_elsewhere(&sessions_dir, &session.id);
-                if let Some(block) = session_lock::resume_block(&session.cwd, cwd, locked) {
-                    return Err(color_eyre::eyre::eyre!("session {}: {block}", session.id));
+                if locked {
+                    return Err(color_eyre::eyre::eyre!(
+                        "session {}: {}",
+                        session.id,
+                        session_lock::OPEN_ELSEWHERE_MSG
+                    ));
                 }
+                session.set_cwd(cwd.to_owned());
                 return Ok(session);
             }
             Ok(None) => {
@@ -794,22 +804,22 @@ mod tests {
     const FAKE_PID: u32 = u32::MAX - 1;
 
     #[test]
-    fn resolve_session_rejects_session_from_other_cwd() {
+    fn resolve_session_adopts_the_current_cwd() {
         use tempfile::tempdir;
 
         let tmp = tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let mut session = AppSession::new("test-model", OTHER_CWD);
         session.save(&storage).unwrap();
-        let err = resolve_session(
+        let loaded = resolve_session(
             false,
             Some(&session.id.to_string()),
             "test-model",
             THIS_CWD,
             &storage,
         )
-        .expect_err("a session stored under another cwd must be rejected");
-        assert!(err.to_string().contains(OTHER_CWD));
+        .expect("a session stored under another cwd is resumed");
+        assert_eq!(loaded.cwd, THIS_CWD);
     }
 
     #[test_case(true; "valued_continue")]
