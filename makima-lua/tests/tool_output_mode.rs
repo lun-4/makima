@@ -188,7 +188,10 @@ fn nested_call_tool_skips_host_presentation_limits() {
         .as_text()
         .to_owned();
     assert!(model.contains(FILE_TRUNCATED_MARKER), "{model}");
-    assert!(!model.contains(LAST_RECORD), "{model}");
+    assert!(
+        model.matches("record-").count() <= MODEL_CAP_LINES,
+        "{model}"
+    );
 
     let nested = dispatch(&model_ctx(&registry), "nested_glob", input)
         .as_text()
