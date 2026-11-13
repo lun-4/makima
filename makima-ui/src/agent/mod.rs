@@ -532,6 +532,9 @@ fn spawn_agent_internal(
     // Seeded empty because `AgentActorHandle::spawn` publishes the real
     // snapshot synchronously, before any handle escapes.
     let shared_history: SharedMessages = Arc::new(ArcSwap::from_pointee(initial_history.clone()));
+    if let Some(session_id) = &session_id {
+        makima_agent::publish_live_history(session_id.id(), &shared_history);
+    }
     let initial_history = Arc::unwrap_or_clone(initial_history.messages);
     let btw_system: Arc<ArcSwap<String>> = Arc::new(ArcSwap::from_pointee(String::new()));
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());

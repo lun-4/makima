@@ -1740,6 +1740,7 @@ mod tests {
                 context_size_before: 0,
                 context_size_after: 0,
                 context_window: 0,
+                summary: String::new(),
             },
             None,
         );

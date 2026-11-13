@@ -1,11 +1,13 @@
+use std::collections::HashMap;
 use std::mem;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
 
 use arc_swap::ArcSwap;
 use makima_providers::{
     ContentBlock, ConversationLink, ConversationRelation, EMPTY_RESPONSE_MARKER, Message, Role,
 };
 use makima_storage::conversation::ConversationState;
+use makima_storage::id::MakimaId;
 use makima_storage::sessions::next_epoch;
 use tracing::warn;
 
@@ -14,6 +16,31 @@ pub const UNAVAILABLE_RESULT: &str = "[Tool result not available]";
 
 pub type HistorySnapshot = makima_storage::sessions::HistorySnapshot<Message>;
 pub type SharedMessages = Arc<ArcSwap<HistorySnapshot>>;
+
+/// Weak, so a session that ends takes its transcript with it. The dead entries
+/// it leaves behind get swept on the next publish.
+static LIVE_HISTORIES: LazyLock<Mutex<HashMap<MakimaId, Weak<ArcSwap<HistorySnapshot>>>>> =
+    LazyLock::new(Mutex::default);
+
+/// Publishes a session's transcript where `makima.session.messages` reads it.
+/// A second publish for the same id wins, which is what a reloaded tab wants.
+pub fn publish_live_history(session: MakimaId, mirror: &SharedMessages) {
+    let mut live = LIVE_HISTORIES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    live.retain(|_, mirror| mirror.strong_count() > 0);
+    live.insert(session, Arc::downgrade(mirror));
+}
+
+/// The messages of a live session, oldest first, or `None` when no actor holds
+/// that session's transcript any more.
+pub fn live_history(session: MakimaId) -> Option<Arc<Vec<Message>>> {
+    let live = LIVE_HISTORIES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let mirror = live.get(&session)?.upgrade()?;
+    Some(Arc::clone(&mirror.load().messages))
+}
 
 pub struct History {
     /// The value the mirror publishes, held whole so the two can never

@@ -925,6 +925,8 @@ pub enum AgentEvent {
         context_size_before: u32,
         context_size_after: u32,
         context_window: u32,
+        /// The text that replaced the history.
+        summary: String,
     },
     Retry {
         attempt: u32,

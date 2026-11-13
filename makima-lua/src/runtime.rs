@@ -4897,6 +4897,9 @@ pub(crate) struct LuaThread {
     pub ui_action_rx: flume::Receiver<UiAction>,
     pub modes: Arc<makima_agent::ModeRegistry>,
     pub session_options: makima_agent::session_coordinator::SessionOptionCatalog,
+    /// Calls the frontend has seen start and not yet seen end. The host owns
+    /// them, so every handle from it reads the same map.
+    pub tool_calls: crate::agent_autocmd::ToolCalls,
 }
 
 /// Pulls one `splash.render` frame. The shared Lua keeps the last task's
@@ -5846,6 +5849,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
         ui_action_rx,
         modes,
         session_options,
+        tool_calls: crate::agent_autocmd::ToolCalls::default(),
     })
 }
 

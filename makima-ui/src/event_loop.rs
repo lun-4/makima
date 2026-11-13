@@ -3194,6 +3194,14 @@ impl<'t> EventLoop<'t> {
                     .collect();
                 let _ = reply_tx.send(Ok(json!(list)));
             }
+            SessionRequest::Current => {
+                let reply = self
+                    .sessions
+                    .get(self.focused)
+                    .map(|runtime| json!(runtime.id().to_string()))
+                    .ok_or_else(|| makima_lua::ui_sink::NO_FOCUSED_SESSION_ERR.to_owned());
+                let _ = reply_tx.send(reply);
+            }
             SessionRequest::Read { id } => {
                 let reply = match self.resolve_session_index(id) {
                     Ok(idx) => Ok(self.session_snapshot_json(idx)),

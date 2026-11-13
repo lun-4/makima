@@ -1070,18 +1070,20 @@ pub fn spawn_interactive_with_binding(
                     root: root.clone(),
                 };
                 let mut template = backend.template(&config);
-                let mirror =
-                    history.map(|snapshot| Arc::new(arc_swap::ArcSwap::from_pointee(snapshot)));
-                let initial_history = mirror
-                    .as_ref()
-                    .map(|mirror| mirror.load().messages.as_ref().clone())
-                    .unwrap_or(params.initial_history);
+                let mirror: crate::SharedMessages = match history {
+                    Some(snapshot) => Arc::new(arc_swap::ArcSwap::from_pointee(snapshot)),
+                    None => Arc::new(arc_swap::ArcSwap::from_pointee(
+                        crate::HistorySnapshot::new(params.initial_history.clone()),
+                    )),
+                };
+                crate::publish_live_history(session_ref.id(), &mirror);
+                let initial_history = mirror.load().messages.as_ref().clone();
                 let (start, started) = flume::bounded(1);
                 let reference = manager
                     .create_root_deferred_with_config(
                         Some(config),
                         initial_history,
-                        mirror,
+                        Some(mirror),
                         |agent_id| {
                             let mut backend = backend;
                             backend.params.agent_id = agent_id;

@@ -4,6 +4,8 @@
 //! for every agent, children included, whichever way makima was started.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use makima_agent::{
     ActorEvent, ActorWorkIdentity, AgentEvent, AgentId, AgentManagerHandle, AgentRef,
@@ -25,9 +27,14 @@ pub const CONFIG_CHANGED_EVENT: &str = "ConfigChanged";
 pub const COMPACTION_DONE_EVENT: &str = "CompactionDone";
 pub const SESSION_CWD_CHANGED_EVENT: &str = "SessionCwdChanged";
 
+/// How long a started call stays remembered. A call moved to the background
+/// reports `BackgroundDone` instead of `ToolDone`, so its entry is never read
+/// back; this is what keeps those from piling up over a long session.
+const TOOL_CALL_RETENTION: Duration = Duration::from_secs(60 * 60);
+
 /// Fires the autocmd for one envelope a frontend read from {root}'s graph.
 pub fn dispatch(handle: &EventHandle, root: &AgentRef, envelope: &Envelope) {
-    let Some((event, data)) = envelope_autocmd(&envelope.event) else {
+    let Some((event, data)) = envelope_autocmd(&envelope.event, handle.tool_calls()) else {
         return;
     };
     let agent = match &envelope.subagent {
@@ -35,6 +42,40 @@ pub fn dispatch(handle: &EventHandle, root: &AgentRef, envelope: &Envelope) {
         None => root.clone(),
     };
     handle.fire_agent_autocmd(event, agent, data);
+}
+
+/// What `ToolDone` cannot carry itself: the input a call ran with and when the
+/// frontend saw it start. `ToolStart` is the only event with both, so the host
+/// holds them until the matching `ToolDone` reads them back. A call that never
+/// reports done has neither.
+#[derive(Clone, Default)]
+pub struct ToolCalls(Arc<Mutex<HashMap<String, StartedCall>>>);
+
+struct StartedCall {
+    input: Option<Value>,
+    started: Instant,
+}
+
+impl ToolCalls {
+    fn start(&self, id: &str, input: Option<Value>) {
+        let mut calls = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        calls.retain(|_, call| now.duration_since(call.started) < TOOL_CALL_RETENTION);
+        calls.insert(
+            id.to_owned(),
+            StartedCall {
+                input,
+                started: now,
+            },
+        );
+    }
+
+    fn finish(&self, id: &str) -> Option<StartedCall> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id)
+    }
 }
 
 /// Fires the lifecycle autocmds of every agent in {manager}'s graph until
@@ -93,10 +134,27 @@ impl IdleFilter {
     }
 }
 
-fn envelope_autocmd(event: &AgentEvent) -> Option<(&'static str, Value)> {
+fn envelope_autocmd(event: &AgentEvent, tool_calls: &ToolCalls) -> Option<(&'static str, Value)> {
     match event {
-        AgentEvent::ToolStart(e) => Some(("ToolStart", json!({ "tool_id": e.id, "tool": e.tool }))),
-        AgentEvent::ToolDone(e) => Some(("ToolDone", json!({ "tool_id": e.id, "tool": e.tool }))),
+        AgentEvent::ToolStart(e) => {
+            tool_calls.start(&e.id, e.raw_input.clone());
+            Some(("ToolStart", json!({ "tool_id": e.id, "tool": e.tool })))
+        }
+        AgentEvent::ToolDone(e) => {
+            let mut data = json!({
+                "tool_id": e.id,
+                "tool": e.tool,
+                "is_error": e.is_error,
+                "bytes": e.output.as_text().len(),
+            });
+            if let Some(call) = tool_calls.finish(&e.id) {
+                if let Some(input) = call.input {
+                    data["input"] = input;
+                }
+                data["duration_ms"] = json!(call.started.elapsed().as_millis() as u64);
+            }
+            Some(("ToolDone", data))
+        }
         AgentEvent::AutoCompacting {
             context_size,
             context_window,
@@ -108,6 +166,7 @@ fn envelope_autocmd(event: &AgentEvent) -> Option<(&'static str, Value)> {
             context_size_before,
             context_size_after,
             context_window,
+            summary,
         } => Some((
             COMPACTION_DONE_EVENT,
             json!({
@@ -115,6 +174,7 @@ fn envelope_autocmd(event: &AgentEvent) -> Option<(&'static str, Value)> {
                 "context_size_before": context_size_before,
                 "context_size_after": context_size_after,
                 "context_window": context_window,
+                "summary": summary,
             }),
         )),
         _ => None,
@@ -127,6 +187,7 @@ fn actor_autocmd(event: ActorEvent) -> Option<(&'static str, Value)> {
             turn_id,
             provenance,
             config,
+            text,
             ..
         } => Some((
             TURN_START_EVENT,
@@ -134,6 +195,7 @@ fn actor_autocmd(event: ActorEvent) -> Option<(&'static str, Value)> {
                 "turn_id": turn_id.to_string(),
                 "origin": origin_json(&provenance),
                 "selection": config.map(|commit| selection_json(&commit.config)),
+                "text": text,
             }),
         )),
         ActorEvent::End(result) => {
@@ -195,11 +257,92 @@ fn turn_end_reason(reason: DoneReason) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use makima_agent::{AgentId, TurnId, TurnProvenance, TurnResult};
+    use makima_agent::{
+        AgentId, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnId, TurnProvenance, TurnResult,
+    };
     use makima_providers::TokenUsage;
     use test_case::test_case;
 
     use super::*;
+
+    const TOOL_ID: &str = "t1";
+    const TOOL_COMMAND: &str = "cargo test";
+    const TOOL_OUTPUT: &str = "ok";
+    const SUMMARY: &str = "the summary";
+    const PROMPT: &str = "fix the build";
+
+    fn tool_start() -> AgentEvent {
+        AgentEvent::ToolStart(Box::new(ToolStartEvent {
+            id: TOOL_ID.into(),
+            tool: "bash".into(),
+            summary: String::new(),
+            render_header: None,
+            annotation: None,
+            input: None,
+            raw_input: Some(json!({ "command": TOOL_COMMAND })),
+            output: None,
+        }))
+    }
+
+    fn tool_done(output: &str) -> AgentEvent {
+        AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+            id: TOOL_ID.into(),
+            tool: "bash".into(),
+            output: ToolOutput::Plain(output.into()),
+            is_error: false,
+            annotation: None,
+            written_path: None,
+        }))
+    }
+
+    /// A plugin charging a budget off `ToolDone` needs the call itself, and
+    /// only `ToolStart` ever carries it, so the pairing is what to pin.
+    #[test]
+    fn tool_done_carries_the_call_it_started() {
+        let calls = ToolCalls::default();
+        envelope_autocmd(&tool_start(), &calls).unwrap();
+        let (event, data) = envelope_autocmd(&tool_done(TOOL_OUTPUT), &calls).unwrap();
+        assert_eq!(event, "ToolDone");
+        assert_eq!(data["input"]["command"], TOOL_COMMAND);
+        assert_eq!(data["bytes"], TOOL_OUTPUT.len());
+        assert_eq!(data["is_error"], false);
+        assert!(data["duration_ms"].is_u64());
+    }
+
+    #[test]
+    fn tool_done_without_a_start_carries_no_call() {
+        let (_, data) = envelope_autocmd(&tool_done(TOOL_OUTPUT), &ToolCalls::default()).unwrap();
+        assert!(data.get("input").is_none() && data.get("duration_ms").is_none());
+        assert_eq!(data["bytes"], TOOL_OUTPUT.len());
+    }
+
+    #[test]
+    fn compaction_done_carries_the_summary() {
+        let event = AgentEvent::CompactionDone {
+            context_size_before: 100_000,
+            context_size_after: 30_000,
+            context_window: 200_000,
+            summary: SUMMARY.into(),
+        };
+        let (name, data) = envelope_autocmd(&event, &ToolCalls::default()).unwrap();
+        assert_eq!(name, COMPACTION_DONE_EVENT);
+        assert_eq!(data["summary"], SUMMARY);
+        assert_eq!(data["context_size_after"], 30_000);
+    }
+
+    #[test]
+    fn turn_start_carries_the_message_that_started_it() {
+        let (name, data) = actor_autocmd(ActorEvent::Start {
+            agent_id: AgentId::generate(),
+            turn_id: TurnId::generate(),
+            provenance: TurnProvenance::default(),
+            config: None,
+            text: PROMPT.into(),
+        })
+        .unwrap();
+        assert_eq!(name, TURN_START_EVENT);
+        assert_eq!(data["text"], PROMPT);
+    }
 
     fn completed_turn(reason: DoneReason) -> ActorEvent {
         ActorEvent::End(TurnResult {
