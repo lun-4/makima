@@ -1209,6 +1209,10 @@ pub struct TurnCompleteEvent {
     pub model: String,
     #[serde(skip)]
     pub cost: Option<f64>,
+    /// What a subsidised turn would have cost at list rates, `None` on every
+    /// metered turn so the status bar never repeats the bill.
+    #[serde(skip)]
+    pub list_cost: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_size: Option<u32>,
     /// The model's context window, so consumers can gauge `context_size`

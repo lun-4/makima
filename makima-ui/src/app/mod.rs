@@ -3172,10 +3172,12 @@ impl App {
         self.state.token_usage += turn.usage;
         if let Some(chat_idx) = chat_idx {
             add_cost(&mut self.chats[chat_idx].cost, turn.cost);
+            add_cost(&mut self.chats[chat_idx].list_cost, turn.list_cost);
         }
-        self.state
-            .session_mut()
-            .add_model_usage(&turn.model, turn.usage.billed(turn.cost));
+        self.state.session_mut().add_model_usage(
+            &turn.model,
+            turn.usage.billed_with_list_cost(turn.cost, turn.list_cost),
+        );
     }
 
     /// Shared `UiAction::OpenWin` path. Returns `true` when the window went

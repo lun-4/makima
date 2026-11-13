@@ -61,6 +61,9 @@ pub enum ChatEventResult {
 pub struct Chat {
     pub name: String,
     pub cost: Option<f64>,
+    /// This chat's list-price reference, `None` until a turn a subscription
+    /// prepaid lands here.
+    pub list_cost: Option<f64>,
     pub context_size: u32,
     pub(crate) retry_info: Option<RetryInfo>,
     pub model_id: Option<String>,
@@ -87,6 +90,7 @@ impl Chat {
         Self {
             name,
             cost: None,
+            list_cost: None,
             context_size: 0,
             retry_info: None,
             model_id: None,
@@ -1069,6 +1073,7 @@ mod tests {
                 usage: Default::default(),
                 model: String::new(),
                 cost: None,
+                list_cost: None,
                 context_size: None,
                 context_window: 0,
             })),

@@ -879,6 +879,7 @@ impl<'h> Agent<'h> {
                 usage: response.usage,
                 model: self.model.id.clone(),
                 cost,
+                list_cost: self.model.subsidised_list_cost(&response.usage, fast),
                 context_size: Some(self.context_size),
                 context_window: self.model.context_window,
             })))
