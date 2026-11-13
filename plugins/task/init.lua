@@ -68,8 +68,8 @@ Report findings classified by severity (critical / high / medium / low), quoting
 
 local opts = makima.api.register_options({
   allow_model = {
-    default = false,
-    desc = "Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves.",
+    default = true,
+    desc = "Expose a `model` input that overrides the subagent model. Only disable if you do not trust callers to pick an exact model themselves.",
   },
 })
 
@@ -106,8 +106,8 @@ local spawn_schema = {
   },
 }
 
--- Only advertise `model` when the plugin opts in: it costs tokens in every
--- task schema, and an off-by-default flag keeps the common path lean.
+-- Advertise `model` by default; disabling it keeps the task schema lean at the
+-- cost of dropping exact-model requests for subagents.
 if opts.allow_model then
   spawn_schema.properties.model = {
     type = "string",

@@ -450,9 +450,7 @@ const FULL_MODEL_SPEC: &str = "gateway/ollama/glm-5.2";
 
 #[test]
 fn model_spec_forwards_full_spec_to_resolve_model() {
-    let mut opts = serde_json::Map::new();
-    opts.insert("allow_model".into(), json!(true));
-    let (reg, _host) = load_task_host_with_opts(opts);
+    let (reg, _host) = load_task_host();
     let mut input = task_input(SCENARIO_PLAIN, None);
     input["model"] = json!(FULL_MODEL_SPEC);
     let result = spawn_and_wait_stub(&reg, input).expect("task with model spec failed");
@@ -471,7 +469,9 @@ fn model_spec_forwards_full_spec_to_resolve_model() {
 
 #[test]
 fn model_spec_ignored_when_allow_model_off() {
-    let (reg, _host) = load_task_host();
+    let mut opts = serde_json::Map::new();
+    opts.insert("allow_model".into(), json!(false));
+    let (reg, _host) = load_task_host_with_opts(opts);
     let mut input = task_input(SCENARIO_PLAIN, None);
     input["model"] = json!(FULL_MODEL_SPEC);
     let result = spawn_and_wait_stub(&reg, input).expect("task with model spec failed");
