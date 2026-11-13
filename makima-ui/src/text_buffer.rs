@@ -1,6 +1,19 @@
+use std::collections::VecDeque;
+use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::highlight::TAB_SPACES;
+
+pub mod layout;
+
+/// How many line changes a reader can catch up from before it must rebuild.
+const CHANGE_LOG: usize = 64;
+
+/// Hands every buffer a version base no earlier one used, so a reader tells a
+/// replaced buffer from the one it was tracking.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 pub fn is_newline_key(key: &KeyEvent) -> bool {
     (matches!(key.code, KeyCode::Enter)
@@ -23,6 +36,22 @@ pub struct TextBuffer {
     lines: Vec<String>,
     raw_x: usize,
     cursor_y: usize,
+    version: u64,
+    generation: u64,
+    changes: VecDeque<LineChange>,
+    /// The end of the selection the cursor is not on, in (line, char) form.
+    /// `None` when nothing is selected.
+    anchor: Option<(usize, usize)>,
+}
+
+/// Lines `first` through the last line that changed hold new text, and `below`
+/// lines after them are untouched, so a reader maps the span back to its old
+/// line indices by counting up from the bottom.
+#[derive(Clone)]
+pub struct LineChange {
+    version: u64,
+    pub first: usize,
+    pub below: usize,
 }
 
 impl TextBuffer {
@@ -32,7 +61,58 @@ impl TextBuffer {
             lines,
             raw_x: 0,
             cursor_y: 0,
+            version: 0,
+            generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
+            changes: VecDeque::new(),
+            anchor: None,
         }
+    }
+
+    /// Moves whenever the text does, so a reader tells a stale layout from a
+    /// current one without comparing the text.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Distinguishes this buffer from another that starts its version at the
+    /// same place, which a reader sees whenever the input is replaced.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The line changes made since `version`, `None` once the log has moved
+    /// past them and the reader has to rebuild.
+    pub fn changes_since(&self, version: u64) -> Option<impl Iterator<Item = LineChange> + '_> {
+        let oldest = self.changes.front()?.version;
+        (oldest <= version + 1).then(|| {
+            self.changes
+                .iter()
+                .filter(move |change| change.version > version)
+                .cloned()
+        })
+    }
+
+    fn touch(&mut self, first: usize, below: usize) {
+        self.version += 1;
+        if self.changes.len() == CHANGE_LOG {
+            self.changes.pop_front();
+        }
+        self.changes.push_back(LineChange {
+            version: self.version,
+            first,
+            below,
+        });
+    }
+
+    /// One line's text changed and every line keeps its index.
+    fn touch_line(&mut self, line: usize) {
+        let below = self.lines.len() - 1 - line;
+        self.touch(line, below);
+    }
+
+    /// Lines were added or removed at `line`, so the ones after it moved.
+    fn touch_shift(&mut self, line: usize) {
+        self.touch(line, 0);
     }
 
     pub fn value(&self) -> String {
@@ -53,6 +133,100 @@ impl TextBuffer {
 
     pub fn line_count(&self) -> usize {
         self.lines.len()
+    }
+
+    pub fn line(&self, y: usize) -> &str {
+        &self.lines[y]
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lines.iter().all(String::is_empty)
+    }
+
+    fn position(&self) -> (usize, usize) {
+        (self.cursor_y, self.x())
+    }
+
+    fn clamped(&self, (line, x): (usize, usize)) -> (usize, usize) {
+        let line = line.min(self.lines.len() - 1);
+        (line, x.min(self.lines[line].chars().count()))
+    }
+
+    /// The ordered ends of the selection, `None` when it is empty.
+    fn selection(&self) -> Option<((usize, usize), (usize, usize))> {
+        let anchor = self.clamped(self.anchor?);
+        let cursor = self.position();
+        (anchor != cursor).then(|| {
+            if anchor < cursor {
+                (anchor, cursor)
+            } else {
+                (cursor, anchor)
+            }
+        })
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.selection().is_some()
+    }
+
+    /// The chars of line `y` inside the selection, for drawing it.
+    pub fn selection_on_line(&self, y: usize, len: usize) -> Option<Range<usize>> {
+        let (start, end) = self.selection()?;
+        if y < start.0 || y > end.0 {
+            return None;
+        }
+        let from = if y == start.0 { start.1 } else { 0 };
+        let to = if y == end.0 { end.1 } else { len };
+        (from < to).then_some(from..to)
+    }
+
+    /// The selected text, lines joined the way [`Self::value`] joins them.
+    pub fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.selection()?;
+        let mut text = String::new();
+        for (y, line) in self.lines.iter().enumerate().take(end.0 + 1).skip(start.0) {
+            if y > start.0 {
+                text.push('\n');
+            }
+            let from = if y == start.0 { start.1 } else { 0 };
+            let to = if y == end.0 {
+                end.1
+            } else {
+                line.chars().count()
+            };
+            text.extend(line.chars().skip(from).take(to - from));
+        }
+        Some(text)
+    }
+
+    /// Drops the selection, reporting whether there was one to drop.
+    pub fn deselect(&mut self) -> bool {
+        let had = self.has_selection();
+        self.anchor = None;
+        had
+    }
+
+    /// Deletes the selected text and parks the cursor where it was, reporting
+    /// whether it deleted anything.
+    fn delete_selection(&mut self) -> bool {
+        let Some((start, end)) = self.selection() else {
+            self.anchor = None;
+            return false;
+        };
+        self.anchor = None;
+        let tail: String = self.lines[end.0].chars().skip(end.1).collect();
+        let head = Self::char_to_byte(&self.lines[start.0], start.1);
+        self.lines[start.0].truncate(head);
+        self.lines[start.0].push_str(&tail);
+        self.lines.drain(start.0 + 1..=end.0);
+        self.cursor_y = start.0;
+        self.raw_x = start.1;
+        if start.0 == end.0 {
+            self.touch_line(start.0);
+        } else {
+            self.touch_shift(start.0);
+        }
+        true
     }
 
     pub fn cursor_byte_offset(&self) -> usize {
@@ -92,22 +266,31 @@ impl TextBuffer {
     }
 
     pub fn push_char(&mut self, c: char) {
+        self.delete_selection();
         let bx = self.byte_x();
         self.lines[self.cursor_y].insert(bx, c);
         self.raw_x = self.x() + 1;
+        self.touch_line(self.cursor_y);
     }
 
     pub fn insert_text(&mut self, text: &str) {
+        self.delete_selection();
+        let first = self.cursor_y;
         let sanitized = text.replace('\t', TAB_SPACES);
         for (i, chunk) in sanitized.split('\n').enumerate() {
             if i > 0 {
-                self.add_line();
+                self.split_line();
             }
             if !chunk.is_empty() {
                 let bx = self.byte_x();
                 self.lines[self.cursor_y].insert_str(bx, chunk);
                 self.raw_x = self.x() + chunk.chars().count();
             }
+        }
+        if self.cursor_y == first {
+            self.touch_line(first);
+        } else {
+            self.touch_shift(first);
         }
     }
 
@@ -118,13 +301,22 @@ impl TextBuffer {
     /// Replaces the byte range `[start, end)` on the cursor's line and places
     /// the cursor just after the inserted text.
     pub fn replace_range_on_current_line(&mut self, start: usize, end: usize, replacement: &str) {
+        self.anchor = None;
         let line = &mut self.lines[self.cursor_y];
         line.replace_range(start..end, replacement);
         let start_chars = Self::byte_to_char(&self.lines[self.cursor_y], start);
         self.raw_x = start_chars + replacement.chars().count();
+        self.touch_line(self.cursor_y);
     }
 
     pub fn add_line(&mut self) {
+        self.delete_selection();
+        let first = self.cursor_y;
+        self.split_line();
+        self.touch_shift(first);
+    }
+
+    fn split_line(&mut self) {
         let bx = self.byte_x();
         let (left, right) = self.lines[self.cursor_y].split_at(bx);
         let (left, right) = (left.to_string(), right.to_string());
@@ -135,6 +327,9 @@ impl TextBuffer {
     }
 
     pub fn remove_char(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let x = self.x();
         if x == 0 {
             self.merge_with_previous_line();
@@ -142,16 +337,21 @@ impl TextBuffer {
             let bx = Self::char_to_byte(self.current_line(), x - 1);
             self.lines[self.cursor_y].remove(bx);
             self.raw_x = x - 1;
+            self.touch_line(self.cursor_y);
         }
     }
 
     pub fn delete_char(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let x = self.x();
         if x == self.current_line_len() {
             self.merge_with_next_line();
         } else {
             let bx = self.byte_x();
             self.lines[self.cursor_y].remove(bx);
+            self.touch_line(self.cursor_y);
         }
     }
 
@@ -201,6 +401,9 @@ impl TextBuffer {
     }
 
     pub fn delete_word_after_cursor(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let x = self.x();
         if x == self.current_line_len() {
             self.merge_with_next_line();
@@ -210,14 +413,22 @@ impl TextBuffer {
         let byte_start = Self::char_to_byte(self.current_line(), x);
         let byte_end = Self::char_to_byte(self.current_line(), new_x);
         self.lines[self.cursor_y].replace_range(byte_start..byte_end, "");
+        self.touch_line(self.cursor_y);
     }
 
     pub fn kill_to_end_of_line(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let bx = self.byte_x();
         self.lines[self.cursor_y].truncate(bx);
+        self.touch_line(self.cursor_y);
     }
 
     pub fn remove_word_before_cursor(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let x = self.x();
         if x == 0 {
             self.merge_with_previous_line();
@@ -229,6 +440,7 @@ impl TextBuffer {
         let byte_end = Self::char_to_byte(line, x);
         self.lines[self.cursor_y].replace_range(byte_start..byte_end, "");
         self.raw_x = new_x;
+        self.touch_line(self.cursor_y);
     }
 
     pub fn move_word_left(&mut self) {
@@ -291,9 +503,22 @@ impl TextBuffer {
         self.lines = vec![String::new()];
         self.raw_x = 0;
         self.cursor_y = 0;
+        self.anchor = None;
+        self.touch_shift(0);
     }
 
     pub fn set_cursor(&mut self, y: usize, x: usize) {
+        self.anchor = None;
+        self.move_cursor(y, x);
+    }
+
+    /// Places the cursor and keeps the anchor, so the motion selects.
+    pub fn set_cursor_extending(&mut self, y: usize, x: usize) {
+        self.anchor.get_or_insert(self.position());
+        self.move_cursor(y, x);
+    }
+
+    fn move_cursor(&mut self, y: usize, x: usize) {
         self.cursor_y = y.min(self.lines.len().saturating_sub(1));
         self.raw_x = x.min(self.current_line_len());
     }
@@ -307,6 +532,7 @@ impl TextBuffer {
         if self.cursor_y + 1 < self.lines.len() {
             let next = self.lines.remove(self.cursor_y + 1);
             self.lines[self.cursor_y].push_str(&next);
+            self.touch_shift(self.cursor_y);
         }
     }
 
@@ -320,12 +546,30 @@ impl TextBuffer {
     }
 
     pub fn kill_to_start_of_line(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let byte_x = Self::char_to_byte(&self.lines[self.cursor_y], self.x());
         self.lines[self.cursor_y].drain(..byte_x);
         self.raw_x = 0;
+        self.touch_line(self.cursor_y);
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> EditResult {
+        let extend = key.modifiers.contains(KeyModifiers::SHIFT);
+        let before = self.position();
+        let result = self.apply_key(key);
+        if result == EditResult::Moved {
+            if extend {
+                self.anchor.get_or_insert(before);
+            } else {
+                self.anchor = None;
+            }
+        }
+        result
+    }
+
+    fn apply_key(&mut self, key: KeyEvent) -> EditResult {
         let m = key.modifiers;
         let ctrl = m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT);
         let alt = m.contains(KeyModifiers::ALT) && !m.contains(KeyModifiers::CONTROL);
@@ -720,6 +964,113 @@ mod tests {
         let mut buf = TextBuffer::new("hello world".into());
         buf.raw_x = 5;
         assert_eq!(buf.handle_key(key), expected);
+    }
+
+    fn shift(code: KeyCode) -> KeyEvent {
+        key(code, KeyModifiers::SHIFT)
+    }
+
+    #[test]
+    fn shift_motions_select_and_plain_motions_drop_it() {
+        let mut buf = TextBuffer::new("hello world".into());
+        buf.raw_x = 5;
+        assert_eq!(buf.handle_key(shift(KeyCode::Left)), EditResult::Moved);
+        assert_eq!(buf.handle_key(shift(KeyCode::Left)), EditResult::Moved);
+        assert_eq!(buf.selected_text().as_deref(), Some("lo"));
+        assert_eq!(buf.selection_on_line(0, 11), Some(3..5));
+
+        assert_eq!(buf.handle_key(plain(KeyCode::Left)), EditResult::Moved);
+        assert_eq!(buf.selected_text(), None);
+    }
+
+    #[test]
+    fn shift_selects_across_lines_and_joins_them_with_newlines() {
+        let mut buf = TextBuffer::new("one\ntwo\nthree".into());
+        buf.set_cursor(0, 1);
+        buf.handle_key(shift(KeyCode::Down));
+        buf.handle_key(shift(KeyCode::End));
+
+        assert_eq!(buf.selected_text().as_deref(), Some("ne\ntwo"));
+        assert_eq!(buf.selection_on_line(0, 3), Some(1..3));
+        assert_eq!(buf.selection_on_line(1, 3), Some(0..3));
+        assert_eq!(buf.selection_on_line(2, 5), None);
+    }
+
+    #[test]
+    fn selection_counts_chars_not_bytes() {
+        let mut buf = TextBuffer::new("a界z".into());
+        buf.set_cursor(0, 1);
+        buf.handle_key(shift(KeyCode::Right));
+        assert_eq!(buf.selected_text().as_deref(), Some("界"));
+    }
+
+    /// Selects chars 3..5 of `hello world`, the `lo`.
+    fn with_selection() -> TextBuffer {
+        let mut buf = TextBuffer::new("hello world".into());
+        buf.raw_x = 5;
+        buf.handle_key(shift(KeyCode::Left));
+        buf.handle_key(shift(KeyCode::Left));
+        assert_eq!(buf.selected_text().as_deref(), Some("lo"));
+        buf
+    }
+
+    #[test]
+    fn typing_replaces_the_selection() {
+        let mut buf = with_selection();
+        buf.push_char('X');
+        assert_eq!(buf.value(), "helX world");
+        assert_eq!((buf.y(), buf.x()), (0, 4));
+        assert!(!buf.has_selection());
+    }
+
+    #[test_case(TextBuffer::remove_char, "hel world" ; "backspace")]
+    #[test_case(TextBuffer::delete_char, "hel world" ; "delete")]
+    #[test_case(|b| b.remove_word_before_cursor(), "hel world" ; "word_before")]
+    #[test_case(|b| b.delete_word_after_cursor(), "hel world" ; "word_after")]
+    fn deleting_keys_take_only_the_selection(edit: fn(&mut TextBuffer), expected: &str) {
+        let mut buf = with_selection();
+        edit(&mut buf);
+        assert_eq!(buf.value(), expected);
+        assert!(!buf.has_selection());
+    }
+
+    #[test]
+    fn deleting_across_lines_takes_the_line_break_with_it() {
+        let mut buf = TextBuffer::new("ab\ncd".into());
+        buf.set_cursor(0, 1);
+        buf.handle_key(shift(KeyCode::Down));
+        buf.remove_char();
+        assert_eq!(buf.value(), "ad");
+        assert_eq!((buf.y(), buf.x()), (0, 1));
+    }
+
+    #[test]
+    fn insert_text_and_kills_take_the_selection_first() {
+        let mut buf = TextBuffer::new("hello world".into());
+        buf.raw_x = 5;
+        buf.handle_key(shift(KeyCode::End));
+        buf.insert_text("!");
+        assert_eq!(buf.value(), "hello!");
+
+        buf.set_cursor(0, 0);
+        buf.handle_key(shift(KeyCode::End));
+        buf.kill_to_end_of_line();
+        assert_eq!(buf.value(), "");
+    }
+
+    #[test]
+    fn deselect_reports_whether_a_selection_was_there() {
+        let mut buf = TextBuffer::new("abc".into());
+        buf.set_cursor(0, 1);
+        buf.handle_key(shift(KeyCode::Right));
+        buf.handle_key(shift(KeyCode::Left));
+        assert!(!buf.has_selection());
+        assert!(!buf.deselect());
+
+        buf.handle_key(shift(KeyCode::Right));
+        assert!(buf.has_selection());
+        assert!(buf.deselect());
+        assert!(!buf.has_selection());
     }
 
     #[test]

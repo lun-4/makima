@@ -16,6 +16,7 @@ pub(crate) mod tests;
 pub(crate) mod view;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,7 +26,7 @@ use crate::AppSession;
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::click::{ClickTarget, CompletionGrid, HitRegistry, PickerId, ScrollOwner, Surface};
-use crate::clipboard::ClipboardState;
+use crate::clipboard::{ClipboardState, CopyResult};
 use crate::command_runtime::{CommandRuntime, PreparedCommandTarget};
 use crate::model_capabilities::ModelCapabilityCache;
 use makima_agent::HistorySnapshot;
@@ -125,6 +126,7 @@ pub(crate) use session_state::stored_to_rules;
 use session_state::{ConfigSource, SessionState};
 
 const CANCEL_MSG: &str = "Cancelled.";
+const FLASH_COPIED: &str = "Copied selection";
 /// Presentation reserved for re-bake replies. They belong to no agent run, so
 /// the staleness filter skips them outright.
 pub(crate) const RESTORE_PRESENTATION: u64 = u64::MAX;
@@ -448,6 +450,9 @@ pub struct App {
     middle_scroll: Option<MiddleScroll>,
     pub(super) clipboard: ClipboardState,
     pub(super) last_esc: Option<Instant>,
+    /// The last key was a `Ctrl+C` that copied the input's selection, see
+    /// [`Self::handle_ctrl`].
+    quit_copied: bool,
     /// Last user keystroke/paste; `None` until the first. Drives input deferral.
     pub(super) last_input: Option<Instant>,
     /// The input surface currently shown/focused (`None` when nothing is live).
@@ -663,6 +668,7 @@ impl App {
             middle_scroll: None,
             clipboard: ClipboardState::new(),
             last_esc: None,
+            quit_copied: false,
             last_input: None,
             active_input: None,
             input_queue: VecDeque::new(),
@@ -997,6 +1003,14 @@ impl App {
 
     pub(crate) fn flash(&mut self, msg: String) {
         self.status_bar.flash(msg);
+    }
+
+    pub(super) fn copy(&mut self, text: &str) {
+        match self.clipboard.copy_text(text) {
+            Ok(CopyResult::Noop) => {}
+            Ok(CopyResult::Copied) => self.flash(FLASH_COPIED.into()),
+            Err(error) => self.flash(format!("Copy failed: {error}")),
+        }
     }
 
     pub(crate) fn fire_session_autocmd(&self, event: &str, mut data: serde_json::Value) {
@@ -1880,6 +1894,15 @@ impl App {
         if key::QUIT.matches(key) {
             self.close_command_palette();
             self.sync_file_completion();
+            // Copying lets go of the selection, so the next press clears the
+            // input and the one after quits, like it does without a selection.
+            if !mem::take(&mut self.quit_copied)
+                && let Some(text) = self.input_box.take_selected_text()
+            {
+                self.copy(&text);
+                self.quit_copied = true;
+                return Some(vec![]);
+            }
             return Some(if self.input_box.is_empty() {
                 if self.focused_streaming() {
                     return Some(self.handle_cancel());
@@ -2251,6 +2274,9 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent) -> Vec<Action> {
         self.clear_selection_unless_pending_copy();
+        if !key::QUIT.matches(key) {
+            self.quit_copied = false;
+        }
 
         if key::SUSPEND.matches(key) && cfg!(unix) {
             return vec![Action::Suspend];

@@ -4,13 +4,17 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::app::shell::parse_shell_prefix;
 use crate::highlight;
-use crate::text_buffer::{EditResult, TextBuffer, is_newline_key};
+use crate::text_buffer::TextBuffer;
+use crate::text_buffer::layout::{Layout, Row};
+use crate::text_buffer::{EditResult, is_newline_key};
 use crate::theme;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use makima_storage::input_history::InputHistory;
+use std::cell::{RefCell, RefMut};
 use std::collections::HashSet;
 use std::mem;
+use std::ops::Range;
 use std::path::Path;
 
 use makima_providers::ImageSource;
@@ -80,6 +84,9 @@ impl Submission {
 
 pub struct InputBox {
     pub(crate) buffer: TextBuffer,
+    /// How the buffer's lines break into rows at the last width drawn. Every
+    /// reader goes through it, so a frame wraps only the rows on screen.
+    layout: RefCell<Layout>,
     /// Labels of known `@`-completion items, used to highlight `@`-tokens in
     /// the input text.
     pub(crate) at_ref_labels: Vec<String>,
@@ -100,12 +107,21 @@ pub struct InputBox {
 }
 
 impl InputBox {
+    /// Shift with a motion selects instead of moving, and runs before the
+    /// history keys so a selection on the first line never swaps the text it
+    /// is selecting. `Esc` with a selection only drops it.
     pub fn handle_key(&mut self, key: KeyEvent) -> InputAction {
         self.follow_cursor = true;
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
-        if key.modifiers == KeyModifiers::NONE && matches!(key.code, KeyCode::Up | KeyCode::Down) {
-            if self.move_visual(key.code == KeyCode::Down) {
+        if matches!(key.code, KeyCode::Up | KeyCode::Down)
+            && (shift || key.modifiers == KeyModifiers::NONE)
+        {
+            if self.move_visual(key.code == KeyCode::Down, shift) {
                 return InputAction::CursorMoved;
+            }
+            if shift {
+                return InputAction::None;
             }
             self.preferred_column = None;
             if key.code == KeyCode::Up {
@@ -126,6 +142,7 @@ impl InputBox {
                 self.history_down();
                 return InputAction::PaletteSync(self.buffer.value());
             }
+            KeyCode::Esc if self.buffer.deselect() => return InputAction::None,
             KeyCode::Tab | KeyCode::BackTab | KeyCode::Esc => {
                 return InputAction::Passthrough(key);
             }
@@ -198,6 +215,7 @@ impl InputBox {
         let max_input_lines = max_input_lines.clamp(1, u16::MAX as u32 - 2) as u16;
         Self {
             buffer: TextBuffer::new(String::new()),
+            layout: RefCell::default(),
             at_ref_labels: Vec::new(),
             history,
             history_index: None,
@@ -229,16 +247,33 @@ impl InputBox {
             .join("\n")
     }
 
+    fn layout(&self, width: u16) -> RefMut<'_, Layout> {
+        self.layout_at(width, self.last_focused)
+    }
+
+    fn layout_at(&self, width: u16, focused: bool) -> RefMut<'_, Layout> {
+        let mut layout = self.layout.borrow_mut();
+        layout.sync(&self.buffer, effective_width(width as usize), focused);
+        layout
+    }
+
+    /// The selected source text, and the selection goes with it.
+    pub fn take_selected_text(&mut self) -> Option<String> {
+        let text = self.buffer.selected_text()?;
+        self.buffer.deselect();
+        Some(text)
+    }
+
     pub fn line_breaks(&self, content_width: u16) -> LineBreaks {
-        let ew = effective_width(content_width as usize);
-        LineBreaks::from_heights(self.buffer.lines().iter().enumerate().map(|(y, line)| {
-            saturating_u16(line_ranges(line, ew, self.last_focused && y == self.buffer.y()).len())
-        }))
+        LineBreaks::from_heights(
+            self.layout(content_width)
+                .heights()
+                .map(|h| saturating_u16(h as usize)),
+        )
     }
 
     pub fn height(&self, width: u16) -> u16 {
-        let ew = effective_width(width as usize);
-        let mut visual_lines = total_visual_lines(&self.buffer, ew, true);
+        let mut visual_lines = self.layout(width).total_rows() as usize;
         if !self.pending_images.is_empty() {
             visual_lines += 1;
         }
@@ -338,64 +373,65 @@ impl InputBox {
         }
     }
 
-    fn visual_rows(&self, ew: usize) -> Vec<(usize, usize, usize, usize)> {
-        self.buffer
-            .lines()
-            .iter()
-            .enumerate()
-            .flat_map(|(y, line)| {
-                line_ranges(line, ew, y == self.buffer.y())
-                    .into_iter()
-                    .enumerate()
-                    .map(move |(row, (start, end))| (y, row, start, end))
-            })
-            .collect()
+    fn visual_cursor_y(&self, width: u16) -> u16 {
+        saturating_u16(self.layout(width).cursor_row(&self.buffer) as usize)
     }
 
-    fn cursor_row(&self, rows: &[(usize, usize, usize, usize)]) -> usize {
-        rows.iter()
-            .rposition(|&(y, _, start, _)| y == self.buffer.y() && start <= self.buffer.x())
-            .unwrap_or(0)
-    }
-
-    fn visual_cursor_y(&self, ew: usize) -> u16 {
-        self.cursor_row(&self.visual_rows(ew))
-            .min(u16::MAX as usize) as u16
-    }
-
-    fn move_visual(&mut self, down: bool) -> bool {
-        let rows = self.visual_rows(effective_width(self.last_width as usize));
-        let current = self.cursor_row(&rows);
-        let target = if down {
-            current.checked_add(1).filter(|&i| i < rows.len())
-        } else {
-            current.checked_sub(1)
+    /// A row up or down, or `false` when there is none. Shift keeps the anchor
+    /// so the motion selects.
+    fn move_visual(&mut self, down: bool, select: bool) -> bool {
+        let Some((line, x)) = self.visual_target(down) else {
+            return false;
         };
-        let Some(target) = target else { return false };
-        let (y, row, start, _) = rows[current];
+        if select {
+            self.buffer.set_cursor_extending(line, x);
+        } else {
+            self.buffer.set_cursor(line, x);
+        }
+        true
+    }
+
+    /// Where one drawn row up or down lands, in (line, char). The preferred
+    /// column is measured on the row the caret leaves and kept for as long as
+    /// it keeps moving vertically.
+    fn visual_target(&mut self, down: bool) -> Option<(usize, usize)> {
+        let width = self.last_width;
+        let (from, to, rows_in_target) = {
+            let layout = self.layout(width);
+            let current = layout.cursor_row(&self.buffer);
+            let target = if down {
+                current
+                    .checked_add(1)
+                    .filter(|&row| row < layout.total_rows())?
+            } else {
+                current.checked_sub(1)?
+            };
+            let from = layout.rows_from(&self.buffer, current).next()?;
+            let to = layout.rows_from(&self.buffer, target).next()?;
+            let rows_in_target = layout.line_row_count(to.line);
+            (from, to, rows_in_target)
+        };
         let column = *self.preferred_column.get_or_insert_with(|| {
-            usize::from(row == 0) * PREFIX_WIDTH as usize
-                + self.buffer.lines()[y]
+            usize::from(from.index == 0) * PREFIX_WIDTH as usize
+                + self.buffer.lines()[from.line]
                     .chars()
-                    .skip(start)
-                    .take(self.buffer.x() - start)
+                    .skip(from.chars.start)
+                    .take(self.buffer.x() - from.chars.start)
                     .map(|c| c.width().unwrap_or(1))
                     .sum::<usize>()
         });
-        let (y, row, start, end) = rows[target];
-        let desired = column.saturating_sub(usize::from(row == 0) * PREFIX_WIDTH as usize);
-        let mut x = start;
-        let mut width = 0;
-        let has_next_in_line = rows.get(target + 1).is_some_and(|next| next.0 == y);
-        let limit = if has_next_in_line {
-            end.saturating_sub(1).max(start)
+        let desired = column.saturating_sub(usize::from(to.index == 0) * PREFIX_WIDTH as usize);
+        let limit = if to.index + 1 < rows_in_target {
+            to.chars.end.saturating_sub(1).max(to.chars.start)
         } else {
-            end
+            to.chars.end
         };
-        for c in self.buffer.lines()[y]
+        let mut x = to.chars.start;
+        let mut width = 0;
+        for c in self.buffer.lines()[to.line]
             .chars()
-            .skip(start)
-            .take(limit - start)
+            .skip(to.chars.start)
+            .take(limit - to.chars.start)
         {
             let w = c.width().unwrap_or(1);
             if width + w > desired {
@@ -404,8 +440,7 @@ impl InputBox {
             width += w;
             x += 1;
         }
-        self.buffer.set_cursor(y, x);
-        true
+        Some((to.line, x))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -425,10 +460,9 @@ impl InputBox {
             self.last_width = area.width;
         }
         let content_height = area.height.saturating_sub(2);
-        let ew = effective_width(area.width as usize);
 
         if self.follow_cursor {
-            let visual_cursor_y = self.visual_cursor_y(ew);
+            let visual_cursor_y = self.visual_cursor_y(area.width);
             if visual_cursor_y < self.scroll_y {
                 self.scroll_y = visual_cursor_y;
             } else if visual_cursor_y >= self.scroll_y.saturating_add(content_height) {
@@ -438,7 +472,16 @@ impl InputBox {
             }
         }
 
-        let mut total_vl = saturating_u16(total_visual_lines(&self.buffer, ew, focused));
+        let (mut total_vl, rows) = {
+            let layout = self.layout(area.width);
+            (
+                saturating_u16(layout.total_rows() as usize),
+                layout
+                    .rows_from(&self.buffer, u32::from(self.scroll_y))
+                    .take(usize::from(content_height))
+                    .collect::<Vec<Row>>(),
+            )
+        };
         if !self.pending_images.is_empty() {
             total_vl = total_vl.saturating_add(1);
         }
@@ -447,8 +490,9 @@ impl InputBox {
         let max_scroll = self.max_scroll();
         self.scroll_y = self.scroll_y.min(max_scroll);
 
-        let is_empty = self.buffer.value().is_empty();
-        let mut styled_lines: Vec<Line> = if is_empty && self.pending_images.is_empty() {
+        let mut styled_lines: Vec<Line> = if self.buffer.is_empty()
+            && self.pending_images.is_empty()
+        {
             let placeholder_base = theme::current().input_placeholder;
             let (head, tail) = match placeholder {
                 Placeholder::Suggestion => (
@@ -475,33 +519,28 @@ impl InputBox {
             vec![Line::from(spans)]
         } else {
             let cursor_y = self.buffer.y();
-            let cursor_x = self.buffer.x();
             let t = theme::current();
             let label_set: HashSet<&str> = self.at_ref_labels.iter().map(String::as_str).collect();
-            self.buffer
-                .lines()
-                .iter()
-                .enumerate()
-                .flat_map(|(i, line)| {
-                    let is_cursor_line = i == cursor_y && focused;
-                    let shell_spans = if i == 0 {
-                        shell_highlight_spans(line)
-                    } else {
-                        None
-                    };
-                    let at_spans =
-                        at_token_spans(line, cwd, &label_set, t.at_ref, t.at_ref_invalid);
-                    let styled = merge_styled_spans(shell_spans.as_deref(), at_spans.as_deref());
-                    wrap_line(
-                        line,
-                        ew,
-                        is_cursor_line,
-                        cursor_x,
-                        i == 0,
-                        styled.as_deref(),
-                    )
-                })
-                .collect()
+            let layout = self.layout(area.width);
+            let mut styled_lines = Vec::with_capacity(rows.len());
+            for line_rows in rows.chunk_by(|a, b| a.line == b.line) {
+                let y = line_rows[0].line;
+                let text = self.buffer.line(y);
+                let chars: Vec<char> = text.chars().collect();
+                let shell_spans = (y == 0).then(|| shell_highlight_spans(text)).flatten();
+                let at_spans = at_token_spans(text, cwd, &label_set, t.at_ref, t.at_ref_invalid);
+                let styled = merge_styled_spans(shell_spans.as_deref(), at_spans.as_deref());
+                styled_lines.extend(wrap_line(
+                    &chars,
+                    line_rows,
+                    layout.line_row_count(y),
+                    (y == cursor_y && focused).then_some(self.buffer.x()),
+                    self.buffer.selection_on_line(y, chars.len()),
+                    styled.as_deref(),
+                    y == 0,
+                ));
+            }
+            styled_lines
         };
 
         if !self.pending_images.is_empty() {
@@ -597,56 +636,41 @@ impl InputBox {
         let content_y = row.checked_sub(area.y)?;
         let content_x = col.checked_sub(area.x)?;
 
-        let ew = effective_width(area.width as usize);
-        let visual_line = content_y as usize + self.scroll_y as usize;
+        let visual_line = u32::from(content_y) + u32::from(self.scroll_y);
+        let layout = self.layout_at(area.width, focused);
+        if visual_line >= layout.total_rows() {
+            return None;
+        }
+        let hit = layout.rows_from(&self.buffer, visual_line).next()?;
+        let chars: Vec<char> = self.buffer.line(hit.line).chars().collect();
+        let widths: Vec<usize> = chars.iter().map(|c| c.width().unwrap_or(1)).collect();
+        let (row_char_start, row_char_end) = (hit.chars.start, hit.chars.end);
+        let row_display_width: usize = widths[row_char_start..row_char_end].iter().sum();
 
-        let cursor_line = self.buffer.y();
-        let mut visual = 0usize;
+        // The first visual row of each buffer line has a 2-cell prefix
+        // (chevron or continuation padding).  Wrapped rows have none.
+        let text_col = if hit.index == 0 {
+            (content_x as usize).saturating_sub(PREFIX_WIDTH as usize)
+        } else {
+            content_x as usize
+        };
+        let text_col = text_col.min(row_display_width);
 
-        for (buf_line_idx, line) in self.buffer.lines().iter().enumerate() {
-            let chars: Vec<char> = line.chars().collect();
-            let widths: Vec<usize> = chars.iter().map(|c| c.width().unwrap_or(1)).collect();
-
-            let is_cursor_line = buf_line_idx == cursor_line && focused;
-            let ranges = wrap_ranges(&widths, ew, is_cursor_line);
-
-            let n_visual_rows = ranges.len();
-
-            if visual_line < visual + n_visual_rows {
-                let wrap_row = visual_line - visual;
-                let (row_char_start, row_char_end) = ranges[wrap_row];
-
-                let row_display_width: usize = widths[row_char_start..row_char_end].iter().sum();
-
-                // The first visual row of each buffer line has a 2-cell prefix
-                // (chevron or continuation padding).  Wrapped rows have none.
-                let text_col = if wrap_row == 0 {
-                    (content_x as usize).saturating_sub(PREFIX_WIDTH as usize)
-                } else {
-                    content_x as usize
-                };
-                let text_col = text_col.min(row_display_width);
-
-                // Walk character widths to find which char the column hits.
-                let mut accum = 0;
-                let mut char_idx = row_char_start;
-                for &w in &widths[row_char_start..row_char_end] {
-                    if accum + w > text_col {
-                        break;
-                    }
-                    accum += w;
-                    char_idx += 1;
-                }
-
-                if wrap_row + 1 < n_visual_rows && char_idx == row_char_end {
-                    char_idx = row_char_end.saturating_sub(1).max(row_char_start);
-                }
-                return Some((buf_line_idx, char_idx));
+        // Walk character widths to find which char the column hits.
+        let mut accum = 0;
+        let mut char_idx = row_char_start;
+        for &w in &widths[row_char_start..row_char_end] {
+            if accum + w > text_col {
+                break;
             }
-            visual += n_visual_rows;
+            accum += w;
+            char_idx += 1;
         }
 
-        None
+        if hit.index + 1 < layout.line_row_count(hit.line) && char_idx == row_char_end {
+            char_idx = row_char_end.saturating_sub(1).max(row_char_start);
+        }
+        Some((hit.line, char_idx))
     }
 }
 
@@ -662,43 +686,47 @@ fn effective_width(content_width: usize) -> usize {
     content_width.saturating_sub(PREFIX_WIDTH as usize)
 }
 
+/// Draws the rows of one line that are on screen. {cursor} is the caret's char
+/// when this is the cursor line, and {selected} the chars the selection covers.
 fn wrap_line(
-    line: &str,
-    ew: usize,
-    is_cursor_line: bool,
-    cursor_x: usize,
-    is_first_line: bool,
+    chars: &[char],
+    rows: &[Row],
+    row_count: u32,
+    cursor: Option<usize>,
+    selected: Option<Range<usize>>,
     shell_spans: Option<&[Span<'static>]>,
+    is_first_line: bool,
 ) -> Vec<Line<'static>> {
-    let chars: Vec<char> = line.chars().collect();
-    let widths: Vec<usize> = chars.iter().map(|c| c.width().unwrap_or(1)).collect();
-
-    let ranges = wrap_ranges(&widths, ew, is_cursor_line);
-    let row_count = ranges.len();
-    ranges
-        .into_iter()
-        .enumerate()
-        .map(|(row, (start, end))| {
-            let prefix_span = if row == 0 && is_first_line {
-                super::chevron_span()
-            } else if row == 0 {
-                Span::raw(NEWLINE_PAD)
-            } else {
+    let selection_style = theme::current().item_selected;
+    let selected = selected.as_ref();
+    rows.iter()
+        .map(|row| {
+            let (start, end) = (row.chars.start, row.chars.end);
+            let prefix_span = if row.index > 0 {
                 Span::raw("")
+            } else if is_first_line {
+                super::chevron_span()
+            } else {
+                Span::raw(NEWLINE_PAD)
             };
             let mut spans = vec![prefix_span];
 
-            let chunk_spans = if let Some(styled) = &shell_spans {
+            let mut chunk_spans = if let Some(styled) = shell_spans {
                 slice_styled_spans(styled, start, end)
             } else {
                 let chunk_text: String = chars[start..end].iter().collect();
                 vec![Span::raw(chunk_text)]
             };
+            if let Some(selected) = selected {
+                let from = selected.start.saturating_sub(start);
+                let to = selected.end.saturating_sub(start).min(end - start);
+                chunk_spans = paint_selection(chunk_spans, from..to, selection_style);
+            }
 
-            if is_cursor_line
+            if let Some(cursor_x) = cursor
                 && cursor_x >= start
                 && (cursor_x < end
-                    || (cursor_x == end && end == chars.len() && row + 1 == row_count))
+                    || (cursor_x == end && end == chars.len() && row.index + 1 == row_count))
             {
                 let local_cursor = cursor_x.saturating_sub(start);
                 spans.extend(overlay_cursor(chunk_spans, local_cursor));
@@ -711,34 +739,46 @@ fn wrap_line(
         .collect()
 }
 
-/// Split a line (given per-char display widths) into wrapped row ranges of
-/// char indices, exactly as it is rendered: an extra empty row is appended
-/// when the cursor sits past a completely full last row.
-fn line_ranges(line: &str, ew: usize, is_cursor_line: bool) -> Vec<(usize, usize)> {
-    let widths: Vec<_> = line.chars().map(|c| c.width().unwrap_or(1)).collect();
-    wrap_ranges(&widths, ew, is_cursor_line)
-}
-
-fn wrap_ranges(widths: &[usize], ew: usize, is_cursor_line: bool) -> Vec<(usize, usize)> {
-    let row_width = ew.max(1);
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    let mut row_start = 0;
-    let mut row_col = 0;
-    for (i, &w) in widths.iter().enumerate() {
-        if row_col + w > row_width && row_col > 0 {
-            ranges.push((row_start, i));
-            row_start = i;
-            row_col = 0;
+/// Restyles the chars of {range}, counted from the start of the row, splitting
+/// spans at the boundaries so only the selected text changes.
+fn paint_selection(
+    spans: Vec<Span<'static>>,
+    range: Range<usize>,
+    style: Style,
+) -> Vec<Span<'static>> {
+    if range.is_empty() {
+        return spans;
+    }
+    let mut out = Vec::with_capacity(spans.len() + 2);
+    let mut pos = 0;
+    for span in spans {
+        let chars: Vec<char> = span.content.chars().collect();
+        let end = pos + chars.len();
+        let from = range.start.max(pos) - pos;
+        let to = range.end.min(end) - pos;
+        if from >= to {
+            out.push(span);
+        } else {
+            if from > 0 {
+                out.push(Span::styled(
+                    chars[..from].iter().collect::<String>(),
+                    span.style,
+                ));
+            }
+            out.push(Span::styled(
+                chars[from..to].iter().collect::<String>(),
+                span.style.patch(style),
+            ));
+            if to < chars.len() {
+                out.push(Span::styled(
+                    chars[to..].iter().collect::<String>(),
+                    span.style,
+                ));
+            }
         }
-        row_col += w;
+        pos = end;
     }
-    if row_start < widths.len() || ranges.is_empty() {
-        ranges.push((row_start, widths.len()));
-    }
-    if is_cursor_line && row_col + 1 > row_width {
-        ranges.push((widths.len(), widths.len()));
-    }
-    ranges
+    out
 }
 
 fn shell_highlight_spans(line: &str) -> Option<Vec<Span<'static>>> {
@@ -938,16 +978,6 @@ fn overlay_cursor(spans: Vec<Span<'static>>, cursor_char_pos: usize) -> Vec<Span
     result
 }
 
-fn total_visual_lines(buffer: &TextBuffer, ew: usize, cursor_visible: bool) -> usize {
-    let cursor_y = buffer.y();
-    buffer
-        .lines()
-        .iter()
-        .enumerate()
-        .map(|(i, line)| line_ranges(line, ew, cursor_visible && i == cursor_y).len())
-        .sum()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1017,8 +1047,6 @@ abcdef"
 
     #[test_case(KeyCode::Up, KeyModifiers::CONTROL; "ctrl_up")]
     #[test_case(KeyCode::Down, KeyModifiers::ALT; "alt_down")]
-    #[test_case(KeyCode::Up, KeyModifiers::SHIFT; "shift_up")]
-    #[test_case(KeyCode::Down, KeyModifiers::SHIFT; "shift_down")]
     fn modified_arrows_delegate_away_from_logical_boundaries(
         code: KeyCode,
         modifiers: KeyModifiers,
@@ -1050,7 +1078,6 @@ abcdef"
 
     #[test_case(KeyModifiers::CONTROL; "ctrl")]
     #[test_case(KeyModifiers::ALT; "alt")]
-    #[test_case(KeyModifiers::SHIFT; "shift")]
     fn modified_arrows_use_history_at_logical_boundaries(modifiers: KeyModifiers) {
         let mut input = InputBox::new(InputHistory::default(), 20);
         submit_text(&mut input, "history");
@@ -1108,15 +1135,80 @@ abcdef"
         assert!(breaks.is_line_start(1));
     }
 
+    fn shift(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
+    }
+
+    /// Up on the first row has nothing to move over, so Shift+Up must not fall
+    /// through to the history and swap out the text being selected.
+    #[test]
+    fn shift_selects_before_history_and_esc_drops_it_first() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        submit_text(&mut input, "history");
+        input.handle_paste("draft");
+
+        assert!(matches!(
+            input.handle_key(shift(KeyCode::Up)),
+            InputAction::None
+        ));
+        assert_eq!(input.buffer.value(), "draft");
+
+        input.handle_key(shift(KeyCode::Home));
+        assert_eq!(input.buffer.selected_text().as_deref(), Some("draft"));
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(input.handle_key(esc), InputAction::None));
+        assert!(!input.buffer.has_selection());
+        assert!(matches!(input.handle_key(esc), InputAction::Passthrough(_)));
+    }
+
+    /// Shift+Down off the end of a full row lands on the cursor's extra row,
+    /// which only exists because the layout counts it.
+    #[test]
+    fn shift_down_selects_the_extra_row_of_a_full_line() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.set_input("abcdefgh".into());
+        input.last_width = 10;
+        input.buffer.set_cursor(0, 2);
+
+        input.handle_key(shift(KeyCode::Down));
+
+        assert_eq!(input.buffer.selected_text().as_deref(), Some("cdefgh"));
+        assert_eq!((input.buffer.y(), input.buffer.x()), (0, 8));
+    }
+
+    #[test]
+    fn a_selection_paints_the_selected_chars_and_copies_them() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        type_text(&mut input, "hello world");
+        input.buffer.set_cursor(0, 6);
+        input.handle_key(shift(KeyCode::End));
+        let terminal = render_input(&mut input, 20, 4);
+
+        let selected = theme::current()
+            .item_selected
+            .bg
+            .expect("themes give the selection a background");
+        let cell = |col: u16| terminal.backend().buffer().cell((col, 1)).unwrap().bg;
+        assert_eq!(cell(PREFIX_WIDTH + 6), selected);
+        assert_eq!(cell(PREFIX_WIDTH + 10), selected);
+        assert_ne!(cell(PREFIX_WIDTH + 5), selected);
+
+        assert_eq!(input.take_selected_text().as_deref(), Some("world"));
+        assert!(!input.buffer.has_selection());
+    }
+
     #[test]
     fn wide_character_wrap_counts_and_cursor_boundary() {
         let mut input = InputBox::new(InputHistory::default(), 20);
         input.set_input("a界界".into());
         input.buffer.set_cursor(0, 2);
-        assert_eq!(input.visual_cursor_y(3), 1);
-        assert_eq!(total_visual_lines(&input.buffer, 3, true), 2);
+        assert_eq!(input.visual_cursor_y(5), 1);
+        assert_eq!(input.layout(5).total_rows(), 2);
         assert_eq!(input.height(5), 4);
-        let lines = wrap_line("a界界", 3, true, 2, true, None);
+        let chars: Vec<char> = "a界界".chars().collect();
+        let rows: Vec<Row> = input.layout(5).rows_from(&input.buffer, 0).collect();
+        let lines = wrap_line(&chars, &rows, 2, Some(2), None, None, true);
         let reversed: usize = lines
             .iter()
             .flat_map(|line| &line.spans)
