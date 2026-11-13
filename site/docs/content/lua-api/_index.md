@@ -405,6 +405,8 @@ Your {spec} table must include a name, a description (the model reads it
 to decide when to use the tool), a JSON Schema for the input, and a handler
 function. The handler receives `(input, ctx)` and returns either a plain
 string or a table with richer output fields.
+`ctx:output_mode()` is "full" or "compact". Apply presentation limits
+only in compact mode so Python and other code callers get complete text.
 
 **Parameters:**
 
@@ -414,7 +416,7 @@ string or a table with richer output fields.
   - `schema` (`table`) Required. JSON Schema object describing the tool's input parameters.
   - `handler` (`function`) Required. Called with `(input, ctx)` when the tool is invoked.
     Must return a string or a table with any of these fields:
-    - `llm_output` (`string`) Text sent to the model.
+    - `llm_output` (`string`) Text returned to the caller, including the model.
     - `is_error` (`boolean`) When true, the result is treated as an error.
     - `output_limits` (`table`) Bounds raw plain-text `llm_output` after the handler or `ctx:finish` returns.
     - `body` (`BufHandle`) Rich rendered body shown in the UI.
@@ -1683,6 +1685,10 @@ through optional callbacks while the tool runs.
 - `{input}` (`table|any`) Tool input (JSON-serializable). Must match the tool's `input_schema`.
 - `{opts?}` (`table?`) Optional fields:
   - `timeout` (`integer?`) deadline in seconds.
+  - `output_mode` (`string?`) "full" (default) returns complete text.
+    "compact" applies model output limits and automatic RTK rewriting.
+    Hooks receive the mode in both cases so presentation filters can skip
+    full results. Permissions and redaction still apply in both modes.
   - `on_live_buf` (`function?`) called with a `BufHandle` for each live buffer
     the tool publishes. Must not yield.
   - `on_annotation` (`function?`) called with an annotation string for each
@@ -3552,7 +3558,7 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{pattern}` (`string`) Regular expression to search for.
-- `{opts?}` (`table?`) `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`). `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `max_line_bytes` (integer): skip lines longer than this.
+- `{opts?}` (`table?`) `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`). `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `max_line_bytes` (integer): truncate lines longer than this (0 means unlimited).
 
 **Returns:** (`table?`, `string?`) Array of `{path, groups}` tables, or nil plus an error message.
 
@@ -7899,23 +7905,34 @@ function M.check_markers(before, after)
 ### `require("makima.output_limits")`
 
 ```lua
--- Shared per-tool output limit options, so the tools that support them
--- cannot drift apart.
+-- Shared per-tool output limit options so the tools cannot drift apart.
 
-local DEFAULT_MAX_OUTPUT_LINES = 2000
-local DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
-local DEFAULT_MAX_LINE_BYTES = 1000
+local DEFAULT_LINES = 2000
+local DEFAULT_BYTES = 50 * 1024
+local DEFAULT_LINE_BYTES = 1000
 
 local M = {}
 
-M.DEFAULT_MAX_LINE_BYTES = DEFAULT_MAX_LINE_BYTES
+M.DEFAULT_MAX_LINE_BYTES = DEFAULT_LINE_BYTES
 M.specs = {
-  max_output_lines = { type = "integer", desc = "Override `agent.max_output_lines` for this tool." },
-  max_output_bytes = { type = "integer", desc = "Override `agent.max_output_bytes` for this tool." },
+  max_output_lines = { type = "integer", desc = "Model-facing `max_output_lines` cap." },
+  max_output_bytes = { type = "integer", desc = "Model-facing `max_output_bytes` cap." },
 }
 
+--- Model output limits, or nil, nil for full output.
+function M.resolve(opts, ctx)
+  if ctx:output_mode() == "full" then
+    return nil, nil
+  end
+  return opts.max_output_lines or ctx:config("max_output_lines", DEFAULT_LINES),
+    opts.max_output_bytes or ctx:config("max_output_bytes", DEFAULT_BYTES)
+end
+
+--- Per-line cap, or nil for full output.
 function M.line_bytes(ctx)
-  return ctx:config("max_line_bytes", DEFAULT_MAX_LINE_BYTES)
+  if ctx:output_mode() ~= "full" then
+    return ctx:config("max_line_bytes", DEFAULT_LINE_BYTES)
+  end
 end
 
 function M.extend(spec)
@@ -7923,12 +7940,6 @@ function M.extend(spec)
     spec[name] = s
   end
   return spec
-end
-
---- Returns max_lines, max_bytes: tool override when set, agent-wide otherwise.
-function M.resolve(opts, ctx)
-  return opts.max_output_lines or ctx:config("max_output_lines", DEFAULT_MAX_OUTPUT_LINES),
-    opts.max_output_bytes or ctx:config("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES)
 end
 
 return M

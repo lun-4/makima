@@ -18,8 +18,8 @@ use makima_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, va
 use makima_agent::tools::{
     BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult,
     OutputFinalization, ParseError, PermissionScopes, TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT,
-    ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation, is_tool_enabled,
-    timeout_annotation,
+    ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation, ToolOutputMode,
+    is_tool_enabled, timeout_annotation,
 };
 use makima_agent::{
     AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, InstructionBlock, SharedBuf,
@@ -595,7 +595,8 @@ impl ToolInvocation for LuaToolInvocation {
                             (runtime, invocation) => runtime.or(invocation),
                         }
                     };
-                    let limiting = reply.has_output_limits();
+                    let limiting =
+                        reply.has_output_limits() && ctx.output_mode == ToolOutputMode::Compact;
                     let already_cancelled = ctx.cancel.is_cancelled();
                     let finalization_deadline = if limiting && already_cancelled {
                         Some(Instant::now() + TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT)
@@ -792,6 +793,8 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 /// to decide when to use the tool), a JSON Schema for the input, and a handler
 /// function. The handler receives `(input, ctx)` and returns either a plain
 /// string or a table with richer output fields.
+/// `ctx:output_mode()` is "full" or "compact". Apply presentation limits
+/// only in compact mode so Python and other code callers get complete text.
 ///
 /// @param spec table Tool specification:
 ///   name            (string)   Required. ASCII identifier, up to 64 chars ([a-zA-Z_][a-zA-Z0-9_]*).
@@ -799,7 +802,7 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///   schema          (table)    Required. JSON Schema object describing the tool's input parameters.
 ///   handler         (function) Required. Called with `(input, ctx)` when the tool is invoked.
 ///                              Must return a string or a table with any of these fields:
-///                                llm_output  (string)  Text sent to the model.
+///                                llm_output  (string)  Text returned to the caller, including the model.
 ///                                is_error    (boolean) When true, the result is treated as an error.
 ///                                output_limits (table) Bounds raw plain-text `llm_output` after the handler or `ctx:finish` returns.
 ///                                body        (BufHandle) Rich rendered body shown in the UI.
@@ -2326,12 +2329,19 @@ impl ToolCallReply {
                 ctx.defer_output_limits(opts);
                 return self;
             }
+            // Full results skip presentation limits and offload: the nested
+            // caller asked for the complete text.
+            let full = ctx.output_mode == ToolOutputMode::Full;
             let result = std::mem::replace(&mut self.result, Ok(String::new()));
             let is_error = result.is_err();
             let body = match result {
                 Ok(body) | Err(body) => body,
             };
-            let body = opts.apply(body, ctx.offload.clone()).await;
+            let body = if full {
+                opts.apply_trailer(body)
+            } else {
+                opts.apply(body, ctx.offload.clone()).await
+            };
             self.result = if is_error { Err(body) } else { Ok(body) };
         }
         self

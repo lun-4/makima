@@ -381,6 +381,7 @@ impl<'a> Hook<'a> {
             tool_id,
             session_id: self.ctx.session_id.as_ref().map(SessionRef::as_str),
             origin: self.origin,
+            output_mode: self.ctx.output_mode,
             authority: self.authority,
             cancel: &self.ctx.cancel,
             deadline: deadline.map_or_else(|| self.window(), |at| at.min(self.window())),

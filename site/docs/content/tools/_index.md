@@ -38,7 +38,7 @@ Read a file. Returns contents with line numbers (1-indexed).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `limit` | integer | yes | Max number of lines to read. Use 0 to read until end of file (capped at 2000 lines). |
+| `limit` | integer | yes | Max number of lines to read. Use 0 to read until end of file (capped at 2000 lines in compact mode). |
 | `offset` | integer | yes | Line number to start from (1-indexed). Use 1 for the first line. |
 | `path` | string | yes | Absolute path to the file |
 

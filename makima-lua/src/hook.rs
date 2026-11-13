@@ -42,6 +42,7 @@ impl ToolHook for SlotHook {
                     "tool_id": call.tool_id,
                     "session_id": call.session_id,
                     "origin": call.origin.as_str(),
+                    "output_mode": call.output_mode.as_str(),
                 }),
             },
             reply,

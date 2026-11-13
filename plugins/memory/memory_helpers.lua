@@ -352,8 +352,8 @@ function M.encode_frontmatter(tags)
   return "---\n" .. yaml .. "---\n"
 end
 
-function M.cap_read_output(s, hint)
-  if #s <= M.MAX_FILE_BYTES then
+function M.cap_read_output(s, hint, ctx)
+  if (ctx and ctx:output_mode() == "full") or #s <= M.MAX_FILE_BYTES then
     return s
   end
   -- Back off UTF-8 continuation bytes so the cut never splits a codepoint.
@@ -389,7 +389,7 @@ function M.format_read_entry(name, size, content)
   return header .. "\n\n" .. body
 end
 
-function M.format_list(dir, raw_tags)
+function M.format_list(dir, raw_tags, ctx)
   local want, warning
   if raw_tags and #raw_tags > 0 then
     local werr
@@ -421,14 +421,14 @@ function M.format_list(dir, raw_tags)
   if matched == 0 then
     return join_parts("\n", warning, unreadable, NO_MATCH_MSG)
   end
-  local body = M.cap_read_output(table.concat(lines, "\n"), M.CAP_HINT_FILTER)
+  local body = M.cap_read_output(table.concat(lines, "\n"), M.CAP_HINT_FILTER, ctx)
   if not want and #groups > M.MAX_TAGS then
     body = body .. "\n" .. PRUNE_ADVISORY
   end
   return join_parts("\n", warning, unreadable, body), nil
 end
 
-function M.format_read(dir, raw_tags)
+function M.format_read(dir, raw_tags, ctx)
   local want, warning, err = normalize_to_want(raw_tags)
   if err then
     return nil, err
@@ -441,7 +441,7 @@ function M.format_read(dir, raw_tags)
   end
 
   local hint = #parts <= 1 and M.CAP_HINT_REWRITE or M.CAP_HINT_NARROW
-  local body = #parts > 0 and M.cap_read_output(table.concat(parts, "\n\n"), hint) or NO_MATCH_MSG
+  local body = #parts > 0 and M.cap_read_output(table.concat(parts, "\n\n"), hint, ctx) or NO_MATCH_MSG
   return join_parts("\n\n", warning, combine_unreadable(read_warnings), body)
 end
 

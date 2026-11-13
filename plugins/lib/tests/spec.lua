@@ -1771,6 +1771,35 @@ case("list_picker_static_items_keep_blocking_recv", function()
   eq(timeouts[1], "blocking", "static pickers still block without an age poll")
 end)
 
+case("output_limits_full_mode_skips_presentation_caps", function()
+  local output_limits = require("makima.output_limits")
+  local full = {
+    output_mode = function()
+      return "full"
+    end,
+  }
+  local lines, bytes = output_limits.resolve({ max_output_lines = 5, max_output_bytes = 10 }, full)
+  eq(lines, nil, "full mode has no line cap")
+  eq(bytes, nil, "full mode has no byte cap")
+  eq(output_limits.line_bytes(full), nil, "full mode has no line-byte cap")
+end)
+
+case("output_limits_compact_mode_applies_model_caps", function()
+  local output_limits = require("makima.output_limits")
+  local compact = {
+    output_mode = function()
+      return "compact"
+    end,
+    config = function(_, name, default)
+      return ({ max_line_bytes = 120, max_output_lines = 7 })[name] or default
+    end,
+  }
+  local lines, bytes = output_limits.resolve({ max_output_bytes = 10 }, compact)
+  eq(lines, 7, "agent-wide line cap")
+  eq(bytes, 10, "tool byte override")
+  eq(output_limits.line_bytes(compact), 120, "agent-wide line-byte cap")
+end)
+
 if #failures > 0 then
   error(#failures .. " case(s) failed:\n\n" .. table.concat(failures, "\n\n"))
 end

@@ -26,7 +26,7 @@ use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::tools::offload::OffloadStore;
 use crate::tools::{
-    Deadline, FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolContext,
+    Deadline, FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolContext, ToolOutputMode,
     TurnToolBindings,
 };
 use crate::{
@@ -983,6 +983,7 @@ impl<'h> Agent<'h> {
             tool_filter: Arc::clone(self.tools.filter()),
             request_tools: Some(self.tools.clone()),
             tool_output_lines: self.tool_output_lines,
+            output_mode: ToolOutputMode::Compact,
             permissions: Arc::clone(&self.permissions),
             timeouts: self.timeouts,
             file_tracker: Arc::clone(&self.file_tracker),

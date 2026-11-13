@@ -38,7 +38,7 @@ use makima_agent::tools::schema::sanitize_tool_input_schema;
 use makima_agent::tools::{
     CallOrigin, Deadline, DescriptionContext, FileReadTracker, LocalTool, LocalTools,
     PermissionScopes, RequestTools, ToolAudience, ToolContext, ToolFilter, ToolLive,
-    TurnToolBindings,
+    ToolOutputMode, TurnToolBindings,
 };
 use makima_agent::{
     Agent, AgentActorHandle, AgentEvent, AgentId, AgentInput, AgentMode, AgentParams, AgentRef,
@@ -74,6 +74,7 @@ const COMPACT_PARAMS_MISSING_ERR: &str = "compaction requires initialized agent 
 const COMPACT_CONFIG_MISSING_ERR: &str =
     "compaction was admitted without an effective agent configuration";
 const INVALID_SHOW_OPTION: &str = "show must be a boolean or string";
+const OUTPUT_MODE_ERR: &str = "output_mode must be 'full' or 'compact'";
 const UNNAMED_AGENT_LABEL: &str = "agent";
 const SPAWN_OPTIONS: &[&str] = &[
     "audience",
@@ -882,6 +883,10 @@ async fn callable_tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<P
 /// @param input table|any Tool input (JSON-serializable). Must match the tool's `input_schema`.
 /// @param opts table? Optional fields:
 ///   `timeout` (integer?) - deadline in seconds.
+///   `output_mode` (string?) - "full" (default) returns complete text.
+///     "compact" applies model output limits and automatic RTK rewriting.
+///     Hooks receive the mode in both cases so presentation filters can skip
+///     full results. Permissions and redaction still apply in both modes.
 ///   `on_live_buf` (function?) - called with a `BufHandle` for each live buffer
 ///     the tool publishes. Must not yield.
 ///   `on_annotation` (function?) - called with an annotation string for each
@@ -919,8 +924,15 @@ async fn call_tool(
         Err(e) => return Ok((None, Some(e.to_string()), LuaValue::Nil)),
     };
     let mut tctx = agent.to_tool_context();
+    tctx.output_mode = ToolOutputMode::Full;
     let (mut on_buf, mut on_ann, mut on_usage, mut rx) = (None, None, None, None);
     if let Some(o) = opts {
+        if let Some(mode) = o.get::<Option<String>>("output_mode")? {
+            let Some(mode) = ToolOutputMode::parse(&mode) else {
+                return Ok((None, Some(OUTPUT_MODE_ERR.to_owned()), LuaValue::Nil));
+            };
+            tctx.output_mode = mode;
+        }
         if let Some(secs) = o.get::<Option<u64>>("timeout")? {
             tctx.deadline = tctx
                 .deadline
@@ -1512,6 +1524,7 @@ impl ChildSettings {
         template.managed_turn = None;
         template.local_tools = Arc::new(tools.local.clone());
         template.local_tool_capture = Some(Arc::clone(commit));
+        template.output_mode = ToolOutputMode::Compact;
         template.mcp = context
             .mcp
             .as_ref()
