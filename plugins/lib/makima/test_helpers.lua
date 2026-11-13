@@ -29,14 +29,17 @@ end
 
 local _tmpdir_counter = 0
 
+-- Absolute so a caller that resolves it again (a tool's ctx:resolve_path)
+-- gets the same spelling: a rooted path without a drive is not absolute on
+-- Windows and resolves against the cwd's drive.
 function M.mktmpdir(prefix)
   _tmpdir_counter = _tmpdir_counter + 1
-  local name = "/tmp/makima_"
+  local name = makima.fs.abspath("/tmp/makima_"
     .. (prefix or "test")
     .. "_"
     .. tostring(os.clock()):gsub("%.", "")
     .. "_"
-    .. _tmpdir_counter
+    .. _tmpdir_counter)
   makima.fs.mkdir(name)
   return name
 end

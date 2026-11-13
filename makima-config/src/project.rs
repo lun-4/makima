@@ -702,7 +702,7 @@ mod tests {
     /// for the home directory: the walk stops there and can never reach a
     /// `.git` that happens to sit above the temp directory.
     fn project_at(path: &Path) -> ProjectConfig {
-        let path = path.canonicalize().unwrap();
+        let path = canonicalize_clean(path);
         ProjectConfig::rooted(&path, path.parent())
     }
 
@@ -852,7 +852,7 @@ mod tests {
     #[test_case(Marker::WorktreeFile ; "a_worktree_git_file_marks_the_root")]
     fn discovery_walks_up_to_the_checkout_root(marker: Marker) {
         let project = tempfile::tempdir().unwrap();
-        let project = project.path().canonicalize().unwrap();
+        let project = canonicalize_clean(project.path());
         let child = project.join("src/child");
         fs::create_dir_all(&child).unwrap();
         let git = project.join(GIT_DIR);
@@ -879,7 +879,7 @@ mod tests {
     #[test_case(None, None ; "a_plain_directory_below_home_is_its_own_root")]
     fn project_discovery_stops_below_home(repo: Option<&str>, expected_root: Option<&str>) {
         let home = tempfile::tempdir().unwrap();
-        let home = home.path().canonicalize().unwrap();
+        let home = canonicalize_clean(home.path());
         let cwd = home.join(NESTED_CWD);
         fs::create_dir_all(&cwd).unwrap();
         if let Some(repo) = repo {

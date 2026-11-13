@@ -600,6 +600,7 @@ async fn shutdown_manager(manager: &AgentManagerHandle) {
 
 struct Fixture {
     _host: PluginHost,
+    registry: Arc<ToolRegistry>,
     _state_dir: tempfile::TempDir,
     manager: AgentManagerHandle,
     requests: flume::Receiver<CapturedRequest>,
@@ -641,7 +642,7 @@ impl Fixture {
             sibling,
         } = options;
         let mode = mode.unwrap_or(AgentMode::Build);
-        let registry = Arc::clone(ToolRegistry::global_arc());
+        let registry = Arc::new(ToolRegistry::new());
         let (requests_tx, requests) = flume::unbounded();
         let provider = Arc::new(ScriptedProvider {
             requests: requests_tx,
@@ -823,7 +824,7 @@ impl Fixture {
         let root = manager
             .create_root_with_config(Some(policy), Vec::new(), None, |_| {
                 Ok::<_, String>(Box::new(LuaInvocationBackend {
-                    registry,
+                    registry: Arc::clone(&registry),
                     context,
                     tool,
                     completed: completed_tx,
@@ -858,6 +859,7 @@ impl Fixture {
             .unwrap();
         Self {
             _host: host,
+            registry,
             _state_dir: state_dir,
             manager,
             requests,
@@ -3300,7 +3302,7 @@ fn trusted_spawn_restores_host_bindings_without_expanding_capabilities(explicit:
         );
         bounded(fixture.root_ticket.wait(), "root settlement").await;
         let (mut template, _events, _cancel) = common::ctx_with_canned_provider();
-        template.registry = Arc::clone(ToolRegistry::global_arc());
+        template.registry = Arc::clone(&fixture.registry);
         template.turn_bindings = Arc::new(makima_agent::tools::TurnToolBindings::default());
         let definitions = json!([
             { "name": "pr5_audience_ceiling", "description": "exact parent snapshot", "input_schema": { "type": "object", "properties": {} } },
@@ -4166,7 +4168,7 @@ fn saturated_event_callbacks_can_dispatch_a_child_lua_tool() {
                 end,
             }})
         "#)).unwrap();
-        template.registry = Arc::clone(ToolRegistry::global_arc());
+        template.registry = Arc::clone(&fixture.registry);
         assert!(
             template.registry.get(TOOL).is_some(),
             "saturation tool must be in parent registry"

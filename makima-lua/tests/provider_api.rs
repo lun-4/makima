@@ -1,7 +1,8 @@
 use std::future::Future;
 use std::io::Write;
 use std::net::TcpListener;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,7 @@ use makima_providers::{
 use serde_json::json;
 use test_case::test_case;
 
+const PROVIDERS_FILE: &str = "providers.toml";
 const PROVIDER: &str = "fake";
 const PLUGIN: &str = "fake_plugin";
 const OTHER_PLUGIN: &str = "other_plugin";
@@ -106,6 +108,20 @@ const REFRESH_SOURCE: &str = r#"
         end,
     })
 "#;
+
+/// `providers.toml` lives in the one config dir the process paths point at,
+/// so tests that read or write it cannot run beside each other.
+fn shared_config() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    let serial = LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    makima_storage::paths::init_shared_for_test();
+    ProvidersConfig::default().save().unwrap();
+    serial
+}
+
+fn config_dir() -> PathBuf {
+    makima_storage::paths::config_dir().unwrap()
+}
 
 fn host() -> PluginHost {
     PluginHost::new(Arc::new(ToolRegistry::new())).unwrap()
@@ -699,8 +715,7 @@ fn optional_methods_dispatch_with_their_arguments() {
 
 #[test]
 fn provider_config_is_nonfatal_after_startup() {
-    let state = tempfile::tempdir().unwrap();
-    makima_storage::paths::init_at(state.path().to_path_buf()).unwrap();
+    let _serial = shared_config();
     let host = host();
     host.load_source(
         PLUGIN,
@@ -711,7 +726,7 @@ fn provider_config_is_nonfatal_after_startup() {
         ),
     )
     .unwrap();
-    std::fs::write(state.path().join("providers.toml"), "[broken\n").unwrap();
+    std::fs::write(config_dir().join(PROVIDERS_FILE), "[broken\n").unwrap();
     let providers = registry(&host);
 
     let mut batches = Vec::new();
@@ -725,8 +740,7 @@ fn provider_config_is_nonfatal_after_startup() {
 
 #[test]
 fn prepare_and_discover_read_the_provider_config_at_call_time() {
-    let state = tempfile::tempdir().unwrap();
-    makima_storage::paths::init_at(state.path().to_path_buf()).unwrap();
+    let _serial = shared_config();
     let host = host();
     host.load_source(PLUGIN, CONFIG_SOURCE).unwrap();
     let providers = registry(&host);
