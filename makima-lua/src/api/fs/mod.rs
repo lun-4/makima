@@ -590,7 +590,7 @@ async fn glob(lua: Lua, pattern: Value, opts: Option<Table>) -> LuaResult<Pair<T
 /// `lines`, where every line has `line_nr`, `text`, and `is_match`.
 ///
 /// @param pattern string Regular expression to search for.
-/// @param opts table? `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`). `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `max_line_bytes` (integer): skip lines longer than this.
+/// @param opts table? `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`). `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `max_line_bytes` (integer): truncate lines longer than this (0 means unlimited).
 /// @return (table?, string?) Array of `{path, groups}` tables, or nil plus an error message.
 /// @example
 /// local hits, err = makima.fs.grep("TODO", { path = "src", include = "*.rs", limit = 5 })

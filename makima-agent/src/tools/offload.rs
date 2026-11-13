@@ -524,6 +524,12 @@ impl OutputLimitOptions {
         })
         .await
     }
+
+    /// Full results skip the limits but keep the trailer, which carries text
+    /// the tool never put in the body, like an exit code or a partial marker.
+    pub fn apply_trailer(self, body: String) -> String {
+        with_trailer(body.trim_end_matches('\n'), self.trailer.as_deref())
+    }
 }
 
 #[derive(Debug, Clone)]

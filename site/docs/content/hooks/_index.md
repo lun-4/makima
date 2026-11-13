@@ -50,11 +50,17 @@ Stopping means something different per stage. On `input` the tool never runs and
 `reason` becomes the tool result, marked as an error. On `output` the work is
 already done, so `reason` only replaces the text the model reads.
 
-`ctx` carries `tool`, `tool_id`, `session_id`, and `origin`. Origin is `"model"`
-for a call the model made and `"nested"` for one made on its behalf by `batch`,
-`code_execution`, or a plugin calling `makima.agent.call_tool`. Nested calls have
-no id of their own, so their `tool_id` is empty. A subagent runs its own model,
-so its calls arrive as `"model"` under the subagent's `session_id`.
+`ctx` carries `tool`, `tool_id`, `session_id`, `origin`, and `output_mode`.
+Origin is `"model"` for a call the model made and `"nested"` for one made on its
+behalf by `batch`, `code_execution`, or a plugin calling
+`makima.agent.call_tool`. Nested calls have no id of their own, so their
+`tool_id` is empty. A subagent runs its own model, so its calls arrive as
+`"model"` under the subagent's `session_id`.
+
+`output_mode` is `"compact"` for text the model reads and `"full"` for a nested
+call that processes the complete result. Output layers run in both modes. Check
+`ctx.output_mode` before shortening text so a script receives everything it
+asked for, and apply redaction in both modes.
 
 ### Rewriting a command
 

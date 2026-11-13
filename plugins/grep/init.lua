@@ -264,7 +264,7 @@ makima.api.register_tool({
 
     local limit = math.min(input.limit or opts.search_result_limit, MAX_PER_CALL_LIMIT)
 
-    local max_line_bytes = output_limits.line_bytes(ctx)
+    local max_line_bytes = output_limits.line_bytes(ctx) or 0
     local path, path_err = ctx:resolve_path(input.path or ".")
     if not path then
       return { llm_output = "error: " .. tostring(path_err), is_error = true }

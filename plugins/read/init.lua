@@ -9,7 +9,7 @@ local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed
 
 - Supports absolute, relative, and ~/ paths.
 - **offset** and **limit** are required. Use offset=1 to read from the first line.
-- Use limit=0 to read until the end of file (capped at 2000 lines).
+- Use limit=0 to read until the end of file (capped at 2000 lines in compact mode).
 - Use the **index** tool or **grep** tool first to find the offset and limit.
 - Only read the sections you actually need.
 - Use `wc -l` to check total number of lines before reading to decide a reasonable limit.
@@ -18,8 +18,6 @@ local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed
 - Prefer grep to locate content instead of scanning full files.
 - Call in parallel when reading multiple files.
 - Avoid tiny repeated slices - read a larger window if you need more context.]]
-
-local DEFAULT_MAX_OUTPUT_LINES = 2000
 
 local opts = makima.api.register_options(output_limits.extend({}))
 
@@ -91,13 +89,16 @@ local function read_file(path, offset, limit, ctx)
   local total_lines = #all_lines
 
   local start = math.max(math.floor(offset), 1)
-  local max_lines, max_bytes = output_limits.resolve(opts, ctx)
-  max_lines = limit == 0 and max_lines or math.min(limit, max_lines)
+  local max_output_lines, max_bytes = output_limits.resolve(opts, ctx)
+  local max_lines = limit == 0 and total_lines or limit
+  if max_output_lines then
+    max_lines = math.min(max_lines, max_output_lines)
+  end
   local max_line_bytes = output_limits.line_bytes(ctx)
 
   local lines = {}
   for i = start, math.min(start + max_lines - 1, total_lines) do
-    lines[#lines + 1] = makima.text.truncate_line(all_lines[i], max_line_bytes)
+    lines[#lines + 1] = max_line_bytes and makima.text.truncate_line(all_lines[i], max_line_bytes) or all_lines[i]
   end
 
   local parts = {}
@@ -107,7 +108,9 @@ local function read_file(path, offset, limit, ctx)
   end
   local trunc_start = start + #lines
   local remaining_lines = trunc_start <= total_lines and total_lines - trunc_start + 1 or 0
-  local llm_output = makima.text.truncate_file(table.concat(parts, "\n"), max_lines, max_bytes, remaining_lines)
+  local text = table.concat(parts, "\n")
+  local llm_output = text == "" and text
+    or makima.text.truncate_file(text, max_lines, max_bytes or #text, remaining_lines)
 
   local shown = #lines
   local annotation = shown < total_lines and string.format("%d of %d lines", shown, total_lines)
@@ -166,7 +169,7 @@ makima.api.register_tool({
       },
       limit = {
         type = "integer",
-        description = "Max number of lines to read. Use 0 to read until end of file (capped at 2000 lines).",
+        description = "Max number of lines to read. Use 0 to read until end of file (capped at 2000 lines in compact mode).",
         required = true,
       },
     },

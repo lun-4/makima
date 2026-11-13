@@ -318,6 +318,31 @@ impl CallOrigin {
     }
 }
 
+/// Result presentation, independent of tool visibility and history ownership.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolOutputMode {
+    #[default]
+    Full,
+    Compact,
+}
+
+impl ToolOutputMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Compact => "compact",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "full" => Some(Self::Full),
+            "compact" => Some(Self::Compact),
+            _ => None,
+        }
+    }
+}
+
 pub type LocalToolResult = BoxFuture<'static, Result<String, String>>;
 pub type LocalToolFn = Arc<dyn Fn(Value, ToolContext) -> LocalToolResult + Send + Sync>;
 
@@ -484,6 +509,9 @@ pub struct ToolContext {
     /// Admitted tool definitions and filter, retained for exact child inheritance.
     pub request_tools: Option<RequestTools>,
     pub tool_output_lines: ToolOutputLines,
+    /// Full returns complete tool text, for nested callers that process it.
+    /// Compact applies model presentation limits and offload.
+    pub output_mode: ToolOutputMode,
     pub permissions: Arc<PermissionManager>,
     pub timeouts: makima_providers::Timeouts,
     pub file_tracker: Arc<FileReadTracker>,
@@ -891,6 +919,7 @@ pub fn interpreter_ctx(
         tool_filter: Arc::default(),
         request_tools: None,
         tool_output_lines: ToolOutputLines::default(),
+        output_mode: ToolOutputMode::Full,
         permissions,
         timeouts: makima_providers::Timeouts::default(),
         file_tracker,
@@ -1079,6 +1108,7 @@ pub mod test_support {
             env::current_dir().expect(TEST_CWD_ERR),
         );
         ctx.tool_use_id = tool_use_id.map(String::from);
+        ctx.output_mode = ToolOutputMode::Compact;
         ctx
     }
 
@@ -1118,6 +1148,7 @@ pub mod test_support {
             env::current_dir().expect(TEST_CWD_ERR),
         );
         ctx.tool_use_id = None;
+        ctx.output_mode = ToolOutputMode::Compact;
         ctx
     }
 }

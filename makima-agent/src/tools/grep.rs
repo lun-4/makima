@@ -180,7 +180,11 @@ impl GrepSink<'_> {
         let text = text.strip_suffix('\r').unwrap_or(text);
         self.current_group.push(GrepLine {
             line_nr: line_nr as usize,
-            text: truncate_line(text, self.max_line_bytes),
+            text: if self.max_line_bytes == 0 {
+                text.to_owned()
+            } else {
+                truncate_line(text, self.max_line_bytes)
+            },
             is_match,
         });
     }
@@ -227,11 +231,32 @@ mod tests {
 
     use super::*;
 
+    const TEST_LINE: &[u8] = "match é tail\r\n".as_bytes();
+
     #[test_case("foo",       false ; "simple_pattern")]
     #[test_case("foo\\nbar", true  ; "literal_newline")]
     #[test_case("(?s)foo",   true  ; "dotall_flag")]
     #[test_case("(?m)^foo",  true  ; "multiline_flag")]
     fn needs_multiline_detection(pattern: &str, expected: bool) {
         assert_eq!(needs_multiline(pattern), expected);
+    }
+
+    #[test_case(0, "match é tail" ; "zero_is_unlimited")]
+    #[test_case(10, "[line truncated, +13 bytes]" ; "bounded_cuts_with_marker")]
+    fn sink_line_byte_limit(max_line_bytes: usize, expected: &str) {
+        let mut groups = Vec::new();
+        let mut sink = GrepSink {
+            groups: &mut groups,
+            current_group: Vec::new(),
+            max_line_bytes,
+            has_context: true,
+        };
+        sink.push_line(TEST_LINE, 2, true);
+        sink.push_line(TEST_LINE, 3, false);
+        sink.flush();
+
+        let lines = &groups[0].lines;
+        assert_eq!(lines[0].text, expected);
+        assert_eq!(lines[1].text, expected);
     }
 }

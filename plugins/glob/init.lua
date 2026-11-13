@@ -5,7 +5,7 @@ local output_limits = require("makima.output_limits")
 local NO_FILES_FOUND = "No files found"
 
 local opts = makima.api.register_options(output_limits.extend({
-  search_result_limit = { default = 100, min = 10, desc = "Max files returned per search." },
+  search_result_limit = { default = 100, min = 10, desc = "Max files returned per search in compact mode." },
 }))
 
 local function glob_view_opts(ctx)
@@ -51,7 +51,6 @@ makima.api.register_tool({
       return { llm_output = "error: pattern is required", is_error = true }
     end
 
-    local limit = opts.search_result_limit
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
     local path, path_err = ctx:resolve_path(input.path or ".")
     if not path then
@@ -62,7 +61,7 @@ makima.api.register_tool({
       path = path,
       gitignore = true,
       sort = "mtime",
-      limit = limit,
+      limit = ctx:output_mode() == "compact" and opts.search_result_limit or nil,
     })
 
     if not files then

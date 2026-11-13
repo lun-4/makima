@@ -244,8 +244,8 @@ makima.setup({
 | `auto_model` | string | - | - | Model spec for the bash auto-mode classifier. Unset: inherits the current session model. |
 | `auto_timeout_secs` | integer | `30` | 5 | Stop the auto-mode classifier after this many seconds and fall back to normal permission handling. |
 | `background_on_timeout` | boolean | `false` | - | Move a command that hits its timeout to the background instead of killing it. |
-| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
-| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `max_output_bytes` | integer | - | - | Model-facing `max_output_bytes` cap. |
+| `max_output_lines` | integer | - | - | Model-facing `max_output_lines` cap. |
 | `timeout_secs` | integer | `120` | 5 | Kill the command after this many seconds of execution. Approval time is excluded. A call's `timeout` param overrides it. |
 
 ### `plugins.code_execution`
@@ -253,8 +253,8 @@ makima.setup({
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
 | `max_memory_mb` | integer | `50` | 10 | Memory limit for the Python sandbox (MB). |
-| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
-| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `max_output_bytes` | integer | - | - | Model-facing `max_output_bytes` cap. |
+| `max_output_lines` | integer | - | - | Model-facing `max_output_lines` cap. |
 | `timeout_secs` | integer | `30` | 5 | Script execution time budget in seconds; waiting on tool calls does not count. A call's `timeout` param overrides it. |
 
 ### `plugins.edit`
@@ -269,16 +269,16 @@ makima.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
-| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
-| `search_result_limit` | integer | `100` | 10 | Max files returned per search. |
+| `max_output_bytes` | integer | - | - | Model-facing `max_output_bytes` cap. |
+| `max_output_lines` | integer | - | - | Model-facing `max_output_lines` cap. |
+| `search_result_limit` | integer | `100` | 10 | Max files returned per search in compact mode. |
 
 ### `plugins.grep`
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
-| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `max_output_bytes` | integer | - | - | Model-facing `max_output_bytes` cap. |
+| `max_output_lines` | integer | - | - | Model-facing `max_output_lines` cap. |
 | `search_result_limit` | integer | `100` | 10 | Max match groups per search. A call's `limit` param overrides it. |
 
 ### `plugins.index`
@@ -291,8 +291,8 @@ makima.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
-| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `max_output_bytes` | integer | - | - | Model-facing `max_output_bytes` cap. |
+| `max_output_lines` | integer | - | - | Model-facing `max_output_lines` cap. |
 
 ### `plugins.skill`
 
@@ -316,16 +316,16 @@ makima.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
-| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `max_output_bytes` | integer | - | - | Model-facing `max_output_bytes` cap. |
+| `max_output_lines` | integer | - | - | Model-facing `max_output_lines` cap. |
 | `max_response_bytes` | integer | `5242880` | 1024 | Stop reading a response after this many bytes. |
 
 ### `plugins.websearch`
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
-| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `max_output_bytes` | integer | - | - | Model-facing `max_output_bytes` cap. |
+| `max_output_lines` | integer | - | - | Model-facing `max_output_lines` cap. |
 | `max_response_bytes` | integer | `5242880` | 1024 | Stop reading a response after this many bytes. |
 | `provider` | string | `"exa"` | - | Search backend: "exa" (default) or "youcom" (You.com MCP). |
 
