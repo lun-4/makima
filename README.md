@@ -12,6 +12,7 @@ _maki is good! i just have different opinions that i dont think are upstreamable
 - mode overrides and a plan mode inspired/stolen from [polytoken](https://docs.polytoken.dev)
 - `plan_submit` tool so model decides when it's time to go for it
 - async subagent implementation where you can talk to the subagents
+  - you can also use `@`-autocomplete to select a specific model as a subagent e.g type `@6.1-sol` and see it in action
 - Claude Code-style automode via `/automode`
 - misc ux fixes, such as
    - `--apend-system-prompt` works in TUI mode
