@@ -26,7 +26,7 @@ pub use agent::{
     Agent, AgentParams, AgentRunParams, History, HistorySnapshot, Instructions, LoadedInstructions,
     ModelSource, RunSettings, SharedMessages, SharedModel, UNAVAILABLE_RESULT,
     close_dangling_tool_calls, end_conversation_detached, find_subdirectory_instructions,
-    is_instruction_file,
+    is_instruction_file, live_history, publish_live_history,
 };
 pub use call_scope::{CallGuard, CallHome, CallScope, MoveError, MovedBy};
 pub use cancel::{

@@ -122,6 +122,8 @@ pub enum ActorEvent {
         turn_id: TurnId,
         provenance: TurnProvenance,
         config: Option<ConfigCommit>,
+        /// The message that started the turn, empty when none did.
+        text: String,
     },
     End(TurnResult),
     SubmissionConsumed(PendingSubmission),

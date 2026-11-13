@@ -1039,7 +1039,7 @@ impl<'h> Agent<'h> {
             &self.model_policy,
         )
         .await;
-        let compaction_usage = compaction::compact_history(
+        let (compaction_usage, summary) = compaction::compact_history(
             &compact_provider,
             &self.provider,
             &compact_model,
@@ -1063,6 +1063,7 @@ impl<'h> Agent<'h> {
             context_size_before,
             context_size_after,
             context_window: self.model.context_window,
+            summary,
         })?;
         self.history
             .push(Message::synthetic(compaction::continue_message(
