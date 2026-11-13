@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::{RetryInfo, Status};
@@ -44,6 +45,12 @@ pub struct UsageStats {
     pub global_cost: Option<f64>,
     pub context_size: u32,
     pub cost: Option<f64>,
+    /// What this chat's turns would have cost at list rates, shown beside
+    /// `cost` only while a subscription covers the bill.
+    pub list_cost: Option<f64>,
+    /// Name of the subscription covering the bill, `None` when the model is
+    /// metered and there is no reference figure to show.
+    pub subsidy_source: Option<Arc<str>>,
     pub context_window: u32,
     pub show_global: bool,
 }
@@ -312,9 +319,16 @@ impl StatusBar {
                     format_tokens(ctx.stats.context_window),
                     pct,
                 );
-                let rest_text = match ctx.stats.cost {
-                    Some(cost) => format!("{context_text} ${cost:.3} "),
-                    None => format!("{context_text} "),
+                let rest_text = match (
+                    ctx.stats.cost,
+                    ctx.stats.list_cost,
+                    &ctx.stats.subsidy_source,
+                ) {
+                    (Some(cost), Some(list), Some(source)) if list > 0.0 => {
+                        format!("{context_text} ${cost:.3} (~${list:.3} {source}) ")
+                    }
+                    (Some(cost), _, _) => format!("{context_text} ${cost:.3} "),
+                    (None, _, _) => format!("{context_text} "),
                 };
                 rest_spans.push(Span::styled(
                     rest_text,
@@ -616,7 +630,6 @@ fn watch_branch(cwd: &Path) -> Option<BranchWatcher> {
 mod tests {
     use std::env;
     use std::fs;
-    use std::sync::Arc;
 
     use super::*;
     use crate::repaint::expect::QUIET;
@@ -632,6 +645,8 @@ mod tests {
     const CHAT_COST: f64 = 0.25;
     const CHAT_COST_TEXT: &str = "$0.250";
     const SESSION_COST: f64 = 1.5;
+    const LIST_COST: f64 = 0.75;
+    const SUBSIDY_SOURCE: &str = "Max";
     const SESSION_COST_TEXT: &str = "\u{03a3}$1.500";
     const SIGMA: char = '\u{03a3}';
     const WATCHER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -663,6 +678,8 @@ mod tests {
                 global_cost: None,
                 context_size: CONTEXT_SIZE,
                 cost: Some(CHAT_COST),
+                list_cost: None,
+                subsidy_source: None,
                 context_window: crate::components::TEST_CONTEXT_WINDOW,
                 show_global: false,
             },
@@ -804,6 +821,46 @@ mod tests {
     }
 
     fn render(global_cost: Option<f64>, show_global: bool) -> String {
+        render_stats(UsageStats {
+            global_cost,
+            context_size: CONTEXT_SIZE,
+            cost: Some(CHAT_COST),
+            list_cost: None,
+            subsidy_source: None,
+            context_window: crate::components::TEST_CONTEXT_WINDOW,
+            show_global,
+        })
+    }
+
+    /// A subscription prepays the bill, so the `$0` it charged reads next to
+    /// the published list price it covered.
+    #[test]
+    fn a_subsidised_chat_shows_the_list_price_beside_its_zero_bill() {
+        let text = render_stats(UsageStats {
+            global_cost: None,
+            context_size: CONTEXT_SIZE,
+            cost: Some(0.0),
+            list_cost: Some(LIST_COST),
+            subsidy_source: Some(SUBSIDY_SOURCE.into()),
+            context_window: crate::components::TEST_CONTEXT_WINDOW,
+            show_global: false,
+        });
+        assert!(
+            text.contains(&format!("(~${LIST_COST:.3} {SUBSIDY_SOURCE})")),
+            "no list price in:\n{text}"
+        );
+    }
+
+    /// A metered bill has no reference figure to add, so it must stay one
+    /// plain number even if a stale list total is lying around.
+    #[test]
+    fn a_metered_chat_shows_only_its_bill() {
+        let text = render(None, false);
+        assert!(text.contains(CHAT_COST_TEXT), "{text}");
+        assert!(!text.contains("(~$"), "{text}");
+    }
+
+    fn render_stats(stats: UsageStats) -> String {
         let bar = StatusBar::new(FLASH_TTL, test_cwd());
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(BAR_WIDTH, 1)).unwrap();
@@ -813,13 +870,7 @@ mod tests {
             mode_style: Style::new(),
             model_id: MODEL_ID,
             model_switch_queued: false,
-            stats: UsageStats {
-                global_cost,
-                context_size: CONTEXT_SIZE,
-                cost: Some(CHAT_COST),
-                context_window: crate::components::TEST_CONTEXT_WINDOW,
-                show_global,
-            },
+            stats,
             auto_scroll: true,
             retry_info: None,
             thinking_label: None,
@@ -860,6 +911,8 @@ mod tests {
                 global_cost: None,
                 context_size: CONTEXT_SIZE,
                 cost: Some(CHAT_COST),
+                list_cost: None,
+                subsidy_source: None,
                 context_window: crate::components::TEST_CONTEXT_WINDOW,
                 show_global: false,
             },
@@ -911,6 +964,8 @@ mod tests {
                 global_cost: None,
                 context_size: CONTEXT_SIZE,
                 cost: Some(CHAT_COST),
+                list_cost: None,
+                subsidy_source: None,
                 context_window: crate::components::TEST_CONTEXT_WINDOW,
                 show_global: false,
             },
@@ -1167,6 +1222,8 @@ mod tests {
                 global_cost: None,
                 context_size: 0,
                 cost: None,
+                list_cost: None,
+                subsidy_source: None,
                 context_window: 0,
                 show_global: false,
             },

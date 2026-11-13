@@ -29,6 +29,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const NO_MATCHES: &str = "No matches";
 const MIN_WIDTH_PERCENT: u16 = 65;
+/// Fits a long model id next to its tier and price columns.
+const MIN_WIDTH_COLS: u16 = 72;
 const MAX_HEIGHT_PERCENT: u16 = 80;
 const SEARCH_ROW: u16 = 1;
 pub(super) const SEARCH_PREFIX_WIDTH: u16 = 2;
@@ -984,7 +986,7 @@ fn render_ready<T: PickerItem>(
     let error_rows = error_text.is_some() as u16;
     let modal = Modal {
         title,
-        width_percent: MIN_WIDTH_PERCENT,
+        width_percent: width_percent(area.width),
         max_height_percent: MAX_HEIGHT_PERCENT,
     };
     let (popup, inner) = modal.render(
@@ -1137,6 +1139,14 @@ fn find_scroll_offset_for_bottom<T: PickerItem>(
         return 0;
     }
     find_scroll_offset_for(filtered, items, len - 1, viewport_height)
+}
+
+/// On a narrow screen the percentage alone leaves the label a sliver next to
+/// its detail, so the picker takes more of the screen before it truncates.
+fn width_percent(screen_width: u16) -> u16 {
+    (MIN_WIDTH_COLS * 100)
+        .div_ceil(screen_width.max(1))
+        .clamp(MIN_WIDTH_PERCENT, 100)
 }
 
 /// Keep the rightmost `max_width` display cells. Ages are ASCII, but the
@@ -1712,7 +1722,7 @@ mod tests {
         assert!(wide_row.contains("12k 4d 7h 23m 9s"));
         assert!(wide_row.chars().count() <= 80);
 
-        let narrow = render(&mut p, 34);
+        let narrow = render(&mut p, 24);
         let narrow_row = narrow.iter().find(|line| line.contains("9s")).unwrap();
         assert!(
             !narrow_row.contains("12k"),
@@ -1720,7 +1730,7 @@ mod tests {
         );
         assert!(narrow_row.contains("4d 7h 23m 9s"));
 
-        let elided = render(&mut p, 28);
+        let elided = render(&mut p, 20);
         let elided_row = elided.iter().find(|line| line.contains("9s")).unwrap();
         assert!(elided_row.contains('…'), "higher units elide first");
         assert!(!elided_row.contains("4d 7h 23m 9s"));
@@ -2580,6 +2590,13 @@ mod tests {
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(matches!(action, PickerAction::Toggle(0, false)));
         assert!(p.is_open());
+    }
+
+    #[test_case(200, MIN_WIDTH_PERCENT ; "wide_screen_keeps_the_default")]
+    #[test_case(80,  90                ; "narrow_screen_grows_to_fit")]
+    #[test_case(60,  100               ; "tiny_screen_takes_it_all")]
+    fn picker_width_percent(screen_width: u16, expected: u16) {
+        assert_eq!(width_percent(screen_width), expected);
     }
 
     #[test]

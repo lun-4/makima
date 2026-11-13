@@ -16,9 +16,11 @@ const REGISTRY_UNAVAILABLE: &str = "provider registry unavailable";
 ///
 /// @param spec string Model spec, e.g. `"anthropic/claude-sonnet-4-20250514"`.
 /// @return (table|nil, string|nil) `{spec, provider, id, tier, supports_thinking,
-///   supports_fast, context_window, max_output_tokens, pricing}`, or nil and an
-///   error. `max_output_tokens` is nil when unknown. `pricing` is
-///   `{input, output, cache_write, cache_read}` in USD per million tokens.
+///   supports_fast, context_window, max_output_tokens, pricing, free,
+///   subsidised_by}`, or nil and an error. `max_output_tokens` is nil when
+///   unknown. `pricing` is `{input, output, cache_write, cache_read}` in USD
+///   per million tokens. `subsidised_by` names the subscription prepaying the
+///   bill, which is always `$0` while the rates above stay the list price.
 /// @example
 /// local info = assert(makima.model.info("anthropic/claude-sonnet-4-20250514"))
 #[lua_fn]
@@ -54,6 +56,8 @@ pub(crate) fn model_table(lua: &Lua, model: &Model) -> LuaResult<Table> {
     pricing.set("cache_write", model.pricing.cache_write)?;
     pricing.set("cache_read", model.pricing.cache_read)?;
     table.set("pricing", pricing)?;
+    table.set("free", model.free)?;
+    table.set("subsidised_by", model.subsidy_source())?;
     Ok(table)
 }
 
@@ -136,5 +140,26 @@ mod tests {
         assert_eq!(info["context_window"], model.context_window);
         assert_eq!(info["pricing"]["input"], model.pricing.input);
         assert_eq!(info["pricing"]["cache_read"], model.pricing.cache_read);
+        assert_eq!(info["free"], false);
+        assert!(info["subsidised_by"].is_null());
+    }
+
+    /// A subsidy is what makes a `$0` bill readable as prepaid rather than
+    /// free, so plugins need it beside the pricing table.
+    #[test]
+    fn info_carries_the_subsidy_source() {
+        let lua = Lua::new();
+        let (provider, id) = Model::parse_spec(SPEC).unwrap();
+        let registry = offline_registry(vec![(
+            provider,
+            vec![ModelInfo {
+                subsidised_by: Some("Max".into()),
+                ..ModelInfo::id_only(id.into())
+            }],
+        )]);
+        let model = registry.model(SPEC).unwrap();
+        let table = model_table(&lua, &model).unwrap();
+        let info = lua_to_json(&lua, &Value::Table(table)).unwrap();
+        assert_eq!(info["subsidised_by"], "Max");
     }
 }

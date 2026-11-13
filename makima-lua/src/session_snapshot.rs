@@ -200,6 +200,7 @@ mod tests {
             usage: TokenUsage::default(),
             model: String::new(),
             cost: None,
+            list_cost: None,
             context_size: Some(context_size),
             context_window: WINDOW,
         })))
@@ -266,6 +267,7 @@ mod tests {
                     cache_creation: 0,
                     cache_read: 0,
                     cost: None,
+                    list_cost: None,
                 },
             ),
             (
@@ -276,6 +278,7 @@ mod tests {
                     cache_creation: 2,
                     cache_read: 3,
                     cost: Some(0.25),
+                    list_cost: None,
                 },
             ),
             (
@@ -286,6 +289,7 @@ mod tests {
                     cache_creation: 0,
                     cache_read: 0,
                     cost: Some(0.5),
+                    list_cost: None,
                 },
             ),
         ]);

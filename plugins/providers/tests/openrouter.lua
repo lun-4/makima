@@ -43,6 +43,16 @@ t.case("reasoning_efforts_skip_unknown_and_sort", function()
   t.same(model.provider_data, { mandatory = false, default_enabled = true, efforts = { "low", "high" } })
 end)
 
+t.case("negative_prices_are_unknown_not_free", function()
+  local model = openrouter.parse_model(kimi({
+    pricing = { prompt = "-1", completion = "-1", input_cache_read = "-1", input_cache_write = "-1" },
+  }))
+  t.eq(model.pricing.input, 0)
+  t.eq(model.pricing.output, 0)
+  t.eq(model.pricing.cache_write, 0)
+  t.eq(model.pricing.cache_read, 0)
+end)
+
 t.case("non_text_models_are_skipped", function()
   for _, modalities in ipairs({ { { "image" }, { "image" } }, { { "image" }, { "text" } }, { { "text" }, { "image" } } }) do
     local row = kimi({ architecture = { input_modalities = modalities[1], output_modalities = modalities[2] } })

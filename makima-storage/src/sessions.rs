@@ -115,6 +115,10 @@ pub struct StoredTokenUsage {
     /// settles an estimate into them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<f64>,
+    /// What the same turns would have cost at the published list price, kept
+    /// only for turns a subscription prepaid. `None` on every metered total.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_cost: Option<f64>,
 }
 
 impl StoredTokenUsage {
@@ -136,6 +140,7 @@ impl std::ops::AddAssign for StoredTokenUsage {
         self.cache_creation = self.cache_creation.saturating_add(rhs.cache_creation);
         self.cache_read = self.cache_read.saturating_add(rhs.cache_read);
         add_cost(&mut self.cost, rhs.cost);
+        add_cost(&mut self.list_cost, rhs.list_cost);
     }
 }
 
@@ -2144,6 +2149,7 @@ mod tests {
                 cache_creation: 5,
                 cache_read: 40,
                 cost: Some(SONNET_COST),
+                ..Default::default()
             },
         );
         session.add_model_usage(

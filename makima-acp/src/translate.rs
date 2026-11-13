@@ -907,6 +907,7 @@ mod tests {
             },
             model: "test-model".into(),
             cost,
+            list_cost: None,
             context_size,
             context_window,
         }

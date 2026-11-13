@@ -1,4 +1,5 @@
 use makima_providers::ThinkingConfigExt;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::click::{ClickTarget, HitTarget, PickerId, ScrollOwner, Surface};
@@ -564,6 +565,11 @@ impl App {
                 global_cost: self.state.cost,
                 context_size: chat.context_size,
                 cost: chat.cost,
+                list_cost: chat.list_cost,
+                subsidy_source: config
+                    .as_ref()
+                    .and_then(|config| config.model.subsidy_source())
+                    .map(Arc::from),
                 context_window: if let Some(config) = &config {
                     config.model.context_window
                 } else if self.focused_streaming() {
