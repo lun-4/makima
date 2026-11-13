@@ -142,6 +142,9 @@
           '';
 
           commonArgs = {
+            # crane's cargoWithProfile turns this into `--profile release-lto`
+            # for both buildDepsOnly and buildPackage.
+            CARGO_PROFILE = "release-lto";
             nativeBuildInputs = with pkgs; [
               pkg-config
               perl

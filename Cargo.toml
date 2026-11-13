@@ -210,6 +210,19 @@ agent-client-protocol-schema = { version = "0.13", features = ["unstable_boolean
 
 wait-timeout = "0.2"
 
+# Thin LTO keeps most of the runtime win of fat LTO at a fraction of its link
+# time, which `cargo install` and `cargo build --release` pay on every machine.
+# The binaries we ship get the full treatment below.
+[profile.release]
+lto = "thin"
+
+# What the release workflow and `nix build` ship. Packagers building from source
+# should pass `--profile release-lto` to match the released binaries.
+[profile.release-lto]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
 [profile.bench]
 debug = true
 
