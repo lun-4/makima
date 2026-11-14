@@ -413,7 +413,7 @@ impl AgentActorHandle {
         if let Some(journal) = &self.inner.journal {
             let snapshot = journal.snapshot();
             let mut deliveries = BTreeMap::new();
-            for record in &snapshot.state {
+            for record in snapshot.state.iter() {
                 if record.agent == Some(self.agent_id())
                     && let StateChange::Delivery { id, op } = &record.change
                 {
@@ -739,7 +739,7 @@ pub(super) fn held(inner: &ActorInner, state: &super::ActorState) -> bool {
     };
     let snapshot = journal.snapshot();
     let mut deliveries = BTreeMap::new();
-    for record in &snapshot.state {
+    for record in snapshot.state.iter() {
         if record.agent == Some(inner.agent_id)
             && let StateChange::Delivery { id, op } = &record.change
         {
@@ -1203,7 +1203,7 @@ mod tests {
         let journal = manager.journal();
         settle_conversions(&journal).await;
         let snapshot = journal.snapshot();
-        SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq).unwrap()
+        snapshot.fold(snapshot.seq).unwrap()
     }
 
     #[test_case(false; "persisted_parent")]
@@ -1391,12 +1391,7 @@ mod tests {
             inbox.commit_completions(&mut |message| {
                 history.push(message);
                 let snapshot = manager.journal().snapshot();
-                let view = SessionStateView::fold(
-                    &snapshot.state,
-                    &snapshot.agent_revisions,
-                    snapshot.seq,
-                )
-                .unwrap();
+                let view = snapshot.fold(snapshot.seq).unwrap();
                 assert_eq!(
                     view.scopes[&Some(parent.agent_id())].deliveries[&id],
                     StoredDeliveryOp::Consumed,

@@ -37,7 +37,7 @@ use makima_storage::restore::RestoreStore;
 use makima_storage::restore::{RestoreChoice, RestoreEndpoint, TransitionRef};
 use makima_storage::session_lock;
 use makima_storage::session_lock::ClaimedSessionLock;
-use makima_storage::session_state::{SessionStateView, StoredBranch};
+use makima_storage::session_state::StoredBranch;
 use tracing::warn;
 
 use super::{EventLoop, InternalEvent, LOCK_LOST_REPLACEMENT_ERR, SessionLockState};
@@ -374,12 +374,9 @@ impl EventLoop<'_> {
                         .apply_configs(applied.changes)
                         .map_err(|error| error.to_string())?;
                     let snapshot = replacement.snapshot().clone();
-                    let view = SessionStateView::fold(
-                        &snapshot.state,
-                        &snapshot.agent_revisions,
-                        snapshot.seq,
-                    )
-                    .map_err(|error| error.to_string())?;
+                    let view = snapshot
+                        .fold(snapshot.seq)
+                        .map_err(|error| error.to_string())?;
                     let saved = view
                         .scopes
                         .get(&Some(root))
@@ -1242,7 +1239,6 @@ async fn reconcile_owned_sessions(
 
 pub(super) fn reconcile_startup(
     sessions_dir: &Path,
-    _storage: &StateDir,
     session: MakimaId,
     lease: Option<ClaimedSessionLock>,
     locks: Arc<FileWriteLocks>,
@@ -1665,7 +1661,8 @@ fn project_presentations(
     snapshot: &SessionJournalSnapshot,
     affected: &BTreeSet<AgentId>,
 ) -> Result<(), String> {
-    let view = SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
+    let view = snapshot
+        .fold(snapshot.seq)
         .map_err(|error| error.to_string())?;
     for agent in affected {
         let Some(record) = view.agents.get(agent) else {

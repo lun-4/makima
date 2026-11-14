@@ -4,17 +4,18 @@ use crate::{
     restore::TransitionRef,
     sessions::StoredRule,
 };
+use imbl::{OrdMap, OrdSet};
 use makima_domain::{ModelSelection, StoredThinking, TokenUsage};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     path::PathBuf,
+    sync::Arc,
 };
 use thiserror::Error;
 
 pub const BOUNDARY_POOL_FORMAT: &str = "boundary-pool-v1";
-pub const BOUNDARY_POOLS_FEATURE: &str = "boundary-pools-v1";
 pub const MAX_STORED_TURN_RESULTS: usize = 128;
 pub const MAX_PLUGIN_VALUE_DEPTH: usize = 64;
 pub const MAX_PLUGIN_VALUE_BYTES: usize = 256 * 1024;
@@ -346,6 +347,302 @@ pub struct SessionStateView {
     pub compactions: BTreeMap<AgentId, (u64, u64)>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SessionStateReducer {
+    pub agents: OrdMap<AgentId, Arc<StoredAgentRecord>>,
+    scopes: OrdMap<Option<AgentId>, ReducedScope>,
+    boundaries: OrdMap<u64, Arc<StoredBoundary>>,
+    compactions: OrdMap<AgentId, (u64, u64)>,
+    state_sequences: OrdSet<u64>,
+    agent_sequences: OrdSet<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReducedScope {
+    generation: u64,
+    config: Option<Arc<StoredAgentConfig>>,
+    rules: Arc<Vec<StoredRule>>,
+    yolo: Option<bool>,
+    context: OrdMap<String, Arc<StoredContext>>,
+    plugins: OrdMap<String, Arc<StoredPluginValue>>,
+    admitted: OrdMap<TurnId, Arc<StoredTurnOrigin>>,
+    results: Arc<VecDeque<(TurnId, StoredTurnResult)>>,
+    deliveries: OrdMap<(AgentId, TurnId), Arc<StoredDeliveryOp>>,
+    delivery_sequences: OrdMap<(AgentId, TurnId), u64>,
+    files: OrdMap<PathBuf, Arc<StoredFileState>>,
+}
+
+impl ReducedScope {
+    fn materialize(&self) -> StoredScopeState {
+        StoredScopeState {
+            generation: self.generation,
+            config: self.config.as_deref().cloned(),
+            rules: self.rules.as_ref().clone(),
+            yolo: self.yolo,
+            context: self
+                .context
+                .iter()
+                .map(|(key, value)| (key.clone(), value.as_ref().clone()))
+                .collect(),
+            plugins: self
+                .plugins
+                .iter()
+                .map(|(key, value)| (key.clone(), value.as_ref().clone()))
+                .collect(),
+            admitted: self
+                .admitted
+                .iter()
+                .map(|(key, value)| (*key, value.as_ref().clone()))
+                .collect(),
+            results: self.results.as_ref().clone(),
+            deliveries: self
+                .deliveries
+                .iter()
+                .map(|(key, value)| (*key, value.as_ref().clone()))
+                .collect(),
+            files: self
+                .files
+                .iter()
+                .map(|(key, value)| (key.clone(), value.as_ref().clone()))
+                .collect(),
+        }
+    }
+}
+
+impl SessionStateReducer {
+    pub fn from_ordered(
+        state: &[StoredStateRecord],
+        revisions: &[(u64, StoredAgentRecord)],
+    ) -> Result<Self, StateFoldError> {
+        SessionStateView::fold(state, revisions, u64::MAX)?;
+        let mut reducer = Self::default();
+        for (seq, agent) in revisions {
+            reducer.apply_agent(*seq, agent)?;
+        }
+        for record in state {
+            reducer.apply_record(record)?;
+        }
+        Ok(reducer)
+    }
+
+    pub fn materialize(&self) -> SessionStateView {
+        SessionStateView {
+            agents: self
+                .agents
+                .iter()
+                .map(|(key, value)| (*key, value.as_ref().clone()))
+                .collect(),
+            scopes: self
+                .scopes
+                .iter()
+                .map(|(key, value)| (*key, value.materialize()))
+                .collect(),
+            boundaries: self
+                .boundaries
+                .iter()
+                .map(|(key, value)| (*key, value.as_ref().clone()))
+                .collect(),
+            compactions: self
+                .compactions
+                .iter()
+                .map(|(key, value)| (*key, *value))
+                .collect(),
+        }
+    }
+
+    pub fn plugin(&self, agent: Option<AgentId>, key: &str) -> Option<&StoredPluginValue> {
+        self.scopes.get(&agent)?.plugins.get(key).map(Arc::as_ref)
+    }
+
+    pub fn deliveries(
+        &self,
+        parent: AgentId,
+    ) -> impl Iterator<Item = ((AgentId, TurnId), &StoredDeliveryOp, u64)> {
+        self.scopes
+            .get(&Some(parent))
+            .into_iter()
+            .flat_map(|scope| {
+                scope.deliveries.iter().map(|(id, op)| {
+                    (
+                        *id,
+                        op.as_ref(),
+                        scope.delivery_sequences.get(id).copied().unwrap_or(0),
+                    )
+                })
+            })
+    }
+
+    pub fn delivery(&self, parent: AgentId, id: (AgentId, TurnId)) -> Option<&StoredDeliveryOp> {
+        self.scopes
+            .get(&Some(parent))?
+            .deliveries
+            .get(&id)
+            .map(Arc::as_ref)
+    }
+
+    pub fn result(&self, agent: AgentId, turn: TurnId) -> Option<&StoredTurnResult> {
+        self.scopes
+            .get(&Some(agent))?
+            .results
+            .iter()
+            .find(|(id, _)| *id == turn)
+            .map(|(_, result)| result)
+    }
+
+    pub fn apply_agent(
+        &mut self,
+        seq: u64,
+        agent: &StoredAgentRecord,
+    ) -> Result<(), StateFoldError> {
+        if self.state_sequences.contains(&seq) || self.agent_sequences.contains(&seq) {
+            return Err(StateFoldError::DuplicateSequence { seq });
+        }
+        if agent.updated_seq != seq || agent.created_seq > agent.updated_seq {
+            return Err(StateFoldError::InvalidAgentRevision { seq });
+        }
+        self.agent_sequences.insert(seq);
+        self.agents.insert(agent.id, Arc::new(agent.clone()));
+        Ok(())
+    }
+
+    pub fn apply_record(&mut self, record: &StoredStateRecord) -> Result<(), StateFoldError> {
+        let seq = record.seq;
+        if self.state_sequences.contains(&seq) || self.agent_sequences.contains(&seq) {
+            return Err(StateFoldError::DuplicateSequence { seq });
+        }
+        let mut candidate = self.clone();
+        candidate.apply_change(record)?;
+        candidate.state_sequences.insert(seq);
+        *self = candidate;
+        Ok(())
+    }
+
+    fn apply_change(&mut self, record: &StoredStateRecord) -> Result<(), StateFoldError> {
+        let seq = record.seq;
+        if let StateChange::BoundarySnapshot { boundary, snapshot } = &record.change {
+            return if *boundary < seq
+                && self.boundaries.contains_key(boundary)
+                && snapshot.is_object()
+                && valid_boundary_pool(*boundary, seq, snapshot)
+            {
+                Ok(())
+            } else {
+                Err(StateFoldError::InvalidBoundarySnapshot {
+                    seq,
+                    boundary: *boundary,
+                })
+            };
+        }
+        let mut scope = self.scopes.get(&record.agent).cloned().unwrap_or_default();
+        scope.generation = record.generation;
+        match &record.change {
+            StateChange::Boundary { offset, lens } => {
+                self.boundaries.insert(
+                    seq,
+                    Arc::new(StoredBoundary {
+                        agent: record.agent,
+                        generation: record.generation,
+                        offset: *offset,
+                        lens: lens.clone(),
+                    }),
+                );
+            }
+            StateChange::BoundarySnapshot { .. } => {}
+            StateChange::Admitted { turn, origin } => {
+                if !scope.results.iter().any(|(id, _)| id == turn) {
+                    scope.admitted.insert(*turn, Arc::new(origin.clone()));
+                }
+            }
+            StateChange::Config(config) => scope.config = Some(Arc::new(config.clone())),
+            StateChange::Rules { rules, yolo } => {
+                scope.rules = Arc::new(rules.clone());
+                scope.yolo = *yolo;
+            }
+            StateChange::Context {
+                source,
+                hash,
+                content,
+            } => {
+                scope.context.insert(
+                    source.clone(),
+                    Arc::new(StoredContext {
+                        hash: hash.clone(),
+                        content: content.clone(),
+                    }),
+                );
+            }
+            StateChange::Plugin {
+                key,
+                version,
+                value,
+            } => {
+                if let Some(value) = value {
+                    validate_plugin_value(value, seq)?;
+                }
+                scope.plugins.insert(
+                    key.clone(),
+                    Arc::new(StoredPluginValue {
+                        revision: seq,
+                        version: *version,
+                        value: value.clone(),
+                    }),
+                );
+            }
+            StateChange::Turn { turn, result } => {
+                if result.outcome.turn_id != *turn || record.agent != Some(result.outcome.agent_id)
+                {
+                    return Err(StateFoldError::TurnIdentityMismatch { seq });
+                }
+                scope.admitted.remove(turn);
+                let results = Arc::make_mut(&mut scope.results);
+                results.retain(|(id, _)| id != turn);
+                results.push_back((*turn, result.clone()));
+                if results.len() > MAX_STORED_TURN_RESULTS {
+                    results.pop_front();
+                }
+            }
+            StateChange::Delivery { id, op } => {
+                if let StoredDeliveryOp::Queued(delivery) = op
+                    && (
+                        delivery.result.outcome.agent_id,
+                        delivery.result.outcome.turn_id,
+                    ) != *id
+                {
+                    return Err(StateFoldError::DeliveryIdentityMismatch { seq });
+                }
+                scope.delivery_sequences.insert(*id, seq);
+                if !scope.deliveries.get(id).is_some_and(|previous| {
+                    !matches!(previous.as_ref(), StoredDeliveryOp::Queued(_))
+                }) {
+                    scope.deliveries.insert(*id, Arc::new(op.clone()));
+                }
+            }
+            StateChange::File {
+                path,
+                before,
+                after,
+            } => {
+                scope.files.insert(
+                    path.clone(),
+                    Arc::new(StoredFileState {
+                        before: before.clone(),
+                        after: after.clone(),
+                    }),
+                );
+            }
+            StateChange::ToolExecution { .. } => {}
+            StateChange::Compaction { epoch } => {
+                let agent = record
+                    .agent
+                    .ok_or(StateFoldError::MissingCompactionAgent { seq })?;
+                self.compactions.insert(agent, (seq, *epoch));
+            }
+        }
+        self.scopes.insert(record.agent, scope);
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum StateFoldError {
     #[error("{stream} sequence {seq} does not follow {previous}")]
@@ -525,6 +822,7 @@ impl SessionStateView {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn boundary_available(&self, seq: u64) -> bool {
         self.boundaries.get(&seq).is_some_and(|boundary| {
             boundary.lens.keys().all(|agent| {
@@ -537,11 +835,6 @@ impl SessionStateView {
 }
 
 fn valid_boundary_pool(boundary: u64, seq: u64, snapshot: &Value) -> bool {
-    if snapshot.get("format").is_none() {
-        return snapshot
-            .get("boundaries")
-            .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty));
-    }
     if snapshot["format"].as_str() != Some(BOUNDARY_POOL_FORMAT) {
         return false;
     }
@@ -656,9 +949,10 @@ fn validate_plugin_value(value: &Value, seq: u64) -> Result<(), StateFoldError> 
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_PLUGIN_VALUE_BYTES, MAX_PLUGIN_VALUE_DEPTH, MAX_STORED_TURN_RESULTS, SessionStateView,
-        StateChange, StateFoldError, StoredAgentConfig, StoredAgentLifecycle, StoredAgentRecord,
-        StoredDelivery, StoredDeliveryOp, StoredStateRecord, StoredTurnResult,
+        MAX_PLUGIN_VALUE_BYTES, MAX_PLUGIN_VALUE_DEPTH, MAX_STORED_TURN_RESULTS,
+        SessionStateReducer, SessionStateView, StateChange, StateFoldError, StoredAgentConfig,
+        StoredAgentLifecycle, StoredAgentRecord, StoredDelivery, StoredDeliveryOp,
+        StoredStateRecord, StoredTurnResult,
     };
     use crate::{
         blobs::FileState,
@@ -712,16 +1006,86 @@ mod tests {
         SessionStateView::fold(state, &[], u64::MAX).unwrap()
     }
 
+    #[test_case(false; "single_scope")]
+    #[test_case(true; "interleaved_scopes")]
+    fn incremental_reducer_matches_full_fold_at_every_prefix(interleaved: bool) {
+        let root = AgentId::generate();
+        let other = AgentId::generate();
+        let turn = TurnId::generate();
+        let revisions = vec![(1, agent(root, 1)), (2, agent(other, 2))];
+        let mut reducer = SessionStateReducer::default();
+        for (seq, agent) in &revisions {
+            reducer.apply_agent(*seq, agent).unwrap();
+        }
+        let changes = vec![
+            serde_json::to_value(StateChange::Config(
+                serde_json::from_value(config()).unwrap(),
+            ))
+            .unwrap(),
+            json!({"kind":"plugin", "key":SLOT, "version":1, "value":{"before":true}}),
+            json!({"kind":"context", "source":SLOT, "hash":SLOT, "content":SLOT}),
+            json!({"kind":"admitted", "turn":turn, "origin":"user"}),
+            json!({"kind":"turn", "turn":turn, "result":result(root, turn)}),
+            json!({"kind":"delivery", "id":[root, turn], "op":{"op":"queued", "delivery":{"label":null,"result":result(root,turn),"held":false}}}),
+            json!({"kind":"delivery", "id":[root, turn], "op":{"op":"consumed"}}),
+            json!({"kind":"delivery", "id":[root, turn], "op":{"op":"queued", "delivery":{"label":null,"result":result(root,turn),"held":true}}}),
+            json!({"kind":"plugin", "key":SLOT, "version":2, "value":null}),
+            json!({"kind":"compaction", "epoch":7}),
+        ];
+        let mut records = Vec::new();
+        for (index, change) in changes.into_iter().enumerate() {
+            let owner = if interleaved && matches!(index, 1 | 2 | 8 | 9) {
+                other
+            } else {
+                root
+            };
+            let record = state(index as u64 + 3, Some(owner), change);
+            let before = reducer.materialize();
+            reducer.apply_record(&record).unwrap();
+            records.push(record);
+            assert_eq!(
+                reducer.materialize(),
+                SessionStateView::fold(&records, &revisions, u64::MAX).unwrap()
+            );
+            for (id, op, seq) in reducer.deliveries(root) {
+                assert_eq!(reducer.delivery(root, id), Some(op));
+                let latest = records.iter().rev().find(|record| matches!(&record.change, StateChange::Delivery { id: saved, .. } if *saved == id)).unwrap();
+                assert_eq!(seq, latest.seq);
+            }
+            if records.len() >= 5 {
+                assert_eq!(
+                    reducer.result(root, turn),
+                    Some(&serde_json::from_value::<StoredTurnResult>(result(root, turn)).unwrap())
+                );
+            }
+            let saved = reducer.clone();
+            let invalid = state(
+                records.last().unwrap().seq + 1,
+                None,
+                json!({"kind":"compaction", "epoch":8}),
+            );
+            assert!(matches!(
+                reducer.apply_record(&invalid),
+                Err(StateFoldError::MissingCompactionAgent { .. })
+            ));
+            assert_eq!(reducer.materialize(), saved.materialize());
+            if records.len() != 8 {
+                assert_ne!(reducer.materialize(), before);
+            }
+        }
+    }
+
     #[test]
     fn boundary_snapshot_round_trips_without_mutating_scope_or_generation() {
         let agent = AgentId::generate();
         let prefix = [state(
             1,
             Some(agent),
-            json!({"kind":"boundary","offset":0,"lens":{}}),
+            json!({"kind":"boundary","offset":0,"lens":{agent.to_string():[7,0]}}),
         )];
         let before = fold(&prefix);
-        let payload = json!({"state":[],"agents":[],"histories":{}});
+        let payload = json!({"format":super::BOUNDARY_POOL_FORMAT,"boundaries":[1],
+            "state":prefix,"agents":[],"histories":{agent.to_string():{"epoch":7,"compacted":false,"messages":[]}}});
         let auxiliary = state(
             2,
             None,
@@ -837,6 +1201,10 @@ mod tests {
     }
 
     #[test_case("format"; "unknown_format")]
+    #[test_case("missing_format"; "missing_format")]
+    #[test_case("format_type"; "non_string_format")]
+    #[test_case("missing_boundaries"; "missing_boundaries")]
+    #[test_case("boundaries_type"; "non_array_boundaries")]
     #[test_case("empty"; "empty_boundaries")]
     #[test_case("order"; "unordered_boundaries")]
     #[test_case("representative"; "wrong_representative")]
@@ -850,6 +1218,14 @@ mod tests {
         let (mut prefix, mut payload) = pooled_boundary(agent);
         match damage {
             "format" => payload["format"] = json!("unknown"),
+            "missing_format" => {
+                payload.as_object_mut().unwrap().remove("format");
+            }
+            "format_type" => payload["format"] = json!(1),
+            "missing_boundaries" => {
+                payload.as_object_mut().unwrap().remove("boundaries");
+            }
+            "boundaries_type" => payload["boundaries"] = json!(1),
             "empty" => payload["boundaries"] = json!([]),
             "order" => payload["boundaries"] = json!([2, 1]),
             "representative" => payload["boundaries"] = json!([2]),

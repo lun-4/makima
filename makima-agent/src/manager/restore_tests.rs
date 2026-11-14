@@ -4,8 +4,8 @@ use futures_lite::future::{or, poll_once, yield_now};
 use makima_providers::TokenUsage;
 use makima_providers::{Message, Model, provider::unconfigured};
 use makima_storage::session_state::{
-    SessionStateView, StateChange, StoredAgentConfig, StoredAgentLifecycle, StoredAgentRecord,
-    StoredAgentSpec, StoredDelivery, StoredDeliveryOp, StoredModeCeiling, StoredTurnOrigin,
+    StateChange, StoredAgentConfig, StoredAgentLifecycle, StoredAgentRecord, StoredAgentSpec,
+    StoredDelivery, StoredDeliveryOp, StoredModeCeiling, StoredTurnOrigin,
 };
 use makima_storage::sessions::Session;
 use test_case::test_case;
@@ -707,8 +707,7 @@ fn restore(
     limits: AgentLimits,
 ) -> Result<AgentManagerHandle, ManagerError> {
     let snapshot = journal.checkpoint_snapshot().unwrap();
-    let view =
-        SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq).unwrap();
+    let view = snapshot.fold(snapshot.seq).unwrap();
     AgentManagerHandle::restore_graph(limits, Arc::clone(journal), view, snapshot.histories)
 }
 
@@ -951,9 +950,7 @@ fn report_withdrawn_during_initializer_is_not_resurrected() {
         let actor = activation.await.unwrap().actor().unwrap();
         assert!(actor.inner.state.lock().unwrap().deliveries.is_empty());
         let withdrawn = journal.checkpoint_snapshot().unwrap();
-        let view =
-            SessionStateView::fold(&withdrawn.state, &withdrawn.agent_revisions, withdrawn.seq)
-                .unwrap();
+        let view = withdrawn.fold(withdrawn.seq).unwrap();
         assert_eq!(
             view.scopes[&Some(parent)].deliveries[&id],
             StoredDeliveryOp::Withdrawn
@@ -1002,8 +999,7 @@ fn closing_dormant_restored_report_releases_hold_and_persists_drop() {
         GraphLifecycle::Closed
     );
     let snapshot = journal.checkpoint_snapshot().unwrap();
-    let view =
-        SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq).unwrap();
+    let view = snapshot.fold(snapshot.seq).unwrap();
     assert_eq!(
         view.scopes[&Some(parent)].deliveries[&id],
         StoredDeliveryOp::Dropped
@@ -1037,7 +1033,7 @@ fn assert_checkpoint(journal: &SessionJournal, expected: &SessionJournalSnapshot
     assert_eq!(actual.agent_revisions, expected.agent_revisions);
     assert_eq!(actual.managed_histories, expected.managed_histories);
     assert_eq!(actual.histories.len(), expected.histories.len());
-    for (id, history) in &expected.histories {
+    for (id, history) in expected.histories.iter() {
         assert_history(&actual.histories[id], history);
     }
 }
@@ -1441,8 +1437,7 @@ fn rejects_mixed_checkpoint_inputs(history: bool) {
     let records = records();
     let journal = journal(&records);
     let before = journal.checkpoint_snapshot().unwrap();
-    let mut view =
-        SessionStateView::fold(&before.state, &before.agent_revisions, before.seq).unwrap();
+    let mut view = before.fold(before.seq).unwrap();
     let mut histories = before.histories.clone();
     if history {
         histories.get_mut(&records[1].id).unwrap().epoch += 1;

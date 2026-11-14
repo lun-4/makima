@@ -27,9 +27,7 @@ use makima_providers::{
     RequestOptions, Role, StopReason, StreamResponse, TokenUsage,
 };
 use makima_storage::id::SessionRef;
-use makima_storage::session_state::{
-    MAX_PLUGIN_VALUE_BYTES, SessionStateView, StoredAgentLifecycle,
-};
+use makima_storage::session_state::{MAX_PLUGIN_VALUE_BYTES, StoredAgentLifecycle};
 use serde_json::{Value, json};
 
 mod common;
@@ -1620,9 +1618,7 @@ fn failed_task_creation_returns_retained_quota(policy_failure: bool) {
             assert_eq!(error, ActorError::InstructionOverflow.to_string());
         }
         let snapshot = manager.journal().checkpoint_snapshot().unwrap();
-        let folded =
-            SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
-                .unwrap();
+        let folded = snapshot.fold(snapshot.seq).unwrap();
         assert!(
             folded
                 .agents

@@ -18,8 +18,8 @@ use makima_storage::{
     StateDir,
     id::SessionRef,
     session_state::{
-        SessionStateView, StateChange, StoredCancellationReason, StoredDelivery, StoredDeliveryOp,
-        StoredStateRecord, StoredTurnStatus,
+        StateChange, StoredCancellationReason, StoredDelivery, StoredDeliveryOp, StoredStateRecord,
+        StoredTurnStatus,
     },
 };
 use serde_json::{Value, json};
@@ -217,8 +217,7 @@ fn held_delivery(
     source: AgentId,
     turn: TurnId,
 ) -> StoredDeliveryOp {
-    let view =
-        SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq).unwrap();
+    let view = snapshot.fold(snapshot.seq).unwrap();
     view.scopes[&Some(parent)].deliveries[&(source, turn)].clone()
 }
 
@@ -282,37 +281,39 @@ fn root_replacement_report_stays_held_after_restart_until_one_explicit_user_turn
     let root = host.root.target.id();
     let mut guard = smol::block_on(common::bounded(host.manager.begin_rewind(root))).unwrap();
     let mut restored = journal.checkpoint_snapshot().unwrap();
-    let generation =
-        SessionStateView::fold(&restored.state, &restored.agent_revisions, restored.seq)
-            .unwrap()
-            .scopes[&Some(parent)]
-            .generation;
+    let generation = restored.fold(restored.seq).unwrap().scopes[&Some(parent)].generation;
     let stored_result = result.to_stored(session_id, None).unwrap();
     restored.seq += 1;
-    restored.state.push(StoredStateRecord {
-        seq: restored.seq,
-        agent: Some(source),
-        generation: 0,
-        change: StateChange::Turn {
-            turn,
-            result: stored_result.clone(),
+    restored.state.insert(
+        restored.seq,
+        StoredStateRecord {
+            seq: restored.seq,
+            agent: Some(source),
+            generation: 0,
+            change: StateChange::Turn {
+                turn,
+                result: stored_result.clone(),
+            },
         },
-    });
+    );
     restored.seq += 1;
-    restored.state.push(StoredStateRecord {
-        seq: restored.seq,
-        agent: Some(parent),
-        generation,
-        change: StateChange::Delivery {
-            id: (source, turn),
-            op: StoredDeliveryOp::Queued(Box::new(StoredDelivery {
-                label: None,
-                result: stored_result,
-                held: false,
-                preview_bytes: None,
-            })),
+    restored.state.insert(
+        restored.seq,
+        StoredStateRecord {
+            seq: restored.seq,
+            agent: Some(parent),
+            generation,
+            change: StateChange::Delivery {
+                id: (source, turn),
+                op: StoredDeliveryOp::Queued(Box::new(StoredDelivery {
+                    label: None,
+                    result: stored_result,
+                    held: false,
+                    preview_bytes: None,
+                })),
+            },
         },
-    });
+    );
     let mut replacement = smol::block_on(common::bounded(
         journal.prepare_branch_restore(root, restored),
     ))

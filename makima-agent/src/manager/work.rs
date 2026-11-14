@@ -269,10 +269,12 @@ impl WorkLedger {
         self.reserve(agent_id, None, true, true)
     }
 
+    #[cfg(test)]
     pub(crate) fn active_agents(&self) -> usize {
         self.lock().active_agents
     }
 
+    #[cfg(test)]
     pub(crate) fn active_children(&self, parent_id: AgentId) -> usize {
         self.lock()
             .active_children

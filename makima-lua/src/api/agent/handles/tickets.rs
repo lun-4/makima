@@ -211,8 +211,8 @@ mod tests {
     use makima_storage::{
         id::{MakimaId, SessionRef},
         session_state::{
-            MAX_INLINE_TURN_RESULT_BYTES, SessionStateView, StateChange, StoredAgentLifecycle,
-            StoredAgentRecord, StoredPayload,
+            MAX_INLINE_TURN_RESULT_BYTES, StateChange, StoredAgentLifecycle, StoredAgentRecord,
+            StoredPayload,
         },
     };
     use mlua::Lua;
@@ -350,8 +350,7 @@ mod tests {
             })
             .unwrap();
         let before = journal.checkpoint_snapshot().unwrap();
-        let view =
-            SessionStateView::fold(&before.state, &before.agent_revisions, before.seq).unwrap();
+        let view = before.fold(before.seq).unwrap();
         let manager = AgentManagerHandle::restore_graph(
             AgentLimits::default(),
             Arc::clone(&journal),

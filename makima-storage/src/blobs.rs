@@ -86,7 +86,15 @@ impl BlobStore {
     }
 
     pub fn put(&self, session: MakimaId, bytes: &[u8]) -> Result<BlobRef, BlobError> {
-        self.put_checked(session, bytes, || Ok(()))
+        #[cfg(unix)]
+        {
+            unix::put(&self.state, session, bytes, |file| file.sync_all())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (&self.state, session, bytes);
+            Err(unsupported())
+        }
     }
 
     pub fn read(&self, reference: &BlobRef) -> Result<Vec<u8>, BlobError> {
@@ -97,40 +105,6 @@ impl BlobStore {
         #[cfg(not(unix))]
         {
             let _ = (&self.state, reference);
-            Err(unsupported())
-        }
-    }
-
-    pub fn copy_to(&self, owner: MakimaId, source: &BlobRef) -> Result<BlobRef, BlobError> {
-        let bytes = self.read(source)?;
-        self.put_checked(owner, &bytes, || self.ensure_session(source.session))
-    }
-
-    fn ensure_session(&self, session: MakimaId) -> Result<(), BlobError> {
-        #[cfg(unix)]
-        {
-            unix::Sessions::open(&self.state, session)?.validate(session)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = session;
-            Err(unsupported())
-        }
-    }
-
-    fn put_checked(
-        &self,
-        session: MakimaId,
-        bytes: &[u8],
-        guard: impl FnMut() -> Result<(), BlobError>,
-    ) -> Result<BlobRef, BlobError> {
-        #[cfg(unix)]
-        {
-            unix::put(&self.state, session, bytes, guard, |file| file.sync_all())
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (session, bytes, guard);
             Err(unsupported())
         }
     }
@@ -364,7 +338,6 @@ mod unix {
         state: &StateDir,
         session: MakimaId,
         bytes: &[u8],
-        mut guard: impl FnMut() -> Result<(), BlobError>,
         mut sync: impl FnMut(&File) -> io::Result<()>,
     ) -> Result<BlobRef, BlobError> {
         let reference = BlobRef {
@@ -372,10 +345,8 @@ mod unix {
             hash: BlobHash::digest(bytes),
         };
         let mut directories = Sessions::open(state, session)?;
-        guard()?;
         directories.owner(session, true)?;
         directories.validate(session)?;
-        guard()?;
         let parent = directories.current();
         match read_at(parent, &reference) {
             Ok(existing) => {
@@ -396,7 +367,6 @@ mod unix {
                 file.write_all(bytes)?;
                 sync(&file)?;
                 directories.validate(session)?;
-                guard()?;
                 match fs::linkat(
                     parent,
                     name.as_str(),
@@ -423,7 +393,6 @@ mod unix {
         sync(&file)?;
         directories.sync(&mut sync)?;
         directories.validate(session)?;
-        guard()?;
         verify_entry(parent, OsStr::new(reference.hash.as_str()), &file)?;
         let existing = read_at(parent, &reference)?;
         if existing != bytes {
@@ -523,7 +492,7 @@ mod tests {
     #[cfg(unix)]
     #[test_case(b""; "empty")]
     #[test_case(CONTENT; "binary")]
-    fn writes_deduplicates_and_copies(bytes: &[u8]) {
+    fn writes_and_deduplicates(bytes: &[u8]) {
         use std::os::unix::fs::MetadataExt;
 
         let (_temporary, state, store, owner) = fixture();
@@ -541,16 +510,6 @@ mod tests {
                 .count(),
             1
         );
-        let destination = session(&state);
-        let copied = store.copy_to(destination, &reference).unwrap();
-        assert_eq!(copied.session, destination);
-        assert_eq!(copied.hash, reference.hash);
-        assert_eq!(store.read(&copied).unwrap(), bytes);
-        fs::remove_file(session_path(&state, owner)).unwrap();
-        assert!(
-            matches!(store.copy_to(destination, &reference), Err(BlobError::SessionUnavailable(id)) if id == owner)
-        );
-        assert_eq!(store.read(&copied).unwrap(), bytes);
     }
 
     #[cfg(unix)]
@@ -584,18 +543,6 @@ mod tests {
         );
         assert!(
             matches!(store.put(owner, CONTENT), Err(BlobError::SessionUnavailable(id)) if id == owner)
-        );
-        let destination = session(&state);
-        assert!(
-            matches!(store.copy_to(destination, &reference), Err(BlobError::SessionUnavailable(id)) if id == owner)
-        );
-        assert!(
-            !state
-                .path()
-                .join(SESSIONS_DIR)
-                .join("blobs")
-                .join(destination.to_string())
-                .exists()
         );
     }
 
@@ -634,10 +581,6 @@ mod tests {
             store.put(owner, CONTENT),
             Err(BlobError::Unsafe(_))
         ));
-        assert!(matches!(
-            store.copy_to(owner, &reference),
-            Err(BlobError::Unsafe(_))
-        ));
     }
 
     #[cfg(unix)]
@@ -652,13 +595,9 @@ mod tests {
             session: owner,
             hash: BlobHash::digest(CONTENT),
         };
-        let error = unix::put(
-            &state,
-            owner,
-            CONTENT,
-            || Ok(()),
-            |_| Err(io::Error::other(SYNC_ERROR)),
-        )
+        let error = unix::put(&state, owner, CONTENT, |_| {
+            Err(io::Error::other(SYNC_ERROR))
+        })
         .unwrap_err();
         assert!(matches!(error, BlobError::Io(source) if source.to_string() == SYNC_ERROR));
         let path = blob_path(&state, &reference);
@@ -677,16 +616,10 @@ mod tests {
             session: owner,
             hash: BlobHash::digest(CONTENT),
         };
-        let result = unix::put(
-            &state,
-            owner,
-            CONTENT,
-            || Ok(()),
-            |file| {
-                file.sync_all()?;
-                fs::remove_file(session_path(&state, owner))
-            },
-        );
+        let result = unix::put(&state, owner, CONTENT, |file| {
+            file.sync_all()?;
+            fs::remove_file(session_path(&state, owner))
+        });
         assert!(matches!(result, Err(BlobError::SessionUnavailable(id)) if id == owner));
         assert!(!blob_path(&state, &reference).exists());
     }
@@ -706,51 +639,18 @@ mod tests {
         let path = blob_path(&state, &reference);
         let directory = path.parent().unwrap();
         let moved = temporary.path().join("moved-owner");
-        let result = unix::put(
-            &state,
-            owner,
-            CONTENT,
-            || Ok(()),
-            |file| {
-                file.sync_all()?;
-                fs::rename(directory, &moved)?;
-                if symlink_replacement {
-                    symlink(&moved, directory)
-                } else {
-                    fs::create_dir(directory)
-                }
-            },
-        );
+        let result = unix::put(&state, owner, CONTENT, |file| {
+            file.sync_all()?;
+            fs::rename(directory, &moved)?;
+            if symlink_replacement {
+                symlink(&moved, directory)
+            } else {
+                fs::create_dir(directory)
+            }
+        });
         assert!(matches!(result, Err(BlobError::Unsafe(_))));
         assert!(!path.exists());
         assert_eq!(fs::read_dir(moved).unwrap().count(), 0);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn source_deletion_at_copy_publication_gate_is_rejected() {
-        use super::unix;
-
-        let (_temporary, state, store, owner) = fixture();
-        let source = store.put(owner, CONTENT).unwrap();
-        let destination = session(&state);
-        let bytes = store.read(&source).unwrap();
-        let result = unix::put(
-            &state,
-            destination,
-            &bytes,
-            || store.ensure_session(source.session),
-            |file| {
-                file.sync_all()?;
-                fs::remove_file(session_path(&state, owner))
-            },
-        );
-        assert!(matches!(result, Err(BlobError::SessionUnavailable(id)) if id == owner));
-        let target = BlobRef {
-            session: destination,
-            hash: source.hash,
-        };
-        assert!(!blob_path(&state, &target).exists());
     }
 
     #[cfg(unix)]
@@ -765,19 +665,13 @@ mod tests {
             session: owner,
             hash: BlobHash::digest(CONTENT),
         };
-        let result = unix::put(
-            &state,
-            owner,
-            CONTENT,
-            || Ok(()),
-            |file| {
-                if file.metadata()?.is_dir() {
-                    Err(io::Error::other(SYNC_ERROR))
-                } else {
-                    file.sync_all()
-                }
-            },
-        );
+        let result = unix::put(&state, owner, CONTENT, |file| {
+            if file.metadata()?.is_dir() {
+                Err(io::Error::other(SYNC_ERROR))
+            } else {
+                file.sync_all()
+            }
+        });
         assert!(matches!(result, Err(BlobError::Io(source)) if source.to_string() == SYNC_ERROR));
         assert_eq!(store.read(&reference).unwrap(), CONTENT);
         assert_eq!(store.put(owner, CONTENT).unwrap(), reference);
@@ -796,20 +690,14 @@ mod tests {
 
         let (_temporary, state, _store, owner) = fixture();
         let mut deleted = false;
-        let result = unix::put(
-            &state,
-            owner,
-            CONTENT,
-            || Ok(()),
-            |file| {
-                file.sync_all()?;
-                if file.metadata()?.is_dir() && !deleted {
-                    fs::remove_file(session_path(&state, owner))?;
-                    deleted = true;
-                }
-                Ok(())
-            },
-        );
+        let result = unix::put(&state, owner, CONTENT, |file| {
+            file.sync_all()?;
+            if file.metadata()?.is_dir() && !deleted {
+                fs::remove_file(session_path(&state, owner))?;
+                deleted = true;
+            }
+            Ok(())
+        });
         assert!(deleted);
         assert!(matches!(result, Err(BlobError::SessionUnavailable(id)) if id == owner));
     }
@@ -844,11 +732,9 @@ mod tests {
             session: owner,
             hash: BlobHash::digest(CONTENT),
         };
-        for result in [store.put(owner, CONTENT), store.copy_to(owner, &reference)] {
-            assert!(
-                matches!(result, Err(BlobError::Io(error)) if error.kind() == ErrorKind::Unsupported)
-            );
-        }
+        assert!(
+            matches!(store.put(owner, CONTENT), Err(BlobError::Io(error)) if error.kind() == ErrorKind::Unsupported)
+        );
         assert!(
             matches!(store.read(&reference), Err(BlobError::Io(error)) if error.kind() == ErrorKind::Unsupported)
         );

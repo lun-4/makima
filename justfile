@@ -41,6 +41,9 @@ gen-docs:
 gen-docs-check:
     cargo run -p makima-docgen -- --check
 
+memory-profile-check:
+    cargo check -p makima-lua -p makima-interpreter --tests --features makima-lua/memory-profile
+
 machete:
     cargo-machete
 
@@ -54,4 +57,4 @@ bench *ARGS:
     cargo bench -p makima-lua {{ARGS}}
 
 # Full CI check
-ci: fmt-check lint pylint test gen-docs-check machete
+ci: fmt-check lint pylint memory-profile-check test gen-docs-check machete

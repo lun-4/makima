@@ -431,7 +431,7 @@ mod context_tests {
         use crate::actor::tests::{ScriptedBackend, policy};
         use crate::manager::AgentManagerHandle;
         use crate::session_checkpoint::stored_agent_config;
-        use makima_storage::session_state::{SessionStateView, StateChange};
+        use makima_storage::session_state::StateChange;
         use std::collections::BTreeMap;
 
         smol::block_on(async {
@@ -484,9 +484,7 @@ mod context_tests {
             assert!(committed.config.config.fast);
             let changed = journal.snapshot();
             assert_eq!(changed.state.len(), before.state.len() + 1);
-            let folded =
-                SessionStateView::fold(&changed.state, &changed.agent_revisions, changed.seq)
-                    .unwrap();
+            let folded = changed.fold(changed.seq).unwrap();
             let saved = folded.scopes[&Some(target.id())].config.as_ref().unwrap();
             assert!(saved.fast);
             assert_eq!(saved.options, options);
@@ -507,7 +505,7 @@ mod context_tests {
             drop(cancelled);
             assert_eq!(journal.snapshot().state, changed.state);
             assert!(matches!(
-                changed.state.last().unwrap().change,
+                changed.state.iter().next_back().unwrap().change,
                 StateChange::Config(_)
             ));
             root.close_subtree().unwrap();
@@ -576,7 +574,8 @@ mod context_tests {
                 .unwrap();
             assert_eq!(commit.config.config.fast, supported);
             let snapshot = manager.journal().snapshot();
-            let StateChange::Config(stored) = &snapshot.state.last().unwrap().change else {
+            let StateChange::Config(stored) = &snapshot.state.iter().next_back().unwrap().change
+            else {
                 panic!("expected configuration record")
             };
             assert_eq!(stored.fast, supported);

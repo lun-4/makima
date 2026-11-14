@@ -1698,7 +1698,6 @@ impl SpawnCtx {
         let session_lock = if exact.is_none() && session_lock.is_some() {
             rewind::reconcile_startup(
                 &self.sessions_dir,
-                &self.storage,
                 session.id,
                 session_lock,
                 Arc::clone(&self.file_write_locks),
@@ -9586,7 +9585,7 @@ end })
     #[test_case(true, false; "resumed_startup")]
     #[test_case(true, true; "same_session_replacement")]
     fn startup_publishes_complete_options_before_first_turn(resumed: bool, replace: bool) {
-        use makima_storage::session_state::{SessionStateView, StateChange, StoredStateRecord};
+        use makima_storage::session_state::{StateChange, StoredStateRecord};
 
         const PLUGIN: &str = "startup_options";
         const PERSISTENT: &str = "startup_options.persistent";
@@ -9681,9 +9680,7 @@ end })
         assert_eq!(expected[TRANSIENT], DISABLED_VALUE);
         assert_eq!(expected[NEW_DEFAULT], DISABLED_VALUE);
         let snapshot = manager.journal().snapshot();
-        let folded =
-            SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
-                .unwrap();
+        let folded = snapshot.fold(snapshot.seq).unwrap();
         assert_eq!(
             folded.scopes[&Some(root)].config.as_ref().unwrap().options,
             expected

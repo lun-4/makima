@@ -172,6 +172,7 @@ impl ActorOnlyBackend {
                 file_write_locks: Arc::clone(&context.file_write_locks),
                 offload: context.offload.clone(),
                 managed_turn: None,
+                root_context: None,
             },
         }
     }

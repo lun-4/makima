@@ -274,6 +274,7 @@ impl RestoreStore {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(test, feature = "test-util"))]
     pub fn pending(&self, owner: MakimaId) -> Result<Vec<TransitionRef>, RestoreError> {
         let locked = match self.owner(owner, false) {
             Ok(locked) => locked,
@@ -439,6 +440,7 @@ impl RestoreStore {
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(any(test, feature = "test-util"))]
     pub fn pending(&self, _: MakimaId) -> Result<Vec<TransitionRef>, RestoreError> {
         ensure_no_restore_metadata(&self.dir.path().join(SESSIONS_DIR))?;
         Ok(Vec::new())

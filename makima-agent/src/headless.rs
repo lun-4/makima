@@ -14,7 +14,7 @@ use makima_providers::model::Model;
 use makima_providers::provider::BoxFuture;
 use makima_providers::{ProviderRegistry, RequestOptions, Timeouts};
 use makima_storage::id::{MakimaId, SessionRef};
-use makima_storage::session_state::{SessionStateView, StateChange};
+use makima_storage::session_state::StateChange;
 use serde_json::Value;
 use tracing::warn;
 
@@ -258,21 +258,6 @@ impl InteractiveControlSender {
         Ok(())
     }
 
-    /// Compacts the root's history and waits for it to settle.
-    pub async fn compact(
-        &self,
-        instructions: Option<String>,
-        cancel: CancelToken,
-    ) -> Result<(), String> {
-        let actor = self
-            .root
-            .get()
-            .await?
-            .actor()
-            .map_err(|error| error.to_string())?;
-        self.compact_to(actor, instructions, cancel).await
-    }
-
     pub async fn compact_to(
         &self,
         actor: AgentActorHandle,
@@ -295,23 +280,6 @@ impl InteractiveControlSender {
                 Err(_) => return Err(OPERATION_CANCELLED.into()),
             }
         }
-    }
-
-    /// Asks {question} beside the root's history, leaving it unchanged, and
-    /// returns the answer.
-    pub async fn ask_isolated(
-        &self,
-        question: String,
-        images: Vec<makima_providers::ImageSource>,
-        cancel: CancelToken,
-    ) -> Result<String, String> {
-        let actor = self
-            .root
-            .get()
-            .await?
-            .actor()
-            .map_err(|error| error.to_string())?;
-        self.ask_isolated_to(actor, question, images, cancel).await
     }
 
     pub async fn send_isolated_to(
@@ -1216,7 +1184,8 @@ fn spawn_interactive(
     let mut restored_config = None;
     let mut restored_permissions = PermissionSnapshot::default();
     let manager = if restored_graph {
-        SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
+        snapshot
+            .fold(snapshot.seq)
             .map_err(|error| error.to_string())
             .and_then(|view| {
                 if let Some(scope) = view.scopes.get(&None) {
@@ -1246,7 +1215,7 @@ fn spawn_interactive(
                         thinking: stored.thinking,
                     };
                 }
-                AgentManagerHandle::restore_graph(limits, journal, view, snapshot.histories)
+                AgentManagerHandle::restore_graph(limits, journal, view, snapshot.histories.clone())
                     .map_err(|error| error.to_string())
             })
     } else {
@@ -1330,12 +1299,9 @@ fn spawn_interactive(
                 let mut mode_fallback = false;
                 let config = if let Some(stored) = restored_config {
                     let restored = crate::plan_state::prepare_restore_for_agent(
-                        &SessionStateView::fold(
-                            &snapshot.state,
-                            &snapshot.agent_revisions,
-                            snapshot.seq,
-                        )
-                        .map_err(|error| error.to_string())?,
+                        &snapshot
+                            .fold(snapshot.seq)
+                            .map_err(|error| error.to_string())?,
                         root_id,
                         &stored.mode,
                         &params.modes,
@@ -2237,12 +2203,7 @@ pub(crate) mod tests {
                             AgentMode::Build
                         ));
                         let snapshot = manager.journal().snapshot();
-                        let view = SessionStateView::fold(
-                            &snapshot.state,
-                            &snapshot.agent_revisions,
-                            snapshot.seq,
-                        )
-                        .unwrap();
+                        let view = snapshot.fold(snapshot.seq).unwrap();
                         assert_eq!(
                             view.scopes[&Some(root_id)].config.as_ref().unwrap().mode.id,
                             crate::ModeId::Build.key()
@@ -2358,9 +2319,7 @@ pub(crate) mod tests {
                 .unwrap();
             let snapshot = handle.manager.journal().snapshot();
             assert_eq!(snapshot.state.len(), before.len() + 1);
-            let view =
-                SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
-                    .unwrap();
+            let view = snapshot.fold(snapshot.seq).unwrap();
             assert_eq!(view.scopes[&None].rules, rules);
             assert_eq!(
                 view.scopes[&None].yolo,
@@ -2766,7 +2725,7 @@ pub(crate) mod tests {
                 }
             });
             let mut previous = 0;
-            for record in &journal.snapshot().state {
+            for record in journal.snapshot().state.iter() {
                 if let StateChange::Rules {
                     rules,
                     yolo: stored,
@@ -2779,9 +2738,7 @@ pub(crate) mod tests {
             }
             assert_eq!(previous, GRANTS + rules.len());
             let snapshot = journal.snapshot();
-            let folded =
-                SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
-                    .unwrap();
+            let folded = snapshot.fold(snapshot.seq).unwrap();
             assert_eq!(
                 folded.scopes[&None].rules,
                 handle.permissions.snapshot().stored_rules()

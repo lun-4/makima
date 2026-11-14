@@ -373,7 +373,7 @@ impl Drop for RestartShutdown {
         if let Some(coordinator) = &self.coordinator {
             smol::block_on(bounded(coordinator.close())).unwrap();
         }
-        for (_, record) in self.manager.journal().snapshot().agent_revisions {
+        for (_, record) in self.manager.journal().snapshot().agent_revisions.iter() {
             if self.manager.is_live(record.id) {
                 let incarnation = self.manager.incarnation(record.id).unwrap();
                 self.manager.detach_incarnation(&incarnation).unwrap();

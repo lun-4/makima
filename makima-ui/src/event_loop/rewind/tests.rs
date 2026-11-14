@@ -241,7 +241,7 @@ fn assert_history(event_loop: &EventLoop<'_>, index: usize, expected: &[Message]
         serde_json::to_value(expected).unwrap()
     );
     assert_persisted_state(&loaded, &journal);
-    assert_eq!(loaded.agent_revisions(), journal.agent_revisions);
+    assert_eq!(loaded.agent_revisions(), journal.agent_revisions.to_vec());
 }
 
 #[track_caller]
@@ -1346,7 +1346,6 @@ fn startup_reconciles_both_endpoints_and_missing_progress(published: bool, compl
                 .unwrap();
             let lease = super::reconcile_startup(
                 &event_loop.ctx.sessions_dir,
-                &event_loop.ctx.storage,
                 id,
                 Some(lease),
                 Arc::clone(&event_loop.ctx.file_write_locks),

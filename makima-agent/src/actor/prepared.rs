@@ -222,7 +222,7 @@ impl PreparedTransaction {
             .filter(|_| self.boundary)
             .and_then(|prepared| {
                 let snapshot = prepared.snapshot();
-                snapshot.state.last().and_then(|record| {
+                snapshot.state.iter().next_back().and_then(|record| {
                     if !matches!(record.change, StateChange::Boundary { .. }) {
                         return None;
                     }

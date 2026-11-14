@@ -954,7 +954,7 @@ mod tests {
         };
         use makima_providers::ModelSelection;
         use makima_storage::plans::PlanSlot;
-        use makima_storage::session_state::{SessionStateView, StateChange};
+        use makima_storage::session_state::StateChange;
         use makima_storage::sessions::Session;
         smol::block_on(async {
             const PLAN: &str = "# Approved implementation plan\n";
@@ -1046,12 +1046,10 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            let view = SessionStateView::fold(
-                &replacement.snapshot().state,
-                &replacement.snapshot().agent_revisions,
-                replacement.snapshot().seq,
-            )
-            .unwrap();
+            let view = replacement
+                .snapshot()
+                .fold(replacement.snapshot().seq)
+                .unwrap();
             assert_eq!(
                 view.scopes[&Some(root.id())].config.as_ref(),
                 Some(&saved_config)
@@ -1149,8 +1147,8 @@ mod tests {
                                 assert_eq!(boundary.agent, final_access.target());
                                 assert_eq!(boundary.epoch, candidate.epoch);
                                 assert_eq!(callback_journal.snapshot().state, callback_before.state);
-                                assert_eq!(candidate.state[..callback_before.state.len()], callback_before.state);
-                                let changes = &candidate.state[callback_before.state.len()..];
+                                assert!(candidate.state.iter().take(callback_before.state.len()).eq(callback_before.state.iter()));
+                                let changes: Vec<_> = candidate.state.iter().skip(callback_before.state.len()).collect();
                                 assert_eq!(changes.len(), usize::from(with_edit) + 1);
                                 if with_edit {
                                     assert!(matches!(
@@ -1171,7 +1169,7 @@ mod tests {
                                     lens[&boundary.agent],
                                     (snapshot.history.epoch, snapshot.history.messages.len())
                                 );
-                                for (id, history) in &callback_before.histories {
+                                for (id, history) in callback_before.histories.iter() {
                                     let candidate_history = &candidate.histories[id];
                                     assert_eq!(candidate_history.epoch, history.epoch);
                                     assert_eq!(candidate_history.compacted, history.compacted);

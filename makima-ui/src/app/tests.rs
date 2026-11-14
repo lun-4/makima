@@ -6520,8 +6520,8 @@ fn checkpoint_syncs_ephemeral_content_into_meta() {
         .unwrap();
     let snapshot = root.manager().journal().snapshot();
     let session = app.state.session_mut();
-    session.replace_state(snapshot.state);
-    session.replace_agent_revisions(snapshot.agent_revisions);
+    session.replace_state(snapshot.state.to_vec());
+    session.replace_agent_revisions(snapshot.agent_revisions.to_vec());
     app.checkpoint();
     assert!(app.state.session.meta.mode.is_none());
     assert!(app.state.plan.path().is_some());

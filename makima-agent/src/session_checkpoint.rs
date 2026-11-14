@@ -372,10 +372,10 @@ impl SessionLogCheckpoint {
                     }
                     let mut candidate = lock(session).clone();
                     if !acknowledge {
-                        candidate.session.replace_state(snapshot.state.clone());
+                        candidate.session.replace_state(snapshot.state.to_vec());
                         candidate
                             .session
-                            .replace_agent_revisions(snapshot.agent_revisions.clone());
+                            .replace_agent_revisions(snapshot.agent_revisions.to_vec());
                     }
                     snapshot.apply_to(&mut candidate.session).map_err(|error| {
                         CheckpointError::Save {
@@ -497,14 +497,22 @@ impl SessionLogCheckpoint {
                 .map(|record| record.seq)
                 .chain(agents.iter().map(|(seq, _)| *seq))
                 .max();
-            if !snapshot.state.starts_with(state)
-                || !snapshot.agent_revisions.starts_with(agents)
-                || snapshot.state[state.len()..]
+            if !snapshot.state.iter().take(state.len()).eq(state.iter())
+                || !snapshot
+                    .agent_revisions
                     .iter()
+                    .take(agents.len())
+                    .eq(agents.iter())
+                || snapshot
+                    .state
+                    .iter()
+                    .skip(state.len())
                     .map(|record| record.seq)
                     .chain(
-                        snapshot.agent_revisions[agents.len()..]
+                        snapshot
+                            .agent_revisions
                             .iter()
+                            .skip(agents.len())
                             .map(|(seq, _)| *seq),
                     )
                     .any(|seq| last_seq.is_some_and(|last| seq <= last))
@@ -1487,7 +1495,13 @@ mod tests {
             let journal = writer.create_journal().await.unwrap();
             let agent = if child {
                 let snapshot = journal.snapshot();
-                let mut record = snapshot.agent_revisions.last().unwrap().1.clone();
+                let mut record = snapshot
+                    .agent_revisions
+                    .iter()
+                    .next_back()
+                    .unwrap()
+                    .1
+                    .clone();
                 record.id = AgentId::generate();
                 record.parent = Some(root);
                 record.depth = 1;
@@ -1930,10 +1944,10 @@ mod tests {
                         .model,
                     COMMITTED_MODEL
                 );
-                assert_eq!(loaded.state(), journal.snapshot().state);
+                assert_eq!(loaded.state(), journal.snapshot().state.to_vec());
                 assert_eq!(journal.published_revision(), journal.snapshot().revision);
             } else {
-                assert_eq!(loaded.state(), before.state);
+                assert_eq!(loaded.state(), before.state.to_vec());
                 assert_eq!(journal.snapshot().state, before.state);
                 assert_eq!(journal.published_revision(), before.revision);
             }
@@ -2126,11 +2140,11 @@ mod tests {
             assert_eq!(journal.checkpoint_snapshot().unwrap().state, initial.state);
             let loaded = StoredSession::load(id, &dir).unwrap();
             if rejected {
-                assert_eq!(loaded.state(), initial.state);
+                assert_eq!(loaded.state(), initial.state.to_vec());
                 assert!(loaded.messages().is_empty());
                 drop(prepared);
             } else {
-                assert_eq!(loaded.state(), prepared.snapshot().state);
+                assert_eq!(loaded.state(), prepared.snapshot().state.to_vec());
                 assert_eq!(loaded.messages(), history.messages.as_ref());
                 let candidate = prepared.snapshot().clone();
                 prepared.commit().unwrap();
@@ -2306,13 +2320,13 @@ mod tests {
             assert_eq!(journal.published_revision(), 0);
             let loaded = StoredSession::load(id, &dir).unwrap();
             if rejected {
-                assert_eq!(loaded.state(), initial.state);
+                assert_eq!(loaded.state(), initial.state.to_vec());
                 assert_eq!(
                     loaded.subagent_messages()[CHILD_KEY],
                     initial.histories[&child_id].messages
                 );
             } else {
-                assert_eq!(loaded.state(), prepared.snapshot().state);
+                assert_eq!(loaded.state(), prepared.snapshot().state.to_vec());
                 assert_eq!(loaded.subagent_messages()[CHILD_KEY], changed.messages);
                 assert_eq!(
                     loaded.latest_state().unwrap().scopes[&Some(child_id)]
@@ -2432,7 +2446,7 @@ mod tests {
                 result.unwrap();
                 assert_eq!(
                     lock(&writer.session).session.state(),
-                    journal.snapshot().state
+                    journal.snapshot().state.to_vec()
                 );
                 writer.bind_journal(Arc::clone(&journal)).await.unwrap();
             }
@@ -2558,7 +2572,7 @@ mod tests {
             ));
             assert_eq!(lock(&writer.session).history_version, None);
             let loaded = StoredSession::load(id, &dir).unwrap();
-            assert_eq!(loaded.state(), before.state);
+            assert_eq!(loaded.state(), before.state.to_vec());
             assert_eq!(loaded.messages(), original.messages.as_ref());
             assert_eq!(
                 loaded.subagent_messages()[CHILD_KEY].as_ref(),
@@ -2613,7 +2627,7 @@ mod tests {
                 kind.as_ref().map(|_| (terminal.epoch, 2))
             );
             let loaded = StoredSession::load(id, &dir).unwrap();
-            assert_eq!(loaded.state(), journal.snapshot().state);
+            assert_eq!(loaded.state(), journal.snapshot().state.to_vec());
             assert_eq!(loaded.model, MODEL);
             assert_eq!(loaded.messages(), terminal.messages.as_ref());
             assert_eq!(
@@ -2974,15 +2988,30 @@ mod tests {
                 )
                 .unwrap();
             let snapshot = journal.snapshot();
-            assert!(snapshot.state.starts_with(&original_state));
-            assert!(snapshot.agent_revisions.starts_with(&original_agents));
+            assert!(
+                snapshot
+                    .state
+                    .iter()
+                    .take(original_state.len())
+                    .eq(original_state.iter())
+            );
+            assert!(
+                snapshot
+                    .agent_revisions
+                    .iter()
+                    .take(original_agents.len())
+                    .eq(original_agents.iter())
+            );
             assert!(snapshot.agent_revisions.len() > original_agents.len());
             assert!(!snapshot.state.is_empty());
             writer.bind_journal(Arc::clone(&journal)).await.unwrap();
             {
                 let retained = lock(&writer.session);
-                assert_eq!(retained.session.state(), snapshot.state);
-                assert_eq!(retained.session.agent_revisions(), snapshot.agent_revisions);
+                assert_eq!(retained.session.state(), snapshot.state.to_vec());
+                assert_eq!(
+                    retained.session.agent_revisions(),
+                    snapshot.agent_revisions.to_vec()
+                );
             }
             let path = dir
                 .ensure_subdir(SESSIONS_DIR)
@@ -3007,8 +3036,11 @@ mod tests {
             writer.checkpoint(change).await.unwrap();
             let published = StoredSession::load(id, &dir).unwrap();
             assert_eq!(published.root_agent_id(), Some(root));
-            assert_eq!(published.state(), snapshot.state);
-            assert_eq!(published.agent_revisions(), snapshot.agent_revisions);
+            assert_eq!(published.state(), snapshot.state.to_vec());
+            assert_eq!(
+                published.agent_revisions(),
+                snapshot.agent_revisions.to_vec()
+            );
             assert_eq!(journal.published_revision(), snapshot.revision);
             start.send(()).unwrap();
             assert!(
@@ -3116,10 +3148,10 @@ mod tests {
             let published = StoredSession::load(id, &dir).unwrap();
             assert_eq!(published.root_agent_id(), Some(root));
             assert_eq!(published.agents()[&child_id].transcript_key, CHILD_KEY);
-            assert_eq!(published.state(), journal.snapshot().state);
+            assert_eq!(published.state(), journal.snapshot().state.to_vec());
             assert_eq!(
                 published.agent_revisions(),
-                journal.snapshot().agent_revisions
+                journal.snapshot().agent_revisions.to_vec()
             );
         });
     }

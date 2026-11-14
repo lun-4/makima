@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Deref;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+#[cfg(test)]
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use event_listener::{Event, EventListener};
 use makima_providers::ThinkingConfig;
@@ -219,11 +221,13 @@ impl Deref for OptionsState {
     }
 }
 
+#[cfg(test)]
 type OptionsProjector = Box<dyn Fn(&SessionOptionsSnapshot) + Send + Sync>;
 
 pub struct SessionOptions {
     state: Mutex<OptionsState>,
     changed: Event,
+    #[cfg(test)]
     projector: OnceLock<OptionsProjector>,
 }
 
@@ -300,14 +304,16 @@ impl SessionOptions {
     /// Applies {project} to the current snapshot and then to every committed
     /// one, synchronously and before subscribers wake. One projector per
     /// store; a second is ignored.
+    #[cfg(test)]
     pub fn project(&self, project: impl Fn(&SessionOptionsSnapshot) + Send + Sync + 'static) {
         project(&self.snapshot());
         let _ = self.projector.set(Box::new(project));
     }
 
-    fn published(&self, snapshot: &SessionOptionsSnapshot) {
+    fn published(&self, _snapshot: &SessionOptionsSnapshot) {
+        #[cfg(test)]
         if let Some(project) = self.projector.get() {
-            project(snapshot);
+            project(_snapshot);
         }
         self.changed.notify(usize::MAX);
     }
@@ -351,6 +357,7 @@ impl SessionOptions {
                 reserved: false,
             }),
             changed: Event::new(),
+            #[cfg(test)]
             projector: OnceLock::new(),
         }))
     }

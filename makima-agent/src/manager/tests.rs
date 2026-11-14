@@ -3563,10 +3563,16 @@ fn supplied_root_identity_journals_config_and_reopens_without_recreating(deferre
     }
     let snapshot = manager.journal().snapshot();
     assert_eq!(snapshot.agent_revisions.len(), 1);
-    let created = snapshot.agent_revisions[0].1.created_seq;
+    let created = snapshot
+        .agent_revisions
+        .iter()
+        .next()
+        .unwrap()
+        .1
+        .created_seq;
     assert_eq!(snapshot.state.len(), 1);
     assert!(
-        matches!(&snapshot.state[0].change, StateChange::Config(saved) if saved.model == MODEL)
+        matches!(&snapshot.state.iter().next().unwrap().change, StateChange::Config(saved) if saved.model == MODEL)
     );
     let mut session = Session::new(MODEL, ".");
     session.adopt_history(&snapshot.histories[&id]);

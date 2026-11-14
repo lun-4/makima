@@ -298,7 +298,8 @@ impl ManagerRewindGuard {
         &self,
         snapshot: &SessionJournalSnapshot,
     ) -> Result<SessionStateView, ManagerError> {
-        let view = SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
+        let view = snapshot
+            .fold(snapshot.seq)
             .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
         let graph = self.manager.lock_graph();
         if graph.shutting_down {

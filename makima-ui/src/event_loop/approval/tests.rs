@@ -1943,7 +1943,10 @@ fn parent_rewind_preserves_implementation_and_redo_stays_in_parent(lose_source_l
             .checkpoint_snapshot()
             .unwrap();
         assert_persisted_state(&persisted, &journal);
-        assert_eq!(persisted.agent_revisions(), journal.agent_revisions);
+        assert_eq!(
+            persisted.agent_revisions(),
+            journal.agent_revisions.to_vec()
+        );
         let root = persisted.root_agent_id().unwrap();
         assert_eq!(
             event_loop.sessions[index]

@@ -785,17 +785,12 @@ impl StorageWriter {
             .latest
             .get(&id)
             .map(|latest| {
-                let mut merged = merge_tui_snapshot(
+                merge_tui_snapshot(
                     &session,
                     latest,
                     preserve_history,
                     state.live_children.get(&id).map(Vec::as_slice),
-                );
-                if state.config_versions.contains_key(&id) && merged.meta.mode != latest.meta.mode {
-                    let merged = Arc::make_mut(&mut merged);
-                    merged.meta.mode = latest.meta.mode.clone();
-                }
-                merged
+                )
             })
             .unwrap_or(session);
         if let Err(error) = project_journal(&state, id, journal.as_ref(), &mut authoritative) {
@@ -1117,14 +1112,7 @@ impl StorageWriter {
             state
                 .latest
                 .get(&session_id)
-                .map(|latest| {
-                    let mut merged = merge_tui_snapshot(&request.snapshot, latest, false, None);
-                    if merged.meta.mode != latest.meta.mode {
-                        let merged = Arc::make_mut(&mut merged);
-                        merged.meta.mode = latest.meta.mode.clone();
-                    }
-                    merged
-                })
+                .map(|latest| merge_tui_snapshot(&request.snapshot, latest, false, None))
                 .unwrap_or(request.snapshot)
         } else {
             let mut snapshot = request.snapshot;
@@ -1337,8 +1325,8 @@ fn enqueue_current_checkpoint(
     request: CurrentSessionCheckpoint,
 ) -> Result<flume::Receiver<Result<(), String>>, String> {
     let id = request.session.id;
-    if request.session.state() != request.journal.state
-        || request.session.agent_revisions() != request.journal.agent_revisions
+    if request.session.state() != request.journal.state.to_vec()
+        || request.session.agent_revisions() != request.journal.agent_revisions.to_vec()
     {
         return Err(RESTORE_PROJECTION_MISMATCH.into());
     }
@@ -1422,8 +1410,8 @@ fn enqueue_restore_checkpoint_inner(
 ) -> Result<flume::Receiver<Result<SessionSaveFence, String>>, String> {
     let id = request.session_id;
     if request.session.id != id
-        || request.session.state() != request.journal.state
-        || request.session.agent_revisions() != request.journal.agent_revisions
+        || request.session.state() != request.journal.state.to_vec()
+        || request.session.agent_revisions() != request.journal.agent_revisions.to_vec()
         || (!files_only && !request.journal.authoritative)
         || !request.session.branches().contains(&request.branch)
     {
@@ -1708,8 +1696,8 @@ fn project_journal(
             return Err(error);
         }
         let projected = Arc::make_mut(session);
-        projected.replace_state(captured.snapshot.state.clone());
-        projected.replace_agent_revisions(captured.snapshot.agent_revisions.clone());
+        projected.replace_state(captured.snapshot.state.to_vec());
+        projected.replace_agent_revisions(captured.snapshot.agent_revisions.to_vec());
         captured
             .snapshot
             .apply_to(projected)
@@ -1759,8 +1747,8 @@ fn project_staged_journal(
         return Err(CHECKPOINT_REPLACED.into());
     }
     let session = Arc::make_mut(session);
-    session.replace_state(snapshot.state.clone());
-    session.replace_agent_revisions(snapshot.agent_revisions.clone());
+    session.replace_state(snapshot.state.to_vec());
+    session.replace_agent_revisions(snapshot.agent_revisions.to_vec());
     snapshot
         .apply_to(session)
         .map_err(|error| error.to_string())
@@ -5470,10 +5458,10 @@ mod tests {
             smol::block_on(ack).unwrap();
         }
         let loaded = AppSession::load(id, &dir).unwrap();
-        assert_eq!(loaded.state(), journal.snapshot().state);
+        assert_eq!(loaded.state(), journal.snapshot().state.to_vec());
         assert_eq!(
             writer.latest_snapshot(id).unwrap().state(),
-            journal.snapshot().state
+            journal.snapshot().state.to_vec()
         );
         assert!(loaded.state().iter().any(
             |record| matches!(&record.change, StateChange::Config(config) if config == &stored)
@@ -5553,9 +5541,9 @@ mod tests {
         let reopened = AppSession::load(id, &dir).unwrap();
         assert_eq!(
             reopened.agent_revisions(),
-            journal.snapshot().agent_revisions
+            journal.snapshot().agent_revisions.to_vec()
         );
-        assert_eq!(reopened.state(), journal.snapshot().state);
+        assert_eq!(reopened.state(), journal.snapshot().state.to_vec());
         assert_eq!(
             reopened.agents()[&agent].lifecycle,
             StoredAgentLifecycle::Closed
@@ -5593,8 +5581,11 @@ mod tests {
         disk.flush(&writer.pending);
         assert_eq!(journal.published_revision(), captured.revision);
         let reopened = AppSession::load(id, &dir).unwrap();
-        assert_eq!(reopened.agent_revisions(), captured.agent_revisions);
-        assert_eq!(reopened.state(), captured.state);
+        assert_eq!(
+            reopened.agent_revisions(),
+            captured.agent_revisions.to_vec()
+        );
+        assert_eq!(reopened.state(), captured.state.to_vec());
     }
 
     #[test_case(false, false, false; "state_only")]
@@ -5866,7 +5857,7 @@ mod tests {
         );
         writer.shutdown(DRAIN_TIMEOUT);
         let reopened = AppSession::load(id, &dir).unwrap();
-        assert_eq!(reopened.state(), journal.snapshot().state);
+        assert_eq!(reopened.state(), journal.snapshot().state.to_vec());
         assert!(reopened.state().iter().any(|record| {
             matches!(record.change, StateChange::Turn { turn: saved, .. } if saved == turn)
         }));
@@ -6120,7 +6111,7 @@ mod tests {
             let journal = manager.journal();
             assert_eq!(
                 AppSession::load(id, &dir).unwrap().state(),
-                journal.snapshot().state
+                journal.snapshot().state.to_vec()
             );
             assert_eq!(journal.published_revision(), journal.snapshot().revision);
             coordinator.retire();
@@ -6242,7 +6233,7 @@ mod tests {
                 assert!(waiter.await.is_err());
             }
             let reopened = AppSession::load(id, &dir).unwrap();
-            assert_eq!(reopened.state(), expected.state);
+            assert_eq!(reopened.state(), expected.state.to_vec());
             assert_eq!(message_texts(&reopened), [REWOUND_MSG]);
         });
     }
@@ -6353,10 +6344,13 @@ mod tests {
             };
             disk.flush(&writer.pending);
             ack.await.unwrap();
-            assert_eq!(AppSession::load(id, &dir).unwrap().state(), expected.state);
+            assert_eq!(
+                AppSession::load(id, &dir).unwrap().state(),
+                expected.state.to_vec()
+            );
             assert_eq!(
                 lock(&writer.pending).acknowledged[&id].state(),
-                expected.state
+                expected.state.to_vec()
             );
             assert!(journal.snapshot().state.len() < expected.state.len());
             assert_eq!(journal.published_revision(), 0);
@@ -6450,7 +6444,7 @@ mod tests {
             disk.flush(&writer.pending);
             response.recv_timeout(DRAIN_TIMEOUT).unwrap().unwrap();
             let reopened = AppSession::load(id, &dir).unwrap();
-            assert_eq!(reopened.state(), expected.state);
+            assert_eq!(reopened.state(), expected.state.to_vec());
             assert_eq!(
                 reopened.subagent_messages()[TOOL_ID][0].user_text(),
                 Some(REWOUND_MSG)
@@ -6730,9 +6724,9 @@ mod tests {
             }
             assert_eq!(
                 session.agent_revisions(),
-                journal.snapshot().agent_revisions
+                journal.snapshot().agent_revisions.to_vec()
             );
-            assert_eq!(session.state(), journal.snapshot().state);
+            assert_eq!(session.state(), journal.snapshot().state.to_vec());
         };
         assert_eq!(journal.snapshot().histories[&agent].epoch, original.epoch);
         assert_eq!(journal.published_revision(), journal.snapshot().revision);
@@ -6818,13 +6812,13 @@ mod tests {
         let reopened = AppSession::load(id, &dir).unwrap();
         assert_eq!(
             reopened.agent_revisions(),
-            journal.snapshot().agent_revisions
+            journal.snapshot().agent_revisions.to_vec()
         );
         writer.send(session);
         disk.flush(&writer.pending);
         assert_eq!(
             AppSession::load(id, &dir).unwrap().state(),
-            journal.snapshot().state
+            journal.snapshot().state.to_vec()
         );
     }
 

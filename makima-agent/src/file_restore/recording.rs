@@ -141,9 +141,7 @@ mod tests {
         StateDir,
         blobs::{BlobHash, BlobRef, BlobStore, FileState},
         id::AgentId,
-        session_state::{
-            SessionStateView, StateChange, StoredAgentConfig, StoredModeSnapshot, StoredStateRecord,
-        },
+        session_state::{StateChange, StoredAgentConfig, StoredModeSnapshot, StoredStateRecord},
     };
     use std::{fs, os::unix::fs::symlink, path::Path, sync::Arc};
     use tempfile::TempDir;
@@ -202,7 +200,7 @@ mod tests {
         assert_eq!(snapshot.revision, 1);
         assert_eq!(snapshot.seq, 1);
         assert_eq!(
-            snapshot.state,
+            snapshot.state.to_vec(),
             [StoredStateRecord {
                 seq: 1,
                 agent: Some(recording.agent),
@@ -218,7 +216,7 @@ mod tests {
             before: saved_before,
             after: saved_after,
             ..
-        } = &snapshot.state[0].change
+        } = &snapshot.state.iter().next().unwrap().change
         else {
             unreachable!()
         };
@@ -404,12 +402,11 @@ mod tests {
         fs::write(&path, AFTER).unwrap();
         recording.finish(capture).unwrap();
         let snapshot = recording.journal.snapshot();
-        let record = snapshot.state.last().unwrap();
+        let record = snapshot.state.iter().next_back().unwrap();
         assert!(matches!(&record.change, StateChange::File { .. }));
         assert_eq!(record.generation, GENERATION + u64::from(reconfigure));
         assert_eq!(snapshot.histories[&recording.agent].epoch, HISTORY_EPOCH);
-        let view = SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
-            .unwrap();
+        let view = snapshot.fold(snapshot.seq).unwrap();
         assert_eq!(
             view.scopes[&Some(recording.agent)].generation,
             record.generation
@@ -439,7 +436,7 @@ mod tests {
         assert_eq!(snapshot.seq, 3);
         assert_eq!(snapshot.revision, 3);
         assert_eq!(
-            snapshot.state,
+            snapshot.state.to_vec(),
             [1, 2, 3].map(|seq| StoredStateRecord {
                 seq,
                 agent: Some(recording.agent),

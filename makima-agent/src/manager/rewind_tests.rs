@@ -10,8 +10,8 @@ use makima_providers::{Message, Model, TokenUsage, provider::unconfigured};
 use makima_storage::{
     id::{MakimaId, SessionRef},
     session_state::{
-        MAX_INLINE_TURN_RESULT_BYTES, MAX_STORED_TURN_RESULTS, SessionStateView, StateChange,
-        StoredAgentLifecycle, StoredAgentRecord, StoredDeliveryOp,
+        MAX_INLINE_TURN_RESULT_BYTES, MAX_STORED_TURN_RESULTS, StateChange, StoredAgentLifecycle,
+        StoredAgentRecord, StoredDeliveryOp,
     },
 };
 use tempfile::TempDir;
@@ -166,8 +166,7 @@ fn graph() -> (AgentManagerHandle, AgentId, AgentId) {
         })
         .unwrap();
     let snapshot = journal.snapshot();
-    let view =
-        SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq).unwrap();
+    let view = snapshot.fold(snapshot.seq).unwrap();
     let manager =
         AgentManagerHandle::restore_graph(AgentLimits::default(), journal, view, histories)
             .unwrap();
@@ -195,7 +194,9 @@ fn dormant_rewind_fences_reactivation_and_reconciles_exact_graph() {
             .retain(|(_, record)| record.id != child);
         candidate.histories.remove(&child);
         candidate.managed_histories.remove(&child);
-        candidate.agent_revisions[0].1.label = Some(HISTORICAL_LABEL.into());
+        let (seq, mut record) = candidate.agent_revisions.iter().next().unwrap().clone();
+        record.label = Some(HISTORICAL_LABEL.into());
+        candidate.agent_revisions.insert(seq, (seq, record));
         guard.validate_replacement(&candidate).unwrap();
         guard.reconcile(&candidate).unwrap();
         assert!(matches!(manager.node(child), Err(ManagerError::UnknownAgent(id)) if id == child));
@@ -301,13 +302,14 @@ fn rewind_prevalidation_rejects_without_mutating_runtime(history: bool) {
         if history {
             candidate.histories.remove(&child);
         } else {
-            candidate
+            let (seq, mut record) = candidate
                 .agent_revisions
-                .iter_mut()
+                .iter()
                 .find(|(_, record)| record.id == child)
                 .unwrap()
-                .1
-                .parent = None;
+                .clone();
+            record.parent = None;
+            candidate.agent_revisions.insert(seq, (seq, record));
         }
         assert!(matches!(
             guard.validate_replacement(&candidate),
@@ -514,8 +516,7 @@ fn child_rewind_preserves_outside_turn_report(commit: bool) {
                 .is_err()
         );
         assert_eq!(manager.journal().snapshot().revision, snapshot.revision);
-        let view = SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
-            .unwrap();
+        let view = snapshot.fold(snapshot.seq).unwrap();
         assert!(matches!(
             view.scopes[&Some(root)]
                 .deliveries
@@ -953,8 +954,11 @@ fn dropped_pending_rewind_releases_global_fence() {
 mod boundary_pin_profile {
     use super::{MODEL, graph};
     use crate::{
-        AgentId, HistorySnapshot, file_restore::StoredSession, journal::JournalCommit,
-        rewind::RewindBoundary, session_recovery::RecoveryCandidate,
+        AgentId, HistorySnapshot,
+        file_restore::StoredSession,
+        journal::{JournalChange, JournalCommit, SessionJournal},
+        rewind::RewindBoundary,
+        session_recovery::RecoveryCandidate,
     };
     use makima_providers::{ContentBlock, Message, Role};
     use makima_storage::{
@@ -963,7 +967,14 @@ mod boundary_pin_profile {
     };
     use serde_json::json;
     use std::{
-        collections::BTreeMap, env, fs, path::Path, process::Command, sync::Arc, time::Instant,
+        alloc::{GlobalAlloc, Layout, System},
+        cell::Cell,
+        collections::BTreeMap,
+        env, fs,
+        path::Path,
+        process::Command,
+        sync::Arc,
+        time::{Duration, Instant},
     };
     use test_case::test_case;
 
@@ -979,6 +990,242 @@ mod boundary_pin_profile {
     const OUTSIDE_AGENTS: usize = 2;
     const INITIAL_TURN: usize = 0;
     const CHILD_TAIL_TURNS: usize = 4;
+    const COMMIT_PROFILE_CHILD: &str = "MAKIMA_JOURNAL_COMMIT_PROFILE_CHILD";
+    const COMMIT_SAMPLES: usize = 32;
+    const COMMIT_SLOT: &str = "profile/commit";
+    const COMMIT_VALUE: &str = "fixed-size normal journal mutation";
+
+    #[derive(Default)]
+    struct AllocationCounts {
+        calls: u64,
+        bytes: u64,
+    }
+
+    thread_local! {
+        static ALLOCATION_COUNTS: Cell<Option<AllocationCounts>> = const { Cell::new(None) };
+    }
+
+    struct ProfileAllocator;
+
+    #[global_allocator]
+    static PROFILE_ALLOCATOR: ProfileAllocator = ProfileAllocator;
+
+    fn count_allocation(bytes: usize) {
+        let _ = ALLOCATION_COUNTS.try_with(|counts| {
+            if let Some(mut value) = counts.take() {
+                value.calls += 1;
+                value.bytes += bytes as u64;
+                counts.set(Some(value));
+            }
+        });
+    }
+
+    unsafe impl GlobalAlloc for ProfileAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc(layout) };
+            if !pointer.is_null() {
+                count_allocation(layout.size());
+            }
+            pointer
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc_zeroed(layout) };
+            if !pointer.is_null() {
+                count_allocation(layout.size());
+            }
+            pointer
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            let pointer = unsafe { System.realloc(pointer, layout, size) };
+            if !pointer.is_null() {
+                count_allocation(size);
+            }
+            pointer
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(pointer, layout) }
+        }
+    }
+
+    fn profile_commit(root: AgentId) -> JournalCommit {
+        JournalCommit {
+            changes: vec![JournalChange {
+                agent: Some(root),
+                generation: 0,
+                change: StateChange::Plugin {
+                    key: COMMIT_SLOT.into(),
+                    version: 1,
+                    value: Some(json!(COMMIT_VALUE)),
+                },
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn commit_profile_fixture(boundaries: usize) -> (Arc<SessionJournal>, AgentId) {
+        smol::block_on(async {
+            let (manager, root, child) = graph();
+            let journal = manager.journal();
+            drop(manager);
+            let mut histories: BTreeMap<_, _> = journal
+                .snapshot()
+                .histories
+                .iter()
+                .map(|(agent, history)| (*agent, history.clone()))
+                .collect();
+            append_turn(
+                histories.get_mut(&root).unwrap(),
+                root,
+                ROOT_TOPIC,
+                INITIAL_TURN,
+            );
+            append_turn(
+                histories.get_mut(&child).unwrap(),
+                child,
+                CHILD_TOPIC,
+                INITIAL_TURN,
+            );
+            journal
+                .commit(JournalCommit {
+                    histories: histories.clone(),
+                    boundary: Some((child, 0)),
+                    ..Default::default()
+                })
+                .unwrap();
+            let boundary = RewindBoundary {
+                agent: child,
+                seq: journal.snapshot().seq,
+                epoch: journal.snapshot().epoch,
+            };
+            let mut root_record = journal.agent(root).unwrap();
+            for turn in 1..=boundaries {
+                append_turn(histories.get_mut(&root).unwrap(), root, ROOT_TOPIC, turn);
+                root_record.label = Some(format!("{ROOT_TOPIC} {turn}"));
+                journal
+                    .commit(JournalCommit {
+                        agents: vec![root_record.clone()],
+                        histories: histories.clone(),
+                        boundary: Some((root, 0)),
+                        changes: profile_commit(root).changes,
+                        ..Default::default()
+                    })
+                    .unwrap();
+            }
+            let mut replacement = journal.prepare_rewind(boundary).await.unwrap();
+            replacement.install().unwrap();
+            replacement.notify();
+            drop(replacement);
+            (journal, root)
+        })
+    }
+
+    #[test_case(10; "10_boundaries")]
+    #[test_case(100; "100_boundaries")]
+    #[test_case(500; "500_boundaries")]
+    #[ignore = "process-isolated normal journal commit time and allocations"]
+    fn journal_commit_growth_profile(boundaries: usize) {
+        let process_key = boundaries.to_string();
+        if env::var(COMMIT_PROFILE_CHILD).ok().as_deref() != Some(process_key.as_str()) {
+            let name = std::thread::current().name().unwrap().to_owned();
+            let status = Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &name,
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(COMMIT_PROFILE_CHILD, process_key)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "journal commit profiling child failed: {status}"
+            );
+            return;
+        }
+        let (journal, root) = commit_profile_fixture(boundaries);
+        let fixture = journal.snapshot();
+        let pool_count = fixture
+            .state
+            .iter()
+            .filter(|record| matches!(record.change, StateChange::BoundarySnapshot { .. }))
+            .count();
+        assert_eq!(pool_count, 1);
+        let covered: usize = fixture
+            .state
+            .iter()
+            .filter_map(|record| match &record.change {
+                StateChange::BoundarySnapshot { snapshot, .. } => {
+                    Some(snapshot["boundaries"].as_array().unwrap().len())
+                }
+                _ => None,
+            })
+            .sum();
+        assert_eq!(covered, boundaries);
+        let state_records = fixture.state.len();
+        let agent_revisions = fixture.agent_revisions.len();
+        let state_json_bytes = serde_json::to_vec(&fixture.state).unwrap().len();
+        let pool_json_bytes: usize = fixture
+            .state
+            .iter()
+            .filter_map(|record| match &record.change {
+                StateChange::BoundarySnapshot { snapshot, .. } => {
+                    Some(serde_json::to_vec(snapshot).unwrap().len())
+                }
+                _ => None,
+            })
+            .sum();
+        let initial_revision = fixture.revision;
+        drop(fixture);
+        let mut elapsed = Duration::ZERO;
+        for _ in 0..COMMIT_SAMPLES {
+            let commit = profile_commit(root);
+            let started = Instant::now();
+            let result = journal.commit(commit);
+            elapsed += started.elapsed();
+            result.unwrap();
+        }
+        let mut allocations = AllocationCounts::default();
+        for _ in 0..COMMIT_SAMPLES {
+            let commit = profile_commit(root);
+            ALLOCATION_COUNTS.with(|counts| counts.set(Some(AllocationCounts::default())));
+            let result = journal.commit(commit);
+            let measured = ALLOCATION_COUNTS.with(|counts| counts.replace(None).unwrap());
+            result.unwrap();
+            allocations.calls += measured.calls;
+            allocations.bytes += measured.bytes;
+        }
+        let completed = journal.snapshot();
+        assert_eq!(
+            completed.revision,
+            initial_revision + (COMMIT_SAMPLES * 2) as u64
+        );
+        assert_eq!(completed.state.len(), state_records + COMMIT_SAMPLES * 2);
+        assert!(completed.state.iter().rev().take(COMMIT_SAMPLES * 2).all(|record| matches!(&record.change, StateChange::Plugin { key, value: Some(value), .. } if key == COMMIT_SLOT && value == &json!(COMMIT_VALUE))));
+        println!(
+            "{}",
+            json!({
+                "benchmark": "normal_journal_commit_growth", "outside_boundaries": boundaries,
+                "initial_state_records": state_records, "initial_agent_revisions": agent_revisions,
+                "initial_state_json_bytes": state_json_bytes, "pool_json_bytes": pool_json_bytes,
+                "boundary_pools": pool_count, "covered_boundaries": covered,
+                "samples_per_pass": COMMIT_SAMPLES, "commit_total_us": elapsed.as_micros(),
+                "commit_mean_ns": elapsed.as_nanos() / COMMIT_SAMPLES as u128,
+                "allocation_calls_total": allocations.calls, "allocated_bytes_total": allocations.bytes,
+                "allocation_calls_per_commit": allocations.calls / COMMIT_SAMPLES as u64,
+                "allocated_bytes_per_commit": allocations.bytes / COMMIT_SAMPLES as u64,
+                "timing_scope": "journal_commit_only_counter_disabled_inputs_prebuilt",
+                "allocation_scope": "journal_commit_only_current_thread_inputs_prebuilt_realloc_counts_requested_size_not_live_bytes",
+                "passes": "timing_then_allocations_32_new_state_records_between_passes",
+                "debug_assertions": cfg!(debug_assertions),
+                "revision": option_env!("MAKIMA_PROFILE_REVISION").unwrap_or("not_supplied"),
+            })
+        );
+    }
 
     fn append_turn(history: &mut HistorySnapshot, agent: AgentId, topic: &str, turn: usize) {
         let messages = Arc::make_mut(&mut history.messages);
@@ -1091,7 +1338,12 @@ mod boundary_pin_profile {
                     ..Default::default()
                 })
                 .unwrap();
-            let mut histories = journal.snapshot().histories;
+            let mut histories: BTreeMap<_, _> = journal
+                .snapshot()
+                .histories
+                .iter()
+                .map(|(agent, history)| (*agent, history.clone()))
+                .collect();
             for (agent, topic) in [
                 (root, ROOT_TOPIC),
                 (child, CHILD_TOPIC),

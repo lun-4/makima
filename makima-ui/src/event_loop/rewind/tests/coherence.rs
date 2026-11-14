@@ -12,7 +12,7 @@ use makima_agent::state::{
 use makima_agent::{AgentInput, AgentRef, CancelToken};
 use makima_commands::{CommandOutcome, InputDispatch};
 use makima_storage::restore::RestoreChoice;
-use makima_storage::session_state::{SessionStateView, StateChange};
+use makima_storage::session_state::StateChange;
 use serde_json::json;
 
 use super::super::super::tests::{pump_until, with_event_loop};
@@ -284,8 +284,7 @@ fn root_restore_removes_later_resident_child_and_releases_only_coherent_notices(
         let mut received: Vec<_> = notices.try_iter().collect();
         let restored_slot = slot.get(&root.state_access()).unwrap();
         let snapshot = journal.snapshot();
-        let view = SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
-            .unwrap();
+        let view = snapshot.fold(snapshot.seq).unwrap();
         let removed_slot = &view.scopes[&Some(child.id())].plugins[SLOT];
         assert!(removed_slot.value.is_none());
         assert!(removed_slot.revision > displaced_seq);
@@ -353,7 +352,7 @@ fn root_restore_removes_later_resident_child_and_releases_only_coherent_notices(
         );
         let disk = AppSession::load(runtime.id(), &event_loop.ctx.storage).unwrap();
         assert_persisted_state(&disk, &snapshot);
-        assert_eq!(disk.agent_revisions(), snapshot.agent_revisions);
+        assert_eq!(disk.agent_revisions(), snapshot.agent_revisions.to_vec());
         assert_eq!(
             serde_json::to_value(disk.messages()).unwrap(),
             serde_json::to_value(&expected).unwrap()

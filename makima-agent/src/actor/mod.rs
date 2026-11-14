@@ -1628,13 +1628,6 @@ impl<'a> ActorHistory<'a> {
 }
 
 impl HistoryBatch<'_> {
-    pub fn actor_history(&mut self) -> ActorHistory<'_> {
-        ActorHistory {
-            history: self.history,
-            permitted: true,
-        }
-    }
-
     pub fn push_observation(&mut self, message: Message) -> Result<(), HistoryMutationError> {
         self.history.checked_observation(message)
     }

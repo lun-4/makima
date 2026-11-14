@@ -206,9 +206,7 @@ mod tests {
     use makima_providers::provider::Provider;
     use makima_providers::{Message, TokenUsage};
     use makima_storage::id::MakimaId;
-    use makima_storage::session_state::{
-        SessionStateView, StateChange, StoredAgentLifecycle, StoredAgentRecord,
-    };
+    use makima_storage::session_state::{StateChange, StoredAgentLifecycle, StoredAgentRecord};
     use mlua::Lua;
     use smol::Timer;
     use std::sync::Arc;
@@ -622,8 +620,7 @@ mod tests {
             })
             .unwrap();
         let snapshot = journal.checkpoint_snapshot().unwrap();
-        let view = SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
-            .unwrap();
+        let view = snapshot.fold(snapshot.seq).unwrap();
         let manager = AgentManagerHandle::restore_graph(
             AgentLimits::default(),
             journal,

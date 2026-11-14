@@ -13,8 +13,8 @@ use makima_providers::{Message, Model, provider::unconfigured};
 use makima_storage::{
     id::{MakimaId, SessionRef},
     session_state::{
-        MAX_INLINE_TURN_RESULT_BYTES, SessionStateView, StateChange, StoredAgentLifecycle,
-        StoredAgentRecord, StoredOffloadRef, StoredPayload, StoredTurnResult,
+        MAX_INLINE_TURN_RESULT_BYTES, StateChange, StoredAgentLifecycle, StoredAgentRecord,
+        StoredOffloadRef, StoredPayload, StoredTurnResult,
     },
 };
 use serde_json::json;
@@ -136,8 +136,7 @@ impl Fixture {
             })
             .unwrap();
         let snapshot = journal.checkpoint_snapshot().unwrap();
-        let view = SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
-            .unwrap();
+        let view = snapshot.fold(snapshot.seq).unwrap();
         let manager = AgentManagerHandle::restore_graph(
             AgentLimits::default(),
             journal,

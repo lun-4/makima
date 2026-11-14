@@ -11,7 +11,7 @@ use makima_agent::actor::HistoryBoundary;
 use makima_agent::parent_rewind::ParentRewindEntry;
 use makima_agent::rewind::RewindBoundary;
 use makima_storage::id::MakimaId;
-use makima_storage::session_state::{SessionStateView, StateChange};
+use makima_storage::session_state::StateChange;
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 
@@ -95,8 +95,7 @@ impl RewindPicker {
         self.picker.close();
         let journal = target.manager().journal();
         let durable = journal.snapshot();
-        let view = SessionStateView::fold(&durable.state, &durable.agent_revisions, u64::MAX)
-            .map_err(|error| error.to_string())?;
+        let view = durable.fold(u64::MAX).map_err(|error| error.to_string())?;
         let pinned: BTreeSet<_> = durable
             .state
             .iter()
@@ -367,7 +366,7 @@ mod tests {
     use makima_providers::{ContentBlock, Message, Role};
     use makima_storage::id::MakimaId;
     use makima_storage::restore_digest::session_digest;
-    use makima_storage::session_state::{SessionStateView, StateChange, StoredStateRecord};
+    use makima_storage::session_state::{StateChange, StoredStateRecord};
     use test_case::test_case;
 
     use super::{NO_TURNS_MSG, PREVIEW_MAX_LEN, RewindPicker, RewindSelection};
@@ -784,9 +783,7 @@ mod tests {
             let recovered = recovery.finalize_after_publication();
             let recovered_journal = recovered.journal();
             let snapshot = recovered_journal.snapshot();
-            let view =
-                SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
-                    .unwrap();
+            let view = snapshot.fold(snapshot.seq).unwrap();
             assert_eq!(
                 view.boundaries[&root_boundary].lens[&root.id()],
                 (snapshot.histories[&root.id()].epoch, 2),

@@ -60,8 +60,7 @@ fn same_plan_path(access: &StateAccess, stored: &Path, requested: &Path) -> bool
         return true;
     }
     let snapshot = access.journal().snapshot();
-    let Ok(view) = SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, u64::MAX)
-    else {
+    let Ok(view) = snapshot.fold(u64::MAX) else {
         return false;
     };
     match (
@@ -236,7 +235,8 @@ impl PlanProjectionRollback {
         snapshot: &SessionJournalSnapshot,
         affected: &BTreeSet<AgentId>,
     ) -> Result<BTreeSet<PathBuf>, String> {
-        let view = SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
+        let view = snapshot
+            .fold(snapshot.seq)
             .map_err(|error| error.to_string())?;
         let plans = plan_entries(&view)?;
         let mut keys = BTreeSet::new();
@@ -283,7 +283,8 @@ impl PlanProjectionRollback {
         snapshot: &SessionJournalSnapshot,
         affected: &BTreeSet<AgentId>,
     ) -> Result<Self, String> {
-        let view = SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
+        let view = snapshot
+            .fold(snapshot.seq)
             .map_err(|error| error.to_string())?;
         let plans = plan_entries(&view)?;
         let mut files = Vec::new();
@@ -880,7 +881,8 @@ pub(crate) fn projection_files(
     snapshot: &SessionJournalSnapshot,
     affected: &BTreeSet<AgentId>,
 ) -> Result<Vec<(PathBuf, Vec<u8>)>, String> {
-    let view = SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
+    let view = snapshot
+        .fold(snapshot.seq)
         .map_err(|error| error.to_string())?;
     let plans = plan_entries(&view)?;
     let mut files = BTreeMap::new();
@@ -1012,7 +1014,8 @@ pub(crate) fn prepare_rewind_projection_with(
         &StoredModeSnapshot,
     ) -> Result<(), String>,
 ) -> Result<(Vec<JournalChange>, Vec<String>), String> {
-    let view = SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
+    let view = snapshot
+        .fold(snapshot.seq)
         .map_err(|error| error.to_string())?;
     let mut changes = Vec::new();
     let mut warnings = Vec::new();
@@ -1507,8 +1510,7 @@ mod tests {
             (metadata.created().unwrap(), original)
         });
         let (snapshot, agent) = rollback_snapshot(&path);
-        let view = SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
-            .unwrap();
+        let view = snapshot.fold(snapshot.seq).unwrap();
         let config = view.scopes[&Some(agent)].config.as_ref().unwrap();
         let restored = super::prepare_restore_for_agent(
             &view,
@@ -1537,9 +1539,7 @@ mod tests {
         let other = directory.path().join("other.md");
         fs::write(&path, MUTATED_CONTENT).unwrap();
         let (snapshot, agent) = rollback_snapshot(&path);
-        let mut view =
-            SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
-                .unwrap();
+        let mut view = snapshot.fold(snapshot.seq).unwrap();
         if path_mismatch {
             view.scopes
                 .get_mut(&Some(agent))
@@ -1600,8 +1600,7 @@ mod tests {
             symlink_file(&sentinel, &path).unwrap();
         }
         let (snapshot, agent) = rollback_snapshot(&path);
-        let view = SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
-            .unwrap();
+        let view = snapshot.fold(snapshot.seq).unwrap();
         let mode = &view.scopes[&Some(agent)].config.as_ref().unwrap().mode;
         let restored =
             super::prepare_restore_for_agent(&view, agent, mode, &crate::ModeRegistry::builtin())

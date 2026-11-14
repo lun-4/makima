@@ -113,12 +113,9 @@ impl StateAccess {
     }
 }
 
-type Migration = dyn Fn(u32, Value) -> Result<Value, StateError> + Send + Sync;
-
 pub struct StateSlot<T> {
     journal: Arc<SessionJournal>,
     spec: StateSlotSpec,
-    migrate: Option<Arc<Migration>>,
     marker: PhantomData<fn() -> T>,
 }
 
@@ -127,7 +124,6 @@ impl<T> Clone for StateSlot<T> {
         Self {
             journal: Arc::clone(&self.journal),
             spec: self.spec.clone(),
-            migrate: self.migrate.clone(),
             marker: PhantomData,
         }
     }
@@ -224,13 +220,6 @@ impl<T> StateSlot<T> {
     pub fn spec(&self) -> &StateSlotSpec {
         &self.spec
     }
-    pub fn with_migration(
-        mut self,
-        migrate: impl Fn(u32, Value) -> Result<Value, StateError> + Send + Sync + 'static,
-    ) -> Self {
-        self.migrate = Some(Arc::new(migrate));
-        self
-    }
     pub fn get_raw(&self, access: &StateAccess) -> Result<RawStateSnapshot, StateError> {
         if !Arc::ptr_eq(&self.journal, &access.journal) {
             return Err(StateError::StaleAccess);
@@ -288,12 +277,11 @@ impl<T> StateSlot<T> {
 
 impl<T: Serialize + DeserializeOwned> StateSlot<T> {
     pub fn get(&self, access: &StateAccess) -> Result<StateSnapshot<T>, StateError> {
-        self.get_migrated(access, |version, value| match &self.migrate {
-            Some(migrate) => migrate(version, value),
-            None => Err(StateError::MigrationRequired {
+        self.get_migrated(access, |version, _| {
+            Err(StateError::MigrationRequired {
                 stored: version,
                 registered: self.spec.version,
-            }),
+            })
         })
     }
     pub fn get_migrated(
@@ -379,27 +367,18 @@ pub(crate) fn read_slot(
     key: &str,
     version: u32,
 ) -> RawStateSnapshot {
-    snapshot
-        .state
-        .iter()
-        .rev()
-        .find_map(|record| match &record.change {
-            StateChange::Plugin {
-                key: saved,
-                version,
-                value,
-            } if record.agent == agent && saved == key => Some(RawStateSnapshot {
-                value: value.clone(),
-                revision: StateRevision(record.seq),
-                version: *version,
-            }),
-            _ => None,
-        })
-        .unwrap_or(RawStateSnapshot {
+    snapshot.plugin(agent, key).map_or(
+        RawStateSnapshot {
             value: None,
             revision: StateRevision(0),
             version,
-        })
+        },
+        |stored| RawStateSnapshot {
+            value: stored.value,
+            revision: StateRevision(stored.revision),
+            version: stored.version,
+        },
+    )
 }
 
 pub(crate) fn validate_record(change: &JournalChange, seq: u64) -> Result<(), StateError> {
@@ -448,15 +427,13 @@ pub(crate) fn validate_access(
             return Err(StateError::StaleAccess);
         }
         if target_record
+            .map(|record| record.lifecycle.clone())
             .or_else(|| {
                 snapshot
-                    .agent_revisions
-                    .iter()
-                    .rev()
-                    .find(|(_, record)| record.id == access.target)
-                    .map(|(_, record)| record)
+                    .latest_agent(access.target)
+                    .map(|record| record.lifecycle)
             })
-            .is_none_or(|record| record.lifecycle == StoredAgentLifecycle::Retired)
+            .is_none_or(|lifecycle| lifecycle == StoredAgentLifecycle::Retired)
         {
             return Err(StateError::StaleAccess);
         }
@@ -491,7 +468,6 @@ impl SessionJournal {
         Ok(StateSlot {
             journal: Arc::clone(self),
             spec,
-            migrate: None,
             marker: PhantomData,
         })
     }
@@ -759,6 +735,13 @@ mod tests {
         let old = slot(&journal, StateScope::Agent, 1);
         let revision = old.set(&access, json!(1), None).unwrap();
         let new = slot(&journal, StateScope::Agent, 2);
+        assert!(matches!(
+            new.get(&access),
+            Err(StateError::MigrationRequired {
+                stored: 1,
+                registered: 2
+            })
+        ));
         assert!(matches!(
             new.get_migrated(&access, |_, _| Err(StateError::InvalidValue(
                 MIGRATION_FAILED.into()

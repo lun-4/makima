@@ -185,8 +185,8 @@ mod tests {
         id::{AgentId, MakimaId},
         restore::TransitionRef,
         session_state::{
-            ParentLink, StateChange, StoredAgentConfig, StoredBranch, StoredModeSnapshot,
-            StoredStateRecord,
+            BOUNDARY_POOL_FORMAT, ParentLink, StateChange, StoredAgentConfig, StoredBranch,
+            StoredModeSnapshot, StoredStateRecord,
         },
         sessions::{HistorySnapshot, Session, next_epoch},
     };
@@ -200,7 +200,6 @@ mod tests {
     const CHILD: &str = "digest-child";
     const TOOL: &str = "digest-tool";
     const CONVERSATION: &str = "digest-conversation";
-    const PIN_VERSION: u32 = 1;
     const GENERATION: u64 = 7;
 
     type TestSession = Session<Value, Value, Value>;
@@ -273,22 +272,16 @@ mod tests {
             },
         );
         if pinned {
-            let nested = json!({
-                "version": PIN_VERSION,
+            let pin = json!({
+                "format": BOUNDARY_POOL_FORMAT,
+                "boundaries": [boundary],
                 "histories": {
-                    root.to_string(): {"epoch": old, "compacted": false, "messages": []},
-                    child.to_string(): {"epoch": child_history.epoch, "compacted": false, "messages": []}
+                    root.to_string(): {"epoch": old, "compacted": false, "messages": history.messages},
+                    child.to_string(): {"epoch": child_history.epoch, "compacted": false, "messages": child_history.messages}
                 },
                 "state": session.state(),
                 "agents": session.agent_revisions()
             });
-            let mut pin = nested.clone();
-            pin["state"].as_array_mut().unwrap().push(json!({
-                "seq": session.next_state_seq(),
-                "agent": root,
-                "generation": GENERATION,
-                "change": {"kind": "boundary_snapshot", "boundary": boundary, "snapshot": nested}
-            }));
             push(
                 &mut session,
                 Some(root),
@@ -302,7 +295,7 @@ mod tests {
     }
 
     #[test_case(false; "boundary_and_compaction")]
-    #[test_case(true; "nested_boundary_pins")]
+    #[test_case(true; "boundary_pool")]
     fn digest_survives_disk_epoch_remapping(pinned: bool) {
         let directory = TempDir::new().unwrap();
         let mut session = fixture(pinned);
@@ -344,7 +337,7 @@ mod tests {
             StateChange::Boundary { offset: 1, lens },
         );
         let snapshot = json!({
-            "format":crate::session_state::BOUNDARY_POOL_FORMAT,"boundaries":[boundary],
+            "format":BOUNDARY_POOL_FORMAT,"boundaries":[boundary],
             "state":session.state(),"agents":session.agent_revisions(),
             "histories":{
                 root.to_string():{"epoch":root_epoch,"compacted":false,"messages":["root","tail"]},

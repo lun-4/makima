@@ -2035,8 +2035,9 @@ mod tests {
         let committed = journal.snapshot();
         assert_eq!(committed.revision, 1);
         assert_eq!(committed.state.len(), 1);
-        assert!(committed.state[0].agent.is_none());
-        match &committed.state[0].change {
+        let record = committed.state.iter().next().unwrap();
+        assert!(record.agent.is_none());
+        match &record.change {
             StateChange::Rules { rules, yolo } => {
                 assert_eq!(rules, &manager.snapshot().stored_rules());
                 assert_eq!(rules.len(), 3);
@@ -2110,7 +2111,7 @@ mod tests {
         let snapshot = journal.snapshot();
         assert_eq!(snapshot.state.len(), WORKERS * 2);
         let mut previous_rule_count = 0;
-        for record in &snapshot.state {
+        for record in snapshot.state.iter() {
             let StateChange::Rules { rules, .. } = &record.change else {
                 panic!("unexpected permission change");
             };
@@ -2118,7 +2119,8 @@ mod tests {
             assert!(rules.len() <= previous_rule_count + 1);
             previous_rule_count = rules.len();
         }
-        let StateChange::Rules { rules, yolo } = &snapshot.state.last().unwrap().change else {
+        let StateChange::Rules { rules, yolo } = &snapshot.state.iter().next_back().unwrap().change
+        else {
             panic!("unexpected permission change");
         };
         assert_eq!(rules, &manager.snapshot().stored_rules());

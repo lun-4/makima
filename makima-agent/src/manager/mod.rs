@@ -397,14 +397,15 @@ impl AgentManagerHandle {
         limits: AgentLimits,
         journal: Arc<SessionJournal>,
         view: SessionStateView,
-        histories: BTreeMap<AgentId, HistorySnapshot>,
+        histories: impl IntoIterator<Item = (AgentId, HistorySnapshot)>,
     ) -> Result<Self, ManagerError> {
+        let histories: BTreeMap<_, _> = histories.into_iter().collect();
         let snapshot = journal
             .checkpoint_snapshot()
             .map_err(ManagerError::InvalidGraph)?;
-        let folded =
-            SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
-                .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
+        let folded = snapshot
+            .fold(snapshot.seq)
+            .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
         if folded != view
             || histories.len() != snapshot.histories.len()
             || histories.iter().any(|(id, history)| {
@@ -617,12 +618,9 @@ impl AgentManagerHandle {
                     .journal
                     .checkpoint_snapshot()
                     .map_err(ManagerError::InvalidGraph)?;
-                let view = SessionStateView::fold(
-                    &snapshot.state,
-                    &snapshot.agent_revisions,
-                    snapshot.seq,
-                )
-                .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
+                let view = snapshot
+                    .fold(snapshot.seq)
+                    .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
                 let input = ReactivationInput {
                     config: view
                         .scopes
@@ -762,7 +760,8 @@ impl AgentManagerHandle {
             .journal
             .checkpoint_snapshot()
             .map_err(ManagerError::InvalidGraph)?;
-        let view = SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
+        let view = snapshot
+            .fold(snapshot.seq)
             .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
         let scope = view.scopes.get(&Some(incarnation.agent_id));
         let results = scope
@@ -1242,9 +1241,9 @@ impl AgentManagerHandle {
                 .journal
                 .checkpoint_snapshot()
                 .map_err(ManagerError::InvalidGraph)?;
-            let view =
-                SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
-                    .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
+            let view = snapshot
+                .fold(snapshot.seq)
+                .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
             if view.scopes.iter().any(|(target, scope)| {
                 scope.deliveries.iter().any(|((source, _), delivery)| {
                     (*source == agent_id || *target == Some(agent_id))
@@ -1453,10 +1452,12 @@ impl AgentManagerHandle {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
     pub fn active_agent_count(&self) -> usize {
         self.0.work.active_agents()
     }
 
+    #[cfg(test)]
     pub fn active_child_count(&self, parent_id: AgentId) -> usize {
         self.0.work.active_children(parent_id)
     }
@@ -1715,9 +1716,9 @@ impl AgentManagerHandle {
             .get(&agent_id)
             .ok_or_else(|| ActorError::InvalidConfig("agent transcript is unavailable".into()))?;
         if let Some(turn) = request.through_turn {
-            let view =
-                SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
-                    .map_err(|error| ActorError::InvalidConfig(error.to_string()))?;
+            let view = snapshot
+                .fold(snapshot.seq)
+                .map_err(|error| ActorError::InvalidConfig(error.to_string()))?;
             return Err(
                 if view
                     .scopes
@@ -1733,6 +1734,7 @@ impl AgentManagerHandle {
         crate::actor::transcript_snapshot(history, &request)
     }
 
+    #[cfg(test)]
     pub fn bind_result_store(&self, store: Arc<OffloadStore>) -> Result<(), ManagerError> {
         if self.0.journal.session_id().is_none() {
             return Err(ManagerError::InvalidGraph(
@@ -1828,7 +1830,8 @@ impl AgentManagerHandle {
             .journal
             .checkpoint_snapshot()
             .map_err(ManagerError::InvalidGraph)?;
-        let view = SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
+        let view = snapshot
+            .fold(snapshot.seq)
             .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
         let stored = view
             .scopes
@@ -2992,6 +2995,7 @@ impl AgentManagerHandle {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn set_agent_transcript_key(
         &self,
         agent_id: AgentId,
@@ -3079,15 +3083,6 @@ impl AgentManagerHandle {
             })
             .map_err(|error| ManagerError::Policy(error.to_string()))?;
         Ok(())
-    }
-
-    pub fn set_agent_spec(
-        &self,
-        agent_id: AgentId,
-        spec: StoredAgentSpec,
-    ) -> Result<(), ManagerError> {
-        let incarnation = self.incarnation(agent_id)?;
-        self.set_agent_restoration(&incarnation, spec, Ok(()))
     }
 
     fn finish_failed_commit(&self, agent_id: AgentId, reservation: u64) {
@@ -3331,6 +3326,7 @@ impl AgentManagerHandle {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn close_descendants(&self, agent_id: AgentId) -> Result<(), ManagerError> {
         let actors = self.capture_subtree(agent_id, false)?;
         for (actor, cut) in actors {
@@ -3865,7 +3861,8 @@ impl AgentManagerHandle {
         let snapshot = journal
             .checkpoint_snapshot()
             .map_err(ManagerError::InvalidGraph)?;
-        let view = SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
+        let view = snapshot
+            .fold(snapshot.seq)
             .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
         let changes = ids
             .iter()

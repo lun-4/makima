@@ -1545,7 +1545,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use crate::{ModeDef, ModeId};
     use makima_storage::plans::PlanSlot;
-    use makima_storage::session_state::{SessionStateView, StateChange};
+    use makima_storage::session_state::StateChange;
 
     const TEST_ID: &str = "t1";
     const PROBE_WIRE: &str = "srv__probe";
@@ -4138,8 +4138,7 @@ mod tests {
 
     fn journal_plans(manager: &AgentManagerHandle) -> PlanSlot {
         let snapshot = manager.journal().snapshot();
-        let view =
-            SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, u64::MAX).unwrap();
+        let view = snapshot.fold(u64::MAX).unwrap();
         crate::plan_state::plan_entries(&view).unwrap()
     }
 

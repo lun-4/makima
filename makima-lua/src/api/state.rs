@@ -153,7 +153,8 @@ pub(crate) fn prepare_restore(
     session_scope: bool,
     publication: CheckpointPublication,
 ) -> Result<PreparedStateRestore, String> {
-    let view = SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
+    let view = snapshot
+        .fold(snapshot.seq)
         .map_err(|error| error.to_string())?;
     let definitions = lua
         .app_data_ref::<StateStore>()

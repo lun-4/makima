@@ -24,9 +24,9 @@ use crate::plans::{PLAN_STATE_KEY, PLAN_STATE_VERSION, PlanEntry, PlanSlot};
 use crate::restore::{RestoreError, RestoreStore, TransitionRef};
 use crate::session_lock::SessionPublicationGuard;
 use crate::session_state::{
-    BOUNDARY_POOL_FORMAT, BOUNDARY_POOLS_FEATURE, ParentLink, SessionStateView, StateChange,
-    StateFoldError, StoredAgentConfig, StoredAgentLifecycle, StoredAgentRecord, StoredBranch,
-    StoredDeliveryOp, StoredModeSnapshot, StoredStateRecord, StoredTurnResult,
+    ParentLink, SessionStateView, StateChange, StateFoldError, StoredAgentConfig,
+    StoredAgentLifecycle, StoredAgentRecord, StoredBranch, StoredDeliveryOp, StoredModeSnapshot,
+    StoredStateRecord, StoredTurnResult,
 };
 use makima_domain::TokenUsage;
 use serde::de::DeserializeOwned;
@@ -578,7 +578,6 @@ pub struct SessionLog {
     /// changes (title, draft, updated_at) instead of dropping them.
     saved_meta: Vec<u8>,
     saved_header: (String, String),
-    saved_features: BTreeSet<String>,
 }
 
 #[derive(Debug)]
@@ -1102,9 +1101,7 @@ impl SessionLog {
         }
         session.latest_state()?;
         self.ensure_appendable(session)?;
-        if session.header_cache()? != self.saved_header
-            || session_features(session) != self.saved_features
-        {
+        if session.header_cache()? != self.saved_header {
             return Err(SessionError::LogDiverged {
                 reason: HEADER_CHANGED,
             });
@@ -1239,7 +1236,6 @@ impl SessionLog {
             saved_sub_msg_counts: sub_msg_snapshot(&session.subagent_messages),
             saved_meta: meta_record(session).unwrap_or_default(),
             saved_header: session.header_cache().unwrap_or_default(),
-            saved_features: session_features(session),
         }
     }
 
@@ -1326,18 +1322,6 @@ where
     Ok(buf)
 }
 
-fn session_features<M, U, T>(session: &Session<M, U, T>) -> BTreeSet<String> {
-    let mut features = session.features.clone();
-    features.remove(BOUNDARY_POOLS_FEATURE);
-    if session.state.iter().any(|record| matches!(&record.change,
-        StateChange::BoundarySnapshot { snapshot, .. }
-            if snapshot.get("format").and_then(serde_json::Value::as_str) == Some(BOUNDARY_POOL_FORMAT)))
-    {
-        features.insert(BOUNDARY_POOLS_FEATURE.into());
-    }
-    features
-}
-
 fn write_full_session<M, U, T>(
     file: &mut File,
     session: &Session<M, U, T>,
@@ -1358,7 +1342,7 @@ where
             cwd,
             created_at: session.created_at,
             parent: session.parent.clone(),
-            features: session_features(session),
+            features: session.features.clone(),
         },
     )?;
     for msg in session.messages.iter() {
@@ -1560,11 +1544,7 @@ where
                     expected: LOG_FORMAT_VERSION,
                 });
             }
-            if header
-                .features
-                .iter()
-                .any(|feature| feature != BOUNDARY_POOLS_FEATURE)
-            {
+            if !header.features.is_empty() {
                 return Err(SessionError::UnsupportedFeatures {
                     features: header.features,
                 });
@@ -1605,10 +1585,7 @@ where
                         expected: LOG_FORMAT_VERSION,
                     });
                 }
-                if h_features
-                    .iter()
-                    .any(|feature| feature != BOUNDARY_POOLS_FEATURE)
-                {
+                if !h_features.is_empty() {
                     return Err(SessionError::UnsupportedFeatures {
                         features: h_features,
                     });
@@ -1669,15 +1646,6 @@ where
         path: display_path.to_string(),
     })?;
 
-    if state.iter().any(|record| matches!(&record.change,
-        StateChange::BoundarySnapshot { snapshot, .. }
-            if snapshot.get("format").and_then(serde_json::Value::as_str) == Some(BOUNDARY_POOL_FORMAT)))
-        && !features.contains(BOUNDARY_POOLS_FEATURE)
-    {
-        return Err(SessionError::UnsupportedFeatures {
-            features: BTreeSet::from([BOUNDARY_POOLS_FEATURE.into()]),
-        });
-    }
     remap_loaded_history_epochs(&mut state, &mut history_epochs, next_epoch);
     mark_duplicate_subagent_identities(&mut subagents);
     let mut session = Session {
@@ -2025,10 +1993,7 @@ fn scan_jsonl_header(path: &Path) -> Option<ScannedHeader> {
     reader.read_until(b'\n', &mut line).ok()?;
     let header: JsonlHeader = serde_json::from_slice(line.trim_ascii_end()).ok()?;
     if !matches!(header.v, LEGACY_LOG_FORMAT_VERSION | LOG_FORMAT_VERSION)
-        || header
-            .features
-            .iter()
-            .any(|feature| feature != BOUNDARY_POOLS_FEATURE)
+        || !header.features.is_empty()
     {
         return None;
     }
@@ -2659,6 +2624,7 @@ where
         self.touch();
     }
 
+    #[cfg(test)]
     pub fn replace_branches(&mut self, branches: Vec<StoredBranch>) {
         if self.branches != branches {
             self.branches = branches;
@@ -3300,8 +3266,8 @@ mod tests {
     use crate::restore::TransitionRef;
     use crate::session_lock;
     use crate::session_state::{
-        ParentLink, StateChange, StoredAgentConfig, StoredAgentLifecycle, StoredBranch,
-        StoredModeSnapshot, StoredStateRecord,
+        BOUNDARY_POOL_FORMAT, ParentLink, StateChange, StoredAgentConfig, StoredAgentLifecycle,
+        StoredBranch, StoredModeSnapshot, StoredStateRecord,
     };
     use serde_json::Value;
     use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -4074,6 +4040,7 @@ mod tests {
             },
         });
         let pin = serde_json::json!({
+            "format": BOUNDARY_POOL_FORMAT, "boundaries": [pinned],
             "state": session.state(), "agents": session.agent_revisions(),
             "histories": {
                 root.to_string(): {"epoch": root_history.epoch, "compacted": false, "messages": []},
@@ -4730,13 +4697,11 @@ mod tests {
                 change: StateChange::BoundarySnapshot {
                     boundary: 1,
                     snapshot: serde_json::json!({
-                        "histories": {"saved": {"epoch": LAST}, "malformed": {"epoch": "invalid"}},
+                        "format": BOUNDARY_POOL_FORMAT, "boundaries": [1],
+                        "histories": {"saved": {"epoch": LAST}, "earlier": {"epoch": FIRST}, "malformed": {"epoch": "invalid"}},
                         "state": [
                             {"generation": LAST, "change": {"kind": "boundary", "lens": {"saved": [SECOND, 0]}}},
-                            {"change": {"kind": "boundary_snapshot", "snapshot": {
-                                "histories": {"saved": {"epoch": FIRST}},
-                                "state": [{"change": {"kind": "compaction", "epoch": LAST}}]
-                            }}}
+                            {"change": {"kind": "compaction", "epoch": LAST}}
                         ]
                     }),
                 },
@@ -4770,14 +4735,8 @@ mod tests {
             snapshot["state"][0]["change"]["lens"]["saved"][0],
             START + 1
         );
-        assert_eq!(
-            snapshot["state"][1]["change"]["snapshot"]["histories"]["saved"]["epoch"],
-            START
-        );
-        assert_eq!(
-            snapshot["state"][1]["change"]["snapshot"]["state"][0]["change"]["epoch"],
-            START + 2
-        );
+        assert_eq!(snapshot["histories"]["earlier"]["epoch"], START);
+        assert_eq!(snapshot["state"][1]["change"]["epoch"], START + 2);
     }
 
     #[test_case(false; "rewrite")]
@@ -7209,8 +7168,9 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), before);
     }
 
-    #[test]
-    fn pooled_boundary_feature_is_emitted_only_for_actual_payloads_and_forces_header_rewrite() {
+    #[test_case(false; "rewrite")]
+    #[test_case(true; "staged_checkpoint")]
+    fn pooled_boundaries_append_and_rewrite_with_empty_v3_features(staged: bool) {
         let directory = TempDir::new().unwrap();
         let mut session = TestSession::new("model", "/project");
         let root = AgentId::generate();
@@ -7233,7 +7193,7 @@ mod tests {
                 .is_empty()
         );
         let snapshot = serde_json::json!({
-            "format":super::BOUNDARY_POOL_FORMAT,"boundaries":[boundary],
+            "format":BOUNDARY_POOL_FORMAT,"boundaries":[boundary],
             "state":session.state(),"agents":session.agent_revisions(),
             "histories":{root.to_string():{"epoch":7,"compacted":false,"messages":[]}}
         });
@@ -7244,33 +7204,26 @@ mod tests {
             generation: 0,
             change: StateChange::BoundarySnapshot { boundary, snapshot },
         });
+        log.append(&session).unwrap();
+        let appended = TestSession::load_from(session.id, directory.path()).unwrap();
+        assert!(appended.features().is_empty());
+        assert_eq!(appended.state().len(), session.state().len());
         assert!(matches!(
-            log.append(&session),
-            Err(SessionError::LogDiverged {
-                reason: super::HEADER_CHANGED
-            })
+            appended.state().last().unwrap().change,
+            StateChange::BoundarySnapshot { .. }
         ));
-        session.save_to(directory.path()).unwrap();
+        if staged {
+            SessionLog::stage_checkpoint(directory.path(), &session)
+                .unwrap()
+                .publish_unowned(|| true)
+                .unwrap();
+        } else {
+            session.save_to(directory.path()).unwrap();
+        }
         let mut loaded = TestSession::load_from(session.id, directory.path()).unwrap();
-        assert_eq!(
-            loaded.features(),
-            &BTreeSet::from([super::BOUNDARY_POOLS_FEATURE.to_owned()])
-        );
+        assert!(loaded.features().is_empty());
+        assert_eq!(loaded.state().len(), appended.state().len());
         assert_eq!(TestSession::list_all_in(directory.path()).unwrap().len(), 1);
-        let path = jsonl_path(directory.path(), session.id);
-        let before = fs::read_to_string(&path).unwrap();
-        let mut lines = before.lines();
-        let mut header: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
-        header["features"] = serde_json::json!([]);
-        fs::write(
-            &path,
-            format!("{header}\n{}\n", lines.collect::<Vec<_>>().join("\n")),
-        )
-        .unwrap();
-        assert!(matches!(
-            TestSession::load_from(session.id, directory.path()),
-            Err(SessionError::UnsupportedFeatures { .. })
-        ));
         let state = loaded
             .state()
             .iter()

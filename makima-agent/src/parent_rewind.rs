@@ -132,7 +132,9 @@ mod tests {
     use crate::{AgentId, HistorySnapshot};
     use makima_providers::Message;
     use makima_storage::id::MakimaId;
-    use makima_storage::session_state::{ParentLink, StateChange, StoredStateRecord};
+    use makima_storage::session_state::{
+        BOUNDARY_POOL_FORMAT, ParentLink, StateChange, StoredStateRecord,
+    };
     use serde_json::json;
     use test_case::test_case;
 
@@ -314,6 +316,7 @@ mod tests {
             json!({})
         } else {
             json!({
+                "format":BOUNDARY_POOL_FORMAT,"boundaries":[link.seq],
                 "state":original,"agents":session.agent_revisions(),
                 "histories":{root.to_string():{"epoch":session.history_snapshot().epoch,"compacted":false,"messages":session.messages()}}
             })
@@ -328,19 +331,19 @@ mod tests {
                 snapshot,
             },
         });
-        let directory = tempfile::tempdir().unwrap();
-        session.save_to(directory.path()).unwrap();
-        let session = StoredSession::load_from(session.id, directory.path()).unwrap();
         if malformed {
             assert!(matches!(
                 boundaries(&session, &link),
                 Err(ParentRewindError::Invalid(_))
             ));
-        } else {
-            let entries = boundaries(&session, &link).unwrap();
-            assert_eq!((entries[0].seq, entries[0].offset), (3, 2));
-            assert_eq!(entries[0].preview, APPROVAL_POINT);
+            return;
         }
+        let directory = tempfile::tempdir().unwrap();
+        session.save_to(directory.path()).unwrap();
+        let session = StoredSession::load_from(session.id, directory.path()).unwrap();
+        let entries = boundaries(&session, &link).unwrap();
+        assert_eq!((entries[0].seq, entries[0].offset), (3, 2));
+        assert_eq!(entries[0].preview, APPROVAL_POINT);
     }
 
     #[test]

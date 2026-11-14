@@ -18,8 +18,8 @@ use makima_providers::{
 use makima_storage::checkpoint::CheckpointPublication;
 use makima_storage::id::SessionRef;
 use makima_storage::session_state::{
-    MAX_INLINE_TURN_RESULT_BYTES, SessionStateView, StateChange, StoredScopeState,
-    StoredTurnOrigin, StoredTurnProvenance,
+    MAX_INLINE_TURN_RESULT_BYTES, StateChange, StoredScopeState, StoredTurnOrigin,
+    StoredTurnProvenance,
 };
 use serde_json::Value;
 
@@ -230,7 +230,7 @@ fn boundary_facade_waits_before_drain_and_rejects_sync_user_messages() {
         assert_eq!(facade.len(), 1);
         let snapshot = journal.snapshot();
         assert!(matches!(
-            snapshot.state.last().unwrap().change,
+            snapshot.state.iter().next_back().unwrap().change,
             StateChange::Boundary { .. }
         ));
     });
@@ -290,9 +290,7 @@ fn prepared_config_allows_observations_but_fences_user_boundaries(install: bool)
             .rev()
             .find(|record| matches!(record.change, StateChange::Boundary { .. }))
             .unwrap();
-        let at_boundary =
-            SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, boundary.seq)
-                .unwrap();
+        let at_boundary = snapshot.fold(boundary.seq).unwrap();
         assert_eq!(
             at_boundary.scopes[&Some(agent)].plugins.contains_key(SLOT),
             install
@@ -3035,7 +3033,8 @@ fn admission_scope(
         })
         .collect();
     assert_eq!(admissions, expected);
-    SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
+    snapshot
+        .fold(snapshot.seq)
         .unwrap()
         .scopes
         .remove(&Some(agent))

@@ -238,7 +238,7 @@ fn root_agent(snapshot: &SessionJournalSnapshot, target: AgentId) -> Result<Agen
 impl RecordedContext {
     fn read(snapshot: &SessionJournalSnapshot, root: AgentId) -> Result<Self, StateError> {
         let mut records = BTreeMap::new();
-        for record in &snapshot.state {
+        for record in snapshot.state.iter() {
             if record.agent == Some(root)
                 && let StateChange::Context {
                     source,
@@ -1203,21 +1203,22 @@ mod tests {
         );
         fixture.commit(update);
         let mut state = fixture.journal.lock();
-        let change = state
+        let mut record = state
             .snapshot
             .state
-            .iter_mut()
+            .iter()
             .rev()
-            .find_map(|record| {
-                if let StateChange::Context { source, hash, .. } = &mut record.change
-                    && (source == CONTEXT_MANIFEST) == manifest
-                {
-                    return Some(hash);
-                }
-                None
+            .find(|record| {
+                matches!(&record.change, StateChange::Context { source, .. }
+                    if (source == CONTEXT_MANIFEST) == manifest)
             })
-            .unwrap();
-        *change = INVALID_HASH.into();
+            .unwrap()
+            .clone();
+        let StateChange::Context { hash, .. } = &mut record.change else {
+            unreachable!()
+        };
+        *hash = INVALID_HASH.into();
+        state.snapshot.state.insert(record.seq, record);
         drop(state);
         assert!(matches!(
             root_context(&fixture.journal.state_access(fixture.root, None)),

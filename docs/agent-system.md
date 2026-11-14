@@ -112,11 +112,15 @@ After the claim, nothing can cancel the publication. The commit runs on an actor
 
 `SessionJournal` gives agent revisions and state changes one monotonic session sequence. Config, rules, recorded context, plugin slots, turn admissions and results, delivery disposition, file changes, and restoration boundaries share that order. Agent scope and session scope are explicit. Actor histories remain the mutable transcript authority; journal snapshots include the matching histories for checkpoint publication.
 
-Session JSONL format v3 stores agent revisions, state records, branch descriptors, restore references, and transcript records. The reader imports v2, but every save writes v3. There is no v2 downgrade path. Grouped boundary payloads use the `boundary-pool-v1` marker and require the supported `boundary-pools-v1` header feature. Writers emit this feature only when grouped payloads are present. Legacy inline snapshots remain readable. Older v3 binaries without this feature reject pooled checkpoints; this does not make every v3 checkpoint incompatible with every older v3 binary. Legacy import assigns durable identities when the migrated checkpoint is published; a transient imported identity must not be used as a stable restore endpoint before that publication. Unknown format versions, unsupported header features, and complete records with unsupported schemas fail loading rather than being silently discarded. Torn non-JSON appends can be skipped. Later schema additions require a named feature gate so older v3 binaries reject files they cannot preserve.
+Session JSONL format v3 stores agent revisions, state records, branch descriptors, restore references, and transcript records. The reader imports v2, but every save writes v3. There is no v2 downgrade path. Grouped boundary snapshots are part of baseline v3. Every pool requires the string marker `boundary-pool-v1` and an explicit ordered `boundaries` list. The first v3 release writes an empty header feature set. Legacy import assigns durable identities when the migrated checkpoint is published; a transient imported identity must not be used as a stable restore endpoint before that publication. Unknown format versions, unsupported header features, and complete records with unsupported schemas fail loading rather than being silently discarded. Torn non-JSON appends can be skipped. Later schema additions require a named feature gate so older v3 binaries reject files they cannot preserve.
 
 Recovery sanitizes transcripts, repairs unavailable tool results, restores retained boundary snapshots, and records `Interrupted` cancellation for admitted turns without terminal results. It never reissues interrupted model requests, tools, shell commands, or queued input. Inactive root text returns to the draft. Recovery publishes its checkpoint before exposing the runtime or admitting work. Root and child Config records, saved mode snapshots, Rules, registered state slots, and recorded instructions supply restored state; runtime providers, tools, permissions, and authority are rebuilt. Instruction-file changes produce a reload notice but do not replace recorded content. `/reload-context` journals the new root content; children retain the system prompt resolved at spawn.
 
 Child result and delivery disposition records use `(AgentId, TurnId)`. Queued, consumed, withdrawn, and dropped deliveries survive restart and compaction. Recovery reconstructs pending delivery work from the journal. A consumed or withdrawn delivery cannot become eligible again because its presentation event was lost. This deduplication is separate from the best-effort event transport and applies only to state retained by a successful checkpoint.
+
+### Legacy import identity
+
+Plan amendment: retain v2 import ambiguity markers and presentation fallbacks where duplicate transcript keys or conflicting historical metadata prevent unique identity resolution. Generated durable IDs identify imported records but do not resolve those conflicts. Ambiguous links remain unavailable across saves and merges. Remove historical lookup paths only where unique durable-ID resolution supersedes them.
 
 ### History epochs and restoration points
 
@@ -124,9 +128,9 @@ A restoration boundary names an agent, journal sequence, journal identity, and p
 
 Grouped snapshots store a shared canonical state and agent-revision prefix, raw histories, and an ordered list of covered boundary sequences. Each boundary lens records an epoch and exact prefix length for every identity retained at that boundary, including closed and retired agents. A later cleanup append cannot extend that cutoff. Old boundaries without an unambiguous durable cutoff are not added to a group. Pools contain no nested boundary snapshots or external pool/history dependencies. Copied state can still contain blob or offload references.
 
-Recovery validates grouped snapshots without eagerly sanitizing every covered prefix. Restoring a selected boundary first truncates raw histories to its recorded cutoffs, then sanitizes those exact prefixes and remaps their offsets and epochs. Sanitizing a full shared history before truncation would incorrectly retain a later tool result or omit the unavailable-result repair required by an earlier boundary. Legacy inline singleton snapshots retain their existing exact-prefix recovery path.
+Recovery validates grouped snapshots without eagerly sanitizing every covered prefix. Restoring a selected boundary first truncates raw histories to its recorded cutoffs, then sanitizes those exact prefixes and remaps their offsets and epochs. Sanitizing a full shared history before truncation would incorrectly retain a later tool result or omit the unavailable-result repair required by an earlier boundary.
 
-History epochs are opaque identities with an order within one history namespace. Their numeric values are not portable identifiers. Import remints every distinct saved epoch into a fresh local epoch while preserving order, equality, and references from histories, boundaries, compactions, and nested pinned snapshots. Independent imported namespaces must not be merged by comparing their raw epoch numbers. Restore endpoint digests use ordered epoch ranks so a valid import does not change the semantic digest. Agent ids, journal state, messages, tool outputs, and retained history relationships still participate in that digest.
+History epochs are opaque identities with an order within one history namespace. Their numeric values are not portable identifiers. Import remints every distinct saved epoch into a fresh local epoch while preserving order, equality, and references from histories, boundaries, compactions, and grouped snapshots. Independent imported namespaces must not be merged by comparing their raw epoch numbers. Restore endpoint digests use ordered epoch ranks so a valid import does not change the semantic digest. Agent ids, journal state, messages, tool outputs, and retained history relationships still participate in that digest.
 
 ### File restore and publication recovery
 
@@ -364,6 +368,18 @@ The ignored `manager::rewind_tests::boundary_pin_profile::boundary_pin_growth_pr
 | 500 | 1.401 | 335.835 | 2.723 | 5677.9 | 92.8 | 18212.6 | 195.1 | 13723.0 | 128.3 |
 
 Inline pins serialize one prefix per covered boundary; the grouped fixture writes one shared pool. Peak RSS is the maximum sampled process-lifetime peak and includes fixture construction and earlier phases. Transition time covers preparation plus publication/install and excludes measurement reporting. Load + recovery time sums only those named phases. The grouped run also publishes recovery and reloads the checkpoint to verify digest stability; its complete restart measurements are 17.7, 132.7, and 647.9 ms. The inline run omits those extra publication/reload checks, so total restart times are not directly comparable. These measurements show the retained-prefix growth cost for this fixture, not a bound for arbitrary session content.
+
+### Normal journal commit measurements
+
+The ignored `manager::rewind_tests::boundary_pin_profile::journal_commit_growth_profile` fixture measures fixed-size normal journal mutations with one grouped boundary pool. The following before/after measurements were recorded before the subsequent compatibility and API cleanup. Before uses full-snapshot cloning and folding; after uses the incremental reducer.
+
+| Retained boundaries | Before mean ms | After mean ms | Before allocated B/commit | After allocated B/commit | Before allocation calls/commit | After allocation calls/commit |
+|---:|---:|---:|---:|---:|---:|---:|
+| 10 | 0.843946 | 0.070003 | 567,237 | 13,634 | 3,309 | 43 |
+| 100 | 6.024690 | 0.075139 | 4,008,594 | 14,274 | 25,783 | 45 |
+| 500 | 32.182244 | 0.078900 | 19,318,895 | 14,274 | 125,661 | 45 |
+
+These are debug-profile measurements from the same remote build box, with debug assertions enabled. Each process measures 32 timed commits with allocation counting disabled, followed by 32 allocation-counted commits. Inputs are prepared before measurement; the allocation pass starts after the timing pass has added 32 state records. Allocation totals cover the calling thread and count requested allocation and reallocation sizes, not retained memory. Results cover normal in-memory journal commits, not checkpoint I/O or end-to-end turn latency, and are not release-build latency targets.
 
 ## Known implementation caveats
 

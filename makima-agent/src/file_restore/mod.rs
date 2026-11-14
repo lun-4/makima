@@ -20,7 +20,7 @@ use makima_storage::{
     },
     restore_digest::session_digest,
     session_lock::{LockHeartbeat, SessionPublicationGuard, claim},
-    session_state::{SessionStateView, StateChange},
+    session_state::StateChange,
     sessions::{SESSIONS_DIR, Session, SessionError},
 };
 use std::{
@@ -527,15 +527,6 @@ impl PreparedRestore {
 
     pub fn retain_barrier(&mut self, guard: impl Any + Send) {
         self.inner_mut().barriers.push(Box::new(guard));
-    }
-
-    pub fn retained() -> Vec<TransitionRef> {
-        RETAINED
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .iter()
-            .map(|lease| lease.reference.clone())
-            .collect()
     }
 
     pub fn take_retained(reference: &TransitionRef) -> Option<Self> {
@@ -1080,12 +1071,10 @@ fn projection_paths(projection: Option<&PlanProjection>) -> Result<ProjectionPat
     };
     let files = plan_state::projection_files(&projection.snapshot, &projection.affected)
         .map_err(RestoreError::Invalid)?;
-    let view = SessionStateView::fold(
-        &projection.snapshot.state,
-        &projection.snapshot.agent_revisions,
-        projection.snapshot.seq,
-    )
-    .map_err(|error| RestoreError::Invalid(error.to_string()))?;
+    let view = projection
+        .snapshot
+        .fold(projection.snapshot.seq)
+        .map_err(|error| RestoreError::Invalid(error.to_string()))?;
     let entries = plan_state::plan_entries(&view).map_err(RestoreError::Invalid)?;
     let mut paths: BTreeSet<_> = files.iter().map(|(path, _)| path.clone()).collect();
     for agent in &projection.affected {

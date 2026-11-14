@@ -14,7 +14,7 @@ use makima_storage::checkpoint::{
     CheckpointVersion, CheckpointWriter,
 };
 use makima_storage::id::MakimaId;
-use makima_storage::session_state::{SessionStateView, StateChange};
+use makima_storage::session_state::StateChange;
 use makima_storage::sessions::HistorySnapshot;
 use thiserror::Error;
 
@@ -947,13 +947,12 @@ impl SessionCoordinatorHandle {
     ) -> Result<PreparedRewindProjection, SessionCoordinatorError> {
         let binding = self.actor_binding()?;
         let reservation = self.reserve_options()?;
-        let view = SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
-            .map_err(|error| {
-                SessionCoordinatorError::Checkpoint(CheckpointError::Save {
-                    session_id: self.session_id,
-                    message: Arc::from(error.to_string()),
-                })
-            })?;
+        let view = snapshot.fold(snapshot.seq).map_err(|error| {
+            SessionCoordinatorError::Checkpoint(CheckpointError::Save {
+                session_id: self.session_id,
+                message: Arc::from(error.to_string()),
+            })
+        })?;
         let saved = view.scopes.get(&Some(binding.agent.id()));
         let mut values = saved
             .and_then(|scope| scope.config.as_ref())
@@ -1799,6 +1798,7 @@ impl SessionReadHandle {
     }
 
     /// See [`SessionOptions::project`].
+    #[cfg(test)]
     pub fn project_options(
         &self,
         project: impl Fn(&SessionOptionsSnapshot) + Send + Sync + 'static,
@@ -3367,7 +3367,8 @@ mod tests {
                 .unwrap();
             let after = journal.snapshot();
             assert_eq!(after.state.len(), before.state.len() + 1);
-            let StateChange::Config(config) = &after.state.last().unwrap().change else {
+            let StateChange::Config(config) = &after.state.iter().next_back().unwrap().change
+            else {
                 panic!("expected configuration record");
             };
             assert!(!config.options.contains_key(OPTION));
@@ -3399,7 +3400,9 @@ mod tests {
                     .await
                     .unwrap();
                 let snapshot = agent.manager().journal().snapshot();
-                let StateChange::Config(config) = &snapshot.state.last().unwrap().change else {
+                let StateChange::Config(config) =
+                    &snapshot.state.iter().next_back().unwrap().change
+                else {
                     panic!("expected configuration record");
                 };
                 assert!(config.workflow);
@@ -3462,7 +3465,8 @@ mod tests {
             ready.await.unwrap();
             policy.commit().unwrap();
             let snapshot = agent.manager().journal().snapshot();
-            let StateChange::Config(config) = &snapshot.state.last().unwrap().change else {
+            let StateChange::Config(config) = &snapshot.state.iter().next_back().unwrap().change
+            else {
                 panic!("expected configuration record");
             };
             assert!(config.workflow);
@@ -4392,7 +4396,9 @@ mod tests {
                 let installed = journal.snapshot();
                 assert_eq!(candidate.state, installed.state);
                 assert_eq!(installed.state.len(), before_journal.len() + 1);
-                let StateChange::Config(config) = &installed.state.last().unwrap().change else {
+                let StateChange::Config(config) =
+                    &installed.state.iter().next_back().unwrap().change
+                else {
                     panic!("expected configuration record");
                 };
                 assert_eq!(config.model, NEW);
@@ -5370,7 +5376,9 @@ mod tests {
                     assert!(!agent.effective_config().unwrap().unwrap().fast);
                     let after = journal.snapshot();
                     assert_eq!(after.state.len(), before.len() + 1);
-                    let StateChange::Config(config) = &after.state.last().unwrap().change else {
+                    let StateChange::Config(config) =
+                        &after.state.iter().next_back().unwrap().change
+                    else {
                         panic!("expected configuration record")
                     };
                     assert!(!config.fast);
@@ -5429,7 +5437,9 @@ mod tests {
             } else {
                 assert!(result.unwrap().pending_fast_model().is_none());
                 let snapshot = journal.snapshot();
-                let StateChange::Config(config) = &snapshot.state.last().unwrap().change else {
+                let StateChange::Config(config) =
+                    &snapshot.state.iter().next_back().unwrap().change
+                else {
                     panic!("expected configuration record")
                 };
                 assert!(!config.fast);
@@ -5862,12 +5872,7 @@ mod tests {
             coordinator.set_option(YOLO_OPTION_ID, value).await.unwrap();
             assert_eq!(permissions.snapshot().yolo, Some(seed));
             let published = lock(&saved).last().unwrap().journal.clone().unwrap();
-            let folded = makima_storage::session_state::SessionStateView::fold(
-                &published.state,
-                &published.agent_revisions,
-                published.seq,
-            )
-            .unwrap();
+            let folded = published.fold(published.seq).unwrap();
             let rules = &folded.scopes[&None];
             assert_eq!(rules.yolo, Some(seed));
             let restarted = PermissionManager::new(
@@ -5934,7 +5939,7 @@ mod tests {
                 assert!(permissions.is_yolo());
                 let after = journal.snapshot();
                 assert_eq!(after.state.len(), before.state.len() + 1);
-                let last = after.state.last().unwrap();
+                let last = after.state.iter().next_back().unwrap();
                 assert!(last.agent.is_none());
                 let StateChange::Rules { rules, yolo } = &last.change else {
                     panic!("expected session rules")

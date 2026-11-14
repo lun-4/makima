@@ -11,7 +11,7 @@ use makima_agent::{
 use makima_lua::{PluginHost, test_support::InMemoryFs, ui_sink::HostUi};
 use makima_storage::{
     checkpoint::CheckpointPublication,
-    session_state::{SessionStateView, StateChange, StoredStateRecord},
+    session_state::{StateChange, StoredStateRecord},
 };
 use serde_json::{Value, json};
 use test_case::test_case;
@@ -1072,7 +1072,7 @@ fn prepublication_migration_installs_once_before_nonveto_notification() {
     assert!(matches!(action, makima_lua::UiAction::Flash(text) if text == TRANSITION_OK));
     host.drain_tasks_for_test();
     let after = journal.snapshot();
-    let view = SessionStateView::fold(&after.state, &after.agent_revisions, after.seq).unwrap();
+    let view = after.fold(after.seq).unwrap();
     let stored = &view.scopes[&Some(root.id())].plugins[&format!("{PLUGIN}/value")];
     assert_eq!(stored.version, 2);
     assert_eq!(stored.value, Some(json!({ "count": 5 })));
@@ -1089,16 +1089,19 @@ fn scoped_prepublication_migration_carries_unloaded_and_outside_values() {
         (Some(child), "unloaded/opaque".into(), 9),
     ] {
         snapshot.seq += 1;
-        snapshot.state.push(StoredStateRecord {
-            seq: snapshot.seq,
-            agent,
-            generation: 7,
-            change: StateChange::Plugin {
-                key,
-                version,
-                value: Some(json!({ "count": 4 })),
+        snapshot.state.insert(
+            snapshot.seq,
+            StoredStateRecord {
+                seq: snapshot.seq,
+                agent,
+                generation: 7,
+                change: StateChange::Plugin {
+                    key,
+                    version,
+                    value: Some(json!({ "count": 4 })),
+                },
             },
-        });
+        );
     }
     host.load_source(
         PLUGIN,

@@ -300,7 +300,7 @@ impl History {
                     }
                     if explicit_user {
                         let mut deliveries = BTreeMap::new();
-                        for record in &snapshot.state {
+                        for record in snapshot.state.iter() {
                             if record.agent == Some(*agent)
                                 && let StateChange::Delivery { id, op } = &record.change
                             {
@@ -684,7 +684,7 @@ mod tests {
         use crate::actor::{ChildDelivery, TurnProvenance, TurnResult};
         use crate::{TurnCancellationReason, TurnOutcome};
         use makima_storage::id::MakimaId;
-        use makima_storage::session_state::{SessionStateView, StoredDelivery};
+        use makima_storage::session_state::StoredDelivery;
 
         let journal = Arc::new(SessionJournal::default());
         let parent = AgentId::generate();
@@ -737,8 +737,7 @@ mod tests {
             Message::user(GO.into())
         });
         let snapshot = journal.snapshot();
-        let view = SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
-            .unwrap();
+        let view = snapshot.fold(snapshot.seq).unwrap();
         let StoredDeliveryOp::Queued(delivery) =
             &view.scopes[&Some(parent)].deliveries[&(child, turn)]
         else {
@@ -747,11 +746,11 @@ mod tests {
         assert_eq!(delivery.held, !user || observation);
         if user && !observation {
             assert!(matches!(
-                &snapshot.state[snapshot.state.len() - 2].change,
+                &snapshot.state.iter().rev().nth(1).unwrap().change,
                 StateChange::Boundary { .. }
             ));
             assert!(
-                matches!(&snapshot.state.last().unwrap().change, StateChange::Delivery { op: StoredDeliveryOp::Queued(delivery), .. } if !delivery.held)
+                matches!(&snapshot.state.iter().next_back().unwrap().change, StateChange::Delivery { op: StoredDeliveryOp::Queued(delivery), .. } if !delivery.held)
             );
         }
     }
@@ -834,7 +833,7 @@ mod tests {
         assert!(observed.managed_histories.contains(&root));
         assert_eq!(boundary_snapshot.histories[&root].messages.len(), 1);
         assert!(matches!(
-            observed.state.last().unwrap().change,
+            observed.state.iter().next_back().unwrap().change,
             StateChange::Delivery { .. }
         ));
     }

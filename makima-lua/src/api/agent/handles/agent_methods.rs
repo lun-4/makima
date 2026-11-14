@@ -14,7 +14,6 @@ use makima_agent::{
 use makima_lua_macro::{lua_class, lua_fn};
 use makima_providers::CompleteModelSelection;
 use makima_storage::checkpoint::CheckpointPublication;
-use makima_storage::session_state::SessionStateView;
 use mlua::{Lua, Table, UserDataMethods, UserDataRef, Value as LuaValue};
 
 use super::authority::{authorize, destination_template, lookup, observe, retire_closed};
@@ -138,11 +137,7 @@ fn agent_config(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::R
     try_pair!(observe(lua, &ctx, this));
     if !this.manager.is_live(this.id) {
         let snapshot = try_pair!(this.manager.journal().checkpoint_snapshot());
-        let view = try_pair!(SessionStateView::fold(
-            &snapshot.state,
-            &snapshot.agent_revisions,
-            snapshot.seq
-        ));
+        let view = try_pair!(snapshot.fold(snapshot.seq));
         let scope = try_pair!(
             view.scopes
                 .get(&Some(this.id))
@@ -561,11 +556,7 @@ fn agent_latest_turn(
         actor.latest_ticket()
     } else {
         let snapshot = try_pair!(this.manager.journal().checkpoint_snapshot());
-        let view = try_pair!(SessionStateView::fold(
-            &snapshot.state,
-            &snapshot.agent_revisions,
-            snapshot.seq
-        ));
+        let view = try_pair!(snapshot.fold(snapshot.seq));
         let turn = view
             .scopes
             .get(&Some(this.id))

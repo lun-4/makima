@@ -42,9 +42,7 @@ pub enum RewindError {
 
 #[derive(Deserialize, Serialize)]
 struct BoundaryPin {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    format: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    format: String,
     boundaries: Vec<u64>,
     state: Vec<StoredStateRecord>,
     agents: Vec<(u64, StoredAgentRecord)>,
@@ -82,10 +80,9 @@ pub(crate) fn pin_outside_boundaries(
 ) -> Result<(), RewindError> {
     prune_boundary_pins(candidate)?;
     carry_boundary_pins(current, candidate)?;
-    let view = SessionStateView::fold(&current.state, &current.agent_revisions, current.seq)
-        .map_err(JournalError::from)?;
+    let view = current.fold(current.seq).map_err(JournalError::from)?;
     let retained = boundary_sequences(candidate);
-    let covered = covered_boundaries(&candidate.state)?;
+    let covered = covered_boundaries(candidate.state.iter())?;
     let boundaries: Vec<_> = view
         .boundaries
         .iter()
@@ -133,7 +130,7 @@ pub(crate) fn pin_outside_boundaries(
         })
         .collect();
     let pin = BoundaryPin {
-        format: Some(BOUNDARY_POOL_FORMAT.into()),
+        format: BOUNDARY_POOL_FORMAT.into(),
         boundaries,
         state: current
             .state
@@ -162,7 +159,6 @@ pub(crate) fn pin_outside_boundaries(
         0,
         StateChange::BoundarySnapshot { boundary, snapshot },
     )?;
-    candidate.state.sort_by_key(|record| record.seq);
     Ok(())
 }
 
@@ -177,9 +173,8 @@ fn boundary_sequences(snapshot: &SessionJournalSnapshot) -> BTreeSet<u64> {
 }
 
 fn pin_boundaries(boundary: u64, snapshot: &serde_json::Value) -> Result<Vec<u64>, RewindError> {
-    match snapshot.get("format") {
-        None => Ok(vec![boundary]),
-        Some(format) if format.as_str() == Some(BOUNDARY_POOL_FORMAT) => {
+    match snapshot.get("format").and_then(serde_json::Value::as_str) {
+        Some(BOUNDARY_POOL_FORMAT) => {
             let boundaries: Vec<u64> =
                 serde_json::from_value(snapshot.get("boundaries").cloned().ok_or_else(|| {
                     RewindError::InvalidPin("pool boundaries are missing".into())
@@ -194,13 +189,16 @@ fn pin_boundaries(boundary: u64, snapshot: &serde_json::Value) -> Result<Vec<u64
             }
             Ok(boundaries)
         }
-        Some(_) => Err(RewindError::InvalidPin(
+        _ => Err(RewindError::InvalidPin(
             "unsupported boundary pool format".into(),
         )),
     }
 }
 
-pub(crate) fn has_boundary_pin(state: &[StoredStateRecord], seq: u64) -> Result<bool, RewindError> {
+pub(crate) fn has_boundary_pin<'a>(
+    state: impl IntoIterator<Item = &'a StoredStateRecord>,
+    seq: u64,
+) -> Result<bool, RewindError> {
     for record in state {
         if let StateChange::BoundarySnapshot { boundary, snapshot } = &record.change
             && pin_boundaries(*boundary, snapshot)?.contains(&seq)
@@ -211,7 +209,9 @@ pub(crate) fn has_boundary_pin(state: &[StoredStateRecord], seq: u64) -> Result<
     Ok(false)
 }
 
-fn covered_boundaries(state: &[StoredStateRecord]) -> Result<BTreeSet<u64>, RewindError> {
+fn covered_boundaries<'a>(
+    state: impl IntoIterator<Item = &'a StoredStateRecord>,
+) -> Result<BTreeSet<u64>, RewindError> {
     let mut covered = BTreeSet::new();
     for record in state {
         if let StateChange::BoundarySnapshot { boundary, snapshot } = &record.change {
@@ -227,8 +227,8 @@ pub(crate) fn carry_boundary_pins(
 ) -> Result<(), RewindError> {
     prune_boundary_pins(candidate)?;
     let retained = boundary_sequences(candidate);
-    let mut covered = covered_boundaries(&candidate.state)?;
-    for record in &source.state {
+    let mut covered = covered_boundaries(candidate.state.iter())?;
+    for record in source.state.iter() {
         let StateChange::BoundarySnapshot { boundary, snapshot } = &record.change else {
             continue;
         };
@@ -242,10 +242,8 @@ pub(crate) fn carry_boundary_pins(
         let mut change = record.change.clone();
         if let StateChange::BoundarySnapshot { boundary, snapshot } = &mut change {
             *boundary = wanted[0];
-            if snapshot.get("format").is_some() {
-                snapshot["boundaries"] = serde_json::to_value(&wanted)
-                    .map_err(|error| RewindError::InvalidPin(error.to_string()))?;
-            }
+            snapshot["boundaries"] = serde_json::to_value(&wanted)
+                .map_err(|error| RewindError::InvalidPin(error.to_string()))?;
         }
         push(candidate, None, 0, change)?;
         covered.extend(wanted);
@@ -255,25 +253,38 @@ pub(crate) fn carry_boundary_pins(
 
 fn prune_boundary_pins(candidate: &mut SessionJournalSnapshot) -> Result<(), RewindError> {
     let retained = boundary_sequences(candidate);
-    let mut keep = Vec::with_capacity(candidate.state.len());
-    for mut record in std::mem::take(&mut candidate.state) {
-        if let StateChange::BoundarySnapshot { boundary, snapshot } = &mut record.change {
-            let wanted: Vec<_> = pin_boundaries(*boundary, snapshot)?
-                .into_iter()
-                .filter(|seq| retained.contains(seq))
-                .collect();
-            if wanted.is_empty() {
-                continue;
-            }
-            *boundary = wanted[0];
-            if snapshot.get("format").is_some() {
-                snapshot["boundaries"] = serde_json::to_value(wanted)
-                    .map_err(|error| RewindError::InvalidPin(error.to_string()))?;
-            }
+    let mut changes = Vec::new();
+    for record in candidate.state.iter() {
+        let StateChange::BoundarySnapshot { boundary, snapshot } = &record.change else {
+            continue;
+        };
+        let wanted: Vec<_> = pin_boundaries(*boundary, snapshot)?
+            .into_iter()
+            .filter(|seq| retained.contains(seq))
+            .collect();
+        if wanted.is_empty() {
+            changes.push((record.seq, None));
+            continue;
         }
-        keep.push(record);
+        let mut snapshot = snapshot.clone();
+        snapshot["boundaries"] = serde_json::to_value(&wanted)
+            .map_err(|error| RewindError::InvalidPin(error.to_string()))?;
+        let mut updated = record.clone();
+        updated.change = StateChange::BoundarySnapshot {
+            boundary: wanted[0],
+            snapshot,
+        };
+        if updated != *record {
+            changes.push((record.seq, Some(updated)));
+        }
     }
-    candidate.state = keep;
+    for (seq, record) in changes {
+        if let Some(record) = record {
+            candidate.state.insert(seq, record);
+        } else {
+            candidate.state.remove(seq);
+        }
+    }
     Ok(())
 }
 
@@ -282,7 +293,7 @@ fn validate_pool(pin: &BoundaryPin) -> Result<(), RewindError> {
         .boundaries
         .last()
         .ok_or_else(|| RewindError::InvalidPin("pool is empty".into()))?;
-    if pin.format.as_deref() != Some(BOUNDARY_POOL_FORMAT)
+    if pin.format != BOUNDARY_POOL_FORMAT
         || pin.boundaries.windows(2).any(|pair| pair[0] >= pair[1])
         || pin
             .state
@@ -360,49 +371,46 @@ fn pinned_snapshot(
     };
     let mut pin: BoundaryPin = serde_json::from_value(snapshot.clone())
         .map_err(|error| RewindError::InvalidPin(error.to_string()))?;
-    if pin.format.is_some() {
-        validate_pool(&pin)?;
-        pin.state.retain(|record| record.seq <= seq);
-        pin.agents.retain(|(record_seq, _)| *record_seq <= seq);
-        let view =
-            SessionStateView::fold(&pin.state, &pin.agents, seq).map_err(JournalError::from)?;
-        let saved = view
-            .boundaries
-            .get(&seq)
-            .ok_or(RewindError::StaleBoundary)?;
-        pin.histories
-            .retain(|agent, _| view.agents.contains_key(agent));
-        let mut remaps = BTreeMap::new();
-        for (agent, history) in &mut pin.histories {
-            let (epoch, len) = saved.lens.get(agent).copied().ok_or_else(|| {
-                RewindError::InvalidPin("pooled boundary history cutoff is missing".into())
-            })?;
-            history.messages.truncate(len);
-            let mut raw = HistorySnapshot::new(std::mem::take(&mut history.messages));
-            raw.epoch = epoch;
-            raw.compacted = history.compacted;
-            let (sanitized, offsets) = crate::session_recovery::sanitize(raw);
-            history.messages = sanitized.messages.as_ref().clone();
-            history.epoch = sanitized.epoch;
-            remaps.insert(*agent, (epoch, sanitized.epoch, offsets));
-        }
-        for record in &mut pin.state {
-            if let StateChange::Boundary { offset, lens } = &mut record.change {
-                if let Some(agent) = record.agent
-                    && let Some((previous, _, offsets)) = remaps.get(&agent)
-                    && lens.get(&agent).is_some_and(|(epoch, _)| epoch == previous)
-                    && let Some(mapped) = offsets.get(*offset)
+    validate_pool(&pin)?;
+    pin.state.retain(|record| record.seq <= seq);
+    pin.agents.retain(|(record_seq, _)| *record_seq <= seq);
+    let view = SessionStateView::fold(&pin.state, &pin.agents, seq).map_err(JournalError::from)?;
+    let saved = view
+        .boundaries
+        .get(&seq)
+        .ok_or(RewindError::StaleBoundary)?;
+    pin.histories
+        .retain(|agent, _| view.agents.contains_key(agent));
+    let mut remaps = BTreeMap::new();
+    for (agent, history) in &mut pin.histories {
+        let (epoch, len) = saved.lens.get(agent).copied().ok_or_else(|| {
+            RewindError::InvalidPin("pooled boundary history cutoff is missing".into())
+        })?;
+        history.messages.truncate(len);
+        let mut raw = HistorySnapshot::new(std::mem::take(&mut history.messages));
+        raw.epoch = epoch;
+        raw.compacted = history.compacted;
+        let (sanitized, offsets) = crate::session_recovery::sanitize(raw);
+        history.messages = sanitized.messages.as_ref().clone();
+        history.epoch = sanitized.epoch;
+        remaps.insert(*agent, (epoch, sanitized.epoch, offsets));
+    }
+    for record in &mut pin.state {
+        if let StateChange::Boundary { offset, lens } = &mut record.change {
+            if let Some(agent) = record.agent
+                && let Some((previous, _, offsets)) = remaps.get(&agent)
+                && lens.get(&agent).is_some_and(|(epoch, _)| epoch == previous)
+                && let Some(mapped) = offsets.get(*offset)
+            {
+                *offset = *mapped;
+            }
+            for (agent, (epoch, len)) in lens {
+                if let Some((previous, restored, offsets)) = remaps.get(agent)
+                    && epoch == previous
+                    && let Some(mapped) = offsets.get(*len)
                 {
-                    *offset = *mapped;
-                }
-                for (agent, (epoch, len)) in lens {
-                    if let Some((previous, restored, offsets)) = remaps.get(agent)
-                        && epoch == previous
-                        && let Some(mapped) = offsets.get(*len)
-                    {
-                        *epoch = *restored;
-                        *len = *mapped;
-                    }
+                    *epoch = *restored;
+                    *len = *mapped;
                 }
             }
         }
@@ -441,8 +449,8 @@ fn pinned_snapshot(
         )));
     }
     let mut snapshot = current.clone();
-    snapshot.state = pin.state;
-    snapshot.agent_revisions = pin.agents;
+    snapshot.state = pin.state.into();
+    snapshot.agent_revisions = pin.agents.into();
     snapshot.histories = pin
         .histories
         .into_iter()
@@ -462,65 +470,13 @@ pub(crate) fn recover_boundary_pins(
 ) -> Result<BTreeSet<u64>, RewindError> {
     let mut pinned = BTreeSet::new();
     for record in state {
-        let StateChange::BoundarySnapshot { boundary, snapshot } = &mut record.change else {
+        let StateChange::BoundarySnapshot { boundary, snapshot } = &record.change else {
             continue;
         };
-        let mut pin: BoundaryPin = serde_json::from_value(snapshot.clone())
+        let pin: BoundaryPin = serde_json::from_value(snapshot.clone())
             .map_err(|error| RewindError::InvalidPin(error.to_string()))?;
-        let covered = pin_boundaries(*boundary, snapshot)?;
-        if pin.format.is_some() {
-            validate_pool(&pin)?;
-            pinned.extend(covered);
-            continue;
-        }
-        let view = SessionStateView::fold(&pin.state, &pin.agents, *boundary)
-            .map_err(JournalError::from)?;
-        let saved = view
-            .boundaries
-            .get(boundary)
-            .ok_or_else(|| RewindError::InvalidPin("pinned boundary is missing".into()))?;
-        if saved.lens.iter().any(|(agent, (epoch, len))| {
-            pin.histories
-                .get(agent)
-                .is_none_or(|history| history.epoch != *epoch || history.messages.len() != *len)
-        }) {
-            return Err(RewindError::InvalidPin(
-                "pinned history does not match boundary lens".into(),
-            ));
-        }
-        let mut maps = BTreeMap::new();
-        for (agent, history) in &mut pin.histories {
-            let previous_epoch = history.epoch;
-            let mut source = HistorySnapshot::new(std::mem::take(&mut history.messages));
-            source.compacted = history.compacted;
-            let (sanitized, offsets) = crate::session_recovery::sanitize(source);
-            history.messages = sanitized.messages.as_ref().clone();
-            history.epoch = sanitized.epoch;
-            maps.insert(*agent, (previous_epoch, history.epoch, offsets));
-        }
-        for record in &mut pin.state {
-            if let StateChange::Boundary { offset, lens } = &mut record.change {
-                if let Some(agent) = record.agent
-                    && let Some((previous, _, offsets)) = maps.get(&agent)
-                    && lens.get(&agent).is_some_and(|(epoch, _)| epoch == previous)
-                    && let Some(restored) = offsets.get(*offset)
-                {
-                    *offset = *restored;
-                }
-                for (agent, (epoch, len)) in lens {
-                    if let Some((previous, restored, offsets)) = maps.get(agent)
-                        && epoch == previous
-                        && let Some(offset) = offsets.get(*len)
-                    {
-                        *epoch = *restored;
-                        *len = *offset;
-                    }
-                }
-            }
-        }
-        *snapshot = serde_json::to_value(pin)
-            .map_err(|error| RewindError::InvalidPin(error.to_string()))?;
-        pinned.insert(*boundary);
+        validate_pool(&pin)?;
+        pinned.extend(pin_boundaries(*boundary, snapshot)?);
     }
     Ok(pinned)
 }
@@ -532,8 +488,7 @@ pub(crate) fn prepare_boundary(
     if current.epoch != boundary.epoch {
         return Err(RewindError::StaleBoundary);
     }
-    let view = SessionStateView::fold(&current.state, &current.agent_revisions, current.seq)
-        .map_err(JournalError::from)?;
+    let view = current.fold(current.seq).map_err(JournalError::from)?;
     view.boundaries
         .get(&boundary.seq)
         .filter(|saved| saved.agent == Some(boundary.agent))
@@ -551,8 +506,7 @@ pub(crate) fn prepare_boundary(
     };
     let pinned = pinned_snapshot(current, boundary.seq)?;
     let source = pinned.as_ref().unwrap_or(current);
-    let historical = SessionStateView::fold(&source.state, &source.agent_revisions, boundary.seq)
-        .map_err(JournalError::from)?;
+    let historical = source.fold(boundary.seq).map_err(JournalError::from)?;
     let saved = historical
         .boundaries
         .get(&boundary.seq)
@@ -589,28 +543,24 @@ pub(crate) fn prepare_boundary(
         candidate.state.retain(|record| {
             !session_scope && record.agent.is_none_or(|id| !affected.contains(&id))
         });
-        candidate.state.extend(
-            source
-                .state
-                .iter()
-                .filter(|record| {
-                    record.seq <= boundary.seq
-                        && (session_scope || record.agent.is_some_and(|id| affected.contains(&id)))
-                })
-                .cloned(),
-        );
-        candidate.state.sort_by_key(|record| record.seq);
+        for record in source.state.iter().filter(|record| {
+            record.seq <= boundary.seq
+                && (session_scope || record.agent.is_some_and(|id| affected.contains(&id)))
+        }) {
+            candidate.state.insert(record.seq, record.clone());
+        }
         candidate
             .agent_revisions
             .retain(|(_, record)| !session_scope && !affected.contains(&record.id));
-        candidate.agent_revisions.extend(
-            source
+        for (seq, record) in source
+            .agent_revisions
+            .iter()
+            .filter(|(seq, record)| *seq <= boundary.seq && affected.contains(&record.id))
+        {
+            candidate
                 .agent_revisions
-                .iter()
-                .filter(|(seq, record)| *seq <= boundary.seq && affected.contains(&record.id))
-                .cloned(),
-        );
-        candidate.agent_revisions.sort_by_key(|(seq, _)| *seq);
+                .insert(*seq, (*seq, record.clone()));
+        }
     } else {
         candidate.state.retain(|record| {
             record.seq <= boundary.seq
@@ -625,13 +575,21 @@ pub(crate) fn prepare_boundary(
     }
     prune_boundary_pins(&mut candidate)?;
     carry_boundary_pins(current, &mut candidate)?;
-    candidate.state.sort_by_key(|record| record.seq);
-    candidate
+    let removed: Vec<_> = candidate
         .histories
-        .retain(|agent, _| !affected.contains(agent) || surviving.contains(agent));
-    candidate
+        .keys()
+        .filter(|agent| affected.contains(agent) && !surviving.contains(agent))
+        .copied()
+        .collect();
+    for agent in removed {
+        candidate.histories.remove(&agent);
+    }
+    candidate.managed_histories = candidate
         .managed_histories
-        .retain(|agent| candidate.histories.contains_key(agent));
+        .iter()
+        .filter(|agent| candidate.histories.contains_key(*agent))
+        .copied()
+        .collect();
     for agent in surviving {
         let history = source
             .histories
@@ -641,7 +599,6 @@ pub(crate) fn prepare_boundary(
             .lens
             .get(&agent)
             .map(|(_, len)| *len)
-            .or_else(|| pinned.as_ref().map(|_| history.messages.len()))
             .ok_or(RewindError::MissingHistory(agent))?;
         if saved
             .lens
@@ -677,13 +634,26 @@ pub(crate) fn rebase_history_epoch(
     let Some(history) = candidate.histories.get(&agent) else {
         return;
     };
-    for record in &mut candidate.state {
+    let epoch = history.epoch;
+    let records: Vec<_> = candidate
+        .state
+        .iter()
+        .filter_map(|record| {
+            let StateChange::Boundary { lens, .. } = &record.change else {
+                return None;
+            };
+            lens.get(&agent)
+                .is_some_and(|(epoch, _)| *epoch == previous_epoch)
+                .then(|| record.clone())
+        })
+        .collect();
+    for mut record in records {
         if let StateChange::Boundary { lens, .. } = &mut record.change
-            && let Some((epoch, _)) = lens.get_mut(&agent)
-            && *epoch == previous_epoch
+            && let Some((previous, _)) = lens.get_mut(&agent)
         {
-            *epoch = history.epoch;
+            *previous = epoch;
         }
+        candidate.state.insert(record.seq, record);
     }
 }
 
@@ -702,11 +672,8 @@ pub(crate) fn finalize_candidate(
         .checked_add(1)
         .ok_or(JournalError::SequenceExhausted)?;
     candidate.seq = current.seq.max(candidate.seq);
-    let candidate_view =
-        SessionStateView::fold(&candidate.state, &candidate.agent_revisions, u64::MAX)
-            .map_err(JournalError::from)?;
-    let current_view = SessionStateView::fold(&current.state, &current.agent_revisions, u64::MAX)
-        .map_err(JournalError::from)?;
+    let candidate_view = candidate.fold(u64::MAX).map_err(JournalError::from)?;
+    let current_view = current.fold(u64::MAX).map_err(JournalError::from)?;
     let retained_turns: BTreeSet<_> = candidate
         .state
         .iter()
@@ -820,8 +787,7 @@ pub(crate) fn finalize_candidate(
         generation,
         StateChange::Boundary { offset, lens },
     )?;
-    SessionStateView::fold(&candidate.state, &candidate.agent_revisions, candidate.seq)
-        .map_err(JournalError::from)?;
+    candidate.fold(candidate.seq).map_err(JournalError::from)?;
     Ok(())
 }
 
@@ -835,12 +801,15 @@ pub(crate) fn push(
         .seq
         .checked_add(1)
         .ok_or(JournalError::SequenceExhausted)?;
-    candidate.state.push(StoredStateRecord {
-        seq: candidate.seq,
-        agent,
-        generation,
-        change,
-    });
+    candidate.state.insert(
+        candidate.seq,
+        StoredStateRecord {
+            seq: candidate.seq,
+            agent,
+            generation,
+            change,
+        },
+    );
     Ok(())
 }
 
@@ -851,15 +820,20 @@ mod tests {
         AgentId, HistorySnapshot,
         actor::ActorHistory,
         agent::History,
-        journal::{JournalChange, JournalCommit, JournalError, SessionJournal},
+        journal::{
+            JournalChange, JournalCommit, JournalError, SessionJournal, SessionJournalSnapshot,
+        },
         state::{StateChangeReason, StateError, StateScope, StateSlotSpec},
     };
     use makima_providers::{ContentBlock, Message, Role};
     use makima_storage::session_state::{
-        SessionStateView, StateChange, StateFoldError, StoredAgentLifecycle, StoredAgentRecord,
+        StateChange, StateFoldError, StoredAgentLifecycle, StoredAgentRecord,
     };
     use serde_json::{Value, json};
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::Arc,
+    };
     use test_case::test_case;
 
     const SLOT: &str = "rewind/value";
@@ -946,7 +920,7 @@ mod tests {
             1
         );
         let original = candidate.state.clone();
-        let recovered = super::recover_boundary_pins(&mut candidate.state).unwrap();
+        let recovered = recover_snapshot_pins(&mut candidate).unwrap();
         assert_eq!(candidate.state, original);
         assert_eq!(recovered, boundaries.iter().copied().collect());
         for (seq, len) in boundaries.iter().zip([first_len, raw.len()]) {
@@ -976,8 +950,8 @@ mod tests {
         let mut carried = current.clone();
         carried.state.retain(|record| record.seq != boundaries[0]);
         super::carry_boundary_pins(&candidate, &mut carried).unwrap();
-        assert!(!super::has_boundary_pin(&carried.state, boundaries[0]).unwrap());
-        assert!(super::has_boundary_pin(&carried.state, boundaries[1]).unwrap());
+        assert!(!super::has_boundary_pin(carried.state.iter(), boundaries[0]).unwrap());
+        assert!(super::has_boundary_pin(carried.state.iter(), boundaries[1]).unwrap());
         assert!(
             super::pinned_snapshot(&carried, boundaries[1])
                 .unwrap()
@@ -1062,7 +1036,9 @@ mod tests {
                     .unwrap();
             }
             let mut replacement = journal.prepare_rewind(child_boundary).await.unwrap();
-            assert!(super::has_boundary_pin(&replacement.snapshot().state, outside[1]).unwrap());
+            assert!(
+                super::has_boundary_pin(replacement.snapshot().state.iter(), outside[1]).unwrap()
+            );
             replacement.install().unwrap();
             drop(replacement);
             let directory = tempfile::tempdir().unwrap();
@@ -1076,7 +1052,8 @@ mod tests {
             let reloaded = StoredSession::load_from(session.id, directory.path()).unwrap();
             let reloaded_journal = SessionJournal::from_session(&reloaded).unwrap();
             assert!(
-                super::has_boundary_pin(&reloaded_journal.snapshot().state, outside[1]).unwrap()
+                super::has_boundary_pin(reloaded_journal.snapshot().state.iter(), outside[1])
+                    .unwrap()
             );
             let recovered = recovery.finalize_after_publication();
             let restarted = recovered.journal();
@@ -1099,26 +1076,20 @@ mod tests {
                 replacement.notify();
                 drop(replacement);
                 let selected = restarted.snapshot();
-                let view = SessionStateView::fold(
-                    &selected.state,
-                    &selected.agent_revisions,
-                    selected.seq,
-                )
-                .unwrap();
+                let view = selected.fold(selected.seq).unwrap();
                 assert_eq!(view.agents[&sibling].lifecycle, lifecycle);
                 assert_eq!(selected.histories[&sibling].messages, expected);
-                assert!(super::has_boundary_pin(&selected.state, earlier).unwrap());
+                assert!(super::has_boundary_pin(selected.state.iter(), earlier).unwrap());
                 assert_eq!(
-                    super::has_boundary_pin(&selected.state, later).unwrap(),
+                    super::has_boundary_pin(selected.state.iter(), later).unwrap(),
                     seq == later
                 );
             }
         });
     }
 
-    #[test_case(false; "ambiguous_legacy_boundary_is_unavailable")]
-    #[test_case(true; "exact_legacy_singleton_stays_available")]
-    fn missing_terminal_cutoff_never_uses_late_history(exact_legacy_pin: bool) {
+    #[test]
+    fn missing_terminal_cutoff_never_uses_late_history() {
         let (journal, root, child, sibling, _) = fixture();
         let mut terminal = journal.agent(sibling).unwrap();
         terminal.lifecycle = StoredAgentLifecycle::Closed;
@@ -1143,45 +1114,11 @@ mod tests {
         )
         .unwrap();
         let seq = current.seq;
-        let exact = current.clone();
         Arc::make_mut(&mut current.histories.get_mut(&sibling).unwrap().messages)
             .push(Message::observation(AFTER.into()));
         let mut candidate = current.clone();
         super::pin_outside_boundaries(&current, &mut candidate, &[child].into()).unwrap();
-        assert!(!super::has_boundary_pin(&candidate.state, seq).unwrap());
-        if exact_legacy_pin {
-            let pin = super::BoundaryPin {
-                format: None,
-                boundaries: Vec::new(),
-                state: exact.state,
-                agents: exact.agent_revisions,
-                histories: exact
-                    .histories
-                    .iter()
-                    .map(|(agent, history)| {
-                        (
-                            *agent,
-                            super::PinnedHistory {
-                                epoch: history.epoch,
-                                compacted: history.compacted,
-                                messages: history.messages.as_ref().clone(),
-                            },
-                        )
-                    })
-                    .collect(),
-            };
-            super::push(
-                &mut candidate,
-                None,
-                0,
-                StateChange::BoundarySnapshot {
-                    boundary: seq,
-                    snapshot: serde_json::to_value(pin).unwrap(),
-                },
-            )
-            .unwrap();
-            super::recover_boundary_pins(&mut candidate.state).unwrap();
-        }
+        assert!(!super::has_boundary_pin(candidate.state.iter(), seq).unwrap());
         let result = super::prepare_boundary(
             &candidate,
             RewindBoundary {
@@ -1190,15 +1127,21 @@ mod tests {
                 epoch: candidate.epoch,
             },
         );
-        if exact_legacy_pin {
-            assert_eq!(result.unwrap().0.histories[&sibling].messages.len(), 1);
-        } else {
-            assert!(matches!(result, Err(RewindError::MissingHistory(agent)) if agent == sibling));
-        }
+        assert!(matches!(result, Err(RewindError::MissingHistory(agent)) if agent == sibling));
     }
 
-    #[test]
-    fn legacy_singleton_pin_remains_readable_and_recoverable() {
+    fn recover_snapshot_pins(
+        snapshot: &mut SessionJournalSnapshot,
+    ) -> Result<BTreeSet<u64>, RewindError> {
+        let mut state = snapshot.state.to_vec();
+        let pinned = super::recover_boundary_pins(&mut state)?;
+        snapshot.state = state.into();
+        Ok(pinned)
+    }
+
+    #[test_case("format"; "missing_format")]
+    #[test_case("boundaries"; "missing_boundaries")]
+    fn pool_metadata_is_required(field: &str) {
         let (journal, root, child, _, _) = fixture();
         let mut current = journal.snapshot();
         let lens = current
@@ -1216,26 +1159,22 @@ mod tests {
         let seq = current.seq;
         let mut candidate = current.clone();
         super::pin_outside_boundaries(&current, &mut candidate, &[child].into()).unwrap();
-        for record in &mut candidate.state {
+        let mut state = candidate.state.to_vec();
+        for record in &mut state {
             if let StateChange::BoundarySnapshot { snapshot, .. } = &mut record.change {
-                let object = snapshot.as_object_mut().unwrap();
-                object.remove("format");
-                object.remove("boundaries");
+                snapshot.as_object_mut().unwrap().remove(field);
+                assert!(serde_json::from_value::<super::BoundaryPin>(snapshot.clone()).is_err());
             }
         }
-        assert_eq!(
-            super::pinned_snapshot(&candidate, seq)
-                .unwrap()
-                .unwrap()
-                .histories[&root]
-                .messages,
-            current.histories[&root].messages
-        );
-        assert_eq!(
-            super::recover_boundary_pins(&mut candidate.state).unwrap(),
-            [seq].into()
-        );
-        assert!(super::pinned_snapshot(&candidate, seq).unwrap().is_some());
+        candidate.state = state.into();
+        assert!(matches!(
+            super::pinned_snapshot(&candidate, seq),
+            Err(RewindError::InvalidPin(_))
+        ));
+        assert!(matches!(
+            recover_snapshot_pins(&mut candidate),
+            Err(RewindError::InvalidPin(_))
+        ));
     }
 
     #[test_case(false; "out_of_range_lens")]
@@ -1258,7 +1197,8 @@ mod tests {
         let seq = current.seq;
         let mut candidate = current.clone();
         super::pin_outside_boundaries(&current, &mut candidate, &[child].into()).unwrap();
-        for record in &mut candidate.state {
+        let mut state = candidate.state.to_vec();
+        for record in &mut state {
             if let StateChange::BoundarySnapshot { snapshot, .. } = &mut record.change {
                 let mut pin: super::BoundaryPin = serde_json::from_value(snapshot.clone()).unwrap();
                 let saved = pin
@@ -1277,12 +1217,13 @@ mod tests {
                 *snapshot = serde_json::to_value(pin).unwrap();
             }
         }
+        candidate.state = state.into();
         assert!(matches!(
             super::pinned_snapshot(&candidate, seq),
             Err(RewindError::InvalidPin(_))
         ));
         assert!(matches!(
-            super::recover_boundary_pins(&mut candidate.state),
+            recover_snapshot_pins(&mut candidate),
             Err(RewindError::InvalidPin(_))
         ));
     }
@@ -1392,13 +1333,9 @@ mod tests {
             let (journal, root, child, sibling, mut boundary) = fixture();
             if root_scope {
                 let mut state = journal.lock();
-                let record = state
-                    .snapshot
-                    .state
-                    .iter_mut()
-                    .find(|record| record.seq == boundary.seq)
-                    .unwrap();
+                let mut record = state.snapshot.state.get(boundary.seq).unwrap().clone();
                 record.agent = Some(root);
+                state.snapshot.state.insert(record.seq, record);
                 boundary.agent = root;
             }
             let before = journal.snapshot();
@@ -1413,9 +1350,7 @@ mod tests {
             assert_eq!(journal.snapshot().seq, before.seq);
             assert!(candidate.seq > before.seq);
             assert_ne!(candidate.epoch, before.epoch);
-            let view =
-                SessionStateView::fold(&candidate.state, &candidate.agent_revisions, candidate.seq)
-                    .unwrap();
+            let view = candidate.fold(candidate.seq).unwrap();
             assert_eq!(
                 view.scopes[&Some(child)].plugins[SLOT].value,
                 Some(json!(BEFORE))
@@ -1426,7 +1361,7 @@ mod tests {
             );
             if !root_scope {
                 for record in outside {
-                    assert!(candidate.state.contains(&record));
+                    assert!(candidate.state.get(record.seq) == Some(&record));
                 }
             }
             replacement.install().unwrap();
@@ -1441,12 +1376,20 @@ mod tests {
     #[test]
     fn failed_preparation_and_dropped_reservation_leave_live_state_unchanged() {
         smol::block_on(async {
-            let (journal, _, _, _, boundary) = fixture();
+            let (journal, _, child, sibling, boundary) = fixture();
             let before = journal.snapshot();
-            let failed = journal
-                .prepare_rewind_with(boundary.clone(), |_| Err(RewindError::LostReservation))
-                .await;
-            assert!(failed.is_err());
+            let mut replacement = journal.prepare_rewind(boundary.clone()).await.unwrap();
+            let candidate = replacement.snapshot().clone();
+            assert!(matches!(
+                replacement.apply_migrations(vec![
+                    plugin(Some(child), BEFORE),
+                    plugin(Some(sibling), BEFORE),
+                ]),
+                Err(RewindError::State(StateError::ReadOnly))
+            ));
+            assert_eq!(replacement.snapshot().seq, candidate.seq);
+            assert_eq!(replacement.snapshot().state, candidate.state);
+            drop(replacement);
             assert_eq!(journal.snapshot().seq, before.seq);
             let replacement = journal.prepare_rewind(boundary).await.unwrap();
             assert!(
@@ -1487,26 +1430,63 @@ mod tests {
         });
     }
 
-    #[test_case(false; "boundary_callback")]
-    #[test_case(true; "branch_callback")]
-    fn migration_callback_runs_outside_journal_mutex(branch: bool) {
+    #[test_case(false, false; "boundary_migration")]
+    #[test_case(true, false; "branch_migration")]
+    #[test_case(false, true; "boundary_unwind_rolls_back")]
+    #[test_case(true, true; "branch_unwind_rolls_back")]
+    fn migration_projection_is_outside_mutex_and_unwind_releases_reservation(
+        branch: bool,
+        unwind: bool,
+    ) {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        const MIGRATION_PANIC: &str = "migration interrupted";
         smol::block_on(async {
-            let (journal, _, _, _, boundary) = fixture();
-            let migrate = |_: &crate::journal::SessionJournalSnapshot| {
-                assert!(journal.try_lock_for_rewind_test());
-                Ok(Vec::new())
-            };
-            if branch {
+            let (journal, _, child, _, boundary) = fixture();
+            let before = journal.snapshot();
+            let replacement = if branch {
                 journal
-                    .prepare_branch_restore_with(boundary.agent, journal.snapshot(), migrate)
+                    .prepare_branch_restore(boundary.agent, before.clone())
                     .await
-                    .unwrap();
+                    .unwrap()
             } else {
-                journal
-                    .prepare_rewind_with(boundary, migrate)
-                    .await
+                journal.prepare_rewind(boundary.clone()).await.unwrap()
+            };
+            let projected = catch_unwind(AssertUnwindSafe(|| {
+                let mut replacement = replacement;
+                assert!(journal.try_lock_for_rewind_test());
+                replacement
+                    .apply_migrations(vec![plugin(Some(child), BEFORE)])
                     .unwrap();
-            }
+                assert!(journal.try_lock_for_rewind_test());
+                assert!(
+                    journal
+                        .commit(JournalCommit {
+                            changes: vec![plugin(None, AFTER)],
+                            ..Default::default()
+                        })
+                        .is_err()
+                );
+                if unwind {
+                    panic!("{MIGRATION_PANIC}");
+                }
+                replacement
+            }));
+            assert_eq!(projected.is_err(), unwind);
+            drop(projected);
+            let after = journal.snapshot();
+            assert_eq!(
+                (after.seq, after.revision, after.epoch),
+                (before.seq, before.revision, before.epoch)
+            );
+            assert_eq!(after.state, before.state);
+            let retry = journal.prepare_rewind(boundary).await.unwrap();
+            drop(retry);
+            journal
+                .commit(JournalCommit {
+                    changes: vec![plugin(None, AFTER)],
+                    ..Default::default()
+                })
+                .unwrap();
         });
     }
 
@@ -1543,12 +1523,10 @@ mod tests {
             );
             assert_eq!(replacement.snapshot().seq, before);
             replacement.apply_configs(vec![change(child)]).unwrap();
-            let view = SessionStateView::fold(
-                &replacement.snapshot().state,
-                &replacement.snapshot().agent_revisions,
-                replacement.snapshot().seq,
-            )
-            .unwrap();
+            let view = replacement
+                .snapshot()
+                .fold(replacement.snapshot().seq)
+                .unwrap();
             assert_eq!(view.scopes[&Some(child)].config.as_ref(), Some(&config));
             assert!(
                 !journal
@@ -1712,12 +1690,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            let view = SessionStateView::fold(
-                &restored.snapshot().state,
-                &restored.snapshot().agent_revisions,
-                restored.snapshot().seq,
-            )
-            .unwrap();
+            let view = restored.snapshot().fold(restored.snapshot().seq).unwrap();
             assert!(view.agents.contains_key(&child));
             assert_eq!(view.agents[&child].label.as_deref(), Some(AFTER));
             assert_eq!(view.agents[&child].lifecycle, StoredAgentLifecycle::Closed);
@@ -1781,6 +1754,27 @@ mod tests {
                 })
                 .unwrap();
             let later = journal.snapshot().seq;
+            let source = journal.snapshot();
+            let pin = super::BoundaryPin {
+                format: super::BOUNDARY_POOL_FORMAT.into(),
+                boundaries: vec![later],
+                state: source.state.to_vec(),
+                agents: source.agent_revisions.to_vec(),
+                histories: source
+                    .histories
+                    .iter()
+                    .map(|(agent, history)| {
+                        (
+                            *agent,
+                            super::PinnedHistory {
+                                epoch: history.epoch,
+                                compacted: history.compacted,
+                                messages: history.messages.as_ref().clone(),
+                            },
+                        )
+                    })
+                    .collect(),
+            };
             journal
                 .commit(JournalCommit {
                     changes: vec![JournalChange {
@@ -1788,7 +1782,7 @@ mod tests {
                         generation: 0,
                         change: StateChange::BoundarySnapshot {
                             boundary: later,
-                            snapshot: json!({}),
+                            snapshot: serde_json::to_value(pin).unwrap(),
                         },
                     }],
                     ..Default::default()
@@ -1821,9 +1815,7 @@ mod tests {
                         && matches!(record.change, StateChange::Boundary { .. })
                 })
                 .unwrap();
-            let view =
-                SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, boundary.seq)
-                    .unwrap();
+            let view = snapshot.fold(boundary.seq).unwrap();
             assert!(view.agents.contains_key(&child));
             replacement.install().unwrap();
             drop(replacement);
@@ -1833,12 +1825,7 @@ mod tests {
                 epoch: snapshot.epoch,
             };
             let prepared = journal.prepare_rewind(boundary).await.unwrap();
-            let view = SessionStateView::fold(
-                &prepared.snapshot().state,
-                &prepared.snapshot().agent_revisions,
-                prepared.snapshot().seq,
-            )
-            .unwrap();
+            let view = prepared.snapshot().fold(prepared.snapshot().seq).unwrap();
             assert!(view.agents.contains_key(&child));
             assert_eq!(
                 view.scopes[&Some(child)].plugins[SLOT].value,
@@ -2090,7 +2077,7 @@ mod tests {
                     Err(RewindError::InvalidPin(_))
                 ));
                 assert!(matches!(
-                    super::recover_boundary_pins(&mut corrupted.state),
+                    recover_snapshot_pins(&mut corrupted),
                     Err(RewindError::InvalidPin(_))
                 ));
             }
@@ -2207,9 +2194,7 @@ mod tests {
                 .unwrap();
             prepared.install().unwrap();
             let installed = journal.snapshot();
-            let view =
-                SessionStateView::fold(&installed.state, &installed.agent_revisions, installed.seq)
-                    .unwrap();
+            let view = installed.fold(installed.seq).unwrap();
             let deliveries = &view.scopes[&Some(root)].deliveries;
             assert!(matches!(
                 deliveries[&(child, consumed)],

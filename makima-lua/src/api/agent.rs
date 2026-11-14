@@ -60,7 +60,7 @@ use makima_providers::provider;
 use makima_providers::{Model, ModelError, ModelSelection, RequestOptions, TokenUsage, add_cost};
 use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
 use makima_storage::id::MakimaId;
-use makima_storage::session_state::{SessionStateView, StoredAgentSpec, StoredModeCeiling};
+use makima_storage::session_state::{StoredAgentSpec, StoredModeCeiling};
 use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table, Value as LuaValue};
 use serde_json::Value as JsonValue;
 use tracing::{info, warn};
@@ -2216,9 +2216,9 @@ async fn ensure_agent_resident(lua: &Lua, ctx: &LuaCtx, agent: &LuaAgent) -> Res
                 .as_ref()
                 .map(|plugin| crate::orchestration::plugin_authority(&lua, plugin.clone()));
             let snapshot = activation_journal.snapshot();
-            let view =
-                SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
-                    .map_err(|error| ReactivationError::Initialization(error.to_string()))?;
+            let view = snapshot
+                .fold(snapshot.seq)
+                .map_err(|error| ReactivationError::Initialization(error.to_string()))?;
             let prepared =
                 reactivation::prepare(&lua, &input.record, input.config.as_ref(), context, &view)
                     .await?;

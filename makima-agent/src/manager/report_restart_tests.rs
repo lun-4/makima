@@ -13,8 +13,7 @@ use futures_lite::future::or;
 use makima_providers::{Message, Model, ObservationSource, TokenUsage, provider::unconfigured};
 use makima_storage::{
     session_state::{
-        SessionStateView, StateChange, StoredAgentConfig, StoredAgentLifecycle, StoredAgentRecord,
-        StoredDeliveryOp,
+        StateChange, StoredAgentConfig, StoredAgentLifecycle, StoredAgentRecord, StoredDeliveryOp,
     },
     sessions::Session,
 };
@@ -211,8 +210,7 @@ fn seed() -> (StoredSession, Arc<SessionJournal>, Arc<ChildDelivery>) {
 }
 fn restore(journal: &Arc<SessionJournal>) -> AgentManagerHandle {
     let snapshot = journal.checkpoint_snapshot().unwrap();
-    let view =
-        SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq).unwrap();
+    let view = snapshot.fold(snapshot.seq).unwrap();
     AgentManagerHandle::restore_graph(
         AgentLimits::default(),
         Arc::clone(journal),
