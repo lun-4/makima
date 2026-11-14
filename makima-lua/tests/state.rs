@@ -3,10 +3,10 @@ mod common;
 use std::{collections::BTreeSet, sync::Arc};
 
 use makima_agent::{
-    ActorBackend, AgentId, AgentLimits, AgentManagerHandle, AgentRef,
+    ActorBackend, AgentId, AgentLimits, AgentManagerHandle, AgentRef, CancelTrigger,
     journal::{JournalChange, SessionJournalSnapshot},
     state::{StateScope, StateSlotSpec},
-    tools::{ToolRegistry, TurnToolBindings},
+    tools::{ToolContext, ToolRegistry, TurnToolBindings},
 };
 use makima_lua::{PluginHost, test_support::InMemoryFs, ui_sink::HostUi};
 use makima_storage::{
@@ -217,8 +217,8 @@ fn state_fixture_migrates_once_and_preserves_failed_and_newer_values() {
     host.load_source(
         PLUGIN,
         &source(
-            2,
-            "function(cur) cur.count = 99; error('migration failed') end",
+            3,
+            "(function() local calls = 0; return function(cur, from_version) calls = calls + 1; assert(from_version == calls); cur.count = 99; if from_version == 2 then error('migration failed') end; return cur end end)()",
         ),
     )
     .unwrap();
@@ -231,9 +231,10 @@ fn state_fixture_migrates_once_and_preserves_failed_and_newer_values() {
         serde_json::from_str::<Value>(&call(json!({}))).unwrap(),
         before
     );
-    host.load_source(PLUGIN, &source(2, "function(cur, version) assert(version == 1); cur.count = cur.count + 1; return cur end")).unwrap();
+    host.load_source(PLUGIN, &source(3, "(function() local calls = 0; return function(cur, from_version) calls = calls + 1; assert(from_version == calls); cur.steps = cur.steps or {}; table.insert(cur.steps, from_version); cur.count = cur.count + from_version; return cur end end)()")).unwrap();
     let migrated: Value = serde_json::from_str(&call(json!({}))).unwrap();
-    assert_eq!(migrated["value"]["count"], 4);
+    assert_eq!(migrated["value"]["count"], 6);
+    assert_eq!(migrated["value"]["steps"], json!([1, 2]));
     assert_ne!(migrated["revision"], before["revision"]);
     assert_eq!(
         serde_json::from_str::<Value>(&call(json!({}))).unwrap(),
@@ -244,7 +245,7 @@ fn state_fixture_migrates_once_and_preserves_failed_and_newer_values() {
         call(json!({ "action": "expect_error", "error": "state_newer_version" })),
         "rejected"
     );
-    host.load_source(PLUGIN, &source(2, "nil")).unwrap();
+    host.load_source(PLUGIN, &source(3, "nil")).unwrap();
     assert_eq!(
         serde_json::from_str::<Value>(&call(json!({}))).unwrap(),
         migrated
@@ -466,11 +467,11 @@ local function probe(input, ctx)
     assert(committed == nil and string.find(err, "state_read_only", 1, true), tostring(err))
     local updated; updated, err = slot:update(ctx, function() return { count = 999 } end)
     assert(updated == nil and string.find(err, "state_read_only", 1, true), tostring(err))
-    assert(migrations == 0)
+    assert(migrations == (input.migrations or 0))
     local buf = makima.ui.buf(); buf:line("readonly verified"); return buf
 end
 makima.api.register_tool({
-    name = "state_readonly", description = "readonly state fixture", schema = { type = "object", properties = { count = { type = "number" }, error = { type = "string" } } },
+    name = "state_readonly", description = "readonly state fixture",     schema = { type = "object", properties = { count = { type = "number" }, migrations = { type = "number" }, error = { type = "string" } } },
     start = function(input, ctx) ctx:live_buf(probe(input, ctx)) end,
     restore = function(input, _, _, ctx) return probe(input, ctx) end,
     handler = function() return "unused" end,
@@ -480,7 +481,7 @@ const READONLY_OK: &str = "readonly verified";
 const RESTORE_ID: &str = "state-readonly-restore";
 
 #[test]
-fn start_and_restore_read_only_use_captured_target_without_migration() {
+fn start_and_restore_read_only_migrate_copies_of_captured_target() {
     use makima_agent::{
         ActorBackend, AgentEvent, AgentManagerHandle, EventSender,
         state::{StateScope, StateSlotSpec},
@@ -595,8 +596,11 @@ fn start_and_restore_read_only_use_captured_target_without_migration() {
     restore(json!({ "error": "state_target_unavailable" }), None);
     host.load_source(PLUGIN, &READONLY_SOURCE.replace("VERSION", "2"))
         .unwrap();
-    start(json!({ "error": "state_read_only" }));
-    restore(json!({ "error": "state_read_only" }), Some(target.clone()));
+    start(json!({ "count": 32, "migrations": 1 }));
+    restore(
+        json!({ "count": 32, "migrations": 2 }),
+        Some(target.clone()),
+    );
     let stored = slot.get_raw(&target.state_access()).unwrap();
     assert_eq!(stored.version, 1);
     assert_eq!(stored.revision, revision);
@@ -606,34 +610,58 @@ fn start_and_restore_read_only_use_captured_target_without_migration() {
 const RETAINED_TOOL: &str = "state_retained";
 const RETAINED_SOURCE: &str = r#"
 local migrations = 0
-makima.state.register("retained", {
+local slot = makima.state.register("retained", {
     scope = "agent", version = VERSION,
     migrate = function(value) migrations = migrations + 1; value.count = 99; return value end,
 })
-makima.api.register_tool({
-    name = "state_retained", description = "retained migration authority", schema = { type = "object", properties = { agent = { type = "string" }, migration = { type = "boolean" } } },
-    handler = function(input, ctx)
-        local child = assert(makima.agent.get(ctx, input.agent))
-        local value, revision = child:state(ctx, "state_fixture/retained")
-        if input.migration then
-            assert(value == nil and string.find(revision, "state_migration_requires_target", 1, true), tostring(revision))
-        else
-            assert(value.count == 6 and type(revision) == "number", tostring(revision))
-        end
-        assert(migrations == 0)
+makima.state.register("absent", { scope = "agent", version = 1 })
+makima.state.register("shared", { scope = "session", version = 1 })
+local captured
+local function probe(input, ctx)
+    local agent = input.agent and assert(makima.agent.get(ctx, input.agent)) or assert(ctx:agent())
+    if input.capture then captured = agent; return end
+    if input.denied then
+        local value, err = captured:state(ctx, "state_fixture/retained")
+        assert(value == nil and err == "agent is not a descendant of the caller", tostring(err))
         return "retained verified"
-    end,
+    end
+    if input.errors then
+        for _, key in ipairs({ "malformed", "state_fixture/unknown", "state_fixture/too/many", "" }) do
+            local value, err = agent:state(ctx, key)
+            assert(value == nil and err == "state_slot_unavailable", tostring(err))
+        end
+        local value, err = agent:state(ctx, "state_fixture/shared")
+        assert(value == nil and err == "state slot is not agent-scoped", tostring(err))
+        return "retained verified"
+    end
+    local value, revision = agent:state(ctx, "state_fixture/retained")
+    assert(value.count == (input.migration and 99 or 6) and type(revision) == "number", tostring(revision))
+    value.count = -1
+    local copy, same_revision = agent:state(ctx, "state_fixture/retained")
+    assert(copy.count == (input.migration and 99 or 6) and same_revision == revision)
+    assert(migrations == (input.migration and 2 or 0))
+    if not input.agent then
+        local own, own_revision = slot:get(ctx)
+        assert(own.count == copy.count and own_revision == revision)
+        local absent, absent_revision = agent:state(ctx, "state_fixture/absent")
+        assert(absent == nil and type(absent_revision) == "number")
+    end
+    return "retained verified"
+end
+makima.api.register_tool({
+    name = "state_retained", description = "retained migration authority", schema = { type = "object", properties = { agent = { type = "string" }, migration = { type = "boolean" }, denied = { type = "boolean" }, errors = { type = "boolean" } } },
+    handler = probe,
+})
+makima.api.register_command({
+    name = "state_retained", description = "retained state read", tui_only = false,
+    arguments = { raw = true, required = true },
+    handler = function(opts, ctx) probe(assert(makima.json.decode(opts.args)), ctx) end,
 })
 "#;
 const RETAINED_OK: &str = "retained verified";
 
-#[test]
-fn delegated_retained_reads_do_not_gain_descendant_migration_writes() {
-    use makima_agent::{
-        ActorBackend, AgentMetadata,
-        state::{StateScope, StateSlotSpec},
-    };
-
+fn retained_fixture() -> (PluginHost, ToolContext, CancelTrigger, AgentRef, AgentRef) {
+    use makima_agent::AgentMetadata;
     let registry = Arc::new(ToolRegistry::new());
     let host = PluginHost::with_session_provider_preparer(
         Arc::clone(&registry),
@@ -647,7 +675,7 @@ fn delegated_retained_reads_do_not_gain_descendant_migration_writes() {
     .unwrap();
     host.load_source(PLUGIN, &RETAINED_SOURCE.replace("VERSION", "1"))
         .unwrap();
-    let (mut ctx, _events, _cancel) = common::ctx_with_canned_provider();
+    let (mut ctx, _events, cancel) = common::ctx_with_canned_provider();
     ctx.registry = Arc::clone(&registry);
     ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
         &registry,
@@ -668,7 +696,7 @@ fn delegated_retained_reads_do_not_gain_descendant_migration_writes() {
     let child = manager
         .spawn_child_trusted_with_config(
             &parent,
-            config,
+            config.clone(),
             AgentMetadata::default(),
             Vec::new(),
             None,
@@ -683,24 +711,223 @@ fn delegated_retained_reads_do_not_gain_descendant_migration_writes() {
             version: 1,
         })
         .unwrap();
-    let revision = slot
-        .set(&child.state_access(), json!({ "count": 6 }), None)
-        .unwrap();
-    let input = |migration| json!({ "agent": child.id().to_string(), "migration": migration });
+    for target in [&parent, &child] {
+        slot.set(&target.state_access(), json!({ "count": 6 }), None)
+            .unwrap();
+    }
+    (host, ctx, cancel, parent, child)
+}
+
+#[test]
+fn resident_retained_reads_match_slot_and_return_copies_and_absence() {
+    let (_host, ctx, _cancel, parent, _) = retained_fixture();
+    let before = parent.manager().journal().snapshot();
     assert_eq!(
-        common::exec_tool_text(&registry, &ctx, RETAINED_TOOL, input(false)).unwrap(),
+        common::exec_tool_text(&ctx.registry, &ctx, RETAINED_TOOL, json!({})).unwrap(),
         RETAINED_OK
     );
+    assert_eq!(parent.manager().journal().snapshot().state, before.state);
+}
+
+#[test_case(false; "own_agent")]
+#[test_case(true; "descendant")]
+fn delegated_retained_reads_migrate_copies_without_journaling(descendant: bool) {
+    let (host, ctx, _cancel, parent, child) = retained_fixture();
     host.load_source(PLUGIN, &RETAINED_SOURCE.replace("VERSION", "2"))
         .unwrap();
+    let journal = parent.manager().journal();
+    let before = journal.snapshot();
     assert_eq!(
-        common::exec_tool_text(&registry, &ctx, RETAINED_TOOL, input(true)).unwrap(),
+        common::exec_tool_text(
+            &ctx.registry,
+            &ctx,
+            RETAINED_TOOL,
+            json!({ "agent": if descendant { child.id() } else { parent.id() }.to_string(), "migration": true })
+        )
+        .unwrap(),
         RETAINED_OK
     );
-    let stored = slot.get_raw(&child.state_access()).unwrap();
-    assert_eq!(stored.revision, revision);
-    assert_eq!(stored.version, 1);
-    assert_eq!(stored.value, Some(json!({ "count": 6 })));
+    let after = journal.snapshot();
+    assert_eq!(after.state, before.state);
+    assert_eq!(after.seq, before.seq);
+    assert_eq!(after.revision, before.revision);
+}
+
+#[test]
+fn retained_reads_reject_session_unknown_and_malformed_slots() {
+    let (_host, ctx, _cancel, parent, _) = retained_fixture();
+    let before = parent.manager().journal().snapshot();
+    assert_eq!(
+        common::exec_tool_text(
+            &ctx.registry,
+            &ctx,
+            RETAINED_TOOL,
+            json!({ "errors": true })
+        )
+        .unwrap(),
+        RETAINED_OK
+    );
+    assert_eq!(parent.manager().journal().snapshot().state, before.state);
+}
+
+#[test]
+fn retained_reads_reject_unrelated_agent_topology() {
+    use makima_agent::{
+        AgentInput, AgentMetadata, BackendResult, ControlWork, CurrentManagedTurn, TurnContext,
+        WorkKind, actor::ActorHistory,
+    };
+    use makima_providers::provider::BoxFuture;
+
+    struct Caller(flume::Sender<CurrentManagedTurn>);
+    impl ActorBackend for Caller {
+        fn run_turn<'a>(
+            &'a mut self,
+            _: ActorHistory<'a>,
+            context: TurnContext,
+            _: AgentInput,
+            _: WorkKind,
+        ) -> BoxFuture<'a, BackendResult> {
+            Box::pin(async move {
+                self.0.send(context.managed_turn.unwrap()).unwrap();
+                std::future::pending().await
+            })
+        }
+        fn run_control<'a>(
+            &'a mut self,
+            _: ActorHistory<'a>,
+            _: TurnContext,
+            _: &'a ControlWork,
+        ) -> BoxFuture<'a, BackendResult> {
+            Box::pin(async { unreachable!() })
+        }
+        fn run_compact<'a>(
+            &'a mut self,
+            _: ActorHistory<'a>,
+            _: TurnContext,
+            _: Option<&'a str>,
+        ) -> BoxFuture<'a, BackendResult> {
+            Box::pin(async { unreachable!() })
+        }
+    }
+
+    let (host, mut ctx, _cancel, parent, sibling) = retained_fixture();
+    let manager = parent.manager();
+    let completed = makima_lua::test_support::run_command(
+        &host.command_registry(),
+        &format!(
+            "/state_retained {}",
+            json!({ "agent": sibling.id().to_string(), "capture": true })
+        ),
+        0,
+        Some(makima_lua::orchestration::TrustedTarget {
+            target: parent.clone(),
+            template: ctx.clone(),
+        }),
+    );
+    smol::block_on(common::bounded(completed.recv_async()))
+        .unwrap()
+        .unwrap();
+    let (entered, current) = flume::bounded(1);
+    let caller = manager
+        .spawn_child_trusted_with_config(
+            &parent,
+            common::effective_config(&ctx),
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            |_| Ok::<_, String>(Box::new(Caller(entered)) as Box<dyn ActorBackend>),
+        )
+        .unwrap();
+    caller
+        .actor()
+        .unwrap()
+        .admit_turn(
+            AgentInput::new("read sibling".into(), Vec::new()),
+            None,
+            "read sibling".into(),
+        )
+        .unwrap();
+    ctx.managed_turn = Some(smol::block_on(common::bounded(current.recv_async())).unwrap());
+    ctx.execution_agent_id = Some(caller.id());
+    let before = manager.journal().snapshot();
+    assert_eq!(
+        common::exec_tool_text(
+            &ctx.registry,
+            &ctx,
+            RETAINED_TOOL,
+            json!({ "denied": true })
+        )
+        .unwrap(),
+        RETAINED_OK
+    );
+    assert_eq!(manager.journal().snapshot().state, before.state);
+}
+
+#[test]
+fn retained_reads_after_restart_leave_child_dormant() {
+    use makima_agent::AgentMetadata;
+    use makima_storage::StateDir;
+
+    let directory = tempfile::tempdir().unwrap();
+    let storage = StateDir::from_path(directory.path().into());
+    let mut session = common::TestSession::new(
+        &common::default_model().spec(),
+        directory.path().to_str().unwrap(),
+    );
+    session.save(&storage).unwrap();
+    let fs = Arc::new(InMemoryFs::new());
+    fs.seed(
+        &directory
+            .path()
+            .join("plugins")
+            .join(format!("{PLUGIN}.lua")),
+        RETAINED_SOURCE.replace("VERSION", "1").into_bytes(),
+    );
+    let host = common::RestartHost::open_with_provider(
+        directory.path(),
+        session.id,
+        fs,
+        vec![PLUGIN.into()],
+        Arc::new(common::CannedProvider::new(Vec::new())),
+    );
+    let child = host
+        .manager
+        .spawn_child_trusted_with_config(
+            &host.root.target,
+            common::effective_config(&host.root.template),
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            |_| Ok::<_, String>(Box::new(common::IdleRoot) as Box<dyn ActorBackend>),
+        )
+        .unwrap();
+    host.manager
+        .journal()
+        .register_state::<Value>(StateSlotSpec {
+            key: "state_fixture/retained".into(),
+            scope: StateScope::Agent,
+            version: 1,
+        })
+        .unwrap()
+        .set(&child.state_access(), json!({ "count": 6 }), None)
+        .unwrap();
+    let id = child.id();
+    let host = host.restart_host(directory.path());
+    assert!(!host.manager.is_live(id));
+    let before = host.manager.journal().snapshot();
+    let completed = makima_lua::test_support::run_command(
+        &host.host.command_registry(),
+        &format!("/state_retained {}", json!({ "agent": id.to_string() })),
+        0,
+        Some(host.root.clone()),
+    );
+    smol::block_on(common::bounded(completed.recv_async()))
+        .unwrap()
+        .unwrap();
+    assert!(!host.manager.is_live(id));
+    let after = host.manager.journal().snapshot();
+    assert_eq!(after.state, before.state);
+    assert_eq!(after.revision, before.revision);
 }
 
 const COMPACT_GATE: &str = "state_compact_gate";
@@ -854,22 +1081,24 @@ const TRANSITION_OK: &str = "candidate migrated before rewind event";
 const TRANSITION_SOURCE: &str = r#"
 local calls = 0
 local slot
-slot = makima.state.register("value", { scope = "agent", version = 2,
+slot = makima.state.register("value", { scope = "agent", version = 3,
     migrate = function(value, version)
-        assert(version == 1 and value.count == 4)
         calls = calls + 1
+        assert(version == calls and value.count == (version == 1 and 4 or 5))
         local ok, err = pcall(function() slot:on_change(function() error("escaped registration") end) end)
         assert(not ok and string.find(tostring(err), "state_migration_has_no_invocation_authority", 1, true))
         ok, err = pcall(function() makima.async.run(function() error("escaped async") end) end)
         assert(not ok and string.find(tostring(err), "state_migration_has_no_invocation_authority", 1, true))
-        value.count = 5
+        value.count = value.count + version
+        value.steps = value.steps or {}
+        table.insert(value.steps, version)
         return value
     end,
 })
 slot:on_change(function(ctx, event)
-    assert(event.reason == "rewind" and calls == 1)
+    assert(event.reason == "rewind" and calls == 2)
     local value, revision = slot:get(ctx)
-    assert(value.count == 5 and revision == event.revision)
+    assert(value.count == 7 and value.steps[1] == 1 and value.steps[2] == 2 and revision == event.revision)
     makima.ui.flash("candidate migrated before rewind event")
     error("notification cannot veto")
 end)
@@ -1074,8 +1303,8 @@ fn prepublication_migration_installs_once_before_nonveto_notification() {
     let after = journal.snapshot();
     let view = after.fold(after.seq).unwrap();
     let stored = &view.scopes[&Some(root.id())].plugins[&format!("{PLUGIN}/value")];
-    assert_eq!(stored.version, 2);
-    assert_eq!(stored.value, Some(json!({ "count": 5 })));
+    assert_eq!(stored.version, 3);
+    assert_eq!(stored.value, Some(json!({ "count": 7, "steps": [1, 2] })));
     assert!(host.ui_action_rx().try_recv().is_err());
 }
 

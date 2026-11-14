@@ -1503,9 +1503,21 @@ Journaled plugin slots, scoped to an agent or session. Values are copied strict 
 makima.state.register({name}, {spec})
 ```
 
-Register a plugin-qualified slot during load. spec supplies scope (agent or session), positive version, and optional synchronous migrate(value, old_version). Registration is transactional with plugin load. Names are local to the plugin and contain no slash; plan/state is reserved for the host.
+Register a plugin-qualified slot during load. spec supplies scope (agent or session), positive version, and optional synchronous migrate(value, old_version). Migration calls it once per version from the stored version through version - 1; each result must be valid strict JSON and becomes the next call's input. Migration cannot yield. Only the final value is journaled after all steps succeed. Registration is transactional with plugin load. Names are local to the plugin and contain no slash; plan/state is reserved for the host.
 
 **Returns:** (`StateSlot`) Registered slot.
+
+**Example:**
+
+```lua
+local progress = makima.state.register('progress', {
+  scope = 'agent', version = 3,
+  migrate = function(value, old_version)
+    if old_version == 1 then return { count = value } end
+    if old_version == 2 then value.finished = false; return value end
+  end,
+})
+```
 
 ---
 
@@ -2004,6 +2016,26 @@ Snapshots are bounded history views, not an archive immune to compaction.
 - `{opts}` (`table`) Required last_messages (1..1000) and max_bytes (2..1048576); optional through_turn. max_bytes bounds compact JSON of the messages array, not metadata.
 
 **Returns:** (`table?`, `string?`) agent_id, through_turn, messages, epoch, total_messages, omitted_messages, omitted_tool_groups, compacted, bytes, truncated. Tool-call/response groups are indivisible; omitted_tool_groups counts omitted groups, not calls. compacted identifies a history containing a compaction summary, independently of bounded truncation.
+
+---
+
+### `Agent:state()` {#Agent-state}
+
+```lua
+Agent:state({ctx}, {key})
+```
+
+Read a registered agent-scoped slot without reactivating this agent.
+Uses the same topology authorization as makima.agent.get. Values are copied.
+Older values return a migrated copy without journaling; slot:get journals owner migrations.
+Unknown keys return state_slot_unavailable; session-scoped slots are rejected.
+
+**Parameters:**
+
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
+- `{key}` (`string`) Plugin-qualified slot key, <plugin>/<name>.
+
+**Returns:** (`any?`, `integer|string`) Value and stored revision, including nil for an absent value, or nil and error.
 
 ---
 

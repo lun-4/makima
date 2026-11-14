@@ -14,7 +14,7 @@ use makima_agent::{
 use makima_lua_macro::{lua_class, lua_fn};
 use makima_providers::CompleteModelSelection;
 use makima_storage::checkpoint::CheckpointPublication;
-use mlua::{Lua, Table, UserDataMethods, UserDataRef, Value as LuaValue};
+use mlua::{IntoLuaMulti, Lua, MultiValue, Table, UserDataMethods, UserDataRef, Value as LuaValue};
 
 use super::authority::{authorize, destination_template, lookup, observe, retire_closed};
 use super::projection::selection_table;
@@ -757,38 +757,43 @@ fn agent_defer_close(
     Ok((Some(true), None))
 }
 
+/// Read a registered agent-scoped slot without reactivating this agent.
+/// Uses the same topology authorization as makima.agent.get. Values are copied.
+/// Older values return a migrated copy without journaling; slot:get journals owner migrations.
+/// Unknown keys return state_slot_unavailable; session-scoped slots are rejected.
+/// @param ctx LuaCtx Invocation context.
+/// @param key string Plugin-qualified slot key, <plugin>/<name>.
+/// @return (any?, integer|string) Value and stored revision, including nil for an absent value, or nil and error.
+#[lua_fn(name = "state")]
+fn agent_state(
+    lua: &Lua,
+    this: &LuaAgent,
+    ctx: UserDataRef<LuaCtx>,
+    key: String,
+) -> mlua::Result<MultiValue> {
+    let context = (*ctx).clone();
+    drop(ctx);
+    let result: Result<_, String> = (|| {
+        observe(lua, &context, this)?;
+        let access = context.state_access(lua)?;
+        Ok(if access.target() == this.id {
+            access
+        } else {
+            this.manager.reference(this.id).state_access()
+        }
+        .read_only())
+    })();
+    match result {
+        Ok(access) => crate::api::state::retained(lua, &context, access, &key),
+        Err(error) => err_pair::<LuaValue>(error).into_lua_multi(lua),
+    }
+}
+
 // Bundled task plugin internals, not public API. `_makima_session_id` reads the
 // task/UI identity. `_makima_task_owner` returns a host-stamped guard whose
 // `_makima_can_control` checks plugin generation, host and parent branch, and whose
 // `_makima_retired` reports a closed child. The guard authorizes no effect.
 fn agent_internal_methods<M: UserDataMethods<LuaAgent>>(methods: &mut M) {
-    methods.add_method(
-        "state",
-        |lua, this, (ctx, key): (UserDataRef<LuaCtx>, String)| {
-            let context = (*ctx).clone();
-            drop(ctx);
-            let ctx = context;
-            let result: Result<_, String> = (|| {
-                observe(lua, &ctx, this)?;
-                let access = ctx.state_access(lua)?;
-                let access = if access.target() == this.id {
-                    access
-                } else if ctx.trusted(lua).is_ok() {
-                    this.manager.reference(this.id).state_access()
-                } else {
-                    this.manager.reference(this.id).state_access().read_only()
-                };
-                Ok(access)
-            })();
-            match result {
-                Ok(access) => crate::api::state::retained(lua, &ctx, access, &key),
-                Err(error) => Ok(mlua::MultiValue::from_vec(vec![
-                    LuaValue::Nil,
-                    LuaValue::String(lua.create_string(error)?),
-                ])),
-            }
-        },
-    );
     methods.add_method(
         "_makima_task_owner",
         |lua, this, ctx: UserDataRef<LuaCtx>| {
@@ -821,7 +826,7 @@ lua_class! {
     /// A held managed handle retains authorized closed-status reads, not mutation rights.
     "makima.agent.Agent" => LuaAgent, AGENT_DOCS [
         agent_id, agent_is_live, agent_turn, agent_latest_turn, agent_status, agent_config, agent_available_models,
-        agent_transcript, agent_ref, agent_send, agent_set_model,
+        agent_transcript, agent_state, agent_ref, agent_send, agent_set_model,
         agent_set_mode, agent_set_option, agent_cancel, agent_cancel_subtree, agent_close, agent_retire, agent_defer_close,
         on_turn_start, on_turn_end, on_idle, on_config_change, on_close,
     ]

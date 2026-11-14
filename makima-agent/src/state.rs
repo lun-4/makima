@@ -108,6 +108,9 @@ impl StateAccess {
         self.writable = false;
         self
     }
+    pub fn is_read_only(&self) -> bool {
+        !self.writable
+    }
     pub fn journal(&self) -> Arc<SessionJournal> {
         Arc::clone(&self.journal)
     }

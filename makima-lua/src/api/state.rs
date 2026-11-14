@@ -194,15 +194,7 @@ pub(crate) fn prepare_restore(
             let Some(value) = stored.value else {
                 continue;
             };
-            let migrate = definition
-                .migrate
-                .as_ref()
-                .ok_or("state_migration_required")?;
-            let copied = state_value_to_lua(lua, &value).map_err(|error| error.to_string())?;
-            let migrated: Value = migrate
-                .call((copied, stored.version))
-                .map_err(|error| error.to_string())?;
-            let value = state_value_from_lua(lua, &migrated).map_err(|error| error.to_string())?;
+            let value = migrate_value(lua, definition, stored.version, &value)?;
             validate_slot(lua, &LuaStateSlot(definition.clone()))?;
             let record = StoredStateRecord {
                 seq: snapshot
@@ -252,6 +244,27 @@ fn host_slot(
         .map_err(|error| error.to_string())
 }
 
+fn migrate_value(
+    lua: &Lua,
+    definition: &Definition,
+    stored_version: u32,
+    value: &JsonValue,
+) -> Result<JsonValue, String> {
+    let mut value = value.clone();
+    for version in stored_version..definition.version {
+        let migrate = definition
+            .migrate
+            .as_ref()
+            .ok_or("state_migration_required")?;
+        let copied = state_value_to_lua(lua, &value).map_err(|error| error.to_string())?;
+        let migrated: Value = migrate
+            .call((copied, version))
+            .map_err(|error| error.to_string())?;
+        value = state_value_from_lua(lua, &migrated).map_err(|error| error.to_string())?;
+    }
+    Ok(value)
+}
+
 fn read_value(
     lua: &Lua,
     ctx: &LuaCtx,
@@ -269,16 +282,12 @@ fn read_value(
     if raw.version < definition.version
         && let Some(value) = raw.value.as_ref()
     {
+        if access.is_read_only() {
+            return migrate_value(lua, definition, raw.version, value)
+                .map(|value| (Some(value), raw.revision));
+        }
         ctx.validate_state_migration(lua, access.target())?;
-        let migrate = definition
-            .migrate
-            .as_ref()
-            .ok_or("state_migration_required")?;
-        let copied = state_value_to_lua(lua, value).map_err(|error| error.to_string())?;
-        let migrated: Value = migrate
-            .call((copied, raw.version))
-            .map_err(|error| error.to_string())?;
-        let value = state_value_from_lua(lua, &migrated).map_err(|error| error.to_string())?;
+        let value = migrate_value(lua, definition, raw.version, value)?;
         let revision = ctx.claim_state_effect(lua, || {
             slot.set(access, value.clone(), Some(raw.revision))
                 .map_err(|error| error.to_string())
@@ -585,10 +594,10 @@ pub(crate) const DOCS: crate::docs::ModuleDoc = crate::docs::ModuleDoc {
         crate::docs::FnDoc {
             name: "register",
             args: "{name}, {spec}",
-            desc: "Register a plugin-qualified slot during load. spec supplies scope (agent or session), positive version, and optional synchronous migrate(value, old_version). Registration is transactional with plugin load. Names are local to the plugin and contain no slash; plan/state is reserved for the host.",
+            desc: "Register a plugin-qualified slot during load. spec supplies scope (agent or session), positive version, and optional synchronous migrate(value, old_version). Migration calls it once per version from the stored version through version - 1; each result must be valid strict JSON and becomes the next call's input. Migration cannot yield. Only the final value is journaled after all steps succeed. Registration is transactional with plugin load. Names are local to the plugin and contain no slash; plan/state is reserved for the host.",
             params: &[],
             returns: "(StateSlot) Registered slot.",
-            example: "",
+            example: "local progress = makima.state.register('progress', {\n  scope = 'agent', version = 3,\n  migrate = function(value, old_version)\n    if old_version == 1 then return { count = value } end\n    if old_version == 2 then value.finished = false; return value end\n  end,\n})",
             guard: None,
         },
         crate::docs::FnDoc {
