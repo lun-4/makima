@@ -204,7 +204,7 @@ fn state_logs(s: &impl BaseStrategy, fallback: &Path) -> (PathBuf, PathBuf) {
 /// directories the person running it keeps their sessions and credentials in.
 ///
 /// A scan of test bodies would not give the same guarantee, because tests
-/// reach these directories transitively -- a provider script cache three
+/// reach these directories transitively -- the models.dev catalog cache three
 /// frames below a test that only asked to scan a directory. The lookup itself
 /// has to be unavailable.
 ///
