@@ -558,21 +558,6 @@ local function stream(state, config, model, ctx, request, emit)
   end)
 end
 
--- Streams {request} through {client} (`base` and `headers(extra)`), whose
--- credentials come from elsewhere: plan models speak Responses and the rest
--- Chat Completions, both with the standard effort levels.
-function M.route_stream(client, ctx, request, emit)
-  local max = thinking.max_budget(request.model)
-  local dialect = thinking.dialects.standard
-  if M.plan_window(request.model.id) then
-    local body = responses.build_request(request, responses.reasoning(request.thinking, dialect, max))
-    return responses.post_stream(ctx, client.base .. RESPONSES_PATH, client.headers(), body, emit)
-  end
-  local body = chat.build_request(request, { max_tokens_field = MAX_TOKENS_FIELD, include_stream_usage = true })
-  body.reasoning_effort = thinking.effort(request.thinking, dialect, max)
-  return http.post_stream(ctx, client.base .. CHAT_PATH, client.headers(), body, chat.stream, emit)
-end
-
 local function new_state(ctx, config)
   local configured, err = http.headers(M.def.id, {}, config.headers)
   if not configured then
