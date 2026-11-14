@@ -1444,6 +1444,13 @@ fn checkpoint(event_loop: &mut EventLoop<'_>, index: usize) {
     .unwrap();
 }
 
+fn checkpoint_settled(event_loop: &mut EventLoop<'_>, index: usize) {
+    let manager = event_loop.sessions[index].handles.manager_and_root().0;
+    smol::block_on(manager.wait_settled());
+    let _guard = manager.reserve_graph_transition().unwrap();
+    checkpoint(event_loop, index);
+}
+
 fn assert_preserved(
     event_loop: &EventLoop<'_>,
     host: &PluginHost,
@@ -1807,7 +1814,7 @@ fn parent_navigation_rejects_without_replacing_implementation(changed_cwd: bool)
                 && !requests.is_empty()
         });
         requests.recv_timeout(WAIT).unwrap();
-        checkpoint(event_loop, index);
+        checkpoint_settled(event_loop, index);
         let runtime = &event_loop.sessions[index];
         let implementation = runtime.id();
         let identity = runtime.handles.identity();
@@ -1867,9 +1874,7 @@ fn parent_rewind_preserves_implementation_and_redo_stays_in_parent(lose_source_l
                 && !requests.is_empty()
         });
         requests.recv_timeout(WAIT).unwrap();
-        let (manager, _) = event_loop.sessions[index].handles.manager_and_root();
-        smol::block_on(manager.wait_settled());
-        checkpoint(event_loop, index);
+        checkpoint_settled(event_loop, index);
         let implementation = event_loop.sessions[index].id();
         let link = event_loop.sessions[index]
             .app
@@ -2042,11 +2047,7 @@ fn queued_parent_restore_abort_repairs_projection_without_publishing(handle_afte
                 && !requests.is_empty()
         });
         requests.recv_timeout(WAIT).unwrap();
-        let manager = event_loop.sessions[index].handles.manager_and_root().0;
-        smol::block_on(manager.wait_settled());
-        let checkpoint_guard = manager.reserve_graph_transition().unwrap();
-        checkpoint(event_loop, index);
-        drop(checkpoint_guard);
+        checkpoint_settled(event_loop, index);
         let link = event_loop.sessions[index]
             .app
             .state
@@ -2112,7 +2113,7 @@ fn parent_provider_failure_restores_actual_plan_bytes_and_keeps_implementation()
                 && !requests.is_empty()
         });
         requests.recv_timeout(WAIT).unwrap();
-        checkpoint(event_loop, index);
+        checkpoint_settled(event_loop, index);
         let implementation = event_loop.sessions[index].id();
         let identity = event_loop.sessions[index].handles.identity();
         let link = event_loop.sessions[index]

@@ -32,6 +32,8 @@ use std::{
 };
 use thiserror::Error;
 
+pub const SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
+
 const SHELL_KIND: &str = "execute";
 const CANCELLED: &str = "file restore cancelled";
 const CONTENT_CONFLICT: &str = "current content does not match the recorded post-image";
@@ -277,7 +279,7 @@ pub fn plan_inverse(
     sessions_dir: &Path,
     reference: &TransitionRef,
 ) -> Result<RestorePreview, RestoreError> {
-    if !cfg!(unix) {
+    if !SUPPORTED {
         return Err(RestoreError::Unsupported);
     }
     let store = RestoreStore::new(state_dir(sessions_dir)?);
@@ -325,7 +327,7 @@ async fn prepare_with(
     + Send
     + 'static,
 ) -> Result<PreparedRestore, RestoreError> {
-    if !cfg!(unix) {
+    if !SUPPORTED {
         return Err(RestoreError::Unsupported);
     }
     match (&request.choice, &request.projection) {
@@ -1243,7 +1245,7 @@ fn check_cancel(cancel: &CancelToken) -> Result<(), RestoreError> {
     }
 }
 
-#[cfg(all(test, not(unix)))]
+#[cfg(all(test, not(any(target_os = "linux", target_os = "macos"))))]
 mod unsupported_tests {
     use super::{RestoreError, RestoreRequest, prepare};
     use crate::CancelToken;
@@ -1290,7 +1292,7 @@ mod unsupported_tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::{
         CONTENT_CONFLICT, DISCONTINUOUS, OwnedRestoreLease, PlanProjection, PlannedFile,

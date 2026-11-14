@@ -9,7 +9,7 @@ use makima_providers::{
     MessageKind, Role,
 };
 use makima_storage::conversation::ConversationState;
-use makima_storage::session_state::{StateChange, StoredAgentLifecycle, StoredDeliveryOp};
+use makima_storage::session_state::{StateChange, StoredDeliveryOp};
 use makima_storage::sessions::next_epoch;
 use tracing::warn;
 
@@ -286,16 +286,6 @@ impl History {
                         let mut lens: BTreeMap<_, _> = snapshot
                             .histories
                             .iter()
-                            .filter(|(id, _)| {
-                                snapshot
-                                    .agent_revisions
-                                    .iter()
-                                    .rev()
-                                    .find(|(_, record)| record.id == **id)
-                                    .is_none_or(|(_, record)| {
-                                        record.lifecycle == StoredAgentLifecycle::Open
-                                    })
-                            })
                             .map(|(id, history)| (*id, (history.epoch, history.messages.len())))
                             .collect();
                         lens.insert(*agent, (self.snapshot.epoch, offset));
@@ -672,7 +662,9 @@ mod tests {
     use crate::ToolOutput;
     use makima_providers::{ContentBlock, Message, Role, TokenUsage};
     use makima_storage::id::TurnId;
-    use makima_storage::session_state::{StoredAgentRecord, StoredDeliveryOp};
+    use makima_storage::session_state::{
+        StoredAgentLifecycle, StoredAgentRecord, StoredDeliveryOp,
+    };
     use makima_storage::sessions::Session;
     use test_case::test_case;
 

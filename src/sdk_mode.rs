@@ -755,19 +755,22 @@ impl SdkRuntime {
             .id
             .clone()
             .unwrap_or_else(|| SessionRef::from(MakimaId::generate()));
-        let root_id = restored.root_id.unwrap_or_else(AgentId::generate);
         let (checkpoint, lock_guard, recovered) = recover_sdk_session(
             &mut restored,
             storage,
             &session_id,
-            root_id,
             &model.spec(),
             &working_dir,
             &lua_handle.mode_registry(),
         )
         .await?;
+        let root_id = recovered
+            .session()
+            .root_agent_id()
+            .ok_or_else(|| eyre!("recovered session has no root agent"))?;
         restored.history = recovered.session().history_snapshot();
         restored.meta = recovered.session().meta.clone();
+        restored.model = Some(recovered.session().model.clone());
         restored.root_id = Some(root_id);
         restored.journal = Some(recovered.journal());
         let recovered_state = recovered.session().latest_state()?;
@@ -1725,7 +1728,6 @@ async fn recover_sdk_session(
     restored: &mut ResolvedSession,
     storage: &StateDir,
     session_id: &SessionRef,
-    root_id: AgentId,
     model: &str,
     cwd: &str,
     modes: &ModeRegistry,
@@ -1765,14 +1767,30 @@ async fn recover_sdk_session(
     .await
     .map_err(|error| eyre!(error.to_string()))
     .context("reconcile pending file restores")?;
-    let restore_legacy = restored.seed.is_some();
-    let mut seed = restored.seed.take().unwrap_or_else(|| {
-        let mut seed = StoredSession::new(model, cwd);
+    let owned_seed = match StoredSession::load(session_id.id(), storage) {
+        Ok(seed) => Some(seed),
+        Err(makima_storage::sessions::SessionError::Storage(
+            makima_storage::StorageError::NotFound(_),
+        )) if restored.seed.is_none() => None,
+        Err(error) => return Err(eyre!("reload owned session {session_id}: {error}")),
+    };
+    if owned_seed.is_some() && restored.seed.is_none() && restored.parent.is_some() {
+        return Err(eyre!(FORK_DESTINATION_EXISTS));
+    }
+    let restore_legacy = owned_seed.is_some();
+    let mut seed = if let Some(seed) = owned_seed {
+        if let Some(block) = session_lock::resume_block(&seed.cwd, cwd, false) {
+            return Err(eyre!("session {session_id}: {block}"));
+        }
+        seed
+    } else {
+        let mut seed = StoredSession::new(restored.model.as_deref().unwrap_or(model), cwd);
         seed.id = session_id.id();
         seed.adopt_history(&restored.history);
         seed.meta = restored.meta.clone();
         seed
-    });
+    };
+    let root_id = seed.root_agent_id().unwrap_or_else(AgentId::generate);
     seed.bind_root_id(root_id)?;
     if restore_legacy
         && let Some(warning) =
@@ -1780,7 +1798,7 @@ async fn recover_sdk_session(
     {
         warn!(%warning, "legacy mode restoration fell back to build");
     }
-    if restored.parent.is_some() {
+    if !restore_legacy && restored.parent.is_some() {
         seed.set_parent(restored.parent.clone());
     }
     let checkpoint = Arc::new(SessionLogCheckpoint::open_with_session(
@@ -2706,7 +2724,7 @@ mod tests {
         RestoreTransition, TransitionRef,
     };
     use makima_storage::restore_digest::session_digest;
-    use makima_storage::session_state::StateChange;
+    use makima_storage::session_state::{StateChange, StoredAgentConfig, StoredStateRecord};
     use makima_storage::sessions::Prefs;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -3081,6 +3099,217 @@ mod tests {
         smol::block_on(fresh.close()).unwrap();
     }
 
+    #[test_case("-c", true, false; "valued_continue")]
+    #[test_case("--session-id", true, false; "pinned_existing")]
+    #[test_case("-l", true, false; "last")]
+    #[test_case("--session-id", false, false; "pinned_created_before_claim")]
+    #[test_case("-c", true, true; "restore_published_before_claim")]
+    fn sdk_recovery_reloads_checkpoint_published_after_resolution(
+        flag: &str,
+        existing: bool,
+        pending: bool,
+    ) {
+        use clap::Parser;
+
+        smol::block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let storage = StateDir::from_path(directory.path().to_path_buf());
+            let cwd = directory.path().to_string_lossy().into_owned();
+            let mut saved = StoredSession::new(STARTUP_MODEL, &cwd);
+            if existing {
+                saved.save(&storage).unwrap();
+            }
+            let mut args = vec!["makima".to_owned(), flag.to_owned()];
+            if flag != "-l" {
+                args.push(saved.id.to_string());
+            }
+            let cli = Cli::parse_from(args);
+            let mut restored = resolve_session(&cli, &cwd, &storage).unwrap();
+            let sessions_dir = storage.ensure_subdir(SESSIONS_DIR).unwrap();
+            let competing_lease = session_lock::claim(&sessions_dir, &saved.id)
+                .unwrap()
+                .unwrap();
+            let root = AgentId::generate();
+            saved.bind_root_id(root).unwrap();
+            saved.set_model(RESTORED_MODEL.into());
+            saved.push_message(Message::user(SDK_ROOT_PROMPT.into()));
+            saved.meta.input_draft = Some(SDK_CHILD_PROMPT.into());
+            let parent = ParentLink {
+                session: MakimaId::generate(),
+                message_count: 0,
+                seq: 0,
+            };
+            saved.set_parent(Some(parent.clone()));
+            let modes = ModeRegistry::builtin();
+            let config = StoredAgentConfig {
+                cwd: cwd.clone(),
+                model: RESTORED_MODEL.into(),
+                thinking: None,
+                fast: true,
+                workflow: false,
+                mode: modes
+                    .get(&ModeId::Build)
+                    .unwrap()
+                    .stored_snapshot(&AgentMode::Build),
+                options: BTreeMap::new(),
+            };
+            saved.push_state(StoredStateRecord {
+                seq: saved.sequence_high_water().unwrap_or_default() + 1,
+                agent: Some(root),
+                generation: 0,
+                change: StateChange::Config(config.clone()),
+            });
+            saved.save(&storage).unwrap();
+            let path = directory.path().join(LEGACY_PLAN_FILE);
+            let reference = pending.then(|| {
+                let reference = pending_sdk_restore(&storage, &saved, &path);
+                saved.push_restore_ref(reference.clone());
+                saved.save(&storage).unwrap();
+                std::fs::write(&path, LEGACY_PLAN_CONTENT).unwrap();
+                reference
+            });
+            competing_lease.release().unwrap();
+
+            let (checkpoint, lease, recovered) = recover_sdk_session(
+                &mut restored,
+                &storage,
+                &SessionRef::from(saved.id),
+                STARTUP_MODEL,
+                &cwd,
+                &modes,
+            )
+            .await
+            .unwrap();
+            checkpoint.drain().await.unwrap();
+            let durable = StoredSession::load(saved.id, &storage).unwrap();
+            if let Some(reference) = &reference {
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), RESTORE_CHANGED);
+                assert_eq!(
+                    RestoreStore::new(storage.clone())
+                        .load(reference)
+                        .unwrap()
+                        .progress
+                        .last(),
+                    Some(&RestoreProgress::Complete)
+                );
+            }
+            for session in [recovered.session(), &durable] {
+                assert_eq!(session.restore_refs(), saved.restore_refs());
+                assert_eq!(session.model, RESTORED_MODEL);
+                assert_eq!(session.root_agent_id(), Some(root));
+                assert_eq!(session.parent(), Some(&parent));
+                assert_eq!(session.messages(), saved.messages());
+                assert_eq!(session.meta.input_draft.as_deref(), Some(SDK_CHILD_PROMPT));
+                assert_eq!(
+                    session.latest_state().unwrap().scopes[&Some(root)].config,
+                    Some(config.clone())
+                );
+            }
+            drop(lease);
+        });
+    }
+
+    #[test_case(false, RESTORED_MODEL; "inherits_source_model")]
+    #[test_case(true, STARTUP_MODEL; "explicit_model_overrides_source")]
+    fn sdk_fork_recovers_source_model_before_runtime_startup(explicit_model: bool, expected: &str) {
+        use clap::Parser;
+
+        let directory = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(directory.path().to_path_buf());
+        let cwd = directory.path().to_string_lossy().into_owned();
+        let mut source = StoredSession::new(RESTORED_MODEL, &cwd);
+        source.push_message(Message::user(SDK_ROOT_PROMPT.into()));
+        source.save(&storage).unwrap();
+        let source_path = storage
+            .path()
+            .join(SESSIONS_DIR)
+            .join(format!("{}.jsonl", source.id));
+        let source_bytes = std::fs::read(&source_path).unwrap();
+        let mut params = reset_sdk_params(directory.path().to_path_buf());
+        params.cli = Cli::parse_from(["makima", "-c", &source.id.to_string(), "--fork-session"]);
+        params.model = sdk_model(STARTUP_MODEL);
+        params.explicit_model = explicit_model;
+        params.providers = Arc::new(makima_providers::test_util::offline_ids(&[
+            "anthropic",
+            "openai",
+        ]));
+        let (out_tx, _out_rx) = flume::unbounded();
+        let session = SdkSession::new(params, storage.clone(), out_tx).unwrap();
+        let runtime = session.current();
+        assert_ne!(runtime.handle.session_id.id(), source.id);
+        assert_eq!(
+            runtime
+                .root
+                .target
+                .effective_config()
+                .unwrap()
+                .unwrap()
+                .settings
+                .model
+                .spec(),
+            expected
+        );
+        smol::block_on(runtime.checkpoint.drain()).unwrap();
+        let saved = StoredSession::load(runtime.handle.session_id.id(), &storage).unwrap();
+        assert_eq!(saved.parent().unwrap().session, source.id);
+        assert_eq!(saved.messages(), source.messages());
+        assert_eq!(
+            saved.latest_state().unwrap().scopes[&Some(runtime.root.target.id())]
+                .config
+                .as_ref()
+                .unwrap()
+                .model,
+            expected
+        );
+        assert_eq!(std::fs::read(source_path).unwrap(), source_bytes);
+        smol::block_on(runtime.close()).unwrap();
+    }
+
+    #[test]
+    fn sdk_recovery_does_not_recreate_previously_resolved_missing_session() {
+        use clap::Parser;
+
+        smol::block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let storage = StateDir::from_path(directory.path().to_path_buf());
+            let cwd = directory.path().to_string_lossy().into_owned();
+            let mut saved = StoredSession::new(RESTORED_MODEL, &cwd);
+            saved.push_message(Message::user(SDK_ROOT_PROMPT.into()));
+            saved.save(&storage).unwrap();
+            let cli = Cli::parse_from(["makima", "-c", &saved.id.to_string()]);
+            let mut restored = resolve_session(&cli, &cwd, &storage).unwrap();
+            let sessions_dir = storage.ensure_subdir(SESSIONS_DIR).unwrap();
+            let competing_lease = session_lock::claim(&sessions_dir, &saved.id)
+                .unwrap()
+                .unwrap();
+            let path = sessions_dir.join(format!("{}.jsonl", saved.id));
+            std::fs::remove_file(&path).unwrap();
+            competing_lease.release().unwrap();
+
+            let result = recover_sdk_session(
+                &mut restored,
+                &storage,
+                &SessionRef::from(saved.id),
+                STARTUP_MODEL,
+                &cwd,
+                &ModeRegistry::builtin(),
+            )
+            .await;
+            let error = result.err().expect("a missing resolved session must fail");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with(&format!("reload owned session {}:", saved.id))
+            );
+            assert!(!path.exists());
+            assert!(
+                session_lock::claim(&sessions_dir, &saved.id)
+                    .unwrap()
+                    .is_some()
+            );
+        });
+    }
+
     #[test_case(false; "published_forward")]
     #[test_case(true; "published_conflict_blocks_recovery")]
     fn sdk_reconciles_published_restore_before_checkpoint_recovery(conflict: bool) {
@@ -3117,7 +3346,6 @@ mod tests {
                 &mut restored,
                 &storage,
                 &SessionRef::from(saved.id),
-                root,
                 RESET_MODEL,
                 &cwd,
                 &ModeRegistry::builtin(),
@@ -4145,7 +4373,6 @@ mod tests {
                     &mut restored,
                     &storage,
                     &SessionRef::from(id),
-                    root_id,
                     STARTUP_MODEL,
                     &cwd,
                     &ModeRegistry::builtin(),

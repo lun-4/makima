@@ -1672,14 +1672,7 @@ impl SessionJournal {
                             .filter(|(_, record)| affected.contains(&record.id))
                             .cloned(),
                     );
-                    let boundaries: BTreeSet<_> = candidate.state.iter().filter_map(|record| matches!(record.change, StateChange::Boundary { .. }).then_some(record.seq)).collect();
-                    for record in &restored.state {
-                        if matches!(&record.change, StateChange::BoundarySnapshot { boundary, .. } if boundaries.contains(boundary))
-                            && !candidate.state.iter().any(|saved| matches!((&saved.change, &record.change), (StateChange::BoundarySnapshot { boundary: existing, .. }, StateChange::BoundarySnapshot { boundary, .. }) if existing == boundary))
-                        {
-                            crate::rewind::push(&mut candidate, None, 0, record.change.clone())?;
-                        }
-                    }
+                    crate::rewind::carry_boundary_pins(&restored, &mut candidate)?;
                     candidate.state.sort_by_key(|record| record.seq);
                     candidate.agent_revisions.sort_by_key(|(seq, _)| *seq);
                     candidate.histories.retain(|id, _| !affected.contains(id));

@@ -57,7 +57,9 @@ fn root(lua: &Lua, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<LuaAgentRef>> 
     ))
 }
 
-/// Resolve an agent reference or stable ID with current control authority.
+/// Resolve an agent reference or durable agent ID with current control authority.
+/// Resolution does not reactivate a dormant agent. Saved IDs can be resolved in
+/// the restored session graph.
 /// @param ctx LuaCtx Invocation context.
 /// @param reference AgentRef|string Visibility-only reference or stable agent ID.
 /// @return (Agent?, string?) Nonowning handle or error.
@@ -152,7 +154,7 @@ fn list(lua: &Lua, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<Table>> {
 /// @param opts table Optional creation fields:
 ///   model (string|table): a spec or `{spec, thinking, fast}` selection, validated
 ///     like `Agent:set_model`; omitted fields inherit, thinking is capped at the
-///     parent's level, and `Agent:model` results can be passed as is.
+///     parent's level, and `Agent:config(ctx).model` results can be passed as is.
 ///   system (string): custom text appended after the admitted mode's prompt contribution; defaults to empty and does not inherit the parent's full system prompt.
 ///   tools (array): request definitions; omitted inherits permitted parent tools.
 ///   local_tools (table): name-keyed Lua tool specs with description, input_schema,

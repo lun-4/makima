@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::UNIX_EPOCH;
 
@@ -24,9 +24,9 @@ use crate::plans::{PLAN_STATE_KEY, PLAN_STATE_VERSION, PlanEntry, PlanSlot};
 use crate::restore::{RestoreError, RestoreStore, TransitionRef};
 use crate::session_lock::SessionPublicationGuard;
 use crate::session_state::{
-    ParentLink, SessionStateView, StateChange, StateFoldError, StoredAgentConfig,
-    StoredAgentLifecycle, StoredAgentRecord, StoredBranch, StoredDeliveryOp, StoredModeSnapshot,
-    StoredStateRecord, StoredTurnResult,
+    BOUNDARY_POOL_FORMAT, BOUNDARY_POOLS_FEATURE, ParentLink, SessionStateView, StateChange,
+    StateFoldError, StoredAgentConfig, StoredAgentLifecycle, StoredAgentRecord, StoredBranch,
+    StoredDeliveryOp, StoredModeSnapshot, StoredStateRecord, StoredTurnResult,
 };
 use makima_domain::TokenUsage;
 use serde::de::DeserializeOwned;
@@ -349,6 +349,7 @@ pub struct Session<M, U, T> {
     /// `epoch` so `set_history` adopting a producer's snapshot can never
     /// erase a locally minted void: cursor validity is the pair.
     rewrites: u64,
+    checkpoint_required: Arc<AtomicBool>,
 }
 
 #[derive(Serialize)]
@@ -577,6 +578,7 @@ pub struct SessionLog {
     /// changes (title, draft, updated_at) instead of dropping them.
     saved_meta: Vec<u8>,
     saved_header: (String, String),
+    saved_features: BTreeSet<String>,
 }
 
 #[derive(Debug)]
@@ -600,6 +602,7 @@ pub struct StagedCheckpoint {
     path: PathBuf,
     cwd: String,
     session_id: MakimaId,
+    checkpoint_required: Arc<AtomicBool>,
 }
 
 impl StagedCheckpoint {
@@ -682,6 +685,7 @@ impl StagedCheckpoint {
             }
             return Err(StorageError::from(error.error).into());
         }
+        self.checkpoint_required.store(true, Ordering::Release);
         *generation = generation.wrapping_add(1);
         if let Err(error) = sync_directory(&self.path) {
             warn!(%error, session_id = %self.session_id, published = true, durability_confirmed = false, "session replacement is live but directory sync failed; retaining all branches");
@@ -993,6 +997,7 @@ impl SessionLog {
         // spend an archive slot, since taking one prunes the oldest.
         archive_if_shrinking(dir, session);
         fs::rename(&tmp, &path).map_err(StorageError::from)?;
+        session.checkpoint_required.store(true, Ordering::Release);
         *generation = generation.wrapping_add(1);
         crate::sync_parent_dir(&path);
         let file = OpenOptions::new()
@@ -1034,6 +1039,7 @@ impl SessionLog {
             path,
             cwd: session.header_cache()?.1,
             session_id: session.id,
+            checkpoint_required: Arc::clone(&session.checkpoint_required),
         })
     }
 
@@ -1096,7 +1102,9 @@ impl SessionLog {
         }
         session.latest_state()?;
         self.ensure_appendable(session)?;
-        if session.header_cache()? != self.saved_header {
+        if session.header_cache()? != self.saved_header
+            || session_features(session) != self.saved_features
+        {
             return Err(SessionError::LogDiverged {
                 reason: HEADER_CHANGED,
             });
@@ -1231,6 +1239,7 @@ impl SessionLog {
             saved_sub_msg_counts: sub_msg_snapshot(&session.subagent_messages),
             saved_meta: meta_record(session).unwrap_or_default(),
             saved_header: session.header_cache().unwrap_or_default(),
+            saved_features: session_features(session),
         }
     }
 
@@ -1317,6 +1326,18 @@ where
     Ok(buf)
 }
 
+fn session_features<M, U, T>(session: &Session<M, U, T>) -> BTreeSet<String> {
+    let mut features = session.features.clone();
+    features.remove(BOUNDARY_POOLS_FEATURE);
+    if session.state.iter().any(|record| matches!(&record.change,
+        StateChange::BoundarySnapshot { snapshot, .. }
+            if snapshot.get("format").and_then(serde_json::Value::as_str) == Some(BOUNDARY_POOL_FORMAT)))
+    {
+        features.insert(BOUNDARY_POOLS_FEATURE.into());
+    }
+    features
+}
+
 fn write_full_session<M, U, T>(
     file: &mut File,
     session: &Session<M, U, T>,
@@ -1337,7 +1358,7 @@ where
             cwd,
             created_at: session.created_at,
             parent: session.parent.clone(),
-            features: session.features.clone(),
+            features: session_features(session),
         },
     )?;
     for msg in session.messages.iter() {
@@ -1539,7 +1560,11 @@ where
                     expected: LOG_FORMAT_VERSION,
                 });
             }
-            if !header.features.is_empty() {
+            if header
+                .features
+                .iter()
+                .any(|feature| feature != BOUNDARY_POOLS_FEATURE)
+            {
                 return Err(SessionError::UnsupportedFeatures {
                     features: header.features,
                 });
@@ -1580,7 +1605,10 @@ where
                         expected: LOG_FORMAT_VERSION,
                     });
                 }
-                if !h_features.is_empty() {
+                if h_features
+                    .iter()
+                    .any(|feature| feature != BOUNDARY_POOLS_FEATURE)
+                {
                     return Err(SessionError::UnsupportedFeatures {
                         features: h_features,
                     });
@@ -1641,6 +1669,15 @@ where
         path: display_path.to_string(),
     })?;
 
+    if state.iter().any(|record| matches!(&record.change,
+        StateChange::BoundarySnapshot { snapshot, .. }
+            if snapshot.get("format").and_then(serde_json::Value::as_str) == Some(BOUNDARY_POOL_FORMAT)))
+        && !features.contains(BOUNDARY_POOLS_FEATURE)
+    {
+        return Err(SessionError::UnsupportedFeatures {
+            features: BTreeSet::from([BOUNDARY_POOLS_FEATURE.into()]),
+        });
+    }
     remap_loaded_history_epochs(&mut state, &mut history_epochs, next_epoch);
     mark_duplicate_subagent_identities(&mut subagents);
     let mut session = Session {
@@ -1677,6 +1714,7 @@ where
         content_revision: 0,
         epoch: next_epoch(),
         rewrites: 0,
+        checkpoint_required: Arc::new(AtomicBool::new(true)),
     };
     if version == LEGACY_LOG_FORMAT_VERSION {
         session.legacy_config = Some(LegacyConfig::from_meta(&session.meta));
@@ -1987,7 +2025,10 @@ fn scan_jsonl_header(path: &Path) -> Option<ScannedHeader> {
     reader.read_until(b'\n', &mut line).ok()?;
     let header: JsonlHeader = serde_json::from_slice(line.trim_ascii_end()).ok()?;
     if !matches!(header.v, LEGACY_LOG_FORMAT_VERSION | LOG_FORMAT_VERSION)
-        || !header.features.is_empty()
+        || header
+            .features
+            .iter()
+            .any(|feature| feature != BOUNDARY_POOLS_FEATURE)
     {
         return None;
     }
@@ -2345,7 +2386,12 @@ where
             content_revision: 0,
             epoch: next_epoch(),
             rewrites: 0,
+            checkpoint_required: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn checkpoint_required(&self) -> bool {
+        self.checkpoint_required.load(Ordering::Acquire)
     }
 
     pub fn bind_root_id(&mut self, id: AgentId) -> Result<(), SessionError> {
@@ -2475,6 +2521,10 @@ where
             });
         }
         replacement.latest_state()?;
+        if replacement.checkpoint_required() {
+            self.checkpoint_required.store(true, Ordering::Release);
+        }
+        replacement.checkpoint_required = Arc::clone(&self.checkpoint_required);
         replacement.sequence_high_water = self
             .sequence_high_water()
             .max(replacement.sequence_high_water());
@@ -3339,6 +3389,70 @@ mod tests {
         (dir, session)
     }
 
+    #[test_case(false; "saved_origin")]
+    #[test_case(true; "staged_publication_origin")]
+    fn checkpoint_existence_is_shared_across_clones_and_authoritative_replacement(staged: bool) {
+        let directory = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/project");
+        let earlier_clone = session.clone();
+        assert!(!session.checkpoint_required());
+        if staged {
+            let pending = SessionLog::stage_checkpoint(directory.path(), &session).unwrap();
+            assert!(!session.checkpoint_required());
+            pending.publish_unowned(|| true).unwrap();
+        } else {
+            session.save_to(directory.path()).unwrap();
+        }
+        assert!(session.checkpoint_required());
+        assert!(earlier_clone.checkpoint_required());
+        let mut replacement = TestSession::new("model", "/project");
+        replacement.id = session.id;
+        session.replace_authoritative(replacement).unwrap();
+        assert!(session.checkpoint_required());
+        assert!(session.clone().checkpoint_required());
+        let loaded = TestSession::load_from(session.id, directory.path()).unwrap();
+        assert!(loaded.checkpoint_required());
+        let mut fresh = TestSession::new("model", "/project");
+        fresh.id = session.id;
+        let fresh_clone = fresh.clone();
+        fresh.replace_authoritative(loaded).unwrap();
+        assert!(fresh.checkpoint_required());
+        assert!(fresh_clone.checkpoint_required());
+    }
+
+    #[test_case(false, false; "cancelled")]
+    #[test_case(true, false; "failed_rename")]
+    #[test_case(true, true; "published_unsynced")]
+    fn checkpoint_origin_changes_only_after_successful_rename(publish: bool, sync_failure: bool) {
+        let directory = TempDir::new().unwrap();
+        let session = TestSession::new("model", "/project");
+        let earlier_clone = session.clone();
+        let staged = SessionLog::stage_checkpoint(directory.path(), &session).unwrap();
+        if publish && !sync_failure {
+            fs::remove_file(staged.temporary.path()).unwrap();
+        }
+        let outcome = staged.publish_with_sync(
+            || publish,
+            |_| Err(StorageError::Io(io::Error::other(POST_TEXT))),
+        );
+        if sync_failure {
+            assert!(matches!(
+                outcome.unwrap(),
+                PublicationOutcome::PublishedUnsynced(_)
+            ));
+        } else if publish {
+            assert!(outcome.is_err());
+        } else {
+            assert!(matches!(outcome.unwrap(), PublicationOutcome::NotPublished));
+        }
+        assert_eq!(session.checkpoint_required(), sync_failure);
+        assert_eq!(earlier_clone.checkpoint_required(), sync_failure);
+        assert_eq!(
+            jsonl_path(directory.path(), session.id).exists(),
+            sync_failure
+        );
+    }
+
     #[test]
     fn restore_references_round_trip_append_deduplicate_and_survive_replacement() {
         let (dir, mut session) = branch_fixture();
@@ -3354,6 +3468,9 @@ mod tests {
         session.push_restore_ref(first.clone());
         let mut log = SessionLog::rewrite(dir.path(), &session).unwrap();
         let loaded = TestSession::load_from(session.id, dir.path()).unwrap();
+        assert!(session.checkpoint_required());
+        assert!(loaded.checkpoint_required());
+        assert!(loaded.clone().checkpoint_required());
         assert_eq!(loaded.restore_refs(), from_ref(&first));
         let revision = session.revision();
         session.push_restore_ref(first.clone());
@@ -7090,6 +7207,84 @@ mod tests {
             "{error}"
         );
         assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn pooled_boundary_feature_is_emitted_only_for_actual_payloads_and_forces_header_rewrite() {
+        let directory = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/project");
+        let root = AgentId::generate();
+        session.bind_root_id(root).unwrap();
+        let boundary = session.next_state_seq();
+        session.push_state(StoredStateRecord {
+            seq: boundary,
+            agent: Some(root),
+            generation: 0,
+            change: StateChange::Boundary {
+                offset: 0,
+                lens: BTreeMap::from([(root, (7, 0))]),
+            },
+        });
+        let mut log = SessionLog::rewrite(directory.path(), &session).unwrap();
+        assert!(
+            TestSession::load_from(session.id, directory.path())
+                .unwrap()
+                .features()
+                .is_empty()
+        );
+        let snapshot = serde_json::json!({
+            "format":super::BOUNDARY_POOL_FORMAT,"boundaries":[boundary],
+            "state":session.state(),"agents":session.agent_revisions(),
+            "histories":{root.to_string():{"epoch":7,"compacted":false,"messages":[]}}
+        });
+        let sequence = session.next_state_seq();
+        session.push_state(StoredStateRecord {
+            seq: sequence,
+            agent: None,
+            generation: 0,
+            change: StateChange::BoundarySnapshot { boundary, snapshot },
+        });
+        assert!(matches!(
+            log.append(&session),
+            Err(SessionError::LogDiverged {
+                reason: super::HEADER_CHANGED
+            })
+        ));
+        session.save_to(directory.path()).unwrap();
+        let mut loaded = TestSession::load_from(session.id, directory.path()).unwrap();
+        assert_eq!(
+            loaded.features(),
+            &BTreeSet::from([super::BOUNDARY_POOLS_FEATURE.to_owned()])
+        );
+        assert_eq!(TestSession::list_all_in(directory.path()).unwrap().len(), 1);
+        let path = jsonl_path(directory.path(), session.id);
+        let before = fs::read_to_string(&path).unwrap();
+        let mut lines = before.lines();
+        let mut header: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        header["features"] = serde_json::json!([]);
+        fs::write(
+            &path,
+            format!("{header}\n{}\n", lines.collect::<Vec<_>>().join("\n")),
+        )
+        .unwrap();
+        assert!(matches!(
+            TestSession::load_from(session.id, directory.path()),
+            Err(SessionError::UnsupportedFeatures { .. })
+        ));
+        let state = loaded
+            .state()
+            .iter()
+            .filter(|record| !matches!(record.change, StateChange::BoundarySnapshot { .. }))
+            .cloned()
+            .collect();
+        loaded.replace_state(state);
+        loaded.save_to(directory.path()).unwrap();
+        assert!(
+            TestSession::load_from(session.id, directory.path())
+                .unwrap()
+                .features()
+                .is_empty()
+        );
     }
 
     #[test_case(true; "unsupported_feature")]

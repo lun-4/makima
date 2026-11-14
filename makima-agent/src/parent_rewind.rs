@@ -2,7 +2,7 @@ use crate::ToolOutput;
 use crate::journal::SessionJournal;
 use crate::rewind::{RewindBoundary, RewindError};
 use makima_providers::{Message, TokenUsage};
-use makima_storage::session_state::{ParentLink, StateChange};
+use makima_storage::session_state::ParentLink;
 use makima_storage::sessions::Session;
 use thiserror::Error;
 
@@ -91,10 +91,8 @@ pub fn boundaries(
         let Some(history) = candidate.histories.get(&root) else {
             continue;
         };
-        let pinned = parent.state().iter().any(|record| {
-            matches!(record.change,
-            StateChange::BoundarySnapshot { boundary, .. } if boundary == *seq)
-        });
+        let pinned = crate::rewind::has_boundary_pin(parent.state(), *seq)
+            .map_err(|error| ParentRewindError::Invalid(error.to_string()))?;
         let preview = (!pinned)
             .then(|| {
                 parent

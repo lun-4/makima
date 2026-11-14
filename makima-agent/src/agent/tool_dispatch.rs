@@ -14,7 +14,10 @@ use tracing::{debug, error, warn};
 
 use crate::actor::ActorHistory;
 use crate::call_scope::{CallGuard, CallScope, MovedBy};
-use crate::file_restore::recording::{SHELL_KIND, ToolRecording};
+use crate::file_restore::{
+    SUPPORTED,
+    recording::{SHELL_KIND, ToolRecording},
+};
 use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
 use crate::tools::hook::{
     Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, OUTPUT_TRAILER, Verdict,
@@ -960,7 +963,7 @@ async fn execute_recorded(
     path: Option<PathBuf>,
     is_shell: bool,
 ) -> ToolExecResult {
-    let path = path.filter(|_| cfg!(unix));
+    let path = path.filter(|_| SUPPORTED);
     let recording = match if path.is_some() || is_shell {
         ToolRecording::from_context(ctx)
     } else {
@@ -1499,7 +1502,7 @@ mod tests {
         DefaultEffect, Effect, Permission, PermissionRule, PermissionsConfig, ToolKey,
     };
     use makima_storage::StateDir;
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use makima_storage::blobs::{BlobStore, FileState};
     use makima_storage::checkpoint::{CheckpointWriter, accept_all};
     use makima_storage::id::MakimaId;
@@ -1511,7 +1514,7 @@ mod tests {
     use crate::call_scope::CallHome;
     use crate::cancel::CancelToken;
     use crate::file_restore::StoredSession;
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use crate::manager::{GraphLifecycle, ReactivationError, ResidentAgent};
     use crate::mcp::test_support::{stub_session, stub_session_with_result};
     use crate::mcp::tool_names;
@@ -1539,7 +1542,7 @@ mod tests {
         ControlWork, CurrentManagedTurn, DoneReason, EffectiveAgentConfig, RunSettings,
         TurnContext, TurnOutcome, WorkKind,
     };
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use crate::{ModeDef, ModeId};
     use makima_storage::plans::PlanSlot;
     use makima_storage::session_state::{SessionStateView, StateChange};
@@ -4268,7 +4271,7 @@ mod tests {
         });
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn unsupported_restore_capture_does_not_block_persistent_mutation_dispatch() {
         smol::block_on(async {
@@ -4330,7 +4333,7 @@ mod tests {
         });
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn dormant_reactivation_waits_for_cancelled_nested_write_postcapture() {
         smol::block_on(async {

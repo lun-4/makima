@@ -53,8 +53,8 @@ const AFTER_TURN_NEEDS_IDLE: &str = "send: after_turn needs when = \"idle\"";
 const NO_SESSION_OPTIONS: &str = "agent belongs to no session with options";
 const TYPED_OPTIONS: [&str; 3] = [MODEL_OPTION_ID, THINKING_OPTION_ID, FAST_OPTION_ID];
 
-/// Read the stable agent ID.
-/// @return (string?, string?) Agent ID.
+/// Read the durable agent ID, retained across session restart.
+/// @return (string?, string?) Agent ID, distinct from the session ID and turn IDs.
 #[lua_fn(name = "id")]
 fn agent_id(_lua: &Lua, this: &LuaAgent) -> mlua::Result<Pair<String>> {
     Ok((Some(this.identity()), None))
@@ -69,7 +69,7 @@ fn agent_is_live(_lua: &Lua, this: &LuaAgent) -> mlua::Result<Pair<bool>> {
 
 /// Read lifecycle, active turn, queue size, and cumulative usage.
 /// @param ctx LuaCtx Invocation context.
-/// @return (table?, string?) Fields: id (string), status ("idle", "working", or "closed", the vocabulary `makima.session` uses, which adds "needs_input"), queued (integer), active_turn (string or nil), input_tokens and output_tokens (cumulative integers). Authorized held managed handles retain a closed snapshot after graph removal.
+/// @return (table?, string?) Fields: id (string), live (boolean, whether an open resident actor exists), status ("idle", "working", or "closed", the vocabulary `makima.session` uses, which adds "needs_input"), queued (integer), active_turn (string or nil), input_tokens and output_tokens (cumulative integers). Dormant agents report live=false without reactivation. Authorized held managed handles retain a closed snapshot after graph removal.
 #[lua_fn(name = "status")]
 fn agent_status(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<Table>> {
     try_pair!(observe(lua, &ctx, this));
@@ -130,7 +130,7 @@ fn session_coordinator(lua: &Lua, agent: &LuaAgent) -> Result<SessionCoordinator
     SessionCoordinatorHandle::resolve(session.id()).map_err(|error| error.to_string())
 }
 
-/// Read the committed configuration.
+/// Read the committed configuration without reactivating a dormant agent.
 /// @param ctx LuaCtx Invocation context.
 /// @return (table?, string?) `{ version, model, mode, options }`. version is the committed config generation; model is the normalized selection `{spec, thinking, fast}` (thinking is a setting string or budget integer, disabled options are "off" and false); mode is the registered mode name; options maps every other session option id (workflow, yolo, plugin options such as `bash.auto_mode`) to its value. workflow is the agent's own; yolo and plugin options belong to the session, so a child reads its root's. The committed config is what the next turn admits; `ctx:model()` and `ctx:mode()` describe the turn already running.
 #[lua_fn(name = "config")]
@@ -488,6 +488,11 @@ fn send_options(opts: &Table) -> mlua::Result<(When, TurnAdmissionOptions)> {
 /// without interrupting a provider request or tool, or starts a turn when
 /// there is none; `"queue"` queues a distinct turn behind admitted work.
 /// Wait for the result with `AgentTurn:wait`.
+/// A dormant agent is reactivated from its saved configuration and capabilities
+/// before admission. Reactivation can fail with `not_restorable`,
+/// `provider_unavailable`, `model_unavailable`, `tool_unavailable`,
+/// `mcp_unavailable`, or `tool_completion_pending` while earlier writes settle.
+/// A failed reactivation admits no turn.
 /// @param ctx LuaCtx Invocation context.
 /// @param message string User message (text only).
 /// @param opts table Required `when` ("idle", "join" or "queue"). `existing_only` (join only) joins compatible work or returns busy without starting a turn. `after_turn` (idle only) must match the latest terminal turn, including failure or cancellation.

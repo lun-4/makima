@@ -324,6 +324,84 @@ mod tests {
         assert_eq!(session_digest(&reloaded).unwrap(), expected);
     }
 
+    #[test]
+    fn grouped_prefix_pool_preserves_digest_and_epoch_partitions_across_independent_imports() {
+        let directory = TempDir::new().unwrap();
+        let mut session = fixture(false);
+        let root = session.root_agent_id().unwrap();
+        let child = session
+            .agents()
+            .keys()
+            .copied()
+            .find(|id| *id != root)
+            .unwrap();
+        let root_epoch = next_epoch();
+        let child_epoch = next_epoch();
+        let lens = [(root, (root_epoch, 1)), (child, (child_epoch, 1))].into();
+        let boundary = push(
+            &mut session,
+            Some(root),
+            StateChange::Boundary { offset: 1, lens },
+        );
+        let snapshot = json!({
+            "format":crate::session_state::BOUNDARY_POOL_FORMAT,"boundaries":[boundary],
+            "state":session.state(),"agents":session.agent_revisions(),
+            "histories":{
+                root.to_string():{"epoch":root_epoch,"compacted":false,"messages":["root","tail"]},
+                child.to_string():{"epoch":child_epoch,"compacted":false,"messages":["child","tail"]}
+            }
+        });
+        push(
+            &mut session,
+            None,
+            StateChange::BoundarySnapshot { boundary, snapshot },
+        );
+        let expected = session_digest(&session).unwrap();
+        session.save_to(directory.path()).unwrap();
+        let first = TestSession::load_from(session.id, directory.path()).unwrap();
+        let second = TestSession::load_from(session.id, directory.path()).unwrap();
+        assert_eq!(session_digest(&first).unwrap(), expected);
+        assert_eq!(session_digest(&second).unwrap(), expected);
+        let snapshot = |session: &TestSession| {
+            session
+                .state()
+                .iter()
+                .find_map(|record| match &record.change {
+                    StateChange::BoundarySnapshot { snapshot, .. } => Some(snapshot.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let first = snapshot(&first);
+        let second = snapshot(&second);
+        assert_eq!(first["boundaries"], json!([boundary]));
+        let first_root = first["histories"][root.to_string()]["epoch"]
+            .as_u64()
+            .unwrap();
+        let first_child = first["histories"][child.to_string()]["epoch"]
+            .as_u64()
+            .unwrap();
+        let second_root = second["histories"][root.to_string()]["epoch"]
+            .as_u64()
+            .unwrap();
+        assert!(first_root < first_child);
+        assert_ne!(first_root, second_root);
+        let lens = first["state"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["seq"] == boundary)
+            .unwrap();
+        assert_eq!(
+            lens["change"]["lens"][root.to_string()][0],
+            json!(first_root)
+        );
+        assert_eq!(
+            lens["change"]["lens"][child.to_string()][0],
+            json!(first_child)
+        );
+    }
+
     #[test_case("message")]
     #[test_case("message_id")]
     #[test_case("submessage")]

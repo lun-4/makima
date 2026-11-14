@@ -1493,7 +1493,7 @@ empty table.
 
 ## makima.state {#makima-state}
 
-Journaled plugin slots, scoped to an agent or session. Values are copied strict JSON data. Unloaded plugin values remain stored without running plugin code.
+Journaled plugin slots, scoped to an agent or session. Values are copied strict JSON data. Agent-scoped values follow the durable agent ID across session restart. Unloaded plugin values remain stored without running plugin code; old slot handles return state_slot_expired after unload or replacement. StateSlot methods are get(ctx), set(ctx, value, opts?), delete(ctx, opts?), update(ctx, callback), and on_change(callback). get returns value, revision on success, including nil, revision for an absent value; update returns the updated value and revision. Failures return nil, error. set and delete return revision or nil, error. opts.expect requires the observed revision. State writes require a live invocation context; retaining a slot or context does not extend its authority.
 
 ---
 
@@ -1503,7 +1503,7 @@ Journaled plugin slots, scoped to an agent or session. Values are copied strict 
 makima.state.register({name}, {spec})
 ```
 
-Register a plugin-qualified slot during load. spec supplies scope (agent or session), positive version, and optional synchronous migrate(value, old_version). Registration is transactional with plugin load.
+Register a plugin-qualified slot during load. spec supplies scope (agent or session), positive version, and optional synchronous migrate(value, old_version). Registration is transactional with plugin load. Names are local to the plugin and contain no slash; plan/state is reserved for the host.
 
 **Returns:** (`StateSlot`) Registered slot.
 
@@ -1515,7 +1515,7 @@ Register a plugin-qualified slot during load. spec supplies scope (agent or sess
 makima.state.null()
 ```
 
-JSON null sentinel. Unlike nil it remains present in arrays and objects.
+JSON null sentinel, used as makima.state.null without a call. Unlike nil it remains present in arrays and objects.
 
 
 ## makima.agent {#makima-agent}
@@ -1812,7 +1812,9 @@ List accessible resident and dormant agents in this context's graph.
 makima.agent.get({ctx}, {reference})
 ```
 
-Resolve an agent reference or stable ID with current control authority.
+Resolve an agent reference or durable agent ID with current control authority.
+Resolution does not reactivate a dormant agent. Saved IDs can be resolved in
+the restored session graph.
 
 **Parameters:**
 
@@ -1842,7 +1844,7 @@ Requires an active managed turn or a trusted manager-backed parent.
 - `{opts}` (`table`) Optional creation fields:
   - `model` (`string|table`) a spec or `{spec, thinking, fast}` selection, validated
     like `Agent:set_model`; omitted fields inherit, thinking is capped at the
-    parent's level, and `Agent:model` results can be passed as is.
+    parent's level, and `Agent:config(ctx).model` results can be passed as is.
   - `system` (`string`) custom text appended after the admitted mode's prompt contribution; defaults to empty and does not inherit the parent's full system prompt.
   - `tools` (`array`) request definitions; omitted inherits permitted parent tools.
   - `local_tools` (`table`) name-keyed Lua tool specs with description, input_schema,
@@ -1884,9 +1886,9 @@ A held managed handle retains authorized closed-status reads, not mutation right
 Agent:id()
 ```
 
-Read the stable agent ID.
+Read the durable agent ID, retained across session restart.
 
-**Returns:** (`string?`, `string?`) Agent ID.
+**Returns:** (`string?`, `string?`) Agent ID, distinct from the session ID and turn IDs.
 
 ---
 
@@ -1948,7 +1950,7 @@ Read lifecycle, active turn, queue size, and cumulative usage.
 
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 
-**Returns:** (`table?`, `string?`) Fields: id (string), status ("idle", "working", or "closed", the vocabulary `makima.session` uses, which adds "needs_input"), queued (integer), active_turn (string or nil), input_tokens and output_tokens (cumulative integers). Authorized held managed handles retain a closed snapshot after graph removal.
+**Returns:** (`table?`, `string?`) Fields: id (string), live (boolean, whether an open resident actor exists), status ("idle", "working", or "closed", the vocabulary `makima.session` uses, which adds "needs_input"), queued (integer), active_turn (string or nil), input_tokens and output_tokens (cumulative integers). Dormant agents report live=false without reactivation. Authorized held managed handles retain a closed snapshot after graph removal.
 
 ---
 
@@ -1958,7 +1960,7 @@ Read lifecycle, active turn, queue size, and cumulative usage.
 Agent:config({ctx})
 ```
 
-Read the committed configuration.
+Read the committed configuration without reactivating a dormant agent.
 
 **Parameters:**
 
@@ -2030,6 +2032,11 @@ joins compatible admitted work, reaching its next safe model request
 without interrupting a provider request or tool, or starts a turn when
 there is none; `"queue"` queues a distinct turn behind admitted work.
 Wait for the result with `AgentTurn:wait`.
+A dormant agent is reactivated from its saved configuration and capabilities
+before admission. Reactivation can fail with `not_restorable`,
+`provider_unavailable`, `model_unavailable`, `tool_unavailable`,
+`mcp_unavailable`, or `tool_completion_pending` while earlier writes settle.
+A failed reactivation admits no turn.
 
 **Parameters:**
 

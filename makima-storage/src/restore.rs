@@ -131,7 +131,7 @@ pub struct RestoreStore {
 
 #[derive(Debug)]
 pub struct RestoreDeletionGuard {
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     _lock: File,
 }
 
@@ -273,7 +273,7 @@ impl RestoreStore {
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn pending(&self, owner: MakimaId) -> Result<Vec<TransitionRef>, RestoreError> {
         let locked = match self.owner(owner, false) {
             Ok(locked) => locked,
@@ -287,7 +287,7 @@ impl RestoreStore {
         Ok(references)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn pending_for_session(
         &self,
         session: MakimaId,
@@ -323,7 +323,7 @@ impl RestoreStore {
         Ok(references)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn validate_checkpoint_references(
         &self,
         sessions: &Directory,
@@ -342,7 +342,7 @@ impl RestoreStore {
         Self::guard_session_deletion_in(&self.dir.path().join(SESSIONS_DIR), session)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn guard_session_deletion_in(
         sessions_root: &Path,
         session: MakimaId,
@@ -438,19 +438,19 @@ impl RestoreStore {
         Ok(guard)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub fn pending(&self, _: MakimaId) -> Result<Vec<TransitionRef>, RestoreError> {
         ensure_no_restore_metadata(&self.dir.path().join(SESSIONS_DIR))?;
         Ok(Vec::new())
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub fn pending_for_session(&self, _: MakimaId) -> Result<Vec<TransitionRef>, RestoreError> {
         ensure_no_restore_metadata(&self.dir.path().join(SESSIONS_DIR))?;
         Ok(Vec::new())
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub fn guard_session_deletion_in(
         sessions_root: &Path,
         _: MakimaId,
@@ -459,7 +459,7 @@ impl RestoreStore {
         Ok(RestoreDeletionGuard {})
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn namespace_lock(sessions_root: &Path) -> Result<RestoreDeletionGuard, RestoreError> {
         let sessions = Directory::open(sessions_root)?;
         let lock = sessions.file(NAMESPACE_LOCK_FILE, true)?;
@@ -470,7 +470,7 @@ impl RestoreStore {
         Ok(RestoreDeletionGuard { _lock: lock })
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn namespace_lock(_: &Path) -> Result<RestoreDeletionGuard, RestoreError> {
         Err(unsupported_restore_metadata().into())
     }
@@ -572,7 +572,7 @@ impl RestoreStore {
     }
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(not(any(target_os = "linux", target_os = "macos")), test))]
 mod compatibility {
     use super::{BRANCHES_DIR, NAMESPACE_LOCK_FILE, RESTORES_DIR};
     use serde_json::Value;
@@ -665,10 +665,10 @@ mod compatibility {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use compatibility::{ensure_no_restore_metadata, unsupported_restore_metadata};
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn checkpoint_references(
     sessions: &Directory,
     session: MakimaId,
@@ -696,7 +696,7 @@ fn checkpoint_references(
     Ok(references)
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_checkpoint_references(
     file: &mut File,
     references: &mut Vec<TransitionRef>,
@@ -728,12 +728,12 @@ fn read_checkpoint_references(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn pending_in(directory: &Directory, owner: MakimaId) -> Result<Vec<TransitionRef>, RestoreError> {
     references_in(directory, owner, true)
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn references_in(
     directory: &Directory,
     owner: MakimaId,
@@ -981,10 +981,10 @@ struct LockedOwner {
     _lock: File,
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use unix::Directory;
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix {
     use rustix::{
         fs::{self, Dir, Mode, OFlags},
@@ -1082,12 +1082,12 @@ mod unix {
         }
 
         pub(super) fn publish(&self, from: &str, to: &str) -> io::Result<()> {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             {
                 fs::renameat_with(&self.0, from, &self.0, to, fs::RenameFlags::NOREPLACE)
                     .map_err(Into::into)
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             {
                 let _ = (from, to);
                 Err(io::Error::new(
@@ -1144,10 +1144,10 @@ mod unix {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 struct Directory;
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl Directory {
     fn open(_: &Path) -> io::Result<Self> {
         Err(io::Error::new(
@@ -1204,13 +1204,13 @@ impl Directory {
 
 #[cfg(test)]
 mod compatibility_tests {
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     use super::RestoreStore;
     use super::{
         BRANCHES_DIR, NAMESPACE_LOCK_FILE, RESTORES_DIR, SESSIONS_DIR,
         compatibility::ensure_no_restore_metadata,
     };
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     use crate::{StateDir, id::MakimaId};
     use serde_json::json;
     use std::{fs, io};
@@ -1232,7 +1232,7 @@ mod compatibility_tests {
             fs::write(branches.join(CHECKPOINT), LEGACY_CHECKPOINT).unwrap();
         }
         ensure_no_restore_metadata(&sessions).unwrap();
-        #[cfg(not(unix))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let state = StateDir::from_path(directory.path().to_path_buf());
             let store = RestoreStore::new(state);
@@ -1294,7 +1294,7 @@ mod compatibility_tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn compatibility_inspection_rejects_symlinked_checkpoints() {
         use std::os::unix::fs::symlink;
@@ -1312,7 +1312,7 @@ mod compatibility_tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::{
         FAIL_PREPARE_FINISH, FAIL_PROGRESS_SYNC, LOCK_FILE, MANIFEST_FILE, NAMESPACE_LOCK_FILE,
@@ -1644,19 +1644,71 @@ mod tests {
     }
 
     #[test]
-    fn staged_publication_never_overwrites_existing_directory() {
+    fn staged_publication_moves_into_absent_destination() {
         let fixture = Fixture::new();
         let store = fixture.store();
         let locked = store.owner(fixture.owner, true).unwrap();
         let staged_name = format!("{STAGING_PREFIX}{}", MakimaId::generate());
         let staged = locked.directory.stage(&staged_name).unwrap();
+        let mut contents = staged.file(MANIFEST_FILE, true).unwrap();
+        contents.write_all(BEFORE).unwrap();
+        contents.sync_all().unwrap();
         let name = fixture.manifest.id.to_string();
-        locked.directory.child(&name, true).unwrap();
+        locked.directory.publish(&staged_name, &name).unwrap();
+        locked.directory.sync().unwrap();
+        locked.directory.validate_child(&name, &staged).unwrap();
+        assert!(!locked.directory.entries().unwrap().contains(&staged_name));
+        assert_eq!(
+            fs::read(fixture.directory().join(MANIFEST_FILE)).unwrap(),
+            BEFORE
+        );
+    }
+
+    #[test_case(false; "empty_destination")]
+    #[test_case(true; "nonempty_destination")]
+    fn staged_publication_never_overwrites_existing_directory(nonempty: bool) {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let locked = store.owner(fixture.owner, true).unwrap();
+        let staged_name = format!("{STAGING_PREFIX}{}", MakimaId::generate());
+        let staged = locked.directory.stage(&staged_name).unwrap();
+        let mut staged_contents = staged.file(MANIFEST_FILE, true).unwrap();
+        staged_contents.write_all(BEFORE).unwrap();
+        staged_contents.sync_all().unwrap();
+        let name = fixture.manifest.id.to_string();
+        let destination = locked.directory.child(&name, true).unwrap();
+        if nonempty {
+            let mut contents = destination.file(MANIFEST_FILE, true).unwrap();
+            contents.write_all(AFTER).unwrap();
+            contents.sync_all().unwrap();
+        }
         assert!(locked.directory.publish(&staged_name, &name).is_err());
         locked
             .directory
             .validate_child(&staged_name, &staged)
             .unwrap();
+        locked
+            .directory
+            .validate_child(&name, &destination)
+            .unwrap();
+        assert_eq!(
+            fs::read(
+                fixture
+                    .directory()
+                    .with_file_name(&staged_name)
+                    .join(MANIFEST_FILE)
+            )
+            .unwrap(),
+            BEFORE
+        );
+        if nonempty {
+            assert_eq!(
+                fs::read(fixture.directory().join(MANIFEST_FILE)).unwrap(),
+                AFTER
+            );
+        } else {
+            assert!(destination.entries().unwrap().is_empty());
+        }
     }
 
     #[test]

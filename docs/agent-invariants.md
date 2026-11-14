@@ -4,12 +4,12 @@ These invariants cover the actor, manager and agent frontends as they are curren
 
 ## Identity and authority
 
-1. `AgentId` and `TurnId` are nominal, distinct types. Never substitute task ids, provider tool-use ids, TUI `run_id`, `parent_tool_use_id`, labels, or chat indexes.
+1. `AgentId` and `TurnId` are nominal, distinct types. The bundled task plugin returns the durable `AgentId` as `task_id`; provider tool-use ids, TUI `run_id`, `parent_tool_use_id`, labels, and chat indexes remain correlation or presentation values.
 2. One durable agent has at most one resident actor. Its `AgentId` survives restart. Every explicit accepted turn receives one fresh `TurnId`.
 3. Graph topology is descriptive, not authority. Knowing an id or parent edge must not grant spawn, wait, cancellation, or ancestor/sibling control.
 4. Delegated managed operations require a manager-issued capability for the exact active `(manager generation, AgentId, TurnId, nonce)`.
 5. A retained capability becomes invalid as soon as its managed turn guard ends. Lua invocation scope must validate the current task's authority, not creation-time context cached in a handle.
-6. Live TUI routing keys descendants by `AgentId`. Task ids and tool-use ids may label or correlate output but may collide.
+6. TUI routing keys descendants by durable `AgentId`, including dormant restorable children. Tool-use ids may correlate output but may collide. Resolving a task id must still validate current manager provenance and authority.
 7. A missing, closed, or foreign target is an error. Never fall back from the executing agent to the focused agent, the root, or a sole headless session.
 
 ## Turn terminalization
@@ -40,7 +40,7 @@ These invariants cover the actor, manager and agent frontends as they are curren
 
 26. Reusable cancellation and permanent closure are different operations.
     - `cancel_turn`, `cancel_existing`, `cancel_agent`, and `cancel_subtree` leave actors/nodes reusable.
-    - `close`, `close_subtree`, and `shutdown` reject future work.
+    - `close` and `close_subtree` durably reject future work. Runtime `shutdown` rejects admission in that runtime without closing an open durable agent.
 27. A reusable actor cancellation is one atomic cut across active work, queued work, and the queue-pop/active-install gap. Work admitted after the cut survives.
 28. A reusable graph cancellation captures one graph cut. Reserved descendants before the cut are cancelled when committed; descendants created after it survive.
 29. Permanent graph closure marks topology closing before invoking actor closure, preventing a child factory from committing beneath the closed branch.
@@ -48,17 +48,17 @@ These invariants cover the actor, manager and agent frontends as they are curren
 31. Close and shutdown are idempotent, reject later admission, cancel active work, terminalize queued explicit turns, and wake the runner.
 32. Child closure never closes ancestors or siblings. Dropping ordinary handles never cancels work.
 33. A descendant's runtime cancellation is independent of the parent turn. A background child may outlive the turn that spawned it.
-34. Interactive child cancellation is reusable. `task_despawn`, `Agent:close`, subtree close, and outer-session shutdown are permanent.
+34. Interactive child cancellation is reusable. `task_despawn`, `Agent:close`, and subtree close durably close the subtree. `/task-retire` and `Agent:retire` retire eligible accessible quiescent leaf identities and release retained capacity. Outer-session teardown and shutdown stop execution without recording durable closure.
 
 ## Manager graph and factories
 
 35. Each outer session (TUI, print, SDK or ACP) owns exactly one manager and exactly one root. Every managed descendant, including grandchildren, is created through that manager.
 36. The manager owns topology, runner tasks, wait watchers, limits, and global turn permits. It must not duplicate actor queue, history, lifecycle scheduling, tickets, or outcome storage.
 37. Root depth is zero. Parent, root, and depth relationships are immutable after reservation.
-38. Limit checks and graph reservation are atomic. Reserved and closing nodes consume capacity; settled closed/removed nodes do not.
+38. Work admission reserves active-agent and direct-child capacity atomically. Queued, executing, delivery, and cleanup work retain capacity until settlement. Idle resident and dormant actors consume neither active-work limit; non-retired identities consume retained capacity except imported legacy records.
 39. Actor/backend factories run outside the graph lock. Returned errors, panics, concurrent closure, and failed commit all roll reservations back exactly once.
 40. Never hold the graph lock across an await, actor call, backend call, factory invocation, task join, or any path that can re-enter tool dispatch.
-41. Graph snapshots may include closed tombstones for the manager lifetime. They are in-memory observations, not persisted identity.
+41. Durable agent records retain topology, spawn specification, lifecycle, usage, and identity across restart. Runtime residency and incarnation reservations are separate. Reactivation installs at most one resident actor and must reject a stale reservation or closed, retired, or unrestorable record.
 42. Root and descendant construction must not fall back to direct `AgentActorHandle::spawn`. Direct construction is allowed only in tests.
 
 ## Managed concurrency and descendant waits
@@ -94,8 +94,27 @@ These invariants cover the actor, manager and agent frontends as they are curren
 ## Current scope boundary
 
 67. Actor config covers model, prompt, tools, permissions, modes, and request options. Do not add a second writable copy of those values in a frontend or coordinator; read them from the actor.
-68. Do not assume agent graph topology, ids, queued work, outcomes, or notifications survive process restart.
+68. Durable graph records, ids, retained results, configuration, state slots, and delivery disposition survive checkpointed restart. Active invocations, accepted input payloads, runtime resources, and permission prompts do not. Recovery terminalizes unfinished admissions as Interrupted and never reexecutes them.
 69. Do not weaken these current invariants to imitate a future design. Land the future ownership model first, migrate all affected callers, and update these docs with the new verified contract.
+
+## Journal, recovery, and file restoration
+
+70. Agent revisions and state changes share one session journal sequence. Config, rules, context, plugin state, admissions, outcomes, deliveries, and file changes must not acquire independent competing orders.
+71. Teardown never records Closed or Retired for an open durable agent. Detachment revokes the old incarnation and retains ownership through tool completion and cleanup before making resources reusable.
+72. Recovery publishes sanitized history, interrupted results, and state before admission or observer activation. Configuration, permissions, plan state, registered plugin state, and recorded context must match that checkpoint.
+73. Delivery deduplication keys by `(AgentId, TurnId)` and records consumed, withdrawn, or dropped disposition durably. Restart and compaction must not redeliver a terminally disposed result from retained state.
+74. Plugin state uses registered, versioned JSON slots in explicit agent or session scope. Mutations validate authority and expected revision. Migration and rewind changes publish with the same journal transaction before observers run.
+75. Session saves write v3; v2 import has no downgrade path. The supported `boundary-pools-v1` feature gates grouped boundary payloads; writers emit it only when pools exist. Legacy inline checkpoints remain readable, and older v3 binaries reject feature-bearing checkpoints they do not support. Unknown versions, unsupported feature names, and complete unsupported record schemas fail closed.
+76. History epochs are opaque ordered identities within one namespace. Import remints distinct saved epochs while preserving order, equality, and all retained references. Independent imported namespaces must never be merged by equal raw epoch numbers.
+77. Rewind reserves the affected graph, actors, journal replacement, state changes, and frontend projections before publication. Branch restoration must preserve the displaced checkpoint and reject unavailable branch history rather than approximate it.
+78. File restoration validates all required blobs before writes and checks expected content under the same canonical locks used by mutable tools. Missing files use explicit Absent states. Unsafe path substitutions and unrelated content must not be overwritten.
+79. Manifest and blob references precede writes durably. Post-rename preparation errors return the visible transition reference so an unresolved receipt retains locks, barriers, and renewing session-lease owners until settlement.
+80. Baseline durability precedes file mutation. Before target publication, abort repairs toward before-state. After visible target publication, cancellation or sync failure retains forward repair and never rolls files back beneath the published conversation. New admission waits for target durability and file completion.
+81. Complete requires no unresolved latest per-path Conflict and no unfinished work. The engine verifies content before recording Applied or RolledBack. A later outcome can resolve an earlier conflict without changing the event schema.
+82. Inverse restore includes only paths actually applied by a completed published forward transition. Skipped paths remain untouched, and files-only restore does not change the conversation revision.
+83. Startup validates checkpoint and retained-branch transition references, including completed manifests, and discovers pending work from both endpoints. Missing or corrupt required metadata blocks admission. A readable Complete record is not acknowledged until its progress file sync succeeds.
+84. Restore recovery holds actual owned leases for owner, source, and target sessions, not publication guards alone. Deletion holds the restore namespace guard and cannot remove pending or referenced cross-session manifests, blobs, or inverse dependencies.
+85. Unsupported platforms reject file restore explicitly. Metadata-free legacy startup and deletion may use conservative read-only inspection; inspection errors or restore artifacts must fail closed rather than enabling path-based restoration.
 
 ## Verification expectations
 

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, iter};
 
 use crate::click::{HitTarget, PickerId};
 use crate::components::Overlay;
@@ -100,9 +100,19 @@ impl RewindPicker {
         let pinned: BTreeSet<_> = durable
             .state
             .iter()
-            .filter_map(|record| match record.change {
-                StateChange::BoundarySnapshot { boundary, .. } => Some(boundary),
+            .filter_map(|record| match &record.change {
+                StateChange::BoundarySnapshot { boundary, snapshot } => Some((*boundary, snapshot)),
                 _ => None,
+            })
+            .flat_map(|(boundary, snapshot)| {
+                iter::once(boundary).chain(
+                    snapshot
+                        .get("boundaries")
+                        .and_then(|value| value.as_array())
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|value| value.as_u64()),
+                )
             })
             .collect();
         let mut snapshot: Vec<_> = if journal.session_id().is_some() {
@@ -189,15 +199,16 @@ impl RewindPicker {
                 continue;
             };
             let seq = seq.filter(|seq| {
-                view.boundaries[seq]
-                    .lens
-                    .keys()
-                    .filter(|agent| session_scope || affected.contains(agent))
-                    .all(|agent| {
-                        view.compactions
-                            .get(agent)
-                            .is_none_or(|(barrier, _)| *barrier <= *seq)
-                    })
+                pinned.contains(seq)
+                    || view.boundaries[seq]
+                        .lens
+                        .keys()
+                        .filter(|agent| session_scope || affected.contains(agent))
+                        .all(|agent| {
+                            view.compactions
+                                .get(agent)
+                                .is_none_or(|(barrier, _)| *barrier <= *seq)
+                        })
             });
             if journal.session_id().is_some() && seq.is_none() {
                 continue;
@@ -355,6 +366,7 @@ mod tests {
     };
     use makima_providers::{ContentBlock, Message, Role};
     use makima_storage::id::MakimaId;
+    use makima_storage::restore_digest::session_digest;
     use makima_storage::session_state::{SessionStateView, StateChange, StoredStateRecord};
     use test_case::test_case;
 
@@ -642,15 +654,19 @@ mod tests {
         });
     }
 
-    #[test_case(false; "active_owner_prompt")]
-    #[test_case(true; "missing_owner_prompt")]
+    #[test_case(false, false; "active_owner_prompt")]
+    #[test_case(true, false; "missing_owner_prompt")]
+    #[test_case(false, true; "active_owner_prompt_after_child_compaction")]
+    #[test_case(true, true; "missing_owner_prompt_after_child_compaction")]
     fn pinned_root_boundary_stays_selectable_after_child_rewind_and_disk_recovery(
         missing_prompt: bool,
+        compact_child: bool,
     ) {
         const FIRST: &str = "root before child rewind";
         const SECOND: &str = "root boundary after child work";
         const CHILD: &str = "child before rewind";
         const LATER_CHILD: &str = "child work retained by root pin";
+        const COMPACTED_CHILD: &str = "compacted child summary";
         let messages = [user_msg(FIRST), assistant_msg(), user_msg(SECOND)];
         with_actor(&messages, |root| {
             let journal = root.manager().journal();
@@ -697,6 +713,24 @@ mod tests {
                         agent: Some(root.id()),
                         generation: 0,
                         change: StateChange::Boundary {
+                            offset: 0,
+                            lens: [
+                                (root.id(), (root_history.epoch, 0)),
+                                (child, (child_history.epoch, 1)),
+                            ]
+                            .into(),
+                        },
+                    }],
+                    ..Default::default()
+                })
+                .unwrap();
+            let earlier_root_boundary = journal.snapshot().seq;
+            journal
+                .commit(JournalCommit {
+                    changes: vec![JournalChange {
+                        agent: Some(root.id()),
+                        generation: 0,
+                        change: StateChange::Boundary {
                             offset: 2,
                             lens: [
                                 (root.id(), (root_history.epoch, 2)),
@@ -717,14 +751,37 @@ mod tests {
             .unwrap();
             replacement.install().unwrap();
             drop(replacement);
+            if compact_child {
+                let mut compacted = HistorySnapshot::new(vec![user_msg(COMPACTED_CHILD)]);
+                compacted.compacted = true;
+                journal
+                    .commit(JournalCommit {
+                        changes: vec![JournalChange {
+                            agent: Some(child),
+                            generation: 0,
+                            change: StateChange::Compaction {
+                                epoch: compacted.epoch,
+                            },
+                        }],
+                        histories: [(child, compacted)].into(),
+                        ..Default::default()
+                    })
+                    .unwrap();
+            }
             let mut session = AppSession::new(FIRST, "/");
             journal.snapshot().apply_to(&mut session).unwrap();
             let directory = tempfile::tempdir().unwrap();
             session.save_to(directory.path()).unwrap();
             let loaded = AppSession::load_from(session.id, directory.path()).unwrap();
-            let recovered = RecoveryCandidate::prepare(loaded)
-                .unwrap()
-                .finalize_after_publication();
+            let recovery = RecoveryCandidate::prepare(loaded).unwrap();
+            let mut published = recovery.session().clone();
+            published.save_to(directory.path()).unwrap();
+            let reloaded = AppSession::load_from(session.id, directory.path()).unwrap();
+            assert_eq!(
+                session_digest(&reloaded).unwrap(),
+                session_digest(&published).unwrap()
+            );
+            let recovered = recovery.finalize_after_publication();
             let recovered_journal = recovered.journal();
             let snapshot = recovered_journal.snapshot();
             let view =
@@ -740,13 +797,17 @@ mod tests {
                 .rev()
                 .find_map(|record| match &record.change {
                     StateChange::BoundarySnapshot { boundary, snapshot }
-                        if *boundary == root_boundary =>
+                        if *boundary == earlier_root_boundary =>
                     {
                         Some(snapshot)
                     }
                     _ => None,
                 })
                 .unwrap();
+            assert_eq!(
+                pin["boundaries"],
+                serde_json::json!([earlier_root_boundary, root_boundary])
+            );
             let pinned_state: Vec<StoredStateRecord> =
                 serde_json::from_value(pin["state"].clone()).unwrap();
             let pinned_lens = pinned_state
@@ -763,7 +824,25 @@ mod tests {
                 let history = &pin["histories"][agent.to_string()];
                 assert_eq!(history["epoch"].as_u64(), Some(pinned_lens[&agent].0));
                 assert_eq!(pinned_lens[&agent].1, expected.len());
-                assert_eq!(history["messages"], serde_json::to_value(expected).unwrap());
+                let expected_raw = if agent == root.id() {
+                    root_history.messages.as_slice()
+                } else {
+                    expected
+                };
+                assert_eq!(
+                    history["messages"],
+                    serde_json::to_value(expected_raw).unwrap()
+                );
+                let raw: Vec<Message> =
+                    serde_json::from_value(history["messages"].clone()).unwrap();
+                assert_eq!(&raw[..pinned_lens[&agent].1], expected);
+            }
+            if compact_child {
+                assert!(view.compactions[&child].0 > root_boundary);
+                assert_eq!(
+                    snapshot.histories[&child].messages.as_slice(),
+                    &[user_msg(COMPACTED_CHILD)]
+                );
             }
             assert_eq!(snapshot.histories[&child].messages.len(), 1);
             let manager =
@@ -773,9 +852,9 @@ mod tests {
             picker.open_actor(manager.reference(root.id())).unwrap();
             let entry = picker.entry_at_offset(2).unwrap();
             let label = if missing_prompt {
-                format!("1: Boundary #{root_boundary}")
+                format!("2: Boundary #{root_boundary}")
             } else {
-                format!("1: {SECOND}")
+                format!("2: {SECOND}")
             };
             assert_eq!(entry.prompt_preview, label);
             let RewindSelection::Boundary {
@@ -788,9 +867,26 @@ mod tests {
             assert_eq!(boundary.epoch, snapshot.histories[&root.id()].epoch);
             assert_eq!(durable.seq, root_boundary);
             assert_eq!(durable.epoch, snapshot.epoch);
-            let restored = smol::block_on(manager.journal().prepare_rewind(durable)).unwrap();
-            assert_eq!(restored.snapshot().histories[&child].messages.len(), 2);
+            let mut restored = smol::block_on(manager.journal().prepare_rewind(durable)).unwrap();
+            assert_eq!(
+                restored.snapshot().histories[&root.id()]
+                    .messages
+                    .as_slice(),
+                &messages[..2]
+            );
+            assert_eq!(
+                restored.snapshot().histories[&child].messages,
+                child_history.messages
+            );
+            restored.install().unwrap();
+            restored.notify();
             drop(restored);
+            let installed = manager.journal().snapshot();
+            assert_eq!(
+                installed.histories[&root.id()].messages.as_slice(),
+                &messages[..2]
+            );
+            assert_eq!(installed.histories[&child].messages, child_history.messages);
             assert!(
                 smol::block_on(manager.shutdown(SHUTDOWN_TIMEOUT))
                     .timed_out

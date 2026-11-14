@@ -13,6 +13,8 @@ use std::{
 };
 use thiserror::Error;
 
+pub const BOUNDARY_POOL_FORMAT: &str = "boundary-pool-v1";
+pub const BOUNDARY_POOLS_FEATURE: &str = "boundary-pools-v1";
 pub const MAX_STORED_TURN_RESULTS: usize = 128;
 pub const MAX_PLUGIN_VALUE_DEPTH: usize = 64;
 pub const MAX_PLUGIN_VALUE_BYTES: usize = 256 * 1024;
@@ -405,6 +407,7 @@ impl SessionStateView {
             return if *boundary < seq
                 && self.boundaries.contains_key(boundary)
                 && snapshot.is_object()
+                && valid_boundary_pool(*boundary, seq, snapshot)
             {
                 Ok(())
             } else {
@@ -533,6 +536,83 @@ impl SessionStateView {
     }
 }
 
+fn valid_boundary_pool(boundary: u64, seq: u64, snapshot: &Value) -> bool {
+    if snapshot.get("format").is_none() {
+        return snapshot
+            .get("boundaries")
+            .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty));
+    }
+    if snapshot["format"].as_str() != Some(BOUNDARY_POOL_FORMAT) {
+        return false;
+    }
+    let Ok(boundaries) = serde_json::from_value::<Vec<u64>>(snapshot["boundaries"].clone()) else {
+        return false;
+    };
+    let Some(state) = snapshot["state"].as_array() else {
+        return false;
+    };
+    if boundaries.first() != Some(&boundary)
+        || boundaries.last().is_none_or(|boundary| *boundary >= seq)
+        || boundaries.windows(2).any(|pair| pair[0] >= pair[1])
+        || state
+            .iter()
+            .any(|record| record["change"]["kind"] == "boundary_snapshot")
+    {
+        return false;
+    }
+    let Ok(state) = serde_json::from_value::<Vec<StoredStateRecord>>(snapshot["state"].clone())
+    else {
+        return false;
+    };
+    let Ok(agents) =
+        serde_json::from_value::<Vec<(u64, StoredAgentRecord)>>(snapshot["agents"].clone())
+    else {
+        return false;
+    };
+    let Some(histories) = snapshot["histories"].as_object() else {
+        return false;
+    };
+    if histories.iter().any(|(agent, history)| {
+        agent.parse::<AgentId>().is_err()
+            || history["epoch"].as_u64().is_none()
+            || history["compacted"].as_bool().is_none()
+            || !history["messages"].is_array()
+    }) {
+        return false;
+    }
+    let Ok(view) = SessionStateView::fold(&state, &agents, u64::MAX) else {
+        return false;
+    };
+    let mut revisions = agents.iter().peekable();
+    let mut retained = BTreeSet::new();
+    boundaries.iter().all(|seq| {
+        while revisions
+            .peek()
+            .is_some_and(|(revision, _)| revision <= seq)
+        {
+            if let Some((_, agent)) = revisions.next() {
+                retained.insert(agent.id);
+            }
+        }
+        let Some(saved) = view.boundaries.get(seq) else {
+            return false;
+        };
+        saved.lens.iter().all(|(agent, (epoch, len))| {
+            histories.get(&agent.to_string()).is_some_and(|history| {
+                history["epoch"].as_u64() == Some(*epoch)
+                    && history["messages"]
+                        .as_array()
+                        .is_some_and(|messages| messages.len() >= *len)
+            })
+        }) && saved.agent.is_none_or(|agent| {
+            saved
+                .lens
+                .get(&agent)
+                .is_some_and(|(_, len)| saved.offset <= *len)
+        }) && retained.iter().all(|agent| saved.lens.contains_key(agent))
+    })
+}
+
 fn validate_sequence(
     stream: &'static str,
     seqs: impl Iterator<Item = u64>,
@@ -585,6 +665,7 @@ mod tests {
         id::{AgentId, TurnId},
     };
     use serde_json::{Value, json};
+    use std::collections::BTreeMap;
     use std::path::Path;
     use test_case::test_case;
 
@@ -653,6 +734,144 @@ mod tests {
         });
         assert_eq!(fold(&records), before);
         assert_eq!(SessionStateView::fold(&records, &[], 1).unwrap(), before);
+    }
+
+    fn pooled_boundary(agent: AgentId) -> (Vec<StoredStateRecord>, Value) {
+        let prefix = vec![
+            state(
+                1,
+                Some(agent),
+                json!({"kind":"boundary","offset":0,"lens":{agent.to_string():[7,0]}}),
+            ),
+            state(
+                2,
+                Some(agent),
+                json!({"kind":"boundary","offset":1,"lens":{agent.to_string():[7,1]}}),
+            ),
+        ];
+        let payload = json!({"format":super::BOUNDARY_POOL_FORMAT,"boundaries":[1,2],
+            "state":prefix,"agents":[],"histories":{agent.to_string():{"epoch":7,"compacted":false,"messages":["message"]}}});
+        (prefix, payload)
+    }
+
+    #[test]
+    fn grouped_boundary_prefix_lenses_can_be_shorter_than_shared_history() {
+        let agent = AgentId::generate();
+        let (mut prefix, payload) = pooled_boundary(agent);
+        prefix.push(state(
+            3,
+            None,
+            json!({"kind":"boundary_snapshot","boundary":1,"snapshot":payload}),
+        ));
+        assert_eq!(fold(&prefix).boundaries.len(), 2);
+    }
+
+    #[test_case(super::StoredAgentLifecycle::Closed, true; "closed_with_cutoff")]
+    #[test_case(super::StoredAgentLifecycle::Closed, false; "closed_without_cutoff")]
+    #[test_case(super::StoredAgentLifecycle::Retired, true; "retired_with_cutoff")]
+    #[test_case(super::StoredAgentLifecycle::Retired, false; "retired_without_cutoff")]
+    fn grouped_pools_require_durable_cutoffs_for_closed_and_retired_histories(
+        lifecycle: super::StoredAgentLifecycle,
+        cutoff: bool,
+    ) {
+        let root = AgentId::generate();
+        let closed = AgentId::generate();
+        let revisions = vec![
+            (0, agent(root, 0)),
+            (1, agent(closed, 1)),
+            (2, {
+                let mut record = agent(closed, 2);
+                record.created_seq = 1;
+                record.lifecycle = lifecycle;
+                record
+            }),
+        ];
+        let mut lens = BTreeMap::from([(root, (7, 0))]);
+        if cutoff {
+            lens.insert(closed, (8, 1));
+        }
+        let prefix = vec![state(
+            3,
+            Some(root),
+            json!({"kind":"boundary","offset":0,"lens":lens}),
+        )];
+        let payload = json!({"format":super::BOUNDARY_POOL_FORMAT,"boundaries":[3],
+        "state":prefix,"agents":revisions,"histories":{
+            root.to_string():{"epoch":7,"compacted":false,"messages":[]},
+            closed.to_string():{"epoch":8,"compacted":false,"messages":["at boundary","late cleanup"]}
+        }});
+        let mut records = prefix;
+        records.push(state(
+            4,
+            None,
+            json!({"kind":"boundary_snapshot","boundary":3,"snapshot":payload}),
+        ));
+        assert_eq!(
+            SessionStateView::fold(&records, &revisions, u64::MAX).is_ok(),
+            cutoff
+        );
+    }
+
+    #[test]
+    fn grouped_pool_does_not_require_cutoffs_for_agents_created_after_covered_boundary() {
+        let root = AgentId::generate();
+        let future = AgentId::generate();
+        let revisions = vec![(0, agent(root, 0)), (2, agent(future, 2))];
+        let prefix = vec![state(
+            1,
+            Some(root),
+            json!({"kind":"boundary","offset":0,"lens":{root.to_string():[7,0]}}),
+        )];
+        let payload = json!({"format":super::BOUNDARY_POOL_FORMAT,"boundaries":[1],
+        "state":prefix,"agents":revisions,"histories":{
+            root.to_string():{"epoch":7,"compacted":false,"messages":[]},
+            future.to_string():{"epoch":8,"compacted":false,"messages":["later"]}
+        }});
+        let mut records = prefix;
+        records.push(state(
+            3,
+            None,
+            json!({"kind":"boundary_snapshot","boundary":1,"snapshot":payload}),
+        ));
+        assert!(SessionStateView::fold(&records, &revisions, u64::MAX).is_ok());
+    }
+
+    #[test_case("format"; "unknown_format")]
+    #[test_case("empty"; "empty_boundaries")]
+    #[test_case("order"; "unordered_boundaries")]
+    #[test_case("representative"; "wrong_representative")]
+    #[test_case("missing"; "missing_covered_boundary")]
+    #[test_case("history"; "short_history")]
+    #[test_case("epoch"; "wrong_epoch")]
+    #[test_case("offset"; "invalid_offset")]
+    #[test_case("nested"; "recursive_snapshot")]
+    fn malformed_grouped_boundary_payload_is_rejected(damage: &str) {
+        let agent = AgentId::generate();
+        let (mut prefix, mut payload) = pooled_boundary(agent);
+        match damage {
+            "format" => payload["format"] = json!("unknown"),
+            "empty" => payload["boundaries"] = json!([]),
+            "order" => payload["boundaries"] = json!([2, 1]),
+            "representative" => payload["boundaries"] = json!([2]),
+            "missing" => payload["boundaries"] = json!([1, 9]),
+            "history" => payload["histories"][agent.to_string()]["messages"] = json!([]),
+            "epoch" => payload["histories"][agent.to_string()]["epoch"] = json!(8),
+            "offset" => payload["state"][1]["change"]["offset"] = json!(2),
+            "nested" => {
+                payload["state"][1]["change"] =
+                    json!({"kind":"boundary_snapshot","boundary":1,"snapshot":{}})
+            }
+            _ => unreachable!(),
+        }
+        prefix.push(state(
+            3,
+            None,
+            json!({"kind":"boundary_snapshot","boundary":1,"snapshot":payload}),
+        ));
+        assert!(matches!(
+            SessionStateView::fold(&prefix, &[], u64::MAX),
+            Err(super::StateFoldError::InvalidBoundarySnapshot { .. })
+        ));
     }
 
     #[test_case(0, json!({}); "missing_boundary")]

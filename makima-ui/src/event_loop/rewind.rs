@@ -14,17 +14,17 @@ use makima_agent::actor::{ActorIdleGuard, InstalledActorRewind};
 use makima_agent::cancel::PublicationRegistration;
 use makima_agent::config_change::prepare_restore;
 use makima_agent::file_restore::AppliedRestore;
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use makima_agent::file_restore::PreparedRestore;
 use makima_agent::file_restore::{
-    self, OwnedRestoreLease, PlanProjection, RestoreRequest, RestoreSegment,
+    self, OwnedRestoreLease, PlanProjection, RestoreRequest, RestoreSegment, SUPPORTED,
 };
 use makima_agent::journal::{
     JournalReplacement, PreparedRewindNotification, SessionJournal, SessionJournalSnapshot,
 };
 use makima_agent::manager::{ManagerRewindGuard, ManagerTransitionGuard};
 use makima_agent::permissions::PermissionSnapshot;
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use makima_agent::plan_state::PlanProjectionRollback;
 use makima_agent::rewind::RewindBoundary;
 use makima_agent::session_coordinator::PreparedRewindProjection;
@@ -32,7 +32,7 @@ use makima_agent::{AgentId, AgentRef};
 use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
 use makima_storage::id::MakimaId;
 use makima_storage::now_epoch;
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use makima_storage::restore::RestoreStore;
 use makima_storage::restore::{RestoreChoice, RestoreEndpoint, TransitionRef};
 use makima_storage::session_lock;
@@ -1216,12 +1216,12 @@ async fn reconcile_owned_sessions(
     locks: Arc<FileWriteLocks>,
     cancel: CancelToken,
 ) -> Result<(), file_restore::RestoreError> {
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         file_restore::reconcile_session_guarded(sessions_dir, session, supplied, locks, cancel)
             .await
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (supplied, locks, cancel);
         let state = sessions_dir
@@ -1315,7 +1315,7 @@ async fn confirm_restore(
                 affected_paths: preview.paths.iter().map(|path| path.path.clone()).collect(),
                 shell_count: preview.shell_commands,
             },
-            default_choice: if cfg!(unix) {
+            default_choice: if SUPPORTED {
                 default_choice
             } else {
                 RestoreChoice::ConversationOnly
@@ -1331,7 +1331,7 @@ async fn confirm_restore(
     Ok(choice)
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn protect_restore_receipt(
     result: Result<PreparedRestore, file_restore::RestoreError>,
     barrier: impl Any + Send,
@@ -1356,9 +1356,9 @@ fn protect_restore_receipt(
 }
 
 enum RestoreFiles {
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     Secure(PreparedRestore),
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     Legacy {
         projection: PlanProjectionRollback,
         snapshot: SessionJournalSnapshot,
@@ -1370,25 +1370,25 @@ enum RestoreFiles {
 impl RestoreFiles {
     fn transition_ref(&self) -> Option<TransitionRef> {
         match self {
-            #[cfg(unix)]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::Secure(receipt) => Some(receipt.transition_ref()),
-            #[cfg(not(unix))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             Self::Legacy { .. } => None,
         }
     }
     fn retain_barrier(&mut self, barrier: impl Any + Send) {
         match self {
-            #[cfg(unix)]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::Secure(receipt) => receipt.retain_barrier(barrier),
-            #[cfg(not(unix))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             Self::Legacy { barriers, .. } => barriers.push(Box::new(barrier)),
         }
     }
     fn apply(&mut self, modes: &ModeRegistry) -> Result<AppliedRestore, String> {
         match self {
-            #[cfg(unix)]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::Secure(receipt) => receipt.apply(modes).map_err(|error| error.to_string()),
-            #[cfg(not(unix))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             Self::Legacy {
                 projection,
                 snapshot,
@@ -1402,27 +1402,28 @@ impl RestoreFiles {
     }
     fn abort(self) -> Result<(), String> {
         match self {
-            #[cfg(unix)]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::Secure(receipt) => receipt.abort().map_err(|error| error.to_string()),
-            #[cfg(not(unix))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             Self::Legacy { projection, .. } => projection.rollback(),
         }
     }
     fn complete(self) -> Result<(), String> {
         match self {
-            #[cfg(unix)]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::Secure(receipt) => receipt.complete().map_err(|error| error.to_string()),
-            #[cfg(not(unix))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             Self::Legacy { .. } => Ok(()),
         }
     }
 }
 
-#[cfg(all(test, not(unix)))]
-#[test_case::test_case(RestoreChoice::ConversationOnly, true)]
-#[test_case::test_case(RestoreChoice::ConversationAndFiles, false)]
-#[test_case::test_case(RestoreChoice::FilesOnly, false)]
-fn platform_restore_choice_is_explicit(choice: RestoreChoice, supported: bool) {
+#[cfg(test)]
+#[test_case::test_case(RestoreChoice::ConversationOnly)]
+#[test_case::test_case(RestoreChoice::ConversationAndFiles)]
+#[test_case::test_case(RestoreChoice::FilesOnly)]
+fn platform_restore_choice_is_explicit(choice: RestoreChoice) {
+    let supported = SUPPORTED || choice == RestoreChoice::ConversationOnly;
     let result = validate_restore_choice(&choice);
     assert_eq!(result.is_ok(), supported);
     if !supported {
@@ -1431,7 +1432,7 @@ fn platform_restore_choice_is_explicit(choice: RestoreChoice, supported: bool) {
 }
 
 fn validate_restore_choice(choice: &RestoreChoice) -> Result<(), String> {
-    if !cfg!(unix) && *choice != RestoreChoice::ConversationOnly {
+    if !SUPPORTED && *choice != RestoreChoice::ConversationOnly {
         return Err(FILE_RESTORE_UNSUPPORTED.into());
     }
     Ok(())
@@ -1442,12 +1443,12 @@ async fn prepare_restore_files(
     barrier: impl Any + Send,
 ) -> Result<RestoreFiles, String> {
     validate_restore_choice(&request.choice)?;
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         protect_restore_receipt(file_restore::prepare(request).await, barrier)
             .map(RestoreFiles::Secure)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let projection = request.projection.ok_or(FILE_RESTORE_UNSUPPORTED)?;
         let captured = PlanProjectionRollback::capture_locked(
@@ -1469,11 +1470,11 @@ async fn prepare_restore_files(
 fn plan_restore_files(
     segments: &[RestoreSegment],
 ) -> Result<file_restore::RestorePreview, file_restore::RestoreError> {
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         file_restore::plan(segments)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = segments;
         Ok(file_restore::RestorePreview::default())
@@ -1484,11 +1485,11 @@ fn inverse_restore_files(
     sessions_dir: &Path,
     reference: &TransitionRef,
 ) -> Result<file_restore::RestorePreview, file_restore::RestoreError> {
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         file_restore::plan_inverse(sessions_dir, reference)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (sessions_dir, reference);
         Ok(file_restore::RestorePreview::default())

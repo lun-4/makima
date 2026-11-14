@@ -604,7 +604,7 @@ async fn load_session(
         .0
         .parse()
         .map_err(|_| AcpError::resource_not_found(Some(req.session_id.0.to_string())))?;
-    let mut restored = load_history_from(&params.storage, session_ref.id())?;
+    load_history_from(&params.storage, session_ref.id())?;
     close_session(srv).await;
     let directory = params
         .storage
@@ -627,6 +627,7 @@ async fn load_session(
     )
     .await
     .map_err(|error| session_registration_error(error.to_string()))?;
+    let mut restored = load_history_from(&params.storage, session_ref.id())?;
     if let Some(warning) = makima_agent::session_recovery::resolve_legacy_mode(
         &mut restored.seed,
         &srv.lua_event_handle.mode_registry(),
@@ -2683,10 +2684,11 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use makima_agent::actor::{ActorLifecycle, ActorStatus};
+    use makima_agent::actor::{ActorLifecycle, ActorStatus, TurnResult};
+    use makima_agent::journal::{JournalChange, JournalCommit};
     use makima_agent::manager::{AgentResidency, GraphLifecycle};
     use makima_agent::state::{StateError, StateRevision, StateScope, StateSlotSpec};
-    use makima_agent::{AgentMode, ModeId, ToolOutput, TurnTicket};
+    use makima_agent::{AgentMode, DoneReason, ModeId, ToolOutput, TurnTicket};
     use makima_agent::{TurnCancellationReason, TurnId, TurnOutcome};
     use makima_commands::TargetCapabilities;
     use makima_lua::orchestration::{OrchestrationServices, TurnCompletion};
@@ -2711,6 +2713,7 @@ mod tests {
         StoredTurnStatus,
     };
     use makima_storage::sessions::{Effort, Session, StoredThinking};
+    use smol::future::poll_once;
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -3768,6 +3771,166 @@ mod tests {
                 );
                 close_session(&mut server).await;
             }
+        });
+    }
+
+    #[test]
+    fn acp_reload_active_session_keeps_state_published_during_shutdown() {
+        smol::block_on(async {
+            let directory = TempDir::new().unwrap();
+            let providers = spec_providers();
+            let mut params = test_params(
+                providers.model(SPAWN_TEST_SPEC).unwrap(),
+                directory.path().to_path_buf(),
+            );
+            params.providers = providers;
+            let mut seed = StoredSession::new(SPAWN_TEST_SPEC, &directory.path().to_string_lossy());
+            let root_id = AgentId::generate();
+            seed.bind_root_id(root_id).unwrap();
+            seed.save(&params.storage).unwrap();
+            let (out_tx, out_rx) = flume::unbounded();
+            let mut server = Server {
+                out_tx,
+                catalog: ModelCatalog::default(),
+                session: None,
+                elicitation: false,
+                supports_boolean: false,
+                lua_event_handle: params.lua_event_handle.clone(),
+                dispatch: None,
+            };
+            let raw = serde_json::json!({ "params": { "sessionId": seed.id.to_string(), "cwd": directory.path(), "mcpServers": [] } });
+            within(load_session(&mut server, &raw, &params), EVENT_STREAM_ENDED)
+                .await
+                .unwrap();
+            let current = server.session.as_ref().unwrap();
+            current.handle.manager.wait_settled().await;
+            current.checkpoint.as_ref().unwrap().drain().await.unwrap();
+            let journal = current.handle.manager.journal();
+            let publication = journal.reserve_publication().await;
+            assert!(journal.try_publication_read().is_none());
+            let before = StoredSession::load(seed.id, &params.storage).unwrap();
+            let mut config = before.latest_state().unwrap().scopes[&Some(root_id)]
+                .config
+                .clone()
+                .unwrap();
+            config.workflow = !config.workflow;
+            config.options.insert(
+                makima_agent::session_options::WORKFLOW_OPTION_ID.into(),
+                if config.workflow {
+                    makima_agent::session_options::ENABLED_VALUE
+                } else {
+                    makima_agent::session_options::DISABLED_VALUE
+                }
+                .into(),
+            );
+            let mut history = before.history_snapshot();
+            Arc::make_mut(&mut history.messages).extend([
+                Message::user(PARKED_THOUGHT.into()),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![MsgBlock::Text {
+                        text: PARKED_REPLY.into(),
+                    }],
+                    ..Default::default()
+                },
+            ]);
+            let turn_id = TurnId::generate();
+            let result = TurnResult {
+                outcome: TurnOutcome::completed(
+                    root_id,
+                    turn_id,
+                    TokenUsage::default(),
+                    1,
+                    DoneReason::EndTurn,
+                ),
+                text: PARKED_REPLY.into(),
+                output: Vec::new(),
+                provenance: Default::default(),
+                duration_ms: 0,
+            }
+            .to_stored(seed.id, None)
+            .unwrap();
+            drop(out_rx.drain());
+            let mut loading = Box::pin(load_session(&mut server, &raw, &params));
+            assert!(poll_once(loading.as_mut()).await.is_none());
+            journal
+                .commit(JournalCommit {
+                    changes: vec![
+                        JournalChange {
+                            agent: Some(root_id),
+                            generation: 0,
+                            change: StateChange::Config(config.clone()),
+                        },
+                        JournalChange {
+                            agent: Some(root_id),
+                            generation: 0,
+                            change: StateChange::Turn {
+                                turn: turn_id,
+                                result: result.clone(),
+                            },
+                        },
+                    ],
+                    histories: BTreeMap::from([(root_id, history.clone())]),
+                    managed_histories: iter::once(root_id).collect(),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(
+                    StoredSession::load(seed.id, &params.storage)
+                        .unwrap()
+                        .messages()
+                )
+                .unwrap(),
+                serde_json::to_value(before.messages()).unwrap()
+            );
+            drop(publication);
+            within(loading, EVENT_STREAM_ENDED).await.unwrap();
+            let saved = StoredSession::load(seed.id, &params.storage).unwrap();
+            assert_eq!(saved.root_agent_id(), Some(root_id));
+            assert_eq!(
+                serde_json::to_value(saved.messages()).unwrap(),
+                serde_json::to_value(history.messages.as_ref()).unwrap()
+            );
+            let view = saved.latest_state().unwrap();
+            let scope = &view.scopes[&Some(root_id)];
+            assert_eq!(scope.config.as_ref(), Some(&config));
+            assert_eq!(scope.results.back(), Some(&(turn_id, result)));
+            assert_eq!(
+                scope
+                    .results
+                    .iter()
+                    .filter(|(id, _)| *id == turn_id)
+                    .count(),
+                1
+            );
+            let root = server
+                .session
+                .as_ref()
+                .unwrap()
+                .handle
+                .initialized_root()
+                .await
+                .unwrap();
+            assert_eq!(root.id(), root_id);
+            assert_eq!(
+                serde_json::to_value(root.actor().unwrap().committed_history().as_ref()).unwrap(),
+                serde_json::to_value(history.messages.as_ref()).unwrap()
+            );
+            assert_eq!(
+                root.actor().unwrap().effective_config().unwrap().workflow,
+                config.workflow
+            );
+            assert_eq!(
+                root.turn_ticket(turn_id).unwrap().wait_result().await.text,
+                PARKED_REPLY
+            );
+            assert!(
+                out_rx
+                    .try_iter()
+                    .any(|event| { event["params"]["update"]["content"]["text"] == PARKED_REPLY })
+            );
+            close_session(&mut server).await;
         });
     }
 

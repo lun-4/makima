@@ -1083,7 +1083,7 @@ fn record_file(root: &AgentRef, path: &Path, before: FileState, after: FileState
 #[test_case(RestoreChoice::ConversationOnly; "conversation_only")]
 #[test_case(RestoreChoice::ConversationAndFiles; "conversation_and_files")]
 #[test_case(RestoreChoice::FilesOnly; "files_only")]
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn restore_choice_preserves_conflicts_and_redoes_only_applied_paths(choice: RestoreChoice) {
     with_event_loop(|event_loop| {
         let (index, _host) = setup(event_loop);
@@ -1230,7 +1230,7 @@ fn offline_file(session: &mut AppSession, path: &Path, before: FileState, after:
     });
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn parent_route_follows_linked_writes_and_excludes_unlinked_parent_tail() {
     with_event_loop(|event_loop| {
@@ -1301,7 +1301,7 @@ fn parent_route_follows_linked_writes_and_excludes_unlinked_parent_tail() {
 #[test_case(false, false; "unpublished_crash_before_progress_rolls_back")]
 #[test_case(true, false; "published_crash_before_progress_completes")]
 #[test_case(true, true; "published_completion_reconciles_idempotently")]
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn startup_reconciles_both_endpoints_and_missing_progress(published: bool, completed: bool) {
     with_event_loop(|event_loop| {
         let source = offline_session(event_loop);
@@ -1369,7 +1369,7 @@ fn startup_reconciles_both_endpoints_and_missing_progress(published: bool, compl
     });
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn startup_conflict_prevents_runtime_admission_and_retains_both_endpoint_leases() {
     with_event_loop(|event_loop| {
@@ -1420,7 +1420,7 @@ fn startup_conflict_prevents_runtime_admission_and_retains_both_endpoint_leases(
 #[test_case(RestoreChoice::ConversationAndFiles, Some(true), false; "parent_sync_failure_stays_forward")]
 #[test_case(RestoreChoice::ConversationAndFiles, Some(false), true; "parent_baseline_sync_recovers")]
 #[test_case(RestoreChoice::ConversationAndFiles, Some(true), true; "parent_baseline_sync_failure_preserves_files")]
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn parent_restore_replaces_runtime_and_restores_linked_files_before_admission(
     choice: RestoreChoice,
     sync_failure: Option<bool>,
@@ -1631,7 +1631,7 @@ fn parent_restore_replaces_runtime_and_restores_linked_files_before_admission(
     });
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn unresolved_rollback_keeps_source_lease_after_runtime_teardown() {
     const PREPARE_FAILURE: &str = "injected preparation failure after file restore";
@@ -1694,7 +1694,7 @@ fn unresolved_rollback_keeps_source_lease_after_runtime_teardown() {
 
 #[test_case(false; "ancestor_pending_is_reconciled_under_owned_route")]
 #[test_case(true; "ancestor_conflict_retains_route_owners")]
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn parent_route_reconciles_pending_ancestor_before_candidate_preparation(conflict: bool) {
     with_event_loop(|event_loop| {
         let parent = offline_session(event_loop);
@@ -1772,7 +1772,7 @@ const SYNC_FAILURE: &str = "injected restore directory sync failure";
 #[test_case(false, true; "ordinary_sync_failure_stays_forward")]
 #[test_case(true, false; "files_only_sync_recovers")]
 #[test_case(true, true; "files_only_sync_failure_stays_forward")]
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn visible_restore_waits_for_durability_without_rollback(files_only: bool, fail: bool) {
     with_event_loop(|event_loop| {
         let (index, _host) = setup(event_loop);
@@ -1915,7 +1915,7 @@ fn visible_restore_waits_for_durability_without_rollback(files_only: bool, fail:
 
 #[test_case(false; "baseline_sync_recovers_before_file_changes")]
 #[test_case(true; "baseline_sync_failure_never_stages_restore")]
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn ordinary_restore_waits_for_baseline_durability_before_files(fail: bool) {
     with_event_loop(|event_loop| {
         let (index, _host) = setup(event_loop);
@@ -1993,7 +1993,7 @@ fn ordinary_restore_waits_for_baseline_durability_before_files(fail: bool) {
     });
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn cancelling_runtime_restore_preview_leaves_files_history_and_admission_intact() {
     with_event_loop(|event_loop| {
@@ -2046,7 +2046,7 @@ fn cancelling_runtime_restore_preview_leaves_files_history_and_admission_intact(
 
 #[test_case(false; "untouched_prepare_receipt_aborts_and_releases_barriers")]
 #[test_case(true; "prepare_abort_conflict_retains_actual_lease_and_graph_barriers")]
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn unresolved_prepare_receipt_is_protected_before_abort(conflict: bool) {
     const PREPARE_ERROR: &str = "injected manifest post-rename sync failure";
     with_event_loop(|event_loop| {
@@ -2143,7 +2143,7 @@ fn unresolved_prepare_receipt_is_protected_before_abort(conflict: bool) {
 #[test_case(true, false; "baseline_cancel_releases_without_file_changes")]
 #[test_case(false, false; "conversation_restore_cancel_retains_forward_receipt")]
 #[test_case(false, true; "files_only_cancel_retains_forward_receipt")]
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn runtime_cancellation_abandons_directory_sync_wait(baseline: bool, files_only: bool) {
     with_event_loop(|event_loop| {
         let (index, _host) = setup(event_loop);
@@ -2250,7 +2250,7 @@ fn runtime_cancellation_abandons_directory_sync_wait(baseline: bool, files_only:
     });
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn conversation_restore_uses_legacy_projection_without_file_restore_metadata() {
     with_event_loop(|event_loop| {
@@ -2280,7 +2280,7 @@ fn conversation_restore_uses_legacy_projection_without_file_restore_metadata() {
     });
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[test_case(RestoreChoice::ConversationAndFiles)]
 #[test_case(RestoreChoice::FilesOnly)]
 fn unsupported_runtime_file_choice_leaves_conversation_and_files_unchanged(choice: RestoreChoice) {

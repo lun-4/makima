@@ -153,8 +153,8 @@ const LOCK_UNAVAILABLE_REPLACEMENT_ERR: &str =
 
 static NEXT_RUNTIME_GENERATION: AtomicU64 = AtomicU64::new(1);
 
-/// Tabs carry their in-memory sessions so `/reload` reopens them without a
-/// disk round-trip; `session_has_content` tells which ones were saved.
+/// Tabs retain transient state for unsaved sessions; saved sessions reload
+/// their authoritative checkpoint after acquiring ownership.
 pub(crate) struct ShutdownReport {
     pub exit: ExitRequest,
     pub tabs: Vec<AppSession>,
@@ -1493,6 +1493,7 @@ impl SessionRuntime {
 
 /// Everything needed to bring up a new session runtime after startup.
 struct SpawnCtx {
+    initial_model_override: bool,
     file_write_locks: Arc<FileWriteLocks>,
     prepare_provider: ModelPreparer,
     providers: Arc<ProviderRegistry>,
@@ -1716,6 +1717,66 @@ impl SpawnCtx {
                 "Pending restore must be reconciled before replacing this runtime"
             ));
         }
+        let resume_cwd = session.cwd.clone();
+        let mut session_lock = session_lock;
+        let (renewing, authoritative) = if seed_snapshot && exact.is_none() {
+            let lease = session_lock
+                .take()
+                .ok_or_else(|| eyre!(LOCK_UNAVAILABLE_REPLACEMENT_ERR))?;
+            let lease = RenewingDeletionLease::new(lease);
+            let loaded = guard
+                .publish(|| AppSession::load(session.id, &self.storage))?
+                .ok_or_else(|| eyre!(LOCK_LOST_REPLACEMENT_ERR))?;
+            let authoritative = match loaded {
+                Ok(loaded) => {
+                    if let Some(block) = session_lock::resume_block(&loaded.cwd, &resume_cwd, false)
+                    {
+                        return Err(eyre!(block.to_string()));
+                    }
+                    session = loaded;
+                    true
+                }
+                Err(SessionError::Storage(StorageError::NotFound(_)))
+                    if !session.checkpoint_required() =>
+                {
+                    false
+                }
+                Err(error) => return Err(error.into()),
+            };
+            (Some(lease), authoritative)
+        } else {
+            (None, false)
+        };
+        let provider =
+            if authoritative && effective_config.is_none() && !self.initial_model_override {
+                match self
+                    .replacement_spec(&session)
+                    .map_err(|error| eyre!(error))?
+                {
+                    Some(spec)
+                        if provider
+                            .as_ref()
+                            .is_none_or(|provider| provider.model.spec() != spec.as_ref()) =>
+                    {
+                        let prepared = smol::block_on((self.prepare_provider)(spec))
+                            .map_err(|error| eyre!(error.to_string()))?;
+                        Some(PreparedProvider {
+                            model: prepared.model,
+                            provider: prepared.provider,
+                        })
+                    }
+                    Some(_) => provider,
+                    None => provider.filter(|provider| {
+                        provider.model.spec() == self.model_slot.load().model.spec()
+                    }),
+                }
+            } else {
+                provider
+            };
+        let session_lock = match renewing {
+            Some(lease) => Some(lease.into_claimed_lock().map_err(|error| eyre!(error))?),
+            None => session_lock,
+        };
         let resumed = session_has_content(&session)
             || session
                 .agents()
@@ -2293,7 +2354,8 @@ impl<'t> EventLoop<'t> {
         let command_runtime = Arc::new(command_runtime);
         let (mcp_handle, mcp_config_errors) =
             smol::block_on(mcp::start(&cwd, project_config.clone()));
-        let ctx = SpawnCtx {
+        let mut ctx = SpawnCtx {
+            initial_model_override: explicit_model,
             file_write_locks: Arc::new(FileWriteLocks::new()),
             prepare_provider: default_model_preparer(Arc::clone(&providers)),
             providers,
@@ -2374,16 +2436,19 @@ impl<'t> EventLoop<'t> {
                 )
             };
             match restore {
-                Some((spec, _, pending)) => prepares.push(StartupPrepare {
-                    spec,
-                    pending,
-                    root: false,
-                    targets: vec![seeded],
-                }),
-                None => on_startup_provider.push(seeded),
+                Some((spec, _, pending)) if seeded.1.model.spec() == spec.as_ref() => prepares
+                    .push(StartupPrepare {
+                        spec,
+                        pending,
+                        root: false,
+                        targets: vec![seeded],
+                    }),
+                _ if seeded.1.model.spec() == model.spec() => on_startup_provider.push(seeded),
+                _ => {}
             }
             runtimes.push(runtime);
         }
+        ctx.initial_model_override = false;
         if let Some(pending) = startup_pending {
             prepares.push(StartupPrepare {
                 spec: Arc::from(model.spec()),
@@ -5295,6 +5360,9 @@ impl<'t> EventLoop<'t> {
             }
         };
         for (session, expected) in targets {
+            if expected.model.spec() != spec.as_ref() {
+                continue;
+            }
             if let Some(idx) = self.position(session) {
                 let replacement = replacement.clone();
                 self.refresh_root_model(idx, Some(expected), async move { Ok(replacement) });
@@ -7795,6 +7863,7 @@ end })
             )
             .unwrap();
             let ctx = SpawnCtx {
+                initial_model_override: false,
                 file_write_locks: Arc::new(FileWriteLocks::new()),
                 prepare_provider: default_model_preparer(Arc::clone(&providers)),
                 providers,
@@ -7838,7 +7907,7 @@ end })
 
         fn session(&self) -> AppSession {
             let cwd = self._temp_dir.path().to_string_lossy();
-            AppSession::new("test-model", cwd.as_ref())
+            AppSession::new(&self.ctx().model_slot.load().model.spec(), cwd.as_ref())
         }
 
         fn prepare(&self) -> PreparedSessionRuntime {
@@ -8129,7 +8198,10 @@ end })
         const ARTIFACT_NAME: &str = "existing-output.txt";
         const REPLACEMENT_PID: &str = "4294967295";
         with_event_loop(|event_loop| {
-            let mut session = AppSession::new("test-model", &event_loop.session_cwd);
+            let mut session = AppSession::new(
+                &event_loop.ctx.model_slot.load().model.spec(),
+                &event_loop.session_cwd,
+            );
             let id = session.id;
             let dir = makima_storage::sessions::offload_dir(&event_loop.ctx.sessions_dir, id);
             let artifact = dir.join(ARTIFACT_NAME);
@@ -8217,7 +8289,10 @@ end })
         with_event_loop(|event_loop| {
             let original = event_loop.sessions[0].id();
             if next {
-                let mut session = AppSession::new("test-model", &event_loop.session_cwd);
+                let mut session = AppSession::new(
+                    &event_loop.ctx.model_slot.load().model.spec(),
+                    &event_loop.session_cwd,
+                );
                 session.save(&event_loop.ctx.storage).unwrap();
                 let runtime = event_loop.ctx.spawn_runtime(session).unwrap();
                 let idx = event_loop.push_runtime(runtime);
@@ -8310,7 +8385,10 @@ end })
         }
 
         with_event_loop(|event_loop| {
-            let mut session = AppSession::new("test-model", &event_loop.session_cwd);
+            let mut session = AppSession::new(
+                &event_loop.ctx.model_slot.load().model.spec(),
+                &event_loop.session_cwd,
+            );
             let id = session.id;
             session.save(&event_loop.ctx.storage).unwrap();
             let (entered_tx, entered_rx) = flume::bounded(1);
@@ -9620,6 +9698,275 @@ end })
             expected
         );
         release_runtime(runtime);
+    }
+
+    #[test]
+    fn owned_existing_runtime_reloads_checkpoint_before_identity_history_and_config() {
+        use makima_storage::session_state::{StateChange, StoredStateRecord};
+        const STALE_TEXT: &str = "stale preloaded history";
+        const CURRENT_TEXT: &str = "final checkpoint after teardown";
+        const CURRENT_DRAFT: &str = "latest saved draft";
+        let harness = RuntimeHarness::new();
+        let prepared = harness.prepare();
+        let mut current = prepared.recovery.as_ref().unwrap().session().clone();
+        drop(prepared);
+        current.replace_messages(vec![Message::user(STALE_TEXT.into())]);
+        current.save(&harness.ctx().storage).unwrap();
+        let stale = AppSession::load(current.id, &harness.ctx().storage).unwrap();
+        let lease = claim_lock(&harness.ctx().sessions_dir, &current.id).unwrap();
+        let root = current.root_agent_id().unwrap();
+        let mut config = current.latest_state().unwrap().scopes[&Some(root)]
+            .config
+            .clone()
+            .unwrap();
+        config.workflow = true;
+        current.push_state(StoredStateRecord {
+            seq: current.next_state_seq(),
+            agent: Some(root),
+            generation: 1,
+            change: StateChange::Config(config),
+        });
+        current.replace_messages(vec![Message::user(CURRENT_TEXT.into())]);
+        current.meta.input_draft = Some(CURRENT_DRAFT.into());
+        current.save(&harness.ctx().storage).unwrap();
+        lease.release().unwrap();
+        let prepared = harness.ctx().prepare_runtime(stale).unwrap();
+        let recovered = prepared.recovery.as_ref().unwrap().session();
+        assert_eq!(recovered.root_agent_id(), Some(root));
+        assert_eq!(recovered.messages().len(), 1);
+        assert_eq!(
+            serde_json::to_value(recovered.messages()).unwrap(),
+            serde_json::to_value(current.messages()).unwrap()
+        );
+        assert_eq!(recovered.meta.input_draft.as_deref(), Some(CURRENT_DRAFT));
+        assert!(prepared.app.app.root_config().workflow);
+        let runtime = prepared.activate(&harness.ctx().model_slot, None).unwrap();
+        let loaded = AppSession::load(current.id, &harness.ctx().storage).unwrap();
+        assert_eq!(
+            serde_json::to_value(loaded.messages()).unwrap(),
+            serde_json::to_value(current.messages()).unwrap()
+        );
+        release_runtime(runtime);
+    }
+
+    #[test_case(true; "matching_provider")]
+    #[test_case(false; "stale_provider")]
+    fn owned_existing_runtime_keeps_only_a_provider_matching_the_startup_checkpoint(
+        matching: bool,
+    ) {
+        const STALE_SPEC: &str = "openai/stale-startup-provider";
+        let harness = RuntimeHarness::new();
+        let mut session = harness.session();
+        session.save(&harness.ctx().storage).unwrap();
+        let supplied = PreparedProvider {
+            model: if matching {
+                harness.ctx().model_slot.load().model.clone()
+            } else {
+                Model::from_spec(STALE_SPEC).unwrap()
+            },
+            provider: Arc::new(FocusedProvider),
+        };
+        let provider = if matching {
+            Arc::clone(&supplied.provider)
+        } else {
+            Arc::clone(&harness.ctx().model_slot.load().provider) as Arc<dyn Provider>
+        };
+        let prepared = harness
+            .ctx()
+            .prepare_runtime_with_provider(session, Some(supplied))
+            .unwrap();
+        match prepared.provider.as_ref() {
+            Some(retained) => {
+                assert!(matching);
+                assert!(Arc::ptr_eq(&retained.provider, &provider));
+            }
+            None => assert!(!matching),
+        }
+        let tracked = Arc::clone(&prepared.model_slot.load().provider) as Arc<dyn Provider>;
+        let config = prepared.app.app.root_config();
+        assert!(Arc::ptr_eq(&config.provider, &tracked));
+        assert_eq!(config.provider.key_count(), provider.key_count());
+    }
+
+    #[test_case(false; "authoritative_model")]
+    #[test_case(true; "explicit_startup_model")]
+    fn owned_existing_runtime_discards_provider_prepared_from_stale_checkpoint(explicit: bool) {
+        use makima_storage::session_state::{StateChange, StoredStateRecord};
+        let mut harness = RuntimeHarness::new();
+        let prepared = harness.prepare();
+        let mut current = prepared.recovery.as_ref().unwrap().session().clone();
+        drop(prepared);
+        current.save(&harness.ctx().storage).unwrap();
+        let stale = AppSession::load(current.id, &harness.ctx().storage).unwrap();
+        let root = current.root_agent_id().unwrap();
+        let latest_model = Model::from_spec("openai/authoritative-checkpoint").unwrap();
+        let startup = harness.ctx().model_slot.load().model.spec();
+        harness.ctx.as_mut().unwrap().initial_model_override = explicit;
+        let stale_model = Model::from_spec("openai/stale-preparation").unwrap();
+        let expected = latest_model.spec();
+        let mut config = current.latest_state().unwrap().scopes[&Some(root)]
+            .config
+            .clone()
+            .unwrap();
+        config.model = expected.clone();
+        current.push_state(StoredStateRecord {
+            seq: current.next_state_seq(),
+            agent: Some(root),
+            generation: 1,
+            change: StateChange::Config(config),
+        });
+        current.save(&harness.ctx().storage).unwrap();
+        let (requested, requests) = flume::unbounded();
+        let sessions = harness.ctx().sessions_dir.clone();
+        let id = current.id;
+        harness.ctx.as_mut().unwrap().prepare_provider = sync_preparer(move |model| {
+            assert!(session_lock::claim(&sessions, &id).unwrap().is_none());
+            requested.send(model.spec()).unwrap();
+            Ok(PreparedModel {
+                model,
+                provider: Arc::new(StubProvider),
+            })
+        });
+        let prepared = harness
+            .ctx()
+            .prepare_runtime_with_provider(
+                stale,
+                (!explicit).then(|| PreparedProvider {
+                    model: stale_model,
+                    provider: Arc::new(StubProvider),
+                }),
+            )
+            .unwrap();
+        if explicit {
+            assert!(requests.is_empty());
+            assert_eq!(prepared.app.app.root_config().model.spec(), startup);
+        } else {
+            assert_eq!(requests.try_recv().unwrap(), expected);
+            assert!(requests.is_empty());
+            assert_eq!(prepared.app.app.root_config().model.spec(), expected);
+            assert_eq!(prepared.provider.as_ref().unwrap().model.spec(), expected);
+        }
+        let selected = if explicit { startup } else { expected };
+        let runtime = prepared.activate(&harness.ctx().model_slot, None).unwrap();
+        assert_eq!(runtime.config().unwrap().model.spec(), selected);
+        let saved = AppSession::load(current.id, &harness.ctx().storage).unwrap();
+        assert_eq!(
+            saved.latest_state().unwrap().scopes[&Some(root)]
+                .config
+                .as_ref()
+                .unwrap()
+                .model,
+            selected
+        );
+        release_runtime(runtime);
+    }
+
+    #[test_case(false; "session_prepare")]
+    #[test_case(true; "startup_prepare")]
+    fn startup_prepare_does_not_retarget_an_authoritative_runtime(root_prepare: bool) {
+        const STALE_SPEC: &str = "openai/stale-startup-preparation";
+        with_event_loop(|event_loop| {
+            let runtime = &event_loop.sessions[0];
+            let (manager, root) = runtime.handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let current = actor.effective_config().unwrap();
+            let target = (
+                runtime.id(),
+                PreparedModel {
+                    model: current.model.clone(),
+                    provider: Arc::clone(&current.provider),
+                },
+            );
+            assert_ne!(current.model.spec(), STALE_SPEC);
+            event_loop.complete_startup_prepare(
+                Arc::from(STALE_SPEC),
+                root_prepare,
+                vec![target],
+                Ok(PreparedModel {
+                    model: Model::from_spec(STALE_SPEC).unwrap(),
+                    provider: Arc::new(StubProvider),
+                }),
+            );
+            let settled = smol::block_on(settled_config(&actor));
+            assert_eq!(settled.model.spec(), current.model.spec());
+            assert!(Arc::ptr_eq(&settled.provider, &current.provider));
+            drain_config_commits(&mut event_loop.sessions[0]);
+            assert_eq!(
+                event_loop.sessions[0].app.root_config().model.spec(),
+                current.model.spec()
+            );
+        });
+    }
+
+    #[test_case(true; "loaded_checkpoint")]
+    #[test_case(false; "saved_origin_checkpoint")]
+    fn owned_existing_runtime_rejects_deleted_empty_preloaded_checkpoint(reload: bool) {
+        let harness = RuntimeHarness::new();
+        let mut session = harness.session();
+        session.save(&harness.ctx().storage).unwrap();
+        let stale = if reload {
+            AppSession::load(session.id, &harness.ctx().storage).unwrap()
+        } else {
+            session.clone()
+        };
+        assert!(stale.messages().is_empty());
+        assert!(stale.agents().is_empty());
+        assert!(stale.checkpoint_required());
+        let path = harness
+            .ctx()
+            .sessions_dir
+            .join(format!("{}.jsonl", session.id));
+        fs::remove_file(&path).unwrap();
+        assert!(harness.ctx().prepare_runtime(stale).is_err());
+        assert!(!path.exists());
+        assert!(
+            session_lock::claim(&harness.ctx().sessions_dir, &session.id)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn owned_existing_runtime_does_not_replace_a_corrupt_checkpoint_with_preloaded_state() {
+        let harness = RuntimeHarness::new();
+        let mut session = harness.session();
+        session.save(&harness.ctx().storage).unwrap();
+        let stale = AppSession::load(session.id, &harness.ctx().storage).unwrap();
+        let path = harness
+            .ctx()
+            .sessions_dir
+            .join(format!("{}.jsonl", session.id));
+        const CORRUPT: &[u8] = b"not a session checkpoint\n";
+        fs::write(&path, CORRUPT).unwrap();
+        assert!(harness.ctx().prepare_runtime(stale).is_err());
+        assert_eq!(fs::read(path).unwrap(), CORRUPT);
+        assert!(
+            session_lock::claim(&harness.ctx().sessions_dir, &session.id)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn unsaved_runtime_keeps_transient_seed_without_checkpoint_reload() {
+        const DRAFT: &str = "unsaved draft";
+        let harness = RuntimeHarness::new();
+        let mut session = harness.session();
+        session.meta.input_draft = Some(DRAFT.into());
+        let id = session.id;
+        let prepared = harness.ctx().prepare_runtime(session).unwrap();
+        assert_eq!(
+            prepared
+                .recovery
+                .as_ref()
+                .unwrap()
+                .session()
+                .meta
+                .input_draft
+                .as_deref(),
+            Some(DRAFT)
+        );
+        assert!(AppSession::load(id, &harness.ctx().storage).is_err());
     }
 
     #[test]

@@ -1,11 +1,11 @@
 use std::{io, path::Path};
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use rustix::{
     fs::{self as anchored, AtFlags, FileType, Mode, OFlags, Stat},
     io::Errno,
 };
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::{
     ffi::{OsStr, OsString},
     fs::File,
@@ -15,27 +15,27 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const INVALID_PATH: &str = "Restore path must be absolute with only normal components";
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const DIRECTORY_CHANGED: &str = "Restore parent directory was replaced";
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const CONTENT_CHANGED: &str = "Restore destination changed since capture";
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const NOT_REGULAR: &str = "Restore destination is not a regular file";
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const LOCK_POISONED: &str = "Restore directory lock was poisoned";
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const TEMPORARY_CHANGED: &str = "Restore temporary file was replaced";
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 const UNSUPPORTED: &str = "Secure file restoration is not supported on this platform";
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug)]
 pub(crate) struct AnchoredPath {
     parents: Vec<OsString>,
@@ -44,7 +44,7 @@ pub(crate) struct AnchoredPath {
     captured_depth: usize,
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl AnchoredPath {
     pub(crate) fn capture(path: &Path) -> io::Result<Self> {
         let mut parts = path.components();
@@ -231,7 +231,7 @@ impl AnchoredPath {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn open_root() -> io::Result<File> {
     Ok(File::from(anchored::open(
         "/",
@@ -240,7 +240,7 @@ fn open_root() -> io::Result<File> {
     )?))
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn open_directory(parent: &File, name: &OsStr) -> io::Result<File> {
     Ok(File::from(anchored::openat(
         parent,
@@ -250,12 +250,12 @@ fn open_directory(parent: &File, name: &OsStr) -> io::Result<File> {
     )?))
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn same_identity(expected: &Stat, actual: &Stat) -> bool {
     expected.st_dev == actual.st_dev && expected.st_ino == actual.st_ino
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn require_same(expected: &File, actual: &File) -> io::Result<()> {
     if !same_identity(&anchored::fstat(expected)?, &anchored::fstat(actual)?) {
         return Err(io::Error::other(DIRECTORY_CHANGED));
@@ -263,7 +263,7 @@ fn require_same(expected: &File, actual: &File) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn open_regular(directory: &File, name: &OsStr) -> io::Result<Option<File>> {
     let file = match anchored::openat(
         directory,
@@ -283,7 +283,7 @@ fn open_regular(directory: &File, name: &OsStr) -> io::Result<Option<File>> {
     Ok(Some(file))
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_in(directory: &File, name: &OsStr) -> io::Result<Option<Vec<u8>>> {
     let Some(mut file) = open_regular(directory, name)? else {
         return Ok(None);
@@ -297,7 +297,7 @@ fn read_in(directory: &File, name: &OsStr) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn write_in(
     directory: &File,
     name: &OsStr,
@@ -331,11 +331,11 @@ fn write_in(
     directory.sync_all()
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[derive(Debug)]
 pub(crate) struct AnchoredPath;
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl AnchoredPath {
     pub(crate) fn capture(_: &Path) -> io::Result<Self> {
         Err(io::Error::new(io::ErrorKind::Unsupported, UNSUPPORTED))
@@ -358,7 +358,7 @@ impl AnchoredPath {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::{AnchoredPath, CONTENT_CHANGED, DIRECTORY_CHANGED, INVALID_PATH};
     use rustix::fs::{CWD, Mode, mkfifoat};

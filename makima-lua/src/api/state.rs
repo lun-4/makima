@@ -579,12 +579,12 @@ pub(crate) fn retained(
 pub(crate) const DOCS: crate::docs::ModuleDoc = crate::docs::ModuleDoc {
     name: "makima.state",
     kind: crate::docs::DocKind::Table,
-    desc: "Journaled plugin slots, scoped to an agent or session. Values are copied strict JSON data. Unloaded plugin values remain stored without running plugin code.",
+    desc: "Journaled plugin slots, scoped to an agent or session. Values are copied strict JSON data. Agent-scoped values follow the durable agent ID across session restart. Unloaded plugin values remain stored without running plugin code; old slot handles return state_slot_expired after unload or replacement. StateSlot methods are get(ctx), set(ctx, value, opts?), delete(ctx, opts?), update(ctx, callback), and on_change(callback). get returns value, revision on success, including nil, revision for an absent value; update returns the updated value and revision. Failures return nil, error. set and delete return revision or nil, error. opts.expect requires the observed revision. State writes require a live invocation context; retaining a slot or context does not extend its authority.",
     fns: &[
         crate::docs::FnDoc {
             name: "register",
             args: "{name}, {spec}",
-            desc: "Register a plugin-qualified slot during load. spec supplies scope (agent or session), positive version, and optional synchronous migrate(value, old_version). Registration is transactional with plugin load.",
+            desc: "Register a plugin-qualified slot during load. spec supplies scope (agent or session), positive version, and optional synchronous migrate(value, old_version). Registration is transactional with plugin load. Names are local to the plugin and contain no slash; plan/state is reserved for the host.",
             params: &[],
             returns: "(StateSlot) Registered slot.",
             example: "",
@@ -593,7 +593,7 @@ pub(crate) const DOCS: crate::docs::ModuleDoc = crate::docs::ModuleDoc {
         crate::docs::FnDoc {
             name: "null",
             args: "",
-            desc: "JSON null sentinel. Unlike nil it remains present in arrays and objects.",
+            desc: "JSON null sentinel, used as makima.state.null without a call. Unlike nil it remains present in arrays and objects.",
             params: &[],
             returns: "",
             example: "",
