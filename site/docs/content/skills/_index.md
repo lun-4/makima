@@ -47,9 +47,25 @@ description: Cut a tagged release and open the changelog PR
 
 The frontmatter is optional. Without it, the directory name is the skill name and the whole file is the body. An empty body is skipped. The `description` is what the model reads when picking a skill, so make it specific.
 
+## Keep a skill out of the model's list
+
+Some skills you only run yourself, like a deploy step. Add this top-level key:
+
+```markdown
+---
+name: deploy
+description: Deploy the application to production
+disable-model-invocation: true
+---
+```
+
+The skill drops out of the list the model reads, so it costs no tokens and the model is never told about it. It still works when you type `@skill:deploy` and send the message: the model gets a token naming the skill and loads it with the skill tool. Completion still offers it.
+
+The value can be `true`, `yes`, `on`, or `1`, in any letter case, matching Claude Code's accepted spellings. Any other value, including `false`, leaves the skill visible.
+
 ## How it gets used
 
-The `skill` tool lists every skill it found, the agent calls it with a name and gets the body back. A wrong name errors and reprints the list so the model can pick again.
+The `skill` tool lists every skill it found that has not opted out, the agent calls it with a name and gets the body back. A wrong name errors and reprints the list so the model can pick again.
 
 Skills are not slash commands: typing `/git-release` does nothing unless you also add a [custom command](/docs/commands/#custom-commands). Ask the agent to use a skill, or let it pick one on its own.
 
