@@ -187,7 +187,7 @@ slot:on_change(function(ctx, event) end)               -- event = { agent, revis
 ### Phase 7: task plugin and durable links
 
 - `plugins/task/init.lua`: `task_id` becomes the durable agent id; task policy (`description`, `writes`, owner) moves to a session-scoped slot keyed by agent id; `resolve_task` uses `makima.agent.get`; `task_wait` uses `Agent:turn`; the plugin's own 128-task eviction is removed, and retention is the manager's `max_retained_agents` with explicit retirement. Old transcript-key task ids from v2 sessions resolve to `unknown task_id` as today.
-- Links: `Post.agent` and `result_agent` store the durable id, and restored chats set `agent_id`. One UI map `AgentId -> chat` and one resolver in `app/mouse.rs`; delete `historical_chat_index`, `result_historical` and the `ambiguous` handling. A missing agent flashes `FLASH_NO_AGENT_CHAT` on both surfaces. Tool-row links are #213, which then needs only the `agent` field on tool replies and the header hit test.
+- Links: `Post.agent` and `result_agent` store the durable id, and restored chats set `agent_id`. One UI map `AgentId -> chat` and one resolver in `app/mouse.rs`; delete `historical_chat_index` and `result_historical`. Keep the `ambiguous` handling for v2 imports: when legacy children share a transcript key, generated ids cannot tell which child a post meant, so those links stay unavailable and the stored per-child model, thinking and fast fields remain the display fallback (decision in `docs/agent-system.md`, "Legacy import identity"). A missing agent flashes `FLASH_NO_AGENT_CHAT` on both surfaces. Tool-row links are #213, which then needs only the `agent` field on tool replies and the header hit test.
 
 ### Phase 8: full-state rewind (#148)
 

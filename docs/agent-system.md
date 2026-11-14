@@ -120,7 +120,7 @@ Child result and delivery disposition records use `(AgentId, TurnId)`. Queued, c
 
 ### Legacy import identity
 
-Plan amendment: retain v2 import ambiguity markers and presentation fallbacks where duplicate transcript keys or conflicting historical metadata prevent unique identity resolution. Generated durable IDs identify imported records but do not resolve those conflicts. Ambiguous links remain unavailable across saves and merges. Remove historical lookup paths only where unique durable-ID resolution supersedes them.
+Decision: retain v2 import ambiguity markers and presentation fallbacks where duplicate transcript keys or conflicting historical metadata prevent unique identity resolution. Generated durable IDs identify imported records but do not resolve those conflicts. Ambiguous links remain unavailable across saves and merges. Remove historical lookup paths only where unique durable-ID resolution supersedes them.
 
 ### History epochs and restoration points
 
