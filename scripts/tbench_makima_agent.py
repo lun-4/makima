@@ -7,7 +7,7 @@ Setup:
     harbor dataset download terminal-bench/terminal-bench-2
 
 Run a single task:
-    MOUNTS='["/usr/local/bin/makima:/mnt/makima:ro", "~/.local/state/makima/auth:/mnt/makima-auth:ro", "~/.config/makima/providers:/mnt/makima-providers:ro"]'
+    MOUNTS='["/usr/local/bin/makima:/mnt/makima:ro", "~/.local/state/makima/auth:/mnt/makima-auth:ro"]'
 
     harbor run \
       -t terminal-bench/fix-git \
@@ -143,10 +143,6 @@ class MakimaAgent(BaseInstalledAgent):
         await self.exec_as_root(
             environment,
             command="if [ -d /mnt/makima-auth ]; then mkdir -p /root/.local/state/makima/auth && cp /mnt/makima-auth/* /root/.local/state/makima/auth/; fi",
-        )
-        await self.exec_as_root(
-            environment,
-            command="if [ -d /mnt/makima-providers ]; then mkdir -p /root/.config/makima/providers && cp /mnt/makima-providers/* /root/.config/makima/providers/ && chmod +x /root/.config/makima/providers/*; fi",
         )
 
     @with_prompt_template

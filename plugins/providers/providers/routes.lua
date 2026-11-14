@@ -1,5 +1,5 @@
--- How a provider whose credentials come from elsewhere, such as an
--- executable provider's script or the Aperture gateway, reaches a provider
+-- How a provider whose credentials come from elsewhere, such as the
+-- Aperture gateway or a custom `providers.toml` section, reaches a provider
 -- implemented here. A route streams through a client: `base`, the base URL,
 -- and `headers(extra)`, which carry the credentials. Listings also use
 -- `get_json(ctx, url, extra)`, `request_json(ctx, request)` and `root`, the
@@ -7,10 +7,8 @@
 --
 -- Route fields: `def` (curated models and the default `base_url`),
 -- `stream(client, model, ctx, request, emit)` for descriptor {model},
--- optional `list_models(ctx, client)` returning discovered rows, optional
--- `fetch_usage(ctx, client)`, and `system_prefix`: `"block"` when `stream`
--- takes the prefix as a sixth argument, `"none"` when the provider drops it.
--- Without it the prefix goes before the system prompt.
+-- optional `list_models(ctx, client)` returning discovered rows, and optional
+-- `fetch_usage(ctx, client)`.
 
 local anthropic = require("providers.anthropic_provider")
 local compat = require("providers.openai_compat")
@@ -62,9 +60,8 @@ end
 M.ROUTES = {
   anthropic = {
     def = anthropic.def,
-    system_prefix = "block",
-    stream = function(client, model, ctx, request, emit, system_prefix)
-      return anthropic.stream(messages_api(client), model, ctx, request, emit, system_prefix)
+    stream = function(client, model, ctx, request, emit)
+      return anthropic.stream(messages_api(client), model, ctx, request, emit)
     end,
     list_models = function(ctx, client)
       return anthropic.list_models(ctx, messages_api(client))
@@ -82,7 +79,6 @@ M.ROUTES = {
   },
   google = {
     def = google.def,
-    system_prefix = "none",
     stream = function(client, _, ctx, request, emit)
       return google.stream(client, ctx, request, emit)
     end,

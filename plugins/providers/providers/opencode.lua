@@ -121,28 +121,6 @@ local function delegate(ctx, config, sub, entry, model_id)
   }
 end
 
--- A route for credentials that come from elsewhere: `<catalog
--- provider>/<model>` goes to that provider and anything else to Zen, at the
--- client's base if it has one.
-function M.delegated(cache)
-  return {
-    def = { models = {} },
-    stream = function(client, _, ctx, request, emit)
-      local sub, model_id = request.model.id:match("^([^/]+)/(.+)$")
-      local entry = sub and cache:served(sub)
-      if not entry then
-        model_id, entry = request.model.id, cache:entry(M.ZEN.id)
-      end
-      if not entry then
-        return nil, http.config_error("provider '" .. M.ZEN.id .. "' is not in the models.dev catalog yet")
-      end
-      request.model.id = model_id
-      local api = { base = client.base or entry.api, protocol = catalog.protocol(entry), headers = client.headers }
-      return catalog.stream(api, ctx, request, emit)
-    end,
-  }
-end
-
 -- The provider for {member} (`M.ZEN` or `M.GO`), backed by {cache}.
 function M.provider(cache, member)
   local id = member.id

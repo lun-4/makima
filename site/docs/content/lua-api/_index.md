@@ -5142,7 +5142,7 @@ output until it exits, for a login that is an interactive program. Only
 **Example:**
 
 ```lua
-local ok, err = ui:run({ "/home/me/.config/makima/providers/corp", "login" })
+local ok, err = ui:run({ "gh", "auth", "login" })
 ```
 
 

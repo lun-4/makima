@@ -140,13 +140,9 @@ local function apply_thinking(body, request)
   end
 end
 
--- The body fields the Anthropic API and Bedrock share. {system_prefix} goes
--- before the system prompt as its own block.
-function M.build_body(request, system_prefix)
+-- The body fields the Anthropic API and Bedrock share.
+function M.build_body(request)
   local system = {}
-  if system_prefix then
-    system[1] = { type = "text", text = system_prefix }
-  end
   system[#system + 1] = { type = "text", text = request.system or "", cache_control = EPHEMERAL }
   local body = {
     max_tokens = request.model.max_output_tokens or FALLBACK_MAX_TOKENS,
@@ -167,8 +163,8 @@ function M.strip_long_context(model_id)
 end
 
 -- The Anthropic API body.
-function M.build_request(request, system_prefix)
-  local body = M.build_body(request, system_prefix)
+function M.build_request(request)
+  local body = M.build_body(request)
   body.model = M.strip_long_context(request.model.id)
   body.stream = true
   if request.fast then

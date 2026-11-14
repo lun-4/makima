@@ -73,8 +73,6 @@ TODO
 * OpenCode Go - `OPENCODE_API_KEY`. Models from the models.dev catalog.
 * Aperture - `APERTURE_HOST` (e.g. `https://your-host.tailnet.ts.net`). No API key needed, Tailscale handles auth.
 
-**Dynamic providers** - drop an executable script into `~/.config/makima/providers/` to add custom providers or proxies. See [docs](https://makima.ln4.net/docs/providers/#executable-providers) for details.
-
 ## Installation
 
 ### Linux / macOS
