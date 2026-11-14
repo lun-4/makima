@@ -1,6 +1,7 @@
 local helpers = require("skill_helpers")
 local parse_frontmatter = helpers.parse_frontmatter
 local build_skill_list = helpers.build_skill_list
+local parse_bool = helpers.parse_bool
 
 local failures = {}
 
@@ -69,6 +70,18 @@ case("frontmatter_only_dashes_no_yaml", function()
   eq(body, "Body")
 end)
 
+-- ── parse_bool ──
+
+case("parse_bool_spellings", function()
+  for _, value in ipairs({ true, 1, "true", "TRUE", "yes", "YES", "on", "On", "1" }) do
+    eq(parse_bool(value), true, "expected truthy: " .. tostring(value))
+  end
+  for _, value in ipairs({ false, 0, "false", "no", "off", "0", "" }) do
+    eq(parse_bool(value), false, "expected falsey: " .. tostring(value))
+  end
+  eq(parse_bool(nil), false, "expected nil to be false")
+end)
+
 -- ── build_skill_list ──
 
 case("build_skill_list_empty", function()
@@ -86,6 +99,26 @@ case("build_skill_list_single_skill", function()
   assert(result:find("test%-skill"), "should contain skill name")
   assert(result:find("A test skill"), "should contain description")
   assert(not result:find("No skills available"), "should not say no skills")
+end)
+
+case("build_skill_list_skips_model_disabled_skill", function()
+  local skills = {
+    visible = { name = "visible", description = "Visible skill" },
+    hidden = { name = "hidden", description = "Hidden skill", disable_model_invocation = true },
+  }
+  local result = build_skill_list(skills)
+  assert(result:find("visible", 1, true), "should contain the visible skill")
+  assert(result:find("Visible skill", 1, true), "should contain the visible description")
+  assert(not result:find("hidden", 1, true), "should not contain the hidden skill")
+end)
+
+case("build_skill_list_only_model_disabled_skills", function()
+  local skills = {
+    hidden = { name = "hidden", description = "Hidden skill", disable_model_invocation = true },
+  }
+  local result = build_skill_list(skills)
+  assert(result:find("No skills available", 1, true), "should say no skills are available")
+  assert(not result:find("hidden", 1, true), "should not contain the hidden skill")
 end)
 
 case("build_skill_list_sorted_alphabetically", function()

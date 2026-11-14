@@ -7,6 +7,7 @@ local ToolView = require("makima.tool_view")
 local helpers = require("skill_helpers")
 local parse_frontmatter = helpers.parse_frontmatter
 local build_skill_list = helpers.build_skill_list
+local parse_bool = helpers.parse_bool
 
 local MAKIMA_SKILL_DIR = ".makima/skills"
 local PROJECT_SKILL_DIRS = {
@@ -39,6 +40,7 @@ local function scan_skill_dir(dir, skills)
             description = (fm and fm.description) or "",
             content = body,
             location = skill_path,
+            disable_model_invocation = parse_bool(fm["disable-model-invocation"]),
           }
         end
       end
@@ -137,6 +139,7 @@ end
 
 local boot_skills = discover_skills(makima.uv.cwd())
 local description = "Load a skill that provides instructions and workflows for specific tasks."
+  .. " When the user message names a skill, load it with this tool, even if it is not in the list below."
   .. build_skill_list(boot_skills)
 
 local function format_skill(content, location)

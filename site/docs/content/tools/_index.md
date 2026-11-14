@@ -241,7 +241,7 @@ Persistent, project-scoped scratchpad for learnings, patterns, decisions, and go
 
 ### `skill` {#skill}
 
-Load a skill that provides instructions and workflows for specific tasks.
+Load a skill that provides instructions and workflows for specific tasks. When the user message names a skill, load it with this tool, even if it is not in the list below.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
